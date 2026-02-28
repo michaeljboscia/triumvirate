@@ -48,14 +48,20 @@ Token economics: **pass paths, not content.** All three agents read files direct
 The `mcp-server/` directory contains a TypeScript MCP server that wraps the Gemini and Codex CLIs with a clean daemon API:
 
 ```typescript
-// Spawn a persistent session
-spawn_daemon(cwd: "/path/to/project") → daemon_id
+// Spawn a named session — survives MCP restarts, resumes with zero token cost
+spawn_daemon({ session_name: "arch-auditor", cwd: "/path/to/project" }) → daemon_id
 
-// Ask questions — full conversation history maintained
+// Ask questions — full conversation history maintained across calls
 ask_daemon(daemon_id, "Read /full/path/to/file.ts and explain the auth flow")
 
-// Dismiss — cleans up the session
+// Soft dismiss (default) — session preserved on disk, resumable later
 dismiss_daemon(daemon_id)
+
+// Hard dismiss — permanently delete session files
+dismiss_daemon(daemon_id, { hard: true })
+
+// Next session: resume instantly with no re-feed
+spawn_daemon({ session_name: "arch-auditor" }) → "Gemini daemon resumed (existing session)."
 ```
 
 Each `ask_daemon` is a fresh process (~2-3s for Gemini, ~7s for Codex) with full conversation continuity. No PTY, no sentinels, no TUI.
@@ -218,6 +224,12 @@ These features are designed and planned — not yet in the codebase:
 - **Pre-compact hooks** — Gemini summarizes Claude's transcript before context compaction, restoring continuity across session boundaries. Reference implementation coming to `docs/hooks/`.
 - **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `taxonomy.json` for all five fields including `feature`.
 - **Ollama as fourth agent** — local, private, zero-cost triage before escalating to cloud models.
+
+### What shipped recently
+
+- **Daemon persistence** — `spawn_daemon({ session_name: "..." })` creates named sessions that survive MCP restarts. Soft dismiss (default) preserves session files. Resume with zero token cost. `list_daemons` auto-discovers hibernated sessions from disk.
+- **Revive-on-ask** — dead daemons (quota-exhausted) probe once on the next `ask_daemon` before giving up permanently. Handles quota resets without re-spawning.
+- **Model fallback chain** — Gemini quota exhaustion falls back automatically through the model chain without user intervention.
 
 PRs welcome. The agents review their own contributions.
 

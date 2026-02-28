@@ -73,7 +73,15 @@ spawn_daemon({ cwd: "/path/to/project" })
 ask_daemon({ daemon_id: "gd_abc123", question: "Read /path/to/file.ts and explain the auth flow" })
 // → { text: "The auth flow works by..." }
 
-// Dismiss — cleans up the session (automatic session log writing: roadmap)
+// Soft dismiss (default) — session files preserved, resumable later
 dismiss_daemon({ daemon_id: "gd_abc123" })
-// → { text: "Gemini daemon gd_abc123 dismissed. Session directory cleaned up." }
+// → { text: "Gemini daemon gd_abc123 dismissed (soft). Session files preserved at: ~/.gemini/tmp/daemon-gd_abc123" }
+
+// Resume the same session in a future call (zero token cost — no re-feed)
+spawn_daemon({ session_name: "gd_abc123" })
+// → { text: "Gemini daemon resumed (existing session)..." }
+
+// Hard dismiss — permanently delete session files
+dismiss_daemon({ daemon_id: "gd_abc123", hard: true })
+// → { text: "Gemini daemon gd_abc123 permanently dismissed. Session files deleted." }
 ```
