@@ -475,7 +475,7 @@ export function registerGeminiTools(server: McpServer): void {
       const result = await executeWithFallback({
         baseArgs: ["-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
         stdin: "You are a helpful research and coding assistant. I will send follow-up questions. Acknowledge with: Ready.",
-        cwd: homedir(),
+        cwd: sessionDir, // unique per daemon — prevents concurrent daemons from sharing `-r latest` session
         timeout_ms: params.timeout_ms || 60_000,
         onProgress: makeProgressLogger(server, "Gemini"),
       });
@@ -549,7 +549,7 @@ export function registerGeminiTools(server: McpServer): void {
         const result = await executeWithFallback({
           baseArgs: ["-r", "latest", "-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
           stdin: params.question,
-          cwd: homedir(),
+          cwd: session.sessionDir, // unique per daemon — prevents cross-talk between concurrent sessions
           timeout_ms: params.timeout_ms || 120_000,
           onProgress: makeProgressLogger(server, "Gemini"),
         });

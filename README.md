@@ -1,8 +1,8 @@
 # triumvirate
 
-**Three AI agents. One coordination layer. No servers.**
+**Three AI agents. One coordination layer. No relay server.**
 
-Claude Code, Gemini CLI, and Codex work together — sharing context, delegating tasks, and logging their own work — without you having to be the relay.
+Claude Code, Gemini CLI, and Codex work together — sharing context, delegating tasks, and documenting their own work — without you having to be the relay.
 
 Built in 27 days. Partially designed by the agents themselves.
 
@@ -18,7 +18,7 @@ Triumvirate is a coordination layer for three CLI-based AI agents:
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | 2M token context, web search, deep research |
 | [Codex](https://github.com/openai/codex) | `codex` | Code generation, refactoring, code review |
 
-The core: an MCP server that gives each agent the ability to **spawn**, **query**, and **dismiss** the others as persistent daemon sessions — with full conversation history, shared scratchpads, and automatic session logging.
+The core: an MCP server that gives each agent the ability to **spawn**, **query**, and **dismiss** the others as persistent daemon sessions — with full conversation history and shared scratchpads.
 
 ---
 
@@ -54,7 +54,7 @@ spawn_daemon(cwd: "/path/to/project") → daemon_id
 // Ask questions — full conversation history maintained
 ask_daemon(daemon_id, "Read /full/path/to/file.ts and explain the auth flow")
 
-// Dismiss — triggers automatic session log
+// Dismiss — cleans up the session
 dismiss_daemon(daemon_id)
 ```
 
@@ -76,15 +76,15 @@ Dispatch Codex for git-aware code review on uncommitted changes, branches, or sp
 
 For large codebases: Claude dispatches Codex, Codex loads the full codebase into Gemini's 2M context window, asks targeted questions, and returns a complete review — without Claude ever touching the files.
 
-### Example: Batch Claude Deep Research
-
-Automate batch-submission of research topics to claude.ai's Deep Research feature via browser automation. Write a list of topics, walk away, come back to completed research.
-
-See `examples/batch-deep-research/`.
-
 ### Session Log Spec
 
-A cross-agent session log standard (`SESSION_LOG_SPEC.md`) so every agent documents its work in a compatible format. Built into `dismiss_daemon` — no manual logging required.
+A cross-agent session log standard (`SESSION_LOG_SPEC.md`) so every agent can document its work in a compatible format that all three can read and resume from.
+
+### Ecosystem: Batch Claude Deep Research
+
+Automate batch-submission of research topics to claude.ai's Deep Research via browser automation. Separate project, works well alongside Triumvirate.
+
+→ [github.com/michaeljboscia/claude-deep-research](https://github.com/michaeljboscia/claude-deep-research)
 
 ---
 
@@ -95,7 +95,7 @@ A cross-agent session log standard (`SESSION_LOG_SPEC.md`) so every agent docume
 - Claude Code (`claude`) — [install](https://claude.ai/code)
 - Gemini CLI (`gemini`) — [install](https://github.com/google-gemini/gemini-cli)
 - Codex (`codex`) — [install](https://github.com/openai/codex)
-- Node.js 18+
+- Node.js 20+
 
 ### 1. Build the MCP server
 
@@ -104,6 +104,7 @@ git clone https://github.com/michaeljboscia/triumvirate
 cd triumvirate/mcp-server
 npm install
 npm run build
+chmod +x start-gemini.sh
 ```
 
 ### 2. Wire into Claude Code
@@ -152,7 +153,7 @@ Full setup guides: `docs/setup/`
 
 ## Session logs
 
-Every daemon writes a structured session log when dismissed — automatically, without you asking.
+Triumvirate defines a cross-agent session log standard (`SESSION_LOG_SPEC.md`) — a shared markdown format so every agent documents its work in a way all three can read.
 
 ```
 project/
@@ -162,7 +163,9 @@ project/
     └── owner--client_domain_repo_feature_20260228_v80_claude.md
 ```
 
-Three agents, three logs, one shared `session-logs/` directory. Any agent can read any other agent's log to pick up context. See `SESSION_LOG_SPEC.md` for the full standard.
+Three agents, three logs, one shared directory. Any agent can read any other agent's log to pick up context across sessions.
+
+See `SESSION_LOG_SPEC.md` for the naming convention, required sections, git workflow, and cross-agent compatibility rules.
 
 ---
 
@@ -186,13 +189,37 @@ Triumvirate is different:
 
 | | Triumvirate | Relay |
 |--|--|--|
-| Infrastructure | Zero — stdio MCP processes | Relay server required |
+| Infrastructure | No relay server — stdio MCP processes only | Relay server required |
 | Sessions | Stateful — full conversation history | Stateless pub-sub |
-| Agents | Wrap existing CLIs | Build on the framework |
+| Agents | Wrap existing CLIs you already have | Build on the framework |
 | Topology | Orchestrator + optional peer-to-peer | Equal peers |
-| Setup | Wire existing tools you have | Build new agents |
+| Setup | Wire tools you already use | Build new agents |
 
-If you already have Claude Code, Gemini CLI, and Codex — Triumvirate works with what you have.
+If you already have Claude Code, Gemini CLI, and Codex — Triumvirate wires them together without adding infrastructure.
+
+---
+
+## Security posture
+
+Both Gemini and Codex CLIs apply their own sandboxes by default. Triumvirate disables these for the MCP daemon context:
+
+- **Codex:** `--dangerously-bypass-approvals-and-sandbox` — removes Codex's seatbelt, allowing outbound network and unrestricted file access
+- **Gemini:** `--approval-mode yolo` — removes Gemini's approval prompts and file access restrictions
+
+These are the CLIs' own documented escape hatches, intended for controlled programmatic environments. Triumvirate is that environment — the MCP server controls what prompts reach the agents. Only use Triumvirate in trusted contexts on your own machine.
+
+---
+
+## Roadmap
+
+These features are designed and planned — not yet in the codebase:
+
+- **Automatic session logs on dismiss** — every daemon writes a structured log to `session-logs/` automatically when dismissed. The spec is defined in `SESSION_LOG_SPEC.md`; the `dismiss_daemon` implementation is in progress.
+- **Pre-compact hooks** — Gemini summarizes Claude's transcript before context compaction, restoring continuity across session boundaries. Reference implementation coming to `docs/hooks/`.
+- **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `taxonomy.json` for all five fields including `feature`.
+- **Ollama as fourth agent** — local, private, zero-cost triage before escalating to cloud models.
+
+PRs welcome. The agents review their own contributions.
 
 ---
 
@@ -200,9 +227,9 @@ If you already have Claude Code, Gemini CLI, and Codex — Triumvirate works wit
 
 Want session logs that survive context compaction — where Gemini automatically summarizes your Claude transcript before memory is lost and restores it on the next session? That's `Tier 2`: a hooks system built on Claude Code's lifecycle hooks, Gemini's pre-compact hook, and Codex's session hooks.
 
-It works. It took the most iteration to get right. Full reference implementation in `docs/hooks/`.
+It took the most iteration to get right. Reference implementation coming to `docs/hooks/`.
 
-Fair warning: it requires all three CLIs, their config repos wired up, and tolerance for a week of debugging hook interactions.
+Fair warning: it requires all three CLIs configured, and tolerance for a week of debugging hook interactions. The roadmap item above tracks this.
 
 ---
 

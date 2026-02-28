@@ -4,7 +4,7 @@
  * Session logs follow the naming convention:
  *   session-logs/{owner}--{client}_{domain}_{repo}_{feature}_{YYYYMMDD}_v{N}_{agent}.md
  *
- * We look for *_claude.md files (since Claude is always the sender in Phase 1).
+ * Accepts an agent parameter to filter by agent suffix (default: claude).
  */
 
 import { existsSync, readdirSync, mkdirSync } from "node:fs";

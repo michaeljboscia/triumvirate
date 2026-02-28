@@ -137,7 +137,7 @@ Each agent stores raw transcripts differently. The session log must reference th
 
 | Agent | Native Transcript Location | Reference Format |
 |-------|---------------------------|------------------|
-| Claude | `~/.claude/projects/-Users-mikeboscia/<UUID>.jsonl` | UUID only: `72512663-f081-45d3-9ed7-dab84ac8bafb` |
+| Claude | `~/.claude/projects/<slugified-path>/<UUID>.jsonl` | UUID only: `72512663-f081-45d3-9ed7-dab84ac8bafb` |
 | Gemini | (similar JSONL) | UUID or path |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/<rollout-timestamp-id>.jsonl` | Full relative path: `sessions/2026/02/12/rollout-2026-02-12T...` |
 
