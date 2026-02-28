@@ -1,0 +1,23 @@
+{
+  "name": "triumvirate-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Claude + Gemini + Codex inter-agent coordination",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "node-pty": "^1.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
