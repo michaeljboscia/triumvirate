@@ -21,7 +21,7 @@
  */
 
 import { z } from "zod";
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -176,6 +176,16 @@ const _sessions = new Map<string, GeminiSession>();
 
 function _genSessionId(): string {
   return `gd_${Date.now().toString(36)}_${++_sessionCounter}`;
+}
+
+/** Sanitize a user-provided session name for use as a directory name */
+function _sanitizeSessionName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40) || "session";
 }
 
 function _cleanupSession(session: GeminiSession): void {
@@ -447,7 +457,7 @@ export function registerGeminiTools(server: McpServer): void {
   // ─── spawn_daemon ───────────────────────────────────────────────
   server.tool(
     "spawn_daemon",
-    "Spawn a persistent Gemini session for multi-turn interaction. Uses `gemini -p --output-format text` in a unique session directory. Subsequent ask_daemon() calls use `gemini -r latest` to continue the conversation. Each ask is a fresh process (~2-3s) with full conversation continuity. Returns a daemon_id.",
+    "Spawn a persistent Gemini session for multi-turn interaction. Pass session_name to create a named, resumable session — if the session already exists on disk from a previous run, it resumes instantly with full conversation history and zero token cost. Unnamed sessions get a random ID. Each ask_daemon() call uses `gemini -r latest` for full conversation continuity. dismiss_daemon() is soft by default (session preserved); pass hard: true for full deletion.",
     {
       cwd: z
         .string()
@@ -459,18 +469,67 @@ export function registerGeminiTools(server: McpServer): void {
         .max(120_000)
         .optional()
         .describe("Timeout for initial session creation (default: 60s)."),
+      session_name: z
+        .string()
+        .optional()
+        .describe(
+          "Optional stable name for this session (e.g. 'arch-auditor', 'security-review'). " +
+          "If the session already exists on disk, spawn_daemon will resume it instantly with zero " +
+          "token cost instead of bootstrapping fresh. Omit for one-off sessions."
+        ),
     },
     async (params) => {
       const projectDir = params.cwd || process.cwd();
       const swept = sweepScratchpad(projectDir);
       ensureScratchpad(projectDir);
 
-      // Create a unique session directory under ~ so Gemini's workspace root
-      // expands to user home directory, allowing reads of any file under home.
+      // Create a session directory under ~ so Gemini's workspace root expands to home.
       // (tmpdir() resolves to /private/var/folders/... which Gemini can't traverse out of)
+      // Deterministic name: named sessions survive MCP restarts and can be resumed.
+      // Random fallback for one-off sessions (no session_name provided).
       const daemonSessionsDir = join(homedir(), ".gemini", "daemon-sessions");
       mkdirSync(daemonSessionsDir, { recursive: true });
-      const sessionDir = mkdtempSync(join(daemonSessionsDir, "daemon-"));
+      const sessionId = _genSessionId();
+      const sessionDirName = params.session_name
+        ? `daemon-${_sanitizeSessionName(params.session_name)}`
+        : `daemon-${sessionId}`;
+      const sessionDir = join(daemonSessionsDir, sessionDirName);
+
+      // Check if this session already exists on disk (resume path).
+      // Both the session dir AND ~/.gemini/tmp/<dirname>/ must exist — the latter
+      // is where Gemini stores the actual conversation history for -r latest.
+      const geminiTmpDir = join(homedir(), ".gemini", "tmp", sessionDirName);
+      const isResuming = existsSync(sessionDir) && existsSync(geminiTmpDir);
+
+      if (isResuming) {
+        // Session history on disk — skip bootstrap entirely, zero token cost.
+        _sessions.set(sessionId, {
+          id: sessionId,
+          sessionDir,
+          cwd: projectDir,
+          created_at: Date.now(),
+          last_used: Date.now(),
+          status: "idle",
+        });
+        const sweptNote = swept.length > 0 ? `\n\nReaper swept ${swept.length} stale scratchpad file(s).` : "";
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              `Gemini daemon resumed (existing session).\n\n` +
+              `Daemon ID: ${sessionId}\n` +
+              `Session: ${sessionDirName}\n` +
+              `Scratchpad: ${projectDir}/.claude/scratchpad/\n\n` +
+              `Full conversation history restored from disk — no re-feed needed.\n` +
+              `Use ask_daemon("${sessionId}", "your question") to continue.\n` +
+              `Use dismiss_daemon("${sessionId}") when done.` +
+              sweptNote,
+          }],
+        };
+      }
+
+      // New session — create directory and bootstrap.
+      mkdirSync(sessionDir, { recursive: true });
 
       const result = await executeWithFallback({
         baseArgs: ["-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
@@ -488,7 +547,6 @@ export function registerGeminiTools(server: McpServer): void {
         };
       }
 
-      const sessionId = _genSessionId();
       _sessions.set(sessionId, {
         id: sessionId,
         sessionDir,
@@ -536,7 +594,30 @@ export function registerGeminiTools(server: McpServer): void {
         return { content: [{ type: "text" as const, text: `Daemon not found: ${params.daemon_id}` }], isError: true };
       }
       if (session.status === "dead") {
-        return { content: [{ type: "text" as const, text: `Daemon ${params.daemon_id} is dead.` }], isError: true };
+        // Attempt resurrection — quota may have reset since daemon died.
+        // One probe attempt with -r latest before giving up permanently.
+        server.sendLoggingMessage({ level: "info", data: `REVIVE: Probing dead daemon ${params.daemon_id}...` });
+        session.status = "busy";
+        const probe = await executeWithFallback({
+          baseArgs: ["-r", "latest", "-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
+          stdin: params.question,
+          cwd: session.sessionDir,
+          timeout_ms: params.timeout_ms || 120_000,
+          onProgress: makeProgressLogger(server, "Gemini"),
+        });
+        if (probe.success) {
+          session.status = "idle";
+          return { content: [{ type: "text" as const, text: `Gemini daemon response (revived):\n\n${probe.stdout}` }] };
+        }
+        // Revival failed — daemon is permanently dead.
+        session.status = "dead";
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Daemon ${params.daemon_id} is dead and could not be revived.\n\n${formatError(probe)}\n\nIf quota-limited, wait ~1 hour then try again, or spawn_daemon({ session_name: "..." }) to start fresh.`,
+          }],
+          isError: true,
+        };
       }
       if (session.status === "busy") {
         return { content: [{ type: "text" as const, text: `Daemon ${params.daemon_id} is busy — wait for the current request to complete.` }], isError: true };
@@ -586,9 +667,16 @@ export function registerGeminiTools(server: McpServer): void {
   // ─── dismiss_daemon ─────────────────────────────────────────────
   server.tool(
     "dismiss_daemon",
-    "Dismiss a Gemini daemon — removes it from the active session registry and cleans up session files.",
+    "Dismiss a Gemini daemon — removes it from the active session registry. By default (soft dismiss), session files are preserved on disk and can be resumed later via spawn_daemon({ session_name: '...' }). Pass hard: true to permanently delete all session files.",
     {
       daemon_id: z.string().min(1).describe("The daemon ID to dismiss"),
+      hard: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, permanently delete all session files (cannot be resumed). " +
+          "Default false: soft dismiss keeps session on disk for future resumption via session_name."
+        ),
     },
     async (params) => {
       const session = _sessions.get(params.daemon_id);
@@ -602,19 +690,37 @@ export function registerGeminiTools(server: McpServer): void {
           ],
         };
       }
+
       const reaped = reapDaemonFiles(session.cwd, params.daemon_id);
-      _cleanupSession(session);
       _sessions.delete(params.daemon_id);
+
       const reapedNote = reaped.length > 0
         ? `\nReaper removed ${reaped.length} scratchpad file(s): ${reaped.join(", ")}`
         : "";
-      return {
-        content: [
-          {
+
+      if (params.hard) {
+        // Hard dismiss: delete all session files. Cannot be resumed.
+        _cleanupSession(session);
+        return {
+          content: [{
             type: "text" as const,
-            text: `Gemini daemon ${params.daemon_id} dismissed. Session directory cleaned up.${reapedNote}`,
-          },
-        ],
+            text: `Gemini daemon ${params.daemon_id} permanently dismissed. Session files deleted.${reapedNote}`,
+          }],
+        };
+      }
+
+      // Soft dismiss (default): keep session files on disk for resumption.
+      // Use spawn_daemon({ session_name: "..." }) to resume.
+      const sessionDirName = basename(session.sessionDir);
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            `Gemini daemon ${params.daemon_id} dismissed (soft).\n` +
+            `Session files preserved at: ~/.gemini/tmp/${sessionDirName}\n` +
+            `Resume with: spawn_daemon({ session_name: "${sessionDirName.replace(/^daemon-/, "")}" })` +
+            reapedNote,
+        }],
       };
     }
   );
@@ -622,28 +728,58 @@ export function registerGeminiTools(server: McpServer): void {
   // ─── list_daemons ───────────────────────────────────────────────
   server.tool(
     "list_daemons",
-    "List all active Gemini daemon sessions with their status, age, and session directory. Non-blocking.",
+    "List all active and hibernated Gemini daemon sessions. Active sessions are in memory; hibernated sessions are on disk (soft-dismissed or survived an MCP restart) and can be resumed with zero token cost via spawn_daemon({ session_name: '...' }). Non-blocking.",
     {},
     async () => {
-      if (_sessions.size === 0) {
-        return {
-          content: [{ type: "text" as const, text: "No active Gemini daemons." }],
-        };
-      }
-      const summary = Array.from(_sessions.values()).map((s) => ({
+      const daemonSessionsDir = join(homedir(), ".gemini", "daemon-sessions");
+
+      // Active sessions (in memory)
+      const active = Array.from(_sessions.values()).map((s) => ({
         id: s.id,
         status: s.status,
-        sessionDir: s.sessionDir,
+        session: basename(s.sessionDir),
         age: `${Math.round((Date.now() - s.created_at) / 1000)}s`,
         cwd: s.cwd,
+        state: "active",
       }));
+
+      // Hibernated sessions (on disk, not in memory)
+      const hibernated: Array<{id: string; session: string; state: string; resume_hint: string}> = [];
+      if (existsSync(daemonSessionsDir)) {
+        try {
+          const activeDirs = new Set(active.map((s) => s.session));
+          for (const entry of readdirSync(daemonSessionsDir)) {
+            if (activeDirs.has(entry)) continue; // already in active list
+            const geminiTmpDir = join(homedir(), ".gemini", "tmp", entry);
+            if (existsSync(geminiTmpDir)) {
+              const sessionName = entry.replace(/^daemon-/, "");
+              hibernated.push({
+                id: "(hibernated)",
+                session: entry,
+                state: "hibernated",
+                resume_hint: `spawn_daemon({ session_name: "${sessionName}" })`,
+              });
+            }
+          }
+        } catch { /* non-fatal — just skip discovery */ }
+      }
+
+      if (active.length === 0 && hibernated.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No active or hibernated Gemini daemons." }],
+        };
+      }
+
+      const sections: string[] = [];
+      if (active.length > 0) {
+        sections.push(`Active (${active.length}):\n${JSON.stringify(active, null, 2)}`);
+      }
+      if (hibernated.length > 0) {
+        sections.push(`Hibernated (${hibernated.length}) — resumable with zero token cost:\n${JSON.stringify(hibernated, null, 2)}`);
+      }
+
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Active Gemini daemons (${_sessions.size}):\n\n${JSON.stringify(summary, null, 2)}`,
-          },
-        ],
+        content: [{ type: "text" as const, text: sections.join("\n\n") }],
       };
     }
   );
@@ -700,11 +836,18 @@ export function registerGeminiTools(server: McpServer): void {
         .string()
         .optional()
         .describe("Project root to find the scratchpad. Defaults to MCP server cwd."),
+      daemon_id: z
+        .string()
+        .optional()
+        .describe(
+          "The daemon ID that is writing this scratchpad entry. " +
+          "Used for cleanup on dismiss_daemon. Defaults to 'gemini' if omitted (not daemon-specific)."
+        ),
     },
     async (params) => {
       const projectDir = params.cwd || process.cwd();
       try {
-        const filepath = writeScratchpad(projectDir, "gemini", params.topic, params.content);
+        const filepath = writeScratchpad(projectDir, params.daemon_id || "gemini", params.topic, params.content);
         return {
           content: [
             {
