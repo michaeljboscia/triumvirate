@@ -3,28 +3,30 @@
  *
  * Session logs follow the naming convention:
  *   session-logs/{owner}--{client}_{domain}_{repo}_{feature}_{YYYYMMDD}_v{N}_{agent}.md
- *
- * Accepts an agent parameter to filter by agent suffix (default: claude).
  */
 
-import { existsSync, readdirSync, mkdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Find the most recent Claude session log in a project directory.
+ * Find the most recent session log for a given agent in a project directory.
  * Returns a relative path from the project root, or generates a new filename.
+ *
+ * @param cwd - Project root directory
+ * @param taxonomy - Slash-separated taxonomy string (owner/client/domain/repo)
+ * @param agent - Agent suffix to filter by (default: "claude")
  */
 export function findLatestSessionLog(
   cwd: string,
-  taxonomy: string
+  taxonomy: string,
+  agent: "claude" | "gemini" | "codex" = "claude"
 ): string {
   const sessionLogDir = join(cwd, "session-logs");
 
-  // Look for existing Claude session logs
   if (existsSync(sessionLogDir)) {
     try {
       const files = readdirSync(sessionLogDir)
-        .filter((f) => f.endsWith("_claude.md"))
+        .filter((f) => f.endsWith(`_${agent}.md`))
         .sort()
         .reverse();
 
@@ -52,5 +54,5 @@ export function findLatestSessionLog(
   });
   const dateStr = formatter.format(now).replace(/-/g, "");
 
-  return `session-logs/${owner}--${client}_${domain}_${repo}_inter-agent-request_${dateStr}_v1_claude.md`;
+  return `session-logs/${owner}--${client}_${domain}_${repo}_inter-agent-request_${dateStr}_v1_${agent}.md`;
 }

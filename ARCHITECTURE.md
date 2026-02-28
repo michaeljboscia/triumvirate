@@ -7,10 +7,12 @@ Everything in Triumvirate is built on one pattern:
 ```
 spawn_daemon(cwd)   →  daemon_id
 ask_daemon(id, q)   →  answer
-dismiss_daemon(id)  →  session log written
+dismiss_daemon(id)  →  session cleaned up
 ```
 
-Each daemon is a persistent AI session. You spawn it, ask it questions across multiple turns (full conversation history maintained), and dismiss it when done. At dismiss time, the daemon writes a structured session log to `session-logs/` automatically.
+Each daemon is a persistent AI session. You spawn it, ask it questions across multiple turns (full conversation history maintained), and dismiss it when done.
+
+> **Roadmap:** Automatic session log writing on `dismiss_daemon` is in progress — see `SESSION_LOG_SPEC.md` for the format and the main Roadmap for implementation status.
 
 Under the hood: each `ask_daemon` is a fresh subprocess (~2-3s for Gemini, ~7s for Codex) that resumes the conversation via the CLI's native session continuity. No PTY, no long-running process, no sentinel protocol.
 
@@ -66,7 +68,7 @@ mcp-server/
 Both expose the same interface:
 - `spawn_daemon` — start a persistent session
 - `ask_daemon` — send a question, get an answer (blocking, with heartbeat logging)
-- `dismiss_daemon` — write session log, clean up
+- `dismiss_daemon` — clean up (session log writing: roadmap)
 - `send_message` / `get_response` — fire-and-forget async (for one-shot requests)
 - `list_daemons`, `list_jobs`, `list_scratchpad`, `write_scratchpad` — housekeeping
 
@@ -93,7 +95,7 @@ project/session-logs/
 ```
 
 Logs are written:
-- **Automatically** — by `dismiss_daemon` (every daemon session)
+- **Automatically** — by `dismiss_daemon` *(roadmap — not yet implemented)*
 - **Manually** — via `/session-notes` skill in Claude Code
 - **On compaction** — by pre-compact hooks (Tier 2)
 

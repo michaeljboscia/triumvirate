@@ -73,7 +73,7 @@ spawn_daemon({ cwd: "/path/to/project" })
 ask_daemon({ daemon_id: "gd_abc123", question: "Read /path/to/file.ts and explain the auth flow" })
 // → { text: "The auth flow works by..." }
 
-// Dismiss — writes session log automatically
+// Dismiss — cleans up the session (automatic session log writing: roadmap)
 dismiss_daemon({ daemon_id: "gd_abc123" })
-// → { text: "Session log written: session-logs/...v1_gemini.md" }
+// → { text: "Gemini daemon gd_abc123 dismissed. Session directory cleaned up." }
 ```

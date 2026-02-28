@@ -41,7 +41,7 @@ How:
 4. `dismiss_daemon(id)` when done
 
 Never pass file content between agents. Pass paths and let Gemini read directly from disk.
-Always dismiss when done — this triggers Gemini's session log.
+Always dismiss when done — this releases resources.
 ```
 
 ## How it works
