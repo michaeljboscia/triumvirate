@@ -21,7 +21,7 @@
  */
 
 import { z } from "zod";
-import { mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, readdirSync, statSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -184,8 +184,10 @@ function _sanitizeSessionName(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 40) || "session";
+    .replace(/^-/, "")       // strip leading hyphens before slice
+    .slice(0, 40)
+    .replace(/-$/, "")       // strip trailing hyphens that slice may produce
+    || "session";
 }
 
 function _cleanupSession(session: GeminiSession): void {
@@ -495,6 +497,22 @@ export function registerGeminiTools(server: McpServer): void {
         : `daemon-${sessionId}`;
       const sessionDir = join(daemonSessionsDir, sessionDirName);
 
+      // Guard: if a session with the same sessionDir is already active in memory,
+      // return the existing daemon_id rather than creating a second conflicting handle.
+      const existingActive = Array.from(_sessions.values()).find((s) => s.sessionDir === sessionDir);
+      if (existingActive) {
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              `Session '${sessionDirName}' is already active.\n\n` +
+              `Daemon ID: ${existingActive.id}\n` +
+              `Use ask_daemon("${existingActive.id}", "your question") to continue.\n` +
+              `Use dismiss_daemon("${existingActive.id}") when done.`,
+          }],
+        };
+      }
+
       // Check if this session already exists on disk (resume path).
       // Both the session dir AND ~/.gemini/tmp/<dirname>/ must exist — the latter
       // is where Gemini stores the actual conversation history for -r latest.
@@ -691,6 +709,18 @@ export function registerGeminiTools(server: McpServer): void {
         };
       }
 
+      // Safety: refuse to dismiss a busy session — it has an in-flight executeWithFallback
+      // running against session.sessionDir. Hard-deleting while busy causes filesystem errors.
+      if (session.status === "busy") {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Daemon ${params.daemon_id} is busy — wait for the current request to complete before dismissing.`,
+          }],
+          isError: true,
+        };
+      }
+
       const reaped = reapDaemonFiles(session.cwd, params.daemon_id);
       _sessions.delete(params.daemon_id);
 
@@ -750,6 +780,8 @@ export function registerGeminiTools(server: McpServer): void {
           const activeDirs = new Set(active.map((s) => s.session));
           for (const entry of readdirSync(daemonSessionsDir)) {
             if (activeDirs.has(entry)) continue; // already in active list
+            // Skip non-directories (stray files shouldn't be reported as sessions)
+            try { if (!statSync(join(daemonSessionsDir, entry)).isDirectory()) continue; } catch { continue; }
             const geminiTmpDir = join(homedir(), ".gemini", "tmp", entry);
             if (existsSync(geminiTmpDir)) {
               const sessionName = entry.replace(/^daemon-/, "");
