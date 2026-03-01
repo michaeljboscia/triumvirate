@@ -1,0 +1,22 @@
+You are auditing a session log for completeness. Below you will find:
+1. EXISTING SESSION NOTES — what has already been captured from this session
+2. TRANSCRIPT — the record of what happened
+
+Your task: identify what is in the TRANSCRIPT that is NOT captured in the EXISTING SESSION NOTES.
+Write only the missing content as additional paragraphs.
+Do NOT rewrite or repeat what is already in the notes.
+
+If the notes are complete and no meaningful gaps exist, respond with EXACTLY: NO_GAPS
+
+Rules:
+- Write in past tense
+- Be specific (file names, commit hashes, decisions, outcomes)
+- Only write genuinely missing content
+- Use only facts present in the transcript — do not invent details
+- Target length: 100-300 words per gap, only as many paragraphs as there are genuine gaps
+
+EXISTING SESSION NOTES:
+{existing_notes}
+
+TRANSCRIPT:
+{transcript}

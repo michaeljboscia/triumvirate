@@ -285,7 +285,43 @@ fi
 
 ok "Inter-agent MCP server wired into all 3 agents"
 
-# ── 6. Shared Templates ──────────────────────────────────────
+# ── 6. Stenographer (Local Session Notes) ─────────────────────
+info "Installing Stenographer (local Ollama session notes)..."
+STENO_DIR="$HOME/.triumvirate/stenographer"
+mkdir -p "$STENO_DIR/parsers" "$STENO_DIR/prompts"
+
+# Core files
+install_file "$SCRIPT_DIR/stenographer/stenographer.py" "$STENO_DIR/stenographer.py"
+for parser in "$SCRIPT_DIR"/stenographer/parsers/*.py; do
+  [[ -f "$parser" ]] || continue
+  install_file "$parser" "$STENO_DIR/parsers/$(basename "$parser")"
+done
+for prompt in "$SCRIPT_DIR"/stenographer/prompts/*.txt; do
+  [[ -f "$prompt" ]] || continue
+  install_file "$prompt" "$STENO_DIR/prompts/$(basename "$prompt")"
+done
+
+# Create state and log directories
+mkdir -p "$HOME/.triumvirate/locks"
+ok "Stenographer installed: $STENO_DIR/"
+
+# Check Ollama (optional but recommended)
+if command -v ollama &>/dev/null; then
+  if ollama list 2>/dev/null | grep -q "qwen2.5"; then
+    ok "Ollama found with qwen2.5 model — Stenographer ready"
+  else
+    info "Ollama found but no qwen2.5 model. Pull one with:"
+    info "  ollama pull qwen2.5:32b    (19GB, best quality)"
+    info "  ollama pull qwen2.5:14b    (8.7GB, good balance)"
+    info "  ollama pull qwen2.5:7b     (4.4GB, fastest)"
+  fi
+else
+  info "Ollama not found — Stenographer will skip saves until installed."
+  info "  macOS:  brew install ollama"
+  info "  Linux:  curl -fsSL https://ollama.ai/install.sh | sh"
+fi
+
+# ── 8. Shared Templates ──────────────────────────────────────
 info "Installing shared templates..."
 
 # .env.example — copy to ~/.claude/ as reference (not as .env)
@@ -300,7 +336,7 @@ fi
 cp "$SCRIPT_DIR/shared/taxonomy.json.example" "$HOME/.claude/taxonomy.json.example"
 ok "Copied taxonomy.json.example to ~/.claude/"
 
-# ── 7. AI Memory Directory ──────────────────────────────────
+# ── 9. AI Memory Directory ──────────────────────────────────
 # Central session log store — all agents write here when it exists.
 # This is a git repo so session logs are versioned and shareable.
 AI_MEM_DIR="$HOME/.ai-memory"
@@ -314,7 +350,7 @@ else
   info "Session logs will be stored here when projects have a taxonomy.json"
 fi
 
-# ── 8. Verify ─────────────────────────────────────────────────
+# ── 10. Verify ────────────────────────────────────────────────
 echo ""
 info "Verifying installation..."
 ISSUES=0
@@ -344,6 +380,7 @@ echo "  Claude MCP:       $HOME/.claude.json  (inter-agent-gemini + inter-agent-
 echo "  Codex config:     $CODEX_DIR/"
 echo "  Gemini config:    $GEMINI_DIR/"
 echo "  MCP server:       $MCP_SERVER_DIR/dist/"
+echo "  Stenographer:     $STENO_DIR/"
 echo ""
 echo "  Next steps:"
 echo "    1. Copy ~/.claude/.env.example to ~/.claude/.env"

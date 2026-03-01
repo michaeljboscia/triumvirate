@@ -102,6 +102,13 @@ fi
 
 CURRENT_BYTES="$(stat -f %z "$TRANSCRIPT" 2>/dev/null)" || exit 0
 
+# ─── File rotation / shrink detection ───────────────────────────────────────
+# If the transcript shrank (new session, file rotation), reset the cursor
+# so growth calculation doesn't go negative and stall the gate.
+if [[ "$CURRENT_BYTES" -lt "$LAST_SAVE_BYTES" ]]; then
+  LAST_SAVE_BYTES=0
+fi
+
 # ─── Threshold check ─────────────────────────────────────────────────────────
 GROWTH="$(( CURRENT_BYTES - LAST_SAVE_BYTES ))"
 
@@ -130,20 +137,25 @@ _write_state "$(jq -cn \
   2>/dev/null
 
 # ─── Background save ─────────────────────────────────────────────────────────
-# Reuses pre-compact.sh with synthesized PreCompact event JSON.
-# Runs fully async — doesn't block the tool call that triggered this.
-PRE_COMPACT_HOOK="$HOME/.claude/hooks/pre-compact.sh"
-SAVE_CWD="${CWD:-$HOME}"
+# Stenographer v1: Delta-only extraction → local Ollama summarization.
+# Replaces the old pre-compact.sh approach that burned 69M Gemini tokens in 4 days.
+# Runs in background via disown so the hook exits immediately.
+STENOGRAPHER="$HOME/.triumvirate/stenographer/stenographer.py"
 
-if [[ -x "$PRE_COMPACT_HOOK" ]]; then
+if [[ -x "$(command -v python3)" && -f "$STENOGRAPHER" ]]; then
   (
-    # Use jq to build JSON so paths with quotes/backslashes/spaces are safe
-    jq -cn --arg cwd "$SAVE_CWD" --arg tp "$TRANSCRIPT" \
-      '{cwd:$cwd, transcript_path:$tp, trigger:"token-gate"}' \
-      | bash "$PRE_COMPACT_HOOK" \
-      >> "$HOME/.claude/artifact-guard-logs/token-gate-save.log" 2>&1
+    python3 "$STENOGRAPHER" \
+      --agent claude \
+      --transcript "$TRANSCRIPT" \
+      >> "$HOME/.triumvirate/stenographer.log" 2>&1
   ) &
-  disown $! 2>/dev/null
+  disown
+  STENO_STATUS="launched"
+else
+  printf '%s TOKEN_GATE stenographer not found at %s — skipping\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$STENOGRAPHER" \
+    >> "$LOG_FILE" 2>/dev/null
+  STENO_STATUS="missing"
 fi
 
 # ─── Notify Claude via additionalContext ─────────────────────────────────────
@@ -152,16 +164,13 @@ jq -cn \
   --arg growth "${GROWTH_TOKENS_APPROX}k" \
   --arg total "${TOKENS_APPROX}k" \
   --arg threshold "${THRESHOLD_KB}KB" \
+  --arg steno "$STENO_STATUS" \
   '{
     hookSpecificOutput: {
       hookEventName: "PostToolUse",
       additionalContext: (
         "💾 TOKEN GATE (save #" + $saves + "): ~" + $growth + " new tokens since last save " +
-        "(~" + $total + " total this session). " +
-        "Threshold: " + $threshold + " transcript growth. " +
-        "Auto-save running in background via pre-compact.sh → Gemini summary → session log → git commit. " +
-        "You do NOT need to stop — this is non-blocking. " +
-        "If you want a manual full save right now, ask Claude to update the session log."
+        "(~" + $total + " total). Stenographer " + $steno + " in background (local Ollama, zero API cost)."
       )
     }
   }'

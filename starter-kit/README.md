@@ -11,7 +11,7 @@ One-command setup for the complete multi-agent operating environment.
 | `post-compact-recovery.sh` | SessionStart:compact | Restores context after memory compaction |
 | `pre-compact.sh` | PreCompact | Auto-saves session state before compaction (Gemini summarization → git commit) |
 | `post-tool-use.sh` | PostToolUse | Auto-stages files, logs activity, taxonomy enforcement |
-| `post-tool-use-token-gate.sh` | PostToolUse | Auto-saves at configurable token thresholds (~50K tokens) |
+| `post-tool-use-token-gate.sh` | PostToolUse | Auto-saves at configurable token thresholds (~50K tokens) via Stenographer |
 | `pre-tool-use-artifact-guard.sh` | PreToolUse | **The Airlock** — Snapshots every file before edit; enforces backup requirements for Supabase SQL |
 | `pre-tool-use-bash-guard.sh` | PreToolUse | Blocks destructive SQL (DELETE/TRUNCATE/DROP) without a fresh backup |
 | `_find-session-log.sh` | (shared) | Helper that finds the latest session log across multiple locations |
@@ -28,6 +28,16 @@ One-command setup for the complete multi-agent operating environment.
 - `hooks/session-start.sh` — Session log recovery for Gemini
 - `hooks/pre-compact.sh` — Self-summarization before context compaction (Gemini summarizes its own transcript)
 - `hooks/post-tool-use.sh` — Auto-stages files, logs activity to session log
+
+### Stenographer (Local Session Notes Engine)
+- `stenographer.py` — Main orchestrator: state management, lock, delta extraction, Ollama generation
+- `parsers/claude.py` — Claude JSONL byte-range parser with secret redaction
+- `parsers/gemini.py` — Gemini JSON message-index parser
+- `parsers/codex.py` — Codex JSONL byte-range parser
+- `prompts/incremental.txt` — Incremental summarization prompt template
+- `prompts/gapfill.txt` — Gap-fill prompt for missed content
+
+Runs locally via Ollama — **zero API cost, zero context window impact**. Called automatically by the token gate hook. See [`stenographer/README.md`](stenographer/README.md) for details.
 
 ### Shared Templates
 - `.env.example` — Credential vault template (API keys)
@@ -139,6 +149,7 @@ This is why the taxonomy naming matters — it's how any agent finds any other a
 - **Gemini CLI** (optional) — For intelligent pre-compact summarization. Without it, hooks fall back to jq-based transcript extraction.
 - **Codex CLI** (optional) — For multi-agent code generation. Requires the [hooks-enabled fork](https://github.com/michaeljboscia/codex).
 - **git** — Used by hooks for auto-staging and session log commits
+- **Ollama** (optional) — For Stenographer local session notes. Without it, token gate logs thresholds but doesn't generate notes. Install: `brew install ollama` then `ollama pull qwen2.5:32b`
 
 ## How the Hooks Work
 
@@ -160,7 +171,7 @@ Every Tool Call:
   └─► PostToolUse: post-tool-use.sh
         └─ git add (staged = experimental) → on test pass: git commit (blessed)
   └─► PostToolUse: token-gate.sh
-        └─ Transcript growth > threshold? → Background save via pre-compact.sh
+        └─ Transcript growth > threshold? → Background save via Stenographer (local Ollama)
 
 Before Memory Loss:
   └─► PreCompact: pre-compact.sh
@@ -183,6 +194,9 @@ Before Memory Loss:
 | `TOKEN_GATE_DISABLE` | Disable token gate | `0` |
 | `ARTIFACT_GUARD_BYPASS` | Emergency bypass for Airlock | `0` |
 | `BASH_GUARD_BYPASS` | Emergency bypass for bash guard | `0` |
+| `STENOGRAPHER_MODEL` | Ollama model for session notes | `qwen2.5:32b` |
+| `STENOGRAPHER_TIMEOUT` | Ollama generation timeout (seconds) | `180` |
+| `STENOGRAPHER_NUM_CTX` | Ollama context window size | `65536` |
 
 ### Taxonomy
 
@@ -213,8 +227,9 @@ All three agents (Claude, Codex, Gemini) read/write session logs in this format 
 7. **Installs GEMINI.md** starter template (skips if exists)
 8. **Builds the inter-agent MCP server** (`npm install && npm run build`)
 9. **Wires MCP configs** for all three agents (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
-10. **Copies .env.example** and **taxonomy.json.example** as reference
-11. **Creates `~/.ai-memory/`** — git-initialized central session log store
+10. **Installs Stenographer** to `~/.triumvirate/stenographer/` (checks for Ollama + model)
+11. **Copies .env.example** and **taxonomy.json.example** as reference
+12. **Creates `~/.ai-memory/`** — git-initialized central session log store
 
 Safe to re-run — always backs up before overwriting.
 
