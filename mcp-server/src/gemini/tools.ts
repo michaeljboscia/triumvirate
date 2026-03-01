@@ -21,8 +21,9 @@
  */
 
 import { z } from "zod";
-import { mkdirSync, rmSync, existsSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, readdirSync, statSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
+import { execSync } from "node:child_process";
 import { join, basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { detectContext } from "../shared/context-detector.js";
@@ -51,8 +52,10 @@ import {
   isQuotaError,
   getQuotaStatus,
 } from "./model-fallback.js";
+import { computeAgentLogPath, parseTaxonomyFull, type TaxonomyFull } from "../shared/agent-log-path.js";
 
 const GEMINI_CLI = process.env.GEMINI_CLI_PATH || "gemini" // set GEMINI_CLI_PATH env var if gemini is not in PATH;
+const SESSION_LOG_SPEC_PATH = process.env.SESSION_LOG_SPEC_PATH || "";
 
 // ─── Model-aware execution helpers ───────────────────────────────────────────
 
@@ -169,6 +172,7 @@ interface GeminiSession {
   created_at: number;
   last_used: number;
   status: "idle" | "busy" | "dead";
+  log_written: boolean; // prevents double-write on retry/double-dismiss
 }
 
 let _sessionCounter = 0;
@@ -191,21 +195,70 @@ function _sanitizeSessionName(name: string): string {
 }
 
 function _cleanupSession(session: GeminiSession): void {
-  // Remove session tmpdir
+  // Remove session marker dir (the ~/.gemini/daemon-sessions/<dirname>/ directory).
+  // NOTE: ~/.gemini/tmp/<dirname>/ is intentionally NOT deleted here — SESSION_LOG_SPEC
+  // requires 30-day retention of native transcripts for soft dismiss.
+  // Hard dismiss handles tmp deletion explicitly in its own branch.
   try {
     if (existsSync(session.sessionDir)) {
       rmSync(session.sessionDir, { recursive: true, force: true });
     }
   } catch { /* non-fatal */ }
+}
 
-  // Remove Gemini's session files stored at ~/.gemini/tmp/<dirname>/
+// ─── Session log helpers ──────────────────────────────────────────────────────
+
+/**
+ * Write a SESSION_LOG_SPEC-compliant fallback stub when the daemon is unavailable.
+ * Includes required TAXONOMY and CONTEXT SUMMARY sections. Non-fatal.
+ */
+function _writeGeminiLogStub(
+  logPath: string,
+  daemonId: string,
+  session: GeminiSession,
+  reason: string,
+  taxonomy: TaxonomyFull
+): void {
   try {
-    const dirName = basename(session.sessionDir);
-    const geminiSessionDir = join(homedir(), ".gemini", "tmp", dirName);
-    if (existsSync(geminiSessionDir)) {
-      rmSync(geminiSessionDir, { recursive: true, force: true });
-    }
+    const durationMin = Math.round((Date.now() - session.created_at) / 60_000);
+    const sessionDirName = basename(session.sessionDir);
+    const stub =
+      `# Session Log: ${taxonomy.owner}/${taxonomy.client}/${taxonomy.domain}/${taxonomy.repo}\n\n` +
+      `**Agent:** gemini\n` +
+      `**Model:** (unknown — daemon unavailable)\n` +
+      `**Feature:** ${taxonomy.feature}\n` +
+      `**Trigger:** daemon-dismiss (stub — ${reason})\n` +
+      `**Previous Log:** none\n\n` +
+      `---\n\n` +
+      `## TAXONOMY\n\n` +
+      `| Level | Value |\n` +
+      `|-------|-------|\n` +
+      `| Owner | ${taxonomy.owner} |\n` +
+      `| Client | ${taxonomy.client} |\n` +
+      `| Domain | ${taxonomy.domain} |\n` +
+      `| Repo | ${taxonomy.repo} |\n` +
+      `| Feature | ${taxonomy.feature} |\n` +
+      `| Agent | gemini |\n` +
+      `| Transcript | \`~/.gemini/tmp/${sessionDirName}/\` |\n\n` +
+      `---\n\n` +
+      `## CONTEXT SUMMARY\n\n` +
+      `**Status:** INCOMPLETE — daemon was ${reason} at dismiss time (~${durationMin} min session). No summary could be generated.\n\n` +
+      `**Daemon ID:** ${daemonId}\n` +
+      `**Session dir:** ${session.sessionDir}\n` +
+      `**Native transcript:** \`~/.gemini/tmp/${sessionDirName}/\`\n`;
+    writeFileSync(logPath, stub, "utf-8");
   } catch { /* non-fatal */ }
+}
+
+/** Commit a session log file to git. Non-fatal. */
+function _gitCommitLog(cwd: string, logPath: string, agent: string, feature: string): void {
+  try {
+    execSync(`git -C "${cwd}" add "${logPath}"`, { timeout: 10_000, stdio: "pipe" });
+    execSync(
+      `git -C "${cwd}" commit -m "session(${agent}): ${feature} — daemon dismiss"`,
+      { timeout: 10_000, stdio: "pipe" }
+    );
+  } catch { /* non-fatal — not all cwds are git repos */ }
 }
 
 /** Build a progress callback that sends MCP logging messages */
@@ -528,6 +581,7 @@ export function registerGeminiTools(server: McpServer): void {
           created_at: Date.now(),
           last_used: Date.now(),
           status: "idle",
+          log_written: false,
         });
         const sweptNote = swept.length > 0 ? `\n\nReaper swept ${swept.length} stale scratchpad file(s).` : "";
         return {
@@ -551,7 +605,7 @@ export function registerGeminiTools(server: McpServer): void {
 
       const result = await executeWithFallback({
         baseArgs: ["-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
-        stdin: "You are a helpful research and coding assistant. I will send follow-up questions. Acknowledge with: Ready.",
+        stdin: "You are a helpful research and coding assistant. I will send follow-up questions. Acknowledge with: Ready.\n\nIMPORTANT: When asked to write a session log at the end of this session, write the markdown file to the exact path provided. Do not run git commands — the system handles that after you write the file. Follow the SESSION_LOG_SPEC format that will be included in the request.",
         cwd: sessionDir, // unique per daemon — prevents concurrent daemons from sharing `-r latest` session
         timeout_ms: params.timeout_ms || 60_000,
         onProgress: makeProgressLogger(server, "Gemini"),
@@ -572,6 +626,7 @@ export function registerGeminiTools(server: McpServer): void {
         created_at: Date.now(),
         last_used: Date.now(),
         status: "idle",
+        log_written: false,
       });
 
       const sweptNote = swept.length > 0 ? `\n\nReaper swept ${swept.length} stale scratchpad file(s).` : "";
@@ -721,6 +776,56 @@ export function registerGeminiTools(server: McpServer): void {
         };
       }
 
+      // ── SESSION LOG WRITE (Layer A) ──────────────────────────────
+      // log_written is set ONLY after existsSync confirms success — failed writes are retryable.
+      if (!session.log_written) {
+        const logPath = computeAgentLogPath(session.cwd, "gemini");
+        const t = parseTaxonomyFull(session.cwd);
+        const sessionDirName = basename(session.sessionDir);
+        const durationMin = Math.round((Date.now() - session.created_at) / 60_000);
+
+        let specContent = "";
+        try { specContent = readFileSync(SESSION_LOG_SPEC_PATH, "utf-8"); } catch { /* spec missing — ok */ }
+
+        if (session.status === "dead") {
+          _writeGeminiLogStub(logPath, params.daemon_id, session, "dead", t);
+        } else {
+          const dismissPrompt =
+            `Write your session log now. This is your final task before shutdown.\n\n` +
+            `Write to this EXACT path: ${logPath}\n\n` +
+            `Header context to use:\n` +
+            `  Agent: gemini\n` +
+            `  Model: (detect your current model name)\n` +
+            `  Feature: ${t.feature}\n` +
+            `  Trigger: daemon-dismiss\n` +
+            `  Duration: ~${durationMin} minutes\n` +
+            `  Daemon ID: ${params.daemon_id}\n` +
+            `  Native transcript: ~/.gemini/tmp/${sessionDirName}/\n` +
+            `  Previous Log: (check session-logs/ for most recent _gemini.md, or "none")\n\n` +
+            (specContent ? `SESSION_LOG_SPEC:\n${specContent}\n\n` : "") +
+            `IMPORTANT: Write the markdown file to the path above only. ` +
+            `DO NOT run git add, git commit, or any shell commands. ` +
+            `Confirm with the exact filename when done.`;
+
+          const logResult = await executeWithFallback({
+            baseArgs: ["-r", "latest", "-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
+            stdin: dismissPrompt,
+            cwd: session.sessionDir,
+            timeout_ms: 150_000,
+          });
+
+          if (!logResult.success || !existsSync(logPath)) {
+            _writeGeminiLogStub(logPath, params.daemon_id, session, logResult.success ? "unresponsive" : "failed", t);
+          }
+        }
+
+        if (existsSync(logPath)) {
+          session.log_written = true;
+          _gitCommitLog(session.cwd, logPath, "gemini", t.feature);
+        }
+      }
+      // ── END SESSION LOG WRITE ─────────────────────────────────────
+
       const reaped = reapDaemonFiles(session.cwd, params.daemon_id);
       _sessions.delete(params.daemon_id);
 
@@ -729,8 +834,15 @@ export function registerGeminiTools(server: McpServer): void {
         : "";
 
       if (params.hard) {
-        // Hard dismiss: delete all session files. Cannot be resumed.
+        // Hard dismiss: delete marker dir AND native transcripts. Cannot be resumed.
         _cleanupSession(session);
+        // Also explicitly delete native transcript (hard dismiss is intentionally destructive)
+        try {
+          const geminiTmpDir = join(homedir(), ".gemini", "tmp", basename(session.sessionDir));
+          if (existsSync(geminiTmpDir)) {
+            rmSync(geminiTmpDir, { recursive: true, force: true });
+          }
+        } catch { /* non-fatal */ }
         return {
           content: [{
             type: "text" as const,

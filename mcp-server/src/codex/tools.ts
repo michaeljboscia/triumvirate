@@ -13,7 +13,7 @@
  */
 
 import { z } from "zod";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { detectContext } from "../shared/context-detector.js";
@@ -34,8 +34,10 @@ import {
   MAX_TIMEOUT_MS,
   REQUEST_TYPES,
 } from "../shared/types.js";
+import { computeAgentLogPath, parseTaxonomyFull, type TaxonomyFull } from "../shared/agent-log-path.js";
 
 const CODEX_CLI = process.env.CODEX_CLI_PATH || "codex" // set CODEX_CLI_PATH env var if codex is not in PATH;
+const SESSION_LOG_SPEC_PATH = process.env.SESSION_LOG_SPEC_PATH || "";
 
 // ─── Thread-based session store ───────────────────────────────────────────────
 // Codex daemon mode uses `codex exec --json` + `codex exec resume <thread_id> --json`.
@@ -49,6 +51,7 @@ interface CodexSession {
   created_at: number;
   last_used: number;
   status: "idle" | "busy" | "dead";
+  log_written: boolean; // prevents double-write on retry/double-dismiss
 }
 
 let _sessionCounter = 0;
@@ -201,6 +204,56 @@ function formatJobResponse(job: ReturnType<typeof getJob>) {
     ],
     isError: true,
   };
+}
+
+// ─── Session log helpers ──────────────────────────────────────────────────────
+
+/** Write a SESSION_LOG_SPEC-compliant fallback stub. Non-fatal. */
+function _writeCodexLogStub(
+  logPath: string,
+  daemonId: string,
+  session: CodexSession,
+  reason: string,
+  taxonomy: TaxonomyFull
+): void {
+  try {
+    const durationMin = Math.round((Date.now() - session.created_at) / 60_000);
+    const stub =
+      `# Session Log: ${taxonomy.owner}/${taxonomy.client}/${taxonomy.domain}/${taxonomy.repo}\n\n` +
+      `**Agent:** codex\n` +
+      `**Model:** (unknown — daemon unavailable)\n` +
+      `**Feature:** ${taxonomy.feature}\n` +
+      `**Trigger:** daemon-dismiss (stub — ${reason})\n` +
+      `**Previous Log:** none\n\n` +
+      `---\n\n` +
+      `## TAXONOMY\n\n` +
+      `| Level | Value |\n` +
+      `|-------|-------|\n` +
+      `| Owner | ${taxonomy.owner} |\n` +
+      `| Client | ${taxonomy.client} |\n` +
+      `| Domain | ${taxonomy.domain} |\n` +
+      `| Repo | ${taxonomy.repo} |\n` +
+      `| Feature | ${taxonomy.feature} |\n` +
+      `| Agent | codex |\n` +
+      `| Transcript | \`thread: ${session.thread_id}\` |\n\n` +
+      `---\n\n` +
+      `## CONTEXT SUMMARY\n\n` +
+      `**Status:** INCOMPLETE — daemon was ${reason} at dismiss time (~${durationMin} min session). No summary could be generated.\n\n` +
+      `**Daemon ID:** ${daemonId}\n` +
+      `**Thread ID:** ${session.thread_id}\n`;
+    writeFileSync(logPath, stub, "utf-8");
+  } catch { /* non-fatal */ }
+}
+
+/** Commit a session log file to git. Non-fatal. */
+function _codexGitCommitLog(cwd: string, logPath: string, feature: string): void {
+  try {
+    execSync(`git -C "${cwd}" add "${logPath}"`, { timeout: 10_000, stdio: "pipe" });
+    execSync(
+      `git -C "${cwd}" commit -m "session(codex): ${feature} — daemon dismiss"`,
+      { timeout: 10_000, stdio: "pipe" }
+    );
+  } catch { /* non-fatal */ }
 }
 
 export function registerCodexTools(server: McpServer): void {
@@ -443,7 +496,7 @@ export function registerCodexTools(server: McpServer): void {
       const result = await executeCli({
         command: CODEX_CLI,
         args: ["exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json",
-          "You are a research and coding assistant. I will send follow-up questions. Acknowledge with: Ready."],
+          "You are a research and coding assistant. I will send follow-up questions. Acknowledge with: Ready.\n\nIMPORTANT: When asked to write a session log at the end of this session, write the markdown file to the exact path provided. Do not run git commands — the system handles that after you write the file. Follow the SESSION_LOG_SPEC format that will be included in the request."],
         cwd: projectDir,
         timeout_ms: params.timeout_ms || 60_000,
         onProgress: makeProgressLogger(server, "Codex"),
@@ -472,6 +525,7 @@ export function registerCodexTools(server: McpServer): void {
         created_at: Date.now(),
         last_used: Date.now(),
         status: "idle",
+        log_written: false,
       });
 
       const sweptNote = swept.length > 0 ? `\n\nReaper swept ${swept.length} stale scratchpad file(s).` : "";
@@ -570,6 +624,61 @@ export function registerCodexTools(server: McpServer): void {
           content: [{ type: "text" as const, text: `Daemon not found: ${params.daemon_id}. It may have already been dismissed.` }],
         };
       }
+      // ── SESSION LOG WRITE (Layer A) ──────────────────────────────
+      // log_written is set ONLY after existsSync confirms success — failed writes are retryable.
+      if (!session.log_written) {
+        const logPath = computeAgentLogPath(session.cwd, "codex");
+        const t = parseTaxonomyFull(session.cwd);
+        const durationMin = Math.round((Date.now() - session.created_at) / 60_000);
+
+        let specContent = "";
+        try { specContent = readFileSync(SESSION_LOG_SPEC_PATH, "utf-8"); } catch { /* spec missing — ok */ }
+
+        if (session.status === "dead") {
+          _writeCodexLogStub(logPath, params.daemon_id, session, "dead", t);
+        } else {
+          const dismissPrompt =
+            `Write your session log now. This is your final task before shutdown.\n\n` +
+            `Write to this EXACT path: ${logPath}\n\n` +
+            `Header context to use:\n` +
+            `  Agent: codex\n` +
+            `  Model: (detect your current model name)\n` +
+            `  Feature: ${t.feature}\n` +
+            `  Trigger: daemon-dismiss\n` +
+            `  Duration: ~${durationMin} minutes\n` +
+            `  Daemon ID: ${params.daemon_id}\n` +
+            `  Native transcript: thread ${session.thread_id}\n` +
+            `  Previous Log: (check session-logs/ for most recent _codex.md, or "none")\n\n` +
+            (specContent ? `SESSION_LOG_SPEC:\n${specContent}\n\n` : "") +
+            `IMPORTANT: Write the markdown file to the path above only. ` +
+            `DO NOT run git add, git commit, or any shell commands. ` +
+            `Confirm with the exact filename when done.`;
+
+          // Use same pattern as ask_daemon — positional arg (not stdin)
+          const logResult = await executeCli({
+            command: CODEX_CLI,
+            args: [
+              "exec", "resume",
+              "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
+              "--json", session.thread_id,
+              dismissPrompt,
+            ],
+            cwd: session.cwd,
+            timeout_ms: 150_000,
+          });
+
+          if (!logResult.success || !existsSync(logPath)) {
+            _writeCodexLogStub(logPath, params.daemon_id, session, logResult.success ? "unresponsive" : "failed", t);
+          }
+        }
+
+        if (existsSync(logPath)) {
+          session.log_written = true;
+          _codexGitCommitLog(session.cwd, logPath, t.feature);
+        }
+      }
+      // ── END SESSION LOG WRITE ─────────────────────────────────────
+
       const reaped = reapDaemonFiles(session.cwd, params.daemon_id);
       _sessions.delete(params.daemon_id);
       const reapedNote = reaped.length > 0
