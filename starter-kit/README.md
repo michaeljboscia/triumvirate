@@ -43,20 +43,91 @@ chmod +x install.sh
 
 # 3. Set up your credentials
 cp ~/.claude/.env.example ~/.claude/.env
-# Edit ~/.claude/.env with your API keys
+# Edit ~/.claude/.env with your API keys (at minimum: GEMINI_API_KEY)
 
 # 4. Uncomment .env sourcing in session-start.sh
-# Edit ~/.claude/hooks/session-start.sh — uncomment the .env block
+# Edit ~/.claude/hooks/session-start.sh — uncomment the .env block (~line 13)
 
-# 5. Create your first project
+# 5. Create your first project — it MUST be a git repo
 mkdir -p ~/projects/my-project/.claude
-cp ~/.claude/taxonomy.json.example ~/projects/my-project/.claude/taxonomy.json
-# Edit taxonomy.json with your project details
+cd ~/projects/my-project
+git init
+cp ~/.claude/taxonomy.json.example .claude/taxonomy.json
+# Edit .claude/taxonomy.json with your project details
+git add .claude/taxonomy.json && git commit -m "init: add taxonomy"
 
 # 6. Start working
-cd ~/projects/my-project
 claude
 ```
+
+## Git Is Foundational — Not Optional
+
+**Every project you work in must be a git repository.** The entire persistence model depends on it.
+
+Here's what happens without git:
+- `post-tool-use.sh` won't auto-stage your file changes (it calls `git add`)
+- `pre-compact.sh` won't commit session logs before compaction (they disappear)
+- Session logs still get written to disk, but they're not versioned or backed up
+- After a context compaction, the agent wakes up with no memory of what happened
+
+The hooks fail gracefully without git — they won't crash — but you lose the entire reason to use them.
+
+**The flow:**
+1. You edit a file → The Airlock snapshots it, `post-tool-use.sh` stages it with `git add`
+2. You commit → `post-tool-use.sh` logs the commit hash to the session log
+3. Claude hits ~50K tokens → `token-gate.sh` runs `pre-compact.sh` in the background → session log written and **committed to git**
+4. Claude runs out of context → `pre-compact.sh` runs synchronously → Gemini summarizes the transcript → session log written and **committed to git**
+5. New session starts → `session-start.sh` finds the latest session log → reads it → injects context → you pick up where you left off
+
+Git is the persistence layer. Session logs in git = AI memory that survives across sessions, machines, and agents.
+
+---
+
+## How Session Logs Work
+
+Session logs are markdown files that serve as shared memory across all three agents.
+
+### Naming Convention
+
+```
+<owner>--<client>_<domain>_<repo>_<feature>_<YYYYMMDD>_v<N>_<agent>.md
+```
+
+Example: `mikeboscia--personal_infrastructure_triumvirate_hooks_20260228_v3_claude.md`
+
+The `<agent>` suffix (`_claude`, `_codex`, `_gemini`) tells you which agent wrote the log. All three agents search for session logs across all suffixes — Claude will read a Gemini log, and vice versa.
+
+### Where They Live
+
+The hooks look for session logs in this order:
+1. `$AI_MEMORY_DIR/<repo>/` — central memory store (default: `~/.ai-memory/<repo>/`)
+2. `<project>/session-logs/` — project-local
+
+If `~/.ai-memory/` exists, session logs go there (cross-project, easy to back up). Otherwise they go in `<project>/session-logs/`.
+
+### When They're Created
+
+| Trigger | Hook | What Happens |
+|---------|------|-------------|
+| Claude hits ~50K tokens | `post-tool-use-token-gate.sh` | Runs `pre-compact.sh` in background, writes + commits log |
+| Claude runs out of context | `pre-compact.sh` (PreCompact event) | Gemini summarizes transcript → writes + commits log |
+| New Codex session | `codex/hooks/pre-compact.sh` | Writes + commits a Codex session log |
+| Manual request | Ask Claude to update the session log | Claude writes narrative update |
+
+### What They Contain
+
+The log written by `pre-compact.sh` has these sections (auto-generated):
+- **GEMINI CONTEXT SUMMARY** — Gemini's structured summary of what happened (or jq fallback if Gemini unavailable)
+- **TRANSCRIPT HISTORY** — table of all previous transcript UUIDs for this feature
+- **SESSION ACTIVITY LOG** — timestamped actions and commits
+
+### The Shared Memory Model
+
+All three agents share a session log and can read each other's entries. When you escalate from Claude to Gemini using `/send-to-gemini`, the skill commits the current session log to git first, then tells Gemini where to find it. Gemini reads the same log, has full context, and writes its findings back — either to the same log or a sibling log (with `_gemini` suffix).
+
+This is why the taxonomy naming matters — it's how any agent finds any other agent's logs.
+
+---
 
 ## Prerequisites
 
