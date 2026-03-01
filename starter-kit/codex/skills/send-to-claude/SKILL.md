@@ -26,7 +26,7 @@ Automates sending properly formatted inter-agent requests to Claude:
 ## When to Use
 
 - Need Claude's Supabase/n8n/infrastructure expertise
-- Escalating after 3 failures on a problem
+- Escalating after 3 failures on a problem (use `/send-to-siblings` for dual escalation)
 - Requesting architectural guidance or system design help
 - Any question where Claude's domain knowledge applies
 
@@ -115,8 +115,9 @@ See `examples/usage.md` for detailed examples.
 
 ## Related Skills
 
-> Note: `/send-to-gemini`, `/send-to-codex`, and `/send-to-siblings` are not included in
-> this starter kit. You can build them using the same pattern as this skill.
+- `/send-to-gemini` — Send to Gemini for research and analysis
+- `/send-to-codex` — Send to Codex for code generation and review
+- `/send-to-siblings` — Send to BOTH Gemini and Codex simultaneously (dual escalation)
 
 ## Protocol Reference
 
