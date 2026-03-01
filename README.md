@@ -102,6 +102,7 @@ Automate batch-submission of research topics to claude.ai's Deep Research via br
 - Gemini CLI (`gemini`) — [install](https://github.com/google-gemini/gemini-cli)
 - Codex (`codex`) — [install](https://github.com/openai/codex)
 - Node.js 20+
+- **git** — every project directory must be a git repo. Hooks use git for auto-staging, committing session logs, and tracking changes. No git = hooks silently fail.
 
 ### 1. Build the MCP server
 
@@ -171,7 +172,16 @@ Session logs are AI working memory — they don't belong inside project repos. T
     └── owner--client_domain_repo_feature_20260228_v80_claude.md
 ```
 
-Set `AI_MEMORY_DIR` to point to your private memory repo. If not set, logs fall back to `<project>/session-logs/`.
+Set up your memory repo:
+
+```bash
+mkdir -p ~/.ai-memory && cd ~/.ai-memory && git init
+# Optional: push to a private remote
+gh repo create ai-memory --private -y
+git remote add origin git@github.com:yourname/ai-memory.git
+```
+
+Set `AI_MEMORY_DIR` to point to your private memory repo (defaults to `~/.ai-memory`). If the directory doesn't exist, logs fall back to `<project>/session-logs/`.
 
 **Automatic logging:** When you `dismiss_daemon`, the agent writes a `SESSION_LOG_SPEC`-compliant log before the session closes. No manual `/save-session` needed — dismiss produces a log.
 
@@ -226,7 +236,7 @@ These are the CLIs' own documented escape hatches, intended for controlled progr
 
 These features are designed and planned — not yet in the codebase:
 
-- **Pre-compact hooks** — Gemini summarizes Claude's transcript before context compaction, restoring continuity across session boundaries. Reference implementation coming to `docs/hooks/`.
+- **Pre-compact hooks (reference implementation)** — Working in the author's config, being cleaned up for `docs/hooks/`. Gemini summarizes Claude's transcript before context compaction, restoring continuity across session boundaries.
 - **Ollama as fourth agent** — local, private, zero-cost triage before escalating to cloud models.
 
 ### What shipped recently
@@ -243,11 +253,11 @@ PRs welcome. The agents review their own contributions.
 
 ## Hooks (advanced)
 
-Want session logs that survive context compaction — where Gemini automatically summarizes your Claude transcript before memory is lost and restores it on the next session? That's `Tier 2`: a hooks system built on Claude Code's lifecycle hooks, Gemini's pre-compact hook, and Codex's session hooks.
+Want session logs that survive context compaction — where Gemini automatically summarizes your Claude transcript before memory is lost and restores it on the next session? That's `Tier 2`: a hooks system built on Claude Code's lifecycle hooks.
 
-It took the most iteration to get right. Reference implementation coming to `docs/hooks/`.
+The hooks use Claude Code's `PreCompact` event to pipe the transcript through Gemini for summarization, save a versioned session log, and restore context on the next session start. They're the most iterated part of the system — reference implementations coming to `docs/hooks/`.
 
-Fair warning: it requires all three CLIs configured, and tolerance for a week of debugging hook interactions. The roadmap item above tracks this.
+The hooks are extensible. The ClickUp integration in the author's config is an example of wiring a PM tool into the hook lifecycle: source a shared library, run in a background subshell `( ... ) &`, gate with an env var. Same pattern works for Linear, Jira, GitHub Projects, or any webhook-based tool.
 
 ---
 
