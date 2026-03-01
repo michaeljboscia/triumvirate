@@ -17,7 +17,6 @@ Key signal for session notes:
 """
 
 import json
-import re
 import os
 from typing import Optional
 
@@ -67,8 +66,10 @@ def _extract_response_item(payload: dict) -> Optional[str]:
         elif btype == 'function_call':
             name = block.get('name', 'unknown')
             args = block.get('arguments', '')
-            if isinstance(args, str) and len(args) > 200:
-                args = args[:200] + '...'
+            if isinstance(args, str):
+                if len(args) > 200:
+                    args = args[:200] + '...'
+                args = redact_secrets(args)
             parts.append(f"[Tool: {name}] {args}")
 
         elif btype == 'function_call_output':
@@ -103,6 +104,7 @@ def _extract_event_msg(payload: dict) -> Optional[str]:
             cmd = ' '.join(cmd)
         if len(cmd) > 200:
             cmd = cmd[:200] + '...'
+        cmd = redact_secrets(cmd)
         return f"[Codex Exec]: {cmd}"
 
     elif etype == 'exec_result':

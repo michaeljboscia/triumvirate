@@ -14,7 +14,6 @@ that must be loaded in full.
 """
 
 import json
-import re
 import os
 from typing import Optional
 

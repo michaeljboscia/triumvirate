@@ -37,7 +37,7 @@ SECRET_PATTERNS = [
 ]
 
 # Hook context dedup — skip repeated additionalContext injections
-HOOK_CONTEXT_HASHES = set()
+
 
 # Max chars for tool output before truncation
 TOOL_OUTPUT_MAX = 500
@@ -254,6 +254,7 @@ def parse_delta(
                     text = body.strip()
                     if len(text) > 500:
                         text = text[:500] + '...'
+                    text = redact_secrets(text)
                     entry = f"[User]: {text}"
                     output_lines.append(entry)
                     chars_emitted += len(entry)
@@ -277,7 +278,8 @@ def parse_delta(
                                 continue
                             text = block.get('text', '').strip()
                             if text and len(text) > 10:
-                                entry = f"[User]: {text[:500]}"
+                                text = redact_secrets(text[:500])
+                                entry = f"[User]: {text}"
                                 output_lines.append(entry)
                                 chars_emitted += len(entry)
                                 stats['user_messages'] += 1
@@ -351,9 +353,12 @@ def parse_delta(
 
 
 if __name__ == '__main__':
-    # Quick self-test: parse last 50KB of the current transcript
+    # Quick self-test: parse last 50KB of a transcript
     import sys
-    transcript = sys.argv[1] if len(sys.argv) > 1 else '/Users/mikeboscia/.claude/projects/-Users-mikeboscia/7cd83b80-ca38-4b6c-979c-0c86105f0f35.jsonl'
+    if len(sys.argv) < 2:
+        print("Usage: python claude.py <transcript.jsonl>")
+        sys.exit(1)
+    transcript = sys.argv[1]
     file_size = os.path.getsize(transcript)
     start = max(0, file_size - 50000)
     result = parse_delta(transcript, start, file_size)

@@ -100,7 +100,12 @@ if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
   exit 0
 fi
 
-CURRENT_BYTES="$(stat -f %z "$TRANSCRIPT" 2>/dev/null)" || exit 0
+# Cross-platform file size (macOS uses -f %z, Linux uses -c %s)
+if stat -c %s /dev/null &>/dev/null 2>&1; then
+  CURRENT_BYTES="$(stat -c %s "$TRANSCRIPT" 2>/dev/null)" || exit 0
+else
+  CURRENT_BYTES="$(stat -f %z "$TRANSCRIPT" 2>/dev/null)" || exit 0
+fi
 
 # ─── File rotation / shrink detection ───────────────────────────────────────
 # If the transcript shrank (new session, file rotation), reset the cursor

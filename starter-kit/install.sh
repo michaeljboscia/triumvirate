@@ -303,6 +303,7 @@ done
 
 # Create state and log directories
 mkdir -p "$HOME/.triumvirate/locks"
+chmod +x "$STENO_DIR/stenographer.py"
 ok "Stenographer installed: $STENO_DIR/"
 
 # Check Ollama (optional but recommended)
@@ -321,7 +322,7 @@ else
   info "  Linux:  curl -fsSL https://ollama.ai/install.sh | sh"
 fi
 
-# ── 8. Shared Templates ──────────────────────────────────────
+# ── 7. Shared Templates ──────────────────────────────────────
 info "Installing shared templates..."
 
 # .env.example — copy to ~/.claude/ as reference (not as .env)
@@ -336,7 +337,7 @@ fi
 cp "$SCRIPT_DIR/shared/taxonomy.json.example" "$HOME/.claude/taxonomy.json.example"
 ok "Copied taxonomy.json.example to ~/.claude/"
 
-# ── 9. AI Memory Directory ──────────────────────────────────
+# ── 8. AI Memory Directory ──────────────────────────────────
 # Central session log store — all agents write here when it exists.
 # This is a git repo so session logs are versioned and shareable.
 AI_MEM_DIR="$HOME/.ai-memory"
@@ -350,7 +351,7 @@ else
   info "Session logs will be stored here when projects have a taxonomy.json"
 fi
 
-# ── 10. Verify ────────────────────────────────────────────────
+# ── 9. Verify ─────────────────────────────────────────────────
 echo ""
 info "Verifying installation..."
 ISSUES=0
