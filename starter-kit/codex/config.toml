@@ -1,0 +1,38 @@
+# Codex CLI Configuration — Triumvirate Starter Kit
+#
+# Place this file at ~/.codex/config.toml
+# Documentation: https://github.com/openai/codex (or your fork with hooks support)
+
+# ── Model Configuration ────────────────────────────────────────
+[model]
+# Default model for Codex sessions
+name = "o4-mini"
+
+# ── Approval Mode ──────────────────────────────────────────────
+[approval]
+# Options: "suggest" (ask before every action), "auto-edit" (auto-approve edits),
+#          "full-auto" (auto-approve everything including shell commands)
+mode = "auto-edit"
+
+# ── MCP Servers ────────────────────────────────────────────────
+# Inter-agent communication with Gemini via Triumvirate MCP server
+# Uncomment and set the path to your Triumvirate MCP start script:
+#
+# [mcp_servers.inter-agent-gemini]
+# command = "/path/to/triumvirate/mcp-server/start-gemini.sh"
+# env = {}
+
+# ── Hooks ──────────────────────────────────────────────────────
+# Session lifecycle hooks (compatible with Triumvirate session log format)
+
+[[hooks.session_start]]
+command = "~/.codex/hooks/session-start.sh"
+
+[[hooks.pre_compact]]
+command = "~/.codex/hooks/pre-compact.sh"
+
+# ── History ────────────────────────────────────────────────────
+[history]
+# Save conversation history for session recovery
+persistence = true
+max_conversations = 50

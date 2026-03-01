@@ -1,0 +1,7 @@
+{
+  "owner": "your-username",
+  "client": "personal",
+  "domain": "infrastructure",
+  "repo": "my-project",
+  "feature": "main"
+}
