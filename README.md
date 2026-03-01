@@ -83,6 +83,32 @@ Dispatch Codex for git-aware code review on uncommitted changes, branches, or sp
 
 For large codebases: Claude dispatches Codex, Codex loads the full codebase into Gemini's 2M context window, asks targeted questions, and returns a complete review — without Claude ever touching the files.
 
+### System: Stenographer — zero-cost session notes
+
+Stenographer is an incremental transcript narrator that runs on every Claude session — no API calls, no cloud tokens, just local Ollama.
+
+The token gate hook fires every ~50K tokens. Stenographer reads only the new transcript bytes since the last save (delta extraction), parses the JSONL into normalized events, feeds them to a local Ollama model, and appends a plain-English paragraph to the session log.
+
+```
+transcript.jsonl  →  parse delta  →  local Ollama  →  session-log.md
+                      (new bytes      (qwen2.5:32b    (appends one
+                       only)           or similar)     paragraph)
+```
+
+Why local? The pre-compact hook used to pipe full Gemini transcripts to the Gemini API for summarization — that burned 69M tokens in 4 days. Stenographer costs $0.00 per save and produces a rolling narrative the next session can resume from.
+
+Supported transcript formats: Claude Code JSONL, Codex JSONL, Gemini JSON arrays.
+
+See [`starter-kit/stenographer/`](starter-kit/stenographer/) for setup and configuration.
+
+### System: The Airlock — file snapshot safety net
+
+The Airlock (`pre-tool-use-artifact-guard.sh`) snapshots every file before Claude edits it. No confirmation prompts — it just runs silently on every `Edit` and `Write` call and writes a timestamped backup to `~/.claude/artifact-guard/`.
+
+Three protection levels: `remote_strict` (Supabase SQL — checks backup freshness + hash match, blocks if stale), `remote_best_effort` (edge functions, n8n JSON — always snapshots, always allows), `local_copy` (source files — snapshots, always allows).
+
+The result: every edit is reversible, even when Claude makes a mistake at 2am.
+
 ### Session Log Spec
 
 A cross-agent session log standard (`SESSION_LOG_SPEC.md`) so every agent can document its work in a compatible format that all three can read and resume from.
@@ -103,6 +129,7 @@ Automate batch-submission of research topics to claude.ai's Deep Research via br
 - [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
 - [Codex](https://github.com/openai/codex) (`codex`)
 - Node.js 20+, jq, git
+- [Ollama](https://ollama.com) — required for Stenographer (local session notes). Pull any general model, e.g. `ollama pull qwen2.5:32b`
 
 ### One-command setup
 
@@ -120,8 +147,9 @@ The installer:
 4. Copies Gemini hooks and GEMINI.md to `~/.gemini/`
 5. Builds the inter-agent MCP server (`npm install && npm run build`)
 6. Wires all three agents' MCP configs (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
-7. Creates `~/.ai-memory/` (git-initialized session log store)
-8. Copies `.env.example` and `taxonomy.json.example` templates
+7. Installs Stenographer to `~/.triumvirate/stenographer/` (local Ollama session notes)
+8. Creates `~/.ai-memory/` (git-initialized session log store)
+9. Copies `.env.example` and `taxonomy.json.example` templates
 
 Safe to re-run — backs up existing files before overwriting.
 
@@ -209,12 +237,14 @@ These are the CLIs' own documented escape hatches, intended for controlled progr
 
 ## Roadmap
 
-- **Ollama as fourth agent** — local, private, zero-cost triage before escalating to cloud models.
+Nothing on the list right now — ship fast, add things when the need is real.
 
 ### What shipped
 
 - **Starter Kit** — one-command installer for the complete multi-agent operating environment. See [`starter-kit/`](starter-kit/).
 - **Hook lifecycle** — 8 Claude hooks + 3 Gemini hooks + 2 Codex hooks. Session recovery, auto-staging, The Airlock (file snapshots before edit), token-gated auto-save, Gemini-powered transcript summarization before context compaction.
+- **Stenographer** — zero-cost incremental session notes via local Ollama. Token gate fires every ~50K tokens; Stenographer reads only new transcript bytes, narrates them locally, appends to the session log. No API calls, no cloud cost. See [`starter-kit/stenographer/`](starter-kit/stenographer/).
+- **The Airlock** — silent file snapshot safety net on every edit. Three protection levels: strict (blocks if backup is stale), best-effort (always snapshots, always allows), copy (source files). Every edit reversible, zero prompts.
 - **Automatic session logs on dismiss** — every daemon writes a `SESSION_LOG_SPEC`-compliant log when dismissed. Gemini and Codex both produce structured markdown with taxonomy, context summary, and transcript history.
 - **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `.claude/taxonomy.json` for project taxonomy.
 - **Daemon persistence** — `spawn_daemon({ session_name: "..." })` creates named sessions that survive MCP restarts. Soft dismiss preserves session files. Resume with zero token cost.
@@ -236,7 +266,7 @@ The starter-kit includes a complete hook lifecycle for all three agents. These a
 | `post-compact-recovery.sh` | Claude | SessionStart:compact | Restores context from session log after compaction |
 | `pre-compact.sh` | Claude | PreCompact | Gemini summarizes transcript → session log → git commit |
 | `post-tool-use.sh` | Claude | PostToolUse | Auto-stages files, logs activity |
-| `post-tool-use-token-gate.sh` | Claude | PostToolUse | Auto-saves at ~50K token intervals |
+| `post-tool-use-token-gate.sh` | Claude | PostToolUse | Auto-saves at ~50K token intervals — triggers **Stenographer** (local Ollama narration) |
 | `pre-tool-use-artifact-guard.sh` | Claude | PreToolUse | **The Airlock** — snapshots every file before edit |
 | `pre-tool-use-bash-guard.sh` | Claude | PreToolUse | Blocks destructive SQL without fresh backup |
 | `session-start.sh` | Gemini | SessionStart | Session log recovery |
