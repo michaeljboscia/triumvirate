@@ -366,34 +366,6 @@ Be SPECIFIC: file names, function names, commit hashes, error messages, fix patt
     fi
   fi
 
-  # ClickUp: Update active task with session progress (background, non-blocking)
-  # Gate: only fires when ENABLE_CLICKUP=1 is set (prevents errors for users without ClickUp)
-  if [ "${ENABLE_CLICKUP:-0}" = "1" ]; then
-  (
-    CLICKUP_API_SH="$HOME/.claude/hooks/clickup-api.sh"
-    if [ -f "$CLICKUP_API_SH" ]; then
-      source "$CLICKUP_API_SH"
-      CU_PROJECT=$(clickup_repo_to_project "$PROJECT_DIR")
-      if [ -n "$CU_PROJECT" ]; then
-        CU_LIST_ID=$(clickup_get_list_id "$CU_PROJECT")
-        if [ -n "$CU_LIST_ID" ]; then
-          GIT_BRANCH=$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || echo "$FEATURE")
-          CU_TASK_ID=$(clickup_find_task "$CU_LIST_ID" "$GIT_BRANCH")
-          if [ -n "$CU_TASK_ID" ]; then
-            # Update session_log custom field with new log path
-            clickup_set_custom_field "$CU_TASK_ID" "$(clickup_get_field_id 'session_log')" "$NEW_LOG"
-            # Add compaction comment
-            SUMMARY_PREVIEW=""
-            if [ -n "$GEMINI_SUMMARY" ]; then
-              SUMMARY_PREVIEW=$(echo "$GEMINI_SUMMARY" | head -5 | tr '\n' ' ' | cut -c1-200)
-            fi
-            clickup_add_comment "$CU_TASK_ID" "Session compacted (v${NEXT_VERSION}). Log: ${NEW_LOG##*/}. Summary: ${SUMMARY_PREVIEW}..."
-          fi
-        fi
-      fi
-    fi
-  ) &
-  fi
 
   # Echo visible message to stderr (shows in UI)
   echo "📝 Session log saved: ${NEW_LOG##*/}" >&2

@@ -2,11 +2,15 @@
 # ============================================================================
 # Triumvirate Starter Kit — Installer
 #
-# Copies hooks, configs, and templates to the right locations:
+# Builds and wires the complete Triumvirate operating environment:
+#   mcp-server/          — Builds the inter-agent MCP server (npm install + tsc)
 #   ~/.claude/hooks/     — Claude Code hooks (session lifecycle + safety gates)
 #   ~/.claude/           — Claude Code settings and instructions
+#   ~/.claude.json       — MCP server registration (inter-agent-gemini + inter-agent-codex)
 #   ~/.codex/            — Codex CLI config, hooks, and skills
+#   ~/.codex/config.toml — MCP server registration (inter-agent-gemini)
 #   ~/.gemini/           — Gemini CLI instructions
+#   ~/.gemini/settings.json — MCP server registration (inter-agent-codex)
 #
 # Usage:
 #   cd triumvirate/starter-kit
@@ -176,7 +180,103 @@ fi
 
 ok "Gemini configuration installed"
 
-# ── 5. Shared Templates ──────────────────────────────────────
+# ── 5. Inter-Agent MCP Server ─────────────────────────────────
+# This is the core of the Triumvirate — without it, the agents can't
+# spawn daemons or do multi-turn inter-agent conversations.
+# Each agent registers the OTHER agents' MCP servers so they are
+# first-party participants with spawn_daemon / ask_daemon support.
+info "Building and wiring inter-agent MCP server..."
+
+MCP_SERVER_DIR="$(cd "$SCRIPT_DIR/../mcp-server" 2>/dev/null && pwd)" || {
+  err "Cannot find mcp-server/ directory. Make sure you cloned the full triumvirate repo."
+  err "Expected: $(dirname "$SCRIPT_DIR")/mcp-server"
+  exit 1
+}
+
+# Check node is available
+if ! command -v node &>/dev/null; then
+  err "Node.js is required to build the MCP server."
+  err "  macOS:  brew install node"
+  err "  Ubuntu: apt-get install nodejs npm"
+  exit 1
+fi
+if ! command -v npm &>/dev/null; then
+  err "npm is required to build the MCP server."
+  exit 1
+fi
+
+# Build the MCP server
+info "Installing MCP server dependencies and building..."
+(cd "$MCP_SERVER_DIR" && npm install --silent && npm run build --silent) || {
+  err "MCP server build failed. Check Node.js version (requires >=20)."
+  exit 1
+}
+ok "MCP server built: $MCP_SERVER_DIR/dist/"
+
+# Make start scripts executable
+chmod +x "$MCP_SERVER_DIR/start-gemini.sh" "$MCP_SERVER_DIR/start-codex.sh"
+ok "Start scripts ready"
+
+# ── Wire Claude: add both servers to ~/.claude.json ──────────
+CLAUDE_JSON="$HOME/.claude.json"
+GEMINI_START="$MCP_SERVER_DIR/start-gemini.sh"
+CODEX_START="$MCP_SERVER_DIR/start-codex.sh"
+
+if [[ -f "$CLAUDE_JSON" ]]; then
+  backup_if_exists "$CLAUDE_JSON"
+  # Merge mcpServers into existing config (preserves all other keys)
+  jq --arg gs "$GEMINI_START" --arg cs "$CODEX_START" '
+    .mcpServers["inter-agent-gemini"] = {"command": $gs} |
+    .mcpServers["inter-agent-codex"]  = {"command": $cs}
+  ' "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp" && mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
+else
+  jq -n --arg gs "$GEMINI_START" --arg cs "$CODEX_START" '{
+    mcpServers: {
+      "inter-agent-gemini": {command: $gs},
+      "inter-agent-codex":  {command: $cs}
+    }
+  }' > "$CLAUDE_JSON"
+fi
+ok "Claude wired: inter-agent-gemini + inter-agent-codex → $CLAUDE_JSON"
+
+# ── Wire Gemini: add inter-agent-codex to ~/.gemini/settings.json ──
+GEMINI_SETTINGS="$HOME/.gemini/settings.json"
+if [[ -f "$GEMINI_SETTINGS" ]]; then
+  backup_if_exists "$GEMINI_SETTINGS"
+  jq --arg cs "$CODEX_START" '
+    .mcpServers["inter-agent-codex"] = {"command": $cs}
+  ' "$GEMINI_SETTINGS" > "${GEMINI_SETTINGS}.tmp" && mv "${GEMINI_SETTINGS}.tmp" "$GEMINI_SETTINGS"
+  ok "Gemini wired: inter-agent-codex → $GEMINI_SETTINGS"
+else
+  warn "~/.gemini/settings.json not found — Gemini MCP not configured."
+  warn "After installing Gemini CLI, add manually:"
+  warn "  {mcpServers: {\"inter-agent-codex\": {command: \"$CODEX_START\"}}}"
+fi
+
+# ── Wire Codex: uncomment and set inter-agent-gemini in config.toml ──
+CODEX_CONFIG="$HOME/.codex/config.toml"
+if [[ -f "$CODEX_CONFIG" ]]; then
+  # Check if MCP server is already configured
+  if grep -q "inter-agent-gemini" "$CODEX_CONFIG" && ! grep -q "^#.*inter-agent-gemini" "$CODEX_CONFIG"; then
+    info "Codex config.toml already has inter-agent-gemini — skipping."
+  else
+    backup_if_exists "$CODEX_CONFIG"
+    # Append the MCP server config block
+    cat >> "$CODEX_CONFIG" <<EOF
+
+# ── Inter-agent MCP server (added by Triumvirate installer) ──────────
+[mcp_servers.inter-agent-gemini]
+command = "$GEMINI_START"
+EOF
+    ok "Codex wired: inter-agent-gemini → $CODEX_CONFIG"
+  fi
+else
+  warn "~/.codex/config.toml not found — Codex MCP not configured."
+fi
+
+ok "Inter-agent MCP server wired into all 3 agents"
+
+# ── 6. Shared Templates ──────────────────────────────────────
 info "Installing shared templates..."
 
 # .env.example — copy to ~/.claude/ as reference (not as .env)
@@ -211,30 +311,31 @@ if ! command -v gemini &>/dev/null; then
   info "Gemini CLI not found — pre-compact will use jq fallback for summarization"
 fi
 
-# Note about optional integrations
-info "Optional: ClickUp task integration (not in starter-kit)"
-info "  Set ENABLE_CLICKUP=1 and install clickup-api.sh separately."
-info "  See https://github.com/michaeljboscia/triumvirate for details."
-
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                    Installation Complete!                    ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
-echo "  Claude hooks:   $CLAUDE_HOOKS_DIR/"
-echo "  Claude config:  $HOME/.claude/settings.json"
-echo "  Codex config:   $CODEX_DIR/"
-echo "  Gemini config:  $GEMINI_DIR/"
+echo "  Claude hooks:     $CLAUDE_HOOKS_DIR/"
+echo "  Claude MCP:       $HOME/.claude.json  (inter-agent-gemini + inter-agent-codex)"
+echo "  Codex config:     $CODEX_DIR/"
+echo "  Gemini config:    $GEMINI_DIR/"
+echo "  MCP server:       $MCP_SERVER_DIR/dist/"
 echo ""
 echo "  Next steps:"
 echo "    1. Copy ~/.claude/.env.example to ~/.claude/.env"
 echo "       Fill in your API keys (at minimum: GEMINI_API_KEY)"
-echo "    2. Uncomment the .env sourcing in session-start.sh"
-echo "    3. Create your first project:"
+echo "    2. Uncomment the .env sourcing block in ~/.claude/hooks/session-start.sh"
+echo "    3. Create your first project (must be a git repo):"
 echo "       mkdir -p ~/projects/my-project/.claude"
-echo "       cp ~/.claude/taxonomy.json.example ~/projects/my-project/.claude/taxonomy.json"
+echo "       cd ~/projects/my-project && git init"
+echo "       cp ~/.claude/taxonomy.json.example .claude/taxonomy.json"
 echo "       # Edit taxonomy.json with your project details"
-echo "    4. Start Claude Code: cd ~/projects/my-project && claude"
+echo "       git add .claude/taxonomy.json && git commit -m 'init: add taxonomy'"
+echo "    4. Start all three agents:"
+echo "       claude        # Primary — hooks auto-load, MCP connects to Gemini + Codex"
+echo "       gemini        # Research + analysis — can daemon-call Codex"
+echo "       codex         # Code generation — can daemon-call Gemini"
 echo ""
 
 if [[ "$ISSUES" -gt 0 ]]; then

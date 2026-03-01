@@ -174,7 +174,6 @@ Before Memory Loss:
 |----------|---------|---------|
 | `GEMINI_CLI_PATH` | Path to Gemini CLI | `gemini` |
 | `AI_MEMORY_DIR` | Central session log store | `~/.ai-memory` |
-| `ENABLE_CLICKUP` | ClickUp task integration | `0` (off) |
 | `SUPABASE_BACKUP_TTL_MINS` | Backup freshness window | `30` min |
 | `TOKEN_GATE_THRESHOLD_KB` | Auto-save threshold | `200` KB (~50K tokens) |
 | `TOKEN_GATE_COOLDOWN_SECS` | Min time between saves | `300` sec |

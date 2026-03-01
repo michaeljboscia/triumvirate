@@ -126,7 +126,6 @@ can find and read any other agent's session logs.
 |----------|---------|---------|
 | `GEMINI_CLI_PATH` | Path to Gemini CLI binary | `gemini` (from PATH) |
 | `AI_MEMORY_DIR` | Central session log store | `~/.ai-memory` |
-| `ENABLE_CLICKUP` | Enable ClickUp task integration | `0` (off) |
 | `SUPABASE_BACKUP_TTL_MINS` | Backup freshness for Supabase gate | `30` |
 | `TOKEN_GATE_THRESHOLD_KB` | Transcript growth before auto-save | `200` |
 | `TOKEN_GATE_COOLDOWN_SECS` | Min seconds between auto-saves | `300` |

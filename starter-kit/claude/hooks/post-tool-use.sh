@@ -121,46 +121,6 @@ case "$TOOL_NAME" in
                 COMMIT_MSG="(no message)"
             fi
             append_to_log "Git commit $COMMIT_HASH: $COMMIT_MSG | COMMITTED |"
-
-            # ClickUp integration: add commit comment to matching task (background, non-blocking)
-            # Gate: only fires when ENABLE_CLICKUP=1 is set (prevents errors for users without ClickUp)
-            if [ "${ENABLE_CLICKUP:-0}" = "1" ]; then
-            (
-              CLICKUP_API_SH="$HOME/.claude/hooks/clickup-api.sh"
-              if [ -f "$CLICKUP_API_SH" ]; then
-                source "$CLICKUP_API_SH"
-                REPO_ROOT=$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null)
-                CU_PROJECT=$(clickup_repo_to_project "$REPO_ROOT")
-                if [ -n "$CU_PROJECT" ]; then
-                  CU_LIST_ID=$(clickup_get_list_id "$CU_PROJECT")
-                  if [ -n "$CU_LIST_ID" ]; then
-                    GIT_BRANCH=$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null)
-                    CU_TASK_ID=$(clickup_find_task "$CU_LIST_ID" "$GIT_BRANCH")
-                    if [ -z "$CU_TASK_ID" ]; then
-                      # No task matches the branch — create one
-                      CU_TASK_ID=$(clickup_create_task "$CU_LIST_ID" "$GIT_BRANCH" "Auto-created from git activity on branch $GIT_BRANCH")
-                      # Set custom fields
-                      if [ -n "$CU_TASK_ID" ]; then
-                        clickup_set_custom_field "$CU_TASK_ID" "$(clickup_get_field_id 'git_branch')" "$GIT_BRANCH"
-                        clickup_set_custom_field "$CU_TASK_ID" "$(clickup_get_field_id 'auto_updated')" "true"
-                        REMOTE_URL=$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null)
-                        if [ -n "$REMOTE_URL" ]; then
-                          clickup_set_custom_field "$CU_TASK_ID" "$(clickup_get_field_id 'git_repo')" "$REMOTE_URL"
-                        fi
-                      fi
-                    fi
-                    # Add commit as comment
-                    if [ -n "$CU_TASK_ID" ]; then
-                      clickup_add_comment "$CU_TASK_ID" "Commit $COMMIT_HASH: $COMMIT_MSG ($(TZ='America/New_York' date '+%H:%M %Z'))"
-                      # Auto-set status to "in progress" if still "to do"
-                      clickup_update_task "$CU_TASK_ID" '{"status":"in progress"}'
-                    fi
-                  fi
-                fi
-              fi
-            ) &
-            fi
-
             # Remind Claude to update the session log with narrative
             jq -n --arg hash "$COMMIT_HASH" --arg wt "$WALL_TIME" '{
               "hookSpecificOutput": {
