@@ -2,7 +2,7 @@
 
 **Purpose:** Define the authoritative format for session logs across Claude, Gemini, and Codex so all three agents produce compatible, mergeable session histories.
 
-**Author:** Claude Opus 4.5 + Mike Boscia
+**Author:** Claude + Contributors
 **Date:** 2026-02-12
 
 ---
@@ -18,10 +18,10 @@
 
 | Component | Description | Example |
 |-----------|-------------|---------|
-| `owner` | GitHub username or identifier | `michaeljboscia` |
-| `client` | Project/client name | `gtm-machine` |
+| `owner` | GitHub username or identifier | `yourname` |
+| `client` | Project/client name | `acme-corp` |
 | `domain` | Work domain | `outreach`, `infrastructure`, `intelligence` |
-| `repo` | Repository name | `gtm-machine-infrastructure` |
+| `repo` | Repository name | `my-project` |
 | `feature` | Feature/task being worked on | `narrative_generator` |
 | `YYYYMMDD` | Date (no separators) | `20260212` |
 | `v<N>` | Version number (increments within same day/feature) | `v1`, `v2`, `v3` |
@@ -29,15 +29,17 @@
 
 ### Examples
 ```
-michaeljboscia--gtm-machine_outreach_gtm-machine-infrastructure_narrative_generator_20260212_v1_claude.md
-michaeljboscia--gtm-machine_outreach_gtm-machine-infrastructure_narrative_generator_20260212_v2_gemini.md
-michaeljboscia--gtm-machine_outreach_gtm-machine-infrastructure_narrative_generator_20260212_v3_codex.md
+yourname--acme-corp_outreach_my-project_auth-refactor_20260212_v1_claude.md
+yourname--acme-corp_outreach_my-project_auth-refactor_20260212_v2_gemini.md
+yourname--acme-corp_outreach_my-project_auth-refactor_20260212_v3_codex.md
 ```
 
 ### Location
-All session logs go to: `<project-root>/session-logs/`
+All session logs go to: `~/.ai-memory/<repo>/`
 
-If no project context, fall back to agent's home:
+This is a dedicated private git repo (`github.com/yourname/ai-memory`) separate from your project repos. AI working memory should not live alongside source code.
+
+If no `~/.ai-memory/` exists, fall back to agent's home config directory:
 - Claude: `~/.claude/session-logs/`
 - Gemini: `~/.gemini/session-logs/`
 - Codex: `~/.codex/session-logs/`
@@ -149,11 +151,11 @@ Each project should have `.claude/taxonomy.json` (or equivalent) defining:
 
 ```json
 {
-  "owner": "michaeljboscia",
-  "client": "gtm-machine",
+  "owner": "yourname",
+  "client": "acme-corp",
   "domain": "outreach",
-  "repo": "gtm-machine-infrastructure",
-  "feature": "narrative_generator"
+  "repo": "my-project",
+  "feature": "auth-refactor"
 }
 ```
 
