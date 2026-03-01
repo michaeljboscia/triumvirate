@@ -5,8 +5,10 @@
  *   <owner>--<client>_<domain>_<repo>_<feature>_<YYYYMMDD>_v<N+1>_<agent>.md
  *
  * Version counter is per-agent (gemini and codex count independently).
- * Written to <cwd>/session-logs/, falling back to ~/.gemini/session-logs/
- * or ~/.codex/session-logs/ if the project path is unwritable.
+ *
+ * Set AI_MEMORY_DIR to a private repo path — logs go to $AI_MEMORY_DIR/<repo>/.
+ * Falls back to <cwd>/session-logs/ if AI_MEMORY_DIR is not configured.
+ * Session logs must NOT live inside project repos — they are AI working memory.
  */
 
 import { existsSync, readdirSync, readFileSync, mkdirSync } from "node:fs";
@@ -83,8 +85,12 @@ function dateStr(): string {
 
 /**
  * Compute the next session log file path for a given agent.
- * Creates the session-logs directory if it doesn't exist.
- * Falls back to ~/.gemini/session-logs/ or ~/.codex/session-logs/ if project dir unwritable.
+ *
+ * Session logs go to a dedicated private AI memory repo, NOT inside the project.
+ * Set AI_MEMORY_DIR to the path of your private memory repo. Each project gets
+ * a subfolder named by its repo slug: $AI_MEMORY_DIR/<repo>/<logfile>.md
+ *
+ * Falls back to <cwd>/session-logs/ if AI_MEMORY_DIR is not set.
  */
 export function computeAgentLogPath(
   cwd: string,
@@ -92,12 +98,20 @@ export function computeAgentLogPath(
 ): string {
   const t = parseTaxonomyFull(cwd);
 
-  // Prefer project session-logs/, fall back to agent home dir
-  let sessionLogDir = join(cwd, "session-logs");
-  try {
-    mkdirSync(sessionLogDir, { recursive: true });
-  } catch {
-    sessionLogDir = join(homedir(), `.${agent}`, "session-logs");
+  // Resolve memory repo: AI_MEMORY_DIR env var → <cwd>/session-logs fallback
+  let sessionLogDir: string;
+  if (process.env.AI_MEMORY_DIR) {
+    const memoryRepoDir = join(process.env.AI_MEMORY_DIR, t.repo);
+    try {
+      mkdirSync(memoryRepoDir, { recursive: true });
+      sessionLogDir = memoryRepoDir;
+    } catch {
+      sessionLogDir = join(cwd, "session-logs");
+      mkdirSync(sessionLogDir, { recursive: true });
+    }
+  } else {
+    // No memory repo configured — fall back to project session-logs/
+    sessionLogDir = join(cwd, "session-logs");
     mkdirSync(sessionLogDir, { recursive: true });
   }
 
