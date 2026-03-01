@@ -98,63 +98,55 @@ Automate batch-submission of research topics to claude.ai's Deep Research via br
 
 ### Prerequisites
 
-- Claude Code (`claude`) — [install](https://claude.ai/code)
-- Gemini CLI (`gemini`) — [install](https://github.com/google-gemini/gemini-cli)
-- Codex (`codex`) — [install](https://github.com/openai/codex)
-- Node.js 20+
-- **git** — every project directory must be a git repo. Hooks use git for auto-staging, committing session logs, and tracking changes. No git = hooks silently fail.
+- [Claude Code](https://claude.ai/code) (`claude`)
+- [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
+- [Codex](https://github.com/openai/codex) (`codex`)
+- Node.js 20+, jq, git
 
-### 1. Build the MCP server
+### One-command setup
 
 ```bash
 git clone https://github.com/michaeljboscia/triumvirate
-cd triumvirate/mcp-server
-npm install
-npm run build
-chmod +x start-gemini.sh
+cd triumvirate/starter-kit
+chmod +x install.sh
+./install.sh
 ```
 
-### 2. Wire into Claude Code
+The installer:
+1. Copies Claude Code hooks (8 files) to `~/.claude/hooks/`
+2. Installs Claude settings, CLAUDE.md starter template
+3. Copies Codex hooks, skills, and config to `~/.codex/`
+4. Copies Gemini hooks and GEMINI.md to `~/.gemini/`
+5. Builds the inter-agent MCP server (`npm install && npm run build`)
+6. Wires all three agents' MCP configs (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
+7. Creates `~/.ai-memory/` (git-initialized session log store)
+8. Copies `.env.example` and `taxonomy.json.example` templates
 
-Add to `~/.claude.json` under `mcpServers`:
+Safe to re-run — backs up existing files before overwriting.
 
-```json
-"inter-agent-gemini": {
-  "command": "/bin/bash",
-  "args": ["/path/to/triumvirate/mcp-server/start-gemini.sh"],
-  "env": {
-    "GEMINI_CLI_PATH": "/usr/local/bin/gemini",
-    "DEFAULT_TIMEOUT_MS": "300000",
-    "MAX_TIMEOUT_MS": "600000"
-  }
-},
-"inter-agent-codex": {
-  "command": "node",
-  "args": ["/path/to/triumvirate/mcp-server/dist/codex/server.js"],
-  "env": {
-    "CODEX_CLI_PATH": "/usr/local/bin/codex",
-    "DEFAULT_TIMEOUT_MS": "300000",
-    "MAX_TIMEOUT_MS": "600000"
-  }
-}
+### Post-install
+
+```bash
+# Set up credentials (at minimum: GEMINI_API_KEY for pre-compact summarization)
+cp ~/.claude/.env.example ~/.claude/.env
+# Edit ~/.claude/.env with your API keys
+
+# Create your first project (must be a git repo)
+mkdir -p ~/projects/my-project/.claude
+cd ~/projects/my-project && git init
+cp ~/.claude/taxonomy.json.example .claude/taxonomy.json
+# Edit taxonomy.json with your project details
+git add .claude/taxonomy.json && git commit -m "init: add taxonomy"
+
+# Start working
+claude
 ```
 
-### 3. Wire Codex→Gemini (optional)
+See [`starter-kit/README.md`](starter-kit/README.md) for full documentation on hooks, session logs, and configuration.
 
-Add to `~/.codex/config.toml` to give Codex the ability to spawn Gemini:
+### Manual setup
 
-```toml
-[mcp_servers.inter-agent-gemini]
-command = "/bin/bash"
-args = ["/path/to/triumvirate/mcp-server/start-gemini.sh"]
-
-[mcp_servers.inter-agent-gemini.env]
-GEMINI_CLI_PATH = "/usr/local/bin/gemini"
-DEFAULT_TIMEOUT_MS = "300000"
-MAX_TIMEOUT_MS = "600000"
-```
-
-Full setup guides: `docs/setup/`
+If you only want the MCP server (no hooks or session persistence), see [`docs/setup/`](docs/setup/) for individual wiring instructions.
 
 ---
 
@@ -234,30 +226,43 @@ These are the CLIs' own documented escape hatches, intended for controlled progr
 
 ## Roadmap
 
-These features are designed and planned — not yet in the codebase:
-
-- **Pre-compact hooks (reference implementation)** — Working in the author's config, being cleaned up for `docs/hooks/`. Gemini summarizes Claude's transcript before context compaction, restoring continuity across session boundaries.
 - **Ollama as fourth agent** — local, private, zero-cost triage before escalating to cloud models.
 
-### What shipped recently
+### What shipped
 
-- **Automatic session logs on dismiss** — every daemon writes a `SESSION_LOG_SPEC`-compliant log when dismissed. Gemini and Codex both produce structured markdown with taxonomy, context summary, and transcript history. Falls back to a stub log if the agent's write fails.
-- **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `.claude/taxonomy.json` for project taxonomy (`owner`, `client`, `domain`, `repo`, `feature`). Falls back to git remote URL inference or directory name. Writes to `$AI_MEMORY_DIR/<repo>/` or `<cwd>/session-logs/`.
-- **Daemon persistence** — `spawn_daemon({ session_name: "..." })` creates named sessions that survive MCP restarts. Soft dismiss (default) preserves session files. Resume with zero token cost. `list_daemons` auto-discovers hibernated sessions from disk.
-- **Revive-on-ask** — dead daemons (quota-exhausted) probe once on the next `ask_daemon` before giving up permanently. Handles quota resets without re-spawning.
-- **Model fallback chain** — Gemini quota exhaustion falls back automatically through the model chain without user intervention.
+- **Starter Kit** — one-command installer for the complete multi-agent operating environment. See [`starter-kit/`](starter-kit/).
+- **Hook lifecycle** — 8 Claude hooks + 3 Gemini hooks + 2 Codex hooks. Session recovery, auto-staging, The Airlock (file snapshots before edit), token-gated auto-save, Gemini-powered transcript summarization before context compaction.
+- **Automatic session logs on dismiss** — every daemon writes a `SESSION_LOG_SPEC`-compliant log when dismissed. Gemini and Codex both produce structured markdown with taxonomy, context summary, and transcript history.
+- **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `.claude/taxonomy.json` for project taxonomy.
+- **Daemon persistence** — `spawn_daemon({ session_name: "..." })` creates named sessions that survive MCP restarts. Soft dismiss preserves session files. Resume with zero token cost.
+- **Revive-on-ask** — dead daemons probe once on the next `ask_daemon` before giving up permanently.
+- **Model fallback chain** — Gemini quota exhaustion falls back automatically through the model chain.
+- **Inter-agent skills** — Codex skills for `/send-to-claude`, `/send-to-gemini`, `/send-to-codex`, `/send-to-siblings` (dual escalation).
 
 PRs welcome. The agents review their own contributions.
 
 ---
 
-## Hooks (advanced)
+## Hooks
 
-Want session logs that survive context compaction — where Gemini automatically summarizes your Claude transcript before memory is lost and restores it on the next session? That's `Tier 2`: a hooks system built on Claude Code's lifecycle hooks.
+The starter-kit includes a complete hook lifecycle for all three agents. These are installed by `install.sh` and work out of the box.
 
-The hooks use Claude Code's `PreCompact` event to pipe the transcript through Gemini for summarization, save a versioned session log, and restore context on the next session start. They're the most iterated part of the system — reference implementations coming to `docs/hooks/`.
+| Hook | Agent | Event | What it does |
+|------|-------|-------|-------------|
+| `session-start.sh` | Claude | SessionStart | Project picker (from HOME) or session recovery (from project) |
+| `post-compact-recovery.sh` | Claude | SessionStart:compact | Restores context from session log after compaction |
+| `pre-compact.sh` | Claude | PreCompact | Gemini summarizes transcript → session log → git commit |
+| `post-tool-use.sh` | Claude | PostToolUse | Auto-stages files, logs activity |
+| `post-tool-use-token-gate.sh` | Claude | PostToolUse | Auto-saves at ~50K token intervals |
+| `pre-tool-use-artifact-guard.sh` | Claude | PreToolUse | **The Airlock** — snapshots every file before edit |
+| `pre-tool-use-bash-guard.sh` | Claude | PreToolUse | Blocks destructive SQL without fresh backup |
+| `session-start.sh` | Gemini | SessionStart | Session log recovery |
+| `pre-compact.sh` | Gemini | PreCompact | Self-summarization → session log → git commit |
+| `post-tool-use.sh` | Gemini | PostToolUse | Auto-stages files, logs activity |
 
-The hooks are extensible. The ClickUp integration in the author's config is an example of wiring a PM tool into the hook lifecycle: source a shared library, run in a background subshell `( ... ) &`, gate with an env var. Same pattern works for Linear, Jira, GitHub Projects, or any webhook-based tool.
+The hooks are extensible. Wire PM tools (Linear, Jira, GitHub Projects) into the lifecycle using the same pattern: source a shared library, run in a background subshell `( ... ) &`, gate with an env var.
+
+See [`starter-kit/README.md`](starter-kit/README.md) for full hook documentation and configuration variables.
 
 ---
 

@@ -10,35 +10,61 @@ SOURCE=$(echo "$INPUT" | jq -r '.source // "startup"')
 HOME_DIR="$HOME"
 WALL_TIME=$(TZ='America/New_York' date '+%Y-%m-%d %H:%M %Z')
 
-# Optional: Source credentials vault (auto-export all vars to child processes)
-# Create ~/.claude/.env with your API keys (see shared/.env.example)
-# Uncomment the block below if you use a .env file:
-# if [ -f "$HOME/.claude/.env" ]; then
-#   set -a
-#   source "$HOME/.claude/.env"
-#   set +a
-# fi
+# Source credentials vault (auto-export all vars to child processes)
+if [ -f "$HOME/.claude/.env" ]; then
+  set -a
+  source "$HOME/.claude/.env"
+  set +a
+fi
 
 # Source shared session log finder
 source "$HOME/.claude/hooks/_find-session-log.sh" 2>/dev/null
 
 # --- Skip picker on resume/compact (already have conversation context) ---
 if [ "$SOURCE" = "resume" ] || [ "$SOURCE" = "compact" ]; then
+  LESSONS_MAX_CHARS=6000
+  ADDED_LESSON_PATHS="|"
   LESSONS_CTX=""
-  if [ -f "$HOME_DIR/.claude/lessons.md" ]; then
-    LESSONS_CTX="$LESSONS_CTX
+
+  # For compact starts, avoid duplicating large lessons payload here.
+  # post-compact-recovery.sh injects the recovery narrative + lessons.
+  if [ "$SOURCE" != "compact" ]; then
+    append_lessons() {
+      local label="$1"
+      local path="$2"
+      [ -z "$path" ] && return
+      [ ! -f "$path" ] && return
+
+      local norm
+      norm="$(cd "$(dirname "$path")" 2>/dev/null && pwd)/$(basename "$path")"
+      case "$ADDED_LESSON_PATHS" in
+        *"|$norm|"*) return ;;
+      esac
+      ADDED_LESSON_PATHS="${ADDED_LESSON_PATHS}${norm}|"
+
+      local body
+      body="$(cat "$path")"
+      local size=${#body}
+      if [ "$size" -gt "$LESSONS_MAX_CHARS" ]; then
+        body="$(printf "%s" "$body" | head -c "$LESSONS_MAX_CHARS")"
+        body="$body
+
+[LESSONS TRUNCATED — showing first ${LESSONS_MAX_CHARS} of ${size} chars]"
+      fi
+
+      LESSONS_CTX="$LESSONS_CTX
 
 ---
-📚 GLOBAL LESSONS ($HOME_DIR/.claude/lessons.md):
-$(cat "$HOME_DIR/.claude/lessons.md")"
-  fi
-  if [ -n "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/lessons.md" ]; then
-    LESSONS_CTX="$LESSONS_CTX
+$label ($path):
+$body"
+    }
 
----
-📁 PROJECT LESSONS ($PROJECT_DIR/lessons.md):
-$(cat "$PROJECT_DIR/lessons.md")"
+    append_lessons "📚 GLOBAL LESSONS" "$HOME_DIR/.claude/lessons.md"
+    if [ -n "$PROJECT_DIR" ]; then
+      append_lessons "📁 PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
+    fi
   fi
+
   jq -n --arg wt "$WALL_TIME" --arg src "$SOURCE" --arg lessons "$LESSONS_CTX" '{
     "hookSpecificOutput": {
       "hookEventName": "SessionStart",

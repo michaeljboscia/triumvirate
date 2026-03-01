@@ -9,6 +9,8 @@
 INPUT=$(cat)
 PROJECT_DIR=$(echo "$INPUT" | jq -r '.cwd // empty')
 TIMESTAMP=$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')
+LESSONS_MAX_CHARS=6000
+ADDED_LESSON_PATHS="|"
 
 # Source shared session log finder
 source "$HOME/.claude/hooks/_find-session-log.sh" 2>/dev/null
@@ -79,20 +81,41 @@ else
 The session log should contain the narrative from before compaction."
 fi
 
-# Inject lessons into recovery context
-if [ -f "$HOME/.claude/lessons.md" ]; then
+# Inject lessons into recovery context (dedup + capped).
+append_lessons() {
+  local label="$1"
+  local path="$2"
+  [ -z "$path" ] && return
+  [ ! -f "$path" ] && return
+
+  # Normalize to avoid double-including same file via different labels.
+  local norm
+  norm="$(cd "$(dirname "$path")" 2>/dev/null && pwd)/$(basename "$path")"
+  case "$ADDED_LESSON_PATHS" in
+    *"|$norm|"*) return ;;
+  esac
+  ADDED_LESSON_PATHS="${ADDED_LESSON_PATHS}${norm}|"
+
+  local body
+  body="$(cat "$path")"
+  local size=${#body}
+  if [ "$size" -gt "$LESSONS_MAX_CHARS" ]; then
+    body="$(printf "%s" "$body" | head -c "$LESSONS_MAX_CHARS")"
+    body="$body
+
+[LESSONS TRUNCATED — showing first ${LESSONS_MAX_CHARS} of ${size} chars]"
+  fi
+
   RECOVERY_MSG="$RECOVERY_MSG
 
 ---
-📚 GLOBAL LESSONS ($HOME/.claude/lessons.md):
-$(cat "$HOME/.claude/lessons.md")"
-fi
-if [ -n "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/lessons.md" ]; then
-  RECOVERY_MSG="$RECOVERY_MSG
+$label ($path):
+$body"
+}
 
----
-📁 PROJECT LESSONS ($PROJECT_DIR/lessons.md):
-$(cat "$PROJECT_DIR/lessons.md")"
+append_lessons "📚 GLOBAL LESSONS" "$HOME/.claude/lessons.md"
+if [ -n "$PROJECT_DIR" ]; then
+  append_lessons "📁 PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
 fi
 
 # Output for Claude to see

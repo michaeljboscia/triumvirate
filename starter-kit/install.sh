@@ -170,13 +170,22 @@ ok "Codex configuration installed"
 # ── 4. Gemini CLI ──────────────────────────────────────────────
 info "Installing Gemini CLI configuration..."
 GEMINI_DIR="$HOME/.gemini"
-mkdir -p "$GEMINI_DIR"
+mkdir -p "$GEMINI_DIR/hooks"
 
 if [[ -f "$GEMINI_DIR/GEMINI.md" ]]; then
   warn "GEMINI.md already exists — skipping."
 else
   install_file "$SCRIPT_DIR/gemini/GEMINI.md" "$GEMINI_DIR/GEMINI.md"
 fi
+
+# Gemini hooks (session persistence, auto-stage, pre-compact summarization)
+for hook in "$SCRIPT_DIR"/gemini/hooks/*.sh; do
+  [[ -f "$hook" ]] || continue
+  dest="$GEMINI_DIR/hooks/$(basename "$hook")"
+  install_file "$hook" "$dest"
+  chmod +x "$dest"
+done
+ok "Gemini hooks installed ($(ls "$SCRIPT_DIR"/gemini/hooks/*.sh 2>/dev/null | wc -l | tr -d ' ') files)"
 
 ok "Gemini configuration installed"
 
@@ -291,7 +300,21 @@ fi
 cp "$SCRIPT_DIR/shared/taxonomy.json.example" "$HOME/.claude/taxonomy.json.example"
 ok "Copied taxonomy.json.example to ~/.claude/"
 
-# ── 6. Verify ─────────────────────────────────────────────────
+# ── 7. AI Memory Directory ──────────────────────────────────
+# Central session log store — all agents write here when it exists.
+# This is a git repo so session logs are versioned and shareable.
+AI_MEM_DIR="$HOME/.ai-memory"
+if [[ -d "$AI_MEM_DIR" ]]; then
+  info "AI memory directory already exists: $AI_MEM_DIR"
+else
+  info "Creating AI memory directory..."
+  mkdir -p "$AI_MEM_DIR"
+  (cd "$AI_MEM_DIR" && git init --quiet)
+  ok "Created $AI_MEM_DIR (git-initialized)"
+  info "Session logs will be stored here when projects have a taxonomy.json"
+fi
+
+# ── 8. Verify ─────────────────────────────────────────────────
 echo ""
 info "Verifying installation..."
 ISSUES=0

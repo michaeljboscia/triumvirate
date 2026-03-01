@@ -25,6 +25,9 @@ One-command setup for the complete multi-agent operating environment.
 
 ### Gemini CLI Configuration
 - `GEMINI.md` — Starter instructions for Gemini as a Triumvirate member
+- `hooks/session-start.sh` — Session log recovery for Gemini
+- `hooks/pre-compact.sh` — Self-summarization before context compaction (Gemini summarizes its own transcript)
+- `hooks/post-tool-use.sh` — Auto-stages files, logs activity to session log
 
 ### Shared Templates
 - `.env.example` — Credential vault template (API keys)
@@ -201,13 +204,17 @@ All three agents (Claude, Codex, Gemini) read/write session logs in this format 
 
 ## What the Installer Does
 
-1. **Copies hooks** to `~/.claude/hooks/` (backs up existing files)
+1. **Copies Claude hooks** (8 files) to `~/.claude/hooks/` (backs up existing)
 2. **Merges hook config** into `~/.claude/settings.json` (or creates if absent)
 3. **Installs CLAUDE.md** starter template (skips if you already have one)
 4. **Copies Codex hooks + skills** to `~/.codex/`
 5. **Installs config.toml** template for Codex (skips if exists)
-6. **Installs GEMINI.md** starter template (skips if exists)
-7. **Copies .env.example** and **taxonomy.json.example** as reference
+6. **Copies Gemini hooks** (3 files) to `~/.gemini/hooks/`
+7. **Installs GEMINI.md** starter template (skips if exists)
+8. **Builds the inter-agent MCP server** (`npm install && npm run build`)
+9. **Wires MCP configs** for all three agents (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
+10. **Copies .env.example** and **taxonomy.json.example** as reference
+11. **Creates `~/.ai-memory/`** — git-initialized central session log store
 
 Safe to re-run — always backs up before overwriting.
 
