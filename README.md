@@ -25,12 +25,13 @@ The core: an MCP server that gives each agent the ability to **spawn**, **query*
 ## How it works
 
 ```
-Star topology (default)          Triangle topology (Codex→Gemini)
+Star topology (default)            Triangle topology (Codex→Gemini)
 
-      Claude                           Claude
-     /     \                          /
-  Gemini   Codex               Codex ──── Gemini
-                               (Codex manages Gemini internally)
+      Claude                              Claude
+      /    \                              /
+     /      \                            /
+  Gemini   Codex                  Codex ──── Gemini
+                                  (Codex manages Gemini internally)
 ```
 
 **Star:** Claude orchestrates. You ask Claude something, Claude decides whether to delegate to Gemini (large context, research) or Codex (code review, generation). Claude synthesizes the results.
@@ -192,24 +193,6 @@ The inter-agent MCP server went through seven rounds of peer review by Gemini an
 The system that lets AI agents coordinate was itself coordinated by AI agents.
 
 That felt worth sharing.
-
----
-
-## Why not Agent Relay?
-
-[Agent Relay](https://github.com/AgentWorkforce/relay) is a proper pub-sub messaging framework — channels, callbacks, real-time routing. It's the right architecture if you're building agents from scratch.
-
-Triumvirate is different:
-
-| | Triumvirate | Relay |
-|--|--|--|
-| Infrastructure | No relay server — stdio MCP processes only | Relay server required |
-| Sessions | Stateful — full conversation history | Stateless pub-sub |
-| Agents | Wrap existing CLIs you already have | Build on the framework |
-| Topology | Orchestrator + optional peer-to-peer | Equal peers |
-| Setup | Wire tools you already use | Build new agents |
-
-If you already have Claude Code, Gemini CLI, and Codex — Triumvirate wires them together without adding infrastructure.
 
 ---
 
