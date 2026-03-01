@@ -62,11 +62,71 @@ python3 stenographer.py --agent claude --transcript /path/to/transcript.jsonl --
 ## Prerequisites
 
 - **Python 3.9+** (uses `zoneinfo` for timezone-aware timestamps)
-- **Ollama** installed and running (`brew install ollama` / `curl -fsSL https://ollama.ai/install.sh | sh`)
+- **Ollama** installed and running
 - **A model pulled** — default is `qwen2.5:32b` (19GB). Smaller options:
   - `qwen2.5:14b` — 8.7GB, faster, slightly lower quality
   - `qwen2.5:7b` — 4.4GB, fast, adequate for basic notes
   - Set via `STENOGRAPHER_MODEL` env var or `--model` flag
+
+## Setup
+
+After running `install.sh`, complete these three steps:
+
+**1. Install Ollama**
+
+```bash
+# macOS
+brew install ollama
+
+# Linux
+curl -fsSL https://ollama.ai/install.sh | sh
+```
+
+Or download from [ollama.com](https://ollama.com).
+
+**2. Start the Ollama service**
+
+```bash
+ollama serve
+```
+
+On macOS, the Ollama.app starts the service automatically at login. On Linux, you can run `ollama serve` in a terminal or set it up as a systemd service.
+
+Verify it's running:
+
+```bash
+curl http://localhost:11434/api/version
+# → {"version":"..."}
+```
+
+**3. Pull a model**
+
+Choose based on available RAM:
+
+```bash
+ollama pull qwen2.5:32b    # 19GB — best quality, recommended if you have ≥24GB RAM
+ollama pull qwen2.5:14b    # 8.7GB — good balance for 16GB machines
+ollama pull qwen2.5:7b     # 4.4GB — fast, adequate, runs on most hardware
+```
+
+The model only needs to be pulled once. Ollama caches it locally.
+
+**4. Verify end-to-end**
+
+```bash
+# Dry run against your most recent Claude transcript (no Ollama call, just parsing)
+python3 ~/.triumvirate/stenographer/stenographer.py \
+  --agent claude \
+  --transcript "$(ls -t ~/.claude/projects/$(printf '%s' "$HOME" | sed 's|/|-|g' | sed 's/^-//')/*.jsonl | head -1)" \
+  --dry-run
+
+# If parsing looks right, run live (calls Ollama)
+python3 ~/.triumvirate/stenographer/stenographer.py \
+  --agent claude \
+  --transcript "$(ls -t ~/.claude/projects/$(printf '%s' "$HOME" | sed 's|/|-|g' | sed 's/^-//')/*.jsonl | head -1)"
+```
+
+After a successful run, check `~/.triumvirate/stenographer.log` — you'll see a timestamped entry. From then on, the token gate calls Stenographer automatically in the background every ~50K tokens.
 
 ## Configuration
 

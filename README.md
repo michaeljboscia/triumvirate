@@ -99,7 +99,7 @@ Why local? The pre-compact hook used to pipe full Gemini transcripts to the Gemi
 
 Supported transcript formats: Claude Code JSONL, Codex JSONL, Gemini JSON arrays.
 
-See [`starter-kit/stenographer/`](starter-kit/stenographer/) for setup and configuration.
+See [`starter-kit/stenographer/README.md`](starter-kit/stenographer/README.md) for step-by-step Ollama setup, model selection, and configuration.
 
 ### System: The Airlock — file snapshot safety net
 
