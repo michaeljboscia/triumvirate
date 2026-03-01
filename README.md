@@ -27,11 +27,11 @@ The core: an MCP server that gives each agent the ability to **spawn**, **query*
 ```
 Star topology (default)            Triangle topology (Codex→Gemini)
 
-      Claude                              Claude
-      /    \                              /
-     /      \                            /
-  Gemini   Codex                  Codex ──── Gemini
-                                  (Codex manages Gemini internally)
+       Claude                              Claude
+       │    │                              │
+       │    │                              │
+  Gemini    Codex                   Codex ──── Gemini
+                                   (Codex manages Gemini internally)
 ```
 
 **Star:** Claude orchestrates. You ask Claude something, Claude decides whether to delegate to Gemini (large context, research) or Codex (code review, generation). Claude synthesizes the results.
