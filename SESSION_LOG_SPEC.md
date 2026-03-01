@@ -271,44 +271,60 @@ When resuming work another agent started:
 
 ### Claude ✅
 - [x] Pre-compact hook generates session logs
-- [x] Naming convention implemented
+- [x] Naming convention with `_claude` suffix
 - [x] Git auto-commit on log creation
-- [ ] Add `_claude` suffix to filename
-- [ ] Update hook to use new naming
+- [x] `computeAgentLogPath` resolves to `$AI_MEMORY_DIR/<repo>/`
 
 ### Gemini ✅
-- [x] Pre-compact hook generates session logs
-- [x] Naming convention implemented
+- [x] `dismiss_daemon` auto-writes session log (Layer A)
+- [x] Naming convention with `_gemini` suffix
 - [x] Git auto-commit on log creation
-- [ ] Add `_gemini` suffix to filename
-- [ ] Update hook to use new naming
+- [x] `computeAgentLogPath` resolves to `$AI_MEMORY_DIR/<repo>/`
+- [x] Fallback stub written if Gemini's own write fails
+- [x] `log_written` idempotency flag (set only after `existsSync` confirms)
 
-### Codex 🚧
-- [x] Native JSONL logging works
-- [ ] Create session summary generator
-- [ ] Implement naming convention
-- [ ] Add git auto-commit
-- [ ] Create pre-session-end hook or manual command
+### Codex ✅
+- [x] `dismiss_daemon` auto-writes session log (Layer A)
+- [x] Naming convention with `_codex` suffix
+- [x] Git auto-commit on log creation
+- [x] `computeAgentLogPath` resolves to `$AI_MEMORY_DIR/<repo>/`
+- [x] Fallback stub written if Codex's own write fails
+- [x] `log_written` idempotency flag
 
 ---
 
 ## Appendix: Agent-Specific Implementation Notes
 
-### Codex Implementation Plan
+### How Daemon Session Logs Work (Layer A)
 
-Codex doesn't have hooks like Claude/Gemini. Options:
-1. **Manual command:** `/save-session` skill that generates summary
-2. **Post-session script:** Run after `codex` exits
-3. **Periodic auto-save:** Background process monitors session activity
+When `dismiss_daemon` is called, the MCP server:
 
-Recommended: Create a Codex skill that:
-1. Reads current session from `~/.codex/sessions/...`
-2. Summarizes using GPT (or Gemini via MCP)
-3. Writes markdown to `session-logs/`
-4. Git commits
+1. Checks the `log_written` flag — skips if already written
+2. Computes the log path via `computeAgentLogPath(cwd, agent)`
+3. Resumes the daemon with a prompt asking it to write the log
+4. Waits up to 150 seconds for the agent to write the file
+5. If the file doesn't exist after the agent returns, writes a fallback stub
+6. Sets `log_written = true` only after `existsSync(logPath)` confirms success
+7. Git-commits the log if the memory repo is a git working tree
 
-### Claude/Gemini Updates Needed
+**Gemini:** Uses `gemini -r latest` with the dismiss prompt via stdin.
+**Codex:** Uses `codex exec resume <thread_id>` with the dismiss prompt as a positional argument.
 
-1. Modify `pre-compact.sh` to append `_<agent>` to filename
-2. Add `Agent:` field to log header
-3. Update TRANSCRIPT HISTORY format to include agent column
+### Taxonomy Source (`taxonomy.json`)
+
+The log filename includes five taxonomy fields. The `computeAgentLogPath` function reads these from `.claude/taxonomy.json` in the project root:
+
+```json
+{
+  "owner": "yourname",
+  "client": "acme-corp",
+  "domain": "outreach",
+  "repo": "my-project",
+  "feature": "auth-refactor"
+}
+```
+
+Fallback chain if `taxonomy.json` is missing:
+1. Infer `owner` and `repo` from `git remote get-url origin`
+2. Infer `repo` from directory name
+3. Use `"unknown"` as final fallback

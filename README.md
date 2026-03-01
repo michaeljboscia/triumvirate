@@ -161,13 +161,19 @@ Full setup guides: `docs/setup/`
 
 Triumvirate defines a cross-agent session log standard (`SESSION_LOG_SPEC.md`) — a shared markdown format so every agent documents its work in a way all three can read.
 
+Session logs are AI working memory — they don't belong inside project repos. They go to a dedicated private memory repo:
+
 ```
-project/
-└── session-logs/
+~/.ai-memory/                          # or $AI_MEMORY_DIR
+└── my-project/
     ├── owner--client_domain_repo_feature_20260228_v1_gemini.md
     ├── owner--client_domain_repo_feature_20260228_v1_codex.md
     └── owner--client_domain_repo_feature_20260228_v80_claude.md
 ```
+
+Set `AI_MEMORY_DIR` to point to your private memory repo. If not set, logs fall back to `<project>/session-logs/`.
+
+**Automatic logging:** When you `dismiss_daemon`, the agent writes a `SESSION_LOG_SPEC`-compliant log before the session closes. No manual `/save-session` needed — dismiss produces a log.
 
 Three agents, three logs, one shared directory. Any agent can read any other agent's log to pick up context across sessions.
 
@@ -220,13 +226,13 @@ These are the CLIs' own documented escape hatches, intended for controlled progr
 
 These features are designed and planned — not yet in the codebase:
 
-- **Automatic session logs on dismiss** — every daemon writes a structured log to `session-logs/` automatically when dismissed. The spec is defined in `SESSION_LOG_SPEC.md`; the `dismiss_daemon` implementation is in progress.
 - **Pre-compact hooks** — Gemini summarizes Claude's transcript before context compaction, restoring continuity across session boundaries. Reference implementation coming to `docs/hooks/`.
-- **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `taxonomy.json` for all five fields including `feature`.
 - **Ollama as fourth agent** — local, private, zero-cost triage before escalating to cloud models.
 
 ### What shipped recently
 
+- **Automatic session logs on dismiss** — every daemon writes a `SESSION_LOG_SPEC`-compliant log when dismissed. Gemini and Codex both produce structured markdown with taxonomy, context summary, and transcript history. Falls back to a stub log if the agent's write fails.
+- **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `.claude/taxonomy.json` for project taxonomy (`owner`, `client`, `domain`, `repo`, `feature`). Falls back to git remote URL inference or directory name. Writes to `$AI_MEMORY_DIR/<repo>/` or `<cwd>/session-logs/`.
 - **Daemon persistence** — `spawn_daemon({ session_name: "..." })` creates named sessions that survive MCP restarts. Soft dismiss (default) preserves session files. Resume with zero token cost. `list_daemons` auto-discovers hibernated sessions from disk.
 - **Revive-on-ask** — dead daemons (quota-exhausted) probe once on the next `ask_daemon` before giving up permanently. Handles quota resets without re-spawning.
 - **Model fallback chain** — Gemini quota exhaustion falls back automatically through the model chain without user intervention.
