@@ -1,6 +1,6 @@
 # triumvirate
 
-**Three AI agents. One coordination layer. No relay server.**
+**Three AI agents. One coordination layer.**
 
 Claude Code, Gemini CLI, and Codex work together — sharing context, delegating tasks, and documenting their own work — without you having to be the relay.
 
