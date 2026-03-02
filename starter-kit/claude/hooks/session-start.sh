@@ -5,8 +5,18 @@
 # When in a project: Read latest session log (existing behavior)
 
 INPUT=$(cat)
+# DEBUG: log raw input to see what Claude Code actually sends (remove after diagnosis)
+echo "$(date -u +%H:%M:%S) INPUT=$INPUT" >> /tmp/session-start-debug.log
 PROJECT_DIR=$(echo "$INPUT" | jq -r '.cwd // empty')
 SOURCE=$(echo "$INPUT" | jq -r '.reason // .source // .trigger // "startup"')
+
+# Sentinel check: post-compact-recovery.sh (matcher: compact) fires before this hook
+# (matcher: *) for the same SessionStart:compact event. If the sentinel exists, this
+# IS a compact start — skip full session injection, recovery hook handles it.
+if [ -f /tmp/claude-compact-active ]; then
+  rm -f /tmp/claude-compact-active
+  SOURCE="compact"
+fi
 HOME_DIR="$HOME"
 WALL_TIME=$(TZ='America/New_York' date '+%Y-%m-%d %H:%M %Z')
 
