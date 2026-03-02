@@ -119,7 +119,7 @@ fi
 # Output for Claude to see
 jq -n --arg msg "$RECOVERY_MSG" '{
   "hookSpecificOutput": {
-    "hookEventName": "SessionStart:compact",
+    "hookEventName": "SessionStart",
     "additionalContext": $msg
   }
 }'
