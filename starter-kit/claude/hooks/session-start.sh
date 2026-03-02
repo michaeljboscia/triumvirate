@@ -67,15 +67,10 @@ $body"
   fi
 
   if [ "$SOURCE" = "compact" ]; then
-    # On compact: output NO additionalContext — post-compact-recovery.sh already
-    # injected the full session context. Claude Code uses the LAST hook's output,
-    # so any additionalContext here would OVERWRITE recovery's 14KB of session log.
-    # Just emit the wall time as a silent acknowledgement.
-    jq -n --arg wt "$WALL_TIME" '{
-      "hookSpecificOutput": {
-        "hookEventName": "SessionStart"
-      }
-    }'
+    # On compact: emit NO JSON at all. post-compact-recovery.sh owns context injection.
+    # Even emitting hookSpecificOutput without additionalContext may clobber recovery's
+    # context under strict last-writer-wins (Codex review finding). Silent exit is safest.
+    exit 0
   else
     # resume/startup: inject wall time + lessons as before
     jq -n --arg wt "$WALL_TIME" --arg src "$SOURCE" --arg lessons "$LESSONS_CTX" '{
