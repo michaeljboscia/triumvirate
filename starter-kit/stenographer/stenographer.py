@@ -279,28 +279,85 @@ def ollama_generate(prompt: str) -> str:
 
 # ─── Session Log Management ───────────────────────────────────────────────
 
-def find_or_create_session_log(agent: str, session_state: dict, transcript_path: str) -> str:
-    """Find existing session log or create a new one."""
-    # Check if state already has a log path
+def _get_repo_name(cwd: str) -> str:
+    """Get repo name from taxonomy.json, git remote, or directory name."""
+    # Taxonomy first (most reliable)
+    taxonomy = Path(cwd) / '.claude' / 'taxonomy.json'
+    if taxonomy.exists():
+        try:
+            with open(taxonomy) as f:
+                data = json.load(f)
+            repo = data.get('repo', '')
+            if repo:
+                return repo
+        except Exception:
+            pass
+
+    # Git remote fallback
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            repo = url.split('/')[-1].replace('.git', '')
+            if repo:
+                return repo
+    except Exception:
+        pass
+
+    return Path(cwd).name
+
+
+def find_or_create_session_log(agent: str, session_state: dict, transcript_path: str,
+                                cwd: str = None) -> str:
+    """Find existing session log or create a new one.
+
+    Priority:
+    1. Latest hook-created log in ~/.ai-memory/{repo}/ (if cwd known).
+       Always checked dynamically so post-compaction files are found immediately.
+    2. Cached path from state (if cwd unavailable or no hook files found).
+    3. Create new file in ~/.ai-memory/stenographer/ (fallback).
+    """
+    ai_memory = Path.home() / '.ai-memory'
+
+    # Priority 1: Latest hook file in ~/.ai-memory/{repo}/
+    # Re-checked on every call so we follow the hook to its new file after each compaction.
+    if cwd and ai_memory.exists():
+        repo = _get_repo_name(cwd)
+        if repo:
+            repo_dir = ai_memory / repo
+            if repo_dir.exists():
+                candidates = sorted(
+                    repo_dir.glob('*--*_v*.md'),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True
+                )
+                if candidates:
+                    hook_log = str(candidates[0])
+                    session_state['session_log_path'] = hook_log
+                    log('INFO', 'Using hook session log', path=hook_log)
+                    return hook_log
+
+    # Priority 2: Cached path from state
     existing = session_state.get('session_log_path')
     if existing and os.path.exists(existing):
         return existing
 
-    # Determine output directory
-    ai_memory = Path.home() / '.ai-memory'
+    # Priority 3: Create new file in stenographer directory (no hook files yet)
     if ai_memory.exists():
         log_dir = ai_memory / 'stenographer'
     else:
         log_dir = TRIUMVIRATE_DIR / 'session-logs'
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate filename from transcript
     transcript_name = Path(transcript_path).stem
     date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f"stenographer_{agent}_{date_str}_{transcript_name[:20]}.md"
     log_path = log_dir / filename
 
-    # Create with header
     header = f"""# Stenographer Session Log — {agent.title()}
 
 **Agent:** {agent}
@@ -339,7 +396,7 @@ def append_to_session_log(log_path: str, section_text: str, save_number: int, st
 
 # ─── Main Pipeline ─────────────────────────────────────────────────────────
 
-def run(agent: str, transcript_path: str, session_log_override: str = None):
+def run(agent: str, transcript_path: str, session_log_override: str = None, cwd: str = None):
     """
     Main stenographer pipeline.
 
@@ -476,7 +533,7 @@ def run(agent: str, transcript_path: str, session_log_override: str = None):
         if session_log_override:
             log_path = session_log_override
         else:
-            log_path = find_or_create_session_log(agent, session, transcript_path)
+            log_path = find_or_create_session_log(agent, session, transcript_path, cwd)
 
         session['saves_count'] += 1
         append_to_session_log(log_path, notes, session['saves_count'], stats)
@@ -534,6 +591,10 @@ def main():
     parser.add_argument(
         '--reset', action='store_true',
         help='Reset state for this agent (process from beginning)'
+    )
+    parser.add_argument(
+        '--cwd',
+        help='Working directory of the project (used to locate hook session log)'
     )
 
     args = parser.parse_args()
@@ -593,7 +654,7 @@ def main():
         return
 
     # Normal run
-    success = run(args.agent, args.transcript, args.session_log)
+    success = run(args.agent, args.transcript, args.session_log, args.cwd)
     sys.exit(0 if success else 1)
 
 
