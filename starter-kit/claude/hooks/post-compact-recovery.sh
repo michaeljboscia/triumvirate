@@ -116,22 +116,9 @@ if [ -n "$PROJECT_DIR" ]; then
   append_lessons "📁 PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
 fi
 
-# Print the full recovery summary directly to the terminal via /dev/tty.
-# /dev/tty bypasses Claude Code's stdout/stderr capture — it writes to the
-# physical terminal device directly, so you see it immediately without waiting
-# for Claude to respond. Zero extra token cost.
-#
-# RECOVERY_PRINT_SUMMARY=1  → print full session context to terminal (default: on)
-# RECOVERY_PRINT_SUMMARY=0  → silent (Claude still gets full context via additionalContext)
-if [ "${RECOVERY_PRINT_SUMMARY:-1}" = "1" ] && [ -n "$GEMINI_SUMMARY" ] && [ -e /dev/tty ]; then
-  {
-    printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
-    printf '🔄 COMPACTION RECOVERY — %s\n' "$TIMESTAMP"
-    printf '📄 %s\n' "$(basename "$SESSION_LOG" 2>/dev/null)"
-    printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
-    printf '%s\n\n' "$GEMINI_SUMMARY"
-  } > /dev/tty
-fi
+# Note: /dev/tty write was attempted here but caused Claude Code's Ink UI to
+# corrupt and the hook to error. Removed. Context is available via additionalContext
+# below — Claude receives it and can surface key points in its first response.
 
 # Output for Claude to see
 jq -n --arg msg "$RECOVERY_MSG" '{
