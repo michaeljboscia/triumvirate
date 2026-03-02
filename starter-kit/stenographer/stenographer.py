@@ -550,6 +550,26 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
         log('INFO', 'State updated successfully',
             agent=agent, cursor=new_cursor, saves=session['saves_count'])
 
+        # ─── Write completion notification for hook to surface ───
+        # The token gate hook checks this file on the next tool call and
+        # displays a visible block. Deleted after first read.
+        notify_path = TRIUMVIRATE_DIR / 'stenographer-notify.json'
+        try:
+            with open(notify_path, 'w') as f:
+                json.dump({
+                    'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                    'log_path': log_path,
+                    'log_basename': os.path.basename(log_path),
+                    'words': len(notes.split()),
+                    'chars': len(notes),
+                    'save_number': session['saves_count'],
+                    'tool_calls': stats.get('tool_calls', 0),
+                    'user_messages': stats.get('user_messages', 0),
+                    'chars_processed': stats.get('chars_emitted', 0),
+                }, f)
+        except OSError:
+            pass  # Notification is best-effort — don't fail the run
+
         return True
 
     except Exception as e:
