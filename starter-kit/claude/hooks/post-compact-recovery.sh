@@ -29,27 +29,20 @@ fi
 # Cap at 80KB (~20K tokens) — take the TAIL (most recent = most useful)
 GEMINI_SUMMARY=""
 if [ -n "$SESSION_LOG" ] && [ -f "$SESSION_LOG" ]; then
-  # Try Gemini section first. Use awk with KNOWN document-level section names as
-  # stop-conditions — NOT any "^## " heading. Gemini's own output uses ## headings
-  # (## OVERALL GOAL, ## KEY DECISIONS, etc.) so stopping at any ## would truncate
-  # the summary immediately. Only stop at template-defined doc-level sections.
+  # Inject the full session log — Gemini summary, Stenographer notes, manually
+  # written SESSION UPDATE sections, all of it. Skip boilerplate header sections
+  # (TAXONOMY, TRANSCRIPT HISTORY, CONTEXT COMPACTION, ACTIVITY LOG, INSTRUCTIONS)
+  # since those are metadata, not working context.
   RAW_NARRATIVE=$(awk '
-    /^## 🧠 GEMINI CONTEXT SUMMARY/{found=1; next}
-    found && /^## (CONTEXT COMPACTION OCCURRED|SESSION ACTIVITY LOG|INSTRUCTIONS FOR NEXT SESSION|TRANSCRIPT HISTORY|TAXONOMY)/{exit}
-    found{print}
+    /^## (TAXONOMY|TRANSCRIPT HISTORY|CONTEXT COMPACTION OCCURRED|SESSION ACTIVITY LOG|INSTRUCTIONS FOR NEXT SESSION)/{skip=1}
+    /^## / && !/^## (TAXONOMY|TRANSCRIPT HISTORY|CONTEXT COMPACTION OCCURRED|SESSION ACTIVITY LOG|INSTRUCTIONS FOR NEXT SESSION)/{skip=0}
+    !skip{print}
   ' "$SESSION_LOG" 2>/dev/null)
-  # Fall back to jq narrative section if Gemini section absent or empty
-  if [ -z "$RAW_NARRATIVE" ]; then
-    RAW_NARRATIVE=$(awk '
-      /^## 📋 SESSION NARRATIVE/{found=1; next}
-      found && /^## (CONTEXT COMPACTION OCCURRED|SESSION ACTIVITY LOG|INSTRUCTIONS FOR NEXT SESSION|TRANSCRIPT HISTORY|TAXONOMY)/{exit}
-      found{print}
-    ' "$SESSION_LOG" 2>/dev/null)
-  fi
+
   NARRATIVE_SIZE=${#RAW_NARRATIVE}
   MAX_CHARS=80000
   if [ "$NARRATIVE_SIZE" -gt "$MAX_CHARS" ]; then
-    GEMINI_SUMMARY="[NARRATIVE TRUNCATED — showing most recent ${MAX_CHARS} of ${NARRATIVE_SIZE} chars. Full log: $SESSION_LOG]
+    GEMINI_SUMMARY="[SESSION LOG TRUNCATED — showing most recent ${MAX_CHARS} of ${NARRATIVE_SIZE} chars. Full log: $SESSION_LOG]
 
 $(echo "$RAW_NARRATIVE" | tail -c "$MAX_CHARS")"
   else
