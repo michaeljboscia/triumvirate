@@ -84,9 +84,38 @@ _write_state "$(jq -cn \
   '{call_count:$count, last_save_bytes:$lsb, last_save_time:$lst, saves_this_session:$sts}')" \
   2>/dev/null
 
+# ─── Stenographer completion notification ────────────────────────────────────
+# Stenographer runs in the background. When it finishes it writes a notify file.
+# We check for it on every call and emit a visible block when found, then delete.
+NOTIFY_FILE="$HOME/.triumvirate/stenographer-notify.json"
+STENO_COMPLETE_BLOCK=""
+if [[ -f "$NOTIFY_FILE" ]]; then
+  _WORDS=$(jq -r '.words // "?"' "$NOTIFY_FILE" 2>/dev/null)
+  _SAVE=$(jq -r '.save_number // "?"' "$NOTIFY_FILE" 2>/dev/null)
+  _LOG=$(jq -r '.log_basename // "unknown"' "$NOTIFY_FILE" 2>/dev/null)
+  _TIME=$(jq -r '.completed_at // ""' "$NOTIFY_FILE" 2>/dev/null)
+  _TOOLS=$(jq -r '.tool_calls // "?"' "$NOTIFY_FILE" 2>/dev/null)
+  _MSGS=$(jq -r '.user_messages // "?"' "$NOTIFY_FILE" 2>/dev/null)
+  rm -f "$NOTIFY_FILE"
+  STENO_COMPLETE_BLOCK="┌─ 📝 STENOGRAPHER ──────────────────────────────────────────────┐
+│                                                                │
+│  ✅ Save #${_SAVE} complete  ·  ${_WORDS} words written  ·  ${_TIME}         │
+│                                                                │
+│  📄 → ${_LOG}  │
+│  🔧 ${_TOOLS} tool calls · ${_MSGS} user messages processed                 │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘"
+fi
+
 # Only check transcript size every N calls (reduces I/O on every tool call)
 SHOULD_CHECK=$(( CALL_COUNT % CHECK_EVERY_N ))
-[[ "$SHOULD_CHECK" -ne 0 ]] && exit 0
+if [[ "$SHOULD_CHECK" -ne 0 ]]; then
+  if [[ -n "$STENO_COMPLETE_BLOCK" ]]; then
+    jq -cn --arg msg "$STENO_COMPLETE_BLOCK" \
+      '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:$msg}}'
+  fi
+  exit 0
+fi
 
 # ─── Cooldown check ──────────────────────────────────────────────────────────
 NOW="$(date +%s)"
@@ -166,10 +195,12 @@ jq -cn \
   --arg total "${TOKENS_APPROX}k" \
   --arg threshold "${THRESHOLD_KB}KB" \
   --arg steno "$STENO_STATUS" \
+  --arg complete "$STENO_COMPLETE_BLOCK" \
   '{
     hookSpecificOutput: {
       hookEventName: "PostToolUse",
       additionalContext: (
+        (if $complete != "" then $complete + "\n\n" else "" end) +
         "💾 TOKEN GATE (save #" + $saves + "): ~" + $growth + " new tokens since last save " +
         "(~" + $total + " total). Stenographer " + $steno + " in background (local Ollama, zero API cost)."
       )
