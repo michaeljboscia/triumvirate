@@ -73,9 +73,22 @@ if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
   # mkdir is atomic on macOS (HFS+/APFS) — safe alternative to flock (Linux-only).
   LOCK_DIR="/tmp/claude-precompact-$(printf '%s' "$SESSION_DIR" | md5 -q 2>/dev/null || printf '%s' "$SESSION_DIR" | md5sum | cut -c1-32).lock"
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "⚠️ pre-compact.sh already running for this session dir — skipping (race prevention)" >&2
-    exit 0
+    # Lock exists — check if the holding process is still alive (stale lock detection).
+    # If the process was SIGKILL'd, the trap won't have fired and the lock is stale.
+    _LOCK_PID=""
+    [ -f "$LOCK_DIR/pid" ] && _LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$_LOCK_PID" ] && kill -0 "$_LOCK_PID" 2>/dev/null; then
+      echo "⚠️ pre-compact.sh already running (pid $_LOCK_PID) — skipping (race prevention)" >&2
+      exit 0
+    else
+      # Stale lock — remove and proceed
+      echo "⚠️ pre-compact.sh: removing stale lock (pid $_LOCK_PID dead or missing)" >&2
+      rm -rf "$LOCK_DIR"
+      mkdir "$LOCK_DIR" 2>/dev/null || { echo "⚠️ pre-compact.sh: could not acquire lock after stale removal" >&2; exit 0; }
+    fi
   fi
+  # Write PID so stale detection works if we're killed without running trap
+  echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
   # Guaranteed cleanup: remove lock on exit, interrupt, or termination
   trap "rm -rf '$LOCK_DIR'" EXIT INT TERM
 
