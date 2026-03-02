@@ -280,8 +280,52 @@ def ollama_generate(prompt: str) -> str:
 # ─── Session Log Management ───────────────────────────────────────────────
 
 def _get_repo_name(cwd: str) -> str:
-    """Get repo name from taxonomy.json, git remote, or directory name."""
-    # Taxonomy first (most reliable)
+    """Get repo name from taxonomy.json, git remote, or git root dirname.
+
+    Walks up the directory tree to find the project root (location of .git),
+    so this works correctly when cwd is a subdirectory of the project.
+    """
+    try:
+        import subprocess
+
+        # Find git root — this is the true project root regardless of cwd depth
+        result = subprocess.run(
+            ['git', '-C', cwd, 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            git_root = result.stdout.strip()
+
+            # Taxonomy in git root (most reliable name)
+            taxonomy = Path(git_root) / '.claude' / 'taxonomy.json'
+            if taxonomy.exists():
+                try:
+                    with open(taxonomy) as f:
+                        data = json.load(f)
+                    repo = data.get('repo', '')
+                    if repo:
+                        return repo
+                except Exception:
+                    pass
+
+            # Git remote name
+            remote = subprocess.run(
+                ['git', '-C', git_root, 'remote', 'get-url', 'origin'],
+                capture_output=True, text=True, timeout=5
+            )
+            if remote.returncode == 0:
+                url = remote.stdout.strip()
+                repo = url.split('/')[-1].replace('.git', '')
+                if repo:
+                    return repo
+
+            # Git root directory name as last resort
+            return Path(git_root).name
+
+    except Exception:
+        pass
+
+    # No git — use taxonomy from cwd or cwd name
     taxonomy = Path(cwd) / '.claude' / 'taxonomy.json'
     if taxonomy.exists():
         try:
@@ -292,21 +336,6 @@ def _get_repo_name(cwd: str) -> str:
                 return repo
         except Exception:
             pass
-
-    # Git remote fallback
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            url = result.stdout.strip()
-            repo = url.split('/')[-1].replace('.git', '')
-            if repo:
-                return repo
-    except Exception:
-        pass
 
     return Path(cwd).name
 
@@ -329,17 +358,17 @@ def find_or_create_session_log(agent: str, session_state: dict, transcript_path:
         repo = _get_repo_name(cwd)
         if repo:
             repo_dir = ai_memory / repo
-            if repo_dir.exists():
-                candidates = sorted(
-                    repo_dir.glob('*--*_v*.md'),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True
-                )
-                if candidates:
-                    hook_log = str(candidates[0])
-                    session_state['session_log_path'] = hook_log
-                    log('INFO', 'Using hook session log', path=hook_log)
-                    return hook_log
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            candidates = sorted(
+                repo_dir.glob('*--*_v*.md'),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            if candidates:
+                hook_log = str(candidates[0])
+                session_state['session_log_path'] = hook_log
+                log('INFO', 'Using hook session log', path=hook_log)
+                return hook_log
 
     # Priority 2: Cached path from state
     existing = session_state.get('session_log_path')
@@ -398,11 +427,17 @@ def append_to_session_log(log_path: str, section_text: str, save_number: int, st
 
 def _write_notify(payload: dict):
     """Write a completion or error notification for the token gate hook to surface.
-    Best-effort — never raises. Deleted by the hook after first read."""
+
+    Uses atomic write (tmp → rename) to prevent the hook from reading a
+    partially-written file if it fires mid-write. Best-effort — never raises.
+    Deleted by the hook after first read.
+    """
     try:
         notify_path = TRIUMVIRATE_DIR / 'stenographer-notify.json'
-        with open(notify_path, 'w') as f:
+        tmp_path = notify_path.with_suffix('.tmp')
+        with open(tmp_path, 'w') as f:
             json.dump(payload, f)
+        os.rename(tmp_path, notify_path)  # atomic on POSIX
     except OSError:
         pass
 
