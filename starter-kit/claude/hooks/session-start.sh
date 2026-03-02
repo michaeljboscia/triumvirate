@@ -75,12 +75,25 @@ $body"
     fi
   fi
 
-  jq -n --arg wt "$WALL_TIME" --arg src "$SOURCE" --arg lessons "$LESSONS_CTX" '{
-    "hookSpecificOutput": {
-      "hookEventName": "SessionStart",
-      "additionalContext": ("🕐 Wall time: " + $wt + "\nSession " + $src + "d — continuing where you left off." + $lessons)
-    }
-  }'
+  if [ "$SOURCE" = "compact" ]; then
+    # On compact: output NO additionalContext — post-compact-recovery.sh already
+    # injected the full session context. Claude Code uses the LAST hook's output,
+    # so any additionalContext here would OVERWRITE recovery's 14KB of session log.
+    # Just emit the wall time as a silent acknowledgement.
+    jq -n --arg wt "$WALL_TIME" '{
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart"
+      }
+    }'
+  else
+    # resume/startup: inject wall time + lessons as before
+    jq -n --arg wt "$WALL_TIME" --arg src "$SOURCE" --arg lessons "$LESSONS_CTX" '{
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": ("🕐 Wall time: " + $wt + "\nSession " + $src + "d — continuing where you left off." + $lessons)
+      }
+    }'
+  fi
   exit 0
 fi
 
