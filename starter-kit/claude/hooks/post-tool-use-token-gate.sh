@@ -87,9 +87,12 @@ _write_state "$(jq -cn \
 # ─── Stenographer completion notification ────────────────────────────────────
 # Stenographer runs in the background. When it finishes it writes a notify file.
 # We check for it on every call and emit a visible block when found, then delete.
+#
+# STENO_COMPLETION_NOTIFY=1  → show ✅/❌ block in additionalContext (default: on)
+# STENO_COMPLETION_NOTIFY=0  → silent (no block, saves ~50 tokens per notification)
 NOTIFY_FILE="$HOME/.triumvirate/stenographer-notify.json"
 STENO_COMPLETE_BLOCK=""
-if [[ -f "$NOTIFY_FILE" ]]; then
+if [[ "${STENO_COMPLETION_NOTIFY:-1}" == "1" && -f "$NOTIFY_FILE" ]]; then
   _STATUS=$(jq -r '.status // "ok"'           "$NOTIFY_FILE" 2>/dev/null)
   _SAVE=$(jq -r   '.save_number // "?"'       "$NOTIFY_FILE" 2>/dev/null)
   _TIME=$(jq -r   '.completed_at // ""'       "$NOTIFY_FILE" 2>/dev/null)

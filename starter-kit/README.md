@@ -197,6 +197,8 @@ Before Memory Loss:
 | `STENOGRAPHER_MODEL` | Ollama model for session notes | `qwen2.5:32b` |
 | `STENOGRAPHER_TIMEOUT` | Ollama generation timeout (seconds) | `180` |
 | `STENOGRAPHER_NUM_CTX` | Ollama context window size | `65536` |
+| `STENO_COMPLETION_NOTIFY` | Show ✅/❌ Stenographer block in Claude's context after each run | `1` |
+| `RECOVERY_PRINT_SUMMARY` | Print full Gemini summary to terminal when resuming after compaction | `1` |
 
 ### Taxonomy
 
