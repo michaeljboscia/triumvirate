@@ -67,9 +67,15 @@ $body"
   fi
 
   if [ "$SOURCE" = "compact" ]; then
-    # On compact: emit NO JSON at all. post-compact-recovery.sh owns context injection.
-    # Even emitting hookSpecificOutput without additionalContext may clobber recovery's
-    # context under strict last-writer-wins (Codex review finding). Silent exit is safest.
+    # On compact: emit minimal JSON with NO additionalContext field.
+    # Omitting the field (not setting it empty) leaves recovery's injection intact.
+    # We cannot exit silently — Claude Code treats 0-byte hook output as hook error.
+    jq -n --arg wt "$WALL_TIME" '{
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": ("🕐 Wall time: " + $wt)
+      }
+    }'
     exit 0
   else
     # resume/startup: inject wall time + lessons as before
