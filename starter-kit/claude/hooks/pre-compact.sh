@@ -78,10 +78,18 @@ if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
     _LOCK_PID=""
     [ -f "$LOCK_DIR/pid" ] && _LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null)
     if [ -z "$_LOCK_PID" ]; then
-      # PID file missing or empty — lock was just created by another process that
-      # hasn't written its PID yet. Treat as live to avoid false-stale removal.
-      echo "⚠️ pre-compact.sh: lock exists with no PID yet — skipping (race prevention)" >&2
-      exit 0
+      # PID file missing or empty — either lock just created (PID not yet written)
+      # or process died before writing PID. Use lock dir mtime to distinguish:
+      # if lock is older than 10s with no PID, it's definitely stale.
+      _LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
+      if [ "$_LOCK_AGE" -lt 10 ]; then
+        echo "⚠️ pre-compact.sh: lock exists with no PID yet (age ${_LOCK_AGE}s) — skipping" >&2
+        exit 0
+      else
+        echo "⚠️ pre-compact.sh: removing stale lock with no PID (age ${_LOCK_AGE}s)" >&2
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR" 2>/dev/null || { echo "⚠️ pre-compact.sh: could not acquire lock after stale removal" >&2; exit 0; }
+      fi
     elif kill -0 "$_LOCK_PID" 2>/dev/null; then
       echo "⚠️ pre-compact.sh already running (pid $_LOCK_PID) — skipping (race prevention)" >&2
       exit 0
