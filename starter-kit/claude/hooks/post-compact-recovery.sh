@@ -10,10 +10,6 @@ INPUT=$(cat)
 PROJECT_DIR=$(echo "$INPUT" | jq -r '.cwd // empty')
 TIMESTAMP=$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')
 
-# Write sentinel so session-start.sh (matcher *) can detect this is a compact event.
-# Claude Code fires hooks in registration order for the same event — compact fires
-# before * — so the sentinel is present when session-start.sh runs.
-touch /tmp/claude-compact-active 2>/dev/null || true
 LESSONS_MAX_CHARS=6000
 ADDED_LESSON_PATHS="|"
 

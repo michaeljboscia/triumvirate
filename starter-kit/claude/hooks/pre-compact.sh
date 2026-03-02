@@ -77,17 +77,22 @@ if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
     # If the process was SIGKILL'd, the trap won't have fired and the lock is stale.
     _LOCK_PID=""
     [ -f "$LOCK_DIR/pid" ] && _LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null)
-    if [ -n "$_LOCK_PID" ] && kill -0 "$_LOCK_PID" 2>/dev/null; then
+    if [ -z "$_LOCK_PID" ]; then
+      # PID file missing or empty — lock was just created by another process that
+      # hasn't written its PID yet. Treat as live to avoid false-stale removal.
+      echo "⚠️ pre-compact.sh: lock exists with no PID yet — skipping (race prevention)" >&2
+      exit 0
+    elif kill -0 "$_LOCK_PID" 2>/dev/null; then
       echo "⚠️ pre-compact.sh already running (pid $_LOCK_PID) — skipping (race prevention)" >&2
       exit 0
     else
-      # Stale lock — remove and proceed
-      echo "⚠️ pre-compact.sh: removing stale lock (pid $_LOCK_PID dead or missing)" >&2
+      # PID is dead — stale lock, remove and proceed
+      echo "⚠️ pre-compact.sh: removing stale lock (pid $_LOCK_PID dead)" >&2
       rm -rf "$LOCK_DIR"
       mkdir "$LOCK_DIR" 2>/dev/null || { echo "⚠️ pre-compact.sh: could not acquire lock after stale removal" >&2; exit 0; }
     fi
   fi
-  # Write PID so stale detection works if we're killed without running trap
+  # Write PID immediately so stale detection works if we're killed without running trap
   echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
   # Guaranteed cleanup: remove lock on exit, interrupt, or termination
   trap "rm -rf '$LOCK_DIR'" EXIT INT TERM
