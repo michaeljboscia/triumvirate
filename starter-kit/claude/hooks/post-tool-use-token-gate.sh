@@ -90,21 +90,36 @@ _write_state "$(jq -cn \
 NOTIFY_FILE="$HOME/.triumvirate/stenographer-notify.json"
 STENO_COMPLETE_BLOCK=""
 if [[ -f "$NOTIFY_FILE" ]]; then
-  _WORDS=$(jq -r '.words // "?"' "$NOTIFY_FILE" 2>/dev/null)
-  _SAVE=$(jq -r '.save_number // "?"' "$NOTIFY_FILE" 2>/dev/null)
-  _LOG=$(jq -r '.log_basename // "unknown"' "$NOTIFY_FILE" 2>/dev/null)
-  _TIME=$(jq -r '.completed_at // ""' "$NOTIFY_FILE" 2>/dev/null)
-  _TOOLS=$(jq -r '.tool_calls // "?"' "$NOTIFY_FILE" 2>/dev/null)
-  _MSGS=$(jq -r '.user_messages // "?"' "$NOTIFY_FILE" 2>/dev/null)
+  _STATUS=$(jq -r '.status // "ok"'           "$NOTIFY_FILE" 2>/dev/null)
+  _SAVE=$(jq -r   '.save_number // "?"'       "$NOTIFY_FILE" 2>/dev/null)
+  _TIME=$(jq -r   '.completed_at // ""'       "$NOTIFY_FILE" 2>/dev/null)
+  _WORDS=$(jq -r  '.words // "?"'             "$NOTIFY_FILE" 2>/dev/null)
+  _LOG=$(jq -r    '.log_basename // ""'       "$NOTIFY_FILE" 2>/dev/null)
+  _TOOLS=$(jq -r  '.tool_calls // "?"'        "$NOTIFY_FILE" 2>/dev/null)
+  _MSGS=$(jq -r   '.user_messages // "?"'     "$NOTIFY_FILE" 2>/dev/null)
+  _ERR=$(jq -r    '.error // ""'              "$NOTIFY_FILE" 2>/dev/null)
   rm -f "$NOTIFY_FILE"
-  STENO_COMPLETE_BLOCK="┌─ 📝 STENOGRAPHER ──────────────────────────────────────────────┐
-│                                                                │
-│  ✅ Save #${_SAVE} complete  ·  ${_WORDS} words written  ·  ${_TIME}         │
-│                                                                │
-│  📄 → ${_LOG}  │
-│  🔧 ${_TOOLS} tool calls · ${_MSGS} user messages processed                 │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘"
+
+  if [[ "$_STATUS" == "ok" ]]; then
+    STENO_COMPLETE_BLOCK="┌─ 📝 STENOGRAPHER ─────────────────────────────────────────────┐
+│                                                               │
+│  ✅ Save #${_SAVE} complete  ·  ${_WORDS} words  ·  ${_TIME}  │
+│                                                               │
+│  📄 → ${_LOG}
+│  🔧 ${_TOOLS} tool calls · ${_MSGS} user messages processed  │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘"
+  else
+    STENO_COMPLETE_BLOCK="┌─ ⚠️  STENOGRAPHER FAILED ─────────────────────────────────────┐
+│                                                               │
+│  ❌ Save #${_SAVE} failed  ·  ${_TIME}                        │
+│                                                               │
+│  ${_ERR}
+│                                                               │
+│  👉 tail ~/.triumvirate/stenographer.log                      │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘"
+  fi
 fi
 
 # Only check transcript size every N calls (reduces I/O on every tool call)
