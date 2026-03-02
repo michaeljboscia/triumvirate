@@ -121,7 +121,10 @@ fi
 # Print the full recovery summary to stderr — visible in terminal, zero extra token cost.
 # You already paid for this content via additionalContext. Printing it to stderr lets
 # you read it in the terminal without waiting for Claude to respond.
-if [ -n "$GEMINI_SUMMARY" ]; then
+#
+# RECOVERY_PRINT_SUMMARY=1  → print full Gemini summary to terminal on recovery (default: on)
+# RECOVERY_PRINT_SUMMARY=0  → silent (no terminal output, Claude still gets full context)
+if [ "${RECOVERY_PRINT_SUMMARY:-1}" = "1" ] && [ -n "$GEMINI_SUMMARY" ]; then
   printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' >&2
   printf '🔄 COMPACTION RECOVERY — %s\n' "$TIMESTAMP" >&2
   printf '📄 %s\n' "$SESSION_LOG" >&2
