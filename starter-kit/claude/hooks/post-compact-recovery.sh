@@ -111,18 +111,21 @@ if [ -n "$PROJECT_DIR" ]; then
   append_lessons "📁 PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
 fi
 
-# Print the full recovery summary to stderr — visible in terminal, zero extra token cost.
-# You already paid for this content via additionalContext. Printing it to stderr lets
-# you read it in the terminal without waiting for Claude to respond.
+# Print the full recovery summary directly to the terminal via /dev/tty.
+# /dev/tty bypasses Claude Code's stdout/stderr capture — it writes to the
+# physical terminal device directly, so you see it immediately without waiting
+# for Claude to respond. Zero extra token cost.
 #
-# RECOVERY_PRINT_SUMMARY=1  → print full Gemini summary to terminal on recovery (default: on)
-# RECOVERY_PRINT_SUMMARY=0  → silent (no terminal output, Claude still gets full context)
-if [ "${RECOVERY_PRINT_SUMMARY:-1}" = "1" ] && [ -n "$GEMINI_SUMMARY" ]; then
-  printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' >&2
-  printf '🔄 COMPACTION RECOVERY — %s\n' "$TIMESTAMP" >&2
-  printf '📄 %s\n' "$SESSION_LOG" >&2
-  printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' >&2
-  printf '%s\n\n' "$GEMINI_SUMMARY" >&2
+# RECOVERY_PRINT_SUMMARY=1  → print full session context to terminal (default: on)
+# RECOVERY_PRINT_SUMMARY=0  → silent (Claude still gets full context via additionalContext)
+if [ "${RECOVERY_PRINT_SUMMARY:-1}" = "1" ] && [ -n "$GEMINI_SUMMARY" ] && [ -e /dev/tty ]; then
+  {
+    printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+    printf '🔄 COMPACTION RECOVERY — %s\n' "$TIMESTAMP"
+    printf '📄 %s\n' "$(basename "$SESSION_LOG" 2>/dev/null)"
+    printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+    printf '%s\n\n' "$GEMINI_SUMMARY"
+  } > /dev/tty
 fi
 
 # Output for Claude to see
