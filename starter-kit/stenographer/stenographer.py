@@ -394,6 +394,19 @@ def append_to_session_log(log_path: str, section_text: str, save_number: int, st
         f.write(section)
 
 
+# ─── Notification Helper ───────────────────────────────────────────────────
+
+def _write_notify(payload: dict):
+    """Write a completion or error notification for the token gate hook to surface.
+    Best-effort — never raises. Deleted by the hook after first read."""
+    try:
+        notify_path = TRIUMVIRATE_DIR / 'stenographer-notify.json'
+        with open(notify_path, 'w') as f:
+            json.dump(payload, f)
+    except OSError:
+        pass
+
+
 # ─── Main Pipeline ─────────────────────────────────────────────────────────
 
 def run(agent: str, transcript_path: str, session_log_override: str = None, cwd: str = None):
@@ -492,11 +505,16 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
         # ─── Ollama health check ───
         if not ollama_health_check():
             log('ERROR', 'Ollama not reachable', host=OLLAMA_BASE)
-            # Do NOT advance cursor — retry next time
+            _write_notify({'status': 'error', 'error': f'Ollama not reachable at {OLLAMA_BASE}',
+                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'save_number': session.get('saves_count', 0) + 1})
             return False
 
         if not ollama_check_model():
             log('ERROR', 'Model not available', model=OLLAMA_MODEL)
+            _write_notify({'status': 'error', 'error': f'Model not pulled: {OLLAMA_MODEL} — run: ollama pull {OLLAMA_MODEL}',
+                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'save_number': session.get('saves_count', 0) + 1})
             return False
 
         # ─── Build prompt ───
@@ -520,11 +538,16 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
             notes = ollama_generate(prompt)
         except (RuntimeError, ValueError) as e:
             log('ERROR', f'Ollama generation failed: {e}')
-            # Do NOT advance cursor — retry next time
+            _write_notify({'status': 'error', 'error': str(e),
+                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'save_number': session.get('saves_count', 0) + 1})
             return False
 
         if not notes or notes.strip() == '':
             log('ERROR', 'Ollama returned empty response')
+            _write_notify({'status': 'error', 'error': 'Ollama returned empty response — model may be overloaded or context too large',
+                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'save_number': session.get('saves_count', 0) + 1})
             return False
 
         log('INFO', 'Notes generated', words=len(notes.split()), chars=len(notes))
@@ -553,22 +576,18 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
         # ─── Write completion notification for hook to surface ───
         # The token gate hook checks this file on the next tool call and
         # displays a visible block. Deleted after first read.
-        notify_path = TRIUMVIRATE_DIR / 'stenographer-notify.json'
-        try:
-            with open(notify_path, 'w') as f:
-                json.dump({
-                    'completed_at': _now_eastern().strftime('%H:%M %Z'),
-                    'log_path': log_path,
-                    'log_basename': os.path.basename(log_path),
-                    'words': len(notes.split()),
-                    'chars': len(notes),
-                    'save_number': session['saves_count'],
-                    'tool_calls': stats.get('tool_calls', 0),
-                    'user_messages': stats.get('user_messages', 0),
-                    'chars_processed': stats.get('chars_emitted', 0),
-                }, f)
-        except OSError:
-            pass  # Notification is best-effort — don't fail the run
+        _write_notify({
+            'status': 'ok',
+            'completed_at': _now_eastern().strftime('%H:%M %Z'),
+            'log_path': log_path,
+            'log_basename': os.path.basename(log_path),
+            'words': len(notes.split()),
+            'chars': len(notes),
+            'save_number': session['saves_count'],
+            'tool_calls': stats.get('tool_calls', 0),
+            'user_messages': stats.get('user_messages', 0),
+            'chars_processed': stats.get('chars_emitted', 0),
+        })
 
         return True
 
