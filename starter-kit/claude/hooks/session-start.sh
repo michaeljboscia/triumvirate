@@ -6,7 +6,7 @@
 
 INPUT=$(cat)
 PROJECT_DIR=$(echo "$INPUT" | jq -r '.cwd // empty')
-SOURCE=$(echo "$INPUT" | jq -r '.source // .trigger // "startup"')
+SOURCE=$(echo "$INPUT" | jq -r '.reason // .source // .trigger // "startup"')
 HOME_DIR="$HOME"
 WALL_TIME=$(TZ='America/New_York' date '+%Y-%m-%d %H:%M %Z')
 

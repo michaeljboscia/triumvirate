@@ -91,20 +91,23 @@ _write_state "$(jq -cn \
 # STENO_COMPLETION_NOTIFY=1  → show ✅/❌ block in additionalContext (default: on)
 # STENO_COMPLETION_NOTIFY=0  → silent (no block, saves ~50 tokens per notification)
 NOTIFY_FILE="$HOME/.triumvirate/stenographer-notify.json"
+NOTIFY_CLAIM="$HOME/.triumvirate/stenographer-notify.claimed.json"
 STENO_COMPLETE_BLOCK=""
 if [[ "${STENO_COMPLETION_NOTIFY:-1}" == "1" && -f "$NOTIFY_FILE" ]]; then
-  _STATUS=$(jq -r '.status // "ok"'           "$NOTIFY_FILE" 2>/dev/null)
-  _SAVE=$(jq -r   '.save_number // "?"'       "$NOTIFY_FILE" 2>/dev/null)
-  _TIME=$(jq -r   '.completed_at // ""'       "$NOTIFY_FILE" 2>/dev/null)
-  _WORDS=$(jq -r  '.words // "?"'             "$NOTIFY_FILE" 2>/dev/null)
-  _LOG=$(jq -r    '.log_basename // ""'       "$NOTIFY_FILE" 2>/dev/null)
-  _TOOLS=$(jq -r  '.tool_calls // "?"'        "$NOTIFY_FILE" 2>/dev/null)
-  _MSGS=$(jq -r   '.user_messages // "?"'     "$NOTIFY_FILE" 2>/dev/null)
-  _ERR=$(jq -r    '.error // ""'              "$NOTIFY_FILE" 2>/dev/null)
-  rm -f "$NOTIFY_FILE"
-
-  if [[ "$_STATUS" == "ok" ]]; then
-    STENO_COMPLETE_BLOCK="┌─ 📝 STENOGRAPHER ─────────────────────────────────────────────┐
+  # Atomic claim: mv is atomic on POSIX — prevents Stenographer from truncating
+  # the file mid-read if it fires again while we're parsing.
+  mv -f "$NOTIFY_FILE" "$NOTIFY_CLAIM" 2>/dev/null || true
+  if [[ -f "$NOTIFY_CLAIM" ]]; then
+    # Single jq call reads all fields at once — no partial-read window.
+    _PARSED=$(jq -r '[.status // "ok", .save_number // "?", .completed_at // "",
+                      .words // "?", .log_basename // "", .tool_calls // "?",
+                      .user_messages // "?", .error // ""] | join("\t")' \
+              "$NOTIFY_CLAIM" 2>/dev/null)
+    rm -f "$NOTIFY_CLAIM"
+    IFS=$'\t' read -r _STATUS _SAVE _TIME _WORDS _LOG _TOOLS _MSGS _ERR \
+      <<< "$_PARSED"
+    if [[ "$_STATUS" == "ok" ]]; then
+      STENO_COMPLETE_BLOCK="┌─ 📝 STENOGRAPHER ─────────────────────────────────────────────┐
 │                                                               │
 │  ✅ Save #${_SAVE} complete  ·  ${_WORDS} words  ·  ${_TIME}  │
 │                                                               │
@@ -112,8 +115,8 @@ if [[ "${STENO_COMPLETION_NOTIFY:-1}" == "1" && -f "$NOTIFY_FILE" ]]; then
 │  🔧 ${_TOOLS} tool calls · ${_MSGS} user messages processed  │
 │                                                               │
 └───────────────────────────────────────────────────────────────┘"
-  else
-    STENO_COMPLETE_BLOCK="┌─ ⚠️  STENOGRAPHER FAILED ─────────────────────────────────────┐
+    else
+      STENO_COMPLETE_BLOCK="┌─ ⚠️  STENOGRAPHER FAILED ─────────────────────────────────────┐
 │                                                               │
 │  ❌ Save #${_SAVE} failed  ·  ${_TIME}                        │
 │                                                               │
@@ -122,6 +125,7 @@ if [[ "${STENO_COMPLETION_NOTIFY:-1}" == "1" && -f "$NOTIFY_FILE" ]]; then
 │  👉 tail ~/.triumvirate/stenographer.log                      │
 │                                                               │
 └───────────────────────────────────────────────────────────────┘"
+    fi
   fi
 fi
 
