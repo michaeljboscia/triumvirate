@@ -118,15 +118,15 @@ if [ -n "$PROJECT_DIR" ]; then
   append_lessons "📁 PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
 fi
 
-# Print a human-readable summary to stderr — visible in terminal, zero token cost.
-# Extracts just the OVERALL GOAL and CURRENT STATE lines from the Gemini summary.
+# Print the full recovery summary to stderr — visible in terminal, zero extra token cost.
+# You already paid for this content via additionalContext. Printing it to stderr lets
+# you read it in the terminal without waiting for Claude to respond.
 if [ -n "$GEMINI_SUMMARY" ]; then
-  _GOAL=$(printf '%s' "$GEMINI_SUMMARY" | awk '/^## OVERALL GOAL/{found=1;next} found && /^## /{exit} found{print}' | head -3 | tr '\n' ' ' | sed 's/  */ /g')
-  _STATE=$(printf '%s' "$GEMINI_SUMMARY" | awk '/^## CURRENT STATE/{found=1;next} found && /^## /{exit} found{print}' | head -2 | tr '\n' ' ' | sed 's/  */ /g')
-  printf '\n🔄 COMPACTION RECOVERY — %s\n' "$TIMESTAMP" >&2
-  [ -n "$_GOAL" ]  && printf '   📌 Goal:  %s\n' "$_GOAL"  >&2
-  [ -n "$_STATE" ] && printf '   📍 State: %s\n' "$_STATE" >&2
-  printf '   📄 Log: %s\n\n' "$(basename "$SESSION_LOG" 2>/dev/null)" >&2
+  printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' >&2
+  printf '🔄 COMPACTION RECOVERY — %s\n' "$TIMESTAMP" >&2
+  printf '📄 %s\n' "$SESSION_LOG" >&2
+  printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' >&2
+  printf '%s\n\n' "$GEMINI_SUMMARY" >&2
 fi
 
 # Output for Claude to see
