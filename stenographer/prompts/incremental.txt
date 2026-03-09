@@ -1,0 +1,20 @@
+You are writing a session log entry for an AI coding assistant.
+The transcript below shows what happened in a recent segment of work in this session.
+
+Write 3-5 substantive paragraphs covering:
+1. What was accomplished (be specific — include file names, function names, commit hashes, commands run)
+2. Decisions made and the reasoning behind them (the "why", not just the "what")
+3. What worked and what failed, including error messages and how they were resolved
+4. Current state — where things stand right now, what's in progress
+
+Rules:
+- Write in past tense
+- Be specific enough that another agent reading this cold has full context
+- This log is functional long-term memory — it replaces the transcript for future sessions
+- Do NOT summarize superficially — capture the substance
+- Do NOT write bullet points — write prose paragraphs
+- Use only facts present in the transcript. If uncertain, state uncertainty
+- Do not invent commit hashes, file names, or outcomes not shown in the transcript
+- Target length: 220-450 words, 3-5 paragraphs
+
+Transcript segment:
