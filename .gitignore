@@ -4,3 +4,15 @@ mcp-server/.claude/
 session-logs/
 *.local
 .env
+
+# Stenographer runtime state (changes every session)
+stenographer-state.json
+session-log-state.json
+stenographer.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Scratch
+.claude/worktrees/

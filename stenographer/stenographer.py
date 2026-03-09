@@ -69,7 +69,7 @@ LOG_FILE = TRIUMVIRATE_DIR / 'stenographer.log'
 
 OLLAMA_BASE = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 OLLAMA_MODEL = os.environ.get('STENOGRAPHER_MODEL', 'qwen2.5:32b')
-OLLAMA_TIMEOUT = int(os.environ.get('STENOGRAPHER_TIMEOUT', '180'))  # seconds
+OLLAMA_TIMEOUT = int(os.environ.get('STENOGRAPHER_TIMEOUT', '300'))  # seconds
 OLLAMA_NUM_CTX = int(os.environ.get('STENOGRAPHER_NUM_CTX', '65536'))
 
 def _set_model(model: str):
@@ -80,8 +80,11 @@ def _set_model(model: str):
 # Minimum chars of extracted content to warrant a save
 MIN_CONTENT_THRESHOLD = 400
 
-# Maximum chars to send to the model
-MAX_PROMPT_CHARS = 120000
+# Maximum chars to send to the model.
+# M3 Pro + qwen2.5:32b processes ~23 chars/sec total pipeline time.
+# 5000 chars ≈ 220s (within 300s timeout with margin).
+# Override with STENOGRAPHER_MAX_CHARS env var for faster hardware.
+MAX_PROMPT_CHARS = int(os.environ.get('STENOGRAPHER_MAX_CHARS', '5000'))
 
 
 def _now_eastern() -> datetime:
@@ -564,6 +567,9 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
                 "Transcript segment:\n"
             )
 
+        # Hard truncate delta to MAX_PROMPT_CHARS (parser may slightly overshoot)
+        if len(delta_text) > MAX_PROMPT_CHARS:
+            delta_text = delta_text[:MAX_PROMPT_CHARS] + f'\n\n[truncated — {len(delta_text) - MAX_PROMPT_CHARS} chars omitted]'
         prompt = prompt_template + delta_text
 
         # ─── Generate notes ───

@@ -1,7 +1,7 @@
 {
   "owner": "michaeljboscia",
-  "client": "open-source",
-  "domain": "tooling",
+  "client": "core",
+  "domain": "infrastructure",
   "repo": "triumvirate",
-  "feature": "initial-release"
+  "feature": "stenographer"
 }
