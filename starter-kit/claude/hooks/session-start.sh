@@ -9,7 +9,7 @@ PROJECT_DIR=$(echo "$INPUT" | jq -r '.cwd // empty')
 # Claude Code sends source:"compact" in the JSON for compact events — use it directly.
 SOURCE=$(echo "$INPUT" | jq -r '.reason // .source // .trigger // "startup"')
 HOME_DIR="$HOME"
-WALL_TIME=$(TZ='America/New_York' date '+%Y-%m-%d %H:%M %Z')
+WALL_TIME=$(date '+%Y-%m-%d %H:%M %Z')
 
 # Source credentials vault (auto-export all vars to child processes)
 if [ -f "$HOME/.claude/.env" ]; then
@@ -60,9 +60,9 @@ $label ($path):
 $body"
     }
 
-    append_lessons "📚 GLOBAL LESSONS" "$HOME_DIR/.claude/lessons.md"
+    append_lessons "GLOBAL LESSONS" "$HOME_DIR/.claude/lessons.md"
     if [ -n "$PROJECT_DIR" ]; then
-      append_lessons "📁 PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
+      append_lessons "PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
     fi
   fi
 
@@ -73,7 +73,7 @@ $body"
     jq -n --arg wt "$WALL_TIME" '{
       "hookSpecificOutput": {
         "hookEventName": "SessionStart",
-        "additionalContext": ("🕐 Wall time: " + $wt)
+        "additionalContext": ("Wall time: " + $wt)
       }
     }'
     exit 0
@@ -82,7 +82,7 @@ $body"
     jq -n --arg wt "$WALL_TIME" --arg src "$SOURCE" --arg lessons "$LESSONS_CTX" '{
       "hookSpecificOutput": {
         "hookEventName": "SessionStart",
-        "additionalContext": ("🕐 Wall time: " + $wt + "\nSession " + $src + "d — continuing where you left off." + $lessons)
+        "additionalContext": ("Wall time: " + $wt + "\nSession " + $src + "d — continuing where you left off." + $lessons)
       }
     }'
   fi
@@ -167,10 +167,10 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
 
     local config_status=""
     if ! $has_tax; then
-      config_status=" ⚠️ no taxonomy"
+      config_status=" [no taxonomy]"
     fi
 
-    PROJECTS="${PROJECTS}  ${PROJECT_COUNT}. **${label}**${config_status} → \`${display}\`\n     Last: ${last_time}"
+    PROJECTS="${PROJECTS}  ${PROJECT_COUNT}. **${label}**${config_status} -> \`${display}\`\n     Last: ${last_time}"
     if [ -n "$feature" ]; then
       PROJECTS="${PROJECTS} | Feature: ${feature}"
     fi
@@ -204,7 +204,7 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
     scan_dir "$HOME_DIR/.claude" "~/.claude"
   fi
 
-  # --- Scan registry entries (catches mismatched names + Google Drive) ---
+  # --- Scan registry entries (catches mismatched names + external drives) ---
   if [ -f "$REGISTRY_FILE" ]; then
     # Read all key-value pairs (skip keys starting with _)
     while IFS=$'\t' read -r repo_name local_path; do
@@ -221,7 +221,7 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
     done < <(jq -r 'to_entries[] | select(.key | startswith("_") | not) | "\(.key)\t\(.value)"' "$REGISTRY_FILE" 2>/dev/null)
   fi
 
-  # --- Scan GitHub repos (catches remote-only projects like tellus) ---
+  # --- Scan GitHub repos (catches remote-only projects) ---
   REMOTE_PROJECTS=""
   REMOTE_COUNT=0
   if command -v gh &>/dev/null; then
@@ -254,7 +254,7 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
           *"|${HOME_DIR}/projects/${repo_name}|"*) FOUND_LOCAL=true ;;
           *"|${HOME_DIR}/.${repo_name}|"*) FOUND_LOCAL=true ;;
         esac
-        # Check registry (handles name mismatches like claude-config → ~/.claude)
+        # Check registry (handles name mismatches)
         if ! $FOUND_LOCAL; then
           case "$REGISTRY_REPO_NAMES" in
             *"|${repo_name}|"*) FOUND_LOCAL=true ;;
@@ -306,7 +306,7 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
       [ -d "$_memdir" ] && ALL_SESSION_DIRS+=("${_memdir%/}")
     done
   fi
-  # Include registry-resolved paths (Google Drive, mismatched names)
+  # Include registry-resolved paths
   # Dedup: only add if not already in the array (check via SCANNED_DIRS)
   if [ -f "$REGISTRY_FILE" ]; then
     while IFS=$'\t' read -r _rname rpath; do
@@ -327,9 +327,12 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
       RECENT_LOGS="${RECENT_LOGS}$(find "$sdir" -maxdepth 1 -name '*_v*_*.md' -type f 2>/dev/null)"$'\n'
     done
     # Sort by mtime (newest first) and take top 8
-    RECENT_LOGS=$(echo "$RECENT_LOGS" | xargs ls -t 2>/dev/null | head -8)
+    # Use stat+sort instead of xargs ls-t — handles spaces in paths
+    RECENT_LOGS=$(echo "$RECENT_LOGS" | grep -v '^$' | while IFS= read -r f; do
+      [ -f "$f" ] && stat -f "%m %N" "$f" 2>/dev/null
+    done | sort -rn | head -8 | sed 's/^[0-9]* //')
     if [ -n "$RECENT_LOGS" ]; then
-      RECENT="\n📋 **Recent sessions (pick up where you left off):**\n"
+      RECENT="\n**Recent sessions (pick up where you left off):**\n"
       while IFS= read -r log; do
         [ -z "$log" ] && continue
         LOG_NAME=$(basename "$log")
@@ -341,7 +344,7 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
         REPO_NAME=$(echo "$LOG_NAME" | sed 's/[^-]*--[^_]*_[^_]*_//' | sed 's/_[^_]*_[0-9].*$//')
         FEATURE_NAME=$(echo "$LOG_NAME" | sed 's/[^-]*--[^_]*_[^_]*_[^_]*_//' | sed 's/_[0-9].*$//')
 
-        RECENT="${RECENT}  - **${REPO_NAME}** / ${FEATURE_NAME} — ${LOG_TIME} → \`${DISPLAY_DIR}\`\n"
+        RECENT="${RECENT}  - **${REPO_NAME}** / ${FEATURE_NAME} — ${LOG_TIME} -> \`${DISPLAY_DIR}\`\n"
       done <<< "$RECENT_LOGS"
     fi
   fi
@@ -352,12 +355,12 @@ if [ "$PROJECT_DIR" = "$HOME_DIR" ] || [ "$PROJECT_DIR" = "$HOME_DIR/" ]; then
     REMOTE_SECTION="\n**GitHub repos (not cloned locally):**\n$(printf '%b' "$REMOTE_PROJECTS")"
   fi
 
-  PICKER_OUTPUT="🏠 **PROJECT PICKER** — You started from the home directory.
-🕐 Wall time: ${WALL_TIME}
+  PICKER_OUTPUT="PROJECT PICKER — You started from the home directory.
+Wall time: ${WALL_TIME}
 
 **Local projects:**
 $(printf '%b' "$PROJECTS")${REMOTE_SECTION}$(printf '%b' "$RECENT")
-🆕 **Or start a NEW project** — just tell me what you're working on.
+**Or start a NEW project** — just tell me what you're working on.
 
 ---
 **INSTRUCTIONS FOR CLAUDE:**
@@ -388,6 +391,13 @@ fi
 # PHASE 2: IN A PROJECT DIRECTORY — NORMAL SESSION LOG RECOVERY
 # ===================================================================
 if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
+  # Session Notes v2 health check (brief, non-blocking)
+  HEALTH_CHECK="$HOME/.triumvirate/stenographer/health_check.py"
+  STENO_HEALTH=""
+  if [ -f "$HEALTH_CHECK" ]; then
+    STENO_HEALTH=$(python3 "$HEALTH_CHECK" --brief 2>/dev/null || true)
+  fi
+
   # Get taxonomy from .claude/taxonomy.json or use defaults
   TAXONOMY_FILE="$PROJECT_DIR/.claude/taxonomy.json"
 
@@ -427,22 +437,27 @@ if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
       CONTENT="$CONTENT
 
 ---
-📚 GLOBAL LESSONS ($HOME_DIR/.claude/lessons.md):
+GLOBAL LESSONS ($HOME_DIR/.claude/lessons.md):
 $(cat "$HOME_DIR/.claude/lessons.md")"
     fi
     if [ -f "$PROJECT_DIR/lessons.md" ]; then
       CONTENT="$CONTENT
 
 ---
-📁 PROJECT LESSONS ($PROJECT_DIR/lessons.md):
+PROJECT LESSONS ($PROJECT_DIR/lessons.md):
 $(cat "$PROJECT_DIR/lessons.md")"
     fi
 
-    CONTEXT="🔔 IRON LAW: Session log found!
+    CONTEXT="Session log found!
 
-🕐 Wall time: $WALL_TIME
+Wall time: $WALL_TIME
 File: $LATEST_LOG
-Taxonomy: ${OWNER}/${CLIENT}/${DOMAIN}/${REPO}
+Taxonomy: ${OWNER}/${CLIENT}/${DOMAIN}/${REPO}"
+    if [ -n "$STENO_HEALTH" ]; then
+      CONTEXT="$CONTEXT
+$STENO_HEALTH"
+    fi
+    CONTEXT="$CONTEXT
 
 $CONTENT"
     jq -n --arg ctx "$CONTEXT" '{
@@ -480,14 +495,14 @@ $CONTENT"
       jq -n --arg sessions "$EXISTING_SESSIONS" --arg wt "$WALL_TIME" '{
         "hookSpecificOutput": {
           "hookEventName": "SessionStart",
-          "additionalContext": "🕐 Wall time: " + $wt + "\n\n🛑 NO SESSION LOG FOR THIS DIRECTORY.\n\nBefore doing ANY work, ask the user:\n\n**Are we starting NEW work or CONTINUING existing?**\n\nIf NEW:\n- What client? (gtm-machine, personal, core)\n- What domain? (infrastructure, intelligence, outreach)\n- What feature/task?\n\nIf CONTINUING, recent sessions:\n" + $sessions + "\n\nThen either create new taxonomy + session log, or cd to the existing project."
+          "additionalContext": "Wall time: " + $wt + "\n\nNO SESSION LOG FOR THIS DIRECTORY.\n\nBefore doing ANY work, ask the user:\n\n**Are we starting NEW work or CONTINUING existing?**\n\nIf NEW:\n- What client? (e.g. personal, work, core)\n- What domain? (e.g. infrastructure, intelligence, outreach)\n- What feature/task?\n\nIf CONTINUING, recent sessions:\n" + $sessions + "\n\nThen either create new taxonomy + session log, or cd to the existing project."
         }
       }'
     else
       jq -n --arg wt "$WALL_TIME" '{
         "hookSpecificOutput": {
           "hookEventName": "SessionStart",
-          "additionalContext": "🕐 Wall time: " + $wt + "\n\n🛑 NO SESSION LOG.\n\nBefore doing ANY work, ask the user:\n\n1. What are we working on? (feature/task)\n2. What client? (gtm-machine, personal, core)\n3. What domain? (infrastructure, intelligence, outreach)\n\nThen CREATE .claude/taxonomy.json and session log with naming:\n<owner>--<client>_<domain>_<repo>_<feature>_<date>_v1.md"
+          "additionalContext": "Wall time: " + $wt + "\n\nNO SESSION LOG.\n\nBefore doing ANY work, ask the user:\n\n1. What are we working on? (feature/task)\n2. What client? (e.g. personal, work, core)\n3. What domain? (e.g. infrastructure, intelligence, outreach)\n\nThen CREATE .claude/taxonomy.json and session log with naming:\n<owner>--<client>_<domain>_<repo>_<feature>_<date>_v1.md"
         }
       }'
     fi

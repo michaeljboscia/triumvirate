@@ -106,7 +106,7 @@ Session logs are markdown files that serve as shared memory across all three age
 <owner>--<client>_<domain>_<repo>_<feature>_<YYYYMMDD>_v<N>_<agent>.md
 ```
 
-Example: `mikeboscia--personal_infrastructure_triumvirate_hooks_20260228_v3_claude.md`
+Example: `your-username--personal_infrastructure_triumvirate_hooks_20260228_v3_claude.md`
 
 The `<agent>` suffix (`_claude`, `_codex`, `_gemini`) tells you which agent wrote the log. All three agents search for session logs across all suffixes — Claude will read a Gemini log, and vice versa.
 

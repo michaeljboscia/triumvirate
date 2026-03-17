@@ -3,29 +3,37 @@
 # The heavy lifting (Gemini summarization OR jq fallback) already happened in PreCompact.
 # This hook reads the pre-computed summary/narrative and injects it.
 # Works with both section headings written by pre-compact.sh:
-#   "## 🧠 GEMINI CONTEXT SUMMARY" (Gemini succeeded)
-#   "## 📋 SESSION NARRATIVE (jq fallback — Gemini unavailable)" (Gemini failed)
+#   "## GEMINI CONTEXT SUMMARY" (Gemini succeeded)
+#   "## SESSION NARRATIVE (jq fallback — Gemini unavailable)" (Gemini failed)
 
 INPUT=$(cat)
 PROJECT_DIR=$(echo "$INPUT" | jq -r '.cwd // empty')
-TIMESTAMP=$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
 
 LESSONS_MAX_CHARS=6000
 ADDED_LESSON_PATHS="|"
 
-# Source shared session log finder
+# Source credentials vault for AI_MEMORY_DIR
+if [ -f "$HOME/.claude/.env" ]; then
+  set -a
+  source "$HOME/.claude/.env"
+  set +a
+fi
+
+# Source shared session log finder (v2: delegates to session_log_path.py)
 source "$HOME/.claude/hooks/_find-session-log.sh" 2>/dev/null
 
-# Find the most recent session log (contains the Gemini summary from PreCompact)
+# Find the most recent session log (contains stenographer notes + gap-fill)
 SESSION_LOG=""
 if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
-  _find_session_log "$PROJECT_DIR"
+  _find_session_log "$PROJECT_DIR" "$TRANSCRIPT_PATH"
 fi
 
 # Extract the session summary from the session log.
 # pre-compact.sh writes one of two section headings:
-#   "## 🧠 GEMINI CONTEXT SUMMARY"  — Gemini succeeded (preferred)
-#   "## 📋 SESSION NARRATIVE"        — jq fallback
+#   "## GEMINI CONTEXT SUMMARY"  — Gemini succeeded (preferred)
+#   "## SESSION NARRATIVE"        — jq fallback
 # Try Gemini section first; fall back to jq narrative section.
 # Cap at 80KB (~20K tokens) — take the TAIL (most recent = most useful)
 GEMINI_SUMMARY=""
@@ -53,7 +61,7 @@ fi
 
 # Build the recovery message
 if [ -n "$GEMINI_SUMMARY" ]; then
-  RECOVERY_MSG="🔄 COMPACTION RECOVERY - CONTEXT RESTORED
+  RECOVERY_MSG="COMPACTION RECOVERY - CONTEXT RESTORED
 
 **Timestamp:** $TIMESTAMP
 **Session Log:** $SESSION_LOG
@@ -66,12 +74,12 @@ $GEMINI_SUMMARY
 Read it, orient yourself, and continue where you left off."
 else
   # Fallback if no summary found
-  RECOVERY_MSG="🔄 COMPACTION OCCURRED
+  RECOVERY_MSG="COMPACTION OCCURRED
 
 **Timestamp:** $TIMESTAMP
 **Session Log:** $SESSION_LOG
 
-⚠️ No session narrative found. Please read the session log manually.
+No session narrative found. Please read the session log manually.
 The session log should contain the narrative from before compaction."
 fi
 
@@ -107,9 +115,9 @@ $label ($path):
 $body"
 }
 
-append_lessons "📚 GLOBAL LESSONS" "$HOME/.claude/lessons.md"
+append_lessons "GLOBAL LESSONS" "$HOME/.claude/lessons.md"
 if [ -n "$PROJECT_DIR" ]; then
-  append_lessons "📁 PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
+  append_lessons "PROJECT LESSONS" "$PROJECT_DIR/lessons.md"
 fi
 
 # Note: /dev/tty write was attempted here but caused Claude Code's Ink UI to

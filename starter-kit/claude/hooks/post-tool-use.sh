@@ -13,8 +13,8 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 
 # Source shared session log finder
 source "$HOME/.claude/hooks/_find-session-log.sh" 2>/dev/null
-TIMESTAMP=$(TZ='America/New_York' date '+%H:%M')
-WALL_TIME=$(TZ='America/New_York' date '+%H:%M %Z')
+TIMESTAMP=$(date '+%H:%M')
+WALL_TIME=$(date '+%H:%M %Z')
 EMITTED=""  # Track if we already emitted JSON output
 
 # Derive PROJECT_DIR from file path (smarter than just cwd)
@@ -90,7 +90,7 @@ git_add_file() {
             local filename=$(basename "$file_path")
             # Update SESSION_LOG to point to correct repo (AI memory → project-local)
             _find_session_log "$repo_root"
-            append_to_log "Staged: $filename ($changes) | ✓ |"
+            append_to_log "Staged: $filename ($changes) | ok |"
         fi
     fi
 }
@@ -121,11 +121,12 @@ case "$TOOL_NAME" in
                 COMMIT_MSG="(no message)"
             fi
             append_to_log "Git commit $COMMIT_HASH: $COMMIT_MSG | COMMITTED |"
+
             # Remind Claude to update the session log with narrative
             jq -n --arg hash "$COMMIT_HASH" --arg wt "$WALL_TIME" '{
               "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": "🕐 " + $wt + "\n✏️ COMMIT MADE (" + $hash + "). Update the session log with:\n- What was accomplished?\n- Why did we do it?\n- What'"'"'s next?\n\nKeep the narrative current - don'"'"'t wait for compaction."
+                "additionalContext": "Wall time: " + $wt + "\nCOMMIT MADE (" + $hash + "). Update the session log with:\n- What was accomplished?\n- Why did we do it?\n- What'"'"'s next?\n\nKeep the narrative current - don'"'"'t wait for compaction."
               }
             }'
             EMITTED="true"
@@ -147,7 +148,7 @@ Files: $STAGED
 
 Co-Authored-By: Claude <noreply@anthropic.com>" 2>/dev/null
 
-                        append_to_log "✅ Tests passed → Auto-committed: $STAGED | BLESSED |"
+                        append_to_log "Tests passed -> Auto-committed: $STAGED | BLESSED |"
 
                         # Also stage+commit the session log itself
                         if [ -n "$SESSION_LOG" ]; then
@@ -160,7 +161,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>" 2>/dev/null
                 # Tests FAILED - log what didn't work WITH GIT STATE
                 GIT_STATE=$(get_git_state "$CWD")
                 ERROR_SNIPPET=$(echo "$INPUT" | jq -r '.tool_response.stdout // .tool_response.stderr // empty' | head -3 | tr '\n' ' ' | cut -c1-60)
-                append_to_log "❌ Tests FAILED $GIT_STATE | exit $EXIT_CODE: $ERROR_SNIPPET | NEEDS FIX |"
+                append_to_log "Tests FAILED $GIT_STATE | exit $EXIT_CODE: $ERROR_SNIPPET | NEEDS FIX |"
             fi
         fi
 
@@ -170,7 +171,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>" 2>/dev/null
                 # Non-test command failed - log with git state for correlation
                 GIT_STATE=$(get_git_state "$CWD")
                 CMD_SHORT=$(echo "$COMMAND" | cut -c1-30)
-                append_to_log "⚠️ Failed $GIT_STATE | $CMD_SHORT... (exit $EXIT_CODE) | ERROR |"
+                append_to_log "Failed $GIT_STATE | $CMD_SHORT... (exit $EXIT_CODE) | ERROR |"
             fi
         fi
         ;;
@@ -185,7 +186,7 @@ if [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ]; then
         jq -n --arg wt "$WALL_TIME" '{
           "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": ("🕐 " + $wt + " — ⚠️ TAXONOMY WARNING: Project is ambiguous (not a git repo). The write completed, but you SHOULD ask the user: What project are we working on? What client/domain does this belong to? Create .claude/taxonomy.json before the next edit.")
+            "additionalContext": ("Wall time: " + $wt + " — TAXONOMY WARNING: Project is ambiguous (not a git repo). The write completed, but you SHOULD ask the user: What project are we working on? What client/domain does this belong to? Create .claude/taxonomy.json before the next edit.")
           }
         }'
         EMITTED="true"
@@ -198,7 +199,7 @@ if [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ]; then
         jq -n --arg repo "$REPO_NAME" --arg dir "$PROJECT_DIR" --arg wt "$WALL_TIME" '{
           "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": ("🕐 " + $wt + " — ⚠️ TAXONOMY WARNING: Project " + $repo + " has no taxonomy. The write completed, but you SHOULD ask: What client and domain does " + $repo + " belong to? Then CREATE " + $dir + "/.claude/taxonomy.json before the next edit.")
+            "additionalContext": ("Wall time: " + $wt + " — TAXONOMY WARNING: Project " + $repo + " has no taxonomy. The write completed, but you SHOULD ask: What client and domain does " + $repo + " belong to? Then CREATE " + $dir + "/.claude/taxonomy.json before the next edit.")
           }
         }'
         EMITTED="true"
@@ -210,7 +211,7 @@ if [ -z "$EMITTED" ]; then
     jq -n --arg wt "$WALL_TIME" '{
       "hookSpecificOutput": {
         "hookEventName": "PostToolUse",
-        "additionalContext": "🕐 " + $wt
+        "additionalContext": "Wall time: " + $wt
       }
     }'
 fi

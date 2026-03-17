@@ -279,6 +279,14 @@ See [`starter-kit/README.md`](starter-kit/README.md) for full hook documentation
 
 ---
 
+## Acknowledgements
+
+Operational resilience patterns in the MCP server — rate limit retry with exponential backoff, stale worker detection, structured result contracts, and SQLite WAL persistence — were inspired by [CodeFleet](https://github.com/techinfobel/codefleet) by [techinfobel](https://github.com/techinfobel).
+
+CodeFleet takes a pipeline/DAG approach to multi-agent coordination (define stages, fan out, collect results). Triumvirate takes a conversational daemon approach (persistent sessions, multi-turn queries, shared context). Different tools for different problems — and we learned from studying theirs.
+
+---
+
 ## License
 
 Apache 2.0

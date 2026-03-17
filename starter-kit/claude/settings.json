@@ -1,9 +1,6 @@
 {
   "permissions": {
-    "allow": [
-      "WebSearch",
-      "WebFetch"
-    ],
+    "allow": [],
     "deny": [],
     "ask": [],
     "defaultMode": "acceptEdits"
@@ -11,20 +8,20 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/post-compact-recovery.sh"
-          }
-        ]
-      },
-      {
         "matcher": "*",
         "hooks": [
           {
             "type": "command",
             "command": "~/.claude/hooks/session-start.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/post-compact-recovery.sh"
           }
         ]
       }
