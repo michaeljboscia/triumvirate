@@ -46,10 +46,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 try:
     from zoneinfo import ZoneInfo
-    EASTERN = ZoneInfo('America/New_York')
+    # Use TZ env var if set, otherwise system local time
+    _tz_name = os.environ.get('TZ', '')
+    if _tz_name:
+        LOCAL_TZ = ZoneInfo(_tz_name)
+    else:
+        LOCAL_TZ = None  # Will use naive local time (system timezone)
 except ImportError:
     # Python 3.8 fallback
-    EASTERN = None
+    LOCAL_TZ = None
 
 # Add parent dir to path for parser imports
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -58,6 +63,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from parsers import claude as claude_parser
 from parsers import gemini as gemini_parser
 from parsers import codex as codex_parser
+import session_log_path
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -66,10 +72,59 @@ STATE_FILE = TRIUMVIRATE_DIR / 'stenographer-state.json'
 LOCK_BASE = TRIUMVIRATE_DIR / 'locks'
 LOG_FILE = TRIUMVIRATE_DIR / 'stenographer.log'
 
-OLLAMA_BASE = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
-OLLAMA_MODEL = os.environ.get('STENOGRAPHER_MODEL', 'qwen2.5:32b')
-OLLAMA_TIMEOUT = int(os.environ.get('STENOGRAPHER_TIMEOUT', '180'))  # seconds
+# Ollama host auto-detection: tries OLLAMA_HOST env first, then OLLAMA_LOCAL,
+# then falls back to OLLAMA_TUNNEL (if set). Set OLLAMA_HOST to skip auto-detect.
+OLLAMA_BASE = os.environ.get('OLLAMA_HOST', '')  # empty = auto-detect
+OLLAMA_LOCAL = os.environ.get('OLLAMA_LOCAL', 'http://localhost:11434')
+OLLAMA_TUNNEL = os.environ.get('OLLAMA_TUNNEL', '')  # optional remote endpoint
+OLLAMA_MODEL = os.environ.get('STENOGRAPHER_MODEL', 'qwen2.5:7b')
+OLLAMA_TIMEOUT = int(os.environ.get('STENOGRAPHER_TIMEOUT', '300'))  # seconds
 OLLAMA_NUM_CTX = int(os.environ.get('STENOGRAPHER_NUM_CTX', '65536'))
+
+# Optional Cloudflare Access service token — required when calling via tunnel.
+# Create in Cloudflare Zero Trust → Access → Service Tokens.
+# Set in shell env or ~/.triumvirate/.env (sourced by the token gate hook).
+_CF_CLIENT_ID = os.environ.get('CF_ACCESS_CLIENT_ID', '')
+_CF_CLIENT_SECRET = os.environ.get('CF_ACCESS_CLIENT_SECRET', '')
+OLLAMA_HEADERS: dict = {}  # populated by _resolve_ollama_base()
+
+
+def _resolve_ollama_base() -> str:
+    """Auto-detect Ollama host: try local first (2s), fall back to tunnel.
+
+    Sets OLLAMA_HEADERS with CF Access credentials when using the tunnel.
+    Result is cached into OLLAMA_BASE for the lifetime of this process.
+    """
+    global OLLAMA_BASE, OLLAMA_HEADERS
+
+    # Explicit override wins — OLLAMA_HOST env var or already resolved
+    if OLLAMA_BASE:
+        return OLLAMA_BASE
+
+    # Try local first — 2s timeout keeps this invisible when Ollama is local
+    try:
+        req = urllib.request.Request(f"{OLLAMA_LOCAL}/api/tags")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status == 200:
+                OLLAMA_BASE = OLLAMA_LOCAL
+                return OLLAMA_BASE
+    except Exception:
+        pass
+
+    # Fall back to tunnel (if configured)
+    if OLLAMA_TUNNEL:
+        OLLAMA_BASE = OLLAMA_TUNNEL
+        if _CF_CLIENT_ID and _CF_CLIENT_SECRET:
+            OLLAMA_HEADERS = {
+                'CF-Access-Client-Id': _CF_CLIENT_ID,
+                'CF-Access-Client-Secret': _CF_CLIENT_SECRET,
+            }
+        return OLLAMA_BASE
+
+    # No tunnel configured — use local anyway (will fail with clear error)
+    OLLAMA_BASE = OLLAMA_LOCAL
+    return OLLAMA_BASE
+
 
 def _set_model(model: str):
     """Update the global model setting."""
@@ -79,15 +134,17 @@ def _set_model(model: str):
 # Minimum chars of extracted content to warrant a save
 MIN_CONTENT_THRESHOLD = 400
 
-# Maximum chars to send to the model
-MAX_PROMPT_CHARS = 120000
+# Maximum chars to send to the model.
+# Smaller models need smaller prompts to stay within timeout.
+# qwen2.5:7b on M-series Mac: ~5000 chars ≈ 220s (within 300s timeout).
+# Override with STENOGRAPHER_MAX_CHARS env var for faster hardware or bigger models.
+MAX_PROMPT_CHARS = int(os.environ.get('STENOGRAPHER_MAX_CHARS', '5000'))
 
 
-def _now_eastern() -> datetime:
-    """Return current time in America/New_York (handles EST/EDT)."""
-    if EASTERN:
-        return datetime.now(EASTERN)
-    # Fallback: naive local time (assumes machine is Eastern)
+def _now_local() -> datetime:
+    """Return current time in configured timezone."""
+    if LOCAL_TZ:
+        return datetime.now(LOCAL_TZ)
     return datetime.now()
 
 
@@ -212,9 +269,9 @@ class TranscriptLock:
 
 def ollama_health_check() -> bool:
     """Quick health check — is Ollama running and reachable?"""
-    url = f"{OLLAMA_BASE}/api/tags"
+    url = f"{_resolve_ollama_base()}/api/tags"
     try:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=OLLAMA_HEADERS)
         with urllib.request.urlopen(req, timeout=3) as resp:
             return resp.status == 200
     except (urllib.error.URLError, OSError, TimeoutError):
@@ -223,9 +280,9 @@ def ollama_health_check() -> bool:
 
 def ollama_check_model() -> bool:
     """Check if the configured model is available."""
-    url = f"{OLLAMA_BASE}/api/tags"
+    url = f"{_resolve_ollama_base()}/api/tags"
     try:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=OLLAMA_HEADERS)
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
             models = [m.get('name', '') for m in data.get('models', [])]
@@ -246,7 +303,7 @@ def ollama_generate(prompt: str) -> str:
     Uses /api/generate with stream=false for a single complete response.
     Returns the generated text, or raises on failure.
     """
-    url = f"{OLLAMA_BASE}/api/generate"
+    url = f"{_resolve_ollama_base()}/api/generate"
     payload = json.dumps({
         'model': OLLAMA_MODEL,
         'prompt': prompt,
@@ -260,7 +317,7 @@ def ollama_generate(prompt: str) -> str:
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={'Content-Type': 'application/json'},
+        headers={'Content-Type': 'application/json', **OLLAMA_HEADERS},
         method='POST',
     )
 
@@ -279,133 +336,9 @@ def ollama_generate(prompt: str) -> str:
 
 # ─── Session Log Management ───────────────────────────────────────────────
 
-def _get_repo_name(cwd: str) -> str:
-    """Get repo name from taxonomy.json, git remote, or git root dirname.
-
-    Walks up the directory tree to find the project root (location of .git),
-    so this works correctly when cwd is a subdirectory of the project.
-    """
-    try:
-        import subprocess
-
-        # Find git root — this is the true project root regardless of cwd depth
-        result = subprocess.run(
-            ['git', '-C', cwd, 'rev-parse', '--show-toplevel'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            git_root = result.stdout.strip()
-
-            # Taxonomy in git root (most reliable name)
-            taxonomy = Path(git_root) / '.claude' / 'taxonomy.json'
-            if taxonomy.exists():
-                try:
-                    with open(taxonomy) as f:
-                        data = json.load(f)
-                    repo = data.get('repo', '')
-                    if repo:
-                        return repo
-                except Exception:
-                    pass
-
-            # Git remote name
-            remote = subprocess.run(
-                ['git', '-C', git_root, 'remote', 'get-url', 'origin'],
-                capture_output=True, text=True, timeout=5
-            )
-            if remote.returncode == 0:
-                url = remote.stdout.strip()
-                repo = url.split('/')[-1].replace('.git', '')
-                if repo:
-                    return repo
-
-            # Git root directory name as last resort
-            return Path(git_root).name
-
-    except Exception:
-        pass
-
-    # No git — use taxonomy from cwd or cwd name
-    taxonomy = Path(cwd) / '.claude' / 'taxonomy.json'
-    if taxonomy.exists():
-        try:
-            with open(taxonomy) as f:
-                data = json.load(f)
-            repo = data.get('repo', '')
-            if repo:
-                return repo
-        except Exception:
-            pass
-
-    return Path(cwd).name
-
-
-def find_or_create_session_log(agent: str, session_state: dict, transcript_path: str,
-                                cwd: str = None) -> str:
-    """Find existing session log or create a new one.
-
-    Priority:
-    1. Latest hook-created log in ~/.ai-memory/{repo}/ (if cwd known).
-       Always checked dynamically so post-compaction files are found immediately.
-    2. Cached path from state (if cwd unavailable or no hook files found).
-    3. Create new file in ~/.ai-memory/stenographer/ (fallback).
-    """
-    ai_memory = Path.home() / '.ai-memory'
-
-    # Priority 1: Latest hook file in ~/.ai-memory/{repo}/
-    # Re-checked on every call so we follow the hook to its new file after each compaction.
-    if cwd and ai_memory.exists():
-        repo = _get_repo_name(cwd)
-        if repo:
-            repo_dir = ai_memory / repo
-            repo_dir.mkdir(parents=True, exist_ok=True)
-            candidates = sorted(
-                repo_dir.glob('*--*_v*.md'),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True
-            )
-            if candidates:
-                hook_log = str(candidates[0])
-                session_state['session_log_path'] = hook_log
-                log('INFO', 'Using hook session log', path=hook_log)
-                return hook_log
-
-    # Priority 2: Cached path from state
-    existing = session_state.get('session_log_path')
-    if existing and os.path.exists(existing):
-        return existing
-
-    # Priority 3: Create new file in stenographer directory (no hook files yet)
-    if ai_memory.exists():
-        log_dir = ai_memory / 'stenographer'
-    else:
-        log_dir = TRIUMVIRATE_DIR / 'session-logs'
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    transcript_name = Path(transcript_path).stem
-    date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"stenographer_{agent}_{date_str}_{transcript_name[:20]}.md"
-    log_path = log_dir / filename
-
-    header = f"""# Stenographer Session Log — {agent.title()}
-
-**Agent:** {agent}
-**Transcript:** `{transcript_path}`
-**Started:** {_now_eastern().strftime('%Y-%m-%d %H:%M:%S %Z')}
-**Generated by:** Stenographer v1 (Ollama: {OLLAMA_MODEL})
-
----
-"""
-    with open(log_path, 'w') as f:
-        f.write(header)
-
-    log('INFO', 'Created session log', path=str(log_path), agent=agent)
-    return str(log_path)
-
-
 def append_to_session_log(log_path: str, section_text: str, save_number: int, stats: dict):
     """Atomically append a new section to the session log."""
-    now = _now_eastern()
+    now = _now_local()
     timestamp = now.strftime('%H:%M %Z')
     date_str = now.strftime('%Y-%m-%d')
 
@@ -541,14 +474,14 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
         if not ollama_health_check():
             log('ERROR', 'Ollama not reachable', host=OLLAMA_BASE)
             _write_notify({'status': 'error', 'error': f'Ollama not reachable at {OLLAMA_BASE}',
-                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'completed_at': _now_local().strftime('%H:%M %Z'),
                            'save_number': session.get('saves_count', 0) + 1})
             return False
 
         if not ollama_check_model():
             log('ERROR', 'Model not available', model=OLLAMA_MODEL)
             _write_notify({'status': 'error', 'error': f'Model not pulled: {OLLAMA_MODEL} — run: ollama pull {OLLAMA_MODEL}',
-                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'completed_at': _now_local().strftime('%H:%M %Z'),
                            'save_number': session.get('saves_count', 0) + 1})
             return False
 
@@ -563,6 +496,9 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
                 "Transcript segment:\n"
             )
 
+        # Hard truncate delta to MAX_PROMPT_CHARS (parser may slightly overshoot)
+        if len(delta_text) > MAX_PROMPT_CHARS:
+            delta_text = delta_text[:MAX_PROMPT_CHARS] + f'\n\n[truncated — {len(delta_text) - MAX_PROMPT_CHARS} chars omitted]'
         prompt = prompt_template + delta_text
 
         # ─── Generate notes ───
@@ -574,27 +510,32 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
         except (RuntimeError, ValueError) as e:
             log('ERROR', f'Ollama generation failed: {e}')
             _write_notify({'status': 'error', 'error': str(e),
-                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'completed_at': _now_local().strftime('%H:%M %Z'),
                            'save_number': session.get('saves_count', 0) + 1})
             return False
 
         if not notes or notes.strip() == '':
             log('ERROR', 'Ollama returned empty response')
             _write_notify({'status': 'error', 'error': 'Ollama returned empty response — model may be overloaded or context too large',
-                           'completed_at': _now_eastern().strftime('%H:%M %Z'),
+                           'completed_at': _now_local().strftime('%H:%M %Z'),
                            'save_number': session.get('saves_count', 0) + 1})
             return False
 
         log('INFO', 'Notes generated', words=len(notes.split()), chars=len(notes))
 
         # ─── Append to session log ───
+        # Uses session_log_path module — single source of truth for log location.
         if session_log_override:
             log_path = session_log_override
         else:
-            log_path = find_or_create_session_log(agent, session, transcript_path, cwd)
+            effective_cwd = cwd or os.getcwd()
+            log_path = session_log_path.get_or_create_session_log(
+                effective_cwd, transcript_path, agent
+            )
 
         session['saves_count'] += 1
         append_to_session_log(log_path, notes, session['saves_count'], stats)
+        session_log_path.update_append_time(transcript_path)
 
         log('INFO', 'Appended to session log',
             path=log_path, save_number=session['saves_count'])
@@ -613,7 +554,7 @@ def run(agent: str, transcript_path: str, session_log_override: str = None, cwd:
         # displays a visible block. Deleted after first read.
         _write_notify({
             'status': 'ok',
-            'completed_at': _now_eastern().strftime('%H:%M %Z'),
+            'completed_at': _now_local().strftime('%H:%M %Z'),
             'log_path': log_path,
             'log_basename': os.path.basename(log_path),
             'words': len(notes.split()),
@@ -656,7 +597,7 @@ def main():
     )
     parser.add_argument(
         '--model',
-        help='Ollama model to use (default: from env or qwen2.5:32b)'
+        help='Ollama model to use (default: from env or qwen2.5:7b)'
     )
     parser.add_argument(
         '--dry-run', action='store_true',

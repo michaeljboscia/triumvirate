@@ -47,7 +47,7 @@ THRESHOLD_BYTES="$(( THRESHOLD_KB * 1024 ))"
 
 STATE_FILE="$HOME/.claude/token-gate-state.json"
 LOG_FILE="$HOME/.claude/artifact-guard-logs/token-gate.log"
-PROJECTS_DIR="$HOME/.claude/projects/$(printf '%s' "$HOME" | sed 's|/|-|g' | sed 's/^-//')"
+PROJECTS_DIR="$HOME/.claude/projects/$(printf '%s' "$HOME" | sed 's|/|-|g')"
 
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
 
@@ -88,7 +88,7 @@ _write_state "$(jq -cn \
 # Stenographer runs in the background. When it finishes it writes a notify file.
 # We check for it on every call and emit a visible block when found, then delete.
 #
-# STENO_COMPLETION_NOTIFY=1  → show ✅/❌ block in additionalContext (default: on)
+# STENO_COMPLETION_NOTIFY=1  → show block in additionalContext (default: on)
 # STENO_COMPLETION_NOTIFY=0  → silent (no block, saves ~50 tokens per notification)
 NOTIFY_FILE="$HOME/.triumvirate/stenographer-notify.json"
 NOTIFY_CLAIM="$HOME/.triumvirate/stenographer-notify.claimed.json"
@@ -107,24 +107,13 @@ if [[ "${STENO_COMPLETION_NOTIFY:-1}" == "1" && -f "$NOTIFY_FILE" ]]; then
     IFS=$'\t' read -r _STATUS _SAVE _TIME _WORDS _LOG _TOOLS _MSGS _ERR \
       <<< "$_PARSED"
     if [[ "$_STATUS" == "ok" ]]; then
-      STENO_COMPLETE_BLOCK="┌─ 📝 STENOGRAPHER ─────────────────────────────────────────────┐
-│                                                               │
-│  ✅ Save #${_SAVE} complete  ·  ${_WORDS} words  ·  ${_TIME}  │
-│                                                               │
-│  📄 → ${_LOG}
-│  🔧 ${_TOOLS} tool calls · ${_MSGS} user messages processed  │
-│                                                               │
-└───────────────────────────────────────────────────────────────┘"
+      STENO_COMPLETE_BLOCK="STENOGRAPHER: Save #${_SAVE} complete | ${_WORDS} words | ${_TIME}
+  Log: ${_LOG}
+  ${_TOOLS} tool calls, ${_MSGS} user messages processed"
     else
-      STENO_COMPLETE_BLOCK="┌─ ⚠️  STENOGRAPHER FAILED ─────────────────────────────────────┐
-│                                                               │
-│  ❌ Save #${_SAVE} failed  ·  ${_TIME}                        │
-│                                                               │
-│  ${_ERR}
-│                                                               │
-│  👉 tail ~/.triumvirate/stenographer.log                      │
-│                                                               │
-└───────────────────────────────────────────────────────────────┘"
+      STENO_COMPLETE_BLOCK="STENOGRAPHER FAILED: Save #${_SAVE} | ${_TIME}
+  ${_ERR}
+  Check: tail ~/.triumvirate/stenographer.log"
     fi
   fi
 fi
@@ -172,7 +161,7 @@ TOKENS_APPROX="$(( CURRENT_BYTES / 4 / 1000 ))"
 GROWTH_TOKENS_APPROX="$(( GROWTH / 4 / 1000 ))"
 SAVES_THIS_SESSION="$(( SAVES_THIS_SESSION + 1 ))"
 
-printf '%s TOKEN_GATE save=%d growth_bytes=%d growth_ktokens≈%d total_bytes=%d transcript=%s\n' \
+printf '%s TOKEN_GATE save=%d growth_bytes=%d growth_ktokens=%d total_bytes=%d transcript=%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   "$SAVES_THIS_SESSION" "$GROWTH" "$GROWTH_TOKENS_APPROX" "$CURRENT_BYTES" \
   "$(basename "$TRANSCRIPT")" \
@@ -188,13 +177,18 @@ _write_state "$(jq -cn \
   2>/dev/null
 
 # ─── Background save ─────────────────────────────────────────────────────────
-# Stenographer v1: Delta-only extraction → local Ollama summarization.
-# Replaces the old pre-compact.sh approach that burned 69M Gemini tokens in 4 days.
+# Stenographer: Delta-only extraction → local Ollama summarization.
 # Runs in background via disown so the hook exits immediately.
 STENOGRAPHER="$HOME/.triumvirate/stenographer/stenographer.py"
 
 if [[ -x "$(command -v python3)" && -f "$STENOGRAPHER" ]]; then
   (
+    # Source env for AI_MEMORY_DIR, tunnel credentials, and other config.
+    # Both files are checked — .claude/.env has AI_MEMORY_DIR, .triumvirate/.env
+    # has tunnel/Cloudflare credentials. Without .claude/.env, stenographer and
+    # pre-compact.sh can disagree on session log routing.
+    [[ -f "$HOME/.claude/.env" ]] && set -a && source "$HOME/.claude/.env" && set +a
+    [[ -f "$HOME/.triumvirate/.env" ]] && set -a && source "$HOME/.triumvirate/.env" && set +a
     python3 "$STENOGRAPHER" \
       --agent claude \
       --transcript "$TRANSCRIPT" \
@@ -223,8 +217,8 @@ jq -cn \
       hookEventName: "PostToolUse",
       additionalContext: (
         (if $complete != "" then $complete + "\n\n" else "" end) +
-        "💾 TOKEN GATE (save #" + $saves + "): ~" + $growth + " new tokens since last save " +
-        "(~" + $total + " total). Stenographer " + $steno + " in background (local Ollama, zero API cost)."
+        "TOKEN GATE (save #" + $saves + "): ~" + $growth + " new tokens since last save " +
+        "(~" + $total + " total). Stenographer " + $steno + " in background."
       )
     }
   }'

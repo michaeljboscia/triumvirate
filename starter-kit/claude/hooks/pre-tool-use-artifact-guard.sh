@@ -6,7 +6,7 @@
 #
 # Routes (determined by file type and path):
 #   remote_strict      — Supabase DB SQL with DDL (deny if no fresh backup)
-#   remote_best_effort — Edge functions, n8n workflows (snapshot, never deny)
+#   remote_best_effort — Edge functions (snapshot, never deny)
 #   local_copy         — All other source files (snapshot, never deny)
 #   pass               — node_modules, .git, logs, tmp (no action)
 #
@@ -22,7 +22,6 @@
 #   - Bash 3.2 compatible: no associative arrays, no mapfile
 #   - No 'timeout' command on macOS; psql timeout handled via perl alarm
 #
-# Created: 2026-02-18
 # Replaces: pre-tool-use-supabase-gate.sh
 # ============================================================================
 
@@ -109,7 +108,7 @@ if [[ -n "$WRITE_TEXT" ]] && ! _is_secret_allow_path "$FILE_PATH"; then
   _match_secret "generic_secret_assignment" '(api[_-]?key|client[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token|password|passwd)[[:space:]]*[:=][[:space:]]*['"'"'"]?[A-Za-z0-9._~+/=!@#$%-]{16,}'
 
   if [[ -n "$_secret_match_label" ]]; then
-    _REASON="🔒 AIRLOCK [secret_scan]: Potential secret detected in write content."
+    _REASON="AIRLOCK [secret_scan]: Potential secret detected in write content."
     _CONTEXT="Denied write — matched pattern: ${_secret_match_label}\nTarget file: ${FILE_PATH}\n\nTo write secrets intentionally:\n  1. Use an allowlisted path (.env, CLAUDE.md, infrastructure.md, credentials/, secrets/)\n  2. Or: export ARTIFACT_GUARD_BYPASS=1 (always logged)\n\nThis check is deterministic (regex, no LLM). If you hit a false positive on\ndocumentation examples, use clearly fake values (e.g. sk-placeholder-xxx)\nor use the bypass."
     jq -n --arg r "$_REASON" --arg c "$_CONTEXT" \
       '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r,additionalContext:$c}}'
@@ -183,21 +182,12 @@ if [[ "$_maybe_supabase" == "1" ]]; then
   fi
 fi
 
-# --- REMOTE_BEST_EFFORT: edge functions, n8n workflows ---
+# --- REMOTE_BEST_EFFORT: edge functions ---
 if [[ "$ROUTE" == "local_copy" ]]; then
   case "$FILE_PATH" in
     */supabase/functions/*/index.ts|*/supabase/functions/*/*.ts)
       ROUTE="remote_best_effort"
       FILE_CLASS="edge_function" ;;
-    *.json)
-      if [[ -f "$FILE_PATH" ]]; then
-        _sniff="$(head -c 512 "$FILE_PATH" 2>/dev/null)"
-        case "$_sniff" in
-          *'"nodes"'*|*'"connections"'*)
-            ROUTE="remote_best_effort"
-            FILE_CLASS="n8n_workflow" ;;
-        esac
-      fi ;;
   esac
 fi
 
@@ -421,7 +411,7 @@ if [[ "$ROUTE" == "remote_strict" ]]; then
   REPO_ROOT="$(cd "$(dirname "$FILE_PATH")" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || echo "")"
   [[ -n "$REPO_ROOT" && -d "$REPO_ROOT/supabase-backups" ]] && \
     BACKUP_DIRS+=("$REPO_ROOT/supabase-backups")
-  GDRIVE_BACKUP="${SUPABASE_GDRIVE_BACKUP_PATH:-}"  # Set via env: export SUPABASE_GDRIVE_BACKUP_PATH="$HOME/My Drive/Your Folder/backups/supabase"
+  GDRIVE_BACKUP="${SUPABASE_GDRIVE_BACKUP_PATH:-}"  # Set via env: export SUPABASE_GDRIVE_BACKUP_PATH="/path/to/backups/supabase"
   [[ -d "$GDRIVE_BACKUP" ]] && BACKUP_DIRS+=("$GDRIVE_BACKUP")
   [[ -d "$HOME/supabase-backups" ]] && BACKUP_DIRS+=("$HOME/supabase-backups")
   if [[ -n "${SUPABASE_BACKUP_DIRS:-}" ]]; then
@@ -452,8 +442,8 @@ if [[ "$ROUTE" == "remote_strict" ]]; then
     for _dir in "${BACKUP_DIRS[@]}"; do DIRS_LISTED="${DIRS_LISTED}  - ${_dir}\n"; done
     [[ -z "$DIRS_LISTED" ]] && DIRS_LISTED="  (no backup directories configured)\n"
 
-    _REASON="🔒 AIRLOCK [remote_strict]: No fresh backup for ${OBJ_TYPE} '${OBJ_NAME}'."
-    _CONTEXT="Before editing Supabase SQL files you MUST pull a live backup first.\n\nRequired: '${PATTERN}' (mtime <= ${TTL_MINS}m) in:\n${DIRS_LISTED}\nRun backup protocol:\n  1. Use mcp__supabase__execute_sql to pull the live definition\n  2. Save to supabase-backups/ as: YYYYMMDD_HHMMSS_<ctx>_${OBJ_TYPE}_${OBJ_NAME}.sql\n  3. Retry this edit.\n\nPre-edit disk snapshot: ${BACKUP_PATH:-none}"
+    _REASON="AIRLOCK [remote_strict]: No fresh backup for ${OBJ_TYPE} '${OBJ_NAME}'."
+    _CONTEXT="Before editing Supabase SQL files you MUST pull a live backup first.\n\nRequired: '${PATTERN}' (mtime <= ${TTL_MINS}m) in:\n${DIRS_LISTED}\nRun backup protocol:\n  1. mcp__supabase__execute_sql -> pull live definition\n  2. Save to supabase-backups/ as: YYYYMMDD_HHMMSS_<ctx>_${OBJ_TYPE}_${OBJ_NAME}.sql\n  3. Retry this edit.\n\nPre-edit disk snapshot: ${BACKUP_PATH:-none}"
 
     jq -n --arg r "$_REASON" --arg c "$_CONTEXT" \
       '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r,additionalContext:$c}}'
@@ -469,7 +459,7 @@ if [[ "$ROUTE" == "remote_strict" ]]; then
 
   if [[ "$HASH_FILE" == "HASH_ERROR_FILE" || "$HASH_BACK" == "HASH_ERROR_BACKUP" ]]; then
     if [[ "${SUPABASE_GATE_ALLOW_HASH_ERROR:-0}" == "1" ]]; then exit 0; fi
-    _REASON="🔒 AIRLOCK [remote_strict]: Hash verification failed for ${OBJ_TYPE} '${OBJ_NAME}'."
+    _REASON="AIRLOCK [remote_strict]: Hash verification failed for ${OBJ_TYPE} '${OBJ_NAME}'."
     _CONTEXT="Cannot compute normalized SQL hash.\nDisk: ${HASH_FILE}\nBackup: ${HASH_BACK}\n\nEmergency bypass: export SUPABASE_GATE_ALLOW_HASH_ERROR=1"
     jq -n --arg r "$_REASON" --arg c "$_CONTEXT" \
       '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r,additionalContext:$c}}'
@@ -491,7 +481,7 @@ if [[ "$ROUTE" == "remote_strict" ]]; then
       "$_NORM_BACK" "$_NORM_DISK" 2>/dev/null | head -30 || true)"
     rm -f "$_NORM_DISK" "$_NORM_BACK" 2>/dev/null
 
-    _REASON="🔒 AIRLOCK [remote_strict]: Stale base for ${OBJ_TYPE} '${OBJ_NAME}'. Disk != live Supabase."
+    _REASON="AIRLOCK [remote_strict]: Stale base for ${OBJ_TYPE} '${OBJ_NAME}'. Disk != live Supabase."
     _CONTEXT="DISK FILE IS OUT OF DATE.\n\nDisk:    ${FILE_PATH}\nBackup:  ${LATEST_BACKUP}\nDisk snapshot saved: ${BACKUP_PATH:-none}"
     [[ -n "$_DIFF" ]] && _CONTEXT="${_CONTEXT}\n\n--- DIFF ---\n${_DIFF}\n--- END ---"
     _CONTEXT="${_CONTEXT}\n\nFIX:\n  cp \"${LATEST_BACKUP}\" \"${FILE_PATH}\"\n  Then retry."
