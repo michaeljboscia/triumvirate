@@ -77,7 +77,9 @@ The MCP server creates a unique working directory per daemon (under `~/.gemini/d
 8. The paragraph is appended to the session log file.
 ```
 
-**Why local Ollama instead of an API?** The original pre-compact hook piped full transcripts to the Gemini API for summarization. That burned 69 million tokens in 4 days. Stenographer costs $0.00 per save because it runs on your own machine.
+**Why local Ollama instead of an API?** The original pre-compact hook piped full transcripts to the Gemini API for summarization. That burned 69 million tokens in 4 days. Stenographer is designed to cost $0.00 per save because it runs on your own machine.
+
+> **Honesty note:** The Stenographer's incremental Ollama saves are experimental and not yet proven end-to-end. What reliably works today for session persistence is the pre-compact hook, which uses Gemini CLI (free tier) to summarize the full conversation at compaction time. The incremental Stenographer saves are a work-in-progress — the code exists, but the integration between the token-gate hook and the Ollama pipeline needs testing and fixing before it's reliable.
 
 **Why incremental?** A 200K-token conversation produces a ~50KB transcript. Re-reading the whole thing every save wastes compute. Stenographer reads only the new bytes since the last save — typically 5-10KB. This means saves are fast (2-5 seconds) and lightweight.
 
