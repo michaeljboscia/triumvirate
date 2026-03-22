@@ -11,6 +11,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerGeminiTools } from "./tools.js";
+import { registerOracleTools } from "../oracle-tools.js";
 
 const server = new McpServer({
   name: "gemini-agent",
@@ -18,6 +19,7 @@ const server = new McpServer({
 });
 
 registerGeminiTools(server);
+registerOracleTools(server);
 
 // Global error handlers to prevent silent crashes
 process.on("uncaughtException", (err) => {
