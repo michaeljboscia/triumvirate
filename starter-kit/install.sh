@@ -490,6 +490,91 @@ mkdir -p "$PROJECTS_DIR"
 ok "Projects directory: $PROJECTS_DIR"
 info "When you start Claude, it will look here for your work"
 
+# ── 8c. Beginner mode (auto-save) ───────────────────────────
+echo ""
+echo "  How experienced are you with git (version control)?"
+echo ""
+echo "    1. I don't know what git is  → BEGINNER MODE (auto-saves everything)"
+echo "    2. I know the basics         → STANDARD MODE (you control when to save)"
+echo "    3. I'm experienced           → STANDARD MODE (full manual control)"
+echo ""
+read -p "  Enter 1-3 [1]: " git_experience
+case "${git_experience:-1}" in
+  1)
+    # Add auto-commit/push to .env
+    ENV_FILE="$HOME/.claude/.env"
+    if [[ -f "$ENV_FILE" ]]; then
+      if ! grep -q "TRIUMVIRATE_AUTO_COMMIT" "$ENV_FILE"; then
+        echo "" >> "$ENV_FILE"
+        echo "# Beginner mode — automatically saves your work after every change" >> "$ENV_FILE"
+        echo "TRIUMVIRATE_AUTO_COMMIT=1" >> "$ENV_FILE"
+        echo "TRIUMVIRATE_AUTO_PUSH=1" >> "$ENV_FILE"
+      fi
+    else
+      cat > "$ENV_FILE" <<'ENVEOF'
+# Beginner mode — automatically saves your work after every change
+TRIUMVIRATE_AUTO_COMMIT=1
+TRIUMVIRATE_AUTO_PUSH=1
+ENVEOF
+    fi
+    ok "Beginner mode ON — your work is auto-saved after every change"
+    info "You'll also get reminders to back up to GitHub"
+    ;;
+  *)
+    ok "Standard mode — you control when to save (commit) and back up (push)"
+    ;;
+esac
+
+# ── 8d. Claude subscription tier ──────────────────────────────
+echo ""
+echo "  What Claude subscription do you have?"
+echo "  (This adjusts how often session notes are saved)"
+echo ""
+echo "    1. Claude Pro ($20/mo)          — saves every ~50K tokens"
+echo "    2. Claude Max 5x ($100/mo)      — saves every ~100K tokens"
+echo "    3. Claude Max 20x ($200/mo)     — saves every ~200K tokens"
+echo "    4. API key (pay-per-use)        — saves every ~50K tokens"
+echo "    5. I'm not sure                 — uses safe defaults"
+echo ""
+read -p "  Enter 1-5 [5]: " sub_choice
+ENV_FILE="$HOME/.claude/.env"
+[[ ! -f "$ENV_FILE" ]] && touch "$ENV_FILE"
+case "${sub_choice:-5}" in
+  1|4|5)
+    # Pro / API / unsure: conservative threshold, check often
+    if ! grep -q "TOKEN_GATE_THRESHOLD_KB" "$ENV_FILE"; then
+      echo "" >> "$ENV_FILE"
+      echo "# Claude Pro / API: moderate pace, check every 15 tool calls, save at ~50K tokens" >> "$ENV_FILE"
+      echo "TOKEN_GATE_THRESHOLD_KB=200" >> "$ENV_FILE"
+      echo "TOKEN_GATE_CHECK_EVERY_N=15" >> "$ENV_FILE"
+      echo "TOKEN_GATE_COOLDOWN_SECS=300" >> "$ENV_FILE"
+    fi
+    ok "Tuned for Pro tier: notes every ~50K tokens, hooks check every 15 calls"
+    ;;
+  2)
+    # Max 5x: faster output, check less often to reduce hook overhead
+    if ! grep -q "TOKEN_GATE_THRESHOLD_KB" "$ENV_FILE"; then
+      echo "" >> "$ENV_FILE"
+      echo "# Claude Max 5x: faster pace, check less often to reduce hook overhead" >> "$ENV_FILE"
+      echo "TOKEN_GATE_THRESHOLD_KB=400" >> "$ENV_FILE"
+      echo "TOKEN_GATE_CHECK_EVERY_N=25" >> "$ENV_FILE"
+      echo "TOKEN_GATE_COOLDOWN_SECS=600" >> "$ENV_FILE"
+    fi
+    ok "Tuned for Max 5x: notes every ~100K tokens, hooks check every 25 calls"
+    ;;
+  3)
+    # Max 20x: very fast, wider intervals to avoid Ollama/hook bottleneck
+    if ! grep -q "TOKEN_GATE_THRESHOLD_KB" "$ENV_FILE"; then
+      echo "" >> "$ENV_FILE"
+      echo "# Claude Max 20x: very fast pace, wide intervals to avoid hook bottleneck" >> "$ENV_FILE"
+      echo "TOKEN_GATE_THRESHOLD_KB=800" >> "$ENV_FILE"
+      echo "TOKEN_GATE_CHECK_EVERY_N=40" >> "$ENV_FILE"
+      echo "TOKEN_GATE_COOLDOWN_SECS=900" >> "$ENV_FILE"
+    fi
+    ok "Tuned for Max 20x: notes every ~200K tokens, hooks check every 40 calls"
+    ;;
+esac
+
 # ── 9. Verify ─────────────────────────────────────────────────
 echo ""
 info "Verifying installation..."
