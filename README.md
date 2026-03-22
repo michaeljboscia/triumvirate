@@ -109,6 +109,31 @@ Three protection levels: `remote_strict` (Supabase SQL — checks backup freshne
 
 The result: every edit is reversible, even when Claude makes a mistake at 2am.
 
+### System: Oracle Engine (Pythia) — persistent knowledge daemons
+
+The oracle engine extends the basic daemon pattern into **persistent, managed knowledge repositories**. An oracle holds research docs, codebase context, and accumulated learnings in Gemini's 2M-token window — and survives session boundaries, compaction, and even daemon death.
+
+17 tools cover the full lifecycle: `oracle_init`, `spawn_oracle`, health monitoring (`oracle_pressure_check`, `oracle_quality_report`), corpus management (`oracle_sync_corpus`, `oracle_add_to_corpus`), persistence (`oracle_checkpoint`, `oracle_salvage`, `oracle_reconstitute`), and a 7-gate decommission protocol with TOTP verification.
+
+Oracle is opt-in — see `ARCHITECTURE.md § Oracle Engine` for setup.
+
+### System: Core Skills — operating discipline
+
+8 Claude skills encode the operating discipline that prevents common multi-agent failure modes:
+
+| Skill | Prevents |
+|-------|----------|
+| `inter-agent-protocol` | Wrong messaging pattern, missing peer review, no escalation |
+| `context-before-action` | Declaring code state without verifying (the "it exists" → "no it doesn't" problem) |
+| `documentation-standards` | Shipping features without docs, tests, or examples |
+| `our-systematic-debugging` | Guessing at fixes before understanding root cause |
+| `persist-or-fail` | Compute results evaporating because persistence was skipped |
+| `file-taxonomy` | Files dumped in wrong locations, lost in project sprawl |
+| `crystallize` | Recurring failures not captured as enforceable rules |
+| `orchestrator-not-compute` | Re-implementing existing infrastructure instead of using it |
+
+Skills are installed to `~/.claude/skills/` by `install.sh`. Add your own by creating `SKILL.md` files with frontmatter.
+
 ### Session Log Spec
 
 A cross-agent session log standard (`SESSION_LOG_SPEC.md`) so every agent can document its work in a compatible format that all three can read and resume from.
@@ -141,15 +166,17 @@ chmod +x install.sh
 ```
 
 The installer:
-1. Copies Claude Code hooks (8 files) to `~/.claude/hooks/`
-2. Installs Claude settings, CLAUDE.md starter template
-3. Copies Codex hooks, skills, and config to `~/.codex/`
-4. Copies Gemini hooks and GEMINI.md to `~/.gemini/`
-5. Builds the inter-agent MCP server (`npm install && npm run build`)
-6. Wires all three agents' MCP configs (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
-7. Installs Stenographer to `~/.triumvirate/stenographer/` (local Ollama session notes)
-8. Creates `~/.ai-memory/` (git-initialized session log store)
-9. Copies `.env.example` and `taxonomy.json.example` templates
+1. Copies Claude Code hooks (12 files) to `~/.claude/hooks/`
+2. Installs 8 core Claude skills to `~/.claude/skills/`
+3. Installs rules templates and lessons directory
+4. Installs Claude settings, CLAUDE.md starter template
+5. Copies Codex hooks, skills, and config to `~/.codex/`
+6. Copies Gemini hooks and GEMINI.md to `~/.gemini/`
+7. Builds the inter-agent MCP server with oracle engine (`npm install && npm run build`)
+8. Wires all three agents' MCP configs (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
+9. Installs Stenographer to `~/.triumvirate/stenographer/` (local Ollama session notes)
+10. Creates `~/.ai-memory/` (git-initialized session log store)
+11. Copies `.env.example` and `taxonomy.json.example` templates
 
 Safe to re-run — backs up existing files before overwriting.
 
@@ -242,7 +269,9 @@ Nothing on the list right now — ship fast, add things when the need is real.
 ### What shipped
 
 - **Starter Kit** — one-command installer for the complete multi-agent operating environment. See [`starter-kit/`](starter-kit/).
-- **Hook lifecycle** — 8 Claude hooks + 3 Gemini hooks + 2 Codex hooks. Session recovery, auto-staging, The Airlock (file snapshots before edit), token-gated auto-save, Gemini-powered transcript summarization before context compaction.
+- **Oracle Engine (Pythia)** — 17-tool persistent Gemini knowledge daemon system. Registry, corpus management, checkpoint/salvage/reconstitute lifecycle, pressure monitoring, TOTP-protected decommission. ~5,900 lines.
+- **Core Skills** — 8 Claude skills encoding operating discipline: inter-agent protocol, context verification, documentation standards, systematic debugging, persistence enforcement, file taxonomy, failure crystallization, orchestrator-not-compute.
+- **Hook lifecycle** — 12 Claude hooks + 3 Gemini hooks + 2 Codex hooks. Session recovery, auto-staging, The Airlock (file snapshots before edit), token-gated auto-save, Gemini-powered transcript summarization, oracle pressure monitoring, execution mode nudging, Supabase MCP gate.
 - **Stenographer** — zero-cost incremental session notes via local Ollama. Token gate fires every ~50K tokens; Stenographer reads only new transcript bytes, narrates them locally, appends to the session log. No API calls, no cloud cost. See [`starter-kit/stenographer/`](starter-kit/stenographer/).
 - **The Airlock** — silent file snapshot safety net on every edit. Three protection levels: strict (blocks if backup is stale), best-effort (always snapshots, always allows), copy (source files). Every edit reversible, zero prompts.
 - **Automatic session logs on dismiss** — every daemon writes a `SESSION_LOG_SPEC`-compliant log when dismissed. Gemini and Codex both produce structured markdown with taxonomy, context summary, and transcript history.
@@ -269,6 +298,10 @@ The starter-kit includes a complete hook lifecycle for all three agents. These a
 | `post-tool-use-token-gate.sh` | Claude | PostToolUse | Auto-saves at ~50K token intervals — triggers **Stenographer** (local Ollama narration) |
 | `pre-tool-use-artifact-guard.sh` | Claude | PreToolUse | **The Airlock** — snapshots every file before edit |
 | `pre-tool-use-bash-guard.sh` | Claude | PreToolUse | Blocks destructive SQL without fresh backup |
+| `pre-tool-use-supabase-mcp-gate.sh` | Claude | PreToolUse | Blocks Supabase MCP SQL without fresh backup |
+| `post-tool-use-oracle-pressure.sh` | Claude | PostToolUse | Oracle context pressure monitoring — recommends checkpoints |
+| `post-tool-use-mode-nudge.sh` | Claude | PostToolUse | Suggests formalizing execution mode after 15+ tool calls |
+| `session-start-v3.sh` | Claude | SessionStart | Orphan recovery — cleans stale locks and saves |
 | `session-start.sh` | Gemini | SessionStart | Session log recovery |
 | `pre-compact.sh` | Gemini | PreCompact | Self-summarization → session log → git commit |
 | `post-tool-use.sh` | Gemini | PostToolUse | Auto-stages files, logs activity |
