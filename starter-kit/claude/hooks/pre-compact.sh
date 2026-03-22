@@ -308,13 +308,25 @@ if [ -n "$LOG_GIT_DIR" ]; then
   fi
 fi
 
+# ── Push reminder (beginner mode) ────────────────────────────────────────────
+PUSH_REMINDER=""
+if [[ -n "$CWD" ]] && git -C "$CWD" rev-parse --git-dir &>/dev/null; then
+  REMOTE=$(git -C "$CWD" remote 2>/dev/null | head -1)
+  if [[ -n "$REMOTE" ]]; then
+    UNPUSHED=$(git -C "$CWD" log "${REMOTE}/$(git -C "$CWD" branch --show-current 2>/dev/null)..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ')
+    if (( UNPUSHED > 0 )); then
+      PUSH_REMINDER="\n\n💾 You have $UNPUSHED unsaved change(s) that haven't been backed up to GitHub yet. To back them up, tell Claude: \"push my changes\""
+    fi
+  fi
+fi
+
 # ── Hook output ──────────────────────────────────────────────────────────────
 echo "pre-compact v2: $(basename "$LOG_PATH")" >&2
 
-jq -n --arg log "$LOG_PATH" --arg gap "$HAS_GAP" '{
+jq -n --arg log "$LOG_PATH" --arg gap "$HAS_GAP" --arg push "$PUSH_REMINDER" '{
   "hookSpecificOutput": {
     "hookEventName": "PreCompact",
-    "additionalContext": ("AUTO-SAVED session log (gap-fill v2):\n" + $log + "\nHad gap: " + $gap)
+    "additionalContext": ("AUTO-SAVED session log (gap-fill v2):\n" + $log + "\nHad gap: " + $gap + $push)
   }
 }'
 

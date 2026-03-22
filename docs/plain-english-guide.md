@@ -165,11 +165,13 @@ Git is a system that tracks every change to your files over time. Think of it as
 
 Triumvirate uses git in two places:
 
-**Your project folder:** Every time the AI edits a file, the system automatically stages it (puts it in the "ready to save" box). When you're happy with the changes, you tell Claude to commit (take a permanent snapshot). This means every change is tracked and reversible.
+**Your project folder:** Every time the AI edits a file, the system tracks the change automatically. If you chose "beginner mode" during setup, it also saves (commits) after every edit — so you never lose work and can always go back to any previous version.
 
-**The memory folder:** Session logs are automatically committed before the whiteboard gets erased. This creates a permanent record of every AI session.
+**The memory folder:** Session logs are automatically saved before the whiteboard gets erased. This creates a permanent record of every AI session.
 
-Important: the AI never pushes your code to the internet without asking. Staging and committing happen locally on your computer. Pushing (sharing with the world) is always a manual, explicit action.
+**Beginner mode** (set during installation): If you told the installer you don't know git, Triumvirate runs in beginner mode — it auto-saves every change and auto-backs-up to GitHub. You never have to think about git. If you're experienced with git, standard mode gives you full manual control.
+
+**Backing up to GitHub:** If you set up a GitHub backup during install, the system will remind you to back up when you have unsaved changes. In beginner mode, this happens automatically.
 
 ---
 

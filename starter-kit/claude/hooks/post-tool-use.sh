@@ -101,6 +101,31 @@ case "$TOOL_NAME" in
         FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
         if [ -n "$FILE_PATH" ]; then
             git_add_file "$FILE_PATH"
+
+            # ── Beginner mode: auto-commit after every edit ──────────
+            # Set TRIUMVIRATE_AUTO_COMMIT=1 in ~/.claude/.env to enable.
+            # Creates automatic save points so non-technical users never
+            # lose work. Each commit uses the filename as the message.
+            if [[ "${TRIUMVIRATE_AUTO_COMMIT:-0}" == "1" ]]; then
+                local file_dir=$(dirname "$FILE_PATH")
+                local repo_root=$(git -C "$file_dir" rev-parse --show-toplevel 2>/dev/null)
+                if [[ -n "$repo_root" ]]; then
+                    local staged_count=$(git -C "$repo_root" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+                    if (( staged_count > 0 )); then
+                        local fname=$(basename "$FILE_PATH")
+                        git -C "$repo_root" commit -m "auto-save: updated $fname" --quiet 2>/dev/null
+                        append_to_log "Auto-committed: $fname | ok |"
+
+                        # Auto-push if remote exists and TRIUMVIRATE_AUTO_PUSH=1
+                        if [[ "${TRIUMVIRATE_AUTO_PUSH:-0}" == "1" ]]; then
+                            local has_remote=$(git -C "$repo_root" remote 2>/dev/null | head -1)
+                            if [[ -n "$has_remote" ]]; then
+                                git -C "$repo_root" push --quiet 2>/dev/null &
+                            fi
+                        fi
+                    fi
+                fi
+            fi
         fi
         ;;
 
