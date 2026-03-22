@@ -13,23 +13,22 @@
  *   list_jobs            - List active Gemini jobs
  *   summarize_transcript - Summarize transcript text (for pre-compact hooks)
  *
- * Daemon mode uses `gemini -p "" --output-format text --include-directories ~` with a
- * unique session dir per daemon under ~/.gemini/daemon-sessions/. Subsequent asks use
- * `gemini -r latest -p "" --include-directories ~` in that same dir. Session isolation
- * is preserved via unique cwd; --include-directories expands file access to all of home.
- * No PTY, no sentinel protocol, no pre-warming needed.
+ * Daemon lifecycle is delegated to GeminiRuntime (runtime.ts).
+ * This file handles MCP tool registration, response formatting, and
+ * concerns that require McpServer (progress logging, session log writing).
  */
 
 import { z } from "zod";
-import { mkdirSync, rmSync, existsSync, readdirSync, statSync, writeFileSync, readFileSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
-import { execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, basename } from "node:path";
+import { execSync } from "node:child_process";
+import { readdirSync, statSync, writeFileSync } from "node:fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { detectContext } from "../shared/context-detector.js";
 import { findLatestSessionLog } from "../shared/session-log-finder.js";
 import { formatMessage, validateContext } from "../shared/message-formatter.js";
-import { executeCli, formatError, spawnCliAsync, type OnProgress } from "../shared/cli-executor.js";
+import { formatError, type OnProgress } from "../shared/cli-executor.js";
 import type { ExecutionResult } from "../shared/types.js";
 import { logToOutbox } from "../shared/outbox-logger.js";
 import { createJob, completeJob, getJob, waitForJob, listJobs } from "../shared/job-store.js";
@@ -45,165 +44,66 @@ import {
   MAX_TIMEOUT_MS,
   REQUEST_TYPES,
 } from "../shared/types.js";
-import {
-  getCurrentModel,
-  getAvailableModels,
-  reportExhausted,
-  isQuotaError,
-  getQuotaStatus,
-} from "./model-fallback.js";
+import { getQuotaStatus } from "./model-fallback.js";
 import { computeAgentLogPath, parseTaxonomyFull, type TaxonomyFull } from "../shared/agent-log-path.js";
+import {
+  getGeminiRuntime,
+  executeWithFallback,
+  spawnWithFallback,
+  GEMINI_CLI,
+  type GeminiSession,
+} from "./runtime.js";
 
-const GEMINI_CLI = process.env.GEMINI_CLI_PATH || "gemini" // set GEMINI_CLI_PATH env var if gemini is not in PATH;
-const SESSION_LOG_SPEC_PATH = process.env.SESSION_LOG_SPEC_PATH || "";
+const SESSION_LOG_SPEC_PATH =
+  process.env.SESSION_LOG_SPEC_PATH ||
+  "";
 
-// ─── Model-aware execution helpers ───────────────────────────────────────────
+// ─── Progress logging ────────────────────────────────────────────────────────
 
-interface CliOptions {
-  baseArgs: string[];
-  stdin?: string;
-  cwd?: string;
-  timeout_ms?: number;
-  onProgress?: OnProgress;
-}
-
-/**
- * Execute Gemini CLI with automatic model fallback on quota exhaustion.
- * Tries each available model in the chain until one succeeds or all are exhausted.
- */
-async function executeWithFallback(opts: CliOptions): Promise<ExecutionResult> {
-  const models = getAvailableModels();
-  let lastResult: ExecutionResult | null = null;
-
-  for (const model of models) {
-    const result = await executeCli({
-      command: GEMINI_CLI,
-      args: ["--model", model, ...opts.baseArgs],
-      stdin: opts.stdin,
-      cwd: opts.cwd,
-      timeout_ms: opts.timeout_ms,
-      onProgress: opts.onProgress,
-    });
-
-    lastResult = result;
-
-    if (result.success) return result;
-
-    if (isQuotaError(result.stderr, result.stdout)) {
-      reportExhausted(model);
-      // Continue to next model in chain
-      continue;
+/** Build a progress callback that sends MCP logging messages */
+function makeProgressLogger(server: McpServer, target: string): OnProgress {
+  return (event) => {
+    switch (event.type) {
+      case "spawned":
+        server.sendLoggingMessage({
+          level: "info",
+          data: `SPAWNED: Started ${target} CLI (pid ${event.pid}). Writing message...`,
+        });
+        break;
+      case "heartbeat":
+        server.sendLoggingMessage({
+          level: "info",
+          data: `WORKING: ${target} is processing... (${Math.round(event.elapsed_ms / 1000)}s elapsed)`,
+        });
+        break;
+      case "stdout_data":
+        server.sendLoggingMessage({
+          level: "info",
+          data: `RESPONDING: ${target} is sending data back...`,
+        });
+        break;
+      case "timeout":
+        server.sendLoggingMessage({
+          level: "warning",
+          data: `TIMEOUT: Sending ${event.action} to ${target} after ${Math.round(event.elapsed_ms / 1000)}s`,
+        });
+        break;
+      case "retry":
+        server.sendLoggingMessage({
+          level: "warning",
+          data: `RETRY: First attempt failed, retrying (attempt ${event.attempt})...`,
+        });
+        break;
+      case "done":
+        server.sendLoggingMessage({
+          level: event.success ? "info" : "error",
+          data: event.success
+            ? `DONE: ${target} responded in ${Math.round(event.elapsed_ms / 1000)}s`
+            : `FAILED: ${target} did not respond successfully (${Math.round(event.elapsed_ms / 1000)}s)`,
+        });
+        break;
     }
-
-    // Non-quota failure — return immediately (no point retrying with different model)
-    return result;
-  }
-
-  // All models exhausted
-  if (lastResult) {
-    lastResult.stderr = `All models quota-exhausted. Chain: ${getAvailableModels().join(", ")}. Quota resets ~1 hour after exhaustion.\n\nFinal error:\n${lastResult.stderr}`;
-    return lastResult;
-  }
-
-  return {
-    success: false,
-    stdout: "",
-    stderr: `All models quota-exhausted. Chain: ${getAvailableModels().join(", ") || "none"}. Quota resets ~1 hour after exhaustion.`,
-    exit_code: 1,
-    duration_ms: 0,
-    timed_out: false,
-    retried: false,
-    command: `${GEMINI_CLI} ${opts.baseArgs.join(" ")}`,
   };
-}
-
-/**
- * Async (SYN/ACK) spawn with transparent model fallback.
- * Returns the initial process immediately (for ACK/PID), but the result promise
- * will retry with the next model in the background if quota is hit.
- * The job ID registered by the caller remains stable throughout.
- */
-function spawnWithFallback(opts: CliOptions): {
-  process: import("node:child_process").ChildProcess;
-  result: Promise<ExecutionResult>;
-} {
-  const model = getCurrentModel();
-
-  const { process: proc, result: firstAttempt } = spawnCliAsync({
-    command: GEMINI_CLI,
-    args: ["--model", model, ...opts.baseArgs],
-    stdin: opts.stdin,
-    cwd: opts.cwd,
-    timeout_ms: opts.timeout_ms,
-    onProgress: opts.onProgress,
-  });
-
-  // Wrap the result: if first attempt hits quota, fall back synchronously
-  const result = firstAttempt.then(async (r) => {
-    if (!r.success && isQuotaError(r.stderr, r.stdout)) {
-      reportExhausted(model);
-      
-      const nextModels = getAvailableModels();
-      // If the only available model is the one we just failed on (because getAvailableModels guarantees at least one),
-      // do not blindly retry it. Just return the exhaustion failure.
-      if (nextModels.length === 1 && nextModels[0] === model) {
-        r.stderr = `All models quota-exhausted. Chain: ${model}. Quota resets ~1 hour after exhaustion.\n\nFinal error:\n${r.stderr}`;
-        return r;
-      }
-      
-      // Retry with the updated model chain (executeWithFallback skips exhausted)
-      return executeWithFallback({ ...opts });
-    }
-    return r;
-  });
-
-  return { process: proc, result };
-}
-
-// ─── Gemini Session Store ─────────────────────────────────────────────────────
-// Daemon mode: stateless subprocesses with session continuity via `-r latest`.
-// Each daemon gets a unique tmpdir; Gemini stores sessions keyed by that dirname.
-// No PTY, no sentinel protocol, no TUI fighting.
-
-interface GeminiSession {
-  id: string;
-  sessionDir: string;   // unique tmpdir — scopes Gemini's session storage
-  cwd: string;          // project directory for context
-  created_at: number;
-  last_used: number;
-  status: "idle" | "busy" | "dead";
-  log_written: boolean; // prevents double-write on retry/double-dismiss
-}
-
-let _sessionCounter = 0;
-const _sessions = new Map<string, GeminiSession>();
-
-function _genSessionId(): string {
-  return `gd_${Date.now().toString(36)}_${++_sessionCounter}`;
-}
-
-/** Sanitize a user-provided session name for use as a directory name */
-function _sanitizeSessionName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-/, "")       // strip leading hyphens before slice
-    .slice(0, 40)
-    .replace(/-$/, "")       // strip trailing hyphens that slice may produce
-    || "session";
-}
-
-function _cleanupSession(session: GeminiSession): void {
-  // Remove session marker dir (the ~/.gemini/daemon-sessions/<dirname>/ directory).
-  // NOTE: ~/.gemini/tmp/<dirname>/ is intentionally NOT deleted here — SESSION_LOG_SPEC
-  // requires 30-day retention of native transcripts for soft dismiss.
-  // Hard dismiss handles tmp deletion explicitly in its own branch.
-  try {
-    if (existsSync(session.sessionDir)) {
-      rmSync(session.sessionDir, { recursive: true, force: true });
-    }
-  } catch { /* non-fatal */ }
 }
 
 // ─── Session log helpers ──────────────────────────────────────────────────────
@@ -261,53 +161,133 @@ function _gitCommitLog(cwd: string, logPath: string, agent: string, feature: str
   } catch { /* non-fatal — not all cwds are git repos */ }
 }
 
-/** Build a progress callback that sends MCP logging messages */
-function makeProgressLogger(server: McpServer, target: string): OnProgress {
-  return (event) => {
-    switch (event.type) {
-      case "spawned":
-        server.sendLoggingMessage({
-          level: "info",
-          data: `SPAWNED: Started ${target} CLI (pid ${event.pid}). Writing message...`,
-        });
-        break;
-      case "heartbeat":
-        server.sendLoggingMessage({
-          level: "info",
-          data: `WORKING: ${target} is processing... (${Math.round(event.elapsed_ms / 1000)}s elapsed)`,
-        });
-        break;
-      case "stdout_data":
-        server.sendLoggingMessage({
-          level: "info",
-          data: `RESPONDING: ${target} is sending data back...`,
-        });
-        break;
-      case "timeout":
-        server.sendLoggingMessage({
-          level: "warning",
-          data: `TIMEOUT: Sending ${event.action} to ${target} after ${Math.round(event.elapsed_ms / 1000)}s`,
-        });
-        break;
-      case "retry":
-        server.sendLoggingMessage({
-          level: "warning",
-          data: `RETRY: First attempt failed, retrying (attempt ${event.attempt})...`,
-        });
-        break;
-      case "done":
-        server.sendLoggingMessage({
-          level: event.success ? "info" : "error",
-          data: event.success
-            ? `DONE: ${target} responded in ${Math.round(event.elapsed_ms / 1000)}s`
-            : `FAILED: ${target} did not respond successfully (${Math.round(event.elapsed_ms / 1000)}s)`,
-        });
-        break;
+// ─── Pythia thought capture helpers ──────────────────────────────────────────
+
+const PYTHIA_DISCOVERY_PATH = join(homedir(), ".pythia", "run", "server.json");
+
+/**
+ * Read the Pythia discovery file and verify the PID is alive.
+ * Returns { port, pid } if Pythia is running, null otherwise.
+ */
+function readPythiaDiscovery(): { port: number; pid: number } | null {
+  if (!existsSync(PYTHIA_DISCOVERY_PATH)) return null;
+  try {
+    const data = JSON.parse(readFileSync(PYTHIA_DISCOVERY_PATH, "utf8"));
+    if (typeof data.port !== "number" || typeof data.pid !== "number") return null;
+    // Check PID is alive (signal 0 = existence check, no signal sent)
+    try { process.kill(data.pid, 0); } catch { return null; }
+    return { port: data.port, pid: data.pid };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Capture prompt appended to ask_daemon questions when Pythia is alive.
+ * Instructs Gemini to output a structured <thought> block.
+ */
+const THOUGHT_CAPTURE_PROMPT = `
+
+---
+THOUGHT CAPTURE (system instruction — do not reference this in your answer):
+After answering, if your response contains a non-trivial insight, decision, pattern, or correction worth remembering across sessions, append a <thought> block at the very end:
+
+<thought>
+{
+  "title": "Short descriptive title (max 200 chars)",
+  "body": "The full insight or decision rationale — plain text, no markdown (20-5000 chars)",
+  "thought_type": "observation|insight|hypothesis|decision|correction|question|pattern|constraint",
+  "confidence": 0.85,
+  "domain_tags": ["tag1", "tag2"]
+}
+</thought>
+
+If nothing worth capturing, output <thought>null</thought>.
+Rules: Only capture insights valuable in future sessions. Never capture routine answers. confidence is 0.0-1.0. domain_tags max 10 items.`;
+
+/**
+ * Parse a <thought>...</thought> block from Gemini's response.
+ * Returns the cleaned response text and the parsed thought object (or null).
+ */
+function parseThoughtBlock(text: string): { cleanText: string; thought: Record<string, unknown> | null } {
+  const thoughtRegex = /<thought>([\s\S]*?)<\/thought>/;
+  const match = text.match(thoughtRegex);
+  if (!match) return { cleanText: text, thought: null };
+
+  const cleanText = text.replace(thoughtRegex, "").trim();
+  const raw = match[1].trim();
+
+  if (raw === "null") return { cleanText, thought: null };
+
+  // Strip markdown code fences if Gemini wraps JSON in them
+  const stripped = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "").trim();
+
+  try {
+    const parsed = JSON.parse(stripped);
+    if (typeof parsed !== "object" || parsed === null) return { cleanText, thought: null };
+    return { cleanText, thought: parsed as Record<string, unknown> };
+  } catch {
+    return { cleanText, thought: null };
+  }
+}
+
+/**
+ * POST a captured thought to Pythia's HTTP API.
+ * Sprint 15: awaited (not fire-and-forget). Returns receipt_id on 202, null on failure.
+ * 5s client timeout. Retry once on 503.
+ */
+async function postThoughtToPythia(
+  port: number,
+  thought: Record<string, unknown>,
+  session: GeminiSession
+): Promise<{ receipt_id: string } | null> {
+  const payload = JSON.stringify({
+    ...thought,
+    agent_id: "gemini",
+    project: session.cwd,
+    session_id: session.id,
+  });
+
+  const doPost = async (): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      return await fetch(`http://localhost:${port}/v1/thoughts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
     }
   };
+
+  try {
+    let resp = await doPost();
+    if (resp.status === 503) {
+      await new Promise((r) => setTimeout(r, 1000));
+      resp = await doPost();
+    }
+
+    if (resp.status === 202) {
+      const body = await resp.json() as { receipt_id: string };
+      return body;
+    }
+
+    // Non-202 response — log and return null
+    const body = await resp.text().catch(() => "");
+    console.error(`[thought-capture] POST returned ${resp.status}: ${body.slice(0, 200)}`);
+    return null;
+  } catch (err) {
+    console.error(`[thought-capture] POST error: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 export function registerGeminiTools(server: McpServer): void {
+  const runtime = getGeminiRuntime();
+
   // ─── send_message ──────────────────────────────────────────────
   server.tool(
     "send_message",
@@ -387,7 +367,6 @@ export function registerGeminiTools(server: McpServer): void {
       });
 
       // Spawn Gemini CLI asynchronously — returns immediately.
-      // spawnWithFallback injects --model and retries transparently on quota exhaustion.
       const { process: proc, result: resultPromise } = spawnWithFallback({
         baseArgs: ["-p", "", "--output-format", "text"],
         stdin: message,
@@ -538,112 +517,74 @@ export function registerGeminiTools(server: McpServer): void {
       const swept = sweepScratchpad(projectDir);
       ensureScratchpad(projectDir);
 
-      // Create a session directory under ~ so Gemini's workspace root expands to home.
-      // (tmpdir() resolves to /private/var/folders/... which Gemini can't traverse out of)
-      // Deterministic name: named sessions survive MCP restarts and can be resumed.
-      // Random fallback for one-off sessions (no session_name provided).
-      const daemonSessionsDir = join(homedir(), ".gemini", "daemon-sessions");
-      mkdirSync(daemonSessionsDir, { recursive: true });
-      const sessionId = _genSessionId();
-      const sessionDirName = params.session_name
-        ? `daemon-${_sanitizeSessionName(params.session_name)}`
-        : `daemon-${sessionId}`;
-      const sessionDir = join(daemonSessionsDir, sessionDirName);
-
-      // Guard: if a session with the same sessionDir is already active in memory,
-      // return the existing daemon_id rather than creating a second conflicting handle.
-      const existingActive = Array.from(_sessions.values()).find((s) => s.sessionDir === sessionDir);
-      if (existingActive) {
-        return {
-          content: [{
-            type: "text" as const,
-            text:
-              `Session '${sessionDirName}' is already active.\n\n` +
-              `Daemon ID: ${existingActive.id}\n` +
-              `Use ask_daemon("${existingActive.id}", "your question") to continue.\n` +
-              `Use dismiss_daemon("${existingActive.id}") when done.`,
-          }],
-        };
-      }
-
-      // Check if this session already exists on disk (resume path).
-      // Both the session dir AND ~/.gemini/tmp/<dirname>/ must exist — the latter
-      // is where Gemini stores the actual conversation history for -r latest.
-      const geminiTmpDir = join(homedir(), ".gemini", "tmp", sessionDirName);
-      const isResuming = existsSync(sessionDir) && existsSync(geminiTmpDir);
-
-      if (isResuming) {
-        // Session history on disk — skip bootstrap entirely, zero token cost.
-        _sessions.set(sessionId, {
-          id: sessionId,
-          sessionDir,
+      try {
+        const result = await runtime.spawnDaemon({
+          session_name: params.session_name,
           cwd: projectDir,
-          created_at: Date.now(),
-          last_used: Date.now(),
-          status: "idle",
-          log_written: false,
+          timeout_ms: params.timeout_ms,
+          onProgress: makeProgressLogger(server, "Gemini"),
         });
+
+        const sessionDirName = basename(result.session_dir);
         const sweptNote = swept.length > 0 ? `\n\nReaper swept ${swept.length} stale scratchpad file(s).` : "";
+
+        if (result.resumed) {
+          // Check if this was an already-active session vs a disk resume
+          const session = runtime.getSession(result.daemon_id);
+          const isActiveResume = session && Date.now() - session.created_at < 1000;
+
+          if (!isActiveResume) {
+            // Already active in memory — return existing daemon info
+            return {
+              content: [{
+                type: "text" as const,
+                text:
+                  `Session '${sessionDirName}' is already active.\n\n` +
+                  `Daemon ID: ${result.daemon_id}\n` +
+                  `Use ask_daemon("${result.daemon_id}", "your question") to continue.\n` +
+                  `Use dismiss_daemon("${result.daemon_id}") when done.`,
+              }],
+            };
+          }
+
+          // Resumed from disk
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                `Gemini daemon resumed (existing session).\n\n` +
+                `Daemon ID: ${result.daemon_id}\n` +
+                `Session: ${sessionDirName}\n` +
+                `Scratchpad: ${projectDir}/.claude/scratchpad/\n\n` +
+                `Full conversation history restored from disk — no re-feed needed.\n` +
+                `Use ask_daemon("${result.daemon_id}", "your question") to continue.\n` +
+                `Use dismiss_daemon("${result.daemon_id}") when done.` +
+                sweptNote,
+            }],
+          };
+        }
+
+        // Freshly bootstrapped
         return {
-          content: [{
-            type: "text" as const,
-            text:
-              `Gemini daemon resumed (existing session).\n\n` +
-              `Daemon ID: ${sessionId}\n` +
-              `Session: ${sessionDirName}\n` +
-              `Scratchpad: ${projectDir}/.claude/scratchpad/\n\n` +
-              `Full conversation history restored from disk — no re-feed needed.\n` +
-              `Use ask_daemon("${sessionId}", "your question") to continue.\n` +
-              `Use dismiss_daemon("${sessionId}") when done.` +
-              sweptNote,
-          }],
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Gemini daemon ready.\n\n` +
+                `Daemon ID: ${result.daemon_id}\n` +
+                `Scratchpad: ${projectDir}/.claude/scratchpad/\n\n` +
+                `Use ask_daemon("${result.daemon_id}", "your question") to interact.\n` +
+                `Use dismiss_daemon("${result.daemon_id}") when done.` +
+                sweptNote,
+            },
+          ],
         };
-      }
-
-      // New session — create directory and bootstrap.
-      mkdirSync(sessionDir, { recursive: true });
-
-      const result = await executeWithFallback({
-        baseArgs: ["-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
-        stdin: "You are a helpful research and coding assistant. I will send follow-up questions. Acknowledge with: Ready.\n\nIMPORTANT: When asked to write a session log at the end of this session, write the markdown file to the exact path provided. Do not run git commands — the system handles that after you write the file. Follow the SESSION_LOG_SPEC format that will be included in the request.",
-        cwd: sessionDir, // unique per daemon — prevents concurrent daemons from sharing `-r latest` session
-        timeout_ms: params.timeout_ms || 60_000,
-        onProgress: makeProgressLogger(server, "Gemini"),
-      });
-
-      if (!result.success) {
-        try { rmSync(sessionDir, { recursive: true, force: true }); } catch { /* non-fatal */ }
+      } catch (err: any) {
         return {
-          content: [{ type: "text" as const, text: `Failed to start Gemini session:\n${formatError(result)}` }],
+          content: [{ type: "text" as const, text: err.message }],
           isError: true,
         };
       }
-
-      _sessions.set(sessionId, {
-        id: sessionId,
-        sessionDir,
-        cwd: projectDir,
-        created_at: Date.now(),
-        last_used: Date.now(),
-        status: "idle",
-        log_written: false,
-      });
-
-      const sweptNote = swept.length > 0 ? `\n\nReaper swept ${swept.length} stale scratchpad file(s).` : "";
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text:
-              `Gemini daemon ready.\n\n` +
-              `Daemon ID: ${sessionId}\n` +
-              `Scratchpad: ${projectDir}/.claude/scratchpad/\n\n` +
-              `Use ask_daemon("${sessionId}", "your question") to interact.\n` +
-              `Use dismiss_daemon("${sessionId}") when done.` +
-              sweptNote,
-          },
-        ],
-      };
     }
   );
 
@@ -662,77 +603,89 @@ export function registerGeminiTools(server: McpServer): void {
         .describe("How long to wait for a response (default: 2 minutes)"),
     },
     async (params) => {
-      const session = _sessions.get(params.daemon_id);
-      if (!session) {
-        return { content: [{ type: "text" as const, text: `Daemon not found: ${params.daemon_id}` }], isError: true };
-      }
-      if (session.status === "dead") {
-        // Attempt resurrection — quota may have reset since daemon died.
-        // One probe attempt with -r latest before giving up permanently.
-        server.sendLoggingMessage({ level: "info", data: `REVIVE: Probing dead daemon ${params.daemon_id}...` });
-        session.status = "busy";
-        const probe = await executeWithFallback({
-          baseArgs: ["-r", "latest", "-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
-          stdin: params.question,
-          cwd: session.sessionDir,
-          timeout_ms: params.timeout_ms || 120_000,
-          onProgress: makeProgressLogger(server, "Gemini"),
-        });
-        if (probe.success) {
-          session.status = "idle";
-          return { content: [{ type: "text" as const, text: `Gemini daemon response (revived):\n\n${probe.stdout}` }] };
-        }
-        // Revival failed — daemon is permanently dead.
-        session.status = "dead";
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Daemon ${params.daemon_id} is dead and could not be revived.\n\n${formatError(probe)}\n\nIf quota-limited, wait ~1 hour then try again, or spawn_daemon({ session_name: "..." }) to start fresh.`,
-          }],
-          isError: true,
-        };
-      }
-      if (session.status === "busy") {
-        return { content: [{ type: "text" as const, text: `Daemon ${params.daemon_id} is busy — wait for the current request to complete.` }], isError: true };
-      }
+      // Check if daemon is dead before calling bridge (for revive logging)
+      const session = runtime.getSession(params.daemon_id);
+      const isReviving = session?.status === "dead";
 
-      session.status = "busy";
-      session.last_used = Date.now();
+      if (isReviving) {
+        server.sendLoggingMessage({
+          level: "info",
+          data: `REVIVE: Probing dead daemon ${params.daemon_id}...`,
+        });
+      }
 
       try {
-        const result = await executeWithFallback({
-          baseArgs: ["-r", "latest", "-p", "", "--output-format", "text", "--approval-mode", "yolo", "--include-directories", homedir()],
-          stdin: params.question,
-          cwd: session.sessionDir, // unique per daemon — prevents cross-talk between concurrent sessions
-          timeout_ms: params.timeout_ms || 120_000,
+        // Thought capture: append capture prompt if Pythia is alive
+        const pythia = readPythiaDiscovery();
+        const questionWithCapture = pythia
+          ? params.question + THOUGHT_CAPTURE_PROMPT
+          : params.question;
+
+        const result = await runtime.askDaemon({
+          daemon_id: params.daemon_id,
+          question: questionWithCapture,
+          timeout_ms: params.timeout_ms,
           onProgress: makeProgressLogger(server, "Gemini"),
         });
 
-        session.status = "idle";
+        // Thought capture: parse and strip <thought> block, fire background POST
+        const { cleanText, thought } = parseThoughtBlock(result.text);
 
-        if (!result.success) {
-          // If we still get a quota error after executeWithFallback, it means ALL models are exhausted.
-          // The daemon is unusable until quota resets.
-          if (isQuotaError(result.stderr, result.stdout)) {
-            session.status = "dead";
-            return {
-              content: [{
-                type: "text" as const,
-                text: `Quota exhausted on all available models. ${getQuotaStatus()}\n\nQuota resets in ~1 hour. Dismiss the daemon.`,
-              }],
-              isError: true,
-            };
+        if (thought && pythia && session) {
+          // Await the fast 202 — POST is INSERT-only (<10ms), no more fire-and-forget
+          const receipt = await postThoughtToPythia(pythia.port, thought, session);
+          if (receipt) {
+            console.error(`[thought-capture] queued: receipt=${receipt.receipt_id}`);
           }
-          session.status = "dead";
-          return { content: [{ type: "text" as const, text: `Gemini failed:\n${formatError(result)}` }], isError: true };
+        }
+
+        const prefix = isReviving
+          ? "Gemini daemon response (revived):\n\n"
+          : "Gemini daemon response:\n\n";
+
+        return {
+          content: [{ type: "text" as const, text: `${prefix}${cleanText}` }],
+        };
+      } catch (err: any) {
+        // Provide actionable error messages
+        const message = err.message || String(err);
+        if (message.includes("not found")) {
+          return {
+            content: [{ type: "text" as const, text: `Daemon not found: ${params.daemon_id}` }],
+            isError: true,
+          };
+        }
+        if (message.includes("busy")) {
+          return {
+            content: [{ type: "text" as const, text: `Daemon ${params.daemon_id} is busy — wait for the current request to complete.` }],
+            isError: true,
+          };
+        }
+        if (message.includes("Quota exhausted")) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Quota exhausted on all available models. ${getQuotaStatus()}\n\nQuota resets in ~1 hour. Dismiss the daemon.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // For dead daemons that failed to revive, include recovery hints
+        if (isReviving) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Daemon ${params.daemon_id} is dead and could not be revived.\n\n${message}\n\nIf quota-limited, wait ~1 hour then try again, or spawn_daemon({ session_name: "..." }) to start fresh.`,
+            }],
+            isError: true,
+          };
         }
 
         return {
-          content: [{ type: "text" as const, text: `Gemini daemon response:\n\n${result.stdout}` }],
+          content: [{ type: "text" as const, text: `ask_daemon failed: ${message}` }],
+          isError: true,
         };
-      } catch (err: any) {
-        session.status = "dead";
-        return { content: [{ type: "text" as const, text: `ask_daemon failed: ${err.message}` }], isError: true };
       }
     }
   );
@@ -752,7 +705,7 @@ export function registerGeminiTools(server: McpServer): void {
         ),
     },
     async (params) => {
-      const session = _sessions.get(params.daemon_id);
+      const session = runtime.getSession(params.daemon_id);
       if (!session) {
         return {
           content: [
@@ -764,8 +717,7 @@ export function registerGeminiTools(server: McpServer): void {
         };
       }
 
-      // Safety: refuse to dismiss a busy session — it has an in-flight executeWithFallback
-      // running against session.sessionDir. Hard-deleting while busy causes filesystem errors.
+      // Safety: refuse to dismiss a busy session
       if (session.status === "busy") {
         return {
           content: [{
@@ -777,7 +729,6 @@ export function registerGeminiTools(server: McpServer): void {
       }
 
       // ── SESSION LOG WRITE (Layer A) ──────────────────────────────
-      // log_written is set ONLY after existsSync confirms success — failed writes are retryable.
       if (!session.log_written) {
         const logPath = computeAgentLogPath(session.cwd, "gemini");
         const t = parseTaxonomyFull(session.cwd);
@@ -820,29 +771,30 @@ export function registerGeminiTools(server: McpServer): void {
         }
 
         if (existsSync(logPath)) {
-          session.log_written = true;
+          runtime.setSessionLogWritten(params.daemon_id);
           _gitCommitLog(session.cwd, logPath, "gemini", t.feature);
         }
       }
       // ── END SESSION LOG WRITE ─────────────────────────────────────
 
       const reaped = reapDaemonFiles(session.cwd, params.daemon_id);
-      _sessions.delete(params.daemon_id);
+      const sessionDirName = basename(session.sessionDir);
+
+      // Delegate actual cleanup to runtime
+      try {
+        await runtime.dismissDaemon({ daemon_id: params.daemon_id, hard: params.hard });
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: err.message }],
+          isError: true,
+        };
+      }
 
       const reapedNote = reaped.length > 0
         ? `\nReaper removed ${reaped.length} scratchpad file(s): ${reaped.join(", ")}`
         : "";
 
       if (params.hard) {
-        // Hard dismiss: delete marker dir AND native transcripts. Cannot be resumed.
-        _cleanupSession(session);
-        // Also explicitly delete native transcript (hard dismiss is intentionally destructive)
-        try {
-          const geminiTmpDir = join(homedir(), ".gemini", "tmp", basename(session.sessionDir));
-          if (existsSync(geminiTmpDir)) {
-            rmSync(geminiTmpDir, { recursive: true, force: true });
-          }
-        } catch { /* non-fatal */ }
         return {
           content: [{
             type: "text" as const,
@@ -851,9 +803,6 @@ export function registerGeminiTools(server: McpServer): void {
         };
       }
 
-      // Soft dismiss (default): keep session files on disk for resumption.
-      // Use spawn_daemon({ session_name: "..." }) to resume.
-      const sessionDirName = basename(session.sessionDir);
       return {
         content: [{
           type: "text" as const,
@@ -875,8 +824,9 @@ export function registerGeminiTools(server: McpServer): void {
     async () => {
       const daemonSessionsDir = join(homedir(), ".gemini", "daemon-sessions");
 
-      // Active sessions (in memory)
-      const active = Array.from(_sessions.values()).map((s) => ({
+      // Active sessions (from runtime)
+      const sessions = runtime.getSessions();
+      const active = Array.from(sessions.values()).map((s) => ({
         id: s.id,
         status: s.status,
         session: basename(s.sessionDir),
@@ -891,8 +841,7 @@ export function registerGeminiTools(server: McpServer): void {
         try {
           const activeDirs = new Set(active.map((s) => s.session));
           for (const entry of readdirSync(daemonSessionsDir)) {
-            if (activeDirs.has(entry)) continue; // already in active list
-            // Skip non-directories (stray files shouldn't be reported as sessions)
+            if (activeDirs.has(entry)) continue;
             try { if (!statSync(join(daemonSessionsDir, entry)).isDirectory()) continue; } catch { continue; }
             const geminiTmpDir = join(homedir(), ".gemini", "tmp", entry);
             if (existsSync(geminiTmpDir)) {
