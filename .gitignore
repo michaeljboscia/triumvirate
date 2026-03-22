@@ -16,3 +16,10 @@ __pycache__/
 
 # Scratch
 .claude/worktrees/
+.claude/scratchpad/
+
+# Implementation plans (contain personal paths from dev environment)
+docs/superpowers/plans/
+
+# OS
+.DS_Store

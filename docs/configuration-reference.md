@@ -22,8 +22,8 @@ Every environment variable, config file, and setting in Triumvirate.
 | `GEMINI_CLI_PATH` | `gemini` | Path to the Gemini CLI binary. Only needed if `gemini` is not in your PATH. |
 | `CODEX_CLI_PATH` | `codex` | Path to the Codex CLI binary. Only needed if `codex` is not in your PATH. |
 | `SESSION_LOG_SPEC_PATH` | (empty) | Path to SESSION_LOG_SPEC.md. Used by Gemini tools for session log writing. If empty, daemons produce session logs without the spec reference. |
-| `TOKEN_GATE_THRESHOLD_KB` | `50` | Transcript size threshold (in KB) before the token-gate hook triggers Stenographer. Lower = more frequent saves. |
-| `STENOGRAPHER_MODEL` | `qwen2.5:32b` | Ollama model used by Stenographer for session note generation. Alternatives: `qwen2.5:14b` (faster, less quality), `qwen2.5:7b` (fastest). |
+| `TOKEN_GATE_THRESHOLD_KB` | `200` | Transcript growth threshold in KB before triggering Stenographer (~50K tokens at 200KB). The installer sets this based on your Claude subscription tier. Lower = more frequent saves. |
+| `STENOGRAPHER_MODEL` | `qwen2.5:7b` | Ollama model used by Stenographer for session note generation. The installer sets this based on your choice. Alternatives: `qwen2.5:3b` (1.9GB, lightest), `qwen2.5:14b` (8.7GB, better quality). |
 | `STENOGRAPHER_TIMEOUT` | `300` | Maximum seconds for a single Stenographer save. Kills the process if exceeded. |
 | `STENOGRAPHER_MAX_CHARS` | `5000` | Maximum characters sent to Ollama per save. Truncates if exceeded. |
 

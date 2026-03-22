@@ -306,8 +306,10 @@ Here's every git operation that Triumvirate's hooks perform:
 | `pre-compact.sh` | `git commit -m "session: ..."` | Memory repo | Before compaction |
 | `session-start.sh` | `git log` (read-only) | Memory repo | On session start (to find latest log) |
 
-**No hook ever runs `git push`.** Pushing is always manual and explicit.
+**In standard mode, no hook ever runs `git push`.** Pushing is always manual and explicit.
 
-**No hook ever commits to the project repo.** Only the memory repo gets automatic commits.
+**Exception: Beginner mode.** If you selected beginner mode during install (`TRIUMVIRATE_AUTO_COMMIT=1` and `TRIUMVIRATE_AUTO_PUSH=1` in `.env`), the post-tool-use hook will auto-commit after every edit and auto-push in the background if a remote exists. This is opt-in only — the installer asks about your git experience and only enables it if you chose "I don't know what git is."
+
+**In standard mode, no hook ever commits to the project repo.** Only the memory repo gets automatic commits. In beginner mode, both repos get automatic commits.
 
 **No hook runs destructive git commands** (`reset`, `rebase`, `force-push`, `clean`). The hooks are append-only — they add files and create commits, nothing else.
