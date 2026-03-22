@@ -85,7 +85,7 @@ The problem: if the AI erases your morning's work to make room for the afternoon
 
 Result: the AI "remembers" across erasures. The whiteboard is temporary, but the notebook is permanent.
 
-> **Note on the Stenographer:** The docs mention a "Stenographer" that writes incremental notes every few minutes using a free, local AI (Ollama). This feature exists in the codebase but is **experimental and not yet reliable.** What actually works today is the pre-compact save — when the whiteboard is about to be erased, Gemini writes a detailed summary into the notebook. That's proven and automatic. The incremental Stenographer saves are a work-in-progress.
+> **About the Stenographer:** The Stenographer writes incremental notes every few minutes using a free AI running on your own computer (Ollama). It requires Ollama installed with a model pulled (e.g., `ollama pull qwen2.5:7b` — a 4.4GB download). Without Ollama, session persistence still works through the pre-compact saves (Gemini summarizes at compaction time), but you miss the incremental mid-session notes.
 
 ### Hooks: Automatic Habits
 
@@ -261,7 +261,7 @@ Quick reference for terms you might see in Claude's output or in the docs:
 | **Compaction** | Erasing the whiteboard to make room. The system saves a summary first. |
 | **Hook** | An automatic habit that fires when something happens (file edited, session started, etc.) |
 | **The Airlock** | Automatic file backup before every edit. Your undo button. |
-| **Stenographer** | The background note-taker (experimental — see note above). Designed to summarize every few minutes using local AI. Pre-compact saves via Gemini are what actually work today. |
+| **Stenographer** | The background note-taker that summarizes your session every few minutes. Runs on local Ollama, costs nothing. Requires `ollama pull qwen2.5:7b` to set up. |
 | **Oracle** | Long-term memory. A filing cabinet with a librarian. Remembers across weeks and months. |
 | **Corpus** | The set of documents loaded into an Oracle's filing cabinet. |
 | **Checkpoint** | A "story so far" summary that the Oracle writes so it can get a fresh start without losing knowledge. |

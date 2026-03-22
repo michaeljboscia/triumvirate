@@ -493,5 +493,26 @@ def main():
         print(result)
 
 
+def update_append_time(transcript_path: str) -> None:
+    """Update the last-append timestamp for a transcript family in state.
+
+    Called by stenographer.py after successfully appending notes.
+    Updates the family's last_append_time so recovery can sort by recency.
+    No-op if state file or family doesn't exist (non-critical metadata).
+    """
+    state_file = Path.home() / '.triumvirate' / 'session-state.json'
+    if not state_file.exists():
+        return
+    try:
+        state = json.loads(state_file.read_text())
+        tuuid = Path(transcript_path).stem
+        families = state.get('families', {})
+        if tuuid in families:
+            families[tuuid]['last_append_time'] = datetime.now().isoformat()
+            state_file.write_text(json.dumps(state, indent=2))
+    except Exception:
+        pass  # Non-critical — don't fail the save over metadata
+
+
 if __name__ == '__main__':
     main()
