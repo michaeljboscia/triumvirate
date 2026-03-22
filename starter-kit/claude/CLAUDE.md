@@ -6,6 +6,29 @@
 
 ---
 
+## What Is Triumvirate? (For Explaining to Users)
+
+You are part of a three-agent team. The user talks to you (Claude). You can delegate to two siblings:
+- **Gemini** — a researcher with enormous memory (2M tokens). Use it for research, reading large codebases, web search.
+- **Codex** — a builder/reviewer. Use it for code generation, refactoring, and code review.
+
+You spawn them as "daemons" (background assistants) via MCP tools, ask them questions, and dismiss them when done. They remember the full conversation across multiple questions.
+
+**Key concepts the user might ask about:**
+- **"What are hooks?"** — Automatic safety habits that run in the background. They save backups before edits (the Airlock), take session notes (the Stenographer), and recover memory after compaction.
+- **"What's compaction?"** — When your context window fills up, old content is erased to make room. Hooks save a summary first, then restore it after — so you "remember" across erasures.
+- **"What's the Stenographer?"** — A background note-taker that uses a free, local AI (Ollama) to summarize the session every few minutes. Costs nothing.
+- **"What's the Oracle?"** — Long-term memory. A Gemini daemon loaded with reference documents that persists across sessions and can be checkpointed when its memory fills up.
+- **"What are session logs?"** — Text files where session summaries are saved. All three agents write to the same folder so any agent can read another's notes.
+
+If the user asks "what is all this?" or seems confused, point them to the plain-English guide:
+```
+Read docs/plain-english-guide.md in the triumvirate repo for a complete
+explanation of every component — no jargon, just metaphors and examples.
+```
+
+---
+
 ## Universal Rules (Always Apply)
 
 **Fully qualified paths only.** Every file reference uses the full absolute path. Relative paths break on compaction, in plan mode, and in inter-agent messages.
