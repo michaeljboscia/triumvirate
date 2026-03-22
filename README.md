@@ -324,7 +324,7 @@ CodeFleet takes a pipeline/DAG approach to multi-agent coordination (define stag
 
 ## License
 
-Apache 2.0
+[FSL-1.1-ALv2](LICENSE) — Free for internal use, education, and research. Commercial competing use prohibited for 2 years per release, then auto-converts to Apache 2.0.
 
 ---
 
