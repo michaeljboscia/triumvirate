@@ -362,20 +362,49 @@ chmod +x "$STENO_DIR/stenographer.py"
 [[ -f "$STENO_DIR/session-save-worker.py" ]] && chmod +x "$STENO_DIR/session-save-worker.py"
 ok "Stenographer installed: $STENO_DIR/"
 
-# Check Ollama (optional but recommended)
+# Check Ollama — powers the free background note-taker (Stenographer)
 if command -v ollama &>/dev/null; then
   if ollama list 2>/dev/null | grep -q "qwen2.5"; then
-    ok "Ollama found with qwen2.5 model — Stenographer ready"
+    ok "Ollama found with qwen2.5 model — background note-taker ready"
   else
-    info "Ollama found but no qwen2.5 model. Pull one with:"
-    info "  ollama pull qwen2.5:32b    (19GB, best quality)"
-    info "  ollama pull qwen2.5:14b    (8.7GB, good balance)"
-    info "  ollama pull qwen2.5:7b     (4.4GB, fastest)"
+    echo ""
+    echo "  Ollama is installed but needs an AI model to take session notes."
+    echo "  This is a one-time download that runs entirely on your computer (free)."
+    echo ""
+    echo "  Model sizes:"
+    echo "    1. qwen2.5:3b   — 1.9 GB  (lightest, works on any machine)"
+    echo "    2. qwen2.5:7b   — 4.4 GB  (recommended)"
+    echo "    3. qwen2.5:14b  — 8.7 GB  (better quality, needs 16GB+ RAM)"
+    echo "    4. Skip for now"
+    echo ""
+    read -p "  Which model? [2]: " model_choice
+    case "${model_choice:-2}" in
+      1) PULL_MODEL="qwen2.5:3b" ;;
+      2) PULL_MODEL="qwen2.5:7b" ;;
+      3) PULL_MODEL="qwen2.5:14b" ;;
+      *) PULL_MODEL="" ;;
+    esac
+    if [[ -n "$PULL_MODEL" ]]; then
+      info "Downloading $PULL_MODEL (this may take a few minutes)..."
+      ollama pull "$PULL_MODEL" && \
+        ok "Model ready: $PULL_MODEL — background note-taker is active" || \
+        warn "Download failed — you can try later with: ollama pull $PULL_MODEL"
+    else
+      info "Skipped — background note-taker will be inactive until you pull a model"
+      info "  Run later: ollama pull qwen2.5:7b"
+    fi
   fi
 else
-  info "Ollama not found — Stenographer will skip saves until installed."
-  info "  macOS:  brew install ollama"
-  info "  Linux:  curl -fsSL https://ollama.ai/install.sh | sh"
+  echo ""
+  info "Ollama not found."
+  echo "  Ollama is a free, local AI that powers the background note-taker."
+  echo "  Without it, your AI assistants still save notes at key moments,"
+  echo "  but you miss the automatic mid-session saves."
+  echo ""
+  echo "  To install later:"
+  echo "    macOS:  brew install ollama"
+  echo "    Linux:  curl -fsSL https://ollama.ai/install.sh | sh"
+  echo "    Then:   ollama pull qwen2.5:7b"
 fi
 
 # ── 7. Shared Templates ──────────────────────────────────────
@@ -393,19 +422,73 @@ fi
 cp "$SCRIPT_DIR/shared/taxonomy.json.example" "$HOME/.claude/taxonomy.json.example"
 ok "Copied taxonomy.json.example to ~/.claude/"
 
-# ── 8. AI Memory Directory ──────────────────────────────────
-# Central session log store — all agents write here when it exists.
-# This is a git repo so session logs are versioned and shareable.
+# ── 8. AI Memory (session notes storage) ─────────────────────
+# This is where your AI assistants save their notes between sessions.
+# Think of it as their shared notebook — all three agents read and write here.
 AI_MEM_DIR="$HOME/.ai-memory"
 if [[ -d "$AI_MEM_DIR" ]]; then
   info "AI memory directory already exists: $AI_MEM_DIR"
 else
-  info "Creating AI memory directory..."
-  mkdir -p "$AI_MEM_DIR"
-  (cd "$AI_MEM_DIR" && git init --quiet)
-  ok "Created $AI_MEM_DIR (git-initialized)"
-  info "Session logs will be stored here when projects have a taxonomy.json"
+  echo ""
+  echo "  Triumvirate saves session notes so your AI assistants remember"
+  echo "  what you worked on yesterday (or last week, or last month)."
+  echo ""
+  read -p "  Create AI memory folder at ~/.ai-memory? [Y/n]: " create_memory
+  if [[ ! "$create_memory" =~ ^[Nn] ]]; then
+    mkdir -p "$AI_MEM_DIR"
+    (cd "$AI_MEM_DIR" && git init --quiet)
+    ok "Created AI memory folder: $AI_MEM_DIR"
+
+    # Offer to back it up to GitHub (private)
+    if command -v gh &>/dev/null; then
+      echo ""
+      echo "  Optional: back up your AI memory to a private GitHub repo."
+      echo "  This lets you access your session notes from other computers"
+      echo "  and keeps them safe if your hard drive dies."
+      echo ""
+      read -p "  Create private GitHub repo for AI memory? [y/N]: " create_remote
+      if [[ "$create_remote" =~ ^[Yy] ]]; then
+        (cd "$AI_MEM_DIR" && \
+          gh repo create ai-memory --private -y 2>/dev/null && \
+          git remote add origin "$(gh repo view ai-memory --json sshUrl -q .sshUrl)" 2>/dev/null && \
+          git add -A && git commit -m "init: AI memory" --quiet 2>/dev/null && \
+          git push -u origin main --quiet 2>/dev/null) && \
+          ok "AI memory backed up to private GitHub repo" || \
+          warn "Couldn't create GitHub repo — memory will be local only (still works fine)"
+      fi
+    fi
+  else
+    warn "Skipped AI memory — session notes will be saved in each project's session-logs/ folder"
+  fi
 fi
+
+# ── 8b. Project directory ────────────────────────────────────
+echo ""
+echo "  Where do you keep your projects?"
+echo "  (The AI uses this to find your work and organize session notes)"
+echo ""
+echo "  Common choices:"
+echo "    1. ~/projects/      (default)"
+echo "    2. ~/Documents/"
+echo "    3. ~/Desktop/"
+echo "    4. Custom path"
+echo ""
+read -p "  Enter 1-4 or a custom path [1]: " project_choice
+case "${project_choice:-1}" in
+  1) PROJECTS_DIR="$HOME/projects" ;;
+  2) PROJECTS_DIR="$HOME/Documents" ;;
+  3) PROJECTS_DIR="$HOME/Desktop" ;;
+  4|*)
+    if [[ "$project_choice" =~ ^/ || "$project_choice" =~ ^~ ]]; then
+      PROJECTS_DIR="${project_choice/#\~/$HOME}"
+    else
+      PROJECTS_DIR="$HOME/projects"
+    fi
+    ;;
+esac
+mkdir -p "$PROJECTS_DIR"
+ok "Projects directory: $PROJECTS_DIR"
+info "When you start Claude, it will look here for your work"
 
 # ── 9. Verify ─────────────────────────────────────────────────
 echo ""
@@ -440,22 +523,32 @@ echo "  MCP server:       $MCP_SERVER_DIR/dist/"
 echo "  Stenographer:     $STENO_DIR/"
 echo ""
 echo "  Next steps:"
-echo "    1. Copy ~/.claude/.env.example to ~/.claude/.env"
-echo "       Fill in your API keys (at minimum: GEMINI_API_KEY)"
-echo "    2. For Oracle Engine (persistent Gemini knowledge daemons):"
+echo ""
+echo "    1. SET UP YOUR API KEYS"
+echo "       cp ~/.claude/.env.example ~/.claude/.env"
+echo "       Open ~/.claude/.env in a text editor and add your keys."
+echo "       At minimum you need: GEMINI_API_KEY (free from Google AI Studio)"
+echo "       See docs/getting-api-access.md for step-by-step instructions."
+echo ""
+echo "    2. INSTALL SUPERPOWERS (recommended)"
+echo "       Superpowers is a plugin that gives Claude advanced skills"
+echo "       like planning, debugging, and code review workflows."
+echo "       Install it by running:"
+echo "         claude /install-plugin https://github.com/anthropics/claude-code-plugins/tree/main/superpowers"
+echo ""
+echo "    3. START WORKING"
+echo "       Just open your terminal and type:"
+echo "         claude"
+echo "       Claude will show you a project picker. Pick a project or"
+echo "       tell it what you want to work on. Everything else is automatic."
+echo ""
+echo "    4. OPTIONAL: Enable long-term memory (Oracle Engine)"
 echo "       cp $SCRIPT_DIR/claude/settings.local.json.example ~/.claude/settings.local.json"
-echo "       See ARCHITECTURE.md § Oracle Engine for details"
-echo "    3. Uncomment the .env sourcing block in ~/.claude/hooks/session-start.sh"
-echo "    4. Create your first project (must be a git repo):"
-echo "       mkdir -p ~/projects/my-project/.claude"
-echo "       cd ~/projects/my-project && git init"
-echo "       cp ~/.claude/taxonomy.json.example .claude/taxonomy.json"
-echo "       # Edit taxonomy.json with your project details"
-echo "       git add .claude/taxonomy.json && git commit -m 'init: add taxonomy'"
-echo "    5. Start all three agents:"
-echo "       claude        # Primary — hooks auto-load, MCP connects to Gemini + Codex"
-echo "       gemini        # Research + analysis — can daemon-call Codex"
-echo "       codex         # Code generation — can daemon-call Gemini"
+echo "       This lets your AI remember things across weeks and months."
+echo "       See docs/oracle-engine.md for details."
+echo ""
+echo "  Read docs/plain-english-guide.md if you want to understand"
+echo "  what all this does — no jargon, just plain English."
 echo ""
 
 if [[ "$ISSUES" -gt 0 ]]; then
