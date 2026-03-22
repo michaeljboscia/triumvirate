@@ -144,6 +144,59 @@ This requires: Claude Code hooks configured, Gemini CLI available locally, Codex
 
 ---
 
+## Oracle Engine (Pythia)
+
+The oracle system provides **persistent Gemini knowledge daemons** that survive
+session boundaries and context compaction. An oracle holds research documents,
+codebase context, and accumulated learnings in Gemini's 2M token window.
+
+### How it works
+
+```
+oracle_init("my-project")           → creates registry entry + manifest
+spawn_oracle("my-project")          → spawns Gemini daemon with corpus loaded
+oracle_add_to_corpus(file_path)     → adds file to manifest
+oracle_sync_corpus()                → syncs changed files to running daemon
+oracle_pressure_check()             → reports context usage + recommendation
+oracle_checkpoint()                 → synthesizes context into checkpoint doc
+oracle_reconstitute()               → atomic generation transition (v→v+1)
+oracle_decommission_execute()       → 7-gate decommission (TOTP + confirmation)
+```
+
+### Architecture
+
+- **Registry:** `~/.pythia/registry.json` — tracks all oracles across projects
+- **State:** Per-oracle state file with interaction history and degradation flags
+- **Manifest:** Corpus definition (static entries + live sources with hashes)
+- **Runtime Bridge:** `OracleRuntimeBridge` interface decouples oracle-tools from Gemini daemon lifecycle
+
+### Tool Categories
+
+| Category | Tools | Purpose |
+|----------|-------|---------|
+| Lifecycle | `oracle_init`, `spawn_oracle`, `oracle_decommission_*` | Create, resume, destroy |
+| Health | `oracle_health`, `oracle_pressure_check`, `oracle_quality_report` | Monitor context usage |
+| Corpus | `oracle_sync_corpus`, `oracle_add_to_corpus`, `oracle_update_entry` | Manage knowledge |
+| Persistence | `oracle_checkpoint`, `oracle_salvage`, `oracle_reconstitute` | Survive context limits |
+| Learning | `oracle_log_learning`, `oracle_refresh` | Capture interactions |
+
+### Error handling
+
+All 17 tools return `OracleResult<T>` — a discriminated union:
+- `{ ok: true, data: T }` on success
+- `{ ok: false, error: { code, message, retryable, details } }` on failure
+
+25 error codes cover daemon states (BUSY_QUERY, BUSY_LOCK, DEAD, QUOTA_EXHAUSTED), operation failures (CHECKPOINT_FAILED, LOCK_TIMEOUT), and decommission gates (TOKEN_EXPIRED, TOTP_INVALID).
+
+### Setup
+
+Oracle is opt-in. To enable:
+1. The MCP server registers oracle tools automatically (no config needed)
+2. Add oracle permissions to `~/.claude/settings.local.json` (see `settings.local.json.example`)
+3. Requires `GEMINI_API_KEY` in environment
+
+---
+
 ## Design decisions
 
 **Why not a relay server?**
