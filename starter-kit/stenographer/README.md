@@ -101,15 +101,23 @@ curl http://localhost:11434/api/version
 
 **3. Pull a model**
 
-Choose based on available RAM:
+Choose based on your machine and available disk space:
 
 ```bash
-ollama pull qwen2.5:32b    # 19GB — best quality, recommended if you have ≥24GB RAM
-ollama pull qwen2.5:14b    # 8.7GB — good balance for 16GB machines
-ollama pull qwen2.5:7b     # 4.4GB — fast, adequate, runs on most hardware
+# Recommended — works well on most machines (8GB+ RAM)
+ollama pull qwen2.5:7b     # 4.4GB download — fast, good quality
+
+# Better quality if you have the hardware (16GB+ RAM)
+ollama pull qwen2.5:14b    # 8.7GB download — noticeably better summaries
+
+# Best quality (24GB+ RAM, M-series Mac or dedicated GPU)
+ollama pull qwen2.5:32b    # 19GB download — highest quality, slow on small machines
+
+# Lightest option (laptops with limited storage or <8GB RAM)
+ollama pull qwen2.5:3b     # 1.9GB download — works, lower quality summaries
 ```
 
-The model only needs to be pulled once. Ollama caches it locally.
+The model only needs to be pulled once. Ollama caches it locally. You can always swap later by pulling a different size and setting `STENOGRAPHER_MODEL=qwen2.5:14b` in your `~/.claude/.env`.
 
 **4. Verify end-to-end**
 
