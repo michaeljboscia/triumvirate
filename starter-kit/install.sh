@@ -488,6 +488,15 @@ case "${project_choice:-1}" in
 esac
 mkdir -p "$PROJECTS_DIR"
 ok "Projects directory: $PROJECTS_DIR"
+
+# Save to .env so session-start.sh can find it
+ENV_FILE="$HOME/.claude/.env"
+[[ ! -f "$ENV_FILE" ]] && touch "$ENV_FILE"
+if ! grep -q "TRIUMVIRATE_PROJECTS_DIR" "$ENV_FILE"; then
+  echo "" >> "$ENV_FILE"
+  echo "# Where your projects live — used by session-start to find your work" >> "$ENV_FILE"
+  echo "TRIUMVIRATE_PROJECTS_DIR=\"$PROJECTS_DIR\"" >> "$ENV_FILE"
+fi
 info "When you start Claude, it will look here for your work"
 
 # ── 8c. Beginner mode (auto-save) ───────────────────────────
