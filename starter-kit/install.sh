@@ -101,6 +101,51 @@ for hook in "$SCRIPT_DIR"/claude/hooks/*.sh; do
 done
 ok "Claude hooks installed ($(ls "$SCRIPT_DIR"/claude/hooks/*.sh | wc -l | tr -d ' ') files)"
 
+# ── 1b. Claude Skills ──────────────────────────────────────
+info "Installing Claude skills..."
+SKILLS_SRC="$SCRIPT_DIR/claude/skills"
+SKILLS_DST="$HOME/.claude/skills"
+
+if [[ -d "$SKILLS_SRC" ]]; then
+  mkdir -p "$SKILLS_DST"
+  for skill_dir in "$SKILLS_SRC"/*/; do
+    [[ -d "$skill_dir" ]] || continue
+    skill_name="$(basename "$skill_dir")"
+    if [[ -d "$SKILLS_DST/$skill_name" ]]; then
+      warn "Skill '$skill_name' already exists — skipping (won't overwrite)"
+    else
+      cp -r "$skill_dir" "$SKILLS_DST/$skill_name"
+      ok "Installed skill: $skill_name"
+    fi
+  done
+  ok "Claude skills installed"
+fi
+
+# ── 1c. Claude Rules + Lessons ──────────────────────────────
+info "Installing Claude rules and lessons templates..."
+RULES_SRC="$SCRIPT_DIR/claude/rules"
+RULES_DST="$HOME/.claude/rules"
+if [[ -d "$RULES_SRC" ]]; then
+  mkdir -p "$RULES_DST"
+  for rule in "$RULES_SRC"/*.md; do
+    [[ -f "$rule" ]] || continue
+    rule_name="$(basename "$rule")"
+    if [[ -f "$RULES_DST/$rule_name" ]]; then
+      warn "Rule '$rule_name' already exists — skipping"
+    else
+      cp "$rule" "$RULES_DST/$rule_name"
+      ok "Installed rule: $rule_name"
+    fi
+  done
+fi
+
+LESSONS_DST="$HOME/.claude/lessons"
+if [[ ! -d "$LESSONS_DST" ]]; then
+  mkdir -p "$LESSONS_DST"
+  cp "$SCRIPT_DIR/claude/lessons/TEMPLATE.md" "$LESSONS_DST/TEMPLATE.md"
+  ok "Created lessons directory with template"
+fi
+
 # ── 2. Claude Code Settings ──────────────────────────────────
 info "Installing Claude Code settings..."
 
@@ -301,9 +346,20 @@ for prompt in "$SCRIPT_DIR"/stenographer/prompts/*.txt; do
   install_file "$prompt" "$STENO_DIR/prompts/$(basename "$prompt")"
 done
 
+# Utility scripts (session_log_path, gap_fill, health_check, workers)
+for util in "$SCRIPT_DIR"/stenographer/*.py; do
+  [[ -f "$util" ]] || continue
+  util_name="$(basename "$util")"
+  # Skip parsers (handled above) and __pycache__
+  [[ "$util_name" == "__"* ]] && continue
+  install_file "$util" "$STENO_DIR/$util_name"
+done
+
 # Create state and log directories
 mkdir -p "$HOME/.triumvirate/locks"
 chmod +x "$STENO_DIR/stenographer.py"
+[[ -f "$STENO_DIR/session-save-ctl.py" ]] && chmod +x "$STENO_DIR/session-save-ctl.py"
+[[ -f "$STENO_DIR/session-save-worker.py" ]] && chmod +x "$STENO_DIR/session-save-worker.py"
 ok "Stenographer installed: $STENO_DIR/"
 
 # Check Ollama (optional but recommended)
@@ -386,14 +442,17 @@ echo ""
 echo "  Next steps:"
 echo "    1. Copy ~/.claude/.env.example to ~/.claude/.env"
 echo "       Fill in your API keys (at minimum: GEMINI_API_KEY)"
-echo "    2. Uncomment the .env sourcing block in ~/.claude/hooks/session-start.sh"
-echo "    3. Create your first project (must be a git repo):"
+echo "    2. For Oracle Engine (persistent Gemini knowledge daemons):"
+echo "       cp $SCRIPT_DIR/claude/settings.local.json.example ~/.claude/settings.local.json"
+echo "       See ARCHITECTURE.md § Oracle Engine for details"
+echo "    3. Uncomment the .env sourcing block in ~/.claude/hooks/session-start.sh"
+echo "    4. Create your first project (must be a git repo):"
 echo "       mkdir -p ~/projects/my-project/.claude"
 echo "       cd ~/projects/my-project && git init"
 echo "       cp ~/.claude/taxonomy.json.example .claude/taxonomy.json"
 echo "       # Edit taxonomy.json with your project details"
 echo "       git add .claude/taxonomy.json && git commit -m 'init: add taxonomy'"
-echo "    4. Start all three agents:"
+echo "    5. Start all three agents:"
 echo "       claude        # Primary — hooks auto-load, MCP connects to Gemini + Codex"
 echo "       gemini        # Research + analysis — can daemon-call Codex"
 echo "       codex         # Code generation — can daemon-call Gemini"
