@@ -24,6 +24,15 @@
             "command": "~/.claude/hooks/post-compact-recovery.sh"
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session-start-v3.sh"
+          }
+        ]
       }
     ],
     "PreCompact": [
@@ -55,11 +64,20 @@
             "command": "~/.claude/hooks/pre-tool-use-bash-guard.sh"
           }
         ]
+      },
+      {
+        "matcher": "mcp__supabase__apply_migration|mcp__supabase__execute_sql",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/pre-tool-use-supabase-mcp-gate.sh"
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|Bash",
+        "matcher": "Edit|Write|Bash|Agent",
         "hooks": [
           {
             "type": "command",
@@ -73,6 +91,24 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/post-tool-use-token-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/post-tool-use-oracle-pressure.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/post-tool-use-mode-nudge.sh"
           }
         ]
       }
