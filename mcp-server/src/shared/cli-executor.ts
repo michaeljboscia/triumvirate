@@ -105,7 +105,14 @@ async function execOnce(options: ExecOptions): Promise<ExecutionResult> {
       cwd,
       env: { ...process.env, ...env },
       stdio: ["pipe", "pipe", "pipe"],
+      // detached=true creates a new process group (proc.pid becomes group leader).
+      // This allows process.kill(-proc.pid, 'SIGKILL') to kill the entire group,
+      // including gemini's child processes that would otherwise hold pipes open
+      // and prevent proc.on('close') from ever firing.
+      detached: true,
     });
+    // Prevent detached child from keeping the parent Node process alive
+    proc.unref();
 
     // ACK: Process spawned successfully — immediate feedback
     if (proc.pid && onProgress) {
@@ -165,12 +172,18 @@ async function execOnce(options: ExecOptions): Promise<ExecutionResult> {
       // Send SIGTERM first (graceful shutdown)
       proc.kill("SIGTERM");
 
-      // If still alive after grace period, SIGKILL
+      // If still alive after grace period, SIGKILL the entire process group
       graceHandle = setTimeout(() => {
         if (!killed) {
           killed = true;
           onProgress?.({ type: "timeout", elapsed_ms: Date.now() - startTime, action: "SIGKILL" });
-          proc.kill("SIGKILL");
+          // Kill entire process group (negative PID) — catches gemini's child processes
+          // that survive a direct proc.kill("SIGKILL") and hold pipes open indefinitely.
+          try {
+            if (proc.pid) process.kill(-proc.pid, "SIGKILL");
+          } catch {
+            proc.kill("SIGKILL"); // fallback: direct kill if group kill fails
+          }
         }
       }, SIGTERM_GRACE_MS);
     }, effectiveTimeout);
@@ -282,7 +295,12 @@ export function spawnCliAsync(options: ExecOptions): {
     cwd,
     env: { ...process.env, ...env },
     stdio: ["pipe", "pipe", "pipe"],
+    // detached=true creates a new process group so we can kill all descendants
+    // with process.kill(-proc.pid, 'SIGKILL') on timeout.
+    detached: true,
   });
+  // Prevent detached child from keeping the parent Node process alive
+  proc.unref();
 
   // ACK: Process spawned — immediate feedback
   if (proc.pid && onProgress) {
@@ -355,7 +373,12 @@ export function spawnCliAsync(options: ExecOptions): {
             elapsed_ms: Date.now() - startTime,
             action: "SIGKILL",
           });
-          proc.kill("SIGKILL");
+          // Kill entire process group — catches gemini's child processes
+          try {
+            if (proc.pid) process.kill(-proc.pid, "SIGKILL");
+          } catch {
+            proc.kill("SIGKILL"); // fallback: direct kill if group kill fails
+          }
         }
       }, SIGTERM_GRACE_MS);
     }, effectiveTimeout);
