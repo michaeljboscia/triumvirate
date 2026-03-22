@@ -1,0 +1,25 @@
+{
+  "_comment": "Oracle permissions for settings.local.json. Copy to ~/.claude/settings.local.json. Decommission tools require manual approval (destructive).",
+  "permissions": {
+    "allow": [
+      "mcp__inter-agent-gemini__oracle_init",
+      "mcp__inter-agent-gemini__oracle_health",
+      "mcp__inter-agent-gemini__oracle_refresh",
+      "mcp__inter-agent-gemini__oracle_sync_corpus",
+      "mcp__inter-agent-gemini__oracle_pressure_check",
+      "mcp__inter-agent-gemini__oracle_log_learning",
+      "mcp__inter-agent-gemini__oracle_checkpoint",
+      "mcp__inter-agent-gemini__oracle_salvage",
+      "mcp__inter-agent-gemini__oracle_reconstitute",
+      "mcp__inter-agent-gemini__oracle_quality_report",
+      "mcp__inter-agent-gemini__oracle_add_to_corpus",
+      "mcp__inter-agent-gemini__oracle_update_entry",
+      "mcp__inter-agent-gemini__spawn_oracle"
+    ],
+    "ask": [
+      "mcp__inter-agent-gemini__oracle_decommission_request",
+      "mcp__inter-agent-gemini__oracle_decommission_cancel",
+      "mcp__inter-agent-gemini__oracle_decommission_execute"
+    ]
+  }
+}
