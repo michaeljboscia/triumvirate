@@ -6,6 +6,8 @@ Claude Code, Gemini CLI, and Codex work together — sharing context, delegating
 
 Built in 27 days. Partially designed by the agents themselves.
 
+> **New to AI tools?** Start with the [Plain English Guide](docs/plain-english-guide.md) — no jargon, no assumptions, just what this does and why it matters.
+
 ---
 
 ## What this is
