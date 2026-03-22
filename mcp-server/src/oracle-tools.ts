@@ -140,6 +140,15 @@ const PYTHIA_LOGS_DIR = join(PYTHIA_HOME, "logs");
 const PYTHIA_ORACLES_DIR = join(PYTHIA_HOME, "oracles");
 const ORACLE_SPAWN_AUDIT_PATH = join(PYTHIA_LOGS_DIR, "oracle-spawn-audit.jsonl");
 
+/**
+ * Sanitize a string for safe shell interpolation in git commit messages.
+ * Strips anything that could break out of double-quoted shell strings.
+ * Used in all execSync git commands to prevent command injection via MCP tool inputs.
+ */
+function shellSafe(s: string): string {
+  return s.replace(/[`$"\\!;|&<>(){}[\]\n\r]/g, "").slice(0, 200);
+}
+
 /** Where pythia-auth stores TOTP secrets: ~/.pythia/keys/<name>.totp (base32 plaintext) */
 const PYTHIA_KEYS_DIR = join(PYTHIA_HOME, "keys");
 
@@ -2266,7 +2275,7 @@ function flushBatchSync(name: string, batch: LearningsBatch): void {
   batch.bytes = 0;
   try {
     execSync(
-      `git add "${batch.filePath}" && git commit -m "oracle(${name}): log ${count} interactions"`,
+      `git add "${batch.filePath}" && git commit -m "oracle(${shellSafe(name)}): log ${count} interactions"`,
       { cwd: batch.projectRoot, stdio: "pipe" },
     );
   } catch { /* JSONL is already safe on disk; git failure is non-fatal */ }
@@ -2296,7 +2305,7 @@ async function flushBatchAsync(name: string, batch: LearningsBatch): Promise<boo
   try {
     // execSync is fine here — commits are infrequent and latency doesn't matter
     execSync(
-      `git add "${batch.filePath}" && git commit -m "oracle(${name}): log ${count} interactions"`,
+      `git add "${batch.filePath}" && git commit -m "oracle(${shellSafe(name)}): log ${count} interactions"`,
       { cwd: batch.projectRoot, stdio: "pipe" },
     );
     return true;
@@ -2629,7 +2638,7 @@ async function runCheckpoint(params: {
       try {
         execSync(
           `git add "${checkpointPath}" "${manifestPath}" && ` +
-          `git commit -m "oracle(${params.name}): v${state.version} checkpoint (${state.query_count} consultations)"`,
+          `git commit -m "oracle(${shellSafe(params.name)}): v${state.version} checkpoint (${state.query_count} consultations)"`,
           { cwd: project_root, stdio: "pipe" },
         );
       } catch { /* git failure is non-fatal — checkpoint is safe on disk */ }
@@ -3073,7 +3082,7 @@ async function runReconstitute(params: {
       const manifestPath = join(oracle_dir, "manifest.json");
       execSync(
         `git add "${manifestPath}" && ` +
-        `git commit -m "oracle(${params.name}): reconstitute v${previousVersion} → v${newVersion}"`,
+        `git commit -m "oracle(${shellSafe(params.name)}): reconstitute v${previousVersion} → v${newVersion}"`,
         { cwd: project_root, stdio: "pipe" },
       );
     } catch { /* non-fatal */ }
@@ -3452,7 +3461,7 @@ async function decommissionExecute(params: {
       const stateFile = join(oracle_dir, "state.json");
       execSync(
         `git add "${stateFile}" && ` +
-        `git commit -m "oracle(${params.name}): decommissioned v${state.version}"`,
+        `git commit -m "oracle(${shellSafe(params.name)}): decommissioned v${state.version}"`,
         { cwd: project_root, stdio: "pipe" },
       );
     } catch { /* non-fatal */ }
@@ -4188,7 +4197,7 @@ async function addToCorpus(params: {
       : `${newEntries.length} entries`;
     execSync(
       `git add "${manifestPath}" && ` +
-      `git commit -m "oracle(${params.name}): add ${params.role} corpus entry ${entryLabel}"`,
+      `git commit -m "oracle(${shellSafe(params.name)}): add ${shellSafe(params.role ?? "unknown")} corpus entry ${shellSafe(entryLabel ?? "entry")}"`,
       { cwd: project_root, stdio: "pipe" },
     );
   } catch { /* non-fatal */ }
@@ -4280,7 +4289,7 @@ async function updateEntry(params: {
       const manifestPath = join(oracle_dir, "manifest.json");
       execSync(
         `git add "${manifestPath}" && ` +
-        `git commit -m "oracle(${params.name}): update entry ${basename} -- ${params.reason}"`,
+        `git commit -m "oracle(${shellSafe(params.name)}): update entry ${shellSafe(basename)} -- ${shellSafe(params.reason)}"`,
         { cwd: project_root, stdio: "pipe" },
       );
     } catch { /* non-fatal */ }

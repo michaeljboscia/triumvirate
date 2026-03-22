@@ -107,20 +107,20 @@ case "$TOOL_NAME" in
             # Creates automatic save points so non-technical users never
             # lose work. Each commit uses the filename as the message.
             if [[ "${TRIUMVIRATE_AUTO_COMMIT:-0}" == "1" ]]; then
-                local file_dir=$(dirname "$FILE_PATH")
-                local repo_root=$(git -C "$file_dir" rev-parse --show-toplevel 2>/dev/null)
-                if [[ -n "$repo_root" ]]; then
-                    local staged_count=$(git -C "$repo_root" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
-                    if (( staged_count > 0 )); then
-                        local fname=$(basename "$FILE_PATH")
-                        git -C "$repo_root" commit -m "auto-save: updated $fname" --quiet 2>/dev/null
-                        append_to_log "Auto-committed: $fname | ok |"
+                _ac_dir=$(dirname "$FILE_PATH")
+                _ac_root=$(git -C "$_ac_dir" rev-parse --show-toplevel 2>/dev/null)
+                if [[ -n "$_ac_root" ]]; then
+                    _ac_staged=$(git -C "$_ac_root" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+                    if (( _ac_staged > 0 )); then
+                        _ac_fname=$(basename "$FILE_PATH")
+                        git -C "$_ac_root" commit -m "auto-save: updated $_ac_fname" --quiet 2>/dev/null
+                        append_to_log "Auto-committed: $_ac_fname | ok |"
 
                         # Auto-push if remote exists and TRIUMVIRATE_AUTO_PUSH=1
                         if [[ "${TRIUMVIRATE_AUTO_PUSH:-0}" == "1" ]]; then
-                            local has_remote=$(git -C "$repo_root" remote 2>/dev/null | head -1)
-                            if [[ -n "$has_remote" ]]; then
-                                git -C "$repo_root" push --quiet 2>/dev/null &
+                            _ac_remote=$(git -C "$_ac_root" remote 2>/dev/null | head -1)
+                            if [[ -n "$_ac_remote" ]]; then
+                                git -C "$_ac_root" push --quiet 2>/dev/null &
                             fi
                         fi
                     fi

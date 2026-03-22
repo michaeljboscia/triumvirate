@@ -29,7 +29,7 @@ import {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-export const GEMINI_CLI = process.env.GEMINI_CLI_PATH || "/opt/homebrew/bin/gemini";
+export const GEMINI_CLI = process.env.GEMINI_CLI_PATH || "gemini";
 
 // ─── Exported Types ──────────────────────────────────────────────────────────
 
@@ -255,7 +255,7 @@ class GeminiRuntime implements OracleRuntimeBridge {
     // FEAT-022: Sweep all oracle pools for idle members and soft-dismiss them.
     // Reads registry + state files directly (cannot import oracle-tools.ts — circular dep).
     const registryPath = process.env.PYTHIA_REGISTRY_PATH ||
-      join(homedir(), "pythia", "registry.json");
+      join(homedir(), ".pythia", "registry.json");
 
     let registry: { oracles?: Record<string, { oracle_dir: string; decommissioned_at?: string }> };
     try {
@@ -309,9 +309,7 @@ class GeminiRuntime implements OracleRuntimeBridge {
           );
 
           // Soft dismiss — best-effort, swallow errors
-          try {
-            this.dismissDaemon({ daemon_id: member.daemon_id, hard: false });
-          } catch { /* ignore */ }
+          void this.dismissDaemon({ daemon_id: member.daemon_id, hard: false }).catch(() => {});
 
           member.status = "dismissed";
           member.daemon_id = null;
