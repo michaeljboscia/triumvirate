@@ -2,29 +2,31 @@
 
 **Three AI agents. One coordination layer.**
 
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE)
+[![Claude Code](https://img.shields.io/badge/built%20with-Claude%20Code-blueviolet)](https://claude.ai/code)
+[![Gemini CLI](https://img.shields.io/badge/uses-Gemini%20CLI-4285F4)](https://github.com/google-gemini/gemini-cli)
+[![Codex CLI](https://img.shields.io/badge/uses-Codex%20CLI-74aa9c)](https://github.com/openai/codex)
+
 Claude Code, Gemini CLI, and Codex work together — sharing context, delegating tasks, and documenting their own work — without you having to be the relay.
 
-Built in 27 days. Partially designed by the agents themselves.
-
-> **New to AI tools?** Start with the [Plain English Guide](docs/plain-english-guide.md) — no jargon, no assumptions, just what this does and why it matters.
-
----
-
-## What this is
-
-Triumvirate is a coordination layer for three CLI-based AI agents:
-
-| Agent | CLI | Strength |
-|-------|-----|----------|
-| [Claude Code](https://claude.ai/code) | `claude` | Orchestration, reasoning, long context |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | 2M token context, web search, deep research |
-| [Codex](https://github.com/openai/codex) | `codex` | Code generation, refactoring, code review |
-
-The core: an MCP server that gives each agent the ability to **spawn**, **query**, and **dismiss** the others as persistent daemon sessions — with full conversation history and shared scratchpads.
+**Human?** [Start with the Plain English Guide](docs/plain-english-guide.md) — no jargon, no assumptions.
+**AI Agent?** [Skip to the Agent Setup Guide.](#agent-setup-guide)
 
 ---
 
-## How it works
+## The Story
+
+We built this in 27 days — and the agents helped design it.
+
+The inter-agent MCP server went through seven rounds of peer review by Gemini and Codex before we shipped it. They found a git commit catch-22 in the session log design. They caught a daemon cross-talk bug where two concurrent Gemini daemons bled into each other's conversation history. They flagged a hardcoded filename filter that would have broken multi-agent log versioning.
+
+Everything in this repo exists because someone screwed up first. The Airlock exists because Claude overwrote a production config at 2am with no backup. The Stenographer exists because the old pre-compact summarizer burned 69 million API tokens in four days. The "persist or fail" skill exists because 5 hours of batch results evaporated from memory without ever hitting disk.
+
+The guardrails aren't theoretical. They're scar tissue.
+
+---
+
+## How It Works
 
 ```
 Star topology (default)            Triangle topology (Codex→Gemini)
@@ -33,292 +35,194 @@ Star topology (default)            Triangle topology (Codex→Gemini)
        │    │                              │
        │    │                              │
   Gemini    Codex                   Codex ──── Gemini
-                                   (Codex manages Gemini internally)
 ```
 
-**Star:** Claude orchestrates. You ask Claude something, Claude decides whether to delegate to Gemini (large context, research) or Codex (code review, generation). Claude synthesizes the results.
+**Star:** You talk to Claude. Claude delegates to Gemini (2M-token context, web search) or Codex (code review, generation), synthesizes the results.
 
-**Triangle:** Claude dispatches Codex with a large task. Codex decides on its own to spin up a Gemini daemon to load a 4000-line file into a 2M-token context window, ask targeted questions, then dismiss Gemini when done. Claude just gets back a finished review — without ever loading the file itself.
+**Triangle:** Claude dispatches Codex with a large task. Codex autonomously spins up a Gemini daemon, loads a 4000-line file into Gemini's context, asks targeted questions, dismisses Gemini, and returns a complete review. Claude never touches the file.
 
-Token economics: **pass paths, not content.** All three agents read files directly from disk. Context windows stay clean.
+**Token economics:** Pass paths, not content. All three agents read files from disk. Context windows stay clean.
 
 ---
 
-## What's included
+## What's Included
 
-### Core: inter-agent MCP server
+### Inter-Agent MCP Server
 
-The `mcp-server/` directory contains a TypeScript MCP server that wraps the Gemini and Codex CLIs with a clean daemon API:
+The core. A TypeScript MCP server wrapping Gemini and Codex CLIs with a daemon API — `spawn_daemon`, `ask_daemon`, `dismiss_daemon`. Named sessions survive MCP restarts and resume with zero token cost. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
-```typescript
-// Spawn a named session — survives MCP restarts, resumes with zero token cost
-spawn_daemon({ session_name: "arch-auditor", cwd: "/path/to/project" }) → daemon_id
+### Stenographer — Zero-Cost Session Notes
 
-// Ask questions — full conversation history maintained across calls
-ask_daemon(daemon_id, "Read /full/path/to/file.ts and explain the auth flow")
+Incremental transcript narrator running on local Ollama. The token gate hook fires every ~50K tokens, Stenographer reads only the new transcript bytes, narrates them locally, appends to the session log. No API calls. $0.00 per save. See [starter-kit/stenographer/](starter-kit/stenographer/).
 
-// Soft dismiss (default) — session preserved on disk, resumable later
-dismiss_daemon(daemon_id)
+### The Airlock — File Snapshot Safety Net
 
-// Hard dismiss — permanently delete session files
-dismiss_daemon(daemon_id, { hard: true })
+Silently snapshots every file before Claude edits it. Three protection levels: strict (blocks if backup stale), best-effort (always snapshots), copy (source files). Every edit reversible. Zero prompts.
 
-// Next session: resume instantly with no re-feed
-spawn_daemon({ session_name: "arch-auditor" }) → "Gemini daemon resumed (existing session)."
-```
+### Oracle Engine — Persistent Knowledge Daemons
 
-Each `ask_daemon` is a fresh process (~2-3s for Gemini, ~7s for Codex) with full conversation continuity. No PTY, no sentinels, no TUI.
+Extends the daemon pattern into managed knowledge repositories. 17 tools covering oracle lifecycle, corpus management, health monitoring, and checkpoint/salvage/reconstitute. A single Gemini daemon holding your full codebase in its 2M-token window, queryable across sessions. See [docs/oracle-engine.md](docs/oracle-engine.md).
 
-### Pattern: Gemini quick search
+### Lifecycle Hooks
 
-Use Gemini's native MCP tools for real-time web search without leaving Claude's context.
+12 Claude hooks + 3 Gemini hooks + 2 Codex hooks covering the full session lifecycle: start, compaction, tool use, save, and recovery. See [docs/hooks/](docs/hooks/) for the complete reference.
 
-### Pattern: Gemini Deep Research
+### Core Skills
 
-Dispatch multi-source research tasks to Gemini and poll for results. Gemini does the heavy lifting; Claude synthesizes.
-
-### Pattern: Codex code review
-
-Dispatch Codex for git-aware code review on uncommitted changes, branches, or specific commits.
-
-### Pattern: Codex→Gemini delegated review
-
-For large codebases: Claude dispatches Codex, Codex loads the full codebase into Gemini's 2M context window, asks targeted questions, and returns a complete review — without Claude ever touching the files.
-
-### System: Stenographer — zero-cost session notes
-
-Stenographer is an incremental transcript narrator that runs on every Claude session — no API calls, no cloud tokens, just local Ollama.
-
-The token gate hook fires every ~50K tokens. Stenographer reads only the new transcript bytes since the last save (delta extraction), parses the JSONL into normalized events, feeds them to a local Ollama model, and appends a plain-English paragraph to the session log.
-
-```
-transcript.jsonl  →  parse delta  →  local Ollama  →  session-log.md
-                      (new bytes      (qwen2.5:32b    (appends one
-                       only)           or similar)     paragraph)
-```
-
-Why local? The pre-compact hook used to pipe full Gemini transcripts to the Gemini API for summarization — that burned 69M tokens in 4 days. Stenographer costs $0.00 per save and produces a rolling narrative the next session can resume from.
-
-Supported transcript formats: Claude Code JSONL, Codex JSONL, Gemini JSON arrays.
-
-See [`starter-kit/stenographer/README.md`](starter-kit/stenographer/README.md) for step-by-step Ollama setup, model selection, and configuration.
-
-### System: The Airlock — file snapshot safety net
-
-The Airlock (`pre-tool-use-artifact-guard.sh`) snapshots every file before Claude edits it. No confirmation prompts — it just runs silently on every `Edit` and `Write` call and writes a timestamped backup to `~/.claude/artifact-guard/`.
-
-Three protection levels: `remote_strict` (Supabase SQL — checks backup freshness + hash match, blocks if stale), `remote_best_effort` (edge functions, n8n JSON — always snapshots, always allows), `local_copy` (source files — snapshots, always allows).
-
-The result: every edit is reversible, even when Claude makes a mistake at 2am.
-
-### System: Oracle Engine (Pythia) — persistent knowledge daemons
-
-The oracle engine extends the basic daemon pattern into **persistent, managed knowledge repositories**. An oracle holds research docs, codebase context, and accumulated learnings in Gemini's 2M-token window — and survives session boundaries, compaction, and even daemon death.
-
-17 tools cover the full lifecycle: `oracle_init`, `spawn_oracle`, health monitoring (`oracle_pressure_check`, `oracle_quality_report`), corpus management (`oracle_sync_corpus`, `oracle_add_to_corpus`), persistence (`oracle_checkpoint`, `oracle_salvage`, `oracle_reconstitute`), and a 7-gate decommission protocol with TOTP verification.
-
-Oracle is opt-in — see `ARCHITECTURE.md § Oracle Engine` for setup.
-
-### System: Core Skills — operating discipline
-
-8 Claude skills encode the operating discipline that prevents common multi-agent failure modes:
-
-| Skill | Prevents |
-|-------|----------|
-| `inter-agent-protocol` | Wrong messaging pattern, missing peer review, no escalation |
-| `context-before-action` | Declaring code state without verifying (the "it exists" → "no it doesn't" problem) |
-| `documentation-standards` | Shipping features without docs, tests, or examples |
-| `our-systematic-debugging` | Guessing at fixes before understanding root cause |
-| `persist-or-fail` | Compute results evaporating because persistence was skipped |
-| `file-taxonomy` | Files dumped in wrong locations, lost in project sprawl |
-| `crystallize` | Recurring failures not captured as enforceable rules |
-| `orchestrator-not-compute` | Re-implementing existing infrastructure instead of using it |
-
-Skills are installed to `~/.claude/skills/` by `install.sh`. Add your own by creating `SKILL.md` files with frontmatter.
+8 Claude skills encoding operating discipline — inter-agent protocol, context verification, documentation standards, systematic debugging, persistence enforcement, file taxonomy, failure crystallization, orchestrator-not-compute. See [starter-kit/README.md](starter-kit/README.md).
 
 ### Session Log Spec
 
-A cross-agent session log standard (`SESSION_LOG_SPEC.md`) so every agent can document its work in a compatible format that all three can read and resume from.
-
-### Ecosystem: Batch Claude Deep Research
-
-Automate batch-submission of research topics to claude.ai's Deep Research via browser automation. Separate project, works well alongside Triumvirate.
-
-→ [github.com/michaeljboscia/claude-deep-research](https://github.com/michaeljboscia/claude-deep-research)
+A cross-agent session log standard so every agent documents its work in a format all three can read and resume from. See [SESSION_LOG_SPEC.md](SESSION_LOG_SPEC.md).
 
 ---
 
-## Quick start
+## System Requirements
 
-### Prerequisites
+| Requirement | Minimum | Notes |
+|-------------|---------|-------|
+| **Node.js** | v20+ | For building the MCP server |
+| **OS** | macOS or Linux | Windows via WSL2 |
+| **Claude Code** | Latest | Primary orchestrator — `claude` in PATH |
+| **Gemini CLI** | Latest | Research + context agent — `gemini` in PATH |
+| **Codex CLI** | Latest | Code agent — `codex` in PATH |
+| **Ollama** | Latest | Required for Stenographer — `ollama pull qwen2.5:7b` |
+| **jq, git** | Any | Used by hooks |
+| **RAM** | 8 GB+ | Ollama models run locally |
+| **Storage** | ~5 GB | Ollama model + npm dependencies |
 
-- [Claude Code](https://claude.ai/code) (`claude`)
-- [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
-- [Codex](https://github.com/openai/codex) (`codex`)
-- Node.js 20+, jq, git
-- [Ollama](https://ollama.com) — required for Stenographer (local session notes). Pull any general model, e.g. `ollama pull qwen2.5:32b`
+---
 
-### One-command setup
+## Quick Start
 
 ```bash
 git clone https://github.com/michaeljboscia/triumvirate
 cd triumvirate/starter-kit
-chmod +x install.sh
-./install.sh
+chmod +x install.sh && ./install.sh
 ```
 
-The installer:
-1. Copies Claude Code hooks (12 files) to `~/.claude/hooks/`
-2. Installs 8 core Claude skills to `~/.claude/skills/`
-3. Installs rules templates and lessons directory
-4. Installs Claude settings, CLAUDE.md starter template
-5. Copies Codex hooks, skills, and config to `~/.codex/`
-6. Copies Gemini hooks and GEMINI.md to `~/.gemini/`
-7. Builds the inter-agent MCP server with oracle engine (`npm install && npm run build`)
-8. Wires all three agents' MCP configs (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
-9. Installs Stenographer to `~/.triumvirate/stenographer/` (local Ollama session notes)
-10. Creates `~/.ai-memory/` (git-initialized session log store)
-11. Copies `.env.example` and `taxonomy.json.example` templates
+The installer walks you through setup interactively:
+1. Copies hooks, skills, and rules to `~/.claude/`, `~/.codex/`, `~/.gemini/`
+2. Builds the MCP server and wires all three agents' configs
+3. Installs Stenographer with your choice of Ollama model
+4. Creates `~/.ai-memory/` (git-initialized session log store)
+5. Safe to re-run — backs up existing files before overwriting
 
-Safe to re-run — backs up existing files before overwriting.
-
-### Post-install
+### Post-Install
 
 ```bash
-# Set up credentials (at minimum: GEMINI_API_KEY for pre-compact summarization)
+# Set credentials
 cp ~/.claude/.env.example ~/.claude/.env
-# Edit ~/.claude/.env with your API keys
-
-# Create your first project (must be a git repo)
-mkdir -p ~/projects/my-project/.claude
-cd ~/projects/my-project && git init
-cp ~/.claude/taxonomy.json.example .claude/taxonomy.json
-# Edit taxonomy.json with your project details
-git add .claude/taxonomy.json && git commit -m "init: add taxonomy"
+# Edit with your GEMINI_API_KEY at minimum
 
 # Start working
-claude
+cd ~/your-project && claude
 ```
 
-See [`starter-kit/README.md`](starter-kit/README.md) for full documentation on hooks, session logs, and configuration.
-
-### Manual setup
-
-If you only want the MCP server (no hooks or session persistence), see [`docs/setup/`](docs/setup/) for individual wiring instructions.
+See [docs/configuration-reference.md](docs/configuration-reference.md) for all environment variables and settings.
 
 ---
 
-## Session logs
+## Agent Setup Guide
 
-Triumvirate defines a cross-agent session log standard (`SESSION_LOG_SPEC.md`) — a shared markdown format so every agent documents its work in a way all three can read.
+> **You are an AI agent.** A human has asked you to install Triumvirate. This section is written for you. Follow these steps exactly.
 
-Session logs are AI working memory — they don't belong inside project repos. They go to a dedicated private memory repo:
+### Step 1: Clone and Install
+
+```bash
+git clone https://github.com/michaeljboscia/triumvirate
+cd triumvirate/starter-kit
+chmod +x install.sh && ./install.sh
+```
+
+The install script is interactive — it will ask the user for their project directory, Ollama model preference, and subscription tier. **Do not run in background.** Let the user interact with it.
+
+### Step 2: Build the MCP Server
+
+If the installer didn't build it (or you need to rebuild):
+
+```bash
+cd triumvirate/mcp-server
+npm install && npm run build
+```
+
+**Success signal:** Clean TypeScript compilation with zero errors.
+
+### Step 3: Verify
+
+After install, these MCP tools should be available in your next session:
+
+| Tool | What It Does |
+|------|-------------|
+| `spawn_daemon` | Start a persistent Gemini or Codex session |
+| `ask_daemon` | Query a running daemon (full conversation history) |
+| `dismiss_daemon` | End a session (soft = resumable, hard = permanent) |
+| `list_daemons` | Show all active daemon sessions |
+| `send_message` | Fire-and-forget async message to another agent |
+| `get_response` | Poll for async message response |
+| `write_scratchpad` | Write to shared inter-agent scratchpad |
+| `list_scratchpad` | Read shared scratchpad entries |
+| `code_review` | Dispatch a structured code review |
+
+If tools are missing, the MCP server config may not have been written. Check `~/.claude.json` for the `inter-agent` server entry.
+
+### Step 4: Verify Ollama (for Stenographer)
+
+```bash
+ollama list | grep qwen2.5
+```
+
+If no model appears: `ollama pull qwen2.5:7b`
+
+### Agent Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| MCP tools not available | Config not written to `~/.claude.json` | Run `install.sh` again, or manually add server entry |
+| `spawn_daemon` fails | Gemini/Codex CLI not in PATH | `which gemini && which codex` — install missing CLIs |
+| Daemon timeout on `ask_daemon` | Model quota exhausted | Fallback chain handles this automatically; check `~/.gemini/quota-state.json` |
+| Stenographer not firing | Ollama not running | `ollama serve` in a separate terminal, then `ollama pull qwen2.5:7b` |
+| Session logs not saving | `AI_MEMORY_DIR` not set or not a git repo | `mkdir -p ~/.ai-memory && cd ~/.ai-memory && git init` |
+| `npm run build` fails | Missing Node.js 20+ | `node --version` — install/upgrade if needed |
+| Hooks not firing | `settings.json` not updated | Re-run `install.sh` or copy from `starter-kit/claude/settings.json` |
+
+---
+
+## Session Logs
+
+Session logs are AI working memory — they don't belong inside project repos. They go to a dedicated private memory store:
 
 ```
 ~/.ai-memory/                          # or $AI_MEMORY_DIR
 └── my-project/
-    ├── owner--client_domain_repo_feature_20260228_v1_gemini.md
-    ├── owner--client_domain_repo_feature_20260228_v1_codex.md
-    └── owner--client_domain_repo_feature_20260228_v80_claude.md
+    ├── ..._v1_gemini.md
+    ├── ..._v1_codex.md
+    └── ..._v80_claude.md
 ```
 
-Set up your memory repo:
+Three agents, three logs, one shared directory. Any agent can read any other agent's log to pick up context across sessions. Daemons write logs automatically on dismiss.
 
-```bash
-mkdir -p ~/.ai-memory && cd ~/.ai-memory && git init
-# Optional: push to a private remote
-gh repo create ai-memory --private -y
-git remote add origin git@github.com:yourname/ai-memory.git
-```
-
-Set `AI_MEMORY_DIR` to point to your private memory repo (defaults to `~/.ai-memory`). If the directory doesn't exist, logs fall back to `<project>/session-logs/`.
-
-**Automatic logging:** When you `dismiss_daemon`, the agent writes a `SESSION_LOG_SPEC`-compliant log before the session closes. No manual `/save-session` needed — dismiss produces a log.
-
-Three agents, three logs, one shared directory. Any agent can read any other agent's log to pick up context across sessions.
-
-See `SESSION_LOG_SPEC.md` for the naming convention, required sections, git workflow, and cross-agent compatibility rules.
+See [SESSION_LOG_SPEC.md](SESSION_LOG_SPEC.md) for the naming convention, required sections, and cross-agent compatibility rules.
 
 ---
 
-## The story
+## Security Posture
 
-We built this in 27 days — and the agents helped design it.
+Both Gemini and Codex CLIs apply sandboxes by default. Triumvirate disables these for the MCP daemon context:
 
-The inter-agent MCP server went through seven rounds of peer review by Gemini and Codex before we shipped it. They found a git commit catch-22 in the session log design. They caught a daemon cross-talk bug where two concurrent Gemini daemons bled into each other's conversation history. They flagged a hardcoded `_claude.md` filter that would have broken multi-agent log versioning.
+- **Codex:** `--dangerously-bypass-approvals-and-sandbox`
+- **Gemini:** `--approval-mode yolo`
 
-The system that lets AI agents coordinate was itself coordinated by AI agents.
-
-That felt worth sharing.
-
----
-
-## Security posture
-
-Both Gemini and Codex CLIs apply their own sandboxes by default. Triumvirate disables these for the MCP daemon context:
-
-- **Codex:** `--dangerously-bypass-approvals-and-sandbox` — removes Codex's seatbelt, allowing outbound network and unrestricted file access
-- **Gemini:** `--approval-mode yolo` — removes Gemini's approval prompts and file access restrictions
-
-These are the CLIs' own documented escape hatches, intended for controlled programmatic environments. Triumvirate is that environment — the MCP server controls what prompts reach the agents. Only use Triumvirate in trusted contexts on your own machine.
+These are the CLIs' own documented escape hatches for programmatic environments. The MCP server controls what prompts reach the agents. Only use Triumvirate in trusted contexts on your own machine.
 
 ---
 
-## Roadmap
+## Ecosystem
 
-Nothing on the list right now — ship fast, add things when the need is real.
-
-### What shipped
-
-- **Starter Kit** — one-command installer for the complete multi-agent operating environment. See [`starter-kit/`](starter-kit/).
-- **Oracle Engine (Pythia)** — 17-tool persistent Gemini knowledge daemon system. Registry, corpus management, checkpoint/salvage/reconstitute lifecycle, pressure monitoring, TOTP-protected decommission. ~5,900 lines.
-- **Core Skills** — 8 Claude skills encoding operating discipline: inter-agent protocol, context verification, documentation standards, systematic debugging, persistence enforcement, file taxonomy, failure crystallization, orchestrator-not-compute.
-- **Hook lifecycle** — 12 Claude hooks + 3 Gemini hooks + 2 Codex hooks. Session recovery, auto-staging, The Airlock (file snapshots before edit), token-gated auto-save, Gemini-powered transcript summarization, oracle pressure monitoring, execution mode nudging, Supabase MCP gate.
-- **Stenographer** — zero-cost incremental session notes via local Ollama. Token gate fires every ~50K tokens; Stenographer reads only new transcript bytes, narrates them locally, appends to the session log. No API calls, no cloud cost. See [`starter-kit/stenographer/`](starter-kit/stenographer/).
-- **The Airlock** — silent file snapshot safety net on every edit. Three protection levels: strict (blocks if backup is stale), best-effort (always snapshots, always allows), copy (source files). Every edit reversible, zero prompts.
-- **Automatic session logs on dismiss** — every daemon writes a `SESSION_LOG_SPEC`-compliant log when dismissed. Gemini and Codex both produce structured markdown with taxonomy, context summary, and transcript history.
-- **`computeAgentLogPath` shared utility** — agent-aware log path computation that reads `.claude/taxonomy.json` for project taxonomy.
-- **Daemon persistence** — `spawn_daemon({ session_name: "..." })` creates named sessions that survive MCP restarts. Soft dismiss preserves session files. Resume with zero token cost.
-- **Revive-on-ask** — dead daemons probe once on the next `ask_daemon` before giving up permanently.
-- **Model fallback chain** — Gemini quota exhaustion falls back automatically through the model chain.
-- **Inter-agent skills** — Codex skills for `/send-to-claude`, `/send-to-gemini`, `/send-to-codex`, `/send-to-siblings` (dual escalation).
-
-PRs welcome. The agents review their own contributions.
-
----
-
-## Hooks
-
-The starter-kit includes a complete hook lifecycle for all three agents. These are installed by `install.sh` and work out of the box.
-
-| Hook | Agent | Event | What it does |
-|------|-------|-------|-------------|
-| `session-start.sh` | Claude | SessionStart | Project picker (from HOME) or session recovery (from project) |
-| `post-compact-recovery.sh` | Claude | SessionStart:compact | Restores context from session log after compaction |
-| `pre-compact.sh` | Claude | PreCompact | Gemini summarizes transcript → session log → git commit |
-| `post-tool-use.sh` | Claude | PostToolUse | Auto-stages files, logs activity |
-| `post-tool-use-token-gate.sh` | Claude | PostToolUse | Auto-saves at ~50K token intervals — triggers **Stenographer** (local Ollama narration) |
-| `pre-tool-use-artifact-guard.sh` | Claude | PreToolUse | **The Airlock** — snapshots every file before edit |
-| `pre-tool-use-bash-guard.sh` | Claude | PreToolUse | Blocks destructive SQL without fresh backup |
-| `pre-tool-use-supabase-mcp-gate.sh` | Claude | PreToolUse | Blocks Supabase MCP SQL without fresh backup |
-| `post-tool-use-oracle-pressure.sh` | Claude | PostToolUse | Oracle context pressure monitoring — recommends checkpoints |
-| `post-tool-use-mode-nudge.sh` | Claude | PostToolUse | Suggests formalizing execution mode after 15+ tool calls |
-| `session-start-v3.sh` | Claude | SessionStart | Orphan recovery — cleans stale locks and saves |
-| `session-start.sh` | Gemini | SessionStart | Session log recovery |
-| `pre-compact.sh` | Gemini | PreCompact | Self-summarization → session log → git commit |
-| `post-tool-use.sh` | Gemini | PostToolUse | Auto-stages files, logs activity |
-
-The hooks are extensible. Wire PM tools (Linear, Jira, GitHub Projects) into the lifecycle using the same pattern: source a shared library, run in a background subshell `( ... ) &`, gate with an env var.
-
-See [`starter-kit/README.md`](starter-kit/README.md) for full hook documentation and configuration variables.
-
----
-
-## Acknowledgements
-
-Operational resilience patterns in the MCP server — rate limit retry with exponential backoff, stale worker detection, structured result contracts, and SQLite WAL persistence — were inspired by [CodeFleet](https://github.com/techinfobel/codefleet) by [techinfobel](https://github.com/techinfobel).
-
-CodeFleet takes a pipeline/DAG approach to multi-agent coordination (define stages, fan out, collect results). Triumvirate takes a conversational daemon approach (persistent sessions, multi-turn queries, shared context). Different tools for different problems — and we learned from studying theirs.
+| Project | What It Does |
+|---------|-------------|
+| [Pythia](https://github.com/michaeljboscia/pythia) | Local code search + architectural memory for AI agents (MCP server, runs on your machine) |
+| [Claude Deep Research](https://github.com/michaeljboscia/claude-deep-research) | Batch-submit research topics to claude.ai's Deep Research via browser automation |
 
 ---
 
@@ -331,3 +235,9 @@ CodeFleet takes a pipeline/DAG approach to multi-agent coordination (define stag
 ## Contributing
 
 Issues and PRs welcome. The agents will review your code — that's not a joke, it's the workflow.
+
+---
+
+## Acknowledgements
+
+Operational resilience patterns — rate limit retry, stale worker detection, structured result contracts — were inspired by [CodeFleet](https://github.com/techinfobel/codefleet) by [techinfobel](https://github.com/techinfobel). CodeFleet takes a pipeline/DAG approach; Triumvirate takes a conversational daemon approach. Different tools for different problems.
