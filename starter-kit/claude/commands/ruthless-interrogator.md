@@ -1,3 +1,7 @@
+---
+description: Ruthless Requirements Interrogator
+---
+
 # Ruthless Requirements Interrogator
 
 **Skill:** `/ruthless-interrogator`

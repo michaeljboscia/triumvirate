@@ -1,3 +1,7 @@
+---
+description: Screenshot Analyzer
+---
+
 # Screenshot Analyzer
 
 **Slash Command:** `/screenshot`

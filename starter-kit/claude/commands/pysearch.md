@@ -1,3 +1,7 @@
+---
+description: Pythia Quick Search
+---
+
 # Pythia Quick Search
 
 Fast semantic search across a project's indexed knowledge. Returns an answer, not a file list.

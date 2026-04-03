@@ -1,3 +1,7 @@
+---
+description: Uncompromising Executor
+---
+
 # Uncompromising Executor
 
 **Skill:** `/uncompromising-executor`

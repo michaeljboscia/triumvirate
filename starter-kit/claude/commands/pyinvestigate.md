@@ -1,3 +1,7 @@
+---
+description: Pythia Investigate — Interactive Project Search
+---
+
 # Pythia Investigate — Interactive Project Search
 
 Search a project's indexed knowledge using Pythia's local search engine. This is NOT the Oracle daemon — this is local code/doc search via the `pythia` MCP server.

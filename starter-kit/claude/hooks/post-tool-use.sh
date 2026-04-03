@@ -236,7 +236,7 @@ if [ -z "$EMITTED" ]; then
     jq -n --arg wt "$WALL_TIME" '{
       "hookSpecificOutput": {
         "hookEventName": "PostToolUse",
-        "additionalContext": "Wall time: " + $wt
+        "additionalContext": ("Wall time: " + $wt)
       }
     }'
 fi
