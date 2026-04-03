@@ -111,9 +111,10 @@ The installer walks you through setup interactively:
 ### Post-Install
 
 ```bash
-# Set credentials
-cp ~/.claude/.env.example ~/.claude/.env
-# Edit with your GEMINI_API_KEY at minimum
+# Add credentials (DO NOT cp — the installer already created this file)
+# Edit the existing .env and add your API keys
+nano ~/.claude/.env
+# At minimum: set GEMINI_API_KEY for pre-compact summarization
 
 # Start working
 cd ~/your-project && claude

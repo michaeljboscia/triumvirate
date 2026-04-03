@@ -261,20 +261,39 @@ fi
 
 # Build the MCP server
 info "Installing MCP server dependencies and building..."
+if [[ ! -f "$MCP_SERVER_DIR/package.json" ]]; then
+  err "MCP server submodule not initialized. Run: git submodule update --init --recursive"
+  exit 1
+fi
 (cd "$MCP_SERVER_DIR" && npm install --silent && npm run build --silent) || {
   err "MCP server build failed. Check Node.js version (requires >=20)."
   exit 1
 }
 ok "MCP server built: $MCP_SERVER_DIR/dist/"
 
-# Make start scripts executable
-chmod +x "$MCP_SERVER_DIR/start-gemini.sh" "$MCP_SERVER_DIR/start-codex.sh"
-ok "Start scripts ready"
+# Generate portable start scripts (resolve node path at install time)
+NODE_PATH=$(which node 2>/dev/null || echo "/usr/local/bin/node")
+DIST_DIR="$MCP_SERVER_DIR/dist"
 
-# ── Wire Claude: add both servers to ~/.claude.json ──────────
+cat > "$MCP_SERVER_DIR/start-gemini.sh" << STARTEOF
+#!/bin/bash
+echo "\$(date) inter-agent-gemini START pid=\$\$" >> /tmp/inter-agent-debug.log
+exec "$NODE_PATH" "$DIST_DIR/gemini/server.js" 2>> /tmp/inter-agent-debug.log
+STARTEOF
+
+cat > "$MCP_SERVER_DIR/start-unified.sh" << STARTEOF
+#!/bin/bash
+export GEMINI_SPAWN_MODEL="\${GEMINI_SPAWN_MODEL:-gemini-2.5-flash}"
+echo "\$(date) inter-agent START pid=\$\$ spawn_model=\$GEMINI_SPAWN_MODEL" >> /tmp/inter-agent-debug.log
+exec "$NODE_PATH" "$DIST_DIR/server.js" 2>> /tmp/inter-agent-debug.log
+STARTEOF
+
+chmod +x "$MCP_SERVER_DIR/start-gemini.sh" "$MCP_SERVER_DIR/start-unified.sh"
+ok "Start scripts generated (node: $NODE_PATH)"
+
+# ── Wire Claude: add unified server to ~/.claude.json ──────────
 CLAUDE_JSON="$HOME/.claude.json"
-GEMINI_START="$MCP_SERVER_DIR/start-gemini.sh"
-CODEX_START="$MCP_SERVER_DIR/start-codex.sh"
+UNIFIED_START="$MCP_SERVER_DIR/start-unified.sh"
 
 if [[ -f "$CLAUDE_JSON" ]]; then
   backup_if_exists "$CLAUDE_JSON"
