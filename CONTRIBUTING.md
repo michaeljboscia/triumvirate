@@ -195,7 +195,7 @@ You do not need to set this up yourself. The maintainers run the reviews.
 
 **Stenographer (`stenographer/`):** Python. No framework. Talks to Ollama via HTTP localhost. No pip dependencies beyond standard library (uses `urllib` not `requests`).
 
-**Hooks (`starter-kit/*/hooks/`):** Bash. POSIX-compatible where possible. Must be idempotent — hooks can fire multiple times. Use `jq` for JSON parsing (assumed available). Always `set -euo pipefail` at the top.
+**Hooks (`starter-kit/*/hooks/`):** Bash. POSIX-compatible where possible. Must be idempotent — hooks can fire multiple times. Use `jq` for JSON parsing (assumed available). Always `set -uo pipefail` at the top (no `-e` — hooks must fail open, never block Claude Code).
 
 **Skills (`starter-kit/claude/skills/`):** Markdown files with structured prompt content. Follow the existing format — look at `inter-agent-protocol/` for the pattern.
 
