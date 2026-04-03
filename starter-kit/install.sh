@@ -312,18 +312,19 @@ else
 fi
 ok "Claude wired: inter-agent → $CLAUDE_JSON"
 
-# ── Wire Gemini: add inter-agent-codex to ~/.gemini/settings.json ──
+# ── Wire Gemini: add inter-agent to ~/.gemini/settings.json ──
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 if [[ -f "$GEMINI_SETTINGS" ]]; then
   backup_if_exists "$GEMINI_SETTINGS"
-  jq --arg cs "$CODEX_START" '
-    .mcpServers["inter-agent-codex"] = {"command": $cs}
+  jq --arg us "$UNIFIED_START" '
+    .mcpServers //= {} |
+    .mcpServers["inter-agent"] = {"command": $us}
   ' "$GEMINI_SETTINGS" > "${GEMINI_SETTINGS}.tmp" && mv "${GEMINI_SETTINGS}.tmp" "$GEMINI_SETTINGS"
-  ok "Gemini wired: inter-agent-codex → $GEMINI_SETTINGS"
+  ok "Gemini wired: inter-agent → $GEMINI_SETTINGS"
 else
   warn "~/.gemini/settings.json not found — Gemini MCP not configured."
   warn "After installing Gemini CLI, add manually:"
-  warn "  {mcpServers: {\"inter-agent-codex\": {command: \"$CODEX_START\"}}}"
+  warn "  {mcpServers: {\"inter-agent\": {command: \"$UNIFIED_START\"}}}"
 fi
 
 # ── Wire Codex: uncomment and set inter-agent-gemini in config.toml ──
