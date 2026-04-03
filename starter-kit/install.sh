@@ -298,19 +298,19 @@ UNIFIED_START="$MCP_SERVER_DIR/start-unified.sh"
 if [[ -f "$CLAUDE_JSON" ]]; then
   backup_if_exists "$CLAUDE_JSON"
   # Merge mcpServers into existing config (preserves all other keys)
-  jq --arg gs "$GEMINI_START" --arg cs "$CODEX_START" '
-    .mcpServers["inter-agent-gemini"] = {"command": $gs} |
-    .mcpServers["inter-agent-codex"]  = {"command": $cs}
+  # Ensure mcpServers object exists before adding to it
+  jq --arg us "$UNIFIED_START" '
+    .mcpServers //= {} |
+    .mcpServers["inter-agent"] = {"command": $us}
   ' "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp" && mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 else
-  jq -n --arg gs "$GEMINI_START" --arg cs "$CODEX_START" '{
+  jq -n --arg us "$UNIFIED_START" '{
     mcpServers: {
-      "inter-agent-gemini": {command: $gs},
-      "inter-agent-codex":  {command: $cs}
+      "inter-agent": {command: $us}
     }
   }' > "$CLAUDE_JSON"
 fi
-ok "Claude wired: inter-agent-gemini + inter-agent-codex → $CLAUDE_JSON"
+ok "Claude wired: inter-agent → $CLAUDE_JSON"
 
 # ── Wire Gemini: add inter-agent-codex to ~/.gemini/settings.json ──
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
