@@ -96,7 +96,7 @@ A cross-agent session log standard so every agent documents its work in a format
 ## Quick Start
 
 ```bash
-git clone https://github.com/michaeljboscia/triumvirate
+git clone --recurse-submodules https://github.com/michaeljboscia/triumvirate
 cd triumvirate/starter-kit
 chmod +x install.sh && ./install.sh
 ```
@@ -130,7 +130,7 @@ See [docs/configuration-reference.md](docs/configuration-reference.md) for all e
 ### Step 1: Clone and Install
 
 ```bash
-git clone https://github.com/michaeljboscia/triumvirate
+git clone --recurse-submodules https://github.com/michaeljboscia/triumvirate
 cd triumvirate/starter-kit
 chmod +x install.sh && ./install.sh
 ```
