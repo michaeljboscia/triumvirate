@@ -327,22 +327,20 @@ else
   warn "  {mcpServers: {\"inter-agent\": {command: \"$UNIFIED_START\"}}}"
 fi
 
-# ── Wire Codex: uncomment and set inter-agent-gemini in config.toml ──
+# ── Wire Codex: add inter-agent to config.toml ──
 CODEX_CONFIG="$HOME/.codex/config.toml"
 if [[ -f "$CODEX_CONFIG" ]]; then
-  # Check if MCP server is already configured
-  if grep -q "inter-agent-gemini" "$CODEX_CONFIG" && ! grep -q "^#.*inter-agent-gemini" "$CODEX_CONFIG"; then
-    info "Codex config.toml already has inter-agent-gemini — skipping."
+  if grep -q "inter-agent" "$CODEX_CONFIG" && ! grep -q "^#.*inter-agent" "$CODEX_CONFIG"; then
+    info "Codex config.toml already has inter-agent — skipping."
   else
     backup_if_exists "$CODEX_CONFIG"
-    # Append the MCP server config block
     cat >> "$CODEX_CONFIG" <<EOF
 
 # ── Inter-agent MCP server (added by Triumvirate installer) ──────────
-[mcp_servers.inter-agent-gemini]
-command = "$GEMINI_START"
+[mcp_servers.inter-agent]
+command = "$UNIFIED_START"
 EOF
-    ok "Codex wired: inter-agent-gemini → $CODEX_CONFIG"
+    ok "Codex wired: inter-agent → $CODEX_CONFIG"
   fi
 else
   warn "~/.codex/config.toml not found — Codex MCP not configured."
