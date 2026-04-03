@@ -292,21 +292,22 @@ fi
 }
 ok "MCP server built: $MCP_SERVER_DIR/dist/"
 
-# Generate portable start scripts (resolve node path at install time)
-NODE_PATH=$(which node 2>/dev/null || echo "/usr/local/bin/node")
+# Generate portable start scripts (resolve node at runtime, not install time)
 DIST_DIR="$MCP_SERVER_DIR/dist"
 
 cat > "$MCP_SERVER_DIR/start-gemini.sh" << STARTEOF
-#!/bin/bash
+#!/usr/bin/env bash
+NODE=\$(which node 2>/dev/null || echo "/usr/local/bin/node")
 echo "\$(date) inter-agent-gemini START pid=\$\$" >> /tmp/inter-agent-debug.log
-exec "$NODE_PATH" "$DIST_DIR/gemini/server.js" 2>> /tmp/inter-agent-debug.log
+exec "\$NODE" "$DIST_DIR/gemini/server.js" 2>> /tmp/inter-agent-debug.log
 STARTEOF
 
 cat > "$MCP_SERVER_DIR/start-unified.sh" << STARTEOF
-#!/bin/bash
+#!/usr/bin/env bash
+NODE=\$(which node 2>/dev/null || echo "/usr/local/bin/node")
 export GEMINI_SPAWN_MODEL="\${GEMINI_SPAWN_MODEL:-gemini-2.5-flash}"
 echo "\$(date) inter-agent START pid=\$\$ spawn_model=\$GEMINI_SPAWN_MODEL" >> /tmp/inter-agent-debug.log
-exec "$NODE_PATH" "$DIST_DIR/server.js" 2>> /tmp/inter-agent-debug.log
+exec "\$NODE" "$DIST_DIR/server.js" 2>> /tmp/inter-agent-debug.log
 STARTEOF
 
 chmod +x "$MCP_SERVER_DIR/start-gemini.sh" "$MCP_SERVER_DIR/start-unified.sh"
