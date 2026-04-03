@@ -11,7 +11,7 @@ Stenographer replaces cloud-based full-transcript summarization with delta-only 
 The old approach (Gemini-based `pre-compact.sh`) re-read the entire transcript on every save — burning 69M Gemini tokens in 4 days with 92 redundant saves. Stenographer fixes this by:
 
 1. **Delta-only extraction** — Only reads bytes added since the last cursor position
-2. **Local inference** — Uses Ollama (qwen2.5:32b) instead of cloud APIs
+2. **Local inference** — Uses Ollama (default: qwen2.5:7b) instead of cloud APIs
 3. **Background execution** — Runs via `disown` so the agent is never blocked
 4. **Two-phase state** — Cursor advances only after successful log append (no data loss)
 
