@@ -63,7 +63,7 @@ python3 stenographer.py --agent claude --transcript /path/to/transcript.jsonl --
 
 - **Python 3.9+** (uses `zoneinfo` for timezone-aware timestamps)
 - **Ollama** installed and running
-- **A model pulled** — default is `qwen2.5:32b` (19GB). Smaller options:
+- **A model pulled** — default is `qwen2.5:7b` (4.4GB). Larger options for better quality:
   - `qwen2.5:14b` — 8.7GB, faster, slightly lower quality
   - `qwen2.5:7b` — 4.4GB, fast, adequate for basic notes
   - Set via `STENOGRAPHER_MODEL` env var or `--model` flag
