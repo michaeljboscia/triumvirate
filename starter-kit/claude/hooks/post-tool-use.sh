@@ -151,7 +151,7 @@ case "$TOOL_NAME" in
             jq -n --arg hash "$COMMIT_HASH" --arg wt "$WALL_TIME" '{
               "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": "Wall time: " + $wt + "\nCOMMIT MADE (" + $hash + "). Update the session log with:\n- What was accomplished?\n- Why did we do it?\n- What'"'"'s next?\n\nKeep the narrative current - don'"'"'t wait for compaction."
+                "additionalContext": ("Wall time: " + $wt + "\nCOMMIT MADE (" + $hash + "). Update the session log with:\n- What was accomplished?\n- Why did we do it?\n- What'"'"'s next?\n\nKeep the narrative current - don'"'"'t wait for compaction.")
               }
             }'
             EMITTED="true"
