@@ -142,7 +142,7 @@ All via environment variables (set before starting your agent):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `STENOGRAPHER_MODEL` | `qwen2.5:32b` | Ollama model for generation |
+| `STENOGRAPHER_MODEL` | `qwen2.5:7b` | Ollama model for generation |
 | `STENOGRAPHER_TIMEOUT` | `180` | Seconds to wait for Ollama response |
 | `STENOGRAPHER_NUM_CTX` | `65536` | Context window size for Ollama |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API base URL |
