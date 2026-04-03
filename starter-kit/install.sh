@@ -118,7 +118,28 @@ if [[ -d "$SKILLS_SRC" ]]; then
       ok "Installed skill: $skill_name"
     fi
   done
+  # Also install standalone skill files (not in subdirectories)
+  for skill_file in "$SKILLS_SRC"/*.md; do
+    [[ -f "$skill_file" ]] || continue
+    skill_name="$(basename "$skill_file")"
+    install_file "$skill_file" "$SKILLS_DST/$skill_name"
+  done
   ok "Claude skills installed"
+fi
+
+# ── 1b2. Claude Commands ──────────────────────────────────────
+info "Installing Claude commands..."
+CMDS_SRC="$SCRIPT_DIR/claude/commands"
+CMDS_DST="$HOME/.claude/commands"
+
+if [[ -d "$CMDS_SRC" ]]; then
+  mkdir -p "$CMDS_DST"
+  for cmd_file in "$CMDS_SRC"/*.md; do
+    [[ -f "$cmd_file" ]] || continue
+    cmd_name="$(basename "$cmd_file")"
+    install_file "$cmd_file" "$CMDS_DST/$cmd_name"
+  done
+  ok "Claude commands installed ($(ls "$CMDS_SRC"/*.md 2>/dev/null | wc -l | tr -d ' ') files)"
 fi
 
 # ── 1c. Claude Rules + Lessons ──────────────────────────────
