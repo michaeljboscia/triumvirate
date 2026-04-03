@@ -1,3 +1,7 @@
+---
+description: Session Notes - Full Narrative
+---
+
 # Session Notes - Full Narrative
 
 **Slash Command:** `/session-notes`
