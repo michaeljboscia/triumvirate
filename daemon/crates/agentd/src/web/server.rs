@@ -107,16 +107,76 @@ async fn message_handler(
             .into_response();
     }
 
+    let (topic, routed_content) = route_message(&content);
+    if routed_content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "message content must not be empty after target prefix" })),
+        )
+            .into_response();
+    }
+
     state
         .bus
         .emit(FabricMessage::new(
             AgentId::Human,
             Topic::HumanInput,
-            Payload::HumanMessage { content },
+            Payload::HumanMessage {
+                content: content.clone(),
+            },
+        ))
+        .await;
+
+    state
+        .bus
+        .emit(FabricMessage::new(
+            AgentId::Human,
+            topic,
+            Payload::HumanMessage {
+                content: routed_content,
+            },
         ))
         .await;
 
     (StatusCode::ACCEPTED, Json(MessageResponse { accepted: true })).into_response()
+}
+
+fn route_message(content: &str) -> (Topic, String) {
+    let trimmed = content.trim();
+
+    let routes = [
+        ("@claude", AgentId::Claude),
+        ("@gemini", AgentId::Gemini),
+        ("@codex", AgentId::Codex),
+    ];
+
+    for (prefix, agent) in routes {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return (Topic::AgentInput(agent), rest.trim().to_string());
+        }
+    }
+
+    (Topic::AgentInput(AgentId::Claude), trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_message;
+    use triumvirate_proto::{AgentId, Topic};
+
+    #[test]
+    fn routes_to_claude_by_default() {
+        let (topic, content) = route_message("hello world");
+        assert!(matches!(topic, Topic::AgentInput(AgentId::Claude)));
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn routes_to_gemini_when_prefixed() {
+        let (topic, content) = route_message("@gemini summarize this");
+        assert!(matches!(topic, Topic::AgentInput(AgentId::Gemini)));
+        assert_eq!(content, "summarize this");
+    }
 }
 
 /// Serve embedded static files (CSS, JS, images).

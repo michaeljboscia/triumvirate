@@ -25,6 +25,7 @@ type TopicKey = String;
 
 fn topic_key(topic: &Topic) -> TopicKey {
     match topic {
+        Topic::AgentInput(agent) => format!("agent_input:{agent}"),
         Topic::AgentOutput(agent) => format!("agent_output:{agent}"),
         other => serde_json::to_string(other)
             .unwrap_or_else(|_| format!("{other:?}")),
