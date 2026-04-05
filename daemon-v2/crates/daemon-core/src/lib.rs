@@ -160,6 +160,40 @@ pub fn list_scratchpad(root: &Path, project: &str) -> anyhow::Result<Vec<PathBuf
     Ok(files)
 }
 
+pub fn append_outbox_event(root: &Path, event: &shared_types::OutboxEvent) -> anyhow::Result<()> {
+    let path = root.join("outbox.jsonl");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(event)?;
+    line.push('\n');
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+pub fn read_outbox_events(root: &Path) -> anyhow::Result<Vec<shared_types::OutboxEvent>> {
+    let path = root.join("outbox.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let body = fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<shared_types::OutboxEvent>(line) {
+            out.push(event);
+        }
+    }
+    Ok(out)
+}
+
 fn sanitize_name(value: &str) -> String {
     value
         .chars()
@@ -220,6 +254,34 @@ mod tests {
         assert!(path.exists());
         let files = super::list_scratchpad(&root, "proj-a")?;
         assert_eq!(files.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_roundtrip() -> anyhow::Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("daemon-core-outbox-{now}"));
+        std::fs::create_dir_all(&root)?;
+
+        super::append_outbox_event(
+            &root,
+            &shared_types::OutboxEvent {
+                ts_ms: 1,
+                request_id: "r1".to_string(),
+                tool: "ask_agent".to_string(),
+                status: "DONE".to_string(),
+                agent: Some("gemini".to_string()),
+                detail: "ok".to_string(),
+                cwd: None,
+                repo: None,
+                branch: None,
+            },
+        )?;
+        let events = super::read_outbox_events(&root)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, "r1");
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
