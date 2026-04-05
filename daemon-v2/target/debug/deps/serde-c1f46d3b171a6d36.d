@@ -1,0 +1,14 @@
+/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/deps/serde-c1f46d3b171a6d36.d: /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/build/serde-8b65f3d89392c4f4/out/private.rs
+
+/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/deps/libserde-c1f46d3b171a6d36.rlib: /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/build/serde-8b65f3d89392c4f4/out/private.rs
+
+/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/deps/libserde-c1f46d3b171a6d36.rmeta: /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/build/serde-8b65f3d89392c4f4/out/private.rs
+
+/Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/build/serde-8b65f3d89392c4f4/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/build/serde-8b65f3d89392c4f4/out
