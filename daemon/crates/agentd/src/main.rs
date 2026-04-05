@@ -4,6 +4,7 @@ mod digest;
 mod fabric;
 mod memory;
 mod routing;
+mod quota;
 mod shutdown;
 mod steno;
 mod web;
@@ -21,6 +22,7 @@ use agent::{
 use digest::DigestEngine;
 use fabric::MessageBus;
 use memory::MemoryStore;
+use quota::{QuotaTracker, SharedQuotaRegistry};
 use steno::Stenographer;
 
 /// triumvirate-agentd — multi-agent daemon
@@ -62,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
     // Step 2: Initialize message fabric
     let bus = Arc::new(MessageBus::new());
     info!("message fabric initialized (tokio broadcast channels)");
+
+    // Step 2b: Initialize quota tracker
+    let quota_registry = SharedQuotaRegistry::default();
+    let quota_tracker = QuotaTracker::new(bus.clone(), quota_registry.clone());
+    quota_tracker.run();
+    info!("quota tracker started");
 
     // Step 3: Open SQLite WAL database
     let store = MemoryStore::open(&cfg.db_path)?;
@@ -169,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
     info!("stenographer started");
 
     // Step 9b: Start digest fan-out for idle peer agents
-    let digest = DigestEngine::new(bus.clone());
+    let digest = DigestEngine::new(bus.clone(), quota_registry.clone());
     digest.run();
     info!("digest engine started");
 
@@ -182,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.web_port
     );
 
-    web::start_web_server(bus, health_registry, cfg.web_port).await?;
+    web::start_web_server(bus, health_registry, quota_registry, cfg.web_port).await?;
 
     Ok(())
 }

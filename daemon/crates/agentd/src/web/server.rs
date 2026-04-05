@@ -14,6 +14,7 @@ use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
 use crate::agent::SharedHealthRegistry;
 use crate::fabric::MessageBus;
+use crate::quota::SharedQuotaRegistry;
 use crate::routing::{RoutingDecision, decide_route};
 use crate::shutdown::wait_for_shutdown_signal;
 use crate::web::ws_handler;
@@ -30,6 +31,7 @@ struct Assets;
 pub struct AppState {
     pub bus: Arc<MessageBus>,
     pub health: SharedHealthRegistry,
+    pub quota: SharedQuotaRegistry,
 }
 
 /// Start the web dashboard server on the given port.
@@ -39,14 +41,16 @@ pub struct AppState {
 pub async fn start_web_server(
     bus: Arc<MessageBus>,
     health: SharedHealthRegistry,
+    quota: SharedQuotaRegistry,
     port: u16,
 ) -> anyhow::Result<()> {
-    let state = AppState { bus, health };
+    let state = AppState { bus, health, quota };
 
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
+        .route("/api/quota", get(quota_handler))
         .route("/api/message", post(message_handler))
         .route("/ws", get(ws_handler))
         .fallback(static_handler)
@@ -105,6 +109,17 @@ async fn agents_handler(State(state): State<AppState>) -> impl IntoResponse {
         { "id": "gemini", "name": "Gemini", "model": "Pro 2M", "status": gemini },
         { "id": "codex", "name": "Codex", "model": "GPT-5.2", "status": codex }
     ]))
+}
+
+async fn quota_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshots = state.quota.snapshot_all().await;
+    axum::Json(serde_json::json!({
+        "agents": {
+            "claude": snapshots.get(&AgentId::Claude),
+            "gemini": snapshots.get(&AgentId::Gemini),
+            "codex": snapshots.get(&AgentId::Codex),
+        }
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]

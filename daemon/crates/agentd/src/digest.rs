@@ -4,8 +4,10 @@ use tracing::info;
 use triumvirate_proto::{AgentId, FabricMessage, Payload, Topic};
 
 use crate::fabric::MessageBus;
+use crate::quota::SharedQuotaRegistry;
 
 const DIGEST_PREFIX: &str = "[DIGEST]";
+const DIGEST_FALLBACK_THRESHOLD_PCT: f64 = 80.0;
 
 /// Mechanical digest fan-out for idle agents.
 ///
@@ -13,11 +15,12 @@ const DIGEST_PREFIX: &str = "[DIGEST]";
 /// It forwards structured, minimal templates derived directly from fabric payloads.
 pub struct DigestEngine {
     bus: Arc<MessageBus>,
+    quota: SharedQuotaRegistry,
 }
 
 impl DigestEngine {
-    pub fn new(bus: Arc<MessageBus>) -> Self {
-        Self { bus }
+    pub fn new(bus: Arc<MessageBus>, quota: SharedQuotaRegistry) -> Self {
+        Self { bus, quota }
     }
 
     pub fn run(self) {
@@ -28,6 +31,26 @@ impl DigestEngine {
                 if let Some((source, content)) = digest_candidate(&msg) {
                     for target in [AgentId::Claude, AgentId::Gemini, AgentId::Codex] {
                         if target == source {
+                            continue;
+                        }
+
+                        if self
+                            .quota
+                            .is_over_threshold(target, DIGEST_FALLBACK_THRESHOLD_PCT)
+                            .await
+                        {
+                            self.bus
+                                .emit(FabricMessage::new(
+                                    AgentId::System,
+                                    Topic::TaskProgress,
+                                    Payload::TextChunk {
+                                        content: format!(
+                                            "digest skipped: quota threshold reached for {target}"
+                                        ),
+                                        is_final: true,
+                                    },
+                                ))
+                                .await;
                             continue;
                         }
 
