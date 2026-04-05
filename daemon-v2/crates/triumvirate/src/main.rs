@@ -1046,38 +1046,62 @@ async fn run_status() -> anyhow::Result<()> {
 
     let health = fetch_daemon_status().await.ok();
     let snapshot = fetch_daemon_status_snapshot().await.ok();
-
-    let report = if let (Some(health), Some(snapshot)) = (health, snapshot) {
-        serde_json::json!({
-            "daemon_reachable": true,
-            "daemon_bind_addr": daemon_bind_addr.clone(),
-            "health": health,
-            "snapshot": snapshot
-        })
-    } else {
-        let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
-        let fallback_tickets = list_pending_fallback_paths(10)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>();
-
-        serde_json::json!({
-            "daemon_reachable": false,
-            "daemon_bind_addr": daemon_bind_addr.clone(),
-            "health": null,
-            "snapshot": {
-                "daemon_mode": "incremental-dev",
-                "supported_agents": ["gemini", "codex"],
-                "pending_fallbacks": pending_fallbacks,
-                "fallback_tickets": fallback_tickets,
-                "daemon_bind_addr": daemon_bind_addr
-            }
-        })
-    };
+    let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
+    let fallback_tickets = list_pending_fallback_paths(10)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    let report = build_status_report(
+        daemon_bind_addr,
+        health,
+        snapshot,
+        pending_fallbacks,
+        fallback_tickets,
+    );
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn build_status_report(
+    daemon_bind_addr: String,
+    health: Option<DaemonHealthResponse>,
+    snapshot: Option<DaemonStatusSnapshot>,
+    pending_fallbacks: usize,
+    fallback_tickets: Vec<String>,
+) -> serde_json::Value {
+    if let (Some(health), Some(snapshot)) = (health, snapshot) {
+        let snapshot_value = serde_json::json!({
+            "daemon_mode": snapshot.daemon_mode.unwrap_or_else(|| "incremental-dev".to_string()),
+            "supported_agents": snapshot
+                .supported_agents
+                .unwrap_or_else(|| vec!["gemini".to_string(), "codex".to_string()]),
+            "pending_fallbacks": snapshot.pending_fallbacks.unwrap_or(0),
+            "fallback_tickets": snapshot.fallback_tickets.unwrap_or_default(),
+            "daemon_bind_addr": snapshot.daemon_bind_addr.unwrap_or_else(|| daemon_bind_addr.clone()),
+        });
+
+        return serde_json::json!({
+            "daemon_reachable": true,
+            "daemon_bind_addr": daemon_bind_addr,
+            "health": health,
+            "snapshot": snapshot_value
+        });
+    }
+
+    serde_json::json!({
+        "daemon_reachable": false,
+        "daemon_bind_addr": daemon_bind_addr.clone(),
+        "health": null,
+        "snapshot": {
+            "daemon_mode": "incremental-dev",
+            "supported_agents": ["gemini", "codex"],
+            "pending_fallbacks": pending_fallbacks,
+            "fallback_tickets": fallback_tickets,
+            "daemon_bind_addr": daemon_bind_addr
+        }
+    })
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
@@ -2553,6 +2577,51 @@ exit 1\n",
         }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
+    }
+
+    #[test]
+    fn build_status_report_reachable_includes_snapshot_bind_addr() {
+        let report = super::build_status_report(
+            "127.0.0.1:8080".to_string(),
+            Some(DaemonHealthResponse {
+                status: "ok".to_string(),
+                service: Some("svc".to_string()),
+                mode: Some("dev".to_string()),
+                daemon: None,
+                auth: None,
+                daemon_bind_addr: None,
+            }),
+            Some(DaemonStatusSnapshot {
+                daemon_mode: Some("daemon-snapshot".to_string()),
+                supported_agents: Some(vec!["gemini".to_string()]),
+                pending_fallbacks: Some(3),
+                fallback_tickets: Some(vec!["a.md".to_string()]),
+                daemon_bind_addr: Some("127.0.0.1:9999".to_string()),
+            }),
+            0,
+            Vec::new(),
+        );
+
+        assert_eq!(report["daemon_reachable"], true);
+        assert_eq!(report["daemon_bind_addr"], "127.0.0.1:8080");
+        assert_eq!(report["snapshot"]["daemon_bind_addr"], "127.0.0.1:9999");
+        assert_eq!(report["snapshot"]["pending_fallbacks"], 3);
+    }
+
+    #[test]
+    fn build_status_report_fallback_includes_local_snapshot_and_bind_addr() {
+        let report = super::build_status_report(
+            "127.0.0.1:7777".to_string(),
+            None,
+            None,
+            2,
+            vec!["x.md".to_string(), "y.md".to_string()],
+        );
+
+        assert_eq!(report["daemon_reachable"], false);
+        assert_eq!(report["daemon_bind_addr"], "127.0.0.1:7777");
+        assert_eq!(report["snapshot"]["daemon_bind_addr"], "127.0.0.1:7777");
+        assert_eq!(report["snapshot"]["pending_fallbacks"], 2);
     }
 
     #[tokio::test]
