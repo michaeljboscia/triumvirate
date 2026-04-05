@@ -45,3 +45,32 @@ impl<'a> FleetWorkflow<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
+    use super::FleetWorkflow;
+    use crate::WorkflowEngine;
+
+    fn temp_db() -> PathBuf {
+        std::env::temp_dir().join(format!("workflow-fleet-{}.db", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn fleet_workflow_advances_steps() {
+        let db = temp_db();
+        let engine = WorkflowEngine::open(&db).expect("open");
+        let fleet = FleetWorkflow::start(&engine, "fleet-test", "1 codex: test").expect("start");
+
+        fleet
+            .mark_contracts_ready("contracts approved")
+            .expect("contracts");
+        fleet.mark_parallel_complete(3).expect("parallel");
+        fleet.mark_completed().expect("complete");
+
+        let events = engine.store().events(fleet.workflow_id()).expect("events");
+        assert!(events.len() >= 4);
+    }
+}
