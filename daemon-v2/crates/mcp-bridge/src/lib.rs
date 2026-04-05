@@ -45,6 +45,66 @@ pub fn should_use_daemon_proxy(var_value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+pub fn daemon_base_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+
+pub fn daemon_status_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_URL")
+        .unwrap_or_else(|_| format!("{}/status", daemon_base_url()))
+}
+
+pub fn daemon_ask_agent_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL")
+        .unwrap_or_else(|_| format!("{}/ask-agent", daemon_base_url()))
+}
+
+pub fn daemon_ask_twins_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_ASK_TWINS_URL")
+        .unwrap_or_else(|_| format!("{}/ask-twins", daemon_base_url()))
+}
+
+pub fn daemon_memory_write_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL")
+        .unwrap_or_else(|_| format!("{}/memory/write", daemon_base_url()))
+}
+
+pub fn daemon_memory_read_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL")
+        .unwrap_or_else(|_| format!("{}/memory/read", daemon_base_url()))
+}
+
+pub fn daemon_scratchpad_write_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL")
+        .unwrap_or_else(|_| format!("{}/scratchpad/write", daemon_base_url()))
+}
+
+pub fn daemon_scratchpad_list_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL")
+        .unwrap_or_else(|_| format!("{}/scratchpad/list", daemon_base_url()))
+}
+
+pub fn daemon_outbox_recent_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL")
+        .unwrap_or_else(|_| format!("{}/outbox/recent", daemon_base_url()))
+}
+
+pub fn daemon_fallback_list_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL")
+        .unwrap_or_else(|_| format!("{}/fallback/list", daemon_base_url()))
+}
+
+pub fn daemon_fallback_ack_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL")
+        .unwrap_or_else(|_| format!("{}/fallback/ack", daemon_base_url()))
+}
+
+pub fn daemon_fallback_gc_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_GC_URL")
+        .unwrap_or_else(|_| format!("{}/fallback/gc", daemon_base_url()))
+}
+
 #[cfg(test)]
 mod tests {
     use shared_types::{AskAgentRequest, AskTwinsRequest};
@@ -94,5 +154,43 @@ mod tests {
         assert!(super::should_use_daemon_proxy(Some("true")));
         assert!(!super::should_use_daemon_proxy(Some("false")));
         assert!(!super::should_use_daemon_proxy(None));
+    }
+
+    #[test]
+    fn daemon_url_builders_default_and_override() {
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+        }
+
+        assert_eq!(super::daemon_base_url(), "http://127.0.0.1:8080");
+        assert_eq!(super::daemon_status_url(), "http://127.0.0.1:8080/status");
+        assert_eq!(
+            super::daemon_ask_agent_url(),
+            "http://127.0.0.1:8080/ask-agent"
+        );
+
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_DAEMON_BASE_URL", "http://127.0.0.1:9000");
+            std::env::set_var("TRIUMVIRATE_DAEMON_URL", "http://127.0.0.1:9001/status");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_ASK_AGENT_URL",
+                "http://127.0.0.1:9002/ask-agent",
+            );
+        }
+
+        assert_eq!(super::daemon_base_url(), "http://127.0.0.1:9000");
+        assert_eq!(super::daemon_status_url(), "http://127.0.0.1:9001/status");
+        assert_eq!(super::daemon_ask_agent_url(), "http://127.0.0.1:9002/ask-agent");
+
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+        }
     }
 }
