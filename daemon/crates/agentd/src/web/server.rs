@@ -51,24 +51,28 @@ pub struct AppState {
 ///
 /// Per GR1-D1: Web-Only UI — this is the exclusive conversation interface.
 /// Temporal UI at :8233 is accessible via "Developer Tools" link (GR1-D6).
+pub struct ServerDeps {
+    pub bus: Arc<MessageBus>,
+    pub health: SharedHealthRegistry,
+    pub quota: SharedQuotaRegistry,
+    pub metrics: SharedMetricsRegistry,
+    pub pricing: PricingConfig,
+    pub memory_db_path: PathBuf,
+    pub workflow_db_path: PathBuf,
+}
+
 pub async fn start_web_server(
-    bus: Arc<MessageBus>,
-    health: SharedHealthRegistry,
-    quota: SharedQuotaRegistry,
-    metrics: SharedMetricsRegistry,
-    pricing: PricingConfig,
-    memory_db_path: PathBuf,
-    workflow_db_path: PathBuf,
+    deps: ServerDeps,
     port: u16,
 ) -> anyhow::Result<()> {
     let state = AppState {
-        bus,
-        health,
-        quota,
-        metrics,
-        pricing,
-        memory_db_path,
-        workflow_db_path,
+        bus: deps.bus,
+        health: deps.health,
+        quota: deps.quota,
+        metrics: deps.metrics,
+        pricing: deps.pricing,
+        memory_db_path: deps.memory_db_path,
+        workflow_db_path: deps.workflow_db_path,
     };
 
     let app = Router::new()

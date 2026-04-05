@@ -150,13 +150,15 @@ async fn main() -> anyhow::Result<()> {
     );
 
     web::start_web_server(
-        bus,
-        health_registry,
-        quota_registry,
-        metrics_registry,
-        cfg.pricing.clone(),
-        cfg.db_path.clone(),
-        workflow_db_path,
+        web::ServerDeps {
+            bus,
+            health: health_registry,
+            quota: quota_registry,
+            metrics: metrics_registry,
+            pricing: cfg.pricing.clone(),
+            memory_db_path: cfg.db_path.clone(),
+            workflow_db_path,
+        },
         cfg.web_port,
     )
     .await?;

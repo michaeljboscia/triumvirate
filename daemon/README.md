@@ -46,6 +46,7 @@ cargo build
 ## Observability
 
 - `GET /metrics` (Prometheus exposition format)
+- `GET /api/costs` (per-agent token and estimated cost attribution)
 
 ## Governance API
 

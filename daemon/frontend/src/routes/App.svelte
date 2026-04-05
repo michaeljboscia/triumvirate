@@ -9,6 +9,7 @@
   import MemoryViewer from '../lib/components/MemoryViewer.svelte';
   import WorkflowPanel from '../lib/components/WorkflowPanel.svelte';
   import MergeResolver from '../lib/components/MergeResolver.svelte';
+  import CostPanel from '../lib/components/CostPanel.svelte';
   import { agents, refreshAgents } from '../lib/stores/agents';
   import { quota, refreshQuota } from '../lib/stores/quota';
   import { tasks, refreshTasks } from '../lib/stores/tasks';
@@ -21,6 +22,7 @@
     refreshFleetStatus,
     runFleetMerge,
   } from '../lib/stores/fleet';
+  import { costs, refreshCosts } from '../lib/stores/costs';
   import { connectFabric, disconnectFabric, fabricConnected, fabricEvents } from '../lib/stores/fabric';
   import { sendMessage, spawnFleet, startDebate } from '../lib/stores/commands';
 
@@ -36,6 +38,7 @@
       refreshQuota(),
       refreshWorkflows(),
       refreshDecisions(),
+      refreshCosts(),
     ]);
     if (!activeFleetId && $tasks.length > 0) {
       activeFleetId = $tasks[0].fleet_id;
@@ -100,6 +103,7 @@
     <QuotaDashboard quota={$quota} />
     <WorkflowPanel workflows={$workflows} />
     <MemoryViewer decisions={$decisions} />
+    <CostPanel costs={$costs} />
     <MergeResolver
       fleetId={activeFleetId}
       fleetStatus={$fleetStatus}
