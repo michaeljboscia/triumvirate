@@ -58,7 +58,9 @@ impl AgentConnector for ClaudeConnector {
         let session_id = Uuid::new_v4().to_string();
         self.session_id = Some(session_id.clone());
 
-        let mut child = Command::new("claude")
+        let claude_bin = std::env::var("TRIUMVIRATE_CLAUDE_BIN")
+            .unwrap_or_else(|_| "claude".to_string());
+        let mut child = Command::new(&claude_bin)
             .arg("--input-format")
             .arg("stream-json")
             .arg("--output-format")
@@ -195,7 +197,7 @@ impl AgentConnector for ClaudeConnector {
             }
         });
 
-        info!(agent = "claude", session = %session_id, "spawned persistent stream-json session");
+        info!(agent = "claude", session = %session_id, cli = %claude_bin, "spawned persistent stream-json session");
         self.set_health(HealthStatus::Ready);
         bus.emit(FabricMessage::new(
             AgentId::System,

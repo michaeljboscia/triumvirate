@@ -56,7 +56,9 @@ impl AgentConnector for GeminiConnector {
         let session_id = Uuid::new_v4().to_string();
         self.session_id = Some(session_id.clone());
 
-        let mut child = Command::new("gemini")
+        let gemini_bin = std::env::var("TRIUMVIRATE_GEMINI_BIN")
+            .unwrap_or_else(|_| "gemini".to_string());
+        let mut child = Command::new(&gemini_bin)
             .arg("--acp")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -190,7 +192,7 @@ impl AgentConnector for GeminiConnector {
             }
         });
 
-        info!(agent = "gemini", session = %session_id, "spawned persistent ACP session");
+        info!(agent = "gemini", session = %session_id, cli = %gemini_bin, "spawned persistent ACP session");
         self.set_health(HealthStatus::Ready);
         bus.emit(FabricMessage::new(
             AgentId::System,

@@ -56,7 +56,9 @@ impl AgentConnector for CodexConnector {
         let session_id = Uuid::new_v4().to_string();
         self.session_id = Some(session_id.clone());
 
-        let mut child = Command::new("codex")
+        let codex_bin = std::env::var("TRIUMVIRATE_CODEX_BIN")
+            .unwrap_or_else(|_| "codex".to_string());
+        let mut child = Command::new(&codex_bin)
             .arg("mcp-server")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -190,7 +192,7 @@ impl AgentConnector for CodexConnector {
             }
         });
 
-        info!(agent = "codex", session = %session_id, "spawned persistent mcp-server session");
+        info!(agent = "codex", session = %session_id, cli = %codex_bin, "spawned persistent mcp-server session");
         self.set_health(HealthStatus::Ready);
         bus.emit(FabricMessage::new(
             AgentId::System,
