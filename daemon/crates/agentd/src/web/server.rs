@@ -68,6 +68,8 @@ pub async fn start_web_server(
         .route("/api/decisions", get(decisions_handler))
         .route("/api/fleet/tasks", get(fleet_tasks_handler))
         .route("/api/fleet/spawn", post(fleet_spawn_handler))
+        .route("/api/fleet/tasks/claim", post(fleet_claim_handler))
+        .route("/api/fleet/tasks/complete", post(fleet_complete_handler))
         .route("/api/message", post(message_handler))
         .route("/ws", get(ws_handler))
         .fallback(static_handler)
@@ -363,6 +365,191 @@ async fn fleet_tasks_handler(State(state): State<AppState>) -> impl IntoResponse
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetTaskClaimRequest {
+    fleet_id: String,
+    task_key: String,
+    agent: String,
+}
+
+async fn fleet_claim_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FleetTaskClaimRequest>,
+) -> impl IntoResponse {
+    let fleet_id = req.fleet_id.trim();
+    let task_key = req.task_key.trim();
+    let agent = req.agent.trim();
+    if fleet_id.is_empty() || task_key.is_empty() || agent.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "fleet_id, task_key, and agent are required" })),
+        )
+            .into_response();
+    }
+
+    let conn = match Connection::open(&state.memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut depends_on: Option<String> = None;
+    let mut current_status: Option<String> = None;
+    let lookup = conn.query_row(
+        "SELECT status, depends_on
+         FROM fleet_tasks
+         WHERE fleet_id = ?1 AND task_key = ?2",
+        rusqlite::params![fleet_id, task_key],
+        |row| {
+            current_status = Some(row.get::<_, String>(0)?);
+            depends_on = row.get::<_, Option<String>>(1)?;
+            Ok(())
+        },
+    );
+    if let Err(e) = lookup {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("task not found: {e}") })),
+        )
+            .into_response();
+    }
+
+    if current_status.as_deref() != Some("pending") && current_status.as_deref() != Some("blocked")
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "task is not claimable in current state" })),
+        )
+            .into_response();
+    }
+
+    if let Some(dep_key) = depends_on {
+        let dep_status = conn.query_row(
+            "SELECT status FROM fleet_tasks WHERE fleet_id = ?1 AND task_key = ?2",
+            rusqlite::params![fleet_id, dep_key],
+            |row| row.get::<_, String>(0),
+        );
+        match dep_status {
+            Ok(status) if status != "completed" => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "dependency not completed" })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": format!("failed dependency lookup: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute(
+        "UPDATE fleet_tasks
+         SET status = 'in_progress',
+             assigned_agent = ?3,
+             updated_at = datetime('now')
+         WHERE fleet_id = ?1 AND task_key = ?2",
+        rusqlite::params![fleet_id, task_key, agent],
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to claim task: {e}") })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "claimed": true,
+            "fleet_id": fleet_id,
+            "task_key": task_key,
+            "agent": agent
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetTaskCompleteRequest {
+    fleet_id: String,
+    task_key: String,
+}
+
+async fn fleet_complete_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FleetTaskCompleteRequest>,
+) -> impl IntoResponse {
+    let fleet_id = req.fleet_id.trim();
+    let task_key = req.task_key.trim();
+    if fleet_id.is_empty() || task_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "fleet_id and task_key are required" })),
+        )
+            .into_response();
+    }
+
+    let conn = match Connection::open(&state.memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = conn.execute(
+        "UPDATE fleet_tasks
+         SET status = 'completed',
+             updated_at = datetime('now')
+         WHERE fleet_id = ?1 AND task_key = ?2",
+        rusqlite::params![fleet_id, task_key],
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to complete task: {e}") })),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = conn.execute(
+        "UPDATE fleet_tasks
+         SET status = 'pending',
+             updated_at = datetime('now')
+         WHERE fleet_id = ?1 AND depends_on = ?2 AND status = 'blocked'",
+        rusqlite::params![fleet_id, task_key],
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to unblock dependents: {e}") })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "completed": true,
+            "fleet_id": fleet_id,
+            "task_key": task_key
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]
