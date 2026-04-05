@@ -215,4 +215,21 @@ mod tests {
         assert_eq!(decoded.agent, "gemini");
         assert_eq!(decoded.message, "hello");
     }
+
+    #[test]
+    fn status_response_roundtrips_json_with_bind_addr() {
+        let status = super::StatusResponse {
+            daemon_mode: "incremental-dev".to_string(),
+            active_sessions: 2,
+            supported_agents: vec!["gemini".to_string(), "codex".to_string()],
+            pending_fallbacks: 1,
+            fallback_tickets: vec!["ticket-1.md".to_string()],
+            daemon_bind_addr: "127.0.0.1:8080".to_string(),
+        };
+
+        let json = serde_json::to_string(&status).expect("serialize");
+        let decoded: super::StatusResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.active_sessions, 2);
+        assert_eq!(decoded.daemon_bind_addr, "127.0.0.1:8080");
+    }
 }
