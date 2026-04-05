@@ -322,7 +322,7 @@ impl McpBridge {
             daemon_mode: "incremental-dev".to_string(),
             active_sessions: sessions.len(),
             supported_agents: vec!["gemini".to_string(), "codex".to_string()],
-            pending_fallbacks: 0,
+            pending_fallbacks: count_pending_fallbacks().unwrap_or(0),
         })
     }
 
@@ -512,19 +512,49 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
             .last()
             .map(|e| e.detail.clone())
             .unwrap_or_default(),
-        cwd: resolved_cwd,
-        repo: resolved_repo,
-        branch: resolved_branch,
+        cwd: resolved_cwd.clone(),
+        repo: resolved_repo.clone(),
+        branch: resolved_branch.clone(),
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
+
+    let fallback_path = spawn_dead_drop(
+        &agent,
+        &req.message,
+        &last_err.clone().unwrap_or_else(|| "unknown error".to_string()),
+        &resolved_cwd,
+        &resolved_repo,
+        &resolved_branch,
+    )
+    .ok();
+    if let Some(path) = fallback_path.as_ref() {
+        lifecycle.push(LifecycleEvent {
+            state: "FALLBACK".to_string(),
+            detail: format!("dead drop launched: {}", path.display()),
+        });
+        let _ = append_outbox_event(&OutboxEvent {
+            ts_ms: now_ms(),
+            request_id: request_id.clone(),
+            tool: "ask_agent".to_string(),
+            status: "FALLBACK".to_string(),
+            agent: Some(agent.clone()),
+            detail: format!("dead drop launched: {}", path.display()),
+            cwd: resolved_cwd.clone(),
+            repo: resolved_repo.clone(),
+            branch: resolved_branch.clone(),
+        });
+    }
     Err(format!(
-        "ask_agent failed after lifecycle {:?}: {}",
+        "ask_agent failed after lifecycle {:?}: {}{}",
         lifecycle
             .iter()
             .map(|e| e.state.as_str())
             .collect::<Vec<_>>(),
-        last_err.unwrap_or_else(|| "unknown error".to_string())
+        last_err.unwrap_or_else(|| "unknown error".to_string()),
+        fallback_path
+            .map(|p| format!("; dead drop launched at {}", p.display()))
+            .unwrap_or_default()
     ))
 }
 
@@ -620,6 +650,24 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 repo: resolved_repo.clone(),
                 branch: resolved_branch.clone(),
             });
+            if let Ok(path) = spawn_dead_drop(
+                "gemini",
+                &req.message,
+                &e.to_string(),
+                &resolved_cwd,
+                &resolved_repo,
+                &resolved_branch,
+            ) {
+                let info = format!("Gemini dead drop launched: {}", path.display());
+                lifecycle.push(LifecycleEvent {
+                    state: "FALLBACK".to_string(),
+                    detail: info.clone(),
+                });
+                failures.push(LifecycleEvent {
+                    state: "FALLBACK".to_string(),
+                    detail: info,
+                });
+            }
         }
     }
 
@@ -667,6 +715,24 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 repo: resolved_repo.clone(),
                 branch: resolved_branch.clone(),
             });
+            if let Ok(path) = spawn_dead_drop(
+                "codex",
+                &req.message,
+                &e.to_string(),
+                &resolved_cwd,
+                &resolved_repo,
+                &resolved_branch,
+            ) {
+                let info = format!("Codex dead drop launched: {}", path.display());
+                lifecycle.push(LifecycleEvent {
+                    state: "FALLBACK".to_string(),
+                    detail: info.clone(),
+                });
+                failures.push(LifecycleEvent {
+                    state: "FALLBACK".to_string(),
+                    detail: info,
+                });
+            }
         }
     }
 
@@ -937,6 +1003,10 @@ fn outbox_file_path() -> anyhow::Result<PathBuf> {
     Ok(triumvirate_home_dir()?.join("outbox.jsonl"))
 }
 
+fn dead_drop_dir_path() -> anyhow::Result<PathBuf> {
+    Ok(triumvirate_home_dir()?.join("dead-drop"))
+}
+
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
     let path = outbox_file_path()?;
     if let Some(parent) = path.parent() {
@@ -994,6 +1064,37 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+fn spawn_dead_drop(
+    agent: &str,
+    message: &str,
+    reason: &str,
+    cwd: &Option<String>,
+    repo: &Option<String>,
+    branch: &Option<String>,
+) -> anyhow::Result<PathBuf> {
+    let dir = dead_drop_dir_path()?;
+    fs::create_dir_all(&dir)?;
+    let id = Uuid::new_v4().to_string();
+    let file = dir.join(format!("{}-{agent}.md", id));
+    let body = format!(
+        "# Dead Drop Fallback\n\nid: {id}\nagent: {agent}\nreason: {reason}\n\
+cwd: {}\nrepo: {}\nbranch: {}\n\n## Original Request\n{message}\n",
+        cwd.clone().unwrap_or_default(),
+        repo.clone().unwrap_or_default(),
+        branch.clone().unwrap_or_default()
+    );
+    fs::write(&file, body)?;
+    Ok(file)
+}
+
+fn count_pending_fallbacks() -> anyhow::Result<usize> {
+    let dir = dead_drop_dir_path()?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_dir(dir)?.filter_map(Result::ok).count())
 }
 
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -2030,6 +2131,76 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_failure_creates_dead_drop_ticket() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-dead-drop-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let script_path = write_failing_agent_script("gemini")?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let err = execute_ask_agent(&AskAgentRequest {
+            agent: "gemini".to_string(),
+            message: "should fail".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            repo: Some("triumvirate".to_string()),
+            branch: Some("feat/mcp-first".to_string()),
+        })
+        .await
+        .err()
+        .unwrap_or_default();
+        assert!(err.contains("dead drop launched"));
+
+        let dead_drop_dir = test_home.join("dead-drop");
+        assert!(dead_drop_dir.exists());
+        let tickets = fs::read_dir(&dead_drop_dir)?
+            .filter_map(Result::ok)
+            .count();
+        assert!(tickets >= 1);
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[test]
+    fn count_pending_fallbacks_reads_dead_drop_directory() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-fallback-count-{now}"));
+        let dead_drop_dir = test_home.join("dead-drop");
+        fs::create_dir_all(&dead_drop_dir)?;
+        fs::write(dead_drop_dir.join("a.md"), "x")?;
+        fs::write(dead_drop_dir.join("b.md"), "x")?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+        let count = count_pending_fallbacks()?;
+        assert_eq!(count, 2);
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
