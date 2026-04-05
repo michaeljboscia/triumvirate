@@ -277,6 +277,16 @@ struct FallbackAckRequest {
     path: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FallbackGcRequest {
+    max_age_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FallbackGcResponse {
+    removed: usize,
+}
+
 #[tool_router]
 impl McpBridge {
     #[tool(description = "Health check tool for MCP connectivity")]
@@ -560,6 +570,22 @@ impl McpBridge {
         }
         acknowledge_fallback_path(&req.path).map_err(|e| format!("fallback_ack failed: {e}"))?;
         Ok(format!("acknowledged {}", req.path))
+    }
+
+    #[tool(description = "Garbage collect stale dead-drop fallback tickets.")]
+    async fn fallback_gc(
+        &self,
+        Parameters(req): Parameters<FallbackGcRequest>,
+    ) -> Result<Json<FallbackGcResponse>, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_fallback_gc(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("fallback_gc via daemon failed: {e}"));
+        }
+        let removed = gc_fallbacks(req.max_age_days.unwrap_or(7))
+            .map_err(|e| format!("fallback_gc failed: {e}"))?;
+        Ok(Json(FallbackGcResponse { removed }))
     }
 }
 
@@ -1390,6 +1416,26 @@ async fn run_daemon() -> anyhow::Result<()> {
         })))
     }
 
+    async fn fallback_gc_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<FallbackGcRequest>,
+    ) -> Result<AxumJson<FallbackGcResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let removed = gc_fallbacks(req.max_age_days.unwrap_or(7)).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+        Ok(AxumJson(FallbackGcResponse { removed }))
+    }
+
     let token = ensure_daemon_token()?;
     let state = DaemonState {
         token,
@@ -1407,6 +1453,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/outbox/recent", post(outbox_recent_route))
         .route("/fallback/list", post(fallback_list_route))
         .route("/fallback/ack", post(fallback_ack_route))
+        .route("/fallback/gc", post(fallback_gc_route))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     axum::serve(listener, app).await?;
@@ -1718,6 +1765,32 @@ fn acknowledge_fallback_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn gc_fallbacks(max_age_days: u64) -> anyhow::Result<usize> {
+    let dir = dead_drop_dir_path()?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let max_age = Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age >= max_age && fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
     let Some(value) = headers.get(AUTHORIZATION) else {
         return false;
@@ -1874,6 +1947,11 @@ fn daemon_fallback_ack_url() -> String {
         .unwrap_or_else(|_| format!("{}/fallback/ack", daemon_base_url()))
 }
 
+fn daemon_fallback_gc_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_GC_URL")
+        .unwrap_or_else(|_| format!("{}/fallback/gc", daemon_base_url()))
+}
+
 async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
     daemon_post_json::<AskAgentRequest, AskAgentResponse>(daemon_ask_agent_url(), req).await
 }
@@ -1935,6 +2013,10 @@ async fn fetch_daemon_fallback_ack(req: &FallbackAckRequest) -> anyhow::Result<S
         .and_then(|v| v.as_str())
         .unwrap_or("acknowledged")
         .to_string())
+}
+
+async fn fetch_daemon_fallback_gc(req: &FallbackGcRequest) -> anyhow::Result<FallbackGcResponse> {
+    daemon_post_json::<FallbackGcRequest, FallbackGcResponse>(daemon_fallback_gc_url(), req).await
 }
 
 #[cfg(test)]
@@ -3394,6 +3476,97 @@ exit 1\n",
     }
 
     #[tokio::test]
+    async fn mcp_fallback_gc_uses_daemon_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home =
+            std::env::temp_dir().join(format!("triumvirate-mcp-fallback-gc-daemon-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "mcp-fallback-gc-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn fallback_gc_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(_req): AxumJson<FallbackGcRequest>,
+        ) -> Result<AxumJson<FallbackGcResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(FallbackGcResponse { removed: 2 }))
+        }
+
+        let app = Router::new()
+            .route("/fallback/gc", post(fallback_gc_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_FALLBACK_GC_URL",
+                format!("http://{addr}/fallback/gc"),
+            );
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let gc = client
+            .call_tool(
+                CallToolRequestParams::new("fallback_gc").with_arguments(
+                    serde_json::json!({ "max_age_days": 7 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            )
+            .await?;
+        let gc_text = gc
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(gc_text.contains("\"removed\":2"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_FALLBACK_GC_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ask_agent_writes_outbox_events() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
         let now = SystemTime::now()
@@ -3660,6 +3833,42 @@ exit 1\n",
             }))
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
+
+        let list_after = bridge
+            .fallback_list(Parameters(FallbackListRequest { limit: Some(10) }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(list_after.0.tickets.len(), 0);
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_gc_removes_stale_tickets() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-fallback-gc-{now}"));
+        let dead_drop = test_home.join("dead-drop");
+        fs::create_dir_all(&dead_drop)?;
+        fs::write(dead_drop.join("stale-a.md"), "old")?;
+        fs::write(dead_drop.join("stale-b.md"), "old")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        // With max_age_days=0 all existing tickets are eligible for removal.
+        let bridge = McpBridge::new_ephemeral();
+        let out = bridge
+            .fallback_gc(Parameters(FallbackGcRequest {
+                max_age_days: Some(0),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert!(out.0.removed >= 2);
 
         let list_after = bridge
             .fallback_list(Parameters(FallbackListRequest { limit: Some(10) }))
