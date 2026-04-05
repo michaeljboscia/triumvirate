@@ -7,7 +7,7 @@ use daemon_core::{
     create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
     read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
-    write_scratchpad as core_write_scratchpad, ensure_daemon_token as core_ensure_daemon_token,
+    resolve_context as core_resolve_context, write_scratchpad as core_write_scratchpad, ensure_daemon_token as core_ensure_daemon_token,
     sessions_file_path as core_sessions_file_path, load_json_file as core_load_json_file,
     persist_json_file as core_persist_json_file,
 };
@@ -494,7 +494,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
     let agent = req.agent.to_lowercase();
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
-        resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
+        core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
 
     // Emit lifecycle states in-band so clients can render progress before native MCP progress
     // notifications are wired in a later increment.
@@ -691,7 +691,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
 async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, String> {
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
-        resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
+        core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
     let (gemini_prompt, codex_prompt) = build_role_adapted_prompts(&AskTwinsRequest {
         message: req.message.clone(),
         cwd: resolved_cwd.clone(),
@@ -1462,41 +1462,6 @@ fn write_scratchpad(project: &str, topic: &str, content: &str) -> anyhow::Result
 
 fn list_scratchpad(project: &str) -> anyhow::Result<Vec<PathBuf>> {
     core_list_scratchpad(&triumvirate_home_dir()?, project)
-}
-
-fn resolve_context(
-    cwd: Option<&String>,
-    repo: Option<&String>,
-    branch: Option<&String>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let resolved_cwd = cwd
-        .cloned()
-        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
-
-    let resolved_repo = repo
-        .cloned()
-        .or_else(|| git_probe(&resolved_cwd, &["rev-parse", "--show-toplevel"]));
-
-    let resolved_branch = branch
-        .cloned()
-        .or_else(|| git_probe(&resolved_cwd, &["rev-parse", "--abbrev-ref", "HEAD"]));
-
-    (resolved_cwd, resolved_repo, resolved_branch)
-}
-
-fn git_probe(cwd: &Option<String>, args: &[&str]) -> Option<String> {
-    let cwd = cwd.as_ref()?;
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
 }
 
 fn now_ms() -> u128 {

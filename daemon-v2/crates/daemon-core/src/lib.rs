@@ -236,6 +236,41 @@ pub fn ensure_daemon_token(root: &Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
+pub fn resolve_context(
+    cwd: Option<&String>,
+    repo: Option<&String>,
+    branch: Option<&String>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let resolved_cwd = cwd
+        .cloned()
+        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
+
+    let resolved_repo = repo
+        .cloned()
+        .or_else(|| git_probe(&resolved_cwd, &["rev-parse", "--show-toplevel"]));
+
+    let resolved_branch = branch
+        .cloned()
+        .or_else(|| git_probe(&resolved_cwd, &["rev-parse", "--abbrev-ref", "HEAD"]));
+
+    (resolved_cwd, resolved_repo, resolved_branch)
+}
+
+fn git_probe(cwd: &Option<String>, args: &[&str]) -> Option<String> {
+    let cwd = cwd.as_ref()?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 fn sanitize_name(value: &str) -> String {
     value
         .chars()
@@ -382,5 +417,17 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn resolve_context_prefers_explicit_values() {
+        let (cwd, repo, branch) = super::resolve_context(
+            Some(&"/tmp/x".to_string()),
+            Some(&"my-repo".to_string()),
+            Some(&"feat/test".to_string()),
+        );
+        assert_eq!(cwd.as_deref(), Some("/tmp/x"));
+        assert_eq!(repo.as_deref(), Some("my-repo"));
+        assert_eq!(branch.as_deref(), Some("feat/test"));
     }
 }
