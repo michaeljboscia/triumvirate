@@ -108,7 +108,9 @@ impl McpBridge {
 
     fn with_persistence(enable_persistence: bool) -> Self {
         let sessions_file = if enable_persistence {
-            sessions_file_path().ok()
+            core_triumvirate_home_dir()
+                .ok()
+                .map(|home| core_sessions_file_path(&home))
         } else {
             None
         };
@@ -1020,7 +1022,7 @@ fn run_uninstall() -> anyhow::Result<()> {
 }
 
 async fn run_doctor() -> anyhow::Result<()> {
-    let token_path = daemon_token_path()?;
+    let token_path = core_triumvirate_home_dir()?.join("daemon.token");
     let plist_path = launchd_plist_path()?;
     let daemon_health = fetch_daemon_status().await.ok();
     let report = serde_json::json!({
@@ -1348,16 +1350,8 @@ async fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn daemon_token_path() -> anyhow::Result<PathBuf> {
-    Ok(core_triumvirate_home_dir()?.join("daemon.token"))
-}
-
 fn ensure_daemon_token() -> anyhow::Result<String> {
     core_ensure_daemon_token(&core_triumvirate_home_dir()?)
-}
-
-fn sessions_file_path() -> anyhow::Result<PathBuf> {
-    Ok(core_sessions_file_path(&core_triumvirate_home_dir()?))
 }
 
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
