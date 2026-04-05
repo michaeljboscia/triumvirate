@@ -112,12 +112,26 @@ impl MemoryStore {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failure', 'partial')),
+                confidence_score REAL NOT NULL CHECK(confidence_score >= 0.0 AND confidence_score <= 1.0),
+                pattern TEXT NOT NULL,
+                agent_source TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
             CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
             CREATE INDEX IF NOT EXISTS idx_routing_log_session ON routing_log(session_id);
             CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id);
             CREATE INDEX IF NOT EXISTS idx_fleet_tasks_fleet ON fleet_tasks(fleet_id);
-            CREATE INDEX IF NOT EXISTS idx_fleet_worktrees_fleet ON fleet_worktrees(fleet_id);",
+            CREATE INDEX IF NOT EXISTS idx_fleet_worktrees_fleet ON fleet_worktrees(fleet_id);
+            CREATE INDEX IF NOT EXISTS idx_lessons_outcome ON lessons(outcome);
+            CREATE INDEX IF NOT EXISTS idx_lessons_pattern ON lessons(pattern);
+            CREATE INDEX IF NOT EXISTS idx_lessons_agent_source ON lessons(agent_source);",
         )?;
 
         info!(path = %path.display(), "memory store opened");

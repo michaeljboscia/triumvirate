@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::path::PathBuf;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::extract::Path as AxumPath;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse};
@@ -27,6 +27,7 @@ use crate::quota::SharedQuotaRegistry;
 use crate::routing::{RoutingDecision, decide_route};
 use crate::shutdown::wait_for_shutdown_signal;
 use crate::metrics::SharedMetricsRegistry;
+use crate::memory::{LessonOutcome, LessonWrite, insert_lesson, query_lessons};
 use crate::web::ws_handler;
 
 /// Static assets embedded in the binary via rust-embed.
@@ -87,6 +88,7 @@ pub async fn start_web_server(
         .route("/api/debate/vote", post(debate_vote_handler))
         .route("/api/debate/complete", post(debate_complete_handler))
         .route("/api/quota", get(quota_handler))
+        .route("/api/lessons", get(lessons_handler).post(lesson_create_handler))
         .route("/api/workflows", get(workflows_handler))
         .route("/api/decisions", get(decisions_handler))
         .route("/api/fleet/tasks", get(fleet_tasks_handler))
@@ -515,6 +517,119 @@ async fn decisions_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct LessonsQuery {
+    outcome: Option<String>,
+    agent_source: Option<String>,
+    pattern: Option<String>,
+    min_confidence: Option<f64>,
+}
+
+async fn lessons_handler(
+    State(state): State<AppState>,
+    Query(query): Query<LessonsQuery>,
+) -> impl IntoResponse {
+    let conn = match Connection::open(&state.memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    match query_lessons(
+        &conn,
+        query.outcome.as_deref(),
+        query.agent_source.as_deref(),
+        query.pattern.as_deref(),
+    ) {
+        Ok(mut lessons) => {
+            if let Some(min_conf) = query.min_confidence {
+                lessons.retain(|l| l.effective_confidence >= min_conf);
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "lessons": lessons }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to read lessons: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LessonCreateRequest {
+    decision: String,
+    rationale: String,
+    outcome: String,
+    confidence_score: f64,
+    pattern: String,
+    agent_source: String,
+}
+
+async fn lesson_create_handler(
+    State(state): State<AppState>,
+    Json(req): Json<LessonCreateRequest>,
+) -> impl IntoResponse {
+    let outcome = match LessonOutcome::parse(&req.outcome) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "outcome must be success, failure, or partial" })),
+            )
+                .into_response();
+        }
+    };
+
+    let lesson = LessonWrite {
+        decision: req.decision.trim().to_string(),
+        rationale: req.rationale.trim().to_string(),
+        outcome,
+        confidence_score: req.confidence_score.clamp(0.0, 1.0),
+        pattern: req.pattern.trim().to_string(),
+        agent_source: req.agent_source.trim().to_string(),
+    };
+    if lesson.decision.is_empty()
+        || lesson.rationale.is_empty()
+        || lesson.pattern.is_empty()
+        || lesson.agent_source.is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "decision, rationale, pattern, and agent_source are required" })),
+        )
+            .into_response();
+    }
+
+    let conn = match Connection::open(&state.memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    match insert_lesson(&conn, &lesson) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "created": true })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to create lesson: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct FleetSpawnRequest {
     spec: String,
 }
@@ -549,6 +664,7 @@ async fn fleet_spawn_handler(
     match Connection::open(&state.memory_db_path) {
         Ok(conn) => {
             let members = parse_fleet_members(spec);
+            let relevant_lessons = fleet_relevant_lessons(&conn, spec).unwrap_or_default();
             let mut created = Vec::new();
             for member in &members {
                 match provision_worktree(&fleet_id, member, "HEAD") {
@@ -612,7 +728,14 @@ async fn fleet_spawn_handler(
                     AgentId::Human,
                     Topic::TaskCreated,
                     Payload::HumanMessage {
-                        content: format!("fleet spawned: {fleet_id} ({spec})"),
+                        content: format!(
+                            "fleet spawned: {fleet_id} ({spec})\nrelevant lessons:\n{}",
+                            if relevant_lessons.is_empty() {
+                                "- none".to_string()
+                            } else {
+                                relevant_lessons.join("\n")
+                            }
+                        ),
                     },
                 ))
                 .await;
@@ -625,6 +748,7 @@ async fn fleet_spawn_handler(
                     "workflow_id": workflow_id,
                     "spec": spec,
                     "members": members.into_iter().map(|m| m.member_key).collect::<Vec<_>>(),
+                    "relevant_lessons": relevant_lessons,
                 })),
             )
                 .into_response()
@@ -1537,13 +1661,103 @@ fn inject_memory_context(
     }
 
     if decisions.is_empty() {
+        if let Some(lesson_block) = lesson_context_block(&conn, target_agent, content)? {
+            return Ok(format!(
+                "[TRIUMVIRATE LESSONS]\n{lesson_block}\n\n[USER REQUEST]\n{content}"
+            ));
+        }
         return Ok(content.to_string());
     }
 
     let context_block = decisions.join("\n");
+    let lessons = lesson_context_block(&conn, target_agent, content)?
+        .map(|v| format!("\n\n[TRIUMVIRATE LESSONS]\n{v}"))
+        .unwrap_or_default();
     Ok(format!(
-        "[TRIUMVIRATE CONTEXT]\nTarget agent: {target_agent}\nRecent decisions:\n{context_block}\n\n[USER REQUEST]\n{content}"
+        "[TRIUMVIRATE CONTEXT]\nTarget agent: {target_agent}\nRecent decisions:\n{context_block}{lessons}\n\n[USER REQUEST]\n{content}"
     ))
+}
+
+fn lesson_context_block(
+    conn: &Connection,
+    target_agent: AgentId,
+    content: &str,
+) -> anyhow::Result<Option<String>> {
+    let keywords = extract_keywords(content);
+    let lessons = query_lessons(conn, None, None, None)?;
+    let mut matches = Vec::new();
+    for lesson in lessons {
+        if lesson.effective_confidence < 0.2 {
+            continue;
+        }
+        if lesson.agent_source != target_agent.to_string()
+            && lesson.agent_source != "human"
+            && lesson.agent_source != "system"
+        {
+            continue;
+        }
+        let haystack = format!(
+            "{} {} {}",
+            lesson.pattern.to_ascii_lowercase(),
+            lesson.decision.to_ascii_lowercase(),
+            lesson.rationale.to_ascii_lowercase()
+        );
+        if keywords.is_empty() || keywords.iter().any(|kw| haystack.contains(kw)) {
+            matches.push(format!(
+                "- [{}] {} (pattern: {}, confidence: {:.2} -> {:.2}) because {}",
+                lesson.outcome,
+                lesson.decision,
+                lesson.pattern,
+                lesson.confidence_score,
+                lesson.effective_confidence,
+                lesson.rationale
+            ));
+        }
+        if matches.len() >= 5 {
+            break;
+        }
+    }
+    if matches.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(matches.join("\n")))
+    }
+}
+
+fn extract_keywords(content: &str) -> Vec<String> {
+    content
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 4)
+        .take(20)
+        .collect()
+}
+
+fn fleet_relevant_lessons(conn: &Connection, spec: &str) -> anyhow::Result<Vec<String>> {
+    let keywords = extract_keywords(spec);
+    let lessons = query_lessons(conn, None, None, None)?;
+    let mut out = Vec::new();
+    for lesson in lessons {
+        if lesson.effective_confidence < 0.2 {
+            continue;
+        }
+        let haystack = format!(
+            "{} {} {}",
+            lesson.pattern.to_ascii_lowercase(),
+            lesson.decision.to_ascii_lowercase(),
+            lesson.rationale.to_ascii_lowercase()
+        );
+        if keywords.is_empty() || keywords.iter().any(|kw| haystack.contains(kw)) {
+            out.push(format!(
+                "- [{}] {} because {}",
+                lesson.outcome, lesson.decision, lesson.rationale
+            ));
+        }
+        if out.len() >= 5 {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn status_label(status: HealthStatus) -> &'static str {
