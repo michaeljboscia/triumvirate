@@ -2781,6 +2781,49 @@ exit 1\n",
         Ok(())
     }
 
+    #[tokio::test]
+    async fn get_status_falls_back_local_when_daemon_snapshot_unreachable() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home =
+            std::env::temp_dir().join(format!("triumvirate-status-daemon-fallback-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let dead_drop = test_home.join("dead-drop");
+        fs::create_dir_all(&dead_drop)?;
+        fs::write(dead_drop.join("ticket-local.md"), "fallback")?;
+        fs::write(test_home.join("daemon.token"), "local-token\n")?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var("TRIUMVIRATE_DAEMON_AUTOSTART", "false");
+            std::env::set_var("TRIUMVIRATE_DAEMON_URL", "http://127.0.0.1:9/status");
+        }
+
+        let bridge = McpBridge::new_ephemeral();
+        let status = bridge.get_status().await;
+        assert_eq!(status.0.daemon_mode, "incremental-dev");
+        assert_eq!(status.0.pending_fallbacks, 1);
+        assert!(status
+            .0
+            .fallback_tickets
+            .iter()
+            .any(|p| p.contains("ticket-local.md")));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
     #[test]
     fn daemon_token_is_created_and_reused() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
