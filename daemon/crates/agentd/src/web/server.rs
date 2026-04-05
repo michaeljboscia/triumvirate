@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-use triumvirate_workflow::{FleetWorkflow, WorkflowEngine, WorkflowStore};
+use triumvirate_workflow::{DebateWorkflow, FleetWorkflow, WorkflowEngine, WorkflowStore};
 use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
 use crate::agent::SharedHealthRegistry;
@@ -69,6 +69,7 @@ pub async fn start_web_server(
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/governance/check", post(governance_check_handler))
+        .route("/api/debate/start", post(debate_start_handler))
         .route("/api/quota", get(quota_handler))
         .route("/api/workflows", get(workflows_handler))
         .route("/api/decisions", get(decisions_handler))
@@ -184,6 +185,45 @@ async fn governance_check_handler(Json(req): Json<GovernanceCheckRequest>) -> im
         })),
     )
         .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DebateStartRequest {
+    topic: String,
+}
+
+async fn debate_start_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DebateStartRequest>,
+) -> impl IntoResponse {
+    let topic = req.topic.trim();
+    if topic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "topic is required" })),
+        )
+            .into_response();
+    }
+
+    match WorkflowEngine::open(&state.workflow_db_path).and_then(|engine| {
+        DebateWorkflow::start(&engine, topic, &["claude", "gemini", "codex"])
+            .map(|workflow| workflow.workflow_id().to_string())
+    }) {
+        Ok(workflow_id) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "accepted": true,
+                "workflow_id": workflow_id,
+                "topic": topic,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to start debate workflow: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 async fn workflows_handler(State(state): State<AppState>) -> impl IntoResponse {
