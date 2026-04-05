@@ -33,10 +33,10 @@ Before writing any code, read these files IN ORDER:
 
 ## Rust Skills (MUST READ before writing Rust code)
 
-8 Rust skills are available at `/Users/mikeboscia/.claude/skills/`. Each contains a `SKILL.md` with idiomatic Rust patterns, anti-patterns, and rules. **Read the relevant skills BEFORE starting each phase.**
+10 Rust skills are available. Each contains a `SKILL.md` with idiomatic Rust patterns, anti-patterns, and rules. **Read the relevant skills BEFORE starting each phase.**
 
-| Skill | Path | When to read |
-|-------|------|-------------|
+| Skill | Full Path | When to read |
+|-------|-----------|-------------|
 | mx-rust-core | `/Users/mikeboscia/.claude/skills/mx-rust-core/SKILL.md` | EVERY phase — ownership, error handling, traits, modules |
 | mx-rust-async | `/Users/mikeboscia/.claude/skills/mx-rust-async/SKILL.md` | Phase 1-4 — tokio::spawn, channels, JoinSet, CancellationToken |
 | mx-rust-data | `/Users/mikeboscia/.claude/skills/mx-rust-data/SKILL.md` | Phase 3 — serde, rusqlite, config, JSON streaming |
@@ -45,6 +45,8 @@ Before writing any code, read these files IN ORDER:
 | mx-rust-systems | `/Users/mikeboscia/.claude/skills/mx-rust-systems/SKILL.md` | Phase 1-2, 7 — subprocesses, signals, process groups, graceful shutdown |
 | mx-rust-testing | `/Users/mikeboscia/.claude/skills/mx-rust-testing/SKILL.md` | ALL phases — tokio::test, proptest, insta, criterion benchmarks |
 | mx-rust-project | `/Users/mikeboscia/.claude/skills/mx-rust-project/SKILL.md` | Phase 0, 8 — Cargo workspaces, clippy, build optimization |
+| mx-rust-observability | `/Users/mikeboscia/.claude/skills/mx-rust-observability/SKILL.md` | Phase 7 — tracing, OpenTelemetry, Prometheus, health checks |
+| mx-rust-perf | `/Users/mikeboscia/.claude/skills/mx-rust-perf/SKILL.md` | Phase 7-8 — profiling, benchmarking, zero-copy, SIMD JSON, build speed |
 
 **Per-phase skill loading:**
 - Phase 0: Read mx-rust-project (study prior art repos)
@@ -54,8 +56,8 @@ Before writing any code, read these files IN ORDER:
 - Phase 4: Read mx-rust-core, mx-rust-async, mx-rust-systems, mx-rust-testing
 - Phase 5: Read mx-rust-network (axum WebSocket), mx-rust-testing
 - Phase 6: Read mx-rust-core, mx-rust-services (Cedar), mx-rust-testing
-- Phase 7: Read mx-rust-core, mx-rust-systems (graceful shutdown), mx-rust-testing
-- Phase 8: Read mx-rust-project (clippy, release build)
+- Phase 7: Read mx-rust-core, mx-rust-systems, mx-rust-observability, mx-rust-perf, mx-rust-testing
+- Phase 8: Read mx-rust-project, mx-rust-perf (release build optimization)
 
 ---
 
