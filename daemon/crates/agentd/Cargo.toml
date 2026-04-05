@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Multi-agent daemon — Claude, Gemini, and Codex working together"
+build = "build.rs"
 
 [[bin]]
 name = "triumvirate-agentd"
