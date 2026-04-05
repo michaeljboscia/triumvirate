@@ -2261,7 +2261,8 @@ exit 1\n",
                 "daemon_mode": "daemon-snapshot",
                 "supported_agents": ["gemini", "codex", "claude"],
                 "pending_fallbacks": 7,
-                "fallback_tickets": ["x.md", "y.md"]
+                "fallback_tickets": ["x.md", "y.md"],
+                "daemon_bind_addr": "127.0.0.1:9999"
             })))
         }
 
@@ -2287,6 +2288,7 @@ exit 1\n",
         assert_eq!(status.0.pending_fallbacks, 7);
         assert_eq!(status.0.fallback_tickets.len(), 2);
         assert!(status.0.supported_agents.contains(&"claude".to_string()));
+        assert_eq!(status.0.daemon_bind_addr, "127.0.0.1:9999");
 
         server.abort();
         let _ = server.await;
@@ -2331,6 +2333,7 @@ exit 1\n",
             .fallback_tickets
             .iter()
             .any(|p| p.contains("ticket-local.md")));
+        assert_eq!(status.0.daemon_bind_addr, "127.0.0.1:8080");
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
