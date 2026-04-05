@@ -1,5 +1,10 @@
 use clap::{Parser, Subcommand};
-use axum::{Json as AxumJson, Router, routing::get};
+use axum::{
+    Json as AxumJson, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    routing::get,
+};
 use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -8,13 +13,19 @@ use rmcp::{
     transport::stdio,
 };
 use schemars::JsonSchema;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Mutex,
     time::{Duration, sleep, timeout},
 };
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "triumvirate")]
@@ -500,18 +511,90 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
-    async fn health() -> AxumJson<serde_json::Value> {
-        AxumJson(serde_json::json!({
+    #[derive(Debug, Clone)]
+    struct DaemonState {
+        token: String,
+    }
+
+    async fn health(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+    ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
+        if !is_authorized(&headers, &state.token) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(AxumJson(serde_json::json!({
             "status": "ok",
             "service": "triumvirate-daemon-v2",
             "mode": "incremental-dev"
-        }))
+        })))
     }
 
-    let app = Router::new().route("/health", get(health));
+    async fn status(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+    ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
+        if !is_authorized(&headers, &state.token) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(AxumJson(serde_json::json!({
+            "daemon": "running",
+            "auth": "bearer-required"
+        })))
+    }
+
+    let token = ensure_daemon_token()?;
+    let state = DaemonState { token };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/status", get(status))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn triumvirate_home_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(override_dir) = std::env::var("TRIUMVIRATE_HOME") {
+        return Ok(PathBuf::from(override_dir));
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?;
+    Ok(home.join(".triumvirate"))
+}
+
+fn daemon_token_path() -> anyhow::Result<PathBuf> {
+    Ok(triumvirate_home_dir()?.join("daemon.token"))
+}
+
+fn ensure_daemon_token() -> anyhow::Result<String> {
+    let token_path = daemon_token_path()?;
+    if let Some(parent) = token_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if token_path.exists() {
+        let existing = fs::read_to_string(&token_path)?;
+        let token = existing.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    let token = Uuid::new_v4().to_string();
+    fs::write(&token_path, format!("{token}\n"))?;
+    Ok(token)
+}
+
+fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let expected = format!("Bearer {token}");
+    value == expected
 }
 
 #[cfg(test)]
@@ -916,5 +999,45 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
         client.cancel().await?;
         server_handle.await??;
         Ok(())
+    }
+
+    #[test]
+    fn daemon_token_is_created_and_reused() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-home-{now}"));
+        fs::create_dir_all(&test_home)?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        let token_one = ensure_daemon_token()?;
+        let token_two = ensure_daemon_token()?;
+        assert_eq!(token_one, token_two);
+        assert!(!token_one.is_empty());
+
+        let token_path = test_home.join("daemon.token");
+        assert!(token_path.exists());
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[test]
+    fn bearer_auth_validation_works() {
+        let token = "abc-123";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {token}")
+                .parse()
+                .expect("header should parse"),
+        );
+        assert!(is_authorized(&headers, token));
+        assert!(!is_authorized(&headers, "wrong"));
     }
 }
