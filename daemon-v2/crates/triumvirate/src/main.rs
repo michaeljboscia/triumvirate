@@ -1142,6 +1142,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     #[derive(Debug, Clone)]
     struct DaemonState {
         token: String,
+        queues: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     }
 
     async fn health(
@@ -1182,6 +1183,9 @@ async fn run_daemon() -> anyhow::Result<()> {
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
             ));
         }
+        // Serialize agent execution per project to keep ordering predictable for concurrent bridges.
+        let queue = acquire_project_queue(&state.queues, project_queue_key(req.cwd.as_ref(), req.repo.as_ref())).await;
+        let _guard = queue.lock().await;
         execute_ask_agent(&req).await.map(AxumJson).map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -1201,6 +1205,8 @@ async fn run_daemon() -> anyhow::Result<()> {
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
             ));
         }
+        let queue = acquire_project_queue(&state.queues, project_queue_key(req.cwd.as_ref(), req.repo.as_ref())).await;
+        let _guard = queue.lock().await;
         execute_ask_twins(&req).await.map(AxumJson).map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -1384,7 +1390,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     let token = ensure_daemon_token()?;
-    let state = DaemonState { token };
+    let state = DaemonState {
+        token,
+        queues: Arc::new(Mutex::new(HashMap::new())),
+    };
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
@@ -1626,6 +1635,27 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+fn project_queue_key(cwd: Option<&String>, repo: Option<&String>) -> String {
+    if let Some(repo) = repo {
+        return format!("repo:{repo}");
+    }
+    if let Some(cwd) = cwd {
+        return format!("cwd:{cwd}");
+    }
+    "global".to_string()
+}
+
+async fn acquire_project_queue(
+    registry: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    key: String,
+) -> Arc<Mutex<()>> {
+    let mut queues = registry.lock().await;
+    queues
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn spawn_dead_drop(
@@ -2566,6 +2596,19 @@ exit 1\n",
         assert!(plist.contains("<string>/tmp/tri-home/daemon.log</string>"));
     }
 
+    #[test]
+    fn project_queue_key_prefers_repo_then_cwd() {
+        assert_eq!(
+            project_queue_key(Some(&"/tmp/a".to_string()), Some(&"triumvirate".to_string())),
+            "repo:triumvirate"
+        );
+        assert_eq!(
+            project_queue_key(Some(&"/tmp/a".to_string()), None),
+            "cwd:/tmp/a"
+        );
+        assert_eq!(project_queue_key(None, None), "global");
+    }
+
     #[tokio::test]
     async fn daemon_health_uses_bearer_token() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
@@ -2624,6 +2667,43 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
         }
         let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_queue_serializes_same_project_requests() -> anyhow::Result<()> {
+        let registry: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = "repo:triumvirate".to_string();
+        let queue = acquire_project_queue(&registry, key.clone()).await;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let holder = tokio::spawn(async move {
+            let _guard = queue.lock().await;
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+        });
+
+        let _ = started_rx.await;
+
+        let registry_clone = registry.clone();
+        let waiter = tokio::spawn(async move {
+            let queue2 = acquire_project_queue(&registry_clone, key).await;
+            let _guard = queue2.lock().await;
+            "acquired"
+        });
+
+        let blocked = tokio::time::timeout(Duration::from_millis(75), waiter).await;
+        assert!(blocked.is_err(), "second request should be queued while first holds lock");
+
+        let _ = release_tx.send(());
+        holder.await?;
+
+        // Run a fresh waiter after releasing to confirm queue drains normally.
+        let queue3 = acquire_project_queue(&registry, "repo:triumvirate".to_string()).await;
+        let _guard = queue3.lock().await;
         Ok(())
     }
 
