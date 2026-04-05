@@ -17,10 +17,7 @@ use crate::fabric::MessageBus;
 ///
 /// Integration path: `claude -p --output-format stream-json`
 /// - Single-shot JSONL streaming (each invocation is one turn)
-/// - For multi-turn: `claude --resume <session_id> -p --output-format stream-json`
-/// - Session ID preserved across turns for context continuity
-///
-/// POC 2 will add PTY mode for full interactive sessions.
+/// - Session continuity is preserved via `--session-id`
 pub struct ClaudeConnector {
     #[allow(dead_code)]
     session_id: Option<String>,
@@ -61,31 +58,9 @@ impl AgentConnector for ClaudeConnector {
     async fn spawn(&mut self, bus: Arc<MessageBus>) -> anyhow::Result<()> {
         let session_id = Uuid::new_v4().to_string();
         self.session_id = Some(session_id.clone());
-
         let claude_bin = claude_cli_bin();
-        let mut child = Command::new(&claude_bin)
-            .arg("--input-format")
-            .arg("stream-json")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--session-id")
-            .arg(&session_id)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("claude stdin not piped"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("claude stdout not piped"))?;
-
-        let (input_tx, mut input_rx) = mpsc::channel::<String>(256);
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(64);
         self.input_tx = Some(input_tx.clone());
 
         let mut human_rx = bus.subscribe(&Topic::AgentInput(AgentId::Claude)).await;
@@ -97,110 +72,225 @@ impl AgentConnector for ClaudeConnector {
             }
         });
 
+        let worker_bus = bus.clone();
+        let worker_claude_bin = claude_bin.clone();
+        let worker_session_id = session_id.clone();
         tokio::spawn(async move {
-            let mut writer = stdin;
             while let Some(message) = input_rx.recv().await {
-                let payload = serde_json::json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": message
+                let mut child = match Command::new(&worker_claude_bin)
+                    .arg("-p")
+                    .arg("--output-format")
+                    .arg("stream-json")
+                    .arg("--bare")
+                    .arg("--dangerously-skip-permissions")
+                    .arg("--session-id")
+                    .arg(&worker_session_id)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(e) => {
+                        worker_bus
+                            .emit(FabricMessage::new(
+                                AgentId::System,
+                                Topic::SystemError,
+                                Payload::Error {
+                                    message: format!("failed to spawn claude process: {e}"),
+                                    source_agent: Some(AgentId::Claude),
+                                },
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+
+                let Some(mut stdin) = child.stdin.take() else {
+                    worker_bus
+                        .emit(FabricMessage::new(
+                            AgentId::System,
+                            Topic::SystemError,
+                            Payload::Error {
+                                message: "claude stdin not piped".to_string(),
+                                source_agent: Some(AgentId::Claude),
+                            },
+                        ))
+                        .await;
+                    continue;
+                };
+                let Some(stdout) = child.stdout.take() else {
+                    worker_bus
+                        .emit(FabricMessage::new(
+                            AgentId::System,
+                            Topic::SystemError,
+                            Payload::Error {
+                                message: "claude stdout not piped".to_string(),
+                                source_agent: Some(AgentId::Claude),
+                            },
+                        ))
+                        .await;
+                    continue;
+                };
+                let Some(stderr) = child.stderr.take() else {
+                    worker_bus
+                        .emit(FabricMessage::new(
+                            AgentId::System,
+                            Topic::SystemError,
+                            Payload::Error {
+                                message: "claude stderr not piped".to_string(),
+                                source_agent: Some(AgentId::Claude),
+                            },
+                        ))
+                        .await;
+                    continue;
+                };
+
+                let prompt = format!("{message}\n");
+                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                    worker_bus
+                        .emit(FabricMessage::new(
+                            AgentId::System,
+                            Topic::SystemError,
+                            Payload::Error {
+                                message: format!("failed writing claude stdin: {e}"),
+                                source_agent: Some(AgentId::Claude),
+                            },
+                        ))
+                        .await;
+                    continue;
+                }
+                let _ = stdin.flush().await;
+                drop(stdin);
+
+                let stderr_bus = worker_bus.clone();
+                tokio::spawn(async move {
+                    let mut stderr_lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = stderr_lines.next_line().await {
+                        warn!(agent = "claude", stderr = %line, "claude stderr");
+                        stderr_bus
+                            .emit(FabricMessage::new(
+                                AgentId::System,
+                                Topic::SystemError,
+                                Payload::Error {
+                                    message: format!("claude stderr: {line}"),
+                                    source_agent: Some(AgentId::Claude),
+                                },
+                            ))
+                            .await;
+                    }
                 });
-                let line = format!("{payload}\n");
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-                if writer.flush().await.is_err() {
-                    break;
-                }
-            }
-        });
 
-        let reader_bus = bus.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => match parse_claude_event(&line) {
-                        Ok(Some(event)) => {
-                            if let Some(text) = event.text_content() {
-                                let payload = if matches!(event.kind, ClaudeEventKind::Result) {
-                                    Payload::AgentResponse {
-                                        content: text,
-                                        tokens_used: None,
-                                    }
-                                } else {
-                                    Payload::TextChunk {
-                                        content: text,
-                                        is_final: false,
-                                    }
-                                };
-                                reader_bus
-                                    .emit(FabricMessage::new(
-                                        AgentId::Claude,
-                                        Topic::AgentOutput(AgentId::Claude),
-                                        payload,
-                                    ))
-                                    .await;
+                let mut lines = BufReader::new(stdout).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => match parse_claude_event(&line) {
+                            Ok(Some(event)) => {
+                                if let Some(text) = event.text_content() {
+                                    let payload = if matches!(event.kind, ClaudeEventKind::Result)
+                                    {
+                                        Payload::AgentResponse {
+                                            content: text,
+                                            tokens_used: None,
+                                        }
+                                    } else {
+                                        Payload::TextChunk {
+                                            content: text,
+                                            is_final: false,
+                                        }
+                                    };
+                                    worker_bus
+                                        .emit(FabricMessage::new(
+                                            AgentId::Claude,
+                                            Topic::AgentOutput(AgentId::Claude),
+                                            payload,
+                                        ))
+                                        .await;
+                                }
+
+                                if matches!(event.kind, ClaudeEventKind::Error) {
+                                    let message = event
+                                        .error_message()
+                                        .unwrap_or_else(|| "claude stream error".to_string());
+                                    worker_bus
+                                        .emit(FabricMessage::new(
+                                            AgentId::System,
+                                            Topic::SystemError,
+                                            Payload::Error {
+                                                message,
+                                                source_agent: Some(AgentId::Claude),
+                                            },
+                                        ))
+                                        .await;
+                                }
                             }
-
-                            if matches!(event.kind, ClaudeEventKind::Error) {
-                                let message = event
-                                    .error_message()
-                                    .unwrap_or_else(|| "claude stream error".to_string());
-                                reader_bus
+                            Ok(None) => {}
+                            Err(e) => {
+                                worker_bus
                                     .emit(FabricMessage::new(
                                         AgentId::System,
                                         Topic::SystemError,
                                         Payload::Error {
-                                            message,
+                                            message: format!("failed to parse claude jsonl: {e}"),
                                             source_agent: Some(AgentId::Claude),
                                         },
                                     ))
                                     .await;
                             }
-                        }
-                        Ok(None) => {}
+                        },
+                        Ok(None) => break,
                         Err(e) => {
-                            reader_bus
+                            worker_bus
                                 .emit(FabricMessage::new(
                                     AgentId::System,
                                     Topic::SystemError,
                                     Payload::Error {
-                                        message: format!("failed to parse claude jsonl: {e}"),
+                                        message: format!("error reading claude stdout: {e}"),
+                                        source_agent: Some(AgentId::Claude),
+                                    },
+                                ))
+                                .await;
+                            break;
+                        }
+                    }
+                }
+
+                match child.wait().await {
+                    Ok(status) => {
+                        if !status.success() {
+                            worker_bus
+                                .emit(FabricMessage::new(
+                                    AgentId::System,
+                                    Topic::SystemError,
+                                    Payload::Error {
+                                        message: format!(
+                                            "claude process exited with status: {}",
+                                            status
+                                        ),
                                         source_agent: Some(AgentId::Claude),
                                     },
                                 ))
                                 .await;
                         }
-                    },
-                    Ok(None) => break,
+                    }
                     Err(e) => {
-                        reader_bus
+                        worker_bus
                             .emit(FabricMessage::new(
                                 AgentId::System,
                                 Topic::SystemError,
                                 Payload::Error {
-                                    message: format!("error reading claude stdout: {e}"),
+                                    message: format!("claude process wait failed: {e}"),
                                     source_agent: Some(AgentId::Claude),
                                 },
                             ))
                             .await;
-                        break;
                     }
                 }
             }
         });
 
-        let monitor_tx = self.health_tx.clone();
-        tokio::spawn(async move {
-            let status = child.wait().await;
-            let _ = monitor_tx.send(HealthStatus::Dead);
-            if let Err(e) = status {
-                warn!(agent = "claude", error = %e, "claude process wait failed");
-            }
-        });
-
-        info!(agent = "claude", session = %session_id, cli = %claude_bin, "spawned persistent stream-json session");
+        info!(agent = "claude", session = %session_id, cli = %claude_bin, "ready for per-turn claude invocations");
         self.set_health(HealthStatus::Ready);
         bus.emit(FabricMessage::new(
             AgentId::System,

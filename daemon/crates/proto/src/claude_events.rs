@@ -55,7 +55,7 @@ pub fn parse_claude_event(line: &str) -> serde_json::Result<Option<ClaudeEvent>>
 
     let kind = if event_name.contains("init") {
         ClaudeEventKind::Init
-    } else if event_name.contains("message") {
+    } else if event_name.contains("message") || event_name.contains("assistant") {
         ClaudeEventKind::Message
     } else if event_name.contains("tool_use") || event_name.contains("tool-use") || event_name.contains("tool") {
         ClaudeEventKind::ToolUse
@@ -74,6 +74,11 @@ fn extract_text(value: &Value) -> Option<String> {
     if let Some(content) = value.get("content").and_then(Value::as_str) {
         return Some(content.to_string());
     }
+    if let Some(content_blocks) = value.get("content").and_then(Value::as_array)
+        && let Some(text) = extract_text_block_array(content_blocks)
+    {
+        return Some(text);
+    }
     if let Some(text) = value.get("text").and_then(Value::as_str) {
         return Some(text.to_string());
     }
@@ -81,6 +86,11 @@ fn extract_text(value: &Value) -> Option<String> {
     if let Some(message) = value.get("message") {
         if let Some(content) = message.get("content").and_then(Value::as_str) {
             return Some(content.to_string());
+        }
+        if let Some(content_blocks) = message.get("content").and_then(Value::as_array)
+            && let Some(text) = extract_text_block_array(content_blocks)
+        {
+            return Some(text);
         }
         if let Some(text) = message.get("text").and_then(Value::as_str) {
             return Some(text.to_string());
@@ -94,6 +104,9 @@ fn extract_text(value: &Value) -> Option<String> {
     }
 
     if let Some(result) = value.get("result") {
+        if let Some(text) = result.as_str() {
+            return Some(text.to_string());
+        }
         if let Some(content) = result.get("content").and_then(Value::as_str) {
             return Some(content.to_string());
         }
@@ -102,6 +115,19 @@ fn extract_text(value: &Value) -> Option<String> {
         }
     }
 
+    None
+}
+
+fn extract_text_block_array(content_blocks: &[Value]) -> Option<String> {
+    for block in content_blocks {
+        let is_text_block = block.get("type").and_then(Value::as_str) == Some("text");
+        if !is_text_block {
+            continue;
+        }
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            return Some(text.to_string());
+        }
+    }
     None
 }
 
@@ -120,6 +146,22 @@ mod tests {
     #[test]
     fn parses_result_event_and_nested_text() {
         let line = r#"{"type":"result","result":{"text":"done"}}"#;
+        let parsed = parse_claude_event(line).expect("valid json").expect("non-empty");
+        assert!(matches!(parsed.kind, ClaudeEventKind::Result));
+        assert_eq!(parsed.text_content().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parses_assistant_event_with_content_blocks() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello from assistant"}]}}"#;
+        let parsed = parse_claude_event(line).expect("valid json").expect("non-empty");
+        assert!(matches!(parsed.kind, ClaudeEventKind::Message));
+        assert_eq!(parsed.text_content().as_deref(), Some("hello from assistant"));
+    }
+
+    #[test]
+    fn parses_result_event_with_plain_string() {
+        let line = r#"{"type":"result","result":"done"}"#;
         let parsed = parse_claude_event(line).expect("valid json").expect("non-empty");
         assert!(matches!(parsed.kind, ClaudeEventKind::Result));
         assert_eq!(parsed.text_content().as_deref(), Some("done"));
