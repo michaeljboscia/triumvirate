@@ -46,6 +46,10 @@ impl CodexConnector {
     }
 }
 
+fn codex_cli_bin() -> String {
+    std::env::var("TRIUMVIRATE_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
+}
+
 #[async_trait::async_trait]
 impl AgentConnector for CodexConnector {
     fn agent_id(&self) -> AgentId {
@@ -56,8 +60,7 @@ impl AgentConnector for CodexConnector {
         let session_id = Uuid::new_v4().to_string();
         self.session_id = Some(session_id.clone());
 
-        let codex_bin = std::env::var("TRIUMVIRATE_CODEX_BIN")
-            .unwrap_or_else(|_| "codex".to_string());
+        let codex_bin = codex_cli_bin();
         let mut child = Command::new(&codex_bin)
             .arg("mcp-server")
             .stdin(std::process::Stdio::piped())
@@ -228,5 +231,26 @@ impl AgentConnector for CodexConnector {
 
     fn health_watch(&self) -> watch::Receiver<HealthStatus> {
         self.health_rx.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::codex_cli_bin;
+
+    #[test]
+    fn defaults_codex_bin() {
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_BIN") };
+        assert_eq!(codex_cli_bin(), "codex");
+    }
+
+    #[test]
+    fn honors_codex_bin_override() {
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::set_var("TRIUMVIRATE_CODEX_BIN", "/tmp/mock-codex") };
+        assert_eq!(codex_cli_bin(), "/tmp/mock-codex");
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_BIN") };
     }
 }
