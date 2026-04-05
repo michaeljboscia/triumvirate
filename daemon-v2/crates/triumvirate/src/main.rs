@@ -34,6 +34,7 @@ use shared_types::{
     MemoryWriteRequest, MemoryWriteResponse, OutboxEvent, OutboxRecentRequest,
     OutboxRecentResponse, ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
     ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse, DaemonStatusSnapshot,
+    SessionState,
 };
 use std::{
     collections::HashMap,
@@ -109,12 +110,6 @@ impl McpBridge {
             sessions_file,
         }
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct SessionState {
-    agent: String,
-    history: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]

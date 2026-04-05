@@ -179,6 +179,12 @@ pub struct StatusResponse {
     pub fallback_tickets: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionState {
+    pub agent: String,
+    pub history: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
