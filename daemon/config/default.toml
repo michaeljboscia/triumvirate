@@ -1,0 +1,10 @@
+# triumvirate-agentd default configuration
+# Copy to ~/.triumvirate/config.toml and customize.
+
+web_port = 8080
+# db_path defaults to ~/.triumvirate/memory.db
+
+[agents]
+claude_enabled = true
+gemini_enabled = true
+codex_enabled = true

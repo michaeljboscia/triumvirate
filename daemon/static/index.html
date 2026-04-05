@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Triumvirate — Agent Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+            background: #0a0a0f;
+            color: #e0e0e8;
+            min-height: 100vh;
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            border-bottom: 1px solid #1a1a2e;
+            background: #0d0d14;
+        }
+        .header h1 {
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            color: #a0a0b8;
+        }
+        .header h1 span { color: #7c6ef0; }
+        .status-badge {
+            font-size: 12px;
+            padding: 4px 12px;
+            border-radius: 12px;
+            background: #1a2e1a;
+            color: #4ade80;
+            border: 1px solid #2a4a2a;
+        }
+        .status-badge.degraded {
+            background: #2e2a1a;
+            color: #f0c040;
+            border-color: #4a4020;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            gap: 1px;
+            background: #1a1a2e;
+            height: calc(100vh - 53px - 200px);
+            min-height: 300px;
+        }
+
+        .agent-pane {
+            background: #0d0d14;
+            display: flex;
+            flex-direction: column;
+        }
+        .agent-pane .pane-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+            border-bottom: 1px solid #1a1a2e;
+            font-size: 13px;
+        }
+        .agent-pane .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4ade80;
+        }
+        .agent-pane .dot.idle { background: #606080; }
+        .agent-pane .dot.dead { background: #ef4444; }
+        .agent-pane .model-tag {
+            margin-left: auto;
+            font-size: 11px;
+            color: #606080;
+        }
+        .agent-pane .output {
+            flex: 1;
+            padding: 12px 16px;
+            overflow-y: auto;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #808098;
+        }
+
+        /* Claude gets a purple accent */
+        .pane-claude .pane-header { border-left: 3px solid #7c6ef0; }
+        /* Gemini gets blue */
+        .pane-gemini .pane-header { border-left: 3px solid #4ecdc4; }
+        /* Codex gets green */
+        .pane-codex .pane-header { border-left: 3px solid #50fa7b; }
+        /* Event log gets orange */
+        .pane-events .pane-header { border-left: 3px solid #f0a040; }
+
+        .input-area {
+            border-top: 1px solid #1a1a2e;
+            background: #0d0d14;
+            padding: 16px 24px;
+            height: 200px;
+            display: flex;
+            flex-direction: column;
+        }
+        .input-area .prompt-label {
+            font-size: 12px;
+            color: #606080;
+            margin-bottom: 8px;
+        }
+        .input-area textarea {
+            flex: 1;
+            background: #12121c;
+            border: 1px solid #1a1a2e;
+            border-radius: 8px;
+            color: #e0e0e8;
+            font-family: inherit;
+            font-size: 14px;
+            padding: 12px 16px;
+            resize: none;
+            outline: none;
+        }
+        .input-area textarea:focus {
+            border-color: #7c6ef0;
+        }
+        .input-area .actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+            align-items: center;
+        }
+        .input-area .actions button {
+            padding: 6px 16px;
+            border-radius: 6px;
+            border: 1px solid #2a2a40;
+            background: #1a1a2e;
+            color: #a0a0b8;
+            font-family: inherit;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .input-area .actions button:hover { background: #2a2a40; }
+        .input-area .actions button.primary {
+            background: #7c6ef0;
+            border-color: #7c6ef0;
+            color: #fff;
+        }
+        .input-area .actions button.primary:hover { background: #6b5ce0; }
+        .input-area .actions .hint {
+            margin-left: auto;
+            font-size: 11px;
+            color: #404060;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span>TRIUMVIRATE</span> — Agent Dashboard</h1>
+        <div class="status-badge" id="system-status">SYSTEM OK</div>
+    </div>
+
+    <div class="grid">
+        <div class="agent-pane pane-claude">
+            <div class="pane-header">
+                <div class="dot" id="claude-dot"></div>
+                <strong>Claude</strong>
+                <span class="model-tag">Opus 4.6</span>
+            </div>
+            <div class="output" id="claude-output">
+                <div style="color:#404060; font-style:italic;">Waiting for input...</div>
+            </div>
+        </div>
+
+        <div class="agent-pane pane-gemini">
+            <div class="pane-header">
+                <div class="dot" id="gemini-dot"></div>
+                <strong>Gemini</strong>
+                <span class="model-tag">Pro 2M</span>
+            </div>
+            <div class="output" id="gemini-output">
+                <div style="color:#404060; font-style:italic;">Waiting for input...</div>
+            </div>
+        </div>
+
+        <div class="agent-pane pane-codex">
+            <div class="pane-header">
+                <div class="dot" id="codex-dot"></div>
+                <strong>Codex</strong>
+                <span class="model-tag">GPT-5.2</span>
+            </div>
+            <div class="output" id="codex-output">
+                <div style="color:#404060; font-style:italic;">Waiting for input...</div>
+            </div>
+        </div>
+
+        <div class="agent-pane pane-events">
+            <div class="pane-header">
+                <div class="dot idle"></div>
+                <strong>Event Log</strong>
+                <span class="model-tag">fabric stream</span>
+            </div>
+            <div class="output" id="event-output">
+                <div style="color:#404060; font-style:italic;">No events yet</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="input-area">
+        <div class="prompt-label">Message all agents — prefix with @claude, @gemini, or @codex to direct</div>
+        <textarea id="user-input" placeholder="How should we handle auth?" autofocus></textarea>
+        <div class="actions">
+            <button class="primary" id="send-btn">Send</button>
+            <button id="debate-btn">/debate</button>
+            <button id="interrupt-btn">ESC Interrupt</button>
+            <span class="hint">Ctrl+Enter to send &middot; ESC to interrupt</span>
+        </div>
+    </div>
+
+    <script>
+        // POC 1: Fetch health on load, wire up basic UI interactions.
+        // POC 2: WebSocket connection to fabric for real-time streaming.
+
+        async function checkHealth() {
+            try {
+                const res = await fetch('/api/health');
+                const data = await res.json();
+                const badge = document.getElementById('system-status');
+
+                if (data.status === 'ok') {
+                    badge.textContent = 'SYSTEM OK';
+                    badge.className = 'status-badge';
+                } else {
+                    badge.textContent = 'DEGRADED';
+                    badge.className = 'status-badge degraded';
+                }
+
+                for (const [agent, status] of Object.entries(data.agents)) {
+                    const dot = document.getElementById(`${agent}-dot`);
+                    if (dot) {
+                        dot.className = status === 'ready' ? 'dot' : 'dot dead';
+                    }
+                }
+            } catch (e) {
+                document.getElementById('system-status').textContent = 'OFFLINE';
+                document.getElementById('system-status').className = 'status-badge degraded';
+            }
+        }
+
+        // Send message (POC 1: just logs to event pane)
+        function sendMessage() {
+            const input = document.getElementById('user-input');
+            const msg = input.value.trim();
+            if (!msg) return;
+
+            const events = document.getElementById('event-output');
+            if (events.querySelector('div[style]')) events.innerHTML = '';
+
+            const ts = new Date().toLocaleTimeString();
+            events.innerHTML += `<div><span style="color:#7c6ef0">[${ts}]</span> human: ${msg}</div>`;
+            input.value = '';
+            input.focus();
+
+            // POC 2: POST to /api/message → fabric → agents
+        }
+
+        document.getElementById('send-btn').addEventListener('click', sendMessage);
+        document.getElementById('user-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                sendMessage();
+            }
+        });
+
+        checkHealth();
+        setInterval(checkHealth, 5000);
+    </script>
+</body>
+</html>
