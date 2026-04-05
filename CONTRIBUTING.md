@@ -70,4 +70,4 @@ If you borrow a pattern from an external project, add:
 
 ## License
 
-MIT. By contributing, you agree your contributions are licensed under MIT.
+[FSL-1.1-ALv2](LICENSE) (Functional Source License 1.1, Apache 2.0 Future License). By contributing, you agree your contributions are licensed under the same terms.
