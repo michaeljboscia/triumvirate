@@ -3,7 +3,7 @@ use axum::{
     Json as AxumJson, Router,
     extract::State,
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
-    routing::get,
+    routing::{get, post},
 };
 use rmcp::{
     Json, ServerHandler, ServiceExt,
@@ -84,7 +84,7 @@ struct SessionState {
     history: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AskAgentRequest {
     agent: String,
     message: String,
@@ -93,20 +93,20 @@ struct AskAgentRequest {
     branch: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct LifecycleEvent {
     state: String,
     detail: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AskAgentResponse {
     agent: String,
     response: String,
     lifecycle: Vec<LifecycleEvent>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AskTwinsRequest {
     message: String,
     cwd: Option<String>,
@@ -114,14 +114,14 @@ struct AskTwinsRequest {
     branch: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AgentResult {
     agent: String,
     response: String,
     prompt_sent: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AskTwinsResponse {
     results: Vec<AgentResult>,
     failures: Vec<LifecycleEvent>,
@@ -186,91 +186,14 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskAgentRequest>,
     ) -> Result<Json<AskAgentResponse>, String> {
-        let agent = req.agent.to_lowercase();
-        if agent != "gemini" && agent != "codex" {
-            return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
+        if use_daemon_for_mcp() {
+            return fetch_daemon_ask_agent(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("ask_agent via daemon failed: {e}"));
         }
 
-        // Increment 1b emits lifecycle states in-band so Claude can render user-visible progress
-        // before we wire native MCP progress notifications in a later increment.
-        let mut lifecycle = vec![LifecycleEvent {
-            state: "SPAWNED".to_string(),
-            detail: format!(
-                "Started {} connector{}{}{}",
-                agent,
-                req.cwd
-                    .as_ref()
-                    .map(|v| format!(" cwd={v}"))
-                    .unwrap_or_default(),
-                req.repo
-                    .as_ref()
-                    .map(|v| format!(" repo={v}"))
-                    .unwrap_or_default(),
-                req.branch
-                    .as_ref()
-                    .map(|v| format!(" branch={v}"))
-                    .unwrap_or_default()
-            ),
-        }];
-
-        lifecycle.push(LifecycleEvent {
-            state: "WORKING".to_string(),
-            detail: format!("{agent} is processing request"),
-        });
-
-        let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
-        let mut last_err: Option<String> = None;
-
-        for (idx, backoff) in backoffs.iter().enumerate() {
-            match run_named_agent(&agent, &req.message).await {
-                Ok(response) => {
-                    lifecycle.push(LifecycleEvent {
-                        state: "DONE".to_string(),
-                        detail: format!("{agent} responded on attempt {}", idx + 1),
-                    });
-                    return Ok(Json(AskAgentResponse {
-                        agent: agent.clone(),
-                        response,
-                        lifecycle,
-                    }));
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("timed out") {
-                        lifecycle.push(LifecycleEvent {
-                            state: "TIMEOUT".to_string(),
-                            detail: format!("{agent} timed out on attempt {}", idx + 1),
-                        });
-                    }
-                    lifecycle.push(LifecycleEvent {
-                        state: "RETRY".to_string(),
-                        detail: format!(
-                            "Retrying {} ({}/{}) after {}",
-                            agent,
-                            idx + 1,
-                            backoffs.len(),
-                            msg
-                        ),
-                    });
-                    last_err = Some(msg);
-                    sleep(*backoff).await;
-                }
-            }
-        }
-
-        lifecycle.push(LifecycleEvent {
-            state: "FAILED".to_string(),
-            detail: format!(
-                "{} failed after {} attempts",
-                agent,
-                backoffs.len()
-            ),
-        });
-        Err(format!(
-            "ask_agent failed after lifecycle {:?}: {}",
-            lifecycle.iter().map(|e| e.state.as_str()).collect::<Vec<_>>(),
-            last_err.unwrap_or_else(|| "unknown error".to_string())
-        ))
+        execute_ask_agent(&req).await.map(Json)
     }
 
     #[tool(description = "Fan out a request to Gemini and Codex in parallel with role-adapted prompts.")]
@@ -278,103 +201,14 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskTwinsRequest>,
     ) -> Result<Json<AskTwinsResponse>, String> {
-        let gemini_prompt = format!(
-            "[Gemini role: research/analysis]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-            req.message, req.cwd, req.repo, req.branch
-        );
-        let codex_prompt = format!(
-            "[Codex role: implementation/testing]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-            req.message, req.cwd, req.repo, req.branch
-        );
-
-        let mut lifecycle = vec![
-            LifecycleEvent {
-                state: "SPAWNED".to_string(),
-                detail: "Gemini request sent".to_string(),
-            },
-            LifecycleEvent {
-                state: "SPAWNED".to_string(),
-                detail: "Codex request sent".to_string(),
-            },
-            LifecycleEvent {
-                state: "WORKING".to_string(),
-                detail: "Gemini and Codex processing in parallel".to_string(),
-            },
-        ];
-
-        let gemini_fut = run_named_agent("gemini", &gemini_prompt);
-        let codex_fut = run_named_agent("codex", &codex_prompt);
-        let (gemini_out, codex_out) = tokio::join!(gemini_fut, codex_fut);
-
-        let mut results = Vec::new();
-        let mut failures = Vec::new();
-
-        match gemini_out {
-            Ok(response) => {
-                lifecycle.push(LifecycleEvent {
-                    state: "DONE".to_string(),
-                    detail: "Gemini responded".to_string(),
-                });
-                results.push(AgentResult {
-                    agent: "gemini".to_string(),
-                    response,
-                    prompt_sent: gemini_prompt,
-                });
-            }
-            Err(e) => {
-                let detail = format!("Gemini failed: {e}");
-                lifecycle.push(LifecycleEvent {
-                    state: "FAILED".to_string(),
-                    detail: detail.clone(),
-                });
-                failures.push(LifecycleEvent {
-                    state: "FAILED".to_string(),
-                    detail,
-                });
-            }
+        if use_daemon_for_mcp() {
+            return fetch_daemon_ask_twins(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("ask_twins via daemon failed: {e}"));
         }
 
-        match codex_out {
-            Ok(response) => {
-                lifecycle.push(LifecycleEvent {
-                    state: "DONE".to_string(),
-                    detail: "Codex responded".to_string(),
-                });
-                results.push(AgentResult {
-                    agent: "codex".to_string(),
-                    response,
-                    prompt_sent: codex_prompt,
-                });
-            }
-            Err(e) => {
-                let detail = format!("Codex failed: {e}");
-                lifecycle.push(LifecycleEvent {
-                    state: "FAILED".to_string(),
-                    detail: detail.clone(),
-                });
-                failures.push(LifecycleEvent {
-                    state: "FAILED".to_string(),
-                    detail,
-                });
-            }
-        }
-
-        if results.is_empty() {
-            return Err(format!(
-                "ask_twins failed for both agents: {}",
-                failures
-                    .iter()
-                    .map(|f| f.detail.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            ));
-        }
-
-        Ok(Json(AskTwinsResponse {
-            results,
-            failures,
-            lifecycle,
-        }))
+        execute_ask_twins(&req).await.map(Json)
     }
 
     #[tool(description = "Create a persistent named session for an agent.")]
@@ -500,6 +334,199 @@ fn codex_command() -> (String, Vec<String>) {
         .map(|v| v.split_whitespace().map(ToString::to_string).collect())
         .unwrap_or_else(|_| Vec::new());
     (bin, args)
+}
+
+fn use_daemon_for_mcp() -> bool {
+    std::env::var("TRIUMVIRATE_MCP_USE_DAEMON")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, String> {
+    let agent = req.agent.to_lowercase();
+    if agent != "gemini" && agent != "codex" {
+        return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
+    }
+
+    // Emit lifecycle states in-band so clients can render progress before native MCP progress
+    // notifications are wired in a later increment.
+    let mut lifecycle = vec![LifecycleEvent {
+        state: "SPAWNED".to_string(),
+        detail: format!(
+            "Started {} connector{}{}{}",
+            agent,
+            req.cwd
+                .as_ref()
+                .map(|v| format!(" cwd={v}"))
+                .unwrap_or_default(),
+            req.repo
+                .as_ref()
+                .map(|v| format!(" repo={v}"))
+                .unwrap_or_default(),
+            req.branch
+                .as_ref()
+                .map(|v| format!(" branch={v}"))
+                .unwrap_or_default()
+        ),
+    }];
+
+    lifecycle.push(LifecycleEvent {
+        state: "WORKING".to_string(),
+        detail: format!("{agent} is processing request"),
+    });
+
+    let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
+    let mut last_err: Option<String> = None;
+
+    for (idx, backoff) in backoffs.iter().enumerate() {
+        match run_named_agent(&agent, &req.message).await {
+            Ok(response) => {
+                lifecycle.push(LifecycleEvent {
+                    state: "DONE".to_string(),
+                    detail: format!("{agent} responded on attempt {}", idx + 1),
+                });
+                return Ok(AskAgentResponse {
+                    agent: agent.clone(),
+                    response,
+                    lifecycle,
+                });
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("timed out") {
+                    lifecycle.push(LifecycleEvent {
+                        state: "TIMEOUT".to_string(),
+                        detail: format!("{agent} timed out on attempt {}", idx + 1),
+                    });
+                }
+                lifecycle.push(LifecycleEvent {
+                    state: "RETRY".to_string(),
+                    detail: format!(
+                        "Retrying {} ({}/{}) after {}",
+                        agent,
+                        idx + 1,
+                        backoffs.len(),
+                        msg
+                    ),
+                });
+                last_err = Some(msg);
+                sleep(*backoff).await;
+            }
+        }
+    }
+
+    lifecycle.push(LifecycleEvent {
+        state: "FAILED".to_string(),
+        detail: format!("{} failed after {} attempts", agent, backoffs.len()),
+    });
+    Err(format!(
+        "ask_agent failed after lifecycle {:?}: {}",
+        lifecycle
+            .iter()
+            .map(|e| e.state.as_str())
+            .collect::<Vec<_>>(),
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, String> {
+    let gemini_prompt = format!(
+        "[Gemini role: research/analysis]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
+        req.message, req.cwd, req.repo, req.branch
+    );
+    let codex_prompt = format!(
+        "[Codex role: implementation/testing]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
+        req.message, req.cwd, req.repo, req.branch
+    );
+
+    let mut lifecycle = vec![
+        LifecycleEvent {
+            state: "SPAWNED".to_string(),
+            detail: "Gemini request sent".to_string(),
+        },
+        LifecycleEvent {
+            state: "SPAWNED".to_string(),
+            detail: "Codex request sent".to_string(),
+        },
+        LifecycleEvent {
+            state: "WORKING".to_string(),
+            detail: "Gemini and Codex processing in parallel".to_string(),
+        },
+    ];
+
+    let gemini_fut = run_named_agent("gemini", &gemini_prompt);
+    let codex_fut = run_named_agent("codex", &codex_prompt);
+    let (gemini_out, codex_out) = tokio::join!(gemini_fut, codex_fut);
+
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+
+    match gemini_out {
+        Ok(response) => {
+            lifecycle.push(LifecycleEvent {
+                state: "DONE".to_string(),
+                detail: "Gemini responded".to_string(),
+            });
+            results.push(AgentResult {
+                agent: "gemini".to_string(),
+                response,
+                prompt_sent: gemini_prompt,
+            });
+        }
+        Err(e) => {
+            let detail = format!("Gemini failed: {e}");
+            lifecycle.push(LifecycleEvent {
+                state: "FAILED".to_string(),
+                detail: detail.clone(),
+            });
+            failures.push(LifecycleEvent {
+                state: "FAILED".to_string(),
+                detail,
+            });
+        }
+    }
+
+    match codex_out {
+        Ok(response) => {
+            lifecycle.push(LifecycleEvent {
+                state: "DONE".to_string(),
+                detail: "Codex responded".to_string(),
+            });
+            results.push(AgentResult {
+                agent: "codex".to_string(),
+                response,
+                prompt_sent: codex_prompt,
+            });
+        }
+        Err(e) => {
+            let detail = format!("Codex failed: {e}");
+            lifecycle.push(LifecycleEvent {
+                state: "FAILED".to_string(),
+                detail: detail.clone(),
+            });
+            failures.push(LifecycleEvent {
+                state: "FAILED".to_string(),
+                detail,
+            });
+        }
+    }
+
+    if results.is_empty() {
+        return Err(format!(
+            "ask_twins failed for both agents: {}",
+            failures
+                .iter()
+                .map(|f| f.detail.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+
+    Ok(AskTwinsResponse {
+        results,
+        failures,
+        lifecycle,
+    })
 }
 
 async fn run_named_agent(agent: &str, message: &str) -> anyhow::Result<String> {
@@ -635,11 +662,51 @@ async fn run_daemon() -> anyhow::Result<()> {
         })))
     }
 
+    async fn ask_agent_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<AskAgentRequest>,
+    ) -> Result<AxumJson<AskAgentResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        execute_ask_agent(&req).await.map(AxumJson).map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                AxumJson(serde_json::json!({ "error": e })),
+            )
+        })
+    }
+
+    async fn ask_twins_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<AskTwinsRequest>,
+    ) -> Result<AxumJson<AskTwinsResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        execute_ask_twins(&req).await.map(AxumJson).map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                AxumJson(serde_json::json!({ "error": e })),
+            )
+        })
+    }
+
     let token = ensure_daemon_token()?;
     let state = DaemonState { token };
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/ask-agent", post(ask_agent_route))
+        .route("/ask-twins", post(ask_twins_route))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     axum::serve(listener, app).await?;
@@ -719,7 +786,7 @@ fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
 
 fn daemon_status_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080/status".to_string())
+        .unwrap_or_else(|_| format!("{}/status", daemon_base_url()))
 }
 
 async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
@@ -734,6 +801,43 @@ async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
 
     let json = response.json::<DaemonHealthResponse>().await?;
     Ok(json)
+}
+
+fn daemon_base_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+
+fn daemon_ask_agent_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL")
+        .unwrap_or_else(|_| format!("{}/ask-agent", daemon_base_url()))
+}
+
+fn daemon_ask_twins_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_ASK_TWINS_URL")
+        .unwrap_or_else(|_| format!("{}/ask-twins", daemon_base_url()))
+}
+
+async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
+    let token = ensure_daemon_token()?;
+    let url = daemon_ask_agent_url();
+    let client = reqwest::Client::new();
+    let response = client.post(url).bearer_auth(token).json(req).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("daemon responded with HTTP {}", response.status());
+    }
+    Ok(response.json::<AskAgentResponse>().await?)
+}
+
+async fn fetch_daemon_ask_twins(req: &AskTwinsRequest) -> anyhow::Result<AskTwinsResponse> {
+    let token = ensure_daemon_token()?;
+    let url = daemon_ask_twins_url();
+    let client = reqwest::Client::new();
+    let response = client.post(url).bearer_auth(token).json(req).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("daemon responded with HTTP {}", response.status());
+    }
+    Ok(response.json::<AskTwinsResponse>().await?)
 }
 
 #[cfg(test)]
@@ -1399,6 +1503,260 @@ exit 1\n",
         unsafe {
             std::env::remove_var("TRIUMVIRATE_HOME");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_ask_agent_uses_bearer_token() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-ask-agent-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "agent-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn ask_agent_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(req): AxumJson<AskAgentRequest>,
+        ) -> Result<AxumJson<AskAgentResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(AskAgentResponse {
+                agent: req.agent,
+                response: format!("daemon echo: {}", req.message),
+                lifecycle: vec![LifecycleEvent {
+                    state: "DONE".to_string(),
+                    detail: "served by daemon".to_string(),
+                }],
+            }))
+        }
+
+        let app = Router::new()
+            .route("/ask-agent", post(ask_agent_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_ASK_AGENT_URL",
+                format!("http://{addr}/ask-agent"),
+            );
+        }
+
+        let out = fetch_daemon_ask_agent(&AskAgentRequest {
+            agent: "gemini".to_string(),
+            message: "run from daemon".to_string(),
+            cwd: None,
+            repo: None,
+            branch: None,
+        })
+        .await?;
+        assert_eq!(out.agent, "gemini");
+        assert_eq!(out.response, "daemon echo: run from daemon");
+        assert_eq!(out.lifecycle.first().map(|e| e.state.as_str()), Some("DONE"));
+
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_daemon_ask_twins_uses_bearer_token() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-ask-twins-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "twins-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn ask_twins_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(_req): AxumJson<AskTwinsRequest>,
+        ) -> Result<AxumJson<AskTwinsResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(AskTwinsResponse {
+                results: vec![AgentResult {
+                    agent: "gemini".to_string(),
+                    response: "daemon twins result".to_string(),
+                    prompt_sent: "prompt".to_string(),
+                }],
+                failures: vec![],
+                lifecycle: vec![LifecycleEvent {
+                    state: "DONE".to_string(),
+                    detail: "served by daemon".to_string(),
+                }],
+            }))
+        }
+
+        let app = Router::new()
+            .route("/ask-twins", post(ask_twins_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_ASK_TWINS_URL",
+                format!("http://{addr}/ask-twins"),
+            );
+        }
+
+        let out = fetch_daemon_ask_twins(&AskTwinsRequest {
+            message: "fan out".to_string(),
+            cwd: None,
+            repo: None,
+            branch: None,
+        })
+        .await?;
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].response, "daemon twins result");
+        assert_eq!(out.lifecycle.first().map(|e| e.state.as_str()), Some("DONE"));
+
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_TWINS_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_ask_agent_uses_daemon_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-mcp-daemon-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "mcp-daemon-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn ask_agent_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(req): AxumJson<AskAgentRequest>,
+        ) -> Result<AxumJson<AskAgentResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(AskAgentResponse {
+                agent: req.agent,
+                response: "daemon path used".to_string(),
+                lifecycle: vec![LifecycleEvent {
+                    state: "DONE".to_string(),
+                    detail: "daemon served".to_string(),
+                }],
+            }))
+        }
+
+        let app = Router::new()
+            .route("/ask-agent", post(ask_agent_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_ASK_AGENT_URL",
+                format!("http://{addr}/ask-agent"),
+            );
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "agent": "gemini",
+            "message": "should proxy"
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_agent")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(raw_text.contains("daemon path used"));
+        assert!(raw_text.contains("daemon served"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
         }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
