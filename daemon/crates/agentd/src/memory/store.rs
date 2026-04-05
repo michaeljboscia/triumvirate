@@ -100,11 +100,24 @@ impl MemoryStore {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS fleet_worktrees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fleet_id TEXT NOT NULL,
+                member_key TEXT NOT NULL,
+                agent_type TEXT NOT NULL,
+                branch_name TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('active', 'tearing_down', 'removed', 'failed')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
             CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
             CREATE INDEX IF NOT EXISTS idx_routing_log_session ON routing_log(session_id);
             CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id);
-            CREATE INDEX IF NOT EXISTS idx_fleet_tasks_fleet ON fleet_tasks(fleet_id);",
+            CREATE INDEX IF NOT EXISTS idx_fleet_tasks_fleet ON fleet_tasks(fleet_id);
+            CREATE INDEX IF NOT EXISTS idx_fleet_worktrees_fleet ON fleet_worktrees(fleet_id);",
         )?;
 
         info!(path = %path.display(), "memory store opened");

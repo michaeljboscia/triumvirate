@@ -17,6 +17,7 @@ use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
 use crate::agent::SharedHealthRegistry;
 use crate::fabric::MessageBus;
+use crate::fleet::worktree::{parse_fleet_members, provision_worktree, remove_worktree};
 use crate::quota::SharedQuotaRegistry;
 use crate::routing::{RoutingDecision, decide_route};
 use crate::shutdown::wait_for_shutdown_signal;
@@ -67,7 +68,9 @@ pub async fn start_web_server(
         .route("/api/workflows", get(workflows_handler))
         .route("/api/decisions", get(decisions_handler))
         .route("/api/fleet/tasks", get(fleet_tasks_handler))
+        .route("/api/fleet/worktrees", get(fleet_worktrees_handler))
         .route("/api/fleet/spawn", post(fleet_spawn_handler))
+        .route("/api/fleet/worktrees/teardown", post(fleet_teardown_handler))
         .route("/api/fleet/tasks/claim", post(fleet_claim_handler))
         .route("/api/fleet/tasks/complete", post(fleet_complete_handler))
         .route("/api/message", post(message_handler))
@@ -253,6 +256,44 @@ async fn fleet_spawn_handler(
 
     match Connection::open(&state.memory_db_path) {
         Ok(conn) => {
+            let members = parse_fleet_members(spec);
+            let mut created = Vec::new();
+            for member in &members {
+                match provision_worktree(&fleet_id, member, "HEAD") {
+                    Ok(worktree) => {
+                        if let Err(e) = conn.execute(
+                            "INSERT INTO fleet_worktrees (fleet_id, member_key, agent_type, branch_name, worktree_path, status)
+                             VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+                            rusqlite::params![
+                                fleet_id,
+                                worktree.member_key,
+                                worktree.agent_type,
+                                worktree.branch_name,
+                                worktree.worktree_path.display().to_string()
+                            ],
+                        ) {
+                            let _ = remove_worktree(&worktree.worktree_path.display().to_string());
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({ "error": format!("failed to persist worktree: {e}") })),
+                            )
+                                .into_response();
+                        }
+                        created.push(worktree);
+                    }
+                    Err(e) => {
+                        for existing in created {
+                            let _ = remove_worktree(&existing.worktree_path.display().to_string());
+                        }
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": format!("failed to provision worktree: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
             let tasks = [
                 ("contracts", "Define contracts", "pending", Option::<&str>::None),
                 ("implementation", "Parallel implementation", "blocked", Some("contracts")),
@@ -290,6 +331,7 @@ async fn fleet_spawn_handler(
                     "accepted": true,
                     "fleet_id": fleet_id,
                     "spec": spec,
+                    "members": members.into_iter().map(|m| m.member_key).collect::<Vec<_>>(),
                 })),
             )
                 .into_response()
@@ -300,6 +342,173 @@ async fn fleet_spawn_handler(
         )
             .into_response(),
     }
+}
+
+async fn fleet_worktrees_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match Connection::open(&state.memory_db_path) {
+        Ok(conn) => {
+            let mut stmt = match conn.prepare(
+                "SELECT fleet_id, member_key, agent_type, branch_name, worktree_path, status, created_at, updated_at
+                 FROM fleet_worktrees
+                 ORDER BY id DESC
+                 LIMIT 500",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("failed to prepare fleet_worktrees query: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let rows = match stmt.query_map([], |row| {
+                Ok(serde_json::json!({
+                    "fleet_id": row.get::<_, String>(0)?,
+                    "member_key": row.get::<_, String>(1)?,
+                    "agent_type": row.get::<_, String>(2)?,
+                    "branch_name": row.get::<_, String>(3)?,
+                    "worktree_path": row.get::<_, String>(4)?,
+                    "status": row.get::<_, String>(5)?,
+                    "created_at": row.get::<_, String>(6)?,
+                    "updated_at": row.get::<_, String>(7)?,
+                }))
+            }) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("failed to query fleet_worktrees: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let mut worktrees = Vec::new();
+            for row in rows {
+                match row {
+                    Ok(value) => worktrees.push(value),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": format!("failed to read fleet_worktrees row: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({ "worktrees": worktrees }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetTeardownRequest {
+    fleet_id: String,
+}
+
+async fn fleet_teardown_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FleetTeardownRequest>,
+) -> impl IntoResponse {
+    let fleet_id = req.fleet_id.trim();
+    if fleet_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "fleet_id is required" })),
+        )
+            .into_response();
+    }
+
+    let conn = match Connection::open(&state.memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT worktree_path FROM fleet_worktrees WHERE fleet_id = ?1 AND status = 'active'",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to query fleet_worktrees: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let paths = match stmt.query_map(rusqlite::params![fleet_id], |row| row.get::<_, String>(0)) {
+        Ok(rows) => {
+            let mut out = Vec::new();
+            for row in rows {
+                match row {
+                    Ok(path) => out.push(path),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": format!("failed to read worktree row: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            out
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to map worktree rows: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut removed = Vec::new();
+    for path in &paths {
+        if let Err(e) = remove_worktree(path) {
+            let _ = conn.execute(
+                "UPDATE fleet_worktrees
+                 SET status = 'failed', updated_at = datetime('now')
+                 WHERE fleet_id = ?1 AND worktree_path = ?2",
+                rusqlite::params![fleet_id, path],
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to remove worktree {path}: {e}") })),
+            )
+                .into_response();
+        }
+        let _ = conn.execute(
+            "UPDATE fleet_worktrees
+             SET status = 'removed', updated_at = datetime('now')
+             WHERE fleet_id = ?1 AND worktree_path = ?2",
+            rusqlite::params![fleet_id, path],
+        );
+        removed.push(path.clone());
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "fleet_id": fleet_id,
+            "removed_worktrees": removed,
+        })),
+    )
+        .into_response()
 }
 
 async fn fleet_tasks_handler(State(state): State<AppState>) -> impl IntoResponse {
