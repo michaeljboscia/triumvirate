@@ -13,7 +13,7 @@ mod web;
 use std::sync::Arc;
 
 use tracing::info;
-use triumvirate_workflow::WorkflowEngine;
+use triumvirate_workflow::{WorkflowEngine, inspect_recovery};
 use uuid::Uuid;
 
 use agent::{
@@ -85,6 +85,15 @@ async fn main() -> anyhow::Result<()> {
         .parent()
         .map(|p| p.join("workflow.db"))
         .unwrap_or_else(|| std::path::PathBuf::from("workflow.db"));
+    let recovery = inspect_recovery(&workflow_db_path)?;
+    if recovery.resumable_count() > 0 {
+        info!(
+            resumable = recovery.resumable_count(),
+            "workflow recovery found resumable executions"
+        );
+    } else {
+        info!("workflow recovery found no resumable executions");
+    }
     let workflow_engine = WorkflowEngine::open(&workflow_db_path)?;
     let boot_workflow_id = workflow_engine.start_workflow(triumvirate_workflow::WorkflowType::Conversation)?;
     workflow_engine.advance_step(
