@@ -150,7 +150,14 @@ fn resolve_connector_command(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use shared_types::{AskAgentRequest, AskTwinsRequest};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn default_name_is_stable() {
@@ -201,6 +208,7 @@ mod tests {
 
     #[test]
     fn daemon_proxy_env_reader_respects_truthy_and_falsey() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
         // SAFETY: test controls env var lifecycle in-process.
         unsafe { std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON") };
         assert!(!super::use_daemon_for_mcp_from_env());
@@ -231,6 +239,7 @@ mod tests {
 
     #[test]
     fn daemon_url_builders_default_and_override() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
@@ -272,6 +281,7 @@ mod tests {
 
     #[test]
     fn daemon_base_url_falls_back_to_bind_addr_when_base_url_missing() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
@@ -286,6 +296,7 @@ mod tests {
 
     #[test]
     fn daemon_status_url_uses_bind_addr_when_only_bind_is_set() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
@@ -307,6 +318,7 @@ mod tests {
 
     #[test]
     fn connector_command_resolution_defaults_and_overrides() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
