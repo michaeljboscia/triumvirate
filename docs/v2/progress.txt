@@ -58,6 +58,14 @@ BLOCKED
 -------
 (nothing blocked)
 
+!! NEW FEATURE — FEAT-031 LESSONS LEDGER !!
+---------------------------------------------
+Machine-readable lessons table (SQLite). Agents consume lessons before tasks.
+Confidence scores decay over time. Fleet gets smarter every session.
+Informed by Flotilla's structured lessons pattern (agentic-fleet-hub).
+Schema, acceptance criteria, and API in PRD.md under "Fleet Learning."
+Add to Phase 6A after cost attribution.
+
 !! IMPORTANT — READ THIS !!
 ----------------------------
 Three new features were added AFTER the original doc suite (commit 90d1931):
