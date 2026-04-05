@@ -61,8 +61,16 @@ pub fn is_bearer_authorized(raw_auth_header: Option<&str>, token: &str) -> bool 
 }
 
 pub fn daemon_base_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+    if let Ok(base) = std::env::var("TRIUMVIRATE_DAEMON_BASE_URL") {
+        return base;
+    }
+    if let Ok(bind_addr) = std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR") {
+        let bind_addr = bind_addr.trim();
+        if !bind_addr.is_empty() {
+            return format!("http://{bind_addr}");
+        }
+    }
+    "http://127.0.0.1:8080".to_string()
 }
 
 pub fn daemon_status_url() -> String {
@@ -226,6 +234,7 @@ mod tests {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
         }
@@ -240,6 +249,7 @@ mod tests {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::set_var("TRIUMVIRATE_DAEMON_BASE_URL", "http://127.0.0.1:9000");
+            std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:9005");
             std::env::set_var("TRIUMVIRATE_DAEMON_URL", "http://127.0.0.1:9001/status");
             std::env::set_var(
                 "TRIUMVIRATE_DAEMON_ASK_AGENT_URL",
@@ -254,8 +264,23 @@ mod tests {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+        }
+    }
+
+    #[test]
+    fn daemon_base_url_falls_back_to_bind_addr_when_base_url_missing() {
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
+            std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "0.0.0.0:8123");
+        }
+        assert_eq!(super::daemon_base_url(), "http://0.0.0.0:8123");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
         }
     }
 
