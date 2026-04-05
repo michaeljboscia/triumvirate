@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use axum::Json;
 use axum::extract::State;
@@ -7,9 +8,11 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Router;
 use rust_embed::Embed;
+use rusqlite::Connection;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+use triumvirate_workflow::WorkflowStore;
 use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
 use crate::agent::SharedHealthRegistry;
@@ -32,6 +35,8 @@ pub struct AppState {
     pub bus: Arc<MessageBus>,
     pub health: SharedHealthRegistry,
     pub quota: SharedQuotaRegistry,
+    pub memory_db_path: PathBuf,
+    pub workflow_db_path: PathBuf,
 }
 
 /// Start the web dashboard server on the given port.
@@ -42,15 +47,25 @@ pub async fn start_web_server(
     bus: Arc<MessageBus>,
     health: SharedHealthRegistry,
     quota: SharedQuotaRegistry,
+    memory_db_path: PathBuf,
+    workflow_db_path: PathBuf,
     port: u16,
 ) -> anyhow::Result<()> {
-    let state = AppState { bus, health, quota };
+    let state = AppState {
+        bus,
+        health,
+        quota,
+        memory_db_path,
+        workflow_db_path,
+    };
 
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/quota", get(quota_handler))
+        .route("/api/workflows", get(workflows_handler))
+        .route("/api/decisions", get(decisions_handler))
         .route("/api/message", post(message_handler))
         .route("/ws", get(ws_handler))
         .fallback(static_handler)
@@ -120,6 +135,96 @@ async fn quota_handler(State(state): State<AppState>) -> impl IntoResponse {
             "codex": snapshots.get(&AgentId::Codex),
         }
     }))
+}
+
+async fn workflows_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match WorkflowStore::open(&state.workflow_db_path)
+        .and_then(|store| store.resumable_workflows())
+    {
+        Ok(workflows) => {
+            let workflows_json: Vec<_> = workflows
+                .into_iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "workflow_id": w.workflow_id,
+                        "workflow_type": w.workflow_type,
+                        "state": w.state,
+                        "current_step": w.current_step,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({ "workflows": workflows_json }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to read workflows: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn decisions_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match Connection::open(&state.memory_db_path) {
+        Ok(conn) => {
+            let mut stmt = match conn.prepare(
+                "SELECT id, session_id, decision_text, proposed_by, validated_by, created_at, evidence
+                 FROM decisions
+                 ORDER BY id DESC
+                 LIMIT 200",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("failed to prepare decisions query: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let rows = match stmt.query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "session_id": row.get::<_, String>(1)?,
+                    "decision_text": row.get::<_, String>(2)?,
+                    "proposed_by": row.get::<_, String>(3)?,
+                    "validated_by": row.get::<_, Option<String>>(4)?,
+                    "created_at": row.get::<_, String>(5)?,
+                    "evidence": row.get::<_, Option<String>>(6)?,
+                }))
+            }) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("failed to query decisions: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let mut decisions = Vec::new();
+            for row in rows {
+                match row {
+                    Ok(value) => decisions.push(value),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": format!("failed to read decisions row: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({ "decisions": decisions }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]

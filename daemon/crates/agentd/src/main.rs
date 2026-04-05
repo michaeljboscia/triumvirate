@@ -190,7 +190,15 @@ async fn main() -> anyhow::Result<()> {
         cfg.web_port
     );
 
-    web::start_web_server(bus, health_registry, quota_registry, cfg.web_port).await?;
+    web::start_web_server(
+        bus,
+        health_registry,
+        quota_registry,
+        cfg.db_path.clone(),
+        workflow_db_path,
+        cfg.web_port,
+    )
+    .await?;
 
     Ok(())
 }
