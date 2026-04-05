@@ -58,10 +58,31 @@ BLOCKED
 -------
 (nothing blocked)
 
+!! IMPORTANT — READ THIS !!
+----------------------------
+Three new features were added AFTER the original doc suite (commit 90d1931):
+  - FEAT-028: Prometheus /metrics endpoint (Phase 6A step 6.1)
+  - FEAT-029: Langfuse LLM observability (Phase 6A steps 6.2 + 6.4)
+  - FEAT-030: Cost attribution (Phase 6A step 6.3)
+
+These are in PRD.md, IMPLEMENTATION_PLAN.md, TEST_PLAN.md, and BACKEND_STRUCTURE.md.
+The routing_log table now has cost_usd, latency_ms, langfuse_trace_id columns.
+Config schema has [langfuse] and [pricing] sections.
+
+Phase 6 in IMPLEMENTATION_PLAN.md was split into 6A (observability) and 6B (debate/governance).
+Re-read IMPLEMENTATION_PLAN.md Phase 6 before starting that phase.
+
+ALSO: All code must have comments. Commenting rules added to AGENTS.md:
+  - /// doc comments on every public item
+  - // inline comments on non-obvious logic
+  - // FEAT-XXX at top of each module
+  - // Adapted from ... attribution on borrowed patterns
+
 NEXT UP
 -------
 Phase 5: full Svelte/Tailwind frontend and rust-embed pipeline
-Phase 6: debate workflow + richer Cedar enforcement
+Phase 6A: LLM observability (metrics, Langfuse, cost attribution) — NEW
+Phase 6B: debate workflow + richer Cedar enforcement
 Phase 7: integration and chaos matrix on mock CLIs
 
 NOTES
@@ -69,3 +90,4 @@ NOTES
 - All 3 CLIs present: claude at ~/.local/bin/claude, gemini at /opt/homebrew/bin/gemini, codex at ~/.local/bin/codex
 - Daemon `target/` ignore already addressed.
 - Live smoke validated fleet spawn/worktree/task/peer/teardown APIs on :8080.
+- Langfuse instance: https://langfuse.e5btools.com (credentials in ~/.claude/infrastructure.md)
