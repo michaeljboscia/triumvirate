@@ -189,6 +189,62 @@ struct DismissSessionRequest {
     name: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct MemoryWriteRequest {
+    namespace: String,
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct MemoryWriteResponse {
+    id: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct MemoryReadRequest {
+    namespace: String,
+    key: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct MemoryEntry {
+    id: String,
+    namespace: String,
+    key: String,
+    value: String,
+    ts_ms: u128,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct MemoryReadResponse {
+    entries: Vec<MemoryEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct ScratchpadWriteRequest {
+    project: String,
+    topic: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ScratchpadWriteResponse {
+    path: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct ScratchpadListRequest {
+    project: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ScratchpadListResponse {
+    files: Vec<String>,
+}
+
 #[tool_router]
 impl McpBridge {
     #[tool(description = "Health check tool for MCP connectivity")]
@@ -333,6 +389,69 @@ impl McpBridge {
             .map(Json)
             .map_err(|e| format!("daemon health query failed: {e}"))
     }
+
+    #[tool(description = "Write a shared memory entry.")]
+    async fn memory_write(
+        &self,
+        Parameters(req): Parameters<MemoryWriteRequest>,
+    ) -> Result<Json<MemoryWriteResponse>, String> {
+        let id = Uuid::new_v4().to_string();
+        let entry = MemoryEntry {
+            id: id.clone(),
+            namespace: req.namespace,
+            key: req.key,
+            value: req.value,
+            ts_ms: now_ms(),
+        };
+        append_memory_entry(&entry).map_err(|e| format!("memory_write failed: {e}"))?;
+        Ok(Json(MemoryWriteResponse {
+            id,
+            status: "ok".to_string(),
+        }))
+    }
+
+    #[tool(description = "Read shared memory entries.")]
+    async fn memory_read(
+        &self,
+        Parameters(req): Parameters<MemoryReadRequest>,
+    ) -> Result<Json<MemoryReadResponse>, String> {
+        let mut entries =
+            read_memory_entries().map_err(|e| format!("memory_read failed: {e}"))?;
+        entries.retain(|e| e.namespace == req.namespace);
+        if let Some(key) = req.key {
+            entries.retain(|e| e.key == key);
+        }
+        entries.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        if let Some(limit) = req.limit {
+            entries.truncate(limit);
+        }
+        Ok(Json(MemoryReadResponse { entries }))
+    }
+
+    #[tool(description = "Write a scratchpad file in the shared workspace.")]
+    async fn scratchpad_write(
+        &self,
+        Parameters(req): Parameters<ScratchpadWriteRequest>,
+    ) -> Result<Json<ScratchpadWriteResponse>, String> {
+        let path = write_scratchpad(&req.project, &req.topic, &req.content)
+            .map_err(|e| format!("scratchpad_write failed: {e}"))?;
+        Ok(Json(ScratchpadWriteResponse {
+            path: path.display().to_string(),
+        }))
+    }
+
+    #[tool(description = "List scratchpad files for a project.")]
+    async fn scratchpad_list(
+        &self,
+        Parameters(req): Parameters<ScratchpadListRequest>,
+    ) -> Result<Json<ScratchpadListResponse>, String> {
+        let files = list_scratchpad(&req.project)
+            .map_err(|e| format!("scratchpad_list failed: {e}"))?
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+        Ok(Json(ScratchpadListResponse { files }))
+    }
 }
 
 fn gemini_command() -> (String, Vec<String>) {
@@ -352,6 +471,8 @@ fn codex_command() -> (String, Vec<String>) {
 }
 
 fn use_daemon_for_mcp() -> bool {
+    // Bridge can be forced to proxy tool execution through daemon HTTP so ephemeral MCP lifetimes
+    // never own long-running agent work.
     std::env::var("TRIUMVIRATE_MCP_USE_DAEMON")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
@@ -1007,6 +1128,14 @@ fn dead_drop_dir_path() -> anyhow::Result<PathBuf> {
     Ok(triumvirate_home_dir()?.join("dead-drop"))
 }
 
+fn memory_file_path() -> anyhow::Result<PathBuf> {
+    Ok(triumvirate_home_dir()?.join("memory.jsonl"))
+}
+
+fn scratchpad_root_path() -> anyhow::Result<PathBuf> {
+    Ok(triumvirate_home_dir()?.join("scratchpad"))
+}
+
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
     let path = outbox_file_path()?;
     if let Some(parent) = path.parent() {
@@ -1021,6 +1150,78 @@ fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
         .open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+fn append_memory_entry(entry: &MemoryEntry) -> anyhow::Result<()> {
+    // JSONL keeps append-only writes simple and resilient without schema migrations for this phase.
+    let path = memory_file_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(entry)?;
+    line.push('\n');
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn read_memory_entries() -> anyhow::Result<Vec<MemoryEntry>> {
+    let path = memory_file_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let body = fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<MemoryEntry>(line) {
+            out.push(entry);
+        }
+    }
+    Ok(out)
+}
+
+fn write_scratchpad(project: &str, topic: &str, content: &str) -> anyhow::Result<PathBuf> {
+    let safe_project = sanitize_name(project);
+    let safe_topic = sanitize_name(topic);
+    let dir = scratchpad_root_path()?.join(safe_project);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}-{}.md", now_ms(), safe_topic));
+    fs::write(&path, content)?;
+    Ok(path)
+}
+
+fn list_scratchpad(project: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let safe_project = sanitize_name(project);
+    let dir = scratchpad_root_path()?.join(safe_project);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect::<Vec<_>>();
+    files.sort();
+    Ok(files)
+}
+
+fn sanitize_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
 }
 
 fn resolve_context(
@@ -1074,6 +1275,7 @@ fn spawn_dead_drop(
     repo: &Option<String>,
     branch: &Option<String>,
 ) -> anyhow::Result<PathBuf> {
+    // Dead-drop ticket is the durable fallback handoff when an agent is unreachable.
     let dir = dead_drop_dir_path()?;
     fs::create_dir_all(&dir)?;
     let id = Uuid::new_v4().to_string();
@@ -2198,6 +2400,81 @@ exit 1\n",
         unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
         let count = count_pending_fallbacks()?;
         assert_eq!(count, 2);
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_write_and_read_roundtrip() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-memory-{now}"));
+        fs::create_dir_all(&test_home)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        let bridge = McpBridge::new_ephemeral();
+        let _ = bridge
+            .memory_write(Parameters(MemoryWriteRequest {
+                namespace: "proj-a".to_string(),
+                key: "decision".to_string(),
+                value: "use oauth".to_string(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let read = bridge
+            .memory_read(Parameters(MemoryReadRequest {
+                namespace: "proj-a".to_string(),
+                key: Some("decision".to_string()),
+                limit: Some(10),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(read.0.entries.len(), 1);
+        assert_eq!(read.0.entries[0].value, "use oauth");
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_and_list_roundtrip() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-scratchpad-{now}"));
+        fs::create_dir_all(&test_home)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        let bridge = McpBridge::new_ephemeral();
+        let write = bridge
+            .scratchpad_write(Parameters(ScratchpadWriteRequest {
+                project: "tri-project".to_string(),
+                topic: "notes".to_string(),
+                content: "hello scratchpad".to_string(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert!(write.0.path.contains("scratchpad"));
+
+        let list = bridge
+            .scratchpad_list(Parameters(ScratchpadListRequest {
+                project: "tri-project".to_string(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(list.0.files.len(), 1);
+        assert!(list.0.files[0].contains("notes"));
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
