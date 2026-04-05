@@ -218,8 +218,75 @@
     </div>
 
     <script>
-        // POC 1: Fetch health on load, wire up basic UI interactions.
-        // POC 2: WebSocket connection to fabric for real-time streaming.
+        let ws = null;
+
+        function appendLine(targetId, line) {
+            const pane = document.getElementById(targetId);
+            if (!pane) return;
+            if (pane.querySelector('div[style]')) pane.innerHTML = '';
+            const row = document.createElement('div');
+            row.textContent = line;
+            pane.appendChild(row);
+            pane.scrollTop = pane.scrollHeight;
+        }
+
+        function setDot(agent, status) {
+            const dot = document.getElementById(`${agent}-dot`);
+            if (!dot) return;
+            if (status === 'ready' || status === 'busy') {
+                dot.className = 'dot';
+            } else if (status === 'dead' || status === 'unresponsive') {
+                dot.className = 'dot dead';
+            } else {
+                dot.className = 'dot idle';
+            }
+        }
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+
+            ws.onopen = () => appendLine('event-output', '[ws] connected');
+            ws.onclose = () => {
+                appendLine('event-output', '[ws] disconnected, retrying...');
+                setTimeout(connectWebSocket, 1000);
+            };
+            ws.onerror = () => appendLine('event-output', '[ws] error');
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    const ts = new Date(msg.timestamp).toLocaleTimeString();
+
+                    if (msg.topic && typeof msg.topic === 'object' && msg.topic.agent_output) {
+                        const agent = msg.topic.agent_output.toLowerCase();
+                        const target = `${agent}-output`;
+                        if (msg.payload?.type === 'text_chunk') {
+                            appendLine(target, msg.payload.content);
+                        } else if (msg.payload?.type === 'agent_response') {
+                            appendLine(target, msg.payload.content);
+                        }
+                        appendLine('event-output', `[${ts}] ${agent}: output`);
+                        return;
+                    }
+
+                    if (msg.payload?.type === 'health_change') {
+                        const agent = msg.payload.agent.toLowerCase();
+                        setDot(agent, msg.payload.status);
+                        appendLine('event-output', `[${ts}] ${agent}: ${msg.payload.status}`);
+                        return;
+                    }
+
+                    if (msg.payload?.type === 'error') {
+                        appendLine('event-output', `[${ts}] error: ${msg.payload.message}`);
+                        return;
+                    }
+
+                    appendLine('event-output', `[${ts}] ${msg.source}: ${msg.payload?.type || 'event'}`);
+                } catch (_) {
+                    appendLine('event-output', `[ws] non-json event: ${event.data}`);
+                }
+            };
+        }
 
         async function checkHealth() {
             try {
@@ -236,32 +303,37 @@
                 }
 
                 for (const [agent, status] of Object.entries(data.agents)) {
-                    const dot = document.getElementById(`${agent}-dot`);
-                    if (dot) {
-                        dot.className = status === 'ready' ? 'dot' : 'dot dead';
-                    }
+                    setDot(agent, status);
                 }
-            } catch (e) {
+            } catch (_) {
                 document.getElementById('system-status').textContent = 'OFFLINE';
                 document.getElementById('system-status').className = 'status-badge degraded';
             }
         }
 
-        // Send message (POC 1: just logs to event pane)
-        function sendMessage() {
+        async function sendMessage() {
             const input = document.getElementById('user-input');
             const msg = input.value.trim();
             if (!msg) return;
 
-            const events = document.getElementById('event-output');
-            if (events.querySelector('div[style]')) events.innerHTML = '';
-
             const ts = new Date().toLocaleTimeString();
-            events.innerHTML += `<div><span style="color:#7c6ef0">[${ts}]</span> human: ${msg}</div>`;
+            appendLine('event-output', `[${ts}] human: ${msg}`);
+
+            try {
+                const res = await fetch('/api/message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: msg }),
+                });
+                if (!res.ok) {
+                    appendLine('event-output', `[${ts}] server rejected message (${res.status})`);
+                }
+            } catch (_) {
+                appendLine('event-output', `[${ts}] failed to send message`);
+            }
+
             input.value = '';
             input.focus();
-
-            // POC 2: POST to /api/message → fabric → agents
         }
 
         document.getElementById('send-btn').addEventListener('click', sendMessage);
@@ -271,6 +343,7 @@
             }
         });
 
+        connectWebSocket();
         checkHealth();
         setInterval(checkHealth, 5000);
     </script>
