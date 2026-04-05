@@ -4103,6 +4103,32 @@ exit 1\n",
         Ok(())
     }
 
+    #[test]
+    fn fallback_ack_rejects_paths_outside_dead_drop() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-fallback-security-{now}"));
+        let dead_drop = test_home.join("dead-drop");
+        fs::create_dir_all(&dead_drop)?;
+        let outside = test_home.join("outside.md");
+        fs::write(&outside, "outside")?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+        let err = acknowledge_fallback_path(&outside.display().to_string())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("outside dead-drop"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fallback_gc_removes_stale_tickets() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
