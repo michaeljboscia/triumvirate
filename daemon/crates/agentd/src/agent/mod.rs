@@ -1,5 +1,6 @@
 mod connector;
 mod api_backend;
+mod pool;
 mod claude;
 mod gemini;
 mod codex;
