@@ -1050,7 +1050,7 @@ async fn run_status() -> anyhow::Result<()> {
     let report = if let (Some(health), Some(snapshot)) = (health, snapshot) {
         serde_json::json!({
             "daemon_reachable": true,
-            "daemon_bind_addr": daemon_bind_addr,
+            "daemon_bind_addr": daemon_bind_addr.clone(),
             "health": health,
             "snapshot": snapshot
         })
@@ -1064,13 +1064,14 @@ async fn run_status() -> anyhow::Result<()> {
 
         serde_json::json!({
             "daemon_reachable": false,
-            "daemon_bind_addr": daemon_bind_addr,
+            "daemon_bind_addr": daemon_bind_addr.clone(),
             "health": null,
             "snapshot": {
                 "daemon_mode": "incremental-dev",
                 "supported_agents": ["gemini", "codex"],
                 "pending_fallbacks": pending_fallbacks,
-                "fallback_tickets": fallback_tickets
+                "fallback_tickets": fallback_tickets,
+                "daemon_bind_addr": daemon_bind_addr
             }
         })
     };
