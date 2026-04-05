@@ -20,5 +20,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 shared-types = { path = "../shared-types" }
 daemon-core = { path = "../daemon-core" }
+mcp-bridge = { path = "../mcp-bridge" }
 
 [dev-dependencies]

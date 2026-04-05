@@ -6,6 +6,7 @@ use daemon_core::{
     list_scratchpad as core_list_scratchpad, read_memory_entries as core_read_memory_entries,
     read_outbox_events as core_read_outbox_events, write_scratchpad as core_write_scratchpad,
 };
+use mcp_bridge::{build_role_adapted_prompts, is_supported_agent};
 use axum::{
     Json as AxumJson, Router,
     extract::State,
@@ -508,10 +509,10 @@ fn use_daemon_for_mcp() -> bool {
 }
 
 async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, String> {
-    let agent = req.agent.to_lowercase();
-    if agent != "gemini" && agent != "codex" {
+    if !is_supported_agent(req) {
         return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
     }
+    let agent = req.agent.to_lowercase();
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
@@ -712,14 +713,12 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
-    let gemini_prompt = format!(
-        "[Gemini role: research/analysis]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-        req.message, resolved_cwd, resolved_repo, resolved_branch
-    );
-    let codex_prompt = format!(
-        "[Codex role: implementation/testing]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-        req.message, resolved_cwd, resolved_repo, resolved_branch
-    );
+    let (gemini_prompt, codex_prompt) = build_role_adapted_prompts(&AskTwinsRequest {
+        message: req.message.clone(),
+        cwd: resolved_cwd.clone(),
+        repo: resolved_repo.clone(),
+        branch: resolved_branch.clone(),
+    });
 
     let mut lifecycle = vec![
         LifecycleEvent {
