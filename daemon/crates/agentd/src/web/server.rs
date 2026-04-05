@@ -17,7 +17,8 @@ use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
 use crate::agent::SharedHealthRegistry;
 use crate::fabric::MessageBus;
-use crate::fleet::worktree::{parse_fleet_members, provision_worktree, remove_worktree};
+use crate::fleet::merge::merge_branches_sequentially;
+use crate::fleet::worktree::{git_repo_root, parse_fleet_members, provision_worktree, remove_worktree};
 use crate::quota::SharedQuotaRegistry;
 use crate::routing::{RoutingDecision, decide_route};
 use crate::shutdown::wait_for_shutdown_signal;
@@ -70,6 +71,7 @@ pub async fn start_web_server(
         .route("/api/fleet/tasks", get(fleet_tasks_handler))
         .route("/api/fleet/worktrees", get(fleet_worktrees_handler))
         .route("/api/fleet/spawn", post(fleet_spawn_handler))
+        .route("/api/fleet/merge", post(fleet_merge_handler))
         .route("/api/fleet/worktrees/teardown", post(fleet_teardown_handler))
         .route("/api/fleet/tasks/claim", post(fleet_claim_handler))
         .route("/api/fleet/tasks/complete", post(fleet_complete_handler))
@@ -509,6 +511,129 @@ async fn fleet_teardown_handler(
         })),
     )
         .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetMergeRequest {
+    fleet_id: String,
+}
+
+async fn fleet_merge_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FleetMergeRequest>,
+) -> impl IntoResponse {
+    let fleet_id = req.fleet_id.trim();
+    if fleet_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "fleet_id is required" })),
+        )
+            .into_response();
+    }
+
+    let conn = match Connection::open(&state.memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT branch_name
+         FROM fleet_worktrees
+         WHERE fleet_id = ?1
+         ORDER BY id ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to prepare branch query: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let branches = match stmt.query_map(rusqlite::params![fleet_id], |row| row.get::<_, String>(0))
+    {
+        Ok(rows) => {
+            let mut out = Vec::new();
+            for row in rows {
+                match row {
+                    Ok(branch) => out.push(branch),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": format!("failed to read branch row: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            out
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to map branch rows: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    if branches.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no branches found for fleet_id" })),
+        )
+            .into_response();
+    }
+
+    let repo_root = match git_repo_root() {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to detect git repo: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    match merge_branches_sequentially(&repo_root, &branches) {
+        Ok((merged, failed_branch)) => {
+            let conflict = failed_branch.is_some();
+            if !conflict {
+                let _ = conn.execute(
+                    "UPDATE fleet_tasks
+                     SET status = 'completed', updated_at = datetime('now')
+                     WHERE fleet_id = ?1 AND task_key = 'merge'",
+                    rusqlite::params![fleet_id],
+                );
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "fleet_id": fleet_id,
+                    "repo_root": repo_root.display().to_string(),
+                    "merged_branches": merged,
+                    "failed_branch": failed_branch,
+                    "conflict": conflict,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("merge failed: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 async fn fleet_tasks_handler(State(state): State<AppState>) -> impl IntoResponse {

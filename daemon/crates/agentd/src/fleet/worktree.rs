@@ -137,7 +137,7 @@ pub fn remove_worktree(worktree_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn git_repo_root() -> anyhow::Result<PathBuf> {
+pub fn git_repo_root() -> anyhow::Result<PathBuf> {
     let output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
