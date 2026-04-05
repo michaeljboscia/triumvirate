@@ -17,6 +17,7 @@ use triumvirate_workflow::{DebateWorkflow, FleetWorkflow, WorkflowEngine, Workfl
 use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
 use crate::agent::SharedHealthRegistry;
+use crate::cost::{PricingConfig, estimate_costs_by_agent};
 use crate::fabric::MessageBus;
 use crate::fleet::merge::merge_branches_sequentially;
 use crate::fleet::peer::{emit_peer_message, FleetPeerMessage};
@@ -41,6 +42,7 @@ pub struct AppState {
     pub health: SharedHealthRegistry,
     pub quota: SharedQuotaRegistry,
     pub metrics: SharedMetricsRegistry,
+    pub pricing: PricingConfig,
     pub memory_db_path: PathBuf,
     pub workflow_db_path: PathBuf,
 }
@@ -54,6 +56,7 @@ pub async fn start_web_server(
     health: SharedHealthRegistry,
     quota: SharedQuotaRegistry,
     metrics: SharedMetricsRegistry,
+    pricing: PricingConfig,
     memory_db_path: PathBuf,
     workflow_db_path: PathBuf,
     port: u16,
@@ -63,6 +66,7 @@ pub async fn start_web_server(
         health,
         quota,
         metrics,
+        pricing,
         memory_db_path,
         workflow_db_path,
     };
@@ -72,6 +76,7 @@ pub async fn start_web_server(
         .route("/api/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/api/agents", get(agents_handler))
+        .route("/api/costs", get(costs_handler))
         .route("/api/governance/check", post(governance_check_handler))
         .route("/api/debate/start", post(debate_start_handler))
         .route("/api/debate/challenge", post(debate_challenge_handler))
@@ -171,6 +176,48 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+async fn costs_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let token_totals = state.metrics.snapshot_tokens().await;
+    let by_agent = estimate_costs_by_agent(token_totals, &state.pricing);
+    let mut total_cost_usd = 0.0f64;
+    let mut total_turns = 0u64;
+
+    let mut agents = serde_json::Map::new();
+    for agent in [AgentId::Claude, AgentId::Gemini, AgentId::Codex] {
+        if let Some(b) = by_agent.get(&agent) {
+            total_cost_usd += b.estimated_cost_usd;
+            total_turns += b.turns;
+            agents.insert(
+                agent.to_string(),
+                serde_json::json!({
+                    "turns": b.turns,
+                    "input_tokens": b.input_tokens,
+                    "output_tokens": b.output_tokens,
+                    "estimated_cost_usd": b.estimated_cost_usd,
+                }),
+            );
+        } else {
+            agents.insert(
+                agent.to_string(),
+                serde_json::json!({
+                    "turns": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                }),
+            );
+        }
+    }
+
+    Json(serde_json::json!({
+        "summary": {
+            "estimated_total_cost_usd": total_cost_usd,
+            "turns_total": total_turns,
+        },
+        "agents": agents,
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]

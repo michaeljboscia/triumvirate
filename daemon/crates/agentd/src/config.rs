@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tracing::info;
 
+use crate::cost::PricingConfig;
+
 /// Daemon configuration loaded from ~/.triumvirate/config.toml
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -14,6 +16,9 @@ pub struct Config {
 
     #[serde(default)]
     pub agents: AgentsConfig,
+
+    #[serde(default)]
+    pub pricing: PricingConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +76,7 @@ pub fn load() -> anyhow::Result<Config> {
             web_port: default_web_port(),
             db_path: default_db_path(),
             agents: AgentsConfig::default(),
+            pricing: PricingConfig::default(),
         })
     }
 }
