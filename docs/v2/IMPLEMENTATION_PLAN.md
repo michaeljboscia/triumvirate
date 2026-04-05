@@ -107,18 +107,29 @@ Build on existing scaffold at `daemon/`. POC 1 is done (boots, serves HTML, find
 - [ ] **5.10** Build Merge Resolver — conflict diff display, human resolution controls. FEAT: FEAT-021
 - [ ] **5.11** Wire `rust-embed` — build Svelte output, embed in Rust binary. Update Cargo.toml `#[folder]` path. FEAT: FEAT-014
 
+- [ ] **5.12** Build Cost Attribution panel — per-turn, per-task, per-fleet, per-session cost breakdown. FEAT: FEAT-030
+
 **Gate:** Full Svelte dashboard replaces POC HTML. All views functional. Real-time streaming. Design system applied pixel-perfect.
 
 ---
 
-## Phase 6: Debate & Governance (Day 9)
+## Phase 6: Observability, Debate & Governance (Day 9-10)
 
-- [ ] **6.1** Implement DebateWorkflow — `/debate` trigger, proposal → challenge → vote → decision. File: `daemon/crates/workflow/src/debate.rs`. FEAT: FEAT-009
-- [ ] **6.2** Add Cedar governance — load policies from `~/.triumvirate/policies/`, evaluate before destructive ops. File: `daemon/crates/agentd/src/governance.rs`. FEAT: FEAT-022
-- [ ] **6.3** Write default Cedar policies — human approval for git push, file delete, db drop. File: `daemon/policies/default.cedar`. FEAT: FEAT-022
-- [ ] **6.4** Implement provider abstraction — API backend for AgentConnector trait. File: `daemon/crates/agentd/src/agent/api_backend.rs`. FEAT: FEAT-005
+### 6A: LLM Observability
 
-**Gate:** Structured debate works. Cedar blocks destructive ops without approval. API backend compiles.
+- [ ] **6.1** Implement Prometheus metrics endpoint — `/metrics` with per-agent histograms, token counters, error rates, connection gauges. File: `daemon/crates/agentd/src/metrics.rs`, update `web/server.rs`. FEAT: FEAT-028
+- [ ] **6.2** Implement Langfuse integration — pure REST client (no SDK), trace every agent turn with tokens, cost, latency, session context. File: `daemon/crates/agentd/src/langfuse.rs`. Config in `~/.triumvirate/config.toml` [langfuse] section. FEAT: FEAT-029
+- [ ] **6.3** Implement cost attribution — pricing table in config, per-turn cost calculation from token counts, cost_usd column in routing_log. File: `daemon/crates/agentd/src/cost.rs`, update `quota.rs`. FEAT: FEAT-030
+- [ ] **6.4** Wire Langfuse into agent connectors — after every agent response, log generation to Langfuse with tokens + cost. Update `claude.rs`, `gemini.rs`, `codex.rs`. FEAT: FEAT-029
+
+### 6B: Debate & Governance
+
+- [ ] **6.5** Implement DebateWorkflow — `/debate` trigger, proposal → challenge → vote → decision. File: `daemon/crates/workflow/src/debate.rs`. FEAT: FEAT-009
+- [ ] **6.6** Add Cedar governance — load policies from `~/.triumvirate/policies/`, evaluate before destructive ops. File: `daemon/crates/agentd/src/governance.rs`. FEAT: FEAT-022
+- [ ] **6.7** Write default Cedar policies — human approval for git push, file delete, db drop. File: `daemon/policies/default.cedar`. FEAT: FEAT-022
+- [ ] **6.8** Implement provider abstraction — API backend for AgentConnector trait. File: `daemon/crates/agentd/src/agent/api_backend.rs`. FEAT: FEAT-005
+
+**Gate:** Metrics endpoint returns data. Langfuse traces visible at langfuse.e5btools.com. Cost shown in dashboard. Debate works. Cedar blocks destructive ops.
 
 ---
 

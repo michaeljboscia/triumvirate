@@ -14,8 +14,13 @@ Rust daemon coordinating Claude, Gemini, and Codex in one shared orchestration r
 
 ```bash
 cd /Users/mikeboscia/projects/triumvirate/daemon
+cd frontend && npm install && cd ..
 cargo run
 ```
+
+`cargo run` and `cargo build` now invoke a build script in `crates/agentd/build.rs` that runs
+`npm run build` in `frontend/` and embeds `frontend/dist` into the Rust binary via `rust-embed`.
+Set `TRIUMVIRATE_SKIP_FRONTEND_BUILD=1` to skip this in constrained environments.
 
 ## Quality Gate
 
