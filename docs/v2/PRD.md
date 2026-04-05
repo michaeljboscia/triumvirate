@@ -314,6 +314,54 @@ A Rust binary (`triumvirate-agentd`) that orchestrates Claude, Gemini, and Codex
   - Configurable latency, error injection, response content
   - Used by CI and dev builds (feature flag `--features mock`)
 
+### Observability (LLM Layer)
+
+**FEAT-028: Prometheus Metrics Endpoint**
+- REQ: REQ-4
+- Priority: P1
+- Description: `/metrics` endpoint serving Prometheus-format metrics. Per-agent latency histograms, token counters, error rates, active connection gauges. The thing that lets you graph what's happening over time.
+- Acceptance:
+  - `GET /metrics` returns Prometheus text format
+  - Histograms: `agent_turn_duration_seconds{agent_type="claude",agent_id="claude-1"}` with p50/p95/p99
+  - Counters: `agent_tokens_total{agent_type="claude",direction="input"}`, `agent_tokens_total{...direction="output"}`
+  - Counters: `agent_errors_total{agent_type="claude",error_type="parse_failure"}`
+  - Gauges: `agent_active_connections{agent_type="claude"}`, `fleet_active_members`
+  - Counters: `fabric_messages_total{topic="agent_output"}`, `fabric_messages_lagged_total`
+  - Gauge: `quota_usage_percent{agent_type="claude"}`
+
+**FEAT-029: Langfuse LLM Observability**
+- REQ: REQ-4
+- Priority: P1
+- Description: Every agent generation traced to Langfuse at `langfuse.e5btools.com`. Token usage, cost, latency, session context. Uses Langfuse REST API (pure HTTP, no SDK dep — same pattern as GTM Machine edge functions).
+- Acceptance:
+  - Every agent turn creates a Langfuse trace with: session_id, agent_type, agent_id, model name
+  - Every generation logged with: input tokens, output tokens, latency_ms, cost_usd
+  - Traces linked by session_id for conversation replay in Langfuse UI
+  - Fleet tasks group traces under a parent span
+  - Cost calculated from known pricing: Claude Opus $5/$25 per MTok, Gemini Pro $0, Codex per OpenAI tier
+  - Langfuse connection config in `~/.triumvirate/config.toml`:
+    ```toml
+    [langfuse]
+    enabled = true
+    host = "https://langfuse.e5btools.com"
+    public_key = "pk-..."
+    secret_key = "sk-..."
+    ```
+  - If Langfuse unreachable: log warning, continue without tracing. Never block agent turns.
+
+**FEAT-030: Cost Attribution**
+- REQ: REQ-5, REQ-7
+- Priority: P1
+- Description: Dollar cost per turn, per task, per fleet. Visible in the dashboard quota panel. The thing that tells you whether spawning 5 Codexes was worth it.
+- Acceptance:
+  - Per-turn cost calculated from token counts + model pricing table
+  - Per-task cost: sum of all turns assigned to that task
+  - Per-fleet cost: sum of all tasks in the fleet
+  - Per-session cost: sum of everything since daemon boot
+  - Dashboard shows: current session cost, breakdown by agent type, most expensive task
+  - Pricing table configurable in config.toml (defaults to current published rates)
+  - Cost data persisted to SQLite routing_log (cost_usd column)
+
 ---
 
 ## Priority Summary
@@ -321,5 +369,5 @@ A Rust binary (`triumvirate-agentd`) that orchestrates Claude, Gemini, and Codex
 | Priority | Features | Description |
 |----------|----------|-------------|
 | P0 | FEAT-001 through FEAT-008, FEAT-010 through FEAT-012, FEAT-014, FEAT-015, FEAT-017, FEAT-019 through FEAT-021, FEAT-023, FEAT-026 | Core daemon: agents, fabric, workflows, memory, dashboard, fleet |
-| P1 | FEAT-005, FEAT-009, FEAT-013, FEAT-016, FEAT-018, FEAT-024, FEAT-027 | Provider abstraction, debate, extraction, debug view, digests, crash recovery, mocks |
-| P2 | FEAT-022, FEAT-025 | Cedar governance, OpenTelemetry |
+| P1 | FEAT-005, FEAT-009, FEAT-013, FEAT-016, FEAT-018, FEAT-024, FEAT-027, FEAT-028, FEAT-029, FEAT-030 | Provider abstraction, debate, extraction, debug view, digests, crash recovery, mocks, metrics, Langfuse, cost attribution |
+| P2 | FEAT-022, FEAT-025 | Cedar governance, OpenTelemetry distributed tracing |
