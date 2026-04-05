@@ -46,6 +46,10 @@ impl GeminiConnector {
     }
 }
 
+fn gemini_cli_bin() -> String {
+    std::env::var("TRIUMVIRATE_GEMINI_BIN").unwrap_or_else(|_| "gemini".to_string())
+}
+
 #[async_trait::async_trait]
 impl AgentConnector for GeminiConnector {
     fn agent_id(&self) -> AgentId {
@@ -56,8 +60,7 @@ impl AgentConnector for GeminiConnector {
         let session_id = Uuid::new_v4().to_string();
         self.session_id = Some(session_id.clone());
 
-        let gemini_bin = std::env::var("TRIUMVIRATE_GEMINI_BIN")
-            .unwrap_or_else(|_| "gemini".to_string());
+        let gemini_bin = gemini_cli_bin();
         let mut child = Command::new(&gemini_bin)
             .arg("--acp")
             .stdin(std::process::Stdio::piped())
@@ -228,5 +231,26 @@ impl AgentConnector for GeminiConnector {
 
     fn health_watch(&self) -> watch::Receiver<HealthStatus> {
         self.health_rx.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gemini_cli_bin;
+
+    #[test]
+    fn defaults_gemini_bin() {
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BIN") };
+        assert_eq!(gemini_cli_bin(), "gemini");
+    }
+
+    #[test]
+    fn honors_gemini_bin_override() {
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BIN", "/tmp/mock-gemini") };
+        assert_eq!(gemini_cli_bin(), "/tmp/mock-gemini");
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BIN") };
     }
 }

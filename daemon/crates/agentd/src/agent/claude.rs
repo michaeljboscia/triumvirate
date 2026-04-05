@@ -48,6 +48,10 @@ impl ClaudeConnector {
     }
 }
 
+fn claude_cli_bin() -> String {
+    std::env::var("TRIUMVIRATE_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+}
+
 #[async_trait::async_trait]
 impl AgentConnector for ClaudeConnector {
     fn agent_id(&self) -> AgentId {
@@ -58,8 +62,7 @@ impl AgentConnector for ClaudeConnector {
         let session_id = Uuid::new_v4().to_string();
         self.session_id = Some(session_id.clone());
 
-        let claude_bin = std::env::var("TRIUMVIRATE_CLAUDE_BIN")
-            .unwrap_or_else(|_| "claude".to_string());
+        let claude_bin = claude_cli_bin();
         let mut child = Command::new(&claude_bin)
             .arg("--input-format")
             .arg("stream-json")
@@ -232,5 +235,26 @@ impl AgentConnector for ClaudeConnector {
 
     fn health_watch(&self) -> watch::Receiver<HealthStatus> {
         self.health_rx.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claude_cli_bin;
+
+    #[test]
+    fn defaults_claude_bin() {
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::remove_var("TRIUMVIRATE_CLAUDE_BIN") };
+        assert_eq!(claude_cli_bin(), "claude");
+    }
+
+    #[test]
+    fn honors_claude_bin_override() {
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::set_var("TRIUMVIRATE_CLAUDE_BIN", "/tmp/mock-claude") };
+        assert_eq!(claude_cli_bin(), "/tmp/mock-claude");
+        // SAFETY: test process controls this env var lifecycle.
+        unsafe { std::env::remove_var("TRIUMVIRATE_CLAUDE_BIN") };
     }
 }
