@@ -1042,6 +1042,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     struct DaemonState {
         token: String,
         queues: QueueRegistry,
+        bind_addr: String,
     }
 
     async fn health(
@@ -1054,7 +1055,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(serde_json::json!({
             "status": "ok",
             "service": "triumvirate-daemon-v2",
-            "mode": "incremental-dev"
+            "mode": "incremental-dev",
+            "daemon_bind_addr": state.bind_addr
         })))
     }
 
@@ -1077,7 +1079,8 @@ async fn run_daemon() -> anyhow::Result<()> {
             "daemon_mode": "incremental-dev",
             "supported_agents": ["gemini", "codex"],
             "pending_fallbacks": pending,
-            "fallback_tickets": tickets
+            "fallback_tickets": tickets,
+            "daemon_bind_addr": state.bind_addr
         })))
     }
 
@@ -1327,9 +1330,11 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
+    let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     let state = DaemonState {
         token,
         queues: Arc::new(Mutex::new(HashMap::new())),
+        bind_addr: bind_addr.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -1345,7 +1350,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/fallback/ack", post(fallback_ack_route))
         .route("/fallback/gc", post(fallback_gc_route))
         .with_state(state);
-    let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

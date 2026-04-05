@@ -290,6 +290,7 @@ mod tests {
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL");
             std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:8456");
         }
         assert_eq!(super::daemon_status_url(), "http://127.0.0.1:8456/status");
@@ -300,6 +301,7 @@ mod tests {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL");
         }
     }
 
