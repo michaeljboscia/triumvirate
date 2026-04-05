@@ -2,32 +2,38 @@ TRIUMVIRATE V2 — PROGRESS TRACKER
 ==================================
 
 Last updated: 2026-04-05
-Current phase: Phase 1 (POC 2 — Live Claude Agent)
-Next step: 1.2 (Implement Claude stream-json parser in proto + wire parser output to web stream)
+Current phase: Phase 4-7 buildout (fleet orchestration + resilience hardening)
+Next step: Phase 4.1 agent pool + Phase 4.4 FleetWorkflow implementation
 
 COMPLETED
 ---------
-- POC 1: Rust scaffold compiles, boots in 13ms, finds all 3 CLIs (daemon/)
-- SPEC.md: Final (7 REQs, Goat Rodeo R1-R6, 17 decisions)
-- Canonical docs: PRD, APP_FLOW, TECH_STACK, DESIGN_SYSTEM, FRONTEND_GUIDELINES, BACKEND_STRUCTURE, IMPLEMENTATION_PLAN, CLAUDE.md written
-- Research: 33 artifacts including multi-agent coordination landscape (032), decision ledger (033)
-- Goat Rodeo: 6 rounds, REQ-7 (Dynamic Multi-Agent Fleet) added
-- Phase 0 complete: prior-art source analysis written
-  - research/034-ruflo-source-analysis.md
-  - research/035-clash-source-analysis.md
-  - research/036-swarms-rs-source-analysis.md
-  - research/037-temporal-workflow-patterns.md
-- Phase 1.1 complete: Claude persistent subprocess connector implemented
-  - `claude --input-format stream-json --output-format stream-json --session-id <uuid>`
-  - dedicated reader/writer tokio tasks + bus bridge
-  - stream-json parser added in proto (`crates/proto/src/claude_events.rs`)
+- POC 1/2/3 foundations are live: Claude/Gemini/Codex connectors, parser mapping, web + WS plumbing.
+- Routing + digest + quota tracking implemented.
+- Memory + steno + workflow persistence implemented.
+- Agent supervisor auto-restart with exponential backoff implemented.
+- Workflow recovery inspection implemented on startup.
+- Fleet task model and lifecycle APIs implemented:
+  - `/api/fleet/spawn`
+  - `/api/fleet/tasks`
+  - `/api/fleet/tasks/claim`
+  - `/api/fleet/tasks/complete`
+- Fleet worktree orchestration implemented:
+  - provision (`git worktree add`) on spawn
+  - list via `/api/fleet/worktrees`
+  - teardown via `/api/fleet/worktrees/teardown`
+- Fleet sequential merge API implemented:
+  - `/api/fleet/merge` (ordered branch merge with conflict detection + abort)
+- Fleet peer messaging API implemented:
+  - `/api/fleet/peer`
+- Prompt memory injection implemented:
+  - recent decisions prepended into routed agent turns.
+- API backend abstraction scaffold added for future provider-backed agents.
 
 IN PROGRESS
 -----------
-- Phase 1.2 / 1.3 / 1.4
-  - JSONL parser hardening and event mapping
-  - WebSocket endpoint for live browser streaming
-  - `POST /api/message` routing to Claude stdin via fabric
+- Phase 4.1 AgentPool for N instances per agent type
+- Phase 4.4 FleetWorkflow (contracts -> parallel wave -> sequential merge)
+- Phase 5 Svelte dashboard replacement (currently still embedded static HTML)
 
 BLOCKED
 -------
@@ -35,13 +41,13 @@ BLOCKED
 
 NEXT UP
 -------
-Phase 1: finish POC 2 — browser message -> Claude -> live stream
-Phase 2: POC 3 — All 3 agents streaming simultaneously
-Phase 3: Foundation — memory, stenographer, workflow engine
-Phase 4: Fleet — worktrees, task list, sequential merge
+Phase 4: complete pool + fleet workflow orchestration end-to-end
+Phase 5: full Svelte/Tailwind frontend and rust-embed pipeline
+Phase 6: governance (Cedar) + debate workflow
+Phase 7: mock CLIs + integration/chaos test matrix
 
 NOTES
 -----
 - All 3 CLIs present: claude at ~/.local/bin/claude, gemini at /opt/homebrew/bin/gemini, codex at ~/.local/bin/codex
-- Daemon target/ directory needs to be added to .gitignore (committed accidentally)
-- Svelte frontend not yet initialized (Phase 5)
+- Daemon `target/` ignore already addressed.
+- Live smoke validated fleet spawn/worktree/task/peer/teardown APIs on :8080.
