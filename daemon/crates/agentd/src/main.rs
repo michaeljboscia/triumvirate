@@ -4,6 +4,7 @@ mod digest;
 mod fabric;
 mod memory;
 mod routing;
+mod shutdown;
 mod steno;
 mod web;
 

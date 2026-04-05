@@ -15,6 +15,7 @@ use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 use crate::agent::SharedHealthRegistry;
 use crate::fabric::MessageBus;
 use crate::routing::{RoutingDecision, decide_route};
+use crate::shutdown::wait_for_shutdown_signal;
 use crate::web::ws_handler;
 
 /// Static assets embedded in the binary via rust-embed.
@@ -56,7 +57,9 @@ pub async fn start_web_server(
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     info!(port, "web dashboard listening");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_shutdown_signal())
+        .await?;
     Ok(())
 }
 
