@@ -5,6 +5,7 @@ mod digest;
 mod fabric;
 mod fleet;
 mod governance;
+mod langfuse;
 mod memory;
 mod metrics;
 mod routing;
@@ -72,7 +73,15 @@ async fn main() -> anyhow::Result<()> {
     // Step 2b: Initialize quota tracker
     let quota_registry = SharedQuotaRegistry::default();
     let metrics_registry = SharedMetricsRegistry::default();
-    let quota_tracker = QuotaTracker::new(bus.clone(), quota_registry.clone(), metrics_registry.clone());
+    let langfuse_client = langfuse::LangfuseClient::new(cfg.langfuse.clone());
+    let quota_tracker = QuotaTracker::new(
+        bus.clone(),
+        quota_registry.clone(),
+        metrics_registry.clone(),
+        langfuse_client,
+        session_id,
+        cfg.pricing.clone(),
+    );
     quota_tracker.run();
     info!("quota tracker started");
 

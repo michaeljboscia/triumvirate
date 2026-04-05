@@ -236,10 +236,18 @@ impl AgentConnector for GeminiConnector {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::gemini_cli_bin;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn defaults_gemini_bin() {
+        let _guard = env_lock().lock().expect("lock poisoned");
         // SAFETY: test process controls this env var lifecycle.
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BIN") };
         assert_eq!(gemini_cli_bin(), "gemini");
@@ -247,6 +255,7 @@ mod tests {
 
     #[test]
     fn honors_gemini_bin_override() {
+        let _guard = env_lock().lock().expect("lock poisoned");
         // SAFETY: test process controls this env var lifecycle.
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BIN", "/tmp/mock-gemini") };
         assert_eq!(gemini_cli_bin(), "/tmp/mock-gemini");
