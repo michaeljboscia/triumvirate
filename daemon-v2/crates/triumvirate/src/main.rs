@@ -262,6 +262,21 @@ struct OutboxRecentResponse {
     events: Vec<OutboxEvent>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FallbackListRequest {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FallbackListResponse {
+    tickets: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FallbackAckRequest {
+    path: String,
+}
+
 #[tool_router]
 impl McpBridge {
     #[tool(description = "Health check tool for MCP connectivity")]
@@ -508,6 +523,25 @@ impl McpBridge {
         events.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
         events.truncate(req.limit.unwrap_or(50));
         Ok(Json(OutboxRecentResponse { events }))
+    }
+
+    #[tool(description = "List pending dead-drop fallback tickets.")]
+    async fn fallback_list(
+        &self,
+        Parameters(req): Parameters<FallbackListRequest>,
+    ) -> Result<Json<FallbackListResponse>, String> {
+        let tickets = list_pending_fallback_paths(req.limit.unwrap_or(20))
+            .map_err(|e| format!("fallback_list failed: {e}"))?
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+        Ok(Json(FallbackListResponse { tickets }))
+    }
+
+    #[tool(description = "Acknowledge a dead-drop fallback ticket by deleting it.")]
+    async fn fallback_ack(&self, Parameters(req): Parameters<FallbackAckRequest>) -> Result<String, String> {
+        acknowledge_fallback_path(&req.path).map_err(|e| format!("fallback_ack failed: {e}"))?;
+        Ok(format!("acknowledged {}", req.path))
     }
 }
 
@@ -1550,6 +1584,18 @@ fn list_pending_fallback_paths(limit: usize) -> anyhow::Result<Vec<PathBuf>> {
     files.reverse();
     files.truncate(limit);
     Ok(files)
+}
+
+fn acknowledge_fallback_path(path: &str) -> anyhow::Result<()> {
+    let root = dead_drop_dir_path()?;
+    let requested = PathBuf::from(path);
+    let canonical_requested = requested.canonicalize()?;
+    let canonical_root = root.canonicalize()?;
+    if !canonical_requested.starts_with(&canonical_root) {
+        anyhow::bail!("path is outside dead-drop directory");
+    }
+    fs::remove_file(canonical_requested)?;
+    Ok(())
 }
 
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -3192,6 +3238,47 @@ exit 1\n",
             .map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(out.0.events.len(), 1);
         assert_eq!(out.0.events[0].request_id, "b");
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_list_and_ack_roundtrip() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-fallback-tools-{now}"));
+        let dead_drop = test_home.join("dead-drop");
+        fs::create_dir_all(&dead_drop)?;
+        let ticket = dead_drop.join("ticket-a.md");
+        fs::write(&ticket, "fallback ticket")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        let bridge = McpBridge::new_ephemeral();
+        let list = bridge
+            .fallback_list(Parameters(FallbackListRequest { limit: Some(10) }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(list.0.tickets.len(), 1);
+        assert!(list.0.tickets[0].contains("ticket-a.md"));
+
+        let _ = bridge
+            .fallback_ack(Parameters(FallbackAckRequest {
+                path: list.0.tickets[0].clone(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let list_after = bridge
+            .fallback_list(Parameters(FallbackListRequest { limit: Some(10) }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(list_after.0.tickets.len(), 0);
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
