@@ -64,6 +64,8 @@ impl FabricMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Topic {
+    /// Directed human input for a specific agent: agents.<name>.input
+    AgentInput(AgentId),
     /// Agent streaming output: agents.<name>.output
     AgentOutput(AgentId),
     /// Human input: agents.human.input

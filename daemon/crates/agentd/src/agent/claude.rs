@@ -83,7 +83,7 @@ impl AgentConnector for ClaudeConnector {
         let (input_tx, mut input_rx) = mpsc::channel::<String>(256);
         self.input_tx = Some(input_tx.clone());
 
-        let mut human_rx = bus.subscribe(&Topic::HumanInput).await;
+        let mut human_rx = bus.subscribe(&Topic::AgentInput(AgentId::Claude)).await;
         tokio::spawn(async move {
             while let Ok(msg) = human_rx.recv().await {
                 if let Payload::HumanMessage { content } = msg.payload {
