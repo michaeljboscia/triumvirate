@@ -406,12 +406,13 @@ impl McpBridge {
     #[tool(description = "Get current system status snapshot.")]
     async fn get_status(&self) -> Json<StatusResponse> {
         let sessions = self.sessions.lock().await;
+        let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
         let fallback_tickets = list_pending_fallback_paths(10).unwrap_or_default();
         Json(StatusResponse {
             daemon_mode: "incremental-dev".to_string(),
             active_sessions: sessions.len(),
             supported_agents: vec!["gemini".to_string(), "codex".to_string()],
-            pending_fallbacks: fallback_tickets.len(),
+            pending_fallbacks,
             fallback_tickets: fallback_tickets
                 .into_iter()
                 .map(|p| p.display().to_string())
@@ -2541,6 +2542,32 @@ exit 1\n",
 
         client.cancel().await?;
         server_handle.await??;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_status_reports_total_pending_even_when_ticket_list_is_truncated() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-status-fallbacks-total-{now}"));
+        let dead_drop = test_home.join("dead-drop");
+        fs::create_dir_all(&dead_drop)?;
+        for i in 0..12 {
+            fs::write(dead_drop.join(format!("ticket-{i}.md")), "fallback")?;
+        }
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        let bridge = McpBridge::new_ephemeral();
+        let status = bridge.get_status().await;
+        let status_json = serde_json::to_string(&status.0)?;
+        assert!(status_json.contains("\"pending_fallbacks\":12"));
+
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
