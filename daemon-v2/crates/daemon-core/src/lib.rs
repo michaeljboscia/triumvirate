@@ -18,6 +18,15 @@ pub fn dead_drop_dir(root: &Path) -> PathBuf {
     root.join("dead-drop")
 }
 
+pub fn triumvirate_home_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(override_dir) = std::env::var("TRIUMVIRATE_HOME") {
+        return Ok(PathBuf::from(override_dir));
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?;
+    Ok(home.join(".triumvirate"))
+}
+
 pub fn create_dead_drop_ticket(
     root: &Path,
     agent: &str,
@@ -274,6 +283,14 @@ pub fn render_launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
     )
 }
 
+pub fn unix_time_ms() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 pub fn resolve_context(
     cwd: Option<&String>,
     repo: Option<&String>,
@@ -345,6 +362,7 @@ pub async fn acquire_project_queue(registry: &QueueRegistry, key: String) -> Arc
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use shared_types::MemoryEntry;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -474,5 +492,20 @@ mod tests {
         let plist = super::render_launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri");
         assert!(plist.contains("com.triumvirate.daemon-v2"));
         assert!(plist.contains("<string>daemon</string>"));
+    }
+
+    #[test]
+    fn home_dir_prefers_env_override() -> anyhow::Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let override_dir = std::env::temp_dir().join(format!("daemon-core-home-{now}"));
+        let override_dir_str = override_dir.display().to_string();
+
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &override_dir_str) };
+        let resolved = super::triumvirate_home_dir()?;
+        assert_eq!(resolved, PathBuf::from(&override_dir_str));
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        Ok(())
     }
 }

@@ -9,7 +9,8 @@ use daemon_core::{
     render_launch_agent_plist as core_render_launch_agent_plist,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
     read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
-    resolve_context as core_resolve_context, write_scratchpad as core_write_scratchpad, ensure_daemon_token as core_ensure_daemon_token,
+    resolve_context as core_resolve_context, triumvirate_home_dir as core_triumvirate_home_dir,
+    unix_time_ms as core_unix_time_ms, write_scratchpad as core_write_scratchpad, ensure_daemon_token as core_ensure_daemon_token,
     sessions_file_path as core_sessions_file_path, load_json_file as core_load_json_file,
     persist_json_file as core_persist_json_file,
 };
@@ -333,7 +334,7 @@ impl McpBridge {
             namespace: req.namespace,
             key: req.key,
             value: req.value,
-            ts_ms: now_ms(),
+            ts_ms: core_unix_time_ms(),
         };
         append_memory_entry(&entry).map_err(|e| format!("memory_write failed: {e}"))?;
         Ok(Json(MemoryWriteResponse {
@@ -504,7 +505,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
         ),
     }];
     if let Err(e) = append_outbox_event(&OutboxEvent {
-        ts_ms: now_ms(),
+        ts_ms: core_unix_time_ms(),
         request_id: request_id.clone(),
         tool: "ask_agent".to_string(),
         status: "SPAWNED".to_string(),
@@ -525,7 +526,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
         detail: format!("{agent} is processing request"),
     });
     if let Err(e) = append_outbox_event(&OutboxEvent {
-        ts_ms: now_ms(),
+        ts_ms: core_unix_time_ms(),
         request_id: request_id.clone(),
         tool: "ask_agent".to_string(),
         status: "WORKING".to_string(),
@@ -552,7 +553,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                     detail: format!("{agent} responded on attempt {}", idx + 1),
                 });
                 if let Err(e) = append_outbox_event(&OutboxEvent {
-                    ts_ms: now_ms(),
+                    ts_ms: core_unix_time_ms(),
                     request_id: request_id.clone(),
                     tool: "ask_agent".to_string(),
                     status: "DONE".to_string(),
@@ -593,7 +594,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                     ),
                 });
                 if let Err(e) = append_outbox_event(&OutboxEvent {
-                    ts_ms: now_ms(),
+                    ts_ms: core_unix_time_ms(),
                     request_id: request_id.clone(),
                     tool: "ask_agent".to_string(),
                     status: "RETRY".to_string(),
@@ -619,7 +620,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
         detail: format!("{} failed after {} attempts", agent, backoffs.len()),
     });
     if let Err(e) = append_outbox_event(&OutboxEvent {
-        ts_ms: now_ms(),
+        ts_ms: core_unix_time_ms(),
         request_id: request_id.clone(),
         tool: "ask_agent".to_string(),
         status: "FAILED".to_string(),
@@ -650,7 +651,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
             detail: format!("dead drop launched: {}", path.display()),
         });
         let _ = append_outbox_event(&OutboxEvent {
-            ts_ms: now_ms(),
+            ts_ms: core_unix_time_ms(),
             request_id: request_id.clone(),
             tool: "ask_agent".to_string(),
             status: "FALLBACK".to_string(),
@@ -700,7 +701,7 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
         },
     ];
     if let Err(e) = append_outbox_event(&OutboxEvent {
-        ts_ms: now_ms(),
+        ts_ms: core_unix_time_ms(),
         request_id: request_id.clone(),
         tool: "ask_twins".to_string(),
         status: "WORKING".to_string(),
@@ -732,7 +733,7 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 prompt_sent: gemini_prompt,
             });
             let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: now_ms(),
+                ts_ms: core_unix_time_ms(),
                 request_id: request_id.clone(),
                 tool: "ask_twins".to_string(),
                 status: "DONE".to_string(),
@@ -754,7 +755,7 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 detail,
             });
             let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: now_ms(),
+                ts_ms: core_unix_time_ms(),
                 request_id: request_id.clone(),
                 tool: "ask_twins".to_string(),
                 status: "FAILED".to_string(),
@@ -797,7 +798,7 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 prompt_sent: codex_prompt,
             });
             let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: now_ms(),
+                ts_ms: core_unix_time_ms(),
                 request_id: request_id.clone(),
                 tool: "ask_twins".to_string(),
                 status: "DONE".to_string(),
@@ -819,7 +820,7 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 detail,
             });
             let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: now_ms(),
+                ts_ms: core_unix_time_ms(),
                 request_id: request_id.clone(),
                 tool: "ask_twins".to_string(),
                 status: "FAILED".to_string(),
@@ -987,7 +988,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn run_install() -> anyhow::Result<()> {
-    let home = triumvirate_home_dir()?;
+    let home = core_triumvirate_home_dir()?;
     fs::create_dir_all(&home)?;
     let launch_agents = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?
@@ -1149,7 +1150,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             namespace: req.namespace,
             key: req.key,
             value: req.value,
-            ts_ms: now_ms(),
+            ts_ms: core_unix_time_ms(),
         };
         append_memory_entry(&entry).map_err(|e| {
             (
@@ -1350,25 +1351,16 @@ async fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn triumvirate_home_dir() -> anyhow::Result<PathBuf> {
-    if let Ok(override_dir) = std::env::var("TRIUMVIRATE_HOME") {
-        return Ok(PathBuf::from(override_dir));
-    }
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?;
-    Ok(home.join(".triumvirate"))
-}
-
 fn daemon_token_path() -> anyhow::Result<PathBuf> {
-    Ok(triumvirate_home_dir()?.join("daemon.token"))
+    Ok(core_triumvirate_home_dir()?.join("daemon.token"))
 }
 
 fn ensure_daemon_token() -> anyhow::Result<String> {
-    core_ensure_daemon_token(&triumvirate_home_dir()?)
+    core_ensure_daemon_token(&core_triumvirate_home_dir()?)
 }
 
 fn sessions_file_path() -> anyhow::Result<PathBuf> {
-    Ok(core_sessions_file_path(&triumvirate_home_dir()?))
+    Ok(core_sessions_file_path(&core_triumvirate_home_dir()?))
 }
 
 fn load_sessions(path: &PathBuf) -> anyhow::Result<HashMap<String, SessionState>> {
@@ -1393,35 +1385,33 @@ fn persist_sessions_if_enabled(
 }
 
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
-    core_append_outbox_event(&triumvirate_home_dir()?, event)
+    core_append_outbox_event(&core_triumvirate_home_dir()?, event)
 }
 
 fn read_outbox_events() -> anyhow::Result<Vec<OutboxEvent>> {
-    core_read_outbox_events(&triumvirate_home_dir()?)
+    core_read_outbox_events(&core_triumvirate_home_dir()?)
 }
 
 fn append_memory_entry(entry: &MemoryEntry) -> anyhow::Result<()> {
-    core_append_memory_entry(&triumvirate_home_dir()?, entry)
+    core_append_memory_entry(&core_triumvirate_home_dir()?, entry)
 }
 
 fn read_memory_entries() -> anyhow::Result<Vec<MemoryEntry>> {
-    core_read_memory_entries(&triumvirate_home_dir()?)
+    core_read_memory_entries(&core_triumvirate_home_dir()?)
 }
 
 fn write_scratchpad(project: &str, topic: &str, content: &str) -> anyhow::Result<PathBuf> {
-    core_write_scratchpad(&triumvirate_home_dir()?, project, topic, content, now_ms())
+    core_write_scratchpad(
+        &core_triumvirate_home_dir()?,
+        project,
+        topic,
+        content,
+        core_unix_time_ms(),
+    )
 }
 
 fn list_scratchpad(project: &str) -> anyhow::Result<Vec<PathBuf>> {
-    core_list_scratchpad(&triumvirate_home_dir()?, project)
-}
-
-fn now_ms() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    core_list_scratchpad(&core_triumvirate_home_dir()?, project)
 }
 
 fn spawn_dead_drop(
@@ -1434,7 +1424,7 @@ fn spawn_dead_drop(
 ) -> anyhow::Result<PathBuf> {
     let id = Uuid::new_v4().to_string();
     create_dead_drop_ticket(
-        &triumvirate_home_dir()?,
+        &core_triumvirate_home_dir()?,
         agent,
         message,
         reason,
@@ -1446,19 +1436,19 @@ fn spawn_dead_drop(
 }
 
 fn count_pending_fallbacks() -> anyhow::Result<usize> {
-    count_dead_drop_tickets(&triumvirate_home_dir()?)
+    count_dead_drop_tickets(&core_triumvirate_home_dir()?)
 }
 
 fn list_pending_fallback_paths(limit: usize) -> anyhow::Result<Vec<PathBuf>> {
-    list_dead_drop_tickets(&triumvirate_home_dir()?, limit)
+    list_dead_drop_tickets(&core_triumvirate_home_dir()?, limit)
 }
 
 fn acknowledge_fallback_path(path: &str) -> anyhow::Result<()> {
-    acknowledge_dead_drop_ticket(&triumvirate_home_dir()?, path)
+    acknowledge_dead_drop_ticket(&core_triumvirate_home_dir()?, path)
 }
 
 fn gc_fallbacks(max_age_days: u64) -> anyhow::Result<usize> {
-    gc_dead_drop_tickets(&triumvirate_home_dir()?, max_age_days)
+    gc_dead_drop_tickets(&core_triumvirate_home_dir()?, max_age_days)
 }
 
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -2983,7 +2973,7 @@ exit 1\n",
                 namespace: req.namespace,
                 key: req.key,
                 value: req.value,
-                ts_ms: now_ms(),
+                ts_ms: core_unix_time_ms(),
             });
             Ok(AxumJson(MemoryWriteResponse {
                 id,
