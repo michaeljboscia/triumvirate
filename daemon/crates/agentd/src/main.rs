@@ -12,7 +12,10 @@ use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
 
-use agent::{AgentConnector, ClaudeConnector, CodexConnector, GeminiConnector, HealthMonitor};
+use agent::{
+    AgentConnector, ClaudeConnector, CodexConnector, GeminiConnector, HealthMonitor,
+    SharedHealthRegistry,
+};
 use digest::DigestEngine;
 use fabric::MessageBus;
 use memory::MemoryStore;
@@ -67,7 +70,8 @@ async fn main() -> anyhow::Result<()> {
     info!(db = %cfg.db_path.display(), "memory store ready");
 
     // Steps 5-7: Spawn agent connectors
-    let mut health_monitor = HealthMonitor::new(bus.clone());
+    let health_registry = SharedHealthRegistry::default();
+    let mut health_monitor = HealthMonitor::new(bus.clone(), health_registry.clone());
     let mut agents_ready = 0u8;
     let mut agents_total = 0u8;
 
@@ -78,9 +82,17 @@ async fn main() -> anyhow::Result<()> {
         match claude.spawn(bus.clone()).await {
             Ok(()) if claude.health() == triumvirate_proto::HealthStatus::Ready => {
                 agents_ready += 1;
+                health_registry
+                    .set(claude.agent_id(), triumvirate_proto::HealthStatus::Ready)
+                    .await;
                 info!("claude: READY");
             }
-            Ok(()) => info!("claude: NOT READY (CLI not found)"),
+            Ok(()) => {
+                health_registry
+                    .set(claude.agent_id(), claude.health())
+                    .await;
+                info!("claude: NOT READY (CLI not found)");
+            }
             Err(e) => error!("claude: FAILED to spawn: {e}"),
         }
     }
@@ -92,9 +104,17 @@ async fn main() -> anyhow::Result<()> {
         match gemini.spawn(bus.clone()).await {
             Ok(()) if gemini.health() == triumvirate_proto::HealthStatus::Ready => {
                 agents_ready += 1;
+                health_registry
+                    .set(gemini.agent_id(), triumvirate_proto::HealthStatus::Ready)
+                    .await;
                 info!("gemini: READY");
             }
-            Ok(()) => info!("gemini: NOT READY (CLI not found)"),
+            Ok(()) => {
+                health_registry
+                    .set(gemini.agent_id(), gemini.health())
+                    .await;
+                info!("gemini: NOT READY (CLI not found)");
+            }
             Err(e) => error!("gemini: FAILED to spawn: {e}"),
         }
     }
@@ -106,9 +126,17 @@ async fn main() -> anyhow::Result<()> {
         match codex.spawn(bus.clone()).await {
             Ok(()) if codex.health() == triumvirate_proto::HealthStatus::Ready => {
                 agents_ready += 1;
+                health_registry
+                    .set(codex.agent_id(), triumvirate_proto::HealthStatus::Ready)
+                    .await;
                 info!("codex: READY");
             }
-            Ok(()) => info!("codex: NOT READY (CLI not found)"),
+            Ok(()) => {
+                health_registry
+                    .set(codex.agent_id(), codex.health())
+                    .await;
+                info!("codex: NOT READY (CLI not found)");
+            }
             Err(e) => error!("codex: FAILED to spawn: {e}"),
         }
     }
@@ -136,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.web_port
     );
 
-    web::start_web_server(bus, cfg.web_port).await?;
+    web::start_web_server(bus, health_registry, cfg.web_port).await?;
 
     Ok(())
 }

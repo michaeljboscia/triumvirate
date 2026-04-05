@@ -10,8 +10,9 @@ use rust_embed::Embed;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
-use triumvirate_proto::{AgentId, FabricMessage, Payload, Topic};
+use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
+use crate::agent::SharedHealthRegistry;
 use crate::fabric::MessageBus;
 use crate::routing::{RoutingDecision, decide_route};
 use crate::web::ws_handler;
@@ -27,14 +28,19 @@ struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     pub bus: Arc<MessageBus>,
+    pub health: SharedHealthRegistry,
 }
 
 /// Start the web dashboard server on the given port.
 ///
 /// Per GR1-D1: Web-Only UI — this is the exclusive conversation interface.
 /// Temporal UI at :8233 is accessible via "Developer Tools" link (GR1-D6).
-pub async fn start_web_server(bus: Arc<MessageBus>, port: u16) -> anyhow::Result<()> {
-    let state = AppState { bus };
+pub async fn start_web_server(
+    bus: Arc<MessageBus>,
+    health: SharedHealthRegistry,
+    port: u16,
+) -> anyhow::Result<()> {
+    let state = AppState { bus, health };
 
     let app = Router::new()
         .route("/", get(index_handler))
@@ -64,24 +70,37 @@ async fn index_handler() -> impl IntoResponse {
     }
 }
 
-async fn health_handler(State(_state): State<AppState>) -> impl IntoResponse {
-    // POC 1: Return basic health. POC 2+: Include per-agent health from bus.
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let statuses = state.health.snapshot().await;
+    let claude = status_label(statuses.get(&AgentId::Claude).copied().unwrap_or(HealthStatus::Starting));
+    let gemini = status_label(statuses.get(&AgentId::Gemini).copied().unwrap_or(HealthStatus::Starting));
+    let codex = status_label(statuses.get(&AgentId::Codex).copied().unwrap_or(HealthStatus::Starting));
+
+    let degraded = [claude, gemini, codex]
+        .iter()
+        .any(|status| *status == "dead" || *status == "unresponsive");
+
     axum::Json(serde_json::json!({
-        "status": "ok",
+        "status": if degraded { "degraded" } else { "ok" },
         "version": env!("CARGO_PKG_VERSION"),
         "agents": {
-            "claude": "ready",
-            "gemini": "ready",
-            "codex": "ready"
+            "claude": claude,
+            "gemini": gemini,
+            "codex": codex
         }
     }))
 }
 
-async fn agents_handler(State(_state): State<AppState>) -> impl IntoResponse {
+async fn agents_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let statuses = state.health.snapshot().await;
+    let claude = status_label(statuses.get(&AgentId::Claude).copied().unwrap_or(HealthStatus::Starting));
+    let gemini = status_label(statuses.get(&AgentId::Gemini).copied().unwrap_or(HealthStatus::Starting));
+    let codex = status_label(statuses.get(&AgentId::Codex).copied().unwrap_or(HealthStatus::Starting));
+
     axum::Json(serde_json::json!([
-        { "id": "claude", "name": "Claude", "model": "Opus 4.6", "status": "ready" },
-        { "id": "gemini", "name": "Gemini", "model": "Pro 2M", "status": "ready" },
-        { "id": "codex", "name": "Codex", "model": "GPT-5.2", "status": "ready" }
+        { "id": "claude", "name": "Claude", "model": "Opus 4.6", "status": claude },
+        { "id": "gemini", "name": "Gemini", "model": "Pro 2M", "status": gemini },
+        { "id": "codex", "name": "Codex", "model": "GPT-5.2", "status": codex }
     ]))
 }
 
@@ -201,6 +220,17 @@ async fn message_handler(
     }
 
     (StatusCode::ACCEPTED, Json(MessageResponse { accepted: true })).into_response()
+}
+
+fn status_label(status: HealthStatus) -> &'static str {
+    match status {
+        HealthStatus::Starting => "starting",
+        HealthStatus::Ready => "ready",
+        HealthStatus::Busy => "busy",
+        HealthStatus::Unresponsive => "unresponsive",
+        HealthStatus::Restarting => "restarting",
+        HealthStatus::Dead => "dead",
+    }
 }
 
 /// Serve embedded static files (CSS, JS, images).

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::watch;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
@@ -15,13 +16,15 @@ use crate::fabric::MessageBus;
 pub struct HealthMonitor {
     watchers: HashMap<AgentId, watch::Receiver<HealthStatus>>,
     bus: Arc<MessageBus>,
+    registry: SharedHealthRegistry,
 }
 
 impl HealthMonitor {
-    pub fn new(bus: Arc<MessageBus>) -> Self {
+    pub fn new(bus: Arc<MessageBus>, registry: SharedHealthRegistry) -> Self {
         Self {
             watchers: HashMap::new(),
             bus,
+            registry,
         }
     }
 
@@ -34,6 +37,7 @@ impl HealthMonitor {
     pub fn run(self) {
         for (agent, mut rx) in self.watchers {
             let bus = self.bus.clone();
+            let registry = self.registry.clone();
             tokio::spawn(async move {
                 let mut prev = *rx.borrow();
                 while rx.changed().await.is_ok() {
@@ -44,6 +48,7 @@ impl HealthMonitor {
                             HealthStatus::Dead => warn!(%agent, "agent dead"),
                             _ => info!(%agent, ?current, "health changed"),
                         }
+                        registry.set(agent, current).await;
 
                         let msg = FabricMessage::new(
                             AgentId::System,
@@ -60,5 +65,21 @@ impl HealthMonitor {
                 }
             });
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct SharedHealthRegistry {
+    inner: Arc<RwLock<HashMap<AgentId, HealthStatus>>>,
+}
+
+impl SharedHealthRegistry {
+    pub async fn set(&self, agent: AgentId, status: HealthStatus) {
+        let mut map = self.inner.write().await;
+        map.insert(agent, status);
+    }
+
+    pub async fn snapshot(&self) -> HashMap<AgentId, HealthStatus> {
+        self.inner.read().await.clone()
     }
 }
