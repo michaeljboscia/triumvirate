@@ -285,6 +285,25 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_url_uses_bind_addr_when_only_bind_is_set() {
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+            std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:8456");
+        }
+        assert_eq!(super::daemon_status_url(), "http://127.0.0.1:8456/status");
+        assert_eq!(
+            super::daemon_memory_read_url(),
+            "http://127.0.0.1:8456/memory/read"
+        );
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
+        }
+    }
+
+    #[test]
     fn connector_command_resolution_defaults_and_overrides() {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
