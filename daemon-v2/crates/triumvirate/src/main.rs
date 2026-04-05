@@ -113,6 +113,14 @@ struct SessionListResponse {
     sessions: Vec<SessionInfo>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+struct StatusResponse {
+    daemon_mode: String,
+    active_sessions: usize,
+    supported_agents: Vec<String>,
+    pending_fallbacks: usize,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
 struct AskSessionRequest {
     name: String,
@@ -355,6 +363,17 @@ impl McpBridge {
             .collect::<Vec<_>>();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Json(SessionListResponse { sessions: out })
+    }
+
+    #[tool(description = "Get current system status snapshot.")]
+    async fn get_status(&self) -> Json<StatusResponse> {
+        let sessions = self.sessions.lock().await;
+        Json(StatusResponse {
+            daemon_mode: "incremental-dev".to_string(),
+            active_sessions: sessions.len(),
+            supported_agents: vec!["gemini".to_string(), "codex".to_string()],
+            pending_fallbacks: 0,
+        })
     }
 }
 
@@ -843,6 +862,43 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_status_reports_active_sessions() -> anyhow::Result<()> {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let spawn_args = serde_json::json!({
+            "agent": "gemini",
+            "name": "status-session"
+        });
+        let _ = client
+            .call_tool(
+                CallToolRequestParams::new("spawn_session")
+                    .with_arguments(spawn_args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        let status = client
+            .call_tool(CallToolRequestParams::new("get_status"))
+            .await?;
+        let status_text = status
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(status_text.contains("\"active_sessions\":1"));
+        assert!(status_text.contains("\"supported_agents\":[\"gemini\",\"codex\"]"));
+
+        client.cancel().await?;
+        server_handle.await??;
         Ok(())
     }
 }
