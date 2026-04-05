@@ -154,6 +154,15 @@ struct StatusResponse {
     pending_fallbacks: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct DaemonHealthResponse {
+    status: String,
+    service: Option<String>,
+    mode: Option<String>,
+    daemon: Option<String>,
+    auth: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
 struct AskSessionRequest {
     name: String,
@@ -467,6 +476,14 @@ impl McpBridge {
             pending_fallbacks: 0,
         })
     }
+
+    #[tool(description = "Query daemon HTTP status using local bearer token.")]
+    async fn daemon_health(&self) -> Result<Json<DaemonHealthResponse>, String> {
+        fetch_daemon_status()
+            .await
+            .map(Json)
+            .map_err(|e| format!("daemon health query failed: {e}"))
+    }
 }
 
 fn gemini_command() -> (String, Vec<String>) {
@@ -700,6 +717,25 @@ fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
     value == expected
 }
 
+fn daemon_status_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080/status".to_string())
+}
+
+async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
+    let token = ensure_daemon_token()?;
+    let url = daemon_status_url();
+    let client = reqwest::Client::new();
+    let response = client.get(url).bearer_auth(token).send().await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("daemon responded with HTTP {}", response.status());
+    }
+
+    let json = response.json::<DaemonHealthResponse>().await?;
+    Ok(json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +743,7 @@ mod tests {
     use rmcp::model::CallToolRequestParams;
     use std::{
         fs,
+        net::SocketAddr,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::{Mutex, OnceLock},
@@ -1304,6 +1341,67 @@ exit 1\n",
         );
         assert!(is_authorized(&headers, token));
         assert!(!is_authorized(&headers, "wrong"));
+    }
+
+    #[tokio::test]
+    async fn daemon_health_uses_bearer_token() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-health-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "test-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn status_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+        ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(serde_json::json!({
+                "status": "ok",
+                "service": "test-daemon",
+                "mode": "test"
+            })))
+        }
+
+        let app = Router::new()
+            .route("/status", get(status_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_DAEMON_URL", format!("http://{addr}/status"));
+        }
+
+        let health = fetch_daemon_status().await?;
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.service.as_deref(), Some("test-daemon"));
+
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
     }
 
     #[tokio::test]
