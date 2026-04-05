@@ -314,6 +314,23 @@ A Rust binary (`triumvirate-agentd`) that orchestrates Claude, Gemini, and Codex
   - Configurable latency, error injection, response content
   - Used by CI and dev builds (feature flag `--features mock`)
 
+### Fleet Learning
+
+**FEAT-031: Machine-Readable Lessons Ledger**
+- REQ: REQ-7, REQ-3
+- Priority: P1
+- Description: SQLite-backed lessons table that captures what worked, what didn't, and why. Agents consume relevant lessons before every task. Confidence scores decay over time. The fleet gets smarter every session. Informed by Flotilla's structured lessons pattern.
+- Acceptance:
+  - `lessons` table in memory.db: decision, rationale, outcome (success/failure/partial), confidence_score (0.0-1.0), pattern, agent_source
+  - Daemon auto-logs failures when agent errors or retries exhaust
+  - Daemon auto-logs successes on non-obvious wins (agent self-reports via structured JSON)
+  - Before fleet fan-out: relevant lessons injected into agent prompts ("Previous attempt at X failed because Y")
+  - Confidence scores decay: lessons older than 7 days get 0.9x multiplier, 30 days get 0.5x
+  - Dashboard shows lessons ledger with filters by outcome, agent type, confidence
+  - Cross-model peer review can create lessons: "Gemini flagged Claude's approach as risky — lesson captured"
+  - `GET /api/lessons` returns filtered list
+  - `POST /api/lessons` for manual human-authored lessons
+
 ### Observability (LLM Layer)
 
 **FEAT-028: Prometheus Metrics Endpoint**
