@@ -1,16 +1,19 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use rust_embed::Embed;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+use triumvirate_proto::{AgentId, FabricMessage, Payload, Topic};
 
 use crate::fabric::MessageBus;
+use crate::web::ws_handler;
 
 /// Static assets embedded in the binary via rust-embed.
 /// In production, the Svelte build output goes here.
@@ -22,7 +25,7 @@ struct Assets;
 /// Shared state available to all HTTP handlers.
 #[derive(Clone)]
 pub struct AppState {
-    pub _bus: Arc<MessageBus>,
+    pub bus: Arc<MessageBus>,
 }
 
 /// Start the web dashboard server on the given port.
@@ -30,12 +33,14 @@ pub struct AppState {
 /// Per GR1-D1: Web-Only UI — this is the exclusive conversation interface.
 /// Temporal UI at :8233 is accessible via "Developer Tools" link (GR1-D6).
 pub async fn start_web_server(bus: Arc<MessageBus>, port: u16) -> anyhow::Result<()> {
-    let state = AppState { _bus: bus };
+    let state = AppState { bus };
 
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
+        .route("/api/message", post(message_handler))
+        .route("/ws", get(ws_handler))
         .fallback(static_handler)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -77,6 +82,41 @@ async fn agents_handler(State(_state): State<AppState>) -> impl IntoResponse {
         { "id": "gemini", "name": "Gemini", "model": "Pro 2M", "status": "ready" },
         { "id": "codex", "name": "Codex", "model": "GPT-5.2", "status": "ready" }
     ]))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MessageRequest {
+    content: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MessageResponse {
+    accepted: bool,
+}
+
+async fn message_handler(
+    State(state): State<AppState>,
+    Json(req): Json<MessageRequest>,
+) -> impl IntoResponse {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "content must not be empty" })),
+        )
+            .into_response();
+    }
+
+    state
+        .bus
+        .emit(FabricMessage::new(
+            AgentId::Human,
+            Topic::HumanInput,
+            Payload::HumanMessage { content },
+        ))
+        .await;
+
+    (StatusCode::ACCEPTED, Json(MessageResponse { accepted: true })).into_response()
 }
 
 /// Serve embedded static files (CSS, JS, images).
