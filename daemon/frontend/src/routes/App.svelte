@@ -136,9 +136,9 @@
 
 <style>
   .page {
-    max-width: 1080px;
-    margin: 2.5rem auto;
-    padding: 0 1rem 2rem;
+    max-width: 1920px;
+    margin: 1rem auto;
+    padding: 0 2rem 2rem;
     display: grid;
     gap: 1rem;
   }
@@ -149,6 +149,6 @@
   }
 
   .two-up {
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
   }
 </style>
