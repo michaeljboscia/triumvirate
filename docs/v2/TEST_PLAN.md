@@ -160,6 +160,41 @@ Every REQ has a test. No orphan REQs.
 | `test_per_instance_tracking` | Each instance tracked separately | claude-1 and claude-2 both used | Separate counts in routing_log |
 | `test_per_type_aggregation` | Type-level quota aggregates instances | claude-1: 40%, claude-2: 45% | Claude type: 85% → threshold exceeded |
 
+### Metrics (daemon/crates/agentd/src/metrics.rs)
+
+| Test | What It Verifies | Input | Expected |
+|------|-----------------|-------|----------|
+| `test_metrics_endpoint_returns_prometheus` | /metrics serves Prometheus format | GET /metrics | Response contains `# HELP`, `# TYPE`, metric lines |
+| `test_agent_turn_histogram` | Latency recorded per turn | Complete 3 Claude turns | `agent_turn_duration_seconds` histogram has 3 observations |
+| `test_token_counters` | Input/output tokens counted | Claude response with 100 input, 50 output tokens | `agent_tokens_total{direction="input"}` = 100, output = 50 |
+| `test_error_counter` | Errors counted by type | Trigger parse failure | `agent_errors_total{error_type="parse_failure"}` incremented |
+| `test_active_connections_gauge` | Connection count accurate | Spawn 3 agents | `agent_active_connections` = 3. Kill one → 2 |
+| `test_fabric_message_counter` | Fabric throughput tracked | Emit 100 messages | `fabric_messages_total` = 100 |
+| `test_quota_gauge` | Quota percentage exported | Claude at 45% | `quota_usage_percent{agent_type="claude"}` = 45 |
+
+### Langfuse Integration (daemon/crates/agentd/src/langfuse.rs)
+
+| Test | What It Verifies | Input | Expected |
+|------|-----------------|-------|----------|
+| `test_langfuse_trace_created` | Every turn creates a trace | Complete Claude turn | HTTP POST to Langfuse /api/public/ingestion with trace data |
+| `test_langfuse_generation_logged` | Token counts and cost sent | Response with 500 input, 200 output tokens | Generation record has model, tokens, cost_usd |
+| `test_langfuse_session_linked` | Traces share session_id | 3 turns in same session | All 3 traces have same sessionId |
+| `test_langfuse_fleet_parent_span` | Fleet tasks grouped | Fleet with 3 agents | Parent trace for fleet, child traces per agent |
+| `test_langfuse_unreachable` | Doesn't block agent turns | Langfuse host unreachable | Warning logged, agent turn completes normally, no timeout |
+| `test_langfuse_disabled` | Config toggle works | `[langfuse] enabled = false` | No HTTP calls to Langfuse, no errors |
+| `test_langfuse_cost_calculation` | Correct dollar amounts | Claude Opus: 500 input, 200 output tokens | Cost = (500 * 5 / 1M) + (200 * 25 / 1M) = $0.0075 |
+
+### Cost Attribution (daemon/crates/agentd/src/cost.rs)
+
+| Test | What It Verifies | Input | Expected |
+|------|-----------------|-------|----------|
+| `test_per_turn_cost` | Cost calculated per turn | Claude turn with known tokens | cost_usd populated in routing_log |
+| `test_per_task_cost` | Task cost = sum of turns | Task with 5 turns | Task cost = sum of 5 turn costs |
+| `test_per_fleet_cost` | Fleet cost = sum of tasks | Fleet with 3 tasks | Fleet cost = sum of 3 task costs |
+| `test_per_session_cost` | Session cost = everything | Full session | Session cost = sum of all routing_log cost_usd |
+| `test_pricing_table_configurable` | Custom prices from config | `[pricing] claude_input_per_mtok = 10.0` | Cost uses custom rate, not default |
+| `test_gemini_free_tier` | Gemini subscription = $0 | Gemini turn | cost_usd = 0.0 (subscription, not API) |
+
 ### Digest System (daemon/crates/agentd/src/digest.rs)
 
 | Test | What It Verifies | Input | Expected |
