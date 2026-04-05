@@ -94,6 +94,12 @@ Read `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` for exact cur
 - **Stenographer** — mechanical extraction from structured JSON (NO LLM summarization)
 - **Dashboard** — axum + Svelte + Tailwind (rust-embed), tasks view + agents view
 
+**Commenting rules:**
+- Every public item gets a `///` doc comment
+- Inline `//` for non-obvious logic — if you had to think about it, comment it
+- Borrowed patterns get attribution: `// Adapted from Ruflo's cost-router (ruvnet/ruflo, MIT)`
+- FEAT-ID at the top of each module: `// FEAT-002: Claude Connector`
+
 **Critical constraints:**
 - NO PTY for agent communication — piped stdio only (GR2-D2)
 - NO LLM-generated summaries — mechanical extraction only (REQ-2)
