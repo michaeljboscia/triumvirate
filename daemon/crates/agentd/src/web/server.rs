@@ -70,6 +70,9 @@ pub async fn start_web_server(
         .route("/api/agents", get(agents_handler))
         .route("/api/governance/check", post(governance_check_handler))
         .route("/api/debate/start", post(debate_start_handler))
+        .route("/api/debate/challenge", post(debate_challenge_handler))
+        .route("/api/debate/vote", post(debate_vote_handler))
+        .route("/api/debate/complete", post(debate_complete_handler))
         .route("/api/quota", get(quota_handler))
         .route("/api/workflows", get(workflows_handler))
         .route("/api/decisions", get(decisions_handler))
@@ -221,6 +224,133 @@ async fn debate_start_handler(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("failed to start debate workflow: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DebateChallengeRequest {
+    workflow_id: String,
+    challenger: String,
+    argument: String,
+}
+
+async fn debate_challenge_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DebateChallengeRequest>,
+) -> impl IntoResponse {
+    let workflow_id = req.workflow_id.trim();
+    let challenger = req.challenger.trim();
+    let argument = req.argument.trim();
+    if workflow_id.is_empty() || challenger.is_empty() || argument.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "workflow_id, challenger, and argument are required" })),
+        )
+            .into_response();
+    }
+
+    match WorkflowEngine::open(&state.workflow_db_path).and_then(|engine| {
+        let debate = DebateWorkflow::attach(&engine, workflow_id.to_string());
+        debate.record_challenge(challenger, argument)
+    }) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "accepted": true,
+                "workflow_id": workflow_id,
+                "phase": "challenge",
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to record challenge: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DebateVoteRequest {
+    workflow_id: String,
+    voter: String,
+    vote: String,
+}
+
+async fn debate_vote_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DebateVoteRequest>,
+) -> impl IntoResponse {
+    let workflow_id = req.workflow_id.trim();
+    let voter = req.voter.trim();
+    let vote = req.vote.trim();
+    if workflow_id.is_empty() || voter.is_empty() || vote.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "workflow_id, voter, and vote are required" })),
+        )
+            .into_response();
+    }
+
+    match WorkflowEngine::open(&state.workflow_db_path).and_then(|engine| {
+        let debate = DebateWorkflow::attach(&engine, workflow_id.to_string());
+        debate.record_vote(voter, vote)
+    }) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "accepted": true,
+                "workflow_id": workflow_id,
+                "phase": "vote",
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to record vote: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DebateCompleteRequest {
+    workflow_id: String,
+    decision: String,
+}
+
+async fn debate_complete_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DebateCompleteRequest>,
+) -> impl IntoResponse {
+    let workflow_id = req.workflow_id.trim();
+    let decision = req.decision.trim();
+    if workflow_id.is_empty() || decision.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "workflow_id and decision are required" })),
+        )
+            .into_response();
+    }
+
+    match WorkflowEngine::open(&state.workflow_db_path).and_then(|engine| {
+        let debate = DebateWorkflow::attach(&engine, workflow_id.to_string());
+        debate.complete(decision)
+    }) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "accepted": true,
+                "workflow_id": workflow_id,
+                "phase": "completed",
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to complete debate: {e}") })),
         )
             .into_response(),
     }
