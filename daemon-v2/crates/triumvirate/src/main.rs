@@ -176,8 +176,9 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskAgentRequest>,
     ) -> Result<Json<AskAgentResponse>, String> {
-        if req.agent.to_lowercase() != "gemini" {
-            return Err("Increment 1b currently supports only agent='gemini'".to_string());
+        let agent = req.agent.to_lowercase();
+        if agent != "gemini" && agent != "codex" {
+            return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
         }
 
         // Increment 1b emits lifecycle states in-band so Claude can render user-visible progress
@@ -185,7 +186,8 @@ impl McpBridge {
         let mut lifecycle = vec![LifecycleEvent {
             state: "SPAWNED".to_string(),
             detail: format!(
-                "Started Gemini connector{}{}{}",
+                "Started {} connector{}{}{}",
+                agent,
                 req.cwd
                     .as_ref()
                     .map(|v| format!(" cwd={v}"))
@@ -203,21 +205,21 @@ impl McpBridge {
 
         lifecycle.push(LifecycleEvent {
             state: "WORKING".to_string(),
-            detail: "Gemini is processing request".to_string(),
+            detail: format!("{agent} is processing request"),
         });
 
         let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
         let mut last_err: Option<String> = None;
 
         for (idx, backoff) in backoffs.iter().enumerate() {
-            match run_gemini_mock(&req.message).await {
+            match run_named_agent(&agent, &req.message).await {
                 Ok(response) => {
                     lifecycle.push(LifecycleEvent {
                         state: "DONE".to_string(),
-                        detail: format!("Gemini responded on attempt {}", idx + 1),
+                        detail: format!("{agent} responded on attempt {}", idx + 1),
                     });
                     return Ok(Json(AskAgentResponse {
-                        agent: "gemini".to_string(),
+                        agent: agent.clone(),
                         response,
                         lifecycle,
                     }));
@@ -227,12 +229,18 @@ impl McpBridge {
                     if msg.contains("timed out") {
                         lifecycle.push(LifecycleEvent {
                             state: "TIMEOUT".to_string(),
-                            detail: format!("Gemini timed out on attempt {}", idx + 1),
+                            detail: format!("{agent} timed out on attempt {}", idx + 1),
                         });
                     }
                     lifecycle.push(LifecycleEvent {
                         state: "RETRY".to_string(),
-                        detail: format!("Retrying Gemini ({}/{}) after {}", idx + 1, backoffs.len(), msg),
+                        detail: format!(
+                            "Retrying {} ({}/{}) after {}",
+                            agent,
+                            idx + 1,
+                            backoffs.len(),
+                            msg
+                        ),
                     });
                     last_err = Some(msg);
                     sleep(*backoff).await;
@@ -243,7 +251,8 @@ impl McpBridge {
         lifecycle.push(LifecycleEvent {
             state: "FAILED".to_string(),
             detail: format!(
-                "Gemini failed after {} attempts",
+                "{} failed after {} attempts",
+                agent,
                 backoffs.len()
             ),
         });
@@ -423,11 +432,6 @@ fn gemini_command() -> (String, Vec<String>) {
         .map(|v| v.split_whitespace().map(ToString::to_string).collect())
         .unwrap_or_else(|_| Vec::new());
     (bin, args)
-}
-
-async fn run_gemini_mock(message: &str) -> anyhow::Result<String> {
-    let (bin, args) = gemini_command();
-    run_agent_process(&bin, &args, message).await
 }
 
 fn codex_command() -> (String, Vec<String>) {
@@ -832,6 +836,66 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_codex_happy_path_returns_lifecycle() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let script_path = write_mock_agent_script("codex", 0.0)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "agent": "codex",
+            "message": "implement auth",
+            "cwd": "/tmp/project",
+            "repo": "triumvirate",
+            "branch": "feat/mcp-first"
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_agent")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+
+        assert!(raw_text.contains("codex done"));
+        assert!(raw_text.contains("SPAWNED"));
+        assert!(raw_text.contains("WORKING"));
+        assert!(raw_text.contains("DONE"));
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        let _ = fs::remove_file(script_path);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
         }
         Ok(())
     }
