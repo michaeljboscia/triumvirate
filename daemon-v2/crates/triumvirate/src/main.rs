@@ -47,6 +47,8 @@ enum CliCommand {
     Daemon,
     /// Install launchd configuration for zero-ceremony daemon startup.
     Install,
+    /// Print daemon health and status snapshot.
+    Status,
 }
 
 #[derive(Debug, Clone)]
@@ -1131,6 +1133,14 @@ async fn main() -> anyhow::Result<()> {
         }
         CliCommand::Install => {
             run_install()?;
+        }
+        CliCommand::Status => {
+            let health = fetch_daemon_status().await?;
+            let snapshot = fetch_daemon_status_snapshot().await?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "health": health,
+                "snapshot": snapshot
+            }))?);
         }
     }
 
@@ -2841,6 +2851,12 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN");
         }
         Ok(())
+    }
+
+    #[test]
+    fn cli_parses_status_subcommand() {
+        let cli = Cli::try_parse_from(["triumvirate", "status"]).expect("status should parse");
+        assert!(matches!(cli.command, CliCommand::Status));
     }
 
     #[test]
