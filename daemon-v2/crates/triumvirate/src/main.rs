@@ -1005,12 +1005,8 @@ fn run_install() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn launchd_plist_path() -> anyhow::Result<PathBuf> {
-    core_launchd_plist_path()
-}
-
 fn run_uninstall() -> anyhow::Result<()> {
-    let plist_path = launchd_plist_path()?;
+    let plist_path = core_launchd_plist_path()?;
     if plist_path.exists() {
         fs::remove_file(&plist_path)?;
         println!("Removed launchd plist at {}", plist_path.display());
@@ -1023,7 +1019,7 @@ fn run_uninstall() -> anyhow::Result<()> {
 
 async fn run_doctor() -> anyhow::Result<()> {
     let token_path = core_triumvirate_home_dir()?.join("daemon.token");
-    let plist_path = launchd_plist_path()?;
+    let plist_path = core_launchd_plist_path()?;
     let daemon_health = fetch_daemon_status().await.ok();
     let report = serde_json::json!({
         "token_file_exists": token_path.exists(),
