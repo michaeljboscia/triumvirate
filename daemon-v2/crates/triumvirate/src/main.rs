@@ -13,11 +13,15 @@ use rmcp::{
     transport::stdio,
 };
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -1448,18 +1452,94 @@ fn daemon_status_url() -> String {
         .unwrap_or_else(|_| format!("{}/status", daemon_base_url()))
 }
 
-async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
-    let token = ensure_daemon_token()?;
-    let url = daemon_status_url();
-    let client = reqwest::Client::new();
-    let response = client.get(url).bearer_auth(token).send().await?;
+static DAEMON_AUTOSTART_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-    if !response.status().is_success() {
-        anyhow::bail!("daemon responded with HTTP {}", response.status());
+fn daemon_autostart_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_DAEMON_AUTOSTART")
+        .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
+    if !daemon_autostart_enabled() {
+        return Ok(false);
+    }
+    if DAEMON_AUTOSTART_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        return Ok(false);
     }
 
-    let json = response.json::<DaemonHealthResponse>().await?;
-    Ok(json)
+    let exe = std::env::current_exe()?;
+    let _child = std::process::Command::new(exe)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(true)
+}
+
+async fn daemon_get_json<T: DeserializeOwned>(url: String) -> anyhow::Result<T> {
+    let token = ensure_daemon_token()?;
+    let client = reqwest::Client::new();
+
+    let first = client.get(&url).bearer_auth(&token).send().await;
+    match first {
+        Ok(response) => {
+            if !response.status().is_success() {
+                anyhow::bail!("daemon responded with HTTP {}", response.status());
+            }
+            return Ok(response.json::<T>().await?);
+        }
+        Err(_) => {
+            if attempt_daemon_autostart_once().unwrap_or(false) {
+                sleep(Duration::from_millis(300)).await;
+                let retry = client.get(&url).bearer_auth(token).send().await?;
+                if !retry.status().is_success() {
+                    anyhow::bail!("daemon responded with HTTP {}", retry.status());
+                }
+                return Ok(retry.json::<T>().await?);
+            }
+        }
+    }
+    anyhow::bail!("daemon request failed");
+}
+
+async fn daemon_post_json<TReq: serde::Serialize, TResp: DeserializeOwned>(
+    url: String,
+    payload: &TReq,
+) -> anyhow::Result<TResp> {
+    let token = ensure_daemon_token()?;
+    let client = reqwest::Client::new();
+
+    let first = client.post(&url).bearer_auth(&token).json(payload).send().await;
+    match first {
+        Ok(response) => {
+            if !response.status().is_success() {
+                anyhow::bail!("daemon responded with HTTP {}", response.status());
+            }
+            return Ok(response.json::<TResp>().await?);
+        }
+        Err(_) => {
+            if attempt_daemon_autostart_once().unwrap_or(false) {
+                sleep(Duration::from_millis(300)).await;
+                let retry = client
+                    .post(&url)
+                    .bearer_auth(token)
+                    .json(payload)
+                    .send()
+                    .await?;
+                if !retry.status().is_success() {
+                    anyhow::bail!("daemon responded with HTTP {}", retry.status());
+                }
+                return Ok(retry.json::<TResp>().await?);
+            }
+        }
+    }
+    anyhow::bail!("daemon request failed");
+}
+
+async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
+    daemon_get_json::<DaemonHealthResponse>(daemon_status_url()).await
 }
 
 fn daemon_base_url() -> String {
@@ -1498,89 +1578,39 @@ fn daemon_scratchpad_list_url() -> String {
 }
 
 async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
-    let token = ensure_daemon_token()?;
-    let url = daemon_ask_agent_url();
-    let client = reqwest::Client::new();
-    let response = client.post(url).bearer_auth(token).json(req).send().await?;
-    if !response.status().is_success() {
-        anyhow::bail!("daemon responded with HTTP {}", response.status());
-    }
-    Ok(response.json::<AskAgentResponse>().await?)
+    daemon_post_json::<AskAgentRequest, AskAgentResponse>(daemon_ask_agent_url(), req).await
 }
 
 async fn fetch_daemon_ask_twins(req: &AskTwinsRequest) -> anyhow::Result<AskTwinsResponse> {
-    let token = ensure_daemon_token()?;
-    let url = daemon_ask_twins_url();
-    let client = reqwest::Client::new();
-    let response = client.post(url).bearer_auth(token).json(req).send().await?;
-    if !response.status().is_success() {
-        anyhow::bail!("daemon responded with HTTP {}", response.status());
-    }
-    Ok(response.json::<AskTwinsResponse>().await?)
+    daemon_post_json::<AskTwinsRequest, AskTwinsResponse>(daemon_ask_twins_url(), req).await
 }
 
 async fn fetch_daemon_memory_write(req: &MemoryWriteRequest) -> anyhow::Result<MemoryWriteResponse> {
-    let token = ensure_daemon_token()?;
-    let client = reqwest::Client::new();
-    let response = client
-        .post(daemon_memory_write_url())
-        .bearer_auth(token)
-        .json(req)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!("daemon responded with HTTP {}", response.status());
-    }
-    Ok(response.json::<MemoryWriteResponse>().await?)
+    daemon_post_json::<MemoryWriteRequest, MemoryWriteResponse>(daemon_memory_write_url(), req).await
 }
 
 async fn fetch_daemon_memory_read(req: &MemoryReadRequest) -> anyhow::Result<MemoryReadResponse> {
-    let token = ensure_daemon_token()?;
-    let client = reqwest::Client::new();
-    let response = client
-        .post(daemon_memory_read_url())
-        .bearer_auth(token)
-        .json(req)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!("daemon responded with HTTP {}", response.status());
-    }
-    Ok(response.json::<MemoryReadResponse>().await?)
+    daemon_post_json::<MemoryReadRequest, MemoryReadResponse>(daemon_memory_read_url(), req).await
 }
 
 async fn fetch_daemon_scratchpad_write(
     req: &ScratchpadWriteRequest,
 ) -> anyhow::Result<ScratchpadWriteResponse> {
-    let token = ensure_daemon_token()?;
-    let client = reqwest::Client::new();
-    let response = client
-        .post(daemon_scratchpad_write_url())
-        .bearer_auth(token)
-        .json(req)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!("daemon responded with HTTP {}", response.status());
-    }
-    Ok(response.json::<ScratchpadWriteResponse>().await?)
+    daemon_post_json::<ScratchpadWriteRequest, ScratchpadWriteResponse>(
+        daemon_scratchpad_write_url(),
+        req,
+    )
+    .await
 }
 
 async fn fetch_daemon_scratchpad_list(
     req: &ScratchpadListRequest,
 ) -> anyhow::Result<ScratchpadListResponse> {
-    let token = ensure_daemon_token()?;
-    let client = reqwest::Client::new();
-    let response = client
-        .post(daemon_scratchpad_list_url())
-        .bearer_auth(token)
-        .json(req)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!("daemon responded with HTTP {}", response.status());
-    }
-    Ok(response.json::<ScratchpadListResponse>().await?)
+    daemon_post_json::<ScratchpadListRequest, ScratchpadListResponse>(
+        daemon_scratchpad_list_url(),
+        req,
+    )
+    .await
 }
 
 #[cfg(test)]
