@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use daemon_core::{
-    acknowledge_dead_drop_ticket, count_dead_drop_tickets, create_dead_drop_ticket,
-    gc_dead_drop_tickets, list_dead_drop_tickets,
+    acknowledge_dead_drop_ticket, append_memory_entry as core_append_memory_entry,
+    count_dead_drop_tickets, create_dead_drop_ticket, gc_dead_drop_tickets,
+    list_dead_drop_tickets, list_scratchpad as core_list_scratchpad,
+    read_memory_entries as core_read_memory_entries, write_scratchpad as core_write_scratchpad,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -1473,14 +1475,6 @@ fn outbox_file_path() -> anyhow::Result<PathBuf> {
     Ok(triumvirate_home_dir()?.join("outbox.jsonl"))
 }
 
-fn memory_file_path() -> anyhow::Result<PathBuf> {
-    Ok(triumvirate_home_dir()?.join("memory.jsonl"))
-}
-
-fn scratchpad_root_path() -> anyhow::Result<PathBuf> {
-    Ok(triumvirate_home_dir()?.join("scratchpad"))
-}
-
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
     let path = outbox_file_path()?;
     if let Some(parent) = path.parent() {
@@ -1516,75 +1510,19 @@ fn read_outbox_events() -> anyhow::Result<Vec<OutboxEvent>> {
 }
 
 fn append_memory_entry(entry: &MemoryEntry) -> anyhow::Result<()> {
-    // JSONL keeps append-only writes simple and resilient without schema migrations for this phase.
-    let path = memory_file_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut line = serde_json::to_string(entry)?;
-    line.push('\n');
-    use std::io::Write as _;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    file.write_all(line.as_bytes())?;
-    Ok(())
+    core_append_memory_entry(&triumvirate_home_dir()?, entry)
 }
 
 fn read_memory_entries() -> anyhow::Result<Vec<MemoryEntry>> {
-    let path = memory_file_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let body = fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for line in body.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<MemoryEntry>(line) {
-            out.push(entry);
-        }
-    }
-    Ok(out)
+    core_read_memory_entries(&triumvirate_home_dir()?)
 }
 
 fn write_scratchpad(project: &str, topic: &str, content: &str) -> anyhow::Result<PathBuf> {
-    let safe_project = sanitize_name(project);
-    let safe_topic = sanitize_name(topic);
-    let dir = scratchpad_root_path()?.join(safe_project);
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}-{}.md", now_ms(), safe_topic));
-    fs::write(&path, content)?;
-    Ok(path)
+    core_write_scratchpad(&triumvirate_home_dir()?, project, topic, content, now_ms())
 }
 
 fn list_scratchpad(project: &str) -> anyhow::Result<Vec<PathBuf>> {
-    let safe_project = sanitize_name(project);
-    let dir = scratchpad_root_path()?.join(safe_project);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = fs::read_dir(dir)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .collect::<Vec<_>>();
-    files.sort();
-    Ok(files)
-}
-
-fn sanitize_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
+    core_list_scratchpad(&triumvirate_home_dir()?, project)
 }
 
 fn resolve_context(
