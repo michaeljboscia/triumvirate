@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use self::watcher::spawn_file_watcher;
 use crate::fabric::MessageBus;
+use crate::memory::extract_decisions;
 
 /// Stenographer — mechanical extraction of session facts from the fabric.
 ///
@@ -110,6 +111,7 @@ impl Stenographer {
 
         if let Some(conn) = db_conn {
             self.maybe_log_routing(conn, msg);
+            self.maybe_log_decisions(conn, msg);
         }
     }
 
@@ -144,6 +146,38 @@ impl Stenographer {
             ],
         ) {
             warn!(error = %e, "failed to write routing_log row");
+        }
+    }
+
+    fn maybe_log_decisions(&self, conn: &Connection, msg: &FabricMessage) {
+        let source_agent = match msg.topic {
+            Topic::AgentOutput(agent) => agent,
+            _ => return,
+        };
+
+        let content = match &msg.payload {
+            Payload::AgentResponse { content, .. } => content.as_str(),
+            Payload::TextChunk {
+                content,
+                is_final: true,
+            } => content.as_str(),
+            _ => return,
+        };
+
+        let decisions = extract_decisions(content);
+        for decision in decisions {
+            if let Err(e) = conn.execute(
+                "INSERT INTO decisions (session_id, decision_text, proposed_by, evidence)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    self.session_id.to_string(),
+                    decision,
+                    source_agent.to_string(),
+                    msg.id.to_string(),
+                ],
+            ) {
+                warn!(error = %e, "failed to write decision row");
+            }
         }
     }
 }
