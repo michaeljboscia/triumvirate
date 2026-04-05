@@ -153,6 +153,32 @@ pub struct OutboxRecentResponse {
     pub events: Vec<OutboxEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonHealthResponse {
+    pub status: String,
+    pub service: Option<String>,
+    pub mode: Option<String>,
+    pub daemon: Option<String>,
+    pub auth: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonStatusSnapshot {
+    pub daemon_mode: Option<String>,
+    pub supported_agents: Option<Vec<String>>,
+    pub pending_fallbacks: Option<usize>,
+    pub fallback_tickets: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StatusResponse {
+    pub daemon_mode: String,
+    pub active_sessions: usize,
+    pub supported_agents: Vec<String>,
+    pub pending_fallbacks: usize,
+    pub fallback_tickets: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
