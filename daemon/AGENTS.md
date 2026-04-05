@@ -6,25 +6,27 @@
 
 ## Session Startup
 
-1. Read `docs/v2/progress.txt` — where is the project
-2. Read `docs/v2/IMPLEMENTATION_PLAN.md` — what phase/step is next
-3. Read `docs/v2/LESSONS.md` — mistakes to avoid
-4. Read `docs/v2/TEST_PLAN.md` — what tests to write alongside code
+1. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` — where is the project
+2. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` — what phase/step is next
+3. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/LESSONS.md` — mistakes to avoid
+4. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/TEST_PLAN.md` — what tests to write alongside code
 
 ## Canonical Docs
 
-All at `/Users/mikeboscia/projects/triumvirate/docs/v2/`:
-
-| Doc | What You Need It For |
-|-----|---------------------|
-| PRD.md | Feature specs with FEAT-IDs and acceptance criteria |
-| BACKEND_STRUCTURE.md | SQLite schema (copy exactly), REST API shapes, agent JSON protocols |
-| TECH_STACK.md | Exact crate versions — do NOT upgrade without approval |
-| IMPLEMENTATION_PLAN.md | Phase/step you're working on, exact file paths |
-| TEST_PLAN.md | Test cases to implement alongside each feature |
-| DESIGN_SYSTEM.md | UI tokens (if working on frontend) |
-| FRONTEND_GUIDELINES.md | Svelte component architecture (if working on frontend) |
-| BUILD.md | How to compile, run, test |
+| Doc | Full Path |
+|-----|-----------|
+| SPEC | `/Users/mikeboscia/projects/triumvirate/SPEC.md` |
+| PRD | `/Users/mikeboscia/projects/triumvirate/docs/v2/PRD.md` |
+| BACKEND_STRUCTURE | `/Users/mikeboscia/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md` |
+| TECH_STACK | `/Users/mikeboscia/projects/triumvirate/docs/v2/TECH_STACK.md` |
+| IMPLEMENTATION_PLAN | `/Users/mikeboscia/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` |
+| TEST_PLAN | `/Users/mikeboscia/projects/triumvirate/docs/v2/TEST_PLAN.md` |
+| DESIGN_SYSTEM | `/Users/mikeboscia/projects/triumvirate/docs/v2/DESIGN_SYSTEM.md` |
+| FRONTEND_GUIDELINES | `/Users/mikeboscia/projects/triumvirate/docs/v2/FRONTEND_GUIDELINES.md` |
+| APP_FLOW | `/Users/mikeboscia/projects/triumvirate/docs/v2/APP_FLOW.md` |
+| BUILD | `/Users/mikeboscia/projects/triumvirate/daemon/BUILD.md` |
+| progress | `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` |
+| LESSONS | `/Users/mikeboscia/projects/triumvirate/docs/v2/LESSONS.md` |
 
 ## Architecture Summary
 
