@@ -78,6 +78,11 @@ pub fn daemon_status_url() -> String {
         .unwrap_or_else(|_| format!("{}/status", daemon_base_url()))
 }
 
+pub fn daemon_health_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_HEALTH_URL")
+        .unwrap_or_else(|_| format!("{}/health", daemon_base_url()))
+}
+
 pub fn daemon_ask_agent_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL")
         .unwrap_or_else(|_| format!("{}/ask-agent", daemon_base_url()))
@@ -249,6 +254,7 @@ mod tests {
         }
 
         assert_eq!(super::daemon_base_url(), "http://127.0.0.1:8080");
+        assert_eq!(super::daemon_health_url(), "http://127.0.0.1:8080/health");
         assert_eq!(super::daemon_status_url(), "http://127.0.0.1:8080/status");
         assert_eq!(
             super::daemon_ask_agent_url(),
@@ -259,6 +265,7 @@ mod tests {
         unsafe {
             std::env::set_var("TRIUMVIRATE_DAEMON_BASE_URL", "http://127.0.0.1:9000");
             std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:9005");
+            std::env::set_var("TRIUMVIRATE_DAEMON_HEALTH_URL", "http://127.0.0.1:9001/health");
             std::env::set_var("TRIUMVIRATE_DAEMON_URL", "http://127.0.0.1:9001/status");
             std::env::set_var(
                 "TRIUMVIRATE_DAEMON_ASK_AGENT_URL",
@@ -267,6 +274,7 @@ mod tests {
         }
 
         assert_eq!(super::daemon_base_url(), "http://127.0.0.1:9000");
+        assert_eq!(super::daemon_health_url(), "http://127.0.0.1:9001/health");
         assert_eq!(super::daemon_status_url(), "http://127.0.0.1:9001/status");
         assert_eq!(super::daemon_ask_agent_url(), "http://127.0.0.1:9002/ask-agent");
 
@@ -274,6 +282,7 @@ mod tests {
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_HEALTH_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
         }
@@ -301,9 +310,11 @@ mod tests {
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_HEALTH_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL");
             std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:8456");
         }
+        assert_eq!(super::daemon_health_url(), "http://127.0.0.1:8456/health");
         assert_eq!(super::daemon_status_url(), "http://127.0.0.1:8456/status");
         assert_eq!(
             super::daemon_memory_read_url(),
@@ -313,6 +324,7 @@ mod tests {
         unsafe {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
             std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_HEALTH_URL");
         }
     }
 
