@@ -181,4 +181,4 @@ Topics: multi-agent coordination landscape, CLI deep dives (Claude/Gemini/Codex)
 
 ## License
 
-MIT
+[FSL-1.1-ALv2](LICENSE) (Functional Source License 1.1, Apache 2.0 Future License)
