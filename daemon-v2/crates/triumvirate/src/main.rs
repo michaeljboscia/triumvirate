@@ -124,6 +124,7 @@ struct AgentResult {
 #[derive(Debug, Clone, serde::Serialize, JsonSchema)]
 struct AskTwinsResponse {
     results: Vec<AgentResult>,
+    failures: Vec<LifecycleEvent>,
     lifecycle: Vec<LifecycleEvent>,
 }
 
@@ -296,31 +297,73 @@ impl McpBridge {
         let codex_fut = run_named_agent("codex", &codex_prompt);
         let (gemini_out, codex_out) = tokio::join!(gemini_fut, codex_fut);
 
-        let gemini_out = gemini_out.map_err(|e| format!("Gemini failed: {e}"))?;
-        lifecycle.push(LifecycleEvent {
-            state: "DONE".to_string(),
-            detail: "Gemini responded".to_string(),
-        });
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
 
-        let codex_out = codex_out.map_err(|e| format!("Codex failed: {e}"))?;
-        lifecycle.push(LifecycleEvent {
-            state: "DONE".to_string(),
-            detail: "Codex responded".to_string(),
-        });
+        match gemini_out {
+            Ok(response) => {
+                lifecycle.push(LifecycleEvent {
+                    state: "DONE".to_string(),
+                    detail: "Gemini responded".to_string(),
+                });
+                results.push(AgentResult {
+                    agent: "gemini".to_string(),
+                    response,
+                    prompt_sent: gemini_prompt,
+                });
+            }
+            Err(e) => {
+                let detail = format!("Gemini failed: {e}");
+                lifecycle.push(LifecycleEvent {
+                    state: "FAILED".to_string(),
+                    detail: detail.clone(),
+                });
+                failures.push(LifecycleEvent {
+                    state: "FAILED".to_string(),
+                    detail,
+                });
+            }
+        }
+
+        match codex_out {
+            Ok(response) => {
+                lifecycle.push(LifecycleEvent {
+                    state: "DONE".to_string(),
+                    detail: "Codex responded".to_string(),
+                });
+                results.push(AgentResult {
+                    agent: "codex".to_string(),
+                    response,
+                    prompt_sent: codex_prompt,
+                });
+            }
+            Err(e) => {
+                let detail = format!("Codex failed: {e}");
+                lifecycle.push(LifecycleEvent {
+                    state: "FAILED".to_string(),
+                    detail: detail.clone(),
+                });
+                failures.push(LifecycleEvent {
+                    state: "FAILED".to_string(),
+                    detail,
+                });
+            }
+        }
+
+        if results.is_empty() {
+            return Err(format!(
+                "ask_twins failed for both agents: {}",
+                failures
+                    .iter()
+                    .map(|f| f.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        }
 
         Ok(Json(AskTwinsResponse {
-            results: vec![
-                AgentResult {
-                    agent: "gemini".to_string(),
-                    response: gemini_out,
-                    prompt_sent: gemini_prompt,
-                },
-                AgentResult {
-                    agent: "codex".to_string(),
-                    response: codex_out,
-                    prompt_sent: codex_prompt,
-                },
-            ],
+            results,
+            failures,
             lifecycle,
         }))
     }
@@ -780,6 +823,25 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
         Ok(path)
     }
 
+    fn write_failing_agent_script(name: &str) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mock-{name}-fail-{now}.sh"));
+        let script = format!(
+            "#!/bin/sh\n\
+echo '{{\"jsonrpc\":\"2.0\",\"method\":\"session/ready\",\"params\":{{\"text\":\"{name} ready\"}}}}'\n\
+IFS= read -r _line\n\
+exit 1\n",
+            name = name
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     #[tokio::test]
     async fn ask_agent_gemini_happy_path_returns_lifecycle() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
@@ -958,6 +1020,65 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
 
         let _ = fs::remove_file(gemini_script);
         let _ = fs::remove_file(codex_script);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_twins_returns_partial_when_one_agent_fails() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let gemini_script = write_mock_agent_script("gemini", 0.0)?;
+        let codex_fail_script = write_failing_agent_script("codex")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex_fail_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "message": "partial success test"
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_twins")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(raw_text.contains("gemini done"));
+        assert!(raw_text.contains("\"failures\""));
+        assert!(raw_text.contains("Codex failed"));
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        let _ = fs::remove_file(gemini_script);
+        let _ = fs::remove_file(codex_fail_script);
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
