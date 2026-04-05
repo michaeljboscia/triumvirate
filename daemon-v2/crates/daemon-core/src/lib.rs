@@ -3,11 +3,14 @@
 //! This crate is the extraction target for daemon-only orchestration logic.
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use shared_types::MemoryEntry;
+use tokio::sync::Mutex;
 
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
     root.join("dead-drop")
@@ -207,6 +210,26 @@ fn sanitize_name(value: &str) -> String {
         .collect::<String>()
 }
 
+pub fn project_queue_key(cwd: Option<&String>, repo: Option<&String>) -> String {
+    if let Some(repo) = repo {
+        return format!("repo:{repo}");
+    }
+    if let Some(cwd) = cwd {
+        return format!("cwd:{cwd}");
+    }
+    "global".to_string()
+}
+
+pub type QueueRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+pub async fn acquire_project_queue(registry: &QueueRegistry, key: String) -> Arc<Mutex<()>> {
+    let mut queues = registry.lock().await;
+    queues
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use shared_types::MemoryEntry;
@@ -285,5 +308,18 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn project_queue_key_prefers_repo_then_cwd() {
+        assert_eq!(
+            super::project_queue_key(Some(&"/tmp/a".to_string()), Some(&"triumvirate".to_string())),
+            "repo:triumvirate"
+        );
+        assert_eq!(
+            super::project_queue_key(Some(&"/tmp/a".to_string()), None),
+            "cwd:/tmp/a"
+        );
+        assert_eq!(super::project_queue_key(None, None), "global");
     }
 }
