@@ -1,3 +1,5 @@
+mod watcher;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,6 +10,7 @@ use tracing::{info, warn};
 use triumvirate_proto::{AgentId, FabricMessage, Payload, Topic};
 use uuid::Uuid;
 
+use self::watcher::spawn_file_watcher;
 use crate::fabric::MessageBus;
 
 /// Stenographer — mechanical extraction of session facts from the fabric.
@@ -19,10 +22,16 @@ pub struct Stenographer {
     session_id: Uuid,
     db_path: PathBuf,
     log_path: PathBuf,
+    working_dir: PathBuf,
 }
 
 impl Stenographer {
-    pub fn new(bus: Arc<MessageBus>, session_id: Uuid, db_path: PathBuf) -> Self {
+    pub fn new(
+        bus: Arc<MessageBus>,
+        session_id: Uuid,
+        db_path: PathBuf,
+        working_dir: PathBuf,
+    ) -> Self {
         let session_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -35,6 +44,7 @@ impl Stenographer {
             session_id,
             db_path,
             log_path,
+            working_dir,
         }
     }
 
@@ -43,6 +53,7 @@ impl Stenographer {
         tokio::spawn(async move {
             let mut rx = self.bus.subscribe_all().await;
             info!(path = %self.log_path.display(), "stenographer started — listening to all fabric topics");
+            spawn_file_watcher(self.bus.clone(), self.working_dir.clone());
 
             if let Some(parent) = self.log_path.parent()
                 && let Err(e) = std::fs::create_dir_all(parent)

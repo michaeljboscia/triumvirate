@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/agentd", "crates/proto"]
+members = ["crates/agentd", "crates/proto", "crates/workflow"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,12 +36,14 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
+notify = "6"
 
 # Static file embedding
 rust-embed = { version = "8", features = ["mime-guess"] }
 
 # Internal crates
 triumvirate-proto = { path = "crates/proto" }
+triumvirate-workflow = { path = "crates/workflow" }
 
 [profile.dev]
 # Use Cranelift backend for faster dev builds (requires nightly or cargo-cranelift)

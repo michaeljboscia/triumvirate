@@ -10,6 +10,7 @@ mod web;
 use std::sync::Arc;
 
 use tracing::{error, info};
+use triumvirate_workflow::WorkflowEngine;
 use uuid::Uuid;
 
 use agent::{
@@ -68,6 +69,22 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "unknown".to_string());
     store.start_session(&session_id.to_string(), &["claude", "gemini", "codex"], &cwd)?;
     info!(db = %cfg.db_path.display(), "memory store ready");
+
+    // Step 3b: Open workflow store (Temporal-inspired event-sourced state machine)
+    let workflow_db_path = cfg
+        .db_path
+        .parent()
+        .map(|p| p.join("workflow.db"))
+        .unwrap_or_else(|| std::path::PathBuf::from("workflow.db"));
+    let workflow_engine = WorkflowEngine::open(&workflow_db_path)?;
+    let boot_workflow_id = workflow_engine.start_workflow(triumvirate_workflow::WorkflowType::Conversation)?;
+    workflow_engine.advance_step(
+        &boot_workflow_id,
+        0,
+        &serde_json::json!({ "event": "daemon_boot" }).to_string(),
+    )?;
+    workflow_engine.complete(&boot_workflow_id, 1)?;
+    info!(db = %workflow_db_path.display(), workflow_id = %boot_workflow_id, "workflow engine ready");
 
     // Steps 5-7: Spawn agent connectors
     let health_registry = SharedHealthRegistry::default();
@@ -146,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
     info!(ready = agents_ready, total = agents_total, "agent health monitor started");
 
     // Step 9: Start Stenographer
-    let steno = Stenographer::new(bus.clone(), session_id, cfg.db_path.clone());
+    let steno = Stenographer::new(bus.clone(), session_id, cfg.db_path.clone(), std::env::current_dir()?);
     steno.run();
     info!("stenographer started");
 
