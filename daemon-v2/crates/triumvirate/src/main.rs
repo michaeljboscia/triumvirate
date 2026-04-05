@@ -64,6 +64,27 @@ struct AskAgentResponse {
     lifecycle: Vec<LifecycleEvent>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct AskTwinsRequest {
+    message: String,
+    cwd: Option<String>,
+    repo: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+struct AgentResult {
+    agent: String,
+    response: String,
+    prompt_sent: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+struct AskTwinsResponse {
+    results: Vec<AgentResult>,
+    lifecycle: Vec<LifecycleEvent>,
+}
+
 #[tool_router]
 impl McpBridge {
     #[tool(description = "Health check tool for MCP connectivity")]
@@ -131,6 +152,68 @@ impl McpBridge {
             }
         }
     }
+
+    #[tool(description = "Fan out a request to Gemini and Codex in parallel with role-adapted prompts.")]
+    async fn ask_twins(
+        &self,
+        Parameters(req): Parameters<AskTwinsRequest>,
+    ) -> Result<Json<AskTwinsResponse>, String> {
+        let gemini_prompt = format!(
+            "[Gemini role: research/analysis]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
+            req.message, req.cwd, req.repo, req.branch
+        );
+        let codex_prompt = format!(
+            "[Codex role: implementation/testing]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
+            req.message, req.cwd, req.repo, req.branch
+        );
+
+        let mut lifecycle = vec![
+            LifecycleEvent {
+                state: "SPAWNED".to_string(),
+                detail: "Gemini request sent".to_string(),
+            },
+            LifecycleEvent {
+                state: "SPAWNED".to_string(),
+                detail: "Codex request sent".to_string(),
+            },
+            LifecycleEvent {
+                state: "WORKING".to_string(),
+                detail: "Gemini and Codex processing in parallel".to_string(),
+            },
+        ];
+
+        let gemini_fut = run_named_agent("gemini", &gemini_prompt);
+        let codex_fut = run_named_agent("codex", &codex_prompt);
+        let (gemini_out, codex_out) = tokio::join!(gemini_fut, codex_fut);
+
+        let gemini_out = gemini_out.map_err(|e| format!("Gemini failed: {e}"))?;
+        lifecycle.push(LifecycleEvent {
+            state: "DONE".to_string(),
+            detail: "Gemini responded".to_string(),
+        });
+
+        let codex_out = codex_out.map_err(|e| format!("Codex failed: {e}"))?;
+        lifecycle.push(LifecycleEvent {
+            state: "DONE".to_string(),
+            detail: "Codex responded".to_string(),
+        });
+
+        Ok(Json(AskTwinsResponse {
+            results: vec![
+                AgentResult {
+                    agent: "gemini".to_string(),
+                    response: gemini_out,
+                    prompt_sent: gemini_prompt,
+                },
+                AgentResult {
+                    agent: "codex".to_string(),
+                    response: codex_out,
+                    prompt_sent: codex_prompt,
+                },
+            ],
+            lifecycle,
+        }))
+    }
 }
 
 fn gemini_command() -> (String, Vec<String>) {
@@ -143,6 +226,32 @@ fn gemini_command() -> (String, Vec<String>) {
 
 async fn run_gemini_mock(message: &str) -> anyhow::Result<String> {
     let (bin, args) = gemini_command();
+    run_agent_process(&bin, &args, message).await
+}
+
+fn codex_command() -> (String, Vec<String>) {
+    let bin = std::env::var("TRIUMVIRATE_CODEX_BIN").unwrap_or_else(|_| "mock-codex".to_string());
+    let args = std::env::var("TRIUMVIRATE_CODEX_ARGS")
+        .map(|v| v.split_whitespace().map(ToString::to_string).collect())
+        .unwrap_or_else(|_| Vec::new());
+    (bin, args)
+}
+
+async fn run_named_agent(agent: &str, message: &str) -> anyhow::Result<String> {
+    match agent {
+        "gemini" => {
+            let (bin, args) = gemini_command();
+            run_agent_process(&bin, &args, message).await
+        }
+        "codex" => {
+            let (bin, args) = codex_command();
+            run_agent_process(&bin, &args, message).await
+        }
+        _ => anyhow::bail!("unsupported agent: {agent}"),
+    }
+}
+
+async fn run_agent_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
     let mut child = Command::new(&bin)
         .args(args)
         .stdin(std::process::Stdio::piped())
@@ -297,6 +406,27 @@ echo '{"jsonrpc":"2.0","id":1,"result":{"text":"mock-gemini received: test messa
         Ok(path)
     }
 
+    fn write_mock_agent_script(name: &str, delay_s: f32) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mock-{name}-{now}.sh"));
+        let script = format!(
+            "#!/bin/sh\n\
+echo '{{\"jsonrpc\":\"2.0\",\"method\":\"session/ready\",\"params\":{{\"text\":\"{name} ready\"}}}}'\n\
+IFS= read -r _line\n\
+sleep {delay}\n\
+echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} done\"}}}}'\n",
+            name = name,
+            delay = delay_s
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     #[tokio::test]
     async fn ask_agent_gemini_happy_path_returns_lifecycle() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
@@ -349,6 +479,70 @@ echo '{"jsonrpc":"2.0","id":1,"result":{"text":"mock-gemini received: test messa
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_twins_parallel_and_role_adapted() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let gemini_script = write_mock_agent_script("gemini", 1.0)?;
+        let codex_script = write_mock_agent_script("codex", 0.2)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "message": "Add auth module",
+            "cwd": "/tmp/project",
+            "repo": "triumvirate",
+            "branch": "feat/mcp-first"
+        });
+
+        let start = std::time::Instant::now();
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_twins")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+        let elapsed = start.elapsed();
+
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+
+        assert!(elapsed < Duration::from_secs(2));
+        assert!(raw_text.contains("gemini done"));
+        assert!(raw_text.contains("codex done"));
+        assert!(raw_text.contains("[Gemini role: research/analysis]"));
+        assert!(raw_text.contains("[Codex role: implementation/testing]"));
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        let _ = fs::remove_file(gemini_script);
+        let _ = fs::remove_file(codex_script);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
         }
         Ok(())
     }
