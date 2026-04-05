@@ -61,6 +61,22 @@ The goal: Other people can use this. Not just you.
 
 ---
 
+## v2.5 — Market-Driven Features (Month 2-3)
+
+The goal: Build what the market is screaming for. These came from competitive research and developer pain point analysis (April 2026).
+
+| Item | Description | Market Signal |
+|------|-------------|---------------|
+| Codebase indexing | Agents understand the whole repo — dependencies, imports, architecture. Think Pythia built into the daemon. | #1 most requested feature across every survey |
+| Budget ceiling mode | "Spend max $5 on this fleet task." Daemon tracks cost real-time, pauses agents at budget limit. | Developers hate unpredictable token spend |
+| Simulation/dry-run | Run fleet against mock CLIs first. Show estimated cost + time before burning real quota. "~$2.40, ~15 min. Go?" | Reduces fear of launching fleets |
+| Agent output validation gates | Automated compile + test + lint between fleet member completion and merge. Machine verification, not just peer review. | Trust in AI output is #1 concern |
+| VS Code extension | Fleet status, task assignment, agent output streaming inside the IDE. Not everyone wants a browser tab. | IDE integration is table stakes |
+| Automated conflict resolution | Intelligent merge for simple conflicts (two agents add to same list). Human escalation only for architectural disagreements. | Current worktree merge is manual-only |
+| Agent testing gym | Simulated environment to test agent behaviors and fleet interactions before production. | Enterprises need pre-deployment validation |
+
+---
+
 ## v3.0 — Platform (Month 3+)
 
 The goal: Triumvirate is infrastructure that teams and products build on.
@@ -75,6 +91,7 @@ The goal: Triumvirate is infrastructure that teams and products build on.
 | A2A protocol compliance | Interoperate with Google's Agent-to-Agent protocol for external agent integration |
 | Streaming API | External applications consume Triumvirate's fabric events via WebSocket/SSE |
 | Self-hosting guide | Docker image, Kubernetes manifest, Terraform module for cloud deployment |
+| Predictable pricing mode | Flat-rate billing option for teams. Not token chaos. |
 
 ---
 
