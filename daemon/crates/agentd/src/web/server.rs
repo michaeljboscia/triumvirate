@@ -13,6 +13,7 @@ use tracing::info;
 use triumvirate_proto::{AgentId, FabricMessage, Payload, Topic};
 
 use crate::fabric::MessageBus;
+use crate::routing::{RoutingDecision, decide_route};
 use crate::web::ws_handler;
 
 /// Static assets embedded in the binary via rust-embed.
@@ -107,15 +108,6 @@ async fn message_handler(
             .into_response();
     }
 
-    let (topic, routed_content) = route_message(&content);
-    if routed_content.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "message content must not be empty after target prefix" })),
-        )
-            .into_response();
-    }
-
     state
         .bus
         .emit(FabricMessage::new(
@@ -127,56 +119,75 @@ async fn message_handler(
         ))
         .await;
 
+    let decision = decide_route(&content);
+    match decision {
+        RoutingDecision::Agent { agent, content } => {
+            if content.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "message content must not be empty after target prefix" })),
+                )
+                    .into_response();
+            }
+
+            state
+                .bus
+                .emit(FabricMessage::new(
+                    AgentId::Human,
+                    Topic::AgentInput(agent),
+                    Payload::HumanMessage { content },
+                ))
+                .await;
+        }
+        RoutingDecision::Debate { topic } => {
+            state
+                .bus
+                .emit(FabricMessage::new(
+                    AgentId::Human,
+                    Topic::DebateProposal,
+                    Payload::HumanMessage { content: topic },
+                ))
+                .await;
+        }
+        RoutingDecision::Fleet { spec } => {
+            state
+                .bus
+                .emit(FabricMessage::new(
+                    AgentId::Human,
+                    Topic::TaskCreated,
+                    Payload::HumanMessage { content: spec },
+                ))
+                .await;
+        }
+        RoutingDecision::Status => {
+            state
+                .bus
+                .emit(FabricMessage::new(
+                    AgentId::System,
+                    Topic::SystemHealth,
+                    Payload::HealthChange {
+                        agent: AgentId::System,
+                        status: triumvirate_proto::HealthStatus::Ready,
+                        detail: Some("status command requested".to_string()),
+                    },
+                ))
+                .await;
+        }
+    }
+
     state
         .bus
         .emit(FabricMessage::new(
             AgentId::Human,
-            topic,
-            Payload::HumanMessage {
-                content: routed_content,
+            Topic::Broadcast,
+            Payload::TextChunk {
+                content: "message routed".to_string(),
+                is_final: true,
             },
         ))
         .await;
 
     (StatusCode::ACCEPTED, Json(MessageResponse { accepted: true })).into_response()
-}
-
-fn route_message(content: &str) -> (Topic, String) {
-    let trimmed = content.trim();
-
-    let routes = [
-        ("@claude", AgentId::Claude),
-        ("@gemini", AgentId::Gemini),
-        ("@codex", AgentId::Codex),
-    ];
-
-    for (prefix, agent) in routes {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return (Topic::AgentInput(agent), rest.trim().to_string());
-        }
-    }
-
-    (Topic::AgentInput(AgentId::Claude), trimmed.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::route_message;
-    use triumvirate_proto::{AgentId, Topic};
-
-    #[test]
-    fn routes_to_claude_by_default() {
-        let (topic, content) = route_message("hello world");
-        assert!(matches!(topic, Topic::AgentInput(AgentId::Claude)));
-        assert_eq!(content, "hello world");
-    }
-
-    #[test]
-    fn routes_to_gemini_when_prefixed() {
-        let (topic, content) = route_message("@gemini summarize this");
-        assert!(matches!(topic, Topic::AgentInput(AgentId::Gemini)));
-        assert_eq!(content, "summarize this");
-    }
 }
 
 /// Serve embedded static files (CSS, JS, images).
