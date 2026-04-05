@@ -138,12 +138,36 @@ pub fn remove_worktree(worktree_path: &str) -> anyhow::Result<()> {
 }
 
 pub fn git_repo_root() -> anyhow::Result<PathBuf> {
+    if let Ok(path) = git_repo_root_from_git() {
+        return Ok(path);
+    }
+
+    if let Ok(repo_root) = std::env::var("TRIUMVIRATE_REPO_ROOT") {
+        let path = PathBuf::from(repo_root);
+        if path.join(".git").exists() {
+            return Ok(path);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let path = ancestor.to_path_buf();
+            if path.join(".git").exists() {
+                return Ok(path);
+            }
+        }
+    }
+
+    anyhow::bail!("failed to discover git repo root")
+}
+
+fn git_repo_root_from_git() -> anyhow::Result<PathBuf> {
     let output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
         .output()?;
     if !output.status.success() {
-        anyhow::bail!("failed to discover git repo root");
+        anyhow::bail!("git rev-parse failed");
     }
     let root = String::from_utf8(output.stdout)?.trim().to_string();
     if root.is_empty() {
