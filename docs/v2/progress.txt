@@ -99,6 +99,32 @@ ALSO: All code must have comments. Commenting rules added to AGENTS.md:
   - // FEAT-XXX at top of each module
   - // Adapted from ... attribution on borrowed patterns
 
+!! BUGS — FOUND DURING LIVE TESTING !!
+-----------------------------------------
+BUG-001 (BLOCKER): Claude doesn't respond to dashboard messages.
+  POST /api/message → 202 accepted → routed to Topic::AgentInput(Claude)
+  → Claude connector subscribes and writes to stdin → NO OUTPUT comes back.
+  Claude stdout reader task gets nothing. Either:
+    (a) The stream-json input format is wrong (currently sending {"type":"message","role":"user","content":"..."})
+    (b) Claude CLI isn't actually reading from stdin in this mode
+    (c) The process spawned but stdin isn't connected
+  Fix: trace the full pipeline. Add logging at every step. Test with mock-claude first.
+
+BUG-002: WebSocket auto-reconnect missing.
+  When daemon restarts, browser shows FABRIC DISCONNECTED permanently.
+  Fix already written in frontend/src/lib/stores/fabric.ts — needs rebuild + deploy.
+  Reconnects after 2s on close.
+
+BUG-003: Dashboard layout too narrow for 4K monitors.
+  max-width: 1080px on a 3840px screen wastes 70% of space.
+  Fix already written in App.svelte — full-width with responsive 3/2/1 column grid.
+  Needs rebuild + deploy.
+
+BUG-002 and BUG-003 fixes are written but NOT built yet. Run:
+  cd frontend && npm run build && cd .. && cargo build --bin triumvirate-agentd
+
+BUG-001 is the real blocker. The daemon accepts messages but Claude never responds.
+
 NEXT UP
 -------
 Phase 5: full Svelte/Tailwind frontend and rust-embed pipeline
