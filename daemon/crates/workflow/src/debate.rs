@@ -63,3 +63,34 @@ impl<'a> DebateWorkflow<'a> {
         self.engine.complete(&self.workflow_id, 4)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
+    use super::DebateWorkflow;
+    use crate::WorkflowEngine;
+
+    fn temp_db() -> PathBuf {
+        std::env::temp_dir().join(format!("workflow-debate-{}.db", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn debate_workflow_records_full_lifecycle() {
+        let db = temp_db();
+        let engine = WorkflowEngine::open(&db).expect("open");
+        let debate = DebateWorkflow::start(&engine, "Redis vs Postgres", &["claude", "gemini"])
+            .expect("start");
+
+        debate
+            .record_challenge("gemini", "postgreSQL is simpler operationally")
+            .expect("challenge");
+        debate.record_vote("claude", "postgres").expect("vote");
+        debate.complete("postgres").expect("complete");
+
+        let events = engine.store().events(debate.workflow_id()).expect("events");
+        assert!(events.len() >= 5);
+    }
+}
