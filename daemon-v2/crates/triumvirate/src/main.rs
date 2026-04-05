@@ -1022,11 +1022,14 @@ async fn run_doctor() -> anyhow::Result<()> {
     let token_path = core_triumvirate_home_dir()?.join("daemon.token");
     let plist_path = core_launchd_plist_path()?;
     let daemon_health = fetch_daemon_status().await.ok();
+    let daemon_bind_addr =
+        core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     let report = serde_json::json!({
         "token_file_exists": token_path.exists(),
         "token_file_path": token_path,
         "launchd_plist_exists": plist_path.exists(),
         "launchd_plist_path": plist_path,
+        "daemon_bind_addr": daemon_bind_addr,
         "daemon_reachable": daemon_health.is_some(),
         "daemon_health": daemon_health
     });
