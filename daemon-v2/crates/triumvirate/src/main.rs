@@ -519,6 +519,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<OutboxRecentRequest>,
     ) -> Result<Json<OutboxRecentResponse>, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_outbox_recent(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("outbox_recent via daemon failed: {e}"));
+        }
         let mut events = read_outbox_events().map_err(|e| format!("outbox_recent failed: {e}"))?;
         events.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
         events.truncate(req.limit.unwrap_or(50));
@@ -530,6 +536,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FallbackListRequest>,
     ) -> Result<Json<FallbackListResponse>, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_fallback_list(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("fallback_list via daemon failed: {e}"));
+        }
         let tickets = list_pending_fallback_paths(req.limit.unwrap_or(20))
             .map_err(|e| format!("fallback_list failed: {e}"))?
             .into_iter()
@@ -540,6 +552,11 @@ impl McpBridge {
 
     #[tool(description = "Acknowledge a dead-drop fallback ticket by deleting it.")]
     async fn fallback_ack(&self, Parameters(req): Parameters<FallbackAckRequest>) -> Result<String, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_fallback_ack(&req)
+                .await
+                .map_err(|e| format!("fallback_ack via daemon failed: {e}"));
+        }
         acknowledge_fallback_path(&req.path).map_err(|e| format!("fallback_ack failed: {e}"))?;
         Ok(format!("acknowledged {}", req.path))
     }
@@ -1297,6 +1314,75 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(ScratchpadListResponse { files }))
     }
 
+    async fn outbox_recent_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<OutboxRecentRequest>,
+    ) -> Result<AxumJson<OutboxRecentResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let mut events = read_outbox_events().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+        events.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        events.truncate(req.limit.unwrap_or(50));
+        Ok(AxumJson(OutboxRecentResponse { events }))
+    }
+
+    async fn fallback_list_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<FallbackListRequest>,
+    ) -> Result<AxumJson<FallbackListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let tickets = list_pending_fallback_paths(req.limit.unwrap_or(20))
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(serde_json::json!({ "error": e.to_string() })),
+                )
+            })?
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+        Ok(AxumJson(FallbackListResponse { tickets }))
+    }
+
+    async fn fallback_ack_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<FallbackAckRequest>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        acknowledge_fallback_path(&req.path).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+        Ok(AxumJson(serde_json::json!({
+            "status": "ok",
+            "message": format!("acknowledged {}", req.path)
+        })))
+    }
+
     let token = ensure_daemon_token()?;
     let state = DaemonState { token };
     let app = Router::new()
@@ -1308,6 +1394,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/memory/read", post(memory_read_route))
         .route("/scratchpad/write", post(scratchpad_write_route))
         .route("/scratchpad/list", post(scratchpad_list_route))
+        .route("/outbox/recent", post(outbox_recent_route))
+        .route("/fallback/list", post(fallback_list_route))
+        .route("/fallback/ack", post(fallback_ack_route))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     axum::serve(listener, app).await?;
@@ -1739,6 +1828,21 @@ fn daemon_scratchpad_list_url() -> String {
         .unwrap_or_else(|_| format!("{}/scratchpad/list", daemon_base_url()))
 }
 
+fn daemon_outbox_recent_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL")
+        .unwrap_or_else(|_| format!("{}/outbox/recent", daemon_base_url()))
+}
+
+fn daemon_fallback_list_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL")
+        .unwrap_or_else(|_| format!("{}/fallback/list", daemon_base_url()))
+}
+
+fn daemon_fallback_ack_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL")
+        .unwrap_or_else(|_| format!("{}/fallback/ack", daemon_base_url()))
+}
+
 async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
     daemon_post_json::<AskAgentRequest, AskAgentResponse>(daemon_ask_agent_url(), req).await
 }
@@ -1773,6 +1877,33 @@ async fn fetch_daemon_scratchpad_list(
         req,
     )
     .await
+}
+
+async fn fetch_daemon_outbox_recent(
+    req: &OutboxRecentRequest,
+) -> anyhow::Result<OutboxRecentResponse> {
+    daemon_post_json::<OutboxRecentRequest, OutboxRecentResponse>(daemon_outbox_recent_url(), req)
+        .await
+}
+
+async fn fetch_daemon_fallback_list(
+    req: &FallbackListRequest,
+) -> anyhow::Result<FallbackListResponse> {
+    daemon_post_json::<FallbackListRequest, FallbackListResponse>(daemon_fallback_list_url(), req)
+        .await
+}
+
+async fn fetch_daemon_fallback_ack(req: &FallbackAckRequest) -> anyhow::Result<String> {
+    let json = daemon_post_json::<FallbackAckRequest, serde_json::Value>(
+        daemon_fallback_ack_url(),
+        req,
+    )
+    .await?;
+    Ok(json
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("acknowledged")
+        .to_string())
 }
 
 #[cfg(test)]
@@ -3001,6 +3132,155 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
             std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_fallback_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home =
+            std::env::temp_dir().join(format!("triumvirate-mcp-fallback-daemon-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "mcp-fallback-daemon-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+            tickets: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn fallback_list_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(_req): AxumJson<FallbackListRequest>,
+        ) -> Result<AxumJson<FallbackListResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let tickets = state
+                .tickets
+                .lock()
+                .expect("tickets lock poisoned")
+                .clone();
+            Ok(AxumJson(FallbackListResponse { tickets }))
+        }
+
+        async fn fallback_ack_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(req): AxumJson<FallbackAckRequest>,
+        ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let mut tickets = state.tickets.lock().expect("tickets lock poisoned");
+            tickets.retain(|t| t != &req.path);
+            Ok(AxumJson(serde_json::json!({
+                "status": "ok",
+                "message": format!("acknowledged {}", req.path)
+            })))
+        }
+
+        let app = Router::new()
+            .route("/fallback/list", post(fallback_list_handler))
+            .route("/fallback/ack", post(fallback_ack_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+                tickets: Arc::new(Mutex::new(vec!["ticket-z.md".to_string()])),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL",
+                format!("http://{addr}/fallback/list"),
+            );
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL",
+                format!("http://{addr}/fallback/ack"),
+            );
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let list = client
+            .call_tool(
+                CallToolRequestParams::new("fallback_list").with_arguments(
+                    serde_json::json!({ "limit": 10 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            )
+            .await?;
+        let list_text = list
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(list_text.contains("ticket-z.md"));
+
+        let _ack = client
+            .call_tool(
+                CallToolRequestParams::new("fallback_ack").with_arguments(
+                    serde_json::json!({ "path": "ticket-z.md" })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            )
+            .await?;
+
+        let list_after = client
+            .call_tool(
+                CallToolRequestParams::new("fallback_list").with_arguments(
+                    serde_json::json!({ "limit": 10 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            )
+            .await?;
+        let list_after_text = list_after
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(!list_after_text.contains("ticket-z.md"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL");
         }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
