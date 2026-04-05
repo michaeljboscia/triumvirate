@@ -69,13 +69,18 @@ CREATE TABLE routing_log (
     message_type TEXT NOT NULL CHECK(message_type IN ('direct', 'summary', 'background', 'broadcast')),
     input_tokens INTEGER,
     output_tokens INTEGER,
+    cost_usd REAL,
+    latency_ms INTEGER,
+    langfuse_trace_id TEXT,
     triggered_response INTEGER NOT NULL DEFAULT 0,
-    task_id TEXT
+    task_id TEXT,
+    fleet_id TEXT
 );
 CREATE INDEX idx_routing_timestamp ON routing_log(timestamp);
+CREATE INDEX idx_routing_task ON routing_log(task_id);
 ```
 
-FEAT: FEAT-017
+FEAT: FEAT-017, FEAT-029, FEAT-030
 
 ---
 
