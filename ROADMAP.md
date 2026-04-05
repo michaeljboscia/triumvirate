@@ -58,6 +58,7 @@ The goal: Other people can use this. Not just you.
 | NATS upgrade | Swap Tokio channels for real NATS when cross-process messaging is needed for remote agents |
 | Persistent fleet templates | Saved configurations: "auth team" = {claude: 2, codex: 2, gemini: 1} |
 | Agent memory profiles | Per-agent-type memory injection — Codex gets implementation context, Gemini gets research context |
+| Daemon lifecycle management (FEAT-032) | Session affinity: reuse hibernated sessions per project instead of spawning new ones. Auto-archive after 24hr idle, auto-dismiss after 7 days. Dashboard shows all sessions. Wake before spawn is the default. |
 
 ---
 
