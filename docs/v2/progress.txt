@@ -25,15 +25,29 @@ COMPLETED
   - `/api/fleet/merge` (ordered branch merge with conflict detection + abort)
 - Fleet peer messaging API implemented:
   - `/api/fleet/peer`
+- Fleet status API implemented:
+  - `/api/fleet/status/{fleet_id}`
+- Fleet merge now governance-gated.
+- Agent pool scaffold implemented (round-robin instance selection).
+- FleetWorkflow scaffold implemented and linked from fleet spawn.
 - Prompt memory injection implemented:
   - recent decisions prepended into routed agent turns.
 - API backend abstraction scaffold added for future provider-backed agents.
+- Governance baseline expanded:
+  - default policy file seeded to `~/.triumvirate/policies/default.cedar`
+  - daemon-side `daemon/policies/default.cedar` added
+- Mock CLI workspace crates added:
+  - `mock-claude`, `mock-gemini`, `mock-codex`
+  - connector binary override env vars + tests added
+- Packaging/docs:
+  - `daemon/NOTICE.md`
+  - `daemon/README.md`
 
 IN PROGRESS
 -----------
-- Phase 4.1 AgentPool for N instances per agent type
-- Phase 4.4 FleetWorkflow (contracts -> parallel wave -> sequential merge)
 - Phase 5 Svelte dashboard replacement (currently still embedded static HTML)
+- Phase 6.1 DebateWorkflow
+- Phase 7.4+ deeper integration/chaos tests using mock CLIs
 
 BLOCKED
 -------
@@ -41,10 +55,9 @@ BLOCKED
 
 NEXT UP
 -------
-Phase 4: complete pool + fleet workflow orchestration end-to-end
 Phase 5: full Svelte/Tailwind frontend and rust-embed pipeline
-Phase 6: governance (Cedar) + debate workflow
-Phase 7: mock CLIs + integration/chaos test matrix
+Phase 6: debate workflow + richer Cedar enforcement
+Phase 7: integration and chaos matrix on mock CLIs
 
 NOTES
 -----
