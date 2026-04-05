@@ -136,7 +136,7 @@ struct AskTwinsResponse {
     lifecycle: Vec<LifecycleEvent>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct OutboxEvent {
     ts_ms: u128,
     request_id: String,
@@ -250,6 +250,16 @@ struct ScratchpadListRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct ScratchpadListResponse {
     files: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OutboxRecentRequest {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OutboxRecentResponse {
+    events: Vec<OutboxEvent>,
 }
 
 #[tool_router]
@@ -487,6 +497,17 @@ impl McpBridge {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>();
         Ok(Json(ScratchpadListResponse { files }))
+    }
+
+    #[tool(description = "Read recent outbox lifecycle events.")]
+    async fn outbox_recent(
+        &self,
+        Parameters(req): Parameters<OutboxRecentRequest>,
+    ) -> Result<Json<OutboxRecentResponse>, String> {
+        let mut events = read_outbox_events().map_err(|e| format!("outbox_recent failed: {e}"))?;
+        events.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        events.truncate(req.limit.unwrap_or(50));
+        Ok(Json(OutboxRecentResponse { events }))
     }
 }
 
@@ -1349,6 +1370,24 @@ fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
         .open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+fn read_outbox_events() -> anyhow::Result<Vec<OutboxEvent>> {
+    let path = outbox_file_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let body = fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<OutboxEvent>(line) {
+            out.push(event);
+        }
+    }
+    Ok(out)
 }
 
 fn append_memory_entry(entry: &MemoryEntry) -> anyhow::Result<()> {
@@ -3105,6 +3144,54 @@ exit 1\n",
             .map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(list.0.files.len(), 1);
         assert!(list.0.files[0].contains("notes"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_recent_returns_latest_events() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-outbox-recent-{now}"));
+        fs::create_dir_all(&test_home)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        append_outbox_event(&OutboxEvent {
+            ts_ms: 10,
+            request_id: "a".to_string(),
+            tool: "ask_agent".to_string(),
+            status: "SPAWNED".to_string(),
+            agent: Some("gemini".to_string()),
+            detail: "first".to_string(),
+            cwd: None,
+            repo: None,
+            branch: None,
+        })?;
+        append_outbox_event(&OutboxEvent {
+            ts_ms: 20,
+            request_id: "b".to_string(),
+            tool: "ask_agent".to_string(),
+            status: "DONE".to_string(),
+            agent: Some("gemini".to_string()),
+            detail: "second".to_string(),
+            cwd: None,
+            repo: None,
+            branch: None,
+        })?;
+
+        let bridge = McpBridge::new_ephemeral();
+        let out = bridge
+            .outbox_recent(Parameters(OutboxRecentRequest { limit: Some(1) }))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(out.0.events.len(), 1);
+        assert_eq!(out.0.events[0].request_id, "b");
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
