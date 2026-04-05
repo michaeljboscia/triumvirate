@@ -49,6 +49,110 @@ pub struct AskTwinsResponse {
     pub lifecycle: Vec<LifecycleEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryWriteRequest {
+    pub namespace: String,
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryWriteResponse {
+    pub id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryReadRequest {
+    pub namespace: String,
+    pub key: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub namespace: String,
+    pub key: String,
+    pub value: String,
+    pub ts_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryReadResponse {
+    pub entries: Vec<MemoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScratchpadWriteRequest {
+    pub project: String,
+    pub topic: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScratchpadWriteResponse {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScratchpadListRequest {
+    pub project: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScratchpadListResponse {
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FallbackListRequest {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FallbackListResponse {
+    pub tickets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FallbackAckRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FallbackGcRequest {
+    pub max_age_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FallbackGcResponse {
+    pub removed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OutboxEvent {
+    pub ts_ms: u128,
+    pub request_id: String,
+    pub tool: String,
+    pub status: String,
+    pub agent: Option<String>,
+    pub detail: String,
+    pub cwd: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OutboxRecentRequest {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OutboxRecentResponse {
+    pub events: Vec<OutboxEvent>,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

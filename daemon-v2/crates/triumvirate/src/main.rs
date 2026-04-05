@@ -16,7 +16,11 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use shared_types::{
     AgentResult, AskAgentRequest, AskAgentResponse, AskTwinsRequest, AskTwinsResponse,
-    LifecycleEvent,
+    FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
+    FallbackListResponse, LifecycleEvent, MemoryEntry, MemoryReadRequest, MemoryReadResponse,
+    MemoryWriteRequest, MemoryWriteResponse, OutboxEvent, OutboxRecentRequest,
+    OutboxRecentResponse, ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
+    ScratchpadWriteResponse,
 };
 use std::{
     collections::HashMap,
@@ -100,19 +104,6 @@ struct SessionState {
     history: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct OutboxEvent {
-    ts_ms: u128,
-    request_id: String,
-    tool: String,
-    status: String,
-    agent: Option<String>,
-    detail: String,
-    cwd: Option<String>,
-    repo: Option<String>,
-    branch: Option<String>,
-}
-
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
 struct SpawnSessionRequest {
     agent: String,
@@ -166,97 +157,6 @@ struct AskSessionRequest {
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
 struct DismissSessionRequest {
     name: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct MemoryWriteRequest {
-    namespace: String,
-    key: String,
-    value: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct MemoryWriteResponse {
-    id: String,
-    status: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct MemoryReadRequest {
-    namespace: String,
-    key: Option<String>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct MemoryEntry {
-    id: String,
-    namespace: String,
-    key: String,
-    value: String,
-    ts_ms: u128,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct MemoryReadResponse {
-    entries: Vec<MemoryEntry>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct ScratchpadWriteRequest {
-    project: String,
-    topic: String,
-    content: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct ScratchpadWriteResponse {
-    path: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct ScratchpadListRequest {
-    project: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct ScratchpadListResponse {
-    files: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct OutboxRecentRequest {
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct OutboxRecentResponse {
-    events: Vec<OutboxEvent>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct FallbackListRequest {
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct FallbackListResponse {
-    tickets: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct FallbackAckRequest {
-    path: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct FallbackGcRequest {
-    max_age_days: Option<u64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct FallbackGcResponse {
-    removed: usize,
 }
 
 #[tool_router]
