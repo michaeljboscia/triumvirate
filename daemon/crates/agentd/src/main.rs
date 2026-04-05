@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     info!(ready = agents_ready, total = agents_total, "agent health monitor started");
 
     // Step 9: Start Stenographer
-    let steno = Stenographer::new(bus.clone());
+    let steno = Stenographer::new(bus.clone(), session_id, cfg.db_path.clone());
     steno.run();
     info!("stenographer started");
 

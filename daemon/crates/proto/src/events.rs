@@ -121,6 +121,12 @@ pub enum Payload {
         #[serde(skip_serializing_if = "Option::is_none")]
         source_agent: Option<AgentId>,
     },
+    /// Routing metadata emitted by the router for traceability.
+    RoutingDecision {
+        target_agent: AgentId,
+        reason: String,
+        content: String,
+    },
     /// Memory write request (syntax-gated via # DECISION: keyword)
     MemoryEntry {
         key: String,

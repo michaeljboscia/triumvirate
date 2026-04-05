@@ -60,8 +60,38 @@ impl MemoryStore {
                 evidence TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS routing_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                source_agent TEXT NOT NULL,
+                target_agent TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS workflows (
+                workflow_id TEXT PRIMARY KEY,
+                workflow_type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                current_step INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id TEXT NOT NULL REFERENCES workflows(workflow_id),
+                step INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
-            CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);",
+            CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
+            CREATE INDEX IF NOT EXISTS idx_routing_log_session ON routing_log(session_id);
+            CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id);",
         )?;
 
         info!(path = %path.display(), "memory store opened");
