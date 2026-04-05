@@ -1,8 +1,0 @@
-/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/deps/lazy_static-4cfba7580baa962b.d: /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/lib.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/inline_lazy.rs
-
-/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/deps/liblazy_static-4cfba7580baa962b.rlib: /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/lib.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/inline_lazy.rs
-
-/Users/mikeboscia/projects/triumvirate/daemon-v2/target/debug/deps/liblazy_static-4cfba7580baa962b.rmeta: /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/lib.rs /Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/inline_lazy.rs
-
-/Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/lib.rs:
-/Users/mikeboscia/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lazy_static-1.5.0/src/inline_lazy.rs:
