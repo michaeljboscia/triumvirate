@@ -5,6 +5,7 @@ mod fabric;
 mod fleet;
 mod governance;
 mod memory;
+mod metrics;
 mod routing;
 mod quota;
 mod shutdown;
@@ -23,6 +24,7 @@ use agent::{
 use digest::DigestEngine;
 use fabric::MessageBus;
 use memory::MemoryStore;
+use metrics::SharedMetricsRegistry;
 use quota::{QuotaTracker, SharedQuotaRegistry};
 use steno::Stenographer;
 
@@ -68,7 +70,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Step 2b: Initialize quota tracker
     let quota_registry = SharedQuotaRegistry::default();
-    let quota_tracker = QuotaTracker::new(bus.clone(), quota_registry.clone());
+    let metrics_registry = SharedMetricsRegistry::default();
+    let quota_tracker = QuotaTracker::new(bus.clone(), quota_registry.clone(), metrics_registry.clone());
     quota_tracker.run();
     info!("quota tracker started");
 
@@ -149,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         bus,
         health_registry,
         quota_registry,
+        metrics_registry,
         cfg.db_path.clone(),
         workflow_db_path,
         cfg.web_port,

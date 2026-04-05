@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::RwLock;
 use tracing::info;
 use triumvirate_proto::{AgentId, Payload, Topic};
 
 use crate::fabric::MessageBus;
+use crate::metrics::SharedMetricsRegistry;
 
 const DEFAULT_AGENT_BUDGET: u64 = 100_000;
 
@@ -61,35 +63,62 @@ impl SharedQuotaRegistry {
 pub struct QuotaTracker {
     bus: Arc<MessageBus>,
     registry: SharedQuotaRegistry,
+    metrics: SharedMetricsRegistry,
 }
 
 impl QuotaTracker {
-    pub fn new(bus: Arc<MessageBus>, registry: SharedQuotaRegistry) -> Self {
-        Self { bus, registry }
+    pub fn new(
+        bus: Arc<MessageBus>,
+        registry: SharedQuotaRegistry,
+        metrics: SharedMetricsRegistry,
+    ) -> Self {
+        Self {
+            bus,
+            registry,
+            metrics,
+        }
     }
 
     pub fn run(self) {
         tokio::spawn(async move {
             let mut rx = self.bus.subscribe_all().await;
+            let mut in_flight: HashMap<AgentId, (Instant, u64)> = HashMap::new();
             while let Ok(msg) = rx.recv().await {
-                let source = match msg.topic {
-                    Topic::AgentOutput(agent) => agent,
-                    _ => continue,
-                };
+                match msg.topic {
+                    Topic::AgentInput(agent) => {
+                        if let Payload::HumanMessage { content } = msg.payload {
+                            in_flight.insert(agent, (Instant::now(), estimate_tokens(&content)));
+                        }
+                    }
+                    Topic::AgentOutput(agent) => {
+                        let content = match msg.payload {
+                            Payload::TextChunk {
+                                ref content,
+                                is_final: true,
+                            } => Some(content.as_str()),
+                            Payload::AgentResponse { ref content, .. } => Some(content.as_str()),
+                            Payload::Error { .. } => {
+                                self.metrics.record_error(agent).await;
+                                None
+                            }
+                            _ => None,
+                        };
 
-                let content = match msg.payload {
-                    Payload::TextChunk {
-                        ref content,
-                        is_final: true,
-                    } => Some(content.as_str()),
-                    Payload::AgentResponse { ref content, .. } => Some(content.as_str()),
-                    _ => None,
-                };
+                        if let Some(content) = content {
+                            let output_tokens = estimate_tokens(content);
+                            self.registry.add_usage(agent, output_tokens).await;
 
-                if let Some(content) = content {
-                    let estimated_tokens = estimate_tokens(content);
-                    self.registry.add_usage(source, estimated_tokens).await;
-                    info!(agent = %source, estimated_tokens, "quota usage updated");
+                            let (started_at, input_tokens) = in_flight
+                                .remove(&agent)
+                                .unwrap_or((Instant::now(), 0));
+                            let duration_secs = started_at.elapsed().as_secs_f64();
+                            self.metrics
+                                .observe_turn(agent, input_tokens, output_tokens, duration_secs)
+                                .await;
+                            info!(agent = %agent, estimated_tokens = output_tokens, "quota usage updated");
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
