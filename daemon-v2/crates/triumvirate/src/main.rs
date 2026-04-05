@@ -1474,10 +1474,7 @@ fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
         return Ok(false);
     }
 
-    if std::env::var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-    {
+    if should_use_daemon_proxy(std::env::var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN").ok().as_deref()) {
         return Ok(true);
     }
 
