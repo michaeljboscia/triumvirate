@@ -1848,12 +1848,24 @@ fn daemon_autostart_enabled() -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(test)]
+fn reset_daemon_autostart_flag_for_tests() {
+    DAEMON_AUTOSTART_ATTEMPTED.store(false, Ordering::SeqCst);
+}
+
 fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
     if !daemon_autostart_enabled() {
         return Ok(false);
     }
     if DAEMON_AUTOSTART_ATTEMPTED.swap(true, Ordering::SeqCst) {
         return Ok(false);
+    }
+
+    if std::env::var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        return Ok(true);
     }
 
     let exe = std::env::current_exe()?;
@@ -2806,6 +2818,29 @@ exit 1\n",
         assert!(plist.contains("<string>/usr/local/bin/triumvirate</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<string>/tmp/tri-home/daemon.log</string>"));
+    }
+
+    #[test]
+    fn daemon_autostart_attempt_is_one_shot() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        reset_daemon_autostart_flag_for_tests();
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_DAEMON_AUTOSTART", "true");
+            std::env::set_var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN", "true");
+        }
+
+        let first = attempt_daemon_autostart_once()?;
+        let second = attempt_daemon_autostart_once()?;
+        assert!(first, "first call should attempt autostart");
+        assert!(!second, "second call should be suppressed");
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN");
+        }
+        Ok(())
     }
 
     #[test]
