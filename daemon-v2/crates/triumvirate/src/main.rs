@@ -47,6 +47,8 @@ enum CliCommand {
     Daemon,
     /// Install launchd configuration for zero-ceremony daemon startup.
     Install,
+    /// Remove launchd configuration for daemon startup.
+    Uninstall,
     /// Print daemon health and status snapshot.
     Status,
 }
@@ -1134,6 +1136,9 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Install => {
             run_install()?;
         }
+        CliCommand::Uninstall => {
+            run_uninstall()?;
+        }
         CliCommand::Status => {
             let health = fetch_daemon_status().await?;
             let snapshot = fetch_daemon_status_snapshot().await?;
@@ -1195,6 +1200,24 @@ fn run_install() -> anyhow::Result<()> {
     println!("Installed launchd plist at {}", plist_path.display());
     println!("Load with: launchctl load {}", plist_path.display());
     println!("Start now with: launchctl start com.triumvirate.daemon-v2");
+    Ok(())
+}
+
+fn launchd_plist_path() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?
+        .join("Library/LaunchAgents/com.triumvirate.daemon-v2.plist"))
+}
+
+fn run_uninstall() -> anyhow::Result<()> {
+    let plist_path = launchd_plist_path()?;
+    if plist_path.exists() {
+        fs::remove_file(&plist_path)?;
+        println!("Removed launchd plist at {}", plist_path.display());
+    } else {
+        println!("No launchd plist found at {}", plist_path.display());
+    }
+    println!("Unload with: launchctl unload {}", plist_path.display());
     Ok(())
 }
 
@@ -2900,6 +2923,12 @@ exit 1\n",
     fn cli_parses_status_subcommand() {
         let cli = Cli::try_parse_from(["triumvirate", "status"]).expect("status should parse");
         assert!(matches!(cli.command, CliCommand::Status));
+    }
+
+    #[test]
+    fn cli_parses_uninstall_subcommand() {
+        let cli = Cli::try_parse_from(["triumvirate", "uninstall"]).expect("uninstall should parse");
+        assert!(matches!(cli.command, CliCommand::Uninstall));
     }
 
     #[test]
