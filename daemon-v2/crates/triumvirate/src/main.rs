@@ -47,18 +47,38 @@ enum CliCommand {
 struct McpBridge {
     tool_router: ToolRouter<Self>,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    sessions_file: Option<PathBuf>,
 }
 
 impl McpBridge {
     fn new() -> Self {
+        Self::with_persistence(true)
+    }
+
+    fn new_ephemeral() -> Self {
+        Self::with_persistence(false)
+    }
+
+    fn with_persistence(enable_persistence: bool) -> Self {
+        let sessions_file = if enable_persistence {
+            sessions_file_path().ok()
+        } else {
+            None
+        };
+        // Load persisted sessions on startup so sessions survive MCP bridge restarts.
+        let sessions = sessions_file
+            .as_ref()
+            .and_then(|path| load_sessions(path).ok())
+            .unwrap_or_default();
         Self {
             tool_router: Self::tool_router(),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(sessions)),
+            sessions_file,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SessionState {
     agent: String,
     history: Vec<String>,
@@ -314,6 +334,8 @@ impl McpBridge {
                 history: Vec::new(),
             },
         );
+        persist_sessions_if_enabled(&self.sessions_file, &sessions)
+            .map_err(|e| format!("failed to persist sessions: {e}"))?;
         Ok(format!("session '{}' spawned for {}", req.name, agent))
     }
 
@@ -346,6 +368,8 @@ impl McpBridge {
         if let Some(state) = sessions.get_mut(&req.name) {
             state.history.push(format!("assistant: {response}"));
         }
+        persist_sessions_if_enabled(&self.sessions_file, &sessions)
+            .map_err(|e| format!("failed to persist sessions: {e}"))?;
 
         Ok(response)
     }
@@ -357,7 +381,11 @@ impl McpBridge {
     ) -> Result<String, String> {
         let mut sessions = self.sessions.lock().await;
         match sessions.remove(&req.name) {
-            Some(_) => Ok(format!("session '{}' dismissed", req.name)),
+            Some(_) => {
+                persist_sessions_if_enabled(&self.sessions_file, &sessions)
+                    .map_err(|e| format!("failed to persist sessions: {e}"))?;
+                Ok(format!("session '{}' dismissed", req.name))
+            }
             None => Err(format!("session '{}' not found", req.name)),
         }
     }
@@ -586,6 +614,34 @@ fn ensure_daemon_token() -> anyhow::Result<String> {
     Ok(token)
 }
 
+fn sessions_file_path() -> anyhow::Result<PathBuf> {
+    Ok(triumvirate_home_dir()?.join("sessions.json"))
+}
+
+fn load_sessions(path: &PathBuf) -> anyhow::Result<HashMap<String, SessionState>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    let sessions = serde_json::from_str::<HashMap<String, SessionState>>(&raw)?;
+    Ok(sessions)
+}
+
+fn persist_sessions_if_enabled(
+    maybe_path: &Option<PathBuf>,
+    sessions: &HashMap<String, SessionState>,
+) -> anyhow::Result<()> {
+    let Some(path) = maybe_path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(sessions)?;
+    fs::write(path, body)?;
+    Ok(())
+}
+
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
     let Some(value) = headers.get(AUTHORIZATION) else {
         return false;
@@ -624,7 +680,11 @@ mod tests {
         let (server_transport, client_transport) = tokio::io::duplex(4096);
 
         let server_handle = tokio::spawn(async move {
-            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
             anyhow::Ok(())
         });
 
@@ -728,7 +788,11 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server_handle = tokio::spawn(async move {
-            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
             anyhow::Ok(())
         });
 
@@ -787,7 +851,11 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server_handle = tokio::spawn(async move {
-            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
             anyhow::Ok(())
         });
         let client = NoopClient.serve(client_transport).await?;
@@ -848,7 +916,11 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server_handle = tokio::spawn(async move {
-            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
             anyhow::Ok(())
         });
         let client = NoopClient.serve(client_transport).await?;
@@ -897,7 +969,11 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
 
         let (server_transport, client_transport) = tokio::io::duplex(8192);
         let server_handle = tokio::spawn(async move {
-            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
             anyhow::Ok(())
         });
         let client = NoopClient.serve(client_transport).await?;
@@ -968,7 +1044,11 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
     async fn get_status_reports_active_sessions() -> anyhow::Result<()> {
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server_handle = tokio::spawn(async move {
-            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
             anyhow::Ok(())
         });
         let client = NoopClient.serve(client_transport).await?;
@@ -1039,5 +1119,41 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
         );
         assert!(is_authorized(&headers, token));
         assert!(!is_authorized(&headers, "wrong"));
+    }
+
+    #[tokio::test]
+    async fn sessions_persist_across_bridge_instances() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-sessions-{now}"));
+        fs::create_dir_all(&test_home)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        let first = McpBridge::new();
+        {
+            let mut sessions = first.sessions.lock().await;
+            sessions.insert(
+                "persisted".to_string(),
+                SessionState {
+                    agent: "gemini".to_string(),
+                    history: vec!["hello".to_string()],
+                },
+            );
+            persist_sessions_if_enabled(&first.sessions_file, &sessions)?;
+        }
+
+        let second = McpBridge::new();
+        let sessions = second.sessions.lock().await;
+        let persisted = sessions.get("persisted");
+        assert!(persisted.is_some());
+        assert_eq!(persisted.map(|s| s.agent.as_str()), Some("gemini"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
     }
 }
