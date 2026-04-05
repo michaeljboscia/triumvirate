@@ -42,11 +42,13 @@ COMPLETED
 - Packaging/docs:
   - `daemon/NOTICE.md`
   - `daemon/README.md`
+- Debate scaffold implemented:
+  - `DebateWorkflow` in workflow crate
+  - `POST /api/debate/start`
 
 IN PROGRESS
 -----------
 - Phase 5 Svelte dashboard replacement (currently still embedded static HTML)
-- Phase 6.1 DebateWorkflow
 - Phase 7.4+ deeper integration/chaos tests using mock CLIs
 
 BLOCKED
