@@ -14,8 +14,11 @@ use daemon_core::{
     persist_json_file as core_persist_json_file,
 };
 use mcp_bridge::{
-    build_role_adapted_prompts, is_supported_agent, is_supported_agent_name,
-    should_use_daemon_proxy,
+    build_role_adapted_prompts, daemon_ask_agent_url, daemon_ask_twins_url,
+    daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
+    daemon_memory_read_url, daemon_memory_write_url, daemon_outbox_recent_url,
+    daemon_scratchpad_list_url, daemon_scratchpad_write_url, daemon_status_url,
+    is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -1484,11 +1487,6 @@ fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
     value == expected
 }
 
-fn daemon_status_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_URL")
-        .unwrap_or_else(|_| format!("{}/status", daemon_base_url()))
-}
-
 static DAEMON_AUTOSTART_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 fn daemon_autostart_enabled() -> bool {
@@ -1593,61 +1591,6 @@ async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
 
 async fn fetch_daemon_status_snapshot() -> anyhow::Result<DaemonStatusSnapshot> {
     daemon_get_json::<DaemonStatusSnapshot>(daemon_status_url()).await
-}
-
-fn daemon_base_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
-}
-
-fn daemon_ask_agent_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL")
-        .unwrap_or_else(|_| format!("{}/ask-agent", daemon_base_url()))
-}
-
-fn daemon_ask_twins_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_ASK_TWINS_URL")
-        .unwrap_or_else(|_| format!("{}/ask-twins", daemon_base_url()))
-}
-
-fn daemon_memory_write_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL")
-        .unwrap_or_else(|_| format!("{}/memory/write", daemon_base_url()))
-}
-
-fn daemon_memory_read_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL")
-        .unwrap_or_else(|_| format!("{}/memory/read", daemon_base_url()))
-}
-
-fn daemon_scratchpad_write_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL")
-        .unwrap_or_else(|_| format!("{}/scratchpad/write", daemon_base_url()))
-}
-
-fn daemon_scratchpad_list_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL")
-        .unwrap_or_else(|_| format!("{}/scratchpad/list", daemon_base_url()))
-}
-
-fn daemon_outbox_recent_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL")
-        .unwrap_or_else(|_| format!("{}/outbox/recent", daemon_base_url()))
-}
-
-fn daemon_fallback_list_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL")
-        .unwrap_or_else(|_| format!("{}/fallback/list", daemon_base_url()))
-}
-
-fn daemon_fallback_ack_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL")
-        .unwrap_or_else(|_| format!("{}/fallback/ack", daemon_base_url()))
-}
-
-fn daemon_fallback_gc_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_GC_URL")
-        .unwrap_or_else(|_| format!("{}/fallback/gc", daemon_base_url()))
 }
 
 async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
