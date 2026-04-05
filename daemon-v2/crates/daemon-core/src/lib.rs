@@ -236,6 +236,44 @@ pub fn ensure_daemon_token(root: &Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
+pub fn launchd_plist_path() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?
+        .join("Library/LaunchAgents/com.triumvirate.daemon-v2.plist"))
+}
+
+pub fn render_launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.triumvirate.daemon-v2</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe_path}</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TRIUMVIRATE_HOME</key>
+    <string>{home_dir}</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{home_dir}/daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>{home_dir}/daemon.err.log</string>
+</dict>
+</plist>
+"#
+    )
+}
+
 pub fn resolve_context(
     cwd: Option<&String>,
     repo: Option<&String>,
@@ -429,5 +467,12 @@ mod tests {
         assert_eq!(cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(repo.as_deref(), Some("my-repo"));
         assert_eq!(branch.as_deref(), Some("feat/test"));
+    }
+
+    #[test]
+    fn launch_plist_render_has_expected_label() {
+        let plist = super::render_launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri");
+        assert!(plist.contains("com.triumvirate.daemon-v2"));
+        assert!(plist.contains("<string>daemon</string>"));
     }
 }
