@@ -51,6 +51,13 @@
 - Reference BACKEND_STRUCTURE.md for exact SQLite table schemas — copy them, don't improvise
 - Reference BACKEND_STRUCTURE.md for exact REST API shapes — implement them as specified
 
+### Commenting Rules
+- Every public struct, trait, function, and enum gets a `///` doc comment explaining WHAT it does
+- Inline `//` comments for any non-obvious logic — if you had to think about it, comment it
+- Every borrowed pattern from Ruflo/Clash/swarms-rs/Temporal gets attribution: `// Adapted from Ruflo's cost-router (ruvnet/ruflo, MIT)`
+- FEAT-ID in a comment at the top of each module: `// FEAT-002: Claude Connector`
+- No comment spam — don't comment `let x = 5; // set x to 5`
+
 ### Must NOT Do
 - Do NOT use PTY for agent communication — piped stdio only
 - Do NOT use `.unwrap()` in production code — use `?` or handle explicitly
