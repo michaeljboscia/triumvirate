@@ -58,6 +58,19 @@ BLOCKED
 -------
 (nothing blocked)
 
+!! NEW FEATURE — FEAT-032 SESSION AFFINITY !!
+------------------------------------------------
+Reuse hibernated agent sessions instead of spawning new ones.
+Before spawn: check SQLite for hibernated session matching (project_path, agent_type).
+If found: wake it (zero token cost, full context). If not: create with deterministic name.
+On task complete: hibernate (don't kill). Auto-archive after 24hr, auto-dismiss after 7 days.
+
+New table in memory.db: agent_sessions (session_name, agent_type, project_path, role, state, last_active, token_cost_usd)
+Index: idx_sessions_project ON (project_path, agent_type, state)
+
+This applies to ALL agent spawns — fleet members, single-agent turns, daemon reuse.
+Canonical name: "Session Affinity" (same concept as load balancer sticky sessions).
+
 !! NEW FEATURE — FEAT-031 LESSONS LEDGER !!
 ---------------------------------------------
 Machine-readable lessons table (SQLite). Agents consume lessons before tasks.
