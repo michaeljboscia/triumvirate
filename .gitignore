@@ -23,3 +23,6 @@ docs/superpowers/plans/
 
 # OS
 .DS_Store
+
+# Rust build artifacts
+daemon/target/

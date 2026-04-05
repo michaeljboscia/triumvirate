@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/mikeboscia/projects/triumvirate/daemon/target/debug/build/mime_guess-aef2902c72776355/out/mime_types_generated.rs
