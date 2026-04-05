@@ -31,7 +31,7 @@ use shared_types::{
     FallbackListResponse, LifecycleEvent, MemoryEntry, MemoryReadRequest, MemoryReadResponse,
     MemoryWriteRequest, MemoryWriteResponse, OutboxEvent, OutboxRecentRequest,
     OutboxRecentResponse, ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
-    ScratchpadWriteResponse,
+    ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse, DaemonStatusSnapshot,
 };
 use std::{
     collections::HashMap,
@@ -131,32 +131,6 @@ struct SessionInfo {
 #[derive(Debug, Clone, serde::Serialize, JsonSchema)]
 struct SessionListResponse {
     sessions: Vec<SessionInfo>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
-struct StatusResponse {
-    daemon_mode: String,
-    active_sessions: usize,
-    supported_agents: Vec<String>,
-    pending_fallbacks: usize,
-    fallback_tickets: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct DaemonHealthResponse {
-    status: String,
-    service: Option<String>,
-    mode: Option<String>,
-    daemon: Option<String>,
-    auth: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct DaemonStatusSnapshot {
-    daemon_mode: Option<String>,
-    supported_agents: Option<Vec<String>>,
-    pending_fallbacks: Option<usize>,
-    fallback_tickets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
