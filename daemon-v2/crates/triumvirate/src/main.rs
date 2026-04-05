@@ -101,6 +101,7 @@ struct LifecycleEvent {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AskAgentResponse {
+    request_id: String,
     agent: String,
     response: String,
     lifecycle: Vec<LifecycleEvent>,
@@ -123,9 +124,23 @@ struct AgentResult {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AskTwinsResponse {
+    request_id: String,
     results: Vec<AgentResult>,
     failures: Vec<LifecycleEvent>,
     lifecycle: Vec<LifecycleEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OutboxEvent {
+    ts_ms: u128,
+    request_id: String,
+    tool: String,
+    status: String,
+    agent: Option<String>,
+    detail: String,
+    cwd: Option<String>,
+    repo: Option<String>,
+    branch: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
@@ -347,6 +362,9 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
     if agent != "gemini" && agent != "codex" {
         return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
     }
+    let request_id = Uuid::new_v4().to_string();
+    let (resolved_cwd, resolved_repo, resolved_branch) =
+        resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
 
     // Emit lifecycle states in-band so clients can render progress before native MCP progress
     // notifications are wired in a later increment.
@@ -369,11 +387,43 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                 .unwrap_or_default()
         ),
     }];
+    if let Err(e) = append_outbox_event(&OutboxEvent {
+        ts_ms: now_ms(),
+        request_id: request_id.clone(),
+        tool: "ask_agent".to_string(),
+        status: "SPAWNED".to_string(),
+        agent: Some(agent.clone()),
+        detail: lifecycle
+            .last()
+            .map(|e| e.detail.clone())
+            .unwrap_or_default(),
+        cwd: resolved_cwd.clone(),
+        repo: resolved_repo.clone(),
+        branch: resolved_branch.clone(),
+    }) {
+        tracing::warn!("failed to append outbox event: {e}");
+    }
 
     lifecycle.push(LifecycleEvent {
         state: "WORKING".to_string(),
         detail: format!("{agent} is processing request"),
     });
+    if let Err(e) = append_outbox_event(&OutboxEvent {
+        ts_ms: now_ms(),
+        request_id: request_id.clone(),
+        tool: "ask_agent".to_string(),
+        status: "WORKING".to_string(),
+        agent: Some(agent.clone()),
+        detail: lifecycle
+            .last()
+            .map(|e| e.detail.clone())
+            .unwrap_or_default(),
+        cwd: resolved_cwd.clone(),
+        repo: resolved_repo.clone(),
+        branch: resolved_branch.clone(),
+    }) {
+        tracing::warn!("failed to append outbox event: {e}");
+    }
 
     let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
     let mut last_err: Option<String> = None;
@@ -385,7 +435,24 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                     state: "DONE".to_string(),
                     detail: format!("{agent} responded on attempt {}", idx + 1),
                 });
+                if let Err(e) = append_outbox_event(&OutboxEvent {
+                    ts_ms: now_ms(),
+                    request_id: request_id.clone(),
+                    tool: "ask_agent".to_string(),
+                    status: "DONE".to_string(),
+                    agent: Some(agent.clone()),
+                    detail: lifecycle
+                        .last()
+                        .map(|e| e.detail.clone())
+                        .unwrap_or_default(),
+                    cwd: resolved_cwd.clone(),
+                    repo: resolved_repo.clone(),
+                    branch: resolved_branch.clone(),
+                }) {
+                    tracing::warn!("failed to append outbox event: {e}");
+                }
                 return Ok(AskAgentResponse {
+                    request_id,
                     agent: agent.clone(),
                     response,
                     lifecycle,
@@ -409,6 +476,22 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                         msg
                     ),
                 });
+                if let Err(e) = append_outbox_event(&OutboxEvent {
+                    ts_ms: now_ms(),
+                    request_id: request_id.clone(),
+                    tool: "ask_agent".to_string(),
+                    status: "RETRY".to_string(),
+                    agent: Some(agent.clone()),
+                    detail: lifecycle
+                        .last()
+                        .map(|e| e.detail.clone())
+                        .unwrap_or_default(),
+                    cwd: resolved_cwd.clone(),
+                    repo: resolved_repo.clone(),
+                    branch: resolved_branch.clone(),
+                }) {
+                    tracing::warn!("failed to append outbox event: {e}");
+                }
                 last_err = Some(msg);
                 sleep(*backoff).await;
             }
@@ -419,6 +502,22 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
         state: "FAILED".to_string(),
         detail: format!("{} failed after {} attempts", agent, backoffs.len()),
     });
+    if let Err(e) = append_outbox_event(&OutboxEvent {
+        ts_ms: now_ms(),
+        request_id: request_id.clone(),
+        tool: "ask_agent".to_string(),
+        status: "FAILED".to_string(),
+        agent: Some(agent.clone()),
+        detail: lifecycle
+            .last()
+            .map(|e| e.detail.clone())
+            .unwrap_or_default(),
+        cwd: resolved_cwd,
+        repo: resolved_repo,
+        branch: resolved_branch,
+    }) {
+        tracing::warn!("failed to append outbox event: {e}");
+    }
     Err(format!(
         "ask_agent failed after lifecycle {:?}: {}",
         lifecycle
@@ -430,6 +529,9 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
 }
 
 async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, String> {
+    let request_id = Uuid::new_v4().to_string();
+    let (resolved_cwd, resolved_repo, resolved_branch) =
+        resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
     let gemini_prompt = format!(
         "[Gemini role: research/analysis]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
         req.message, req.cwd, req.repo, req.branch
@@ -453,6 +555,19 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
             detail: "Gemini and Codex processing in parallel".to_string(),
         },
     ];
+    if let Err(e) = append_outbox_event(&OutboxEvent {
+        ts_ms: now_ms(),
+        request_id: request_id.clone(),
+        tool: "ask_twins".to_string(),
+        status: "WORKING".to_string(),
+        agent: None,
+        detail: "Gemini and Codex processing in parallel".to_string(),
+        cwd: resolved_cwd.clone(),
+        repo: resolved_repo.clone(),
+        branch: resolved_branch.clone(),
+    }) {
+        tracing::warn!("failed to append outbox event: {e}");
+    }
 
     let gemini_fut = run_named_agent("gemini", &gemini_prompt);
     let codex_fut = run_named_agent("codex", &codex_prompt);
@@ -472,6 +587,17 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 response,
                 prompt_sent: gemini_prompt,
             });
+            let _ = append_outbox_event(&OutboxEvent {
+                ts_ms: now_ms(),
+                request_id: request_id.clone(),
+                tool: "ask_twins".to_string(),
+                status: "DONE".to_string(),
+                agent: Some("gemini".to_string()),
+                detail: "Gemini responded".to_string(),
+                cwd: resolved_cwd.clone(),
+                repo: resolved_repo.clone(),
+                branch: resolved_branch.clone(),
+            });
         }
         Err(e) => {
             let detail = format!("Gemini failed: {e}");
@@ -482,6 +608,17 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
             failures.push(LifecycleEvent {
                 state: "FAILED".to_string(),
                 detail,
+            });
+            let _ = append_outbox_event(&OutboxEvent {
+                ts_ms: now_ms(),
+                request_id: request_id.clone(),
+                tool: "ask_twins".to_string(),
+                status: "FAILED".to_string(),
+                agent: Some("gemini".to_string()),
+                detail: "Gemini failed".to_string(),
+                cwd: resolved_cwd.clone(),
+                repo: resolved_repo.clone(),
+                branch: resolved_branch.clone(),
             });
         }
     }
@@ -497,6 +634,17 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
                 response,
                 prompt_sent: codex_prompt,
             });
+            let _ = append_outbox_event(&OutboxEvent {
+                ts_ms: now_ms(),
+                request_id: request_id.clone(),
+                tool: "ask_twins".to_string(),
+                status: "DONE".to_string(),
+                agent: Some("codex".to_string()),
+                detail: "Codex responded".to_string(),
+                cwd: resolved_cwd.clone(),
+                repo: resolved_repo.clone(),
+                branch: resolved_branch.clone(),
+            });
         }
         Err(e) => {
             let detail = format!("Codex failed: {e}");
@@ -507,6 +655,17 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
             failures.push(LifecycleEvent {
                 state: "FAILED".to_string(),
                 detail,
+            });
+            let _ = append_outbox_event(&OutboxEvent {
+                ts_ms: now_ms(),
+                request_id: request_id.clone(),
+                tool: "ask_twins".to_string(),
+                status: "FAILED".to_string(),
+                agent: Some("codex".to_string()),
+                detail: "Codex failed".to_string(),
+                cwd: resolved_cwd.clone(),
+                repo: resolved_repo.clone(),
+                branch: resolved_branch.clone(),
             });
         }
     }
@@ -523,6 +682,7 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
     }
 
     Ok(AskTwinsResponse {
+        request_id,
         results,
         failures,
         lifecycle,
@@ -771,6 +931,69 @@ fn persist_sessions_if_enabled(
     let body = serde_json::to_string_pretty(sessions)?;
     fs::write(path, body)?;
     Ok(())
+}
+
+fn outbox_file_path() -> anyhow::Result<PathBuf> {
+    Ok(triumvirate_home_dir()?.join("outbox.jsonl"))
+}
+
+fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
+    let path = outbox_file_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(event)?;
+    line.push('\n');
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn resolve_context(
+    cwd: Option<&String>,
+    repo: Option<&String>,
+    branch: Option<&String>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let resolved_cwd = cwd
+        .cloned()
+        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
+
+    let resolved_repo = repo
+        .cloned()
+        .or_else(|| git_probe(&resolved_cwd, &["rev-parse", "--show-toplevel"]));
+
+    let resolved_branch = branch
+        .cloned()
+        .or_else(|| git_probe(&resolved_cwd, &["rev-parse", "--abbrev-ref", "HEAD"]));
+
+    (resolved_cwd, resolved_repo, resolved_branch)
+}
+
+fn git_probe(cwd: &Option<String>, args: &[&str]) -> Option<String> {
+    let cwd = cwd.as_ref()?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn now_ms() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -1533,6 +1756,7 @@ exit 1\n",
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(AskAgentResponse {
+                request_id: "daemon-req-1".to_string(),
                 agent: req.agent,
                 response: format!("daemon echo: {}", req.message),
                 lifecycle: vec![LifecycleEvent {
@@ -1609,6 +1833,7 @@ exit 1\n",
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(AskTwinsResponse {
+                request_id: "daemon-req-2".to_string(),
                 results: vec![AgentResult {
                     agent: "gemini".to_string(),
                     response: "daemon twins result".to_string(),
@@ -1688,6 +1913,7 @@ exit 1\n",
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(AskAgentResponse {
+                request_id: "daemon-req-3".to_string(),
                 agent: req.agent,
                 response: "daemon path used".to_string(),
                 lifecycle: vec![LifecycleEvent {
@@ -1758,6 +1984,52 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
         }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_writes_outbox_events() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-outbox-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let script_path = write_mock_agent_script("gemini", 0.0)?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let response = execute_ask_agent(&AskAgentRequest {
+            agent: "gemini".to_string(),
+            message: "outbox check".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            repo: Some("triumvirate".to_string()),
+            branch: Some("feat/mcp-first".to_string()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+        assert!(!response.request_id.is_empty());
+        assert_eq!(response.agent, "gemini");
+
+        let outbox = fs::read_to_string(test_home.join("outbox.jsonl"))?;
+        assert!(outbox.contains("\"tool\":\"ask_agent\""));
+        assert!(outbox.contains("\"status\":\"SPAWNED\""));
+        assert!(outbox.contains("\"status\":\"DONE\""));
+        assert!(outbox.contains(&response.request_id));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
