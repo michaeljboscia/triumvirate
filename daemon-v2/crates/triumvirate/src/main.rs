@@ -173,6 +173,7 @@ struct StatusResponse {
     active_sessions: usize,
     supported_agents: Vec<String>,
     pending_fallbacks: usize,
+    fallback_tickets: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -380,11 +381,16 @@ impl McpBridge {
     #[tool(description = "Get current system status snapshot.")]
     async fn get_status(&self) -> Json<StatusResponse> {
         let sessions = self.sessions.lock().await;
+        let fallback_tickets = list_pending_fallback_paths(10).unwrap_or_default();
         Json(StatusResponse {
             daemon_mode: "incremental-dev".to_string(),
             active_sessions: sessions.len(),
             supported_agents: vec!["gemini".to_string(), "codex".to_string()],
-            pending_fallbacks: count_pending_fallbacks().unwrap_or(0),
+            pending_fallbacks: fallback_tickets.len(),
+            fallback_tickets: fallback_tickets
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         })
     }
 
@@ -1492,6 +1498,21 @@ fn count_pending_fallbacks() -> anyhow::Result<usize> {
     Ok(fs::read_dir(dir)?.filter_map(Result::ok).count())
 }
 
+fn list_pending_fallback_paths(limit: usize) -> anyhow::Result<Vec<PathBuf>> {
+    let dir = dead_drop_dir_path()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.reverse();
+    files.truncate(limit);
+    Ok(files)
+}
+
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
     let Some(value) = headers.get(AUTHORIZATION) else {
         return false;
@@ -2233,6 +2254,50 @@ exit 1\n",
 
         client.cancel().await?;
         server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_status_includes_pending_fallback_tickets() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-status-fallbacks-{now}"));
+        let dead_drop = test_home.join("dead-drop");
+        fs::create_dir_all(&dead_drop)?;
+        fs::write(dead_drop.join("ticket-1.md"), "fallback")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let status = client
+            .call_tool(CallToolRequestParams::new("get_status"))
+            .await?;
+        let status_text = status
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(status_text.contains("\"pending_fallbacks\":1"));
+        assert!(status_text.contains("ticket-1.md"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
 
