@@ -5,8 +5,11 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::info;
 use triumvirate_proto::{AgentId, Payload, Topic};
+use uuid::Uuid;
 
+use crate::cost::{PricingConfig, estimate_cost_usd};
 use crate::fabric::MessageBus;
+use crate::langfuse::LangfuseClient;
 use crate::metrics::SharedMetricsRegistry;
 
 const DEFAULT_AGENT_BUDGET: u64 = 100_000;
@@ -64,6 +67,9 @@ pub struct QuotaTracker {
     bus: Arc<MessageBus>,
     registry: SharedQuotaRegistry,
     metrics: SharedMetricsRegistry,
+    langfuse: LangfuseClient,
+    session_id: Uuid,
+    pricing: PricingConfig,
 }
 
 impl QuotaTracker {
@@ -71,11 +77,17 @@ impl QuotaTracker {
         bus: Arc<MessageBus>,
         registry: SharedQuotaRegistry,
         metrics: SharedMetricsRegistry,
+        langfuse: LangfuseClient,
+        session_id: Uuid,
+        pricing: PricingConfig,
     ) -> Self {
         Self {
             bus,
             registry,
             metrics,
+            langfuse,
+            session_id,
+            pricing,
         }
     }
 
@@ -115,6 +127,16 @@ impl QuotaTracker {
                             self.metrics
                                 .observe_turn(agent, input_tokens, output_tokens, duration_secs)
                                 .await;
+                            let estimated_cost_usd =
+                                estimate_cost_usd(agent, input_tokens, output_tokens, &self.pricing);
+                            self.langfuse.record_turn(
+                                &self.session_id.to_string(),
+                                agent,
+                                input_tokens,
+                                output_tokens,
+                                estimated_cost_usd,
+                                (duration_secs * 1_000.0) as u64,
+                            );
                             info!(agent = %agent, estimated_tokens = output_tokens, "quota usage updated");
                         }
                     }

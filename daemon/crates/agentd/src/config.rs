@@ -4,6 +4,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::cost::PricingConfig;
+use crate::langfuse::LangfuseConfig;
 
 /// Daemon configuration loaded from ~/.triumvirate/config.toml
 #[derive(Debug, Deserialize)]
@@ -19,6 +20,9 @@ pub struct Config {
 
     #[serde(default)]
     pub pricing: PricingConfig,
+
+    #[serde(default)]
+    pub langfuse: LangfuseConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +81,7 @@ pub fn load() -> anyhow::Result<Config> {
             db_path: default_db_path(),
             agents: AgentsConfig::default(),
             pricing: PricingConfig::default(),
+            langfuse: LangfuseConfig::default(),
         })
     }
 }
