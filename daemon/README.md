@@ -22,6 +22,44 @@ cargo run
 `npm run build` in `frontend/` and embeds `frontend/dist` into the Rust binary via `rust-embed`.
 Set `TRIUMVIRATE_SKIP_FRONTEND_BUILD=1` to skip this in constrained environments.
 
+## CLI Usage (Operator Flow)
+
+Use the helper scripts in `daemon/scripts/` for day-to-day usage:
+
+```bash
+cd /Users/mikeboscia/projects/triumvirate
+./daemon/scripts/triumvirate-cli.sh health
+./daemon/scripts/triumvirate-cli.sh ask "what changed in auth?"
+./daemon/scripts/ask-the-twins "review this migration plan"
+./daemon/scripts/triumvirate-cli.sh debate "Redis vs Postgres for caching"
+./daemon/scripts/triumvirate-cli.sh fleet "1 codex: build e2e harness"
+```
+
+Notes:
+- `ask-the-twins` sends both `@claude` and `@gemini` via the v2 `/api/message` endpoint.
+- `TRIUMVIRATE_URL` can override the default `http://127.0.0.1:8080`.
+- If Claude responds with `Not logged in · Please run /login`, authenticate with the Claude CLI first.
+
+## Keep Daemon Running (macOS launchd)
+
+For reliable background operation, install the launchd service:
+
+```bash
+cd /Users/mikeboscia/projects/triumvirate/daemon
+./scripts/triumvirate-service.sh install
+./scripts/triumvirate-service.sh status
+./scripts/triumvirate-service.sh logs
+```
+
+Service management commands:
+- `install`
+- `start`
+- `stop`
+- `restart`
+- `status`
+- `logs`
+- `uninstall`
+
 ## Quality Gate
 
 ```bash

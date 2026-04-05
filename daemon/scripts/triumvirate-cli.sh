@@ -2,6 +2,10 @@
 set -euo pipefail
 
 BASE_URL="${TRIUMVIRATE_URL:-http://127.0.0.1:8080}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_SCRIPT="${SCRIPT_DIR}/triumvirate-service.sh"
+PROJECT_DAEMON_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LOCAL_BIN="${PROJECT_DAEMON_DIR}/target/release/triumvirate-agentd"
 
 usage() {
   cat <<'EOF'
@@ -39,6 +43,40 @@ post_json() {
   echo
 }
 
+daemon_is_up() {
+  curl -fsS "${BASE_URL}/api/health" >/dev/null 2>&1
+}
+
+ensure_daemon() {
+  if daemon_is_up; then
+    return 0
+  fi
+
+  # First choice: launchd service if installed.
+  if [[ -x "${SERVICE_SCRIPT}" ]] && [[ -f "${HOME}/Library/LaunchAgents/com.triumvirate.agentd.plist" ]]; then
+    "${SERVICE_SCRIPT}" start >/dev/null 2>&1 || true
+  fi
+
+  # Fallback: local detached process from release binary.
+  if ! daemon_is_up; then
+    if [[ ! -x "${LOCAL_BIN}" ]]; then
+      (cd "${PROJECT_DAEMON_DIR}" && cargo build --release -p triumvirate-agentd --bin triumvirate-agentd >/dev/null)
+    fi
+    nohup "${LOCAL_BIN}" >/tmp/triumvirate_agentd.out.log 2>/tmp/triumvirate_agentd.err.log &
+    disown || true
+  fi
+
+  for _ in {1..30}; do
+    if daemon_is_up; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "error: daemon is not reachable at ${BASE_URL}" >&2
+  exit 1
+}
+
 cmd="${1:-}"
 if [[ -z "${cmd}" ]]; then
   usage
@@ -48,15 +86,18 @@ shift || true
 
 case "${cmd}" in
   health)
+    ensure_daemon
     curl -fsS "${BASE_URL}/api/health"
     echo
     ;;
   ask)
+    ensure_daemon
     need_arg "$@"
     msg="$*"
     post_json "/api/message" "{\"content\":\"${msg//\"/\\\"}\"}"
     ;;
   twins)
+    ensure_daemon
     need_arg "$@"
     msg="$*"
     post_json "/api/message" "{\"content\":\"@claude ${msg//\"/\\\"}\"}" &
@@ -66,11 +107,13 @@ case "${cmd}" in
     wait "${p1}" "${p2}"
     ;;
   debate)
+    ensure_daemon
     need_arg "$@"
     topic="$*"
     post_json "/api/debate/start" "{\"topic\":\"${topic//\"/\\\"}\"}"
     ;;
   fleet)
+    ensure_daemon
     need_arg "$@"
     spec="$*"
     post_json "/api/fleet/spawn" "{\"spec\":\"${spec//\"/\\\"}\"}"
