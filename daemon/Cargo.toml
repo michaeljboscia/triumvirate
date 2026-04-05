@@ -44,6 +44,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 notify = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Static file embedding
 rust-embed = { version = "8", features = ["mime-guess"] }

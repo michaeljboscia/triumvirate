@@ -31,6 +31,7 @@ triumvirate-proto.workspace = true
 triumvirate-workflow.workspace = true
 async-trait.workspace = true
 notify.workspace = true
+reqwest.workspace = true
 
 # Agent process management (PTY support added in POC 2)
 # portable-pty = "0.8"
