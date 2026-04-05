@@ -160,6 +160,7 @@ pub struct DaemonHealthResponse {
     pub mode: Option<String>,
     pub daemon: Option<String>,
     pub auth: Option<String>,
+    pub daemon_bind_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -168,6 +169,7 @@ pub struct DaemonStatusSnapshot {
     pub supported_agents: Option<Vec<String>>,
     pub pending_fallbacks: Option<usize>,
     pub fallback_tickets: Option<Vec<String>>,
+    pub daemon_bind_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
