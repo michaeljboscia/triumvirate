@@ -3481,6 +3481,145 @@ exit 1\n",
     }
 
     #[tokio::test]
+    async fn mcp_scratchpad_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home =
+            std::env::temp_dir().join(format!("triumvirate-mcp-scratchpad-daemon-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "mcp-scratchpad-daemon-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+            files: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn scratchpad_write_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(req): AxumJson<ScratchpadWriteRequest>,
+        ) -> Result<AxumJson<ScratchpadWriteResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let path = format!("/tmp/daemon-scratch/{}/notes.md", req.project);
+            state
+                .files
+                .lock()
+                .expect("files lock poisoned")
+                .push(path.clone());
+            Ok(AxumJson(ScratchpadWriteResponse { path }))
+        }
+
+        async fn scratchpad_list_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(_req): AxumJson<ScratchpadListRequest>,
+        ) -> Result<AxumJson<ScratchpadListResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let files = state.files.lock().expect("files lock poisoned").clone();
+            Ok(AxumJson(ScratchpadListResponse { files }))
+        }
+
+        let app = Router::new()
+            .route("/scratchpad/write", post(scratchpad_write_handler))
+            .route("/scratchpad/list", post(scratchpad_list_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+                files: Arc::new(Mutex::new(Vec::new())),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL",
+                format!("http://{addr}/scratchpad/write"),
+            );
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL",
+                format!("http://{addr}/scratchpad/list"),
+            );
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let write = client
+            .call_tool(
+                CallToolRequestParams::new("scratchpad_write").with_arguments(
+                    serde_json::json!({
+                        "project": "daemon-proj",
+                        "topic": "notes",
+                        "content": "hello"
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                ),
+            )
+            .await?;
+        let write_text = write
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(write_text.contains("/tmp/daemon-scratch/daemon-proj/notes.md"));
+
+        let list = client
+            .call_tool(
+                CallToolRequestParams::new("scratchpad_list").with_arguments(
+                    serde_json::json!({ "project": "daemon-proj" })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            )
+            .await?;
+        let list_text = list
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(list_text.contains("/tmp/daemon-scratch/daemon-proj/notes.md"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mcp_fallback_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
         let now = SystemTime::now()
