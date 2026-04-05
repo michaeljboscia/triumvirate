@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use axum::Json;
 use axum::extract::State;
+use axum::extract::Path as AxumPath;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -73,6 +74,7 @@ pub async fn start_web_server(
         .route("/api/decisions", get(decisions_handler))
         .route("/api/fleet/tasks", get(fleet_tasks_handler))
         .route("/api/fleet/worktrees", get(fleet_worktrees_handler))
+        .route("/api/fleet/status/{fleet_id}", get(fleet_status_handler))
         .route("/api/fleet/spawn", post(fleet_spawn_handler))
         .route("/api/fleet/merge", post(fleet_merge_handler))
         .route("/api/fleet/peer", post(fleet_peer_handler))
@@ -567,6 +569,7 @@ async fn fleet_teardown_handler(
 #[derive(Debug, serde::Deserialize)]
 struct FleetMergeRequest {
     fleet_id: String,
+    human_approved: Option<bool>,
 }
 
 async fn fleet_merge_handler(
@@ -578,6 +581,19 @@ async fn fleet_merge_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "fleet_id is required" })),
+        )
+            .into_response();
+    }
+
+    let governance = GovernanceEngine::default();
+    let decision = governance.evaluate(
+        GovernedAction::FleetMerge,
+        req.human_approved.unwrap_or(false),
+    );
+    if !decision.allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": decision.reason })),
         )
             .into_response();
     }
@@ -685,6 +701,152 @@ async fn fleet_merge_handler(
         )
             .into_response(),
     }
+}
+
+async fn fleet_status_handler(
+    State(state): State<AppState>,
+    AxumPath(fleet_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let fleet_id = fleet_id.trim().to_string();
+    if fleet_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "fleet_id is required" })),
+        )
+            .into_response();
+    }
+
+    let conn = match Connection::open(&state.memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut tasks_stmt = match conn.prepare(
+        "SELECT task_key, title, status, assigned_agent, depends_on, updated_at
+         FROM fleet_tasks
+         WHERE fleet_id = ?1
+         ORDER BY id ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to prepare task query: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let task_rows = match tasks_stmt.query_map(rusqlite::params![fleet_id], |row| {
+        Ok(serde_json::json!({
+            "task_key": row.get::<_, String>(0)?,
+            "title": row.get::<_, String>(1)?,
+            "status": row.get::<_, String>(2)?,
+            "assigned_agent": row.get::<_, Option<String>>(3)?,
+            "depends_on": row.get::<_, Option<String>>(4)?,
+            "updated_at": row.get::<_, String>(5)?,
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to read tasks: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let mut tasks = Vec::new();
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    for row in task_rows {
+        match row {
+            Ok(value) => {
+                match value.get("status").and_then(|v| v.as_str()) {
+                    Some("completed") => completed += 1,
+                    Some("failed") => failed += 1,
+                    _ => {}
+                }
+                tasks.push(value);
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("failed to decode task row: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut wt_stmt = match conn.prepare(
+        "SELECT member_key, agent_type, branch_name, worktree_path, status, updated_at
+         FROM fleet_worktrees
+         WHERE fleet_id = ?1
+         ORDER BY id ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to prepare worktree query: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let wt_rows = match wt_stmt.query_map(rusqlite::params![fleet_id], |row| {
+        Ok(serde_json::json!({
+            "member_key": row.get::<_, String>(0)?,
+            "agent_type": row.get::<_, String>(1)?,
+            "branch_name": row.get::<_, String>(2)?,
+            "worktree_path": row.get::<_, String>(3)?,
+            "status": row.get::<_, String>(4)?,
+            "updated_at": row.get::<_, String>(5)?,
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to read worktrees: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let mut worktrees = Vec::new();
+    for row in wt_rows {
+        match row {
+            Ok(value) => worktrees.push(value),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("failed to decode worktree row: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "fleet_id": fleet_id,
+            "summary": {
+                "task_total": tasks.len(),
+                "task_completed": completed,
+                "task_failed": failed,
+                "worktree_total": worktrees.len(),
+            },
+            "tasks": tasks,
+            "worktrees": worktrees,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]
