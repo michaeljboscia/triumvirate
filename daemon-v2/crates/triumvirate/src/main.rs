@@ -36,7 +36,11 @@ use axum::{
 use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{
+        LoggingLevel, LoggingMessageNotificationParam, ProgressNotificationParam, ProgressToken,
+        ServerCapabilities, ServerInfo,
+    },
+    service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -64,7 +68,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Mutex,
-    time::{Duration, sleep, timeout},
+    time::{Duration, Instant, sleep, sleep_until, timeout},
 };
 use uuid::Uuid;
 
@@ -97,6 +101,74 @@ struct McpBridge {
     tool_router: ToolRouter<Self>,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     sessions_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct ProgressEmitter {
+    peer: rmcp::service::Peer<RoleServer>,
+    progress_token: Option<ProgressToken>,
+    progress_counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ProgressEmitter {
+    fn from_context(context: &RequestContext<RoleServer>) -> Self {
+        Self {
+            peer: context.peer.clone(),
+            progress_token: context.meta.get_progress_token(),
+            progress_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    async fn emit(&self, message: impl Into<String>) {
+        let message = message.into();
+        if let Err(err) = self
+            .peer
+            .notify_logging_message(
+                LoggingMessageNotificationParam::new(
+                    LoggingLevel::Info,
+                    serde_json::Value::String(message.clone()),
+                )
+                .with_logger("triumvirate"),
+            )
+            .await
+        {
+            tracing::debug!("progress logging notification failed: {err}");
+        }
+
+        if let Some(token) = self.progress_token.as_ref() {
+            let progress = self
+                .progress_counter
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1) as f64;
+            let mut params = ProgressNotificationParam::new(token.clone(), progress);
+            params.message = Some(message);
+            if let Err(err) = self.peer.notify_progress(params).await {
+                tracing::debug!("progress notification failed: {err}");
+            }
+        }
+    }
+}
+
+fn display_agent_name(agent: &str) -> String {
+    match agent.to_lowercase().as_str() {
+        "codex" => "Codex".to_string(),
+        "gemini" => "Gemini".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Agent".to_string(),
+            }
+        }
+    }
+}
+
+fn next_heartbeat_offset(current: Duration) -> Duration {
+    if current == Duration::from_secs(10) {
+        Duration::from_secs(40)
+    } else {
+        current.saturating_add(Duration::from_secs(60))
+    }
 }
 
 impl McpBridge {
@@ -170,6 +242,7 @@ impl McpBridge {
     async fn ask_agent(
         &self,
         Parameters(req): Parameters<AskAgentRequest>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<AskAgentResponse>, String> {
         if use_daemon_for_mcp_from_env() {
             return fetch_daemon_ask_agent(&req)
@@ -178,13 +251,16 @@ impl McpBridge {
                 .map_err(|e| format!("ask_agent via daemon failed: {e}"));
         }
 
-        execute_ask_agent(&req).await.map(Json)
+        execute_ask_agent(&req, Some(ProgressEmitter::from_context(&context)))
+            .await
+            .map(Json)
     }
 
     #[tool(description = "Fan out a request to Gemini and Codex in parallel with role-adapted prompts.")]
     async fn ask_twins(
         &self,
         Parameters(req): Parameters<AskTwinsRequest>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<AskTwinsResponse>, String> {
         if use_daemon_for_mcp_from_env() {
             return fetch_daemon_ask_twins(&req)
@@ -193,7 +269,9 @@ impl McpBridge {
                 .map_err(|e| format!("ask_twins via daemon failed: {e}"));
         }
 
-        execute_ask_twins(&req).await.map(Json)
+        execute_ask_twins(&req, Some(ProgressEmitter::from_context(&context)))
+            .await
+            .map(Json)
     }
 
     #[tool(description = "Create a persistent named session for an agent.")]
@@ -480,7 +558,10 @@ impl McpBridge {
     }
 }
 
-async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, String> {
+async fn execute_ask_agent(
+    req: &AskAgentRequest,
+    progress: Option<ProgressEmitter>,
+) -> Result<AskAgentResponse, String> {
     if !is_supported_agent(req) {
         return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
     }
@@ -489,8 +570,7 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
 
-    // Emit lifecycle states in-band so clients can render progress before native MCP progress
-    // notifications are wired in a later increment.
+    let agent_display = display_agent_name(&agent);
     let mut lifecycle = vec![LifecycleEvent {
         state: "SPAWNED".to_string(),
         detail: format!(
@@ -526,6 +606,9 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
+    if let Some(emitter) = progress.as_ref() {
+        emitter.emit(format!("→ {agent_display}: sent ✓")).await;
+    }
 
     lifecycle.push(LifecycleEvent {
         state: "WORKING".to_string(),
@@ -547,12 +630,42 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
+    if let Some(emitter) = progress.as_ref() {
+        emitter.emit(format!("→ {agent_display}: working...")).await;
+    }
 
     let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
     let mut last_err: Option<String> = None;
 
     for (idx, backoff) in backoffs.iter().enumerate() {
-        match run_named_agent(&agent, &req.message).await {
+        let mut attempt = Box::pin(run_named_agent(&agent, &req.message));
+        let started = Instant::now();
+        let mut next_heartbeat = Duration::from_secs(10);
+
+        let attempt_result = loop {
+            let sleep_duration = next_heartbeat.saturating_sub(started.elapsed());
+            tokio::select! {
+                result = &mut attempt => break result,
+                _ = sleep(sleep_duration) => {
+                    if started.elapsed() >= next_heartbeat {
+                        let elapsed = started.elapsed().as_secs();
+                        let detail = format!("{agent} still working ({elapsed}s elapsed)");
+                        lifecycle.push(LifecycleEvent {
+                            state: "WORKING".to_string(),
+                            detail,
+                        });
+                        if let Some(emitter) = progress.as_ref() {
+                            emitter
+                                .emit(format!("→ {agent_display}: working... ({elapsed}s elapsed)"))
+                                .await;
+                        }
+                        next_heartbeat = next_heartbeat_offset(next_heartbeat);
+                    }
+                }
+            }
+        };
+
+        match attempt_result {
             Ok(response) => {
                 lifecycle.push(LifecycleEvent {
                     state: "DONE".to_string(),
@@ -574,6 +687,9 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                 }) {
                     tracing::warn!("failed to append outbox event: {e}");
                 }
+                if let Some(emitter) = progress.as_ref() {
+                    emitter.emit(format!("→ {agent_display}: responded ✓")).await;
+                }
                 return Ok(AskAgentResponse {
                     request_id,
                     agent: agent.clone(),
@@ -588,6 +704,11 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                         state: "TIMEOUT".to_string(),
                         detail: format!("{agent} timed out on attempt {}", idx + 1),
                     });
+                    if let Some(emitter) = progress.as_ref() {
+                        emitter
+                            .emit(format!("→ {agent_display}: TIMEOUT after 60s ✗"))
+                            .await;
+                    }
                 }
                 lifecycle.push(LifecycleEvent {
                     state: "RETRY".to_string(),
@@ -615,6 +736,11 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
                 }) {
                     tracing::warn!("failed to append outbox event: {e}");
                 }
+                if let Some(emitter) = progress.as_ref() {
+                    emitter
+                        .emit(format!("→ {agent_display}: retrying ({}/{})...", idx + 1, backoffs.len()))
+                        .await;
+                }
                 last_err = Some(msg);
                 sleep(*backoff).await;
             }
@@ -640,6 +766,11 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
         branch: resolved_branch.clone(),
     }) {
         tracing::warn!("failed to append outbox event: {e}");
+    }
+    if let Some(emitter) = progress.as_ref() {
+        emitter
+            .emit(format!("→ {agent_display}: FAILED after {} attempts", backoffs.len()))
+            .await;
     }
 
     let fallback_path = spawn_dead_drop(
@@ -667,6 +798,11 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
             repo: resolved_repo.clone(),
             branch: resolved_branch.clone(),
         });
+        if let Some(emitter) = progress.as_ref() {
+            emitter
+                .emit(format!("→ {agent_display}: dead drop launched, {}", path.display()))
+                .await;
+        }
     }
     Err(format!(
         "ask_agent failed after lifecycle {:?}: {}{}",
@@ -681,7 +817,10 @@ async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, St
     ))
 }
 
-async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, String> {
+async fn execute_ask_twins(
+    req: &AskTwinsRequest,
+    progress: Option<ProgressEmitter>,
+) -> Result<AskTwinsResponse, String> {
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
@@ -706,6 +845,13 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
             detail: "Gemini and Codex processing in parallel".to_string(),
         },
     ];
+    if let Some(emitter) = progress.as_ref() {
+        emitter.emit("→ Gemini: sent ✓").await;
+        emitter.emit("→ Codex: sent ✓").await;
+        emitter
+            .emit("→ Gemini and Codex: working in parallel...")
+            .await;
+    }
     if let Err(e) = append_outbox_event(&OutboxEvent {
         ts_ms: core_unix_time_ms(),
         request_id: request_id.clone(),
@@ -720,139 +866,141 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
         tracing::warn!("failed to append outbox event: {e}");
     }
 
-    let gemini_fut = run_named_agent("gemini", &gemini_prompt);
-    let codex_fut = run_named_agent("codex", &codex_prompt);
-    let (gemini_out, codex_out) = tokio::join!(gemini_fut, codex_fut);
+    let mut handles = tokio::task::JoinSet::new();
+    handles.spawn(async move {
+        let prompt_sent = gemini_prompt.clone();
+        (
+            "gemini".to_string(),
+            prompt_sent,
+            run_named_agent("gemini", &gemini_prompt).await,
+        )
+    });
+    handles.spawn(async move {
+        let prompt_sent = codex_prompt.clone();
+        (
+            "codex".to_string(),
+            prompt_sent,
+            run_named_agent("codex", &codex_prompt).await,
+        )
+    });
 
     let mut results = Vec::new();
     let mut failures = Vec::new();
+    let mut pending = HashMap::from([
+        ("gemini".to_string(), (Instant::now(), Duration::from_secs(10))),
+        ("codex".to_string(), (Instant::now(), Duration::from_secs(10))),
+    ]);
 
-    match gemini_out {
-        Ok(response) => {
-            lifecycle.push(LifecycleEvent {
-                state: "DONE".to_string(),
-                detail: "Gemini responded".to_string(),
-            });
-            results.push(AgentResult {
-                agent: "gemini".to_string(),
-                response,
-                prompt_sent: gemini_prompt,
-            });
-            let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: core_unix_time_ms(),
-                request_id: request_id.clone(),
-                tool: "ask_twins".to_string(),
-                status: "DONE".to_string(),
-                agent: Some("gemini".to_string()),
-                detail: "Gemini responded".to_string(),
-                cwd: resolved_cwd.clone(),
-                repo: resolved_repo.clone(),
-                branch: resolved_branch.clone(),
-            });
+    while !pending.is_empty() {
+        let mut next_deadline = None;
+        for (started, heartbeat_offset) in pending.values() {
+            let deadline = *started + *heartbeat_offset;
+            next_deadline = Some(next_deadline.map_or(deadline, |prev: Instant| prev.min(deadline)));
         }
-        Err(e) => {
-            let detail = format!("Gemini failed: {e}");
-            lifecycle.push(LifecycleEvent {
-                state: "FAILED".to_string(),
-                detail: detail.clone(),
-            });
-            failures.push(LifecycleEvent {
-                state: "FAILED".to_string(),
-                detail,
-            });
-            let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: core_unix_time_ms(),
-                request_id: request_id.clone(),
-                tool: "ask_twins".to_string(),
-                status: "FAILED".to_string(),
-                agent: Some("gemini".to_string()),
-                detail: "Gemini failed".to_string(),
-                cwd: resolved_cwd.clone(),
-                repo: resolved_repo.clone(),
-                branch: resolved_branch.clone(),
-            });
-            if let Ok(path) = spawn_dead_drop(
-                "gemini",
-                &req.message,
-                &e.to_string(),
-                &resolved_cwd,
-                &resolved_repo,
-                &resolved_branch,
-            ) {
-                let info = format!("Gemini dead drop launched: {}", path.display());
-                lifecycle.push(LifecycleEvent {
-                    state: "FALLBACK".to_string(),
-                    detail: info.clone(),
-                });
-                failures.push(LifecycleEvent {
-                    state: "FALLBACK".to_string(),
-                    detail: info,
-                });
+        let timer_deadline = next_deadline.unwrap_or_else(Instant::now);
+        let timer = sleep_until(timer_deadline);
+        tokio::pin!(timer);
+
+        tokio::select! {
+            join_result = handles.join_next(), if !pending.is_empty() => {
+                let Some(join_result) = join_result else { break; };
+                let (agent, prompt_sent, outcome) = join_result.map_err(|e| e.to_string())?;
+                pending.remove(&agent);
+                let display = display_agent_name(&agent);
+                match outcome {
+                    Ok(response) => {
+                        lifecycle.push(LifecycleEvent {
+                            state: "DONE".to_string(),
+                            detail: format!("{display} responded"),
+                        });
+                        results.push(AgentResult {
+                            agent: agent.clone(),
+                            response,
+                            prompt_sent,
+                        });
+                        let _ = append_outbox_event(&OutboxEvent {
+                            ts_ms: core_unix_time_ms(),
+                            request_id: request_id.clone(),
+                            tool: "ask_twins".to_string(),
+                            status: "DONE".to_string(),
+                            agent: Some(agent.clone()),
+                            detail: format!("{display} responded"),
+                            cwd: resolved_cwd.clone(),
+                            repo: resolved_repo.clone(),
+                            branch: resolved_branch.clone(),
+                        });
+                        if let Some(emitter) = progress.as_ref() {
+                            emitter.emit(format!("→ {display}: responded ✓")).await;
+                        }
+                    }
+                    Err(e) => {
+                        let detail = format!("{display} failed: {e}");
+                        lifecycle.push(LifecycleEvent {
+                            state: "FAILED".to_string(),
+                            detail: detail.clone(),
+                        });
+                        failures.push(LifecycleEvent {
+                            state: "FAILED".to_string(),
+                            detail,
+                        });
+                        let _ = append_outbox_event(&OutboxEvent {
+                            ts_ms: core_unix_time_ms(),
+                            request_id: request_id.clone(),
+                            tool: "ask_twins".to_string(),
+                            status: "FAILED".to_string(),
+                            agent: Some(agent.clone()),
+                            detail: format!("{display} failed"),
+                            cwd: resolved_cwd.clone(),
+                            repo: resolved_repo.clone(),
+                            branch: resolved_branch.clone(),
+                        });
+                        if let Some(emitter) = progress.as_ref() {
+                            emitter.emit(format!("→ {display}: FAILED ✗ ({e})")).await;
+                        }
+                        if let Ok(path) = spawn_dead_drop(
+                            &agent,
+                            &req.message,
+                            &e.to_string(),
+                            &resolved_cwd,
+                            &resolved_repo,
+                            &resolved_branch,
+                        ) {
+                            let info = format!("{display} dead drop launched: {}", path.display());
+                            lifecycle.push(LifecycleEvent {
+                                state: "FALLBACK".to_string(),
+                                detail: info.clone(),
+                            });
+                            failures.push(LifecycleEvent {
+                                state: "FALLBACK".to_string(),
+                                detail: info.clone(),
+                            });
+                            if let Some(emitter) = progress.as_ref() {
+                                emitter.emit(format!("→ {display}: dead drop launched, {}", path.display())).await;
+                            }
+                        }
+                    }
+                }
             }
-        }
-    }
-
-    match codex_out {
-        Ok(response) => {
-            lifecycle.push(LifecycleEvent {
-                state: "DONE".to_string(),
-                detail: "Codex responded".to_string(),
-            });
-            results.push(AgentResult {
-                agent: "codex".to_string(),
-                response,
-                prompt_sent: codex_prompt,
-            });
-            let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: core_unix_time_ms(),
-                request_id: request_id.clone(),
-                tool: "ask_twins".to_string(),
-                status: "DONE".to_string(),
-                agent: Some("codex".to_string()),
-                detail: "Codex responded".to_string(),
-                cwd: resolved_cwd.clone(),
-                repo: resolved_repo.clone(),
-                branch: resolved_branch.clone(),
-            });
-        }
-        Err(e) => {
-            let detail = format!("Codex failed: {e}");
-            lifecycle.push(LifecycleEvent {
-                state: "FAILED".to_string(),
-                detail: detail.clone(),
-            });
-            failures.push(LifecycleEvent {
-                state: "FAILED".to_string(),
-                detail,
-            });
-            let _ = append_outbox_event(&OutboxEvent {
-                ts_ms: core_unix_time_ms(),
-                request_id: request_id.clone(),
-                tool: "ask_twins".to_string(),
-                status: "FAILED".to_string(),
-                agent: Some("codex".to_string()),
-                detail: "Codex failed".to_string(),
-                cwd: resolved_cwd.clone(),
-                repo: resolved_repo.clone(),
-                branch: resolved_branch.clone(),
-            });
-            if let Ok(path) = spawn_dead_drop(
-                "codex",
-                &req.message,
-                &e.to_string(),
-                &resolved_cwd,
-                &resolved_repo,
-                &resolved_branch,
-            ) {
-                let info = format!("Codex dead drop launched: {}", path.display());
-                lifecycle.push(LifecycleEvent {
-                    state: "FALLBACK".to_string(),
-                    detail: info.clone(),
-                });
-                failures.push(LifecycleEvent {
-                    state: "FALLBACK".to_string(),
-                    detail: info,
-                });
+            _ = &mut timer, if !pending.is_empty() => {
+                let now = Instant::now();
+                let mut agents = pending.keys().cloned().collect::<Vec<_>>();
+                agents.sort();
+                for agent in agents {
+                    if let Some((started, next_offset)) = pending.get_mut(&agent) {
+                        if now >= *started + *next_offset {
+                            let elapsed = started.elapsed().as_secs();
+                            let display = display_agent_name(&agent);
+                            lifecycle.push(LifecycleEvent {
+                                state: "WORKING".to_string(),
+                                detail: format!("{display} still working ({elapsed}s elapsed)"),
+                            });
+                            if let Some(emitter) = progress.as_ref() {
+                                emitter.emit(format!("→ {display}: working... ({elapsed}s elapsed)")).await;
+                            }
+                            *next_offset = next_heartbeat_offset(*next_offset);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1174,7 +1322,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         )
         .await;
         let _guard = queue.lock().await;
-        execute_ask_agent(&req).await.map(AxumJson).map_err(|e| {
+        execute_ask_agent(&req, None).await.map(AxumJson).map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
                 AxumJson(serde_json::json!({ "error": e })),
@@ -1199,7 +1347,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         )
         .await;
         let _guard = queue.lock().await;
-        execute_ask_twins(&req).await.map(AxumJson).map_err(|e| {
+        execute_ask_twins(&req, None).await.map(AxumJson).map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
                 AxumJson(serde_json::json!({ "error": e })),
@@ -3716,7 +3864,7 @@ exit 1\n",
             cwd: Some("/tmp/project".to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
-        })
+        }, None)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
         assert!(!response.request_id.is_empty());
@@ -3762,7 +3910,7 @@ exit 1\n",
             cwd: Some("/tmp/project".to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
-        })
+        }, None)
         .await
         .err()
         .unwrap_or_default();
