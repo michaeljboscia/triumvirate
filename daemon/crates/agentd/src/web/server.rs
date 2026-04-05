@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
 use rust_embed::Embed;
@@ -22,7 +22,7 @@ struct Assets;
 /// Shared state available to all HTTP handlers.
 #[derive(Clone)]
 pub struct AppState {
-    pub bus: Arc<MessageBus>,
+    pub _bus: Arc<MessageBus>,
 }
 
 /// Start the web dashboard server on the given port.
@@ -30,7 +30,7 @@ pub struct AppState {
 /// Per GR1-D1: Web-Only UI — this is the exclusive conversation interface.
 /// Temporal UI at :8233 is accessible via "Developer Tools" link (GR1-D6).
 pub async fn start_web_server(bus: Arc<MessageBus>, port: u16) -> anyhow::Result<()> {
-    let state = AppState { bus };
+    let state = AppState { _bus: bus };
 
     let app = Router::new()
         .route("/", get(index_handler))

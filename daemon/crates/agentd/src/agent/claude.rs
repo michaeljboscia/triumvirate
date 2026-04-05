@@ -1,8 +1,14 @@
 use std::sync::Arc;
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::{info, warn};
-use triumvirate_proto::{AgentId, HealthStatus};
+use triumvirate_proto::{
+    parse_claude_event, AgentId, ClaudeEventKind, FabricMessage, HealthStatus, Payload, Topic,
+};
+use uuid::Uuid;
 
 use super::connector::AgentConnector;
 use crate::fabric::MessageBus;
@@ -16,7 +22,9 @@ use crate::fabric::MessageBus;
 ///
 /// POC 2 will add PTY mode for full interactive sessions.
 pub struct ClaudeConnector {
+    #[allow(dead_code)]
     session_id: Option<String>,
+    input_tx: Option<mpsc::Sender<String>>,
     health_status: HealthStatus,
     health_tx: watch::Sender<HealthStatus>,
     health_rx: watch::Receiver<HealthStatus>,
@@ -27,6 +35,7 @@ impl ClaudeConnector {
         let (health_tx, health_rx) = watch::channel(HealthStatus::Starting);
         Self {
             session_id: None,
+            input_tx: None,
             health_status: HealthStatus::Starting,
             health_tx,
             health_rx,
@@ -45,30 +54,168 @@ impl AgentConnector for ClaudeConnector {
         AgentId::Claude
     }
 
-    async fn spawn(&mut self, _bus: Arc<MessageBus>) -> anyhow::Result<()> {
-        // POC 1: Verify claude CLI exists, mark ready
-        match tokio::process::Command::new("which")
-            .arg("claude")
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
-                let path = String::from_utf8_lossy(&output.stdout);
-                info!(agent = "claude", path = %path.trim(), "CLI found");
-                self.set_health(HealthStatus::Ready);
+    async fn spawn(&mut self, bus: Arc<MessageBus>) -> anyhow::Result<()> {
+        let session_id = Uuid::new_v4().to_string();
+        self.session_id = Some(session_id.clone());
+
+        let mut child = Command::new("claude")
+            .arg("--input-format")
+            .arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--session-id")
+            .arg(&session_id)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("claude stdin not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("claude stdout not piped"))?;
+
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(256);
+        self.input_tx = Some(input_tx.clone());
+
+        let mut human_rx = bus.subscribe(&Topic::HumanInput).await;
+        tokio::spawn(async move {
+            while let Ok(msg) = human_rx.recv().await {
+                if let Payload::HumanMessage { content } = msg.payload {
+                    let _ = input_tx.send(content).await;
+                }
             }
-            _ => {
-                warn!(agent = "claude", "CLI not found in PATH");
-                self.set_health(HealthStatus::Dead);
+        });
+
+        tokio::spawn(async move {
+            let mut writer = stdin;
+            while let Some(message) = input_rx.recv().await {
+                let payload = serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": message
+                });
+                let line = format!("{payload}\n");
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                if writer.flush().await.is_err() {
+                    break;
+                }
             }
-        }
+        });
+
+        let reader_bus = bus.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => match parse_claude_event(&line) {
+                        Ok(Some(event)) => {
+                            if let Some(text) = event.text_content() {
+                                let payload = if matches!(event.kind, ClaudeEventKind::Result) {
+                                    Payload::AgentResponse {
+                                        content: text,
+                                        tokens_used: None,
+                                    }
+                                } else {
+                                    Payload::TextChunk {
+                                        content: text,
+                                        is_final: false,
+                                    }
+                                };
+                                reader_bus
+                                    .emit(FabricMessage::new(
+                                        AgentId::Claude,
+                                        Topic::AgentOutput(AgentId::Claude),
+                                        payload,
+                                    ))
+                                    .await;
+                            }
+
+                            if matches!(event.kind, ClaudeEventKind::Error) {
+                                let message = event
+                                    .error_message()
+                                    .unwrap_or_else(|| "claude stream error".to_string());
+                                reader_bus
+                                    .emit(FabricMessage::new(
+                                        AgentId::System,
+                                        Topic::SystemError,
+                                        Payload::Error {
+                                            message,
+                                            source_agent: Some(AgentId::Claude),
+                                        },
+                                    ))
+                                    .await;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            reader_bus
+                                .emit(FabricMessage::new(
+                                    AgentId::System,
+                                    Topic::SystemError,
+                                    Payload::Error {
+                                        message: format!("failed to parse claude jsonl: {e}"),
+                                        source_agent: Some(AgentId::Claude),
+                                    },
+                                ))
+                                .await;
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        reader_bus
+                            .emit(FabricMessage::new(
+                                AgentId::System,
+                                Topic::SystemError,
+                                Payload::Error {
+                                    message: format!("error reading claude stdout: {e}"),
+                                    source_agent: Some(AgentId::Claude),
+                                },
+                            ))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        let monitor_tx = self.health_tx.clone();
+        tokio::spawn(async move {
+            let status = child.wait().await;
+            let _ = monitor_tx.send(HealthStatus::Dead);
+            if let Err(e) = status {
+                warn!(agent = "claude", error = %e, "claude process wait failed");
+            }
+        });
+
+        info!(agent = "claude", session = %session_id, "spawned persistent stream-json session");
+        self.set_health(HealthStatus::Ready);
+        bus.emit(FabricMessage::new(
+            AgentId::System,
+            Topic::SystemHealth,
+            Payload::HealthChange {
+                agent: AgentId::Claude,
+                status: HealthStatus::Ready,
+                detail: Some("claude connector started".to_string()),
+            },
+        ))
+        .await;
         Ok(())
     }
 
     async fn send(&self, message: &str) -> anyhow::Result<()> {
-        // POC 1: Log the message. POC 2: Write to subprocess stdin.
-        info!(agent = "claude", session = ?self.session_id, %message, "would send to Claude CLI");
-        Ok(())
+        if let Some(tx) = &self.input_tx {
+            tx.send(message.to_string()).await?;
+            return Ok(());
+        }
+        Err(anyhow::anyhow!("claude connector is not running"))
     }
 
     async fn shutdown(&mut self) -> anyhow::Result<()> {

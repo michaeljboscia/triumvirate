@@ -7,11 +7,12 @@ use crate::fabric::MessageBus;
 
 /// Trait for all agent CLI connectors.
 ///
-/// Each implementation manages a persistent subprocess (PTY in POC 2+),
+/// Each implementation manages a persistent subprocess over piped stdio,
 /// parses its output into FabricMessages, and routes input from the bus.
 ///
 /// The lifecycle: spawn() → ready → send()/recv loop → shutdown()
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait AgentConnector: Send + Sync {
     /// Which agent this connector manages.
     fn agent_id(&self) -> AgentId;
@@ -35,6 +36,7 @@ pub trait AgentConnector: Send + Sync {
 
 /// Handle returned after spawning an agent — allows the daemon to interact
 /// with the running connector without holding a mutable reference.
+#[allow(dead_code)]
 pub struct AgentHandle {
     pub agent_id: AgentId,
     pub health_rx: watch::Receiver<HealthStatus>,

@@ -2,8 +2,8 @@ TRIUMVIRATE V2 — PROGRESS TRACKER
 ==================================
 
 Last updated: 2026-04-05
-Current phase: Phase 0 (Prior Art Research)
-Next step: 0.1 (Study Ruflo source)
+Current phase: Phase 1 (POC 2 — Live Claude Agent)
+Next step: 1.2 (Implement Claude stream-json parser in proto + wire parser output to web stream)
 
 COMPLETED
 ---------
@@ -12,10 +12,22 @@ COMPLETED
 - Canonical docs: PRD, APP_FLOW, TECH_STACK, DESIGN_SYSTEM, FRONTEND_GUIDELINES, BACKEND_STRUCTURE, IMPLEMENTATION_PLAN, CLAUDE.md written
 - Research: 33 artifacts including multi-agent coordination landscape (032), decision ledger (033)
 - Goat Rodeo: 6 rounds, REQ-7 (Dynamic Multi-Agent Fleet) added
+- Phase 0 complete: prior-art source analysis written
+  - research/034-ruflo-source-analysis.md
+  - research/035-clash-source-analysis.md
+  - research/036-swarms-rs-source-analysis.md
+  - research/037-temporal-workflow-patterns.md
+- Phase 1.1 complete: Claude persistent subprocess connector implemented
+  - `claude --input-format stream-json --output-format stream-json --session-id <uuid>`
+  - dedicated reader/writer tokio tasks + bus bridge
+  - stream-json parser added in proto (`crates/proto/src/claude_events.rs`)
 
 IN PROGRESS
 -----------
-(nothing currently in progress)
+- Phase 1.2 / 1.3 / 1.4
+  - JSONL parser hardening and event mapping
+  - WebSocket endpoint for live browser streaming
+  - `POST /api/message` routing to Claude stdin via fabric
 
 BLOCKED
 -------
@@ -23,8 +35,7 @@ BLOCKED
 
 NEXT UP
 -------
-Phase 0: Study Ruflo, Clash, swarms-rs, Temporal source code
-Phase 1: POC 2 — Claude live agent (stream-json over piped stdio)
+Phase 1: finish POC 2 — browser message -> Claude -> live stream
 Phase 2: POC 3 — All 3 agents streaming simultaneously
 Phase 3: Foundation — memory, stenographer, workflow engine
 Phase 4: Fleet — worktrees, task list, sequential merge

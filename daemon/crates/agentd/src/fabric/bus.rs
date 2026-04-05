@@ -56,6 +56,7 @@ impl MessageBus {
     }
 
     /// Subscribe to a topic. Returns a receiver that yields all future messages.
+    #[allow(dead_code)]
     pub async fn subscribe(
         &self,
         topic: &Topic,
