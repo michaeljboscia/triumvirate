@@ -105,6 +105,26 @@ pub fn daemon_fallback_gc_url() -> String {
         .unwrap_or_else(|_| format!("{}/fallback/gc", daemon_base_url()))
 }
 
+pub fn gemini_command() -> (String, Vec<String>) {
+    resolve_connector_command("TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_GEMINI_ARGS", "mock-gemini")
+}
+
+pub fn codex_command() -> (String, Vec<String>) {
+    resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "mock-codex")
+}
+
+fn resolve_connector_command(
+    bin_env: &str,
+    args_env: &str,
+    default_bin: &str,
+) -> (String, Vec<String>) {
+    let bin = std::env::var(bin_env).unwrap_or_else(|_| default_bin.to_string());
+    let args = std::env::var(args_env)
+        .map(|v| v.split_whitespace().map(ToString::to_string).collect())
+        .unwrap_or_else(|_| Vec::new());
+    (bin, args)
+}
+
 #[cfg(test)]
 mod tests {
     use shared_types::{AskAgentRequest, AskTwinsRequest};
@@ -191,6 +211,45 @@ mod tests {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BASE_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+        }
+    }
+
+    #[test]
+    fn connector_command_resolution_defaults_and_overrides() {
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+        assert_eq!(super::gemini_command().0, "mock-gemini");
+        assert_eq!(super::codex_command().0, "mock-codex");
+
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", "gemini-cli");
+            std::env::set_var("TRIUMVIRATE_GEMINI_ARGS", "--model pro");
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", "codex-cli");
+            std::env::set_var("TRIUMVIRATE_CODEX_ARGS", "--reasoning high");
+        }
+        assert_eq!(super::gemini_command().0, "gemini-cli");
+        assert_eq!(
+            super::gemini_command().1,
+            vec!["--model".to_string(), "pro".to_string()]
+        );
+        assert_eq!(super::codex_command().0, "codex-cli");
+        assert_eq!(
+            super::codex_command().1,
+            vec!["--reasoning".to_string(), "high".to_string()]
+        );
+
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
         }
     }
 }
