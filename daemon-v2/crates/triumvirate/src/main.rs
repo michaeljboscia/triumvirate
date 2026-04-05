@@ -104,6 +104,7 @@ impl McpBridge {
         Self::with_persistence(true)
     }
 
+    #[cfg(test)]
     fn new_ephemeral() -> Self {
         Self::with_persistence(false)
     }
