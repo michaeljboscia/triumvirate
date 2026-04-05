@@ -119,8 +119,9 @@ async fn message_handler(
         ))
         .await;
 
+    let is_direct_mention = content.starts_with('@');
     let decision = decide_route(&content);
-    match decision {
+    let (reason, target_agent) = match decision {
         RoutingDecision::Agent { agent, content } => {
             if content.is_empty() {
                 return (
@@ -138,6 +139,12 @@ async fn message_handler(
                     Payload::HumanMessage { content },
                 ))
                 .await;
+            let reason = if is_direct_mention {
+                "direct_mention".to_string()
+            } else {
+                "lead_default".to_string()
+            };
+            (reason, Some(agent))
         }
         RoutingDecision::Debate { topic } => {
             state
@@ -148,6 +155,7 @@ async fn message_handler(
                     Payload::HumanMessage { content: topic },
                 ))
                 .await;
+            ("debate_command".to_string(), None)
         }
         RoutingDecision::Fleet { spec } => {
             state
@@ -158,6 +166,7 @@ async fn message_handler(
                     Payload::HumanMessage { content: spec },
                 ))
                 .await;
+            ("fleet_command".to_string(), None)
         }
         RoutingDecision::Status => {
             state
@@ -172,20 +181,24 @@ async fn message_handler(
                     },
                 ))
                 .await;
+            ("status_command".to_string(), None)
         }
-    }
+    };
 
-    state
-        .bus
-        .emit(FabricMessage::new(
-            AgentId::Human,
-            Topic::Broadcast,
-            Payload::TextChunk {
-                content: "message routed".to_string(),
-                is_final: true,
-            },
-        ))
-        .await;
+    if let Some(target_agent) = target_agent {
+        state
+            .bus
+            .emit(FabricMessage::new(
+                AgentId::System,
+                Topic::TaskProgress,
+                Payload::RoutingDecision {
+                    target_agent,
+                    reason,
+                    content,
+                },
+            ))
+            .await;
+    }
 
     (StatusCode::ACCEPTED, Json(MessageResponse { accepted: true })).into_response()
 }
