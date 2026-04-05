@@ -1,246 +1,240 @@
 # Triumvirate v2 — Specification
 
-**Date:** 2026-04-04
+**Date:** 2026-04-05
 **Author:** Mike Boscia + Claude + Gemini + Codex
-**Status:** Draft
-**Origin:** nudge-reaper catastrophe → crystallize → first-principles rebuild
+**Status:** Final (Goat Rodeo R1-R6 complete)
+**Origin:** nudge-reaper catastrophe → crystallize → first-principles rebuild → 6-round Goat Rodeo
 
 ---
 
 ## What This Is
 
-A Go binary (`triumvirate-agentd`) that runs on your machine and makes Claude, Gemini, and Codex work together as a team. Not a framework. Not a platform. Your everyday driver.
+A Rust binary (`triumvirate-agentd`) that runs on your machine and makes Claude, Gemini, and Codex work together as a fleet. Not a framework. Not a platform. Your everyday driver.
 
-## The Four Requirements
+The thing that doesn't exist anywhere else: **cross-model multi-agent fleet coordination.** Claude Agent Teams is Claude-only. OpenAI Swarm is OpenAI-only. Google ADK is Gemini-only. This runs all three simultaneously — any number of each — coordinated by one daemon.
+
+## The Seven Requirements
 
 Everything in this spec serves one of these. If it doesn't serve one, it's not in v1.
 
-### REQ-1: 3-Agent Conversation
-Claude, Gemini, and Codex in the same terminal, all talking, all live. The human is the fourth participant. Not note-passing through files — real-time streaming collaboration where all four participants see each other's output.
+### REQ-1: N-Agent Conversation
+Claude, Gemini, and Codex in the same browser, all talking, all live. The human is the fourth participant. Not note-passing through files — real-time streaming collaboration where all participants see each other's output. Each agent connected via its native structured JSON protocol.
 
 ### REQ-2: Working Stenographer
 Session notes that actually capture what happened, every time. No hallucinated summaries. No silent failures. Mechanical extraction of facts from the conversation, verified against reality.
 
 ### REQ-3: Reliable Memory
-Shared across all three agents and the human. Never silently fails. Never loses data. Never diverges between agents. When Claude learns something, Gemini and Codex know it next time they're asked.
+Shared across all agents and the human via SQLite WAL. Never silently fails. Never loses data. Never diverges between agents. When Claude learns something, Gemini and Codex know it next time they're asked. No hot cache — SQLite handles reads directly.
 
 ### REQ-4: It All Works Together
-One system. One binary. One install. Not a pile of scripts hoping for the best. If any component fails, the system tells you — it doesn't silently degrade.
+One system. One binary. One install. Not a pile of scripts hoping for the best. If any component fails, the system tells you — it doesn't silently degrade. No external dependencies (no NATS server, no Temporal cluster). Everything is in-process.
 
 ### REQ-5: Use All Three, All The Time
-Three subscriptions. Three agents. All working simultaneously, not taking turns. When Claude is designing, Gemini is researching, and Codex is coding — in parallel. No agent sits idle while another thinks. The system should maximize utilization of every subscription dollar. When implementation starts, Codex writes Go. Claude architects. Gemini validates. All at the same time.
+Three subscriptions. Three agents. All working simultaneously, not taking turns. When Claude is designing, Gemini is researching, and Codex is coding — in parallel. Idle agents receive lightweight mechanical digests (not LLM-generated summaries) so they can self-activate on high-value moments. Quota-gated: per-agent budget meters with auto-fallback to explicit routing at 80% threshold.
+
+### REQ-6: Visual Dashboard
+A web UI served from the binary via `rust-embed`. Shows agents working, tasks progressing, memory state, and fleet health. Two views: tasks (executive) and agents (debug). The interface you show someone so they understand what the system does in 30 seconds.
+
+### REQ-7: Dynamic Multi-Agent Fleet
+The daemon can spawn N instances of any agent type on demand. "Give me 3 Claudes on auth, 2 Codexes on API, 1 Gemini researching" is a valid command. Fleet composition is defined per-task, not per-daemon. The daemon manages task assignment, context distribution via git worktrees, collision prevention, quota tracking, and result aggregation. Cross-model fleet coordination — the killer feature.
 
 ---
 
 ## Architecture
 
 ```
-triumvirate-agentd (single Go binary)
+triumvirate-agentd (single Rust binary)
 │
-├── Agent Connectors (persistent CLI subprocesses)
-│   ├── Claude  (claude --resume <sid> | claude -p --stream-json)
-│   ├── Gemini  (gemini CLI | future: Go SDK direct)
-│   └── Codex   (codex CLI | future: Go SDK direct)
+├── Agent Pool (persistent CLI subprocesses, N per type)
+│   ├── Claude  (--input-format stream-json --output-format stream-json --session-id)
+│   ├── Gemini  (--acp, JSON-RPC over stdio)
+│   └── Codex   (mcp-server, JSON-RPC over stdio)
+│   Each agent type supports CLI or API backend (config switch)
 │
-├── Message Fabric (embedded NATS + JetStream)
-│   ├── agents.stream    — all agent messages, debate turns, responses
-│   ├── tasks.stream     — task lifecycle events
-│   ├── tools.stream     — tool invocations and results
-│   └── memory.stream    — memory writes, reads, updates
+├── Message Fabric (Tokio broadcast/mpsc/watch channels)
+│   ├── agents.{type}.{id}.output  — agent streaming output
+│   ├── tasks.stream               — task lifecycle events
+│   ├── fleet.stream               — fleet coordination events
+│   └── memory.stream              — memory writes/reads
+│   Topic enum maps to NATS subjects (future swap path)
 │
-├── Orchestration (Temporal.io)
-│   ├── ConversationWorkflow  — 4-way live collaboration
+├── Workflow Engine (purpose-built, SQLite-backed)
+│   ├── ConversationWorkflow  — N-way live collaboration
 │   ├── DebateWorkflow        — structured Toulmin debate with vote
-│   └── TaskWorkflow          — plan → execute → verify
+│   ├── TaskWorkflow          — plan → execute → verify
+│   └── FleetWorkflow         — fan-out N agents, worktrees, sequential merge
+│   Informed by Temporal source (Apache 2.0). Event-sourced state machine.
+│   Crash recovery via write-ahead log in SQLite WAL.
+│
+├── Fleet Coordinator
+│   ├── Git worktrees          — one per fleet member (isolation)
+│   ├── Contract definitions   — interfaces defined before fan-out (Wave 0)
+│   ├── Shared task list       — SQLite, dependency tracking, claim/complete
+│   ├── Sequential merge       — one branch at a time, full context
+│   └── Peer messaging         — fleet members communicate via fabric
+│   Informed by Ruflo, Clash, Claude Agent Teams patterns.
 │
 ├── Memory (shared context fabric)
-│   ├── SQLite WAL             — persistent key-value + event store
-│   ├── NATS KV                — fast ephemeral state
-│   └── Sync engine            — pushes memory to all agents on session start
+│   ├── SQLite WAL             — persistent store (memories, sessions, decisions)
+│   └── Daemon extraction      — daemon proposes memory writes from structured
+│                                JSON, human or second agent confirms
 │
-├── Governance (embedded OPA)
-│   ├── Rego policies          — what each agent can/can't do
+├── Governance (Cedar, Rust-native)
+│   ├── Cedar policies         — what each agent can/can't do
 │   └── Human approval gates   — destructive ops require confirmation
 │
 ├── Observability (OpenTelemetry)
 │   ├── Per-agent spans        — latency, tokens, cost per turn
 │   └── Trace correlation      — session_id across all agents
 │
-└── TUI (BubbleTea)
-    ├── Agent panes            — one per agent, streaming output
-    ├── Human input pane       — always has priority
-    ├── Event log pane         — NATS message stream (optional)
-    └── Status bar             — who's thinking, idle, streaming
+├── Stenographer (fabric consumer)
+│   ├── Mechanical extraction  — structured JSON events, NOT LLM summaries
+│   ├── Git diffs              — files changed between session start/end
+│   ├── Tool results           — every invocation and outcome
+│   └── Decisions              — syntax-gated via daemon extraction
+│
+└── Web Dashboard (axum + Svelte + Tailwind, rust-embed)
+    ├── Tasks view             — grouped by work item, agent assignments
+    ├── Agents view            — dynamic grid, one pane per running agent
+    ├── Quota meters           — per-agent budget bars with thresholds
+    ├── Routing log            — every message, who got what, token cost
+    ├── Memory viewer          — query SQLite, display current state
+    └── Workflow panel          — state machine visualization (replaces Temporal UI)
 ```
 
 ---
 
-## REQ-1: 3-Agent Conversation
+## REQ-1: N-Agent Conversation
 
 ### How It Works
 
-1. **Daemon boots.** Spawns 3 CLI subprocesses, one per agent. Holds them alive for the daemon's lifetime. Never cold starts.
+1. **Daemon boots.** Spawns persistent CLI subprocesses per config. Holds them alive for the daemon's lifetime. Never cold starts.
 
-2. **Human types.** Input goes to the daemon, not directly to a CLI. The daemon decides routing:
+2. **Human types.** Input goes to the daemon via the web dashboard, not directly to a CLI. The daemon decides routing:
    - Direct message: `@claude migrate auth to supabase` → routes to Claude only
-   - Open question: `how should we handle auth?` → routes to all 3 in parallel
+   - Open question: `how should we handle auth?` → routes to lead agent per GR1-D3
    - Debate trigger: `/debate should we use Redis or Postgres for caching?` → structured Toulmin workflow
 
-3. **Agents respond.** Each agent's stdout is parsed by jsoniter (zero-allocation streaming), published to NATS `agents.stream`, and rendered in its BubbleTea pane in real-time.
+3. **Agents respond.** Each agent's stdout is parsed from its native JSON protocol (stream-json, ACP, or MCP), published to the fabric, and rendered in the dashboard in real-time.
 
-4. **Agents see each other.** When Claude publishes a response, Gemini and Codex receive it via NATS subscription. On their next turn, their prompt includes the other agents' recent messages. They can challenge, agree, or build on each other's ideas.
+4. **Agents see each other.** When Claude publishes a response, other agents receive a mechanical digest via the fabric. On their next turn, their prompt includes what other agents said. They can challenge, agree, or build on each other's ideas.
 
-5. **Human interrupts.** ESC key sends AbortError to the active agent's CLI. Human input always takes priority. Three modes: `interrupt` (stop now), `append` (finish sentence), `queue` (process after current turn).
+5. **Human interrupts.** ESC sends cancellation to the active agent. Human input always takes priority.
 
 ### Agent Connector Design
 
-```go
-type AgentConnector struct {
-    Name        string           // "claude", "gemini", "codex"
-    Process     *exec.Cmd        // persistent subprocess
-    Stdin       io.WriteCloser   // dedicated writer goroutine reads from channel
-    Stdout      io.ReadCloser    // dedicated reader goroutine publishes to NATS
-    WriteCh     chan []byte       // serialized writes to stdin (no interleaving)
-    Health      HealthStatus     // liveness + readiness + progress
-    SessionID   string           // for --resume (Claude) or equivalent
+```rust
+#[async_trait]
+pub trait AgentConnector: Send + Sync {
+    fn agent_id(&self) -> AgentId;
+    async fn spawn(&mut self, bus: Arc<MessageBus>) -> Result<()>;
+    async fn send(&self, message: &str) -> Result<()>;
+    async fn shutdown(&mut self) -> Result<()>;
+    fn health(&self) -> HealthStatus;
+    fn health_watch(&self) -> watch::Receiver<HealthStatus>;
 }
 ```
 
 Each connector:
-- Spawns with `SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}`
-- Dedicated reader goroutine: stdout → jsoniter parse → NATS publish
-- Dedicated writer goroutine: NATS subscribe → channel → stdin write + `\n`
-- Buffered channel between pipe and NATS (backpressure without blocking subprocess)
-- Health check: liveness (PID exists), readiness (output within timeout), progress (expected events within SLA)
-- On death: auto-restart with jitter/backoff, replay last N messages from JetStream
+- Spawns with `tokio::process::Command`, stdin/stdout piped (no PTY)
+- Dedicated reader task: stdout → JSON parse → fabric publish
+- Dedicated writer task: fabric subscribe → JSON serialize → stdin write
+- Health check: liveness (PID exists), readiness (output within timeout)
+- On death: auto-restart with jitter/backoff
 
-### NATS Topic Structure
+### Per-Agent Protocols
 
+| Agent | Command | Protocol | Persistent? | Multi-turn |
+|-------|---------|----------|-------------|------------|
+| Claude | `claude --input-format stream-json --output-format stream-json --session-id <id>` | Bidirectional JSONL | Yes | Yes (session-id) |
+| Gemini | `gemini --acp` | JSON-RPC over stdio | Yes | Yes (session state) |
+| Codex | `codex mcp-server` | JSON-RPC/MCP over stdio | Yes | Yes (codex-reply tool) |
+
+All three are persistent subprocesses with structured JSON. System prompt sent once. Subsequent messages via stdin. Truly warm.
+
+### Provider Abstraction
+
+The `AgentConnector` trait supports both CLI subprocess and API backends:
+
+```toml
+# ~/.triumvirate/config.toml
+[agents.claude]
+backend = "cli"       # or "api"
+instances = 1          # default; REQ-7 overrides per-task
+# api_key = "sk-..."  # only if backend = "api"
 ```
-agents.claude.output    — Claude's streaming token output
-agents.gemini.output    — Gemini's streaming token output
-agents.codex.output     — Codex's streaming token output
-agents.human.input      — Human's typed messages
-agents.broadcast        — Messages all agents should see
 
-debate.proposals        — Toulmin claims
-debate.challenges       — Toulmin rebuttals
-debate.votes            — Agent votes on proposals
-
-tasks.created           — New task assignments
-tasks.progress          — Status updates
-tasks.completed         — Finished tasks with outcomes
-```
-
-### TUI Layout
-
-```
-┌──────────────────┬──────────────────┐
-│ Claude (Opus)    │ Gemini (Pro 2M)  │
-│ [streaming...]   │ [idle]           │
-│                  │                  │
-├──────────────────┼──────────────────┤
-│ Codex (GPT-5.2) │ Event Log        │
-│ [thinking...]    │ debate.proposals │
-│                  │ agents.claude... │
-├──────────────────┴──────────────────┤
-│ > you: how should we handle auth?   │
-│ [interrupt] [append] [queue]        │
-└─────────────────────────────────────┘
-```
+If a provider restricts CLI usage for third-party frameworks, flip to API. No code change.
 
 ---
 
 ## REQ-2: Working Stenographer
 
-### The Problem With Current Stenographer
-It depends on Ollama + qwen2.5:7b for summarization. LLMs hallucinate. The nudge-reaper's notes system proved this catastrophically — it generated fake session notes about JWT middleware that never existed.
-
 ### The Fix: Mechanical Extraction, Not Summarization
 
 Stenographer v2 does NOT use an LLM to generate notes. It mechanically extracts facts:
 
-1. **From NATS streams:** Every agent message, tool call, file edit, and debate turn is already in JetStream. Stenographer subscribes to relevant topics and builds a structured log.
+1. **From the fabric:** Every agent message, tool call, and decision is already structured JSON in the fabric. Stenographer subscribes and builds a structured log.
 
 2. **From git:** `git diff` and `git log` provide ground truth about what code actually changed. Stenographer diffs the repo at session start vs. session end.
 
-3. **From tool results:** Every tool invocation (file read, bash command, web search) and its result is logged in `tools.stream`. Stenographer includes these as verifiable facts.
+3. **From tool results:** Every tool invocation and its result is logged. Stenographer includes these as verifiable facts.
 
 4. **Structured output, not narrative:**
 ```json
 {
   "session_id": "abc-123",
   "duration_minutes": 47,
-  "agents_involved": ["claude", "gemini"],
-  "files_modified": ["src/auth.go", "src/auth_test.go"],
+  "agents_involved": ["claude-1", "claude-2", "gemini-1"],
+  "fleet_composition": {"claude": 2, "gemini": 1, "codex": 0},
+  "files_modified": ["src/auth.rs", "src/auth_test.rs"],
   "git_commits": ["a1b2c3d Fix auth middleware"],
   "tool_calls": 23,
   "debates": [{
     "topic": "Redis vs Postgres for caching",
     "winner": "Postgres",
     "vote": "2-1",
-    "evidence": ["debate.proposals:msg-47", "debate.challenges:msg-52"]
+    "evidence": ["fabric:msg-47", "fabric:msg-52"]
   }],
   "key_decisions": [
     "Use Postgres JSONB instead of Redis (Gemini's rebuttal: fewer infrastructure deps)"
   ],
-  "unresolved": [
-    "Rate limiting strategy not decided"
-  ],
+  "unresolved": ["Rate limiting strategy not decided"],
   "resume_command": "triumvirate-agentd --resume abc-123"
 }
 ```
 
-5. **Verification against reality:** Every claim in the session notes must be traceable to a NATS message ID or git commit. "47 tests pass" → show the tool result that ran the tests. If it can't be traced, it's not in the notes.
+5. **Verification against reality:** Every claim in the session notes must be traceable to a fabric message ID or git commit. If it can't be traced, it's not in the notes.
 
 ### How It Integrates
 
-Stenographer is a NATS consumer inside `triumvirate-agentd`. Not a separate process. Not an LLM. It subscribes to all streams, maintains a running session summary, and writes the structured log on session end (or periodically for long sessions).
+Stenographer is a Tokio task inside `triumvirate-agentd`. Not a separate process. Not an LLM. It subscribes to the fabric firehose, maintains a running session summary, and writes the structured log on session end.
 
 ---
 
 ## REQ-3: Reliable Memory
 
-### The Problem With Current Memory
-- Claude has `MEMORY.md` (flat files in `~/.claude/`)
-- Gemini has CLI state (opaque, session-scoped)
-- Codex has threads (opaque, not queryable)
-- None of them share. When Claude learns something, Gemini doesn't know.
-- Silent failures: a memory write can fail and nobody notices for weeks.
+### Shared Memory Fabric
 
-### The Fix: Shared Memory Fabric
-
-One memory store. All three agents read and write to it. The daemon ensures consistency.
+One memory store. All agents read and write to it. The daemon ensures consistency.
 
 ```
 Memory Layer:
 ├── SQLite WAL database (persistent, crash-safe)
 │   ├── memories table (key, value, type, agent, timestamp, verified)
 │   ├── sessions table (session_id, start, end, agents, summary_json)
-│   └── decisions table (decision_id, debate_id, outcome, evidence)
+│   └── decisions table (decision_id, outcome, evidence)
 │
-├── NATS KV bucket "memory" (fast access, ephemeral)
-│   └── Hot cache of recently accessed memories
-│
-└── Sync Engine
-    ├── On agent session start: inject relevant memories into agent's system prompt
-    ├── On memory write: validate → SQLite → NATS KV → confirm to writing agent
-    └── On memory read failure: LOUD error in TUI, not silent skip
+└── Daemon Extraction
+    ├── On agent output: daemon parses structured JSON for decision-like content
+    ├── On detection: proposes memory write to dashboard
+    ├── On confirmation: human or second agent approves → SQLite write
+    └── On failure: LOUD error in dashboard, not silent skip
 ```
 
-### Memory Write Protocol
+No NATS KV cache. No in-memory HashMap. SQLite WAL mode supports concurrent reads at microsecond latency for this data volume (dozens to hundreds of entries). Add cache only if profiling demands it.
 
-```
-Agent writes memory → daemon receives via NATS
-  → Validate: is this a real fact? (check against tool results, git, debate outcomes)
-  → Deduplicate: does this memory already exist?
-  → Persist: SQLite WAL write (crash-safe, fsync'd)
-  → Cache: NATS KV update
-  → Confirm: publish confirmation to writing agent
-  → If ANY step fails: error in TUI status bar + NATS error topic
-```
-
-### Memory Types (from existing system, preserved)
+### Memory Types (preserved from existing system)
 - **user** — who the user is, preferences, expertise
 - **feedback** — corrections, what to do/not do
 - **project** — ongoing work, goals, deadlines
@@ -250,15 +244,14 @@ Agent writes memory → daemon receives via NATS
 
 On every agent turn, the daemon prepends relevant memories to the prompt:
 ```
-[SHARED MEMORY — verified as of 2026-04-04T10:30:00]
+[SHARED MEMORY — verified as of 2026-04-05T10:30:00]
 - User is a senior enterprise AE who builds through AI-assisted development
 - Prefer Agent Teams over sub-agents for parallel work
 - nudge-reaper is DISABLED — do not re-enable without fixing detect.sh
-- Triumvirate v2 research at /Users/mikeboscia/projects/triumvirate/research/
 [END SHARED MEMORY]
 ```
 
-This replaces per-agent MEMORY.md files. One source of truth. All agents see the same thing.
+One source of truth. All agents see the same thing.
 
 ---
 
@@ -267,189 +260,194 @@ This replaces per-agent MEMORY.md files. One source of truth. All agents see the
 ### Single Binary Install
 
 ```bash
-# Install
-go install github.com/michaeljboscia/triumvirate-agentd@latest
-
-# Or build from source
+# Build from source
 git clone https://github.com/michaeljboscia/triumvirate-agentd
-cd triumvirate-agentd
-go build -o triumvirate-agentd .
+cd triumvirate-agentd/daemon
+cargo build --release
 
 # Run
-./triumvirate-agentd
+./target/release/triumvirate-agentd
 ```
 
-One binary. Embeds NATS server, OPA engine, SQLite, BubbleTea TUI. No Docker. No npm. No Python. No node_modules.
+One binary. Embeds workflow engine, Cedar policy engine, SQLite, axum web server, Svelte dashboard. No Docker. No npm. No external processes.
 
 ### Startup Sequence
 
 ```
 triumvirate-agentd boot:
-  1. Load config from ~/.triumvirate/config.toml
-  2. Start embedded NATS + JetStream (in-process, no network)
-  3. Start embedded OPA with Rego policies
-  4. Open SQLite WAL database
-  5. Initialize OpenTelemetry exporter
-  6. Spawn Claude CLI subprocess → health check → mark ready
-  7. Spawn Gemini CLI subprocess → health check → mark ready
-  8. Spawn Codex CLI subprocess → health check → mark ready
-  9. Start BubbleTea TUI
-  10. Start Stenographer consumer
-  11. Ready. All 4 participants online.
+  1. Initialize tracing (so all subsequent steps can log)
+  2. Load config from ~/.triumvirate/config.toml
+  3. Start message fabric (Tokio broadcast channels)
+  4. Open SQLite WAL databases (memory.db, workflow.db)
+  5. Load Cedar policies
+  6. Initialize OpenTelemetry exporter
+  7. Spawn agent subprocesses per config → health check → mark ready
+  8. Start health monitor
+  9. Start Stenographer consumer
+  10. Start web dashboard on :8080
+  11. Ready. All participants online.
 
   If ANY step fails: display error in terminal, don't silently continue.
-  If an agent fails health check: mark degraded, show in status bar, retry with backoff.
+  If an agent fails health check: mark degraded, show in dashboard, retry with backoff.
 ```
 
 ### Failure Modes (visible, never silent)
 
 | What Fails | What Happens | User Sees |
 |---|---|---|
-| Agent subprocess dies | Auto-restart with backoff, replay from JetStream | Status bar: "Claude: restarting..." |
-| Memory write fails | Retry 3x, then ERROR in TUI | Red banner: "Memory write failed: [reason]" |
-| NATS internal error | Log + alert, attempt recovery | Status bar: "FABRIC: degraded" |
-| Daemon crash | On restart: load SQLite snapshot, replay JetStream tail | Resume prompt: "Session abc-123 recovered" |
-| Agent unresponsive | Health check fails after timeout | Status bar: "Gemini: unresponsive (45s)" |
-
-### REQ-6: Visual Dashboard
-
-A web UI that shows people what the system does. Served from the same Go binary via `//go:embed` + `net/http`. Opens at `http://localhost:8080` when the daemon starts.
-
-Shows:
-- Agent panes with real-time streaming output (via WebSocket/SSE from NATS)
-- Temporal workflow state (leverages Temporal's built-in Web UI on port 8233)
-- Shared memory viewer (query SQLite, display current state)
-- Session history (stenographer logs, searchable)
-- Event stream (NATS messages flowing between agents)
-- Agent health (liveness, readiness, progress per agent)
-
-Temporal's Web UI provides ~50% of this for free: workflow visualization, activity status, retries, failures. We build a custom frontend for the chat view and memory viewer.
+| Agent subprocess dies | Auto-restart with backoff | Dashboard: "Claude-1: restarting..." |
+| Memory write fails | Retry 3x, then ERROR | Red banner: "Memory write failed: [reason]" |
+| Fabric channel closed | Log + alert, attempt recovery | Dashboard: "FABRIC: degraded" |
+| Daemon crash | On restart: load SQLite snapshot, resume workflows | Resume prompt: "Session abc-123 recovered" |
+| Agent unresponsive | Health check fails after timeout | Dashboard: "Gemini-1: unresponsive (45s)" |
+| Quota exhausted | Auto-fallback from digest to explicit routing | Dashboard: "Claude: 92% quota, digest OFF" |
 
 ---
 
-## Architecture Revisions (Post-Gemini Review)
+## REQ-5: Use All Three, All The Time
 
-### Pivot 1: Observe, Don't Intercept
-CLIs execute their own tools internally. We can't intercept. Instead:
-- Spawn CLIs inside PTYs (`creack/pty`) — they think they're in a real terminal
-- Scrape PTY output with regex for tool executions, proposals, errors
-- Watch filesystem with `fsnotify` for file changes
-- Stenographer works by observing the exhaust pipe, not controlling the engine
+### Quota-Gated Routing (not passive monitoring)
 
-### Pivot 2: Embedded Temporal (Not External Cluster)
-Temporal server embeds as a Go library via `go.temporal.io/server/temporalite`. Uses SQLite for persistence. Web UI included. Single binary.
+The original spec proposed passive monitoring where all agents read every message. This burns subscription quota (5-hour rolling windows, daily caps) for messages agents ignore.
 
-Gives us for free:
-- Crash recovery with deterministic replay
-- Automatic retries with configurable policies
-- Saga compensation for multi-step operations
-- Human-in-the-loop signals (pause workflow, wait for approval)
-- Web UI showing every workflow, step, retry, failure
+Instead:
 
-Risk mitigations:
-- Separate SQLite files: `temporal.db` + `memory.db` (avoid write contention)
-- Go workspaces for dependency isolation (NATS + Temporal + OPA gRPC conflicts)
-- PTY I/O happens in Temporal Activities, never Workflows (determinism requirement)
+1. **Active agent** does the work — responds to the human's question.
+2. **Idle agents on the same task** receive a **mechanical digest** — template-based extraction from structured JSON: "Claude-1 proposed JWT auth. [3 tool calls, 2 files modified]. Gemini-1, anything to add?" No LLM generates this. The daemon formats it from fabric events.
+3. **Idle agents on OTHER tasks** receive nothing — digests are scoped to task, not fleet.
+4. **Self-activation** — if an idle agent's digest triggers a response (e.g., Gemini spots a security gap), the daemon routes it to the conversation.
+5. **Auto-fallback** — when an agent's quota meter hits 80%, digests stop. Only explicit @-mentions reach that agent.
 
-### Pivot 3: Prompt Prefix Stuffing for Context
-Every message to an agent gets a context header prepended to stdin:
+### Background Tasks
+
+The daemon can assign explicit background work to idle agents:
+- Test generation (Codex)
+- Documentation pre-fetch (Gemini)
+- Code review (any agent)
+
+Background outputs go to the Intelligence Feed in the dashboard, not the main conversation.
+
+---
+
+## REQ-6: Visual Dashboard
+
+Served from the same Rust binary via `rust-embed` + `axum`. Opens at `http://localhost:8080`.
+
+### Two Views
+
+**Tasks View (default, executive):**
+- Grouped by work item ("Auth Module", "API Design", "Database Schema")
+- Shows which agents are assigned to each task
+- Progress indicators, completion status
+- Click into a task to see agent output
+
+**Agents View (debug):**
+- Dynamic grid — auto-layouts based on fleet size
+- One pane per running agent with streaming output
+- Health indicators per agent
+- Quota meters
+
+### Dashboard Panels
+- **Routing log** — every message, target agent, type, token cost
+- **Memory viewer** — query SQLite, display current state
+- **Workflow panel** — state machine visualization (purpose-built, not Temporal)
+- **Session history** — stenographer logs, searchable
+- **Quota dashboard** — per-agent and per-model-type spend
+
+---
+
+## REQ-7: Dynamic Multi-Agent Fleet
+
+### Fleet Spawning
+
 ```
-[CONTEXT — do not reply to this section]
-- Memory: We decided SQLite, not Postgres (debate 2026-04-04, 2-1)
-- Claude proposed JWT auth — Gemini flagged revocation gap
-[END CONTEXT]
-
-How should we handle token revocation?
+User: "Build the auth system"
+Daemon: Spawns fleet:
+  - Claude-1: architect (design interfaces, define contracts)
+  - Claude-2: review (challenge Claude-1's design, find gaps)
+  - Gemini-1: research (JWT best practices, OWASP guidelines)
+  - Codex-1: implement auth module
+  - Codex-2: implement auth tests
 ```
-Works with ANY CLI. Universal. Burns some tokens but guarantees shared state.
 
-### Pivot 4: Markdown Keywords for Agent Protocol
-Agents output natural Markdown headers instead of JSON schemas:
-- `# PROPOSAL:` — Claude proposing architecture
-- `# CHALLENGE:` — Gemini finding a problem  
-- `# APPROVED:` — Gemini passing review
-- `# IMPLEMENTATION:` — Codex writing code
-- `# BUG:` — Codex finding an issue
+Fleet composition is defined per-task at spawn time. The daemon provisions:
+- One git worktree per fleet member (isolation)
+- One persistent subprocess per fleet member
+- Task assignments in the shared task list (SQLite)
+- Contract definitions from Wave 0 before implementation begins
 
-Daemon parses headers to route messages and trigger state transitions.
-Internally translates to structured NATS events. Best of both worlds.
+### Coordination Model
+
+Informed by Claude Agent Teams, Ruflo, Clash, and swarms-rs patterns:
+
+1. **Contracts first (Wave 0)** — before the fleet fans out, one agent (or the human) defines interfaces: function signatures, types, API shapes. Fleet members implement AGAINST those contracts. They can't conflict because boundaries are pre-defined.
+
+2. **Git worktrees** — each fleet member works in an isolated worktree. Same `.git`, separate working directories. Prevents direct overwrites.
+
+3. **Shared task list** — daemon decomposes work into subtasks with dependencies. Fleet members claim available tasks. Completed tasks unblock dependents. Tracked in SQLite.
+
+4. **Sequential merge** — when fleet members finish, branches merge one at a time. Each merge gets full context of previous merges. Not parallel.
+
+5. **Peer messaging** — fleet members communicate through the fabric. Codex-1 can message Codex-2: "I changed the User struct, heads up." No routing through a lead required.
+
+6. **Human gate** — simple conflicts (two agents add to same list) = daemon resolves. Architectural conflicts = human decides via dashboard.
+
+### Concurrency Limits
+
+| Provider | Max Concurrent | Quota Model | Practical Fleet Size |
+|----------|---------------|-------------|---------------------|
+| Claude (Max 20x) | Unlimited instances | ~900 messages / 5-hour window shared | 3-5 on heavy tasks |
+| Codex | ~8 concurrent API requests | RPM/TPM tiers | 2-3 |
+| Gemini (Ultra) | Unlimited instances | 2,000 requests/day shared | 2-4 |
+
+The daemon tracks quota per-instance and per-model-type. Fleet size is limited by quota, not architecture.
 
 ---
 
-## What's NOT in v1
+## Architecture Decisions
 
-- Multi-machine deployment (local only)
-- API connectors (CLI only, API is future upgrade)
-- CRDTs for parallel editing (file-level locking for now)
-- Full speculative execution (pragmatic pre-fetching only)
-- Tree-sitter AST operations (text editing for now)
-- A2A protocol compliance (internal NATS messaging for now)
-- Toulmin JSON output from agents (Markdown keywords instead, structured internally)
+### Goat Rodeo Round 1 (Pre-Rust Pivot)
 
----
+**GR1-D1: Web-Only UI (REQ-1, REQ-4, REQ-6)**
+Daemon runs headless. Web dashboard at `localhost:8080` is the exclusive conversation interface.
 
-## Implementation Plan
+**GR1-D3: Adaptive Lead with Human Override (REQ-1, REQ-5)**
+Claude synthesizes by default. Topic-based lead rotation: architecture → Claude, research → Gemini, implementation → Codex. On diametric disagreements, human decides.
 
-### POC (Day 1-2): Prove The Chimera Lives
+**GR1-D7: Mock CLIs for Dev, Real CLI E2E as Gate (ALL)**
+Deterministic mock CLIs for fast development iteration. Real CLI E2E tests as acceptance gate before anything ships.
 
-Before building anything else, prove the foundational assumptions work.
+### Goat Rodeo Round 2-6 (Rust Pivot + REQ-7)
 
-**POC 1: The Embedded Chimera**
-Single Go binary that boots:
-- Embedded Temporal server (SQLite persistence) on localhost:7233
-- Embedded NATS + JetStream on localhost:4222
-- HTTP server with `//go:embed` serving a "hello world" page on localhost:8080
+**GR2-D1: Purpose-Built Workflow Engine (REQ-4)**
+Rust, SQLite-backed, informed by Temporal's open source Go code (Apache 2.0). No sidecar, no Go dependency. True single binary.
 
-Success: binary runs, curl the HTTP server, connect to NATS, hit Temporal Web UI on port 8233.
+**GR2-D2: Per-Agent Native Adapters (REQ-1)**
+Drop PTY entirely. Claude: stream-json. Gemini: ACP pipe-mode. Codex: mcp-server. All persistent subprocesses with bidirectional JSON stdio.
 
-**POC 2: The PTY Agent**
-- Write Temporal Workflow: `RunAgentTurn`
-- Write Temporal Activity: `ExecuteClaudePTY`
-- Activity spawns `claude` in a PTY (`creack/pty`), sends "Say hello", reads response, returns to Workflow
-- Stream PTY output to NATS topic and to the embedded web page via WebSocket
+**GR2-D3: Tokio Channels, NATS If Needed (REQ-4)**
+In-process broadcast/mpsc/watch. Topic enum makes NATS a future swap. No external dependency.
 
-Success: Claude responds in the browser. Temporal UI shows the workflow completed.
+**GR2-D4: Summary Digests with Fallback (REQ-5)**
+Idle agents get mechanical digests, not firehose. Auto-fallback at 80% quota. Digests scoped to task, not fleet.
 
-**POC 3: The Triplex**
-- Spawn all 3 CLIs in PTYs
-- Broadcast human input from web UI to all 3
-- Stream all 3 outputs to browser simultaneously in 3 panes
-- Regex scraper catches `# PROPOSAL:` and tool execution patterns
+**GR2-D5: Daemon Extracts Decisions (REQ-3)**
+No Markdown keywords. JSON is native transport. Daemon proposes memory writes. Human/agent approves.
 
-Success: type a question in the browser, see Claude, Gemini, and Codex all respond in real-time.
+**GR2-D6: No Hot Cache (REQ-3)**
+SQLite WAL handles concurrent reads. Add cache only if profiling demands it.
 
-If POC 3 works, the architecture is proven. Everything after is engineering.
+**GR4-D1: Provider Abstraction (REQ-7)**
+AgentConnector trait supports CLI + API backends. Config switch. No code change if policy shifts.
 
-### Week 1: The Foundation
-- Formalize Agent Connector with health checks, auto-restart, JetStream replay
-- Context injection (prompt prefix stuffing with shared memory)
-- Markdown keyword parser + NATS event publishing
-- Supervisor state machine (route messages based on keyword headers)
-- SQLite WAL for memory persistence with loud-failure protocol
-- **Prove:** 4-way conversation where agents reference each other's output
+**GR4-D2: Dynamic Dashboard (REQ-6, REQ-7)**
+Tasks view + agents view, toggled. Dynamic grid scales with fleet size.
 
-### Week 2: The Workflows
-- `ConversationWorkflow` — multi-turn 4-way collaboration
-- `DebateWorkflow` — proposal → challenge → vote → decide
-- `TaskWorkflow` — plan → implement → verify with human approval gate
-- OPA embedded with basic policies (destructive ops require approval)
-- Stenographer consumer writing structured session logs from NATS streams
-- **Prove:** structured debate between 3 agents with human approval gate
+**GR4-D3: Worktrees + Contracts + Task List + Sequential Merge (REQ-7)**
+Informed by Claude Agent Teams, Ruflo, Clash patterns. Applied cross-model.
 
-### Week 3: The Dashboard
-- Custom web frontend (agent chat panes, memory viewer, session history)
-- WebSocket streaming from NATS to browser
-- Temporal UI integration (workflow state, retries, failures)
-- `fsnotify` file watcher for ground-truth file change tracking
-- **Prove:** show someone the dashboard and they understand what the system does in 30 seconds
-
-### Week 4: The Armor
-- Chaos testing (Toxiproxy, failpoint for stream truncation, process death)
-- Crash recovery E2E: kill daemon mid-workflow, restart, verify resume
-- Process management (Setpgid + Pdeathsig + graceful shutdown)
-- E2E tests against real CLIs (reality-check matrix applied)
-- OpenTelemetry tracing with GenAI semantic conventions
-- **Prove:** kill -9 the daemon, restart, conversation resumes at exact point
+**GR4-D4: Study and Borrow from Prior Art (REQ-7)**
+Ruflo (multi-model routing), Clash (worktree conflict detection), swarms-rs (agent lifecycle). Attribute everything in NOTICE.md.
 
 ---
 
@@ -457,42 +455,89 @@ If POC 3 works, the architecture is proven. Everything after is engineering.
 
 | Component | Technology | Why |
 |---|---|---|
-| Language | Rust | Zero-cost abstractions, no GC, compile-time safety, deterministic performance |
-| Messaging | Embedded NATS + JetStream | In-process pub/sub, persistence, replay, zero network overhead |
-| Orchestration | Temporal.io | Durable execution, retry, compensation, human-in-the-loop |
-| Governance | Cedar (Rust-native) | AWS policy engine, embeds directly, millisecond evaluation |
-| Persistence | SQLite WAL | Crash-safe, embedded, zero-config, mature Go bindings |
+| Language | Rust | Zero-cost abstractions, no GC, compile-time safety |
+| Async Runtime | Tokio | Industry standard, full ecosystem |
+| Message Fabric | Tokio channels (broadcast/mpsc/watch) | In-process, zero overhead, NATS-shaped topics |
+| Workflow Engine | Purpose-built (SQLite + event sourcing) | Informed by Temporal source. No sidecar. |
+| Governance | Cedar (`cedar-policy` crate) | AWS policy engine, Rust-native, millisecond evaluation |
+| Persistence | SQLite WAL (`rusqlite` bundled) | Crash-safe, embedded, zero-config |
 | Observability | OpenTelemetry | Distributed tracing, GenAI semantic conventions |
-| CLI Interface | Colored scrolling conversation | Single-pane terminal with agent-labeled output |
-| Web Dashboard | Svelte + Tailwind (rust-embed) | SOTA frontend, static build embedded in binary |
-| JSON parsing | serde_json / simd-json | Rust-native JSON streaming and parsing |
-| Debate schema | Toulmin model | claim/data/warrant/rebuttal — structured, not "give your opinion" |
-| CLI connectors | Persistent subprocesses | Subscription accounts ($0), full agent capabilities |
+| Web Server | axum + tower-http | Tokio-native, fast, middleware ecosystem |
+| Web Dashboard | Svelte + Tailwind (`rust-embed`) | Static build embedded in binary |
+| JSON Parsing | serde_json | Rust-native, zero-copy deserialization |
+| Process Mgmt | `tokio::process` + `portable-pty` (if needed) | Subprocess lifecycle, signal handling |
+| File Watching | `notify` crate | Rust equivalent of fsnotify |
+| Debate Schema | Toulmin model | claim/data/warrant/rebuttal — structured |
+| CLI Connectors | Persistent subprocesses | Subscription accounts, full agent capabilities |
 
 ---
 
-## Goat Rodeo Round 1 Decisions
+## What's NOT in v1
 
-### GR1-D1: Web-Only UI (REQ-1, REQ-4, REQ-6)
-Daemon runs headless. Terminal shows health logs + minimal CLI (`triumvirate status`). Web dashboard at `localhost:8080` is the exclusive conversation interface. TUI stubbed as `triumvirate ask` for later. One UI to build, one to maintain, one to show people.
+- Multi-machine deployment (local only)
+- API-only connectors as default (CLI is primary, API is fallback)
+- CRDTs for parallel editing (worktrees + sequential merge instead)
+- Full speculative execution (pragmatic pre-fetching only)
+- Tree-sitter AST operations (text editing for now)
+- A2A protocol compliance (internal fabric messaging for now)
+- Embedded NATS (Tokio channels for now, NATS as future upgrade)
+- Embedded Temporal (purpose-built engine instead)
 
-### GR1-D2: Delta Context Injection (REQ-1, REQ-3)
-Persistent PTYs hold their own conversation history. On each turn, daemon only injects what OTHER agents said since this agent's last turn. Full state injection only on agent restart (PTY crash recovery). Agents already know their own context — we only bridge the gap between them.
+---
 
-### GR1-D3: Adaptive Lead with Human Override (REQ-1, REQ-5)
-Claude synthesizes by default. Topic-based lead rotation: architecture → Claude, research → Gemini, implementation → Codex. On diametric disagreements, human decides. Lead role is a soft default the conversation can override, not a hardcoded hierarchy.
+## Implementation Plan
 
-### GR1-D4: Syntax-Gated Memory + Dual-Agent Approval (REQ-2, REQ-3)
-Memory writes ONLY via `# DECISION:` keyword. Second agent must `# VALIDATE: APPROVE` to persist. No LLM interpretation. No conversation parsing. This also replaces stenographer decision capture — decisions are syntax-gated facts, not summarized text. Stenographer captures files changed (fsnotify/git), tool calls (PTY scraping), decisions (keyword protocol), and metadata (duration, agents, NATS counts).
+### POC (Day 1): Prove The Chimera Lives
 
-### GR1-D5: Passive Monitoring + Background Tasks (REQ-5)
-Idle agents passively monitor conversation stream and self-activate when relevant. Daemon also assigns background tasks: test generation (Codex), doc pre-fetch (Gemini), code review (all). Background outputs go to Intelligence Feed pane in dashboard, not main conversation.
+**POC 1: The Embedded Chimera** ✅ (completed, boots in 13ms)
+Single Rust binary that boots: Tokio runtime, axum HTTP server with `rust-embed` on :8080, SQLite WAL database, message fabric. Scaffold at `daemon/`.
 
-### GR1-D6: Unified Dashboard, Temporal as DevTools (REQ-4, REQ-6)
-Custom dashboard at :8080 is the one interface. Temporal UI at :8233 accessible via "Developer Tools" link from dashboard. Normal use = one browser tab. Deep workflow debugging = click through.
+**POC 2: The Live Agent**
+- Write the Claude connector: spawn `claude --input-format stream-json --output-format stream-json --session-id <id>`
+- Parse JSONL output, publish to fabric
+- Stream fabric events to browser via WebSocket
+- Success: Claude responds in the browser. Fabric carries the message.
 
-### GR1-D7: Mock CLIs for Dev, Real CLI E2E as Gate (ALL)
-Deterministic mock CLIs (`mock-claude`, `mock-gemini`, `mock-codex`) for fast development iteration. Real CLI E2E tests as actual acceptance gate before anything ships. Mocks verify plumbing. Real CLIs verify reality. Reality-check matrix applies.
+**POC 3: The Triplex**
+- Add Gemini (ACP) and Codex (mcp-server) connectors
+- All 3 outputs streaming to browser simultaneously
+- Daemon-generated mechanical digest to idle agents
+- Success: type a question, see all 3 respond in real-time.
+
+**POC 4: The Fleet**
+- Spawn 2 Claudes + 1 Codex on the same task
+- Git worktree per fleet member
+- Shared task list in SQLite
+- Sequential merge of results
+- Success: fleet produces coordinated output from 3 agents.
+
+### Week 1: Foundation
+- Formalize agent pools with health checks, auto-restart
+- Context injection (memory prefix + delta from other agents)
+- Workflow engine: ConversationWorkflow, basic state machine + SQLite persistence
+- Cedar policies for destructive ops (human approval gate)
+- Stenographer writing structured session logs from fabric
+
+### Week 2: Fleet
+- FleetWorkflow: fan-out, worktrees, task list, sequential merge
+- Contract definitions (Wave 0) before fleet fan-out
+- Peer messaging through fabric
+- Dynamic dashboard: tasks view + agents view
+- Quota management: per-agent meters, auto-fallback
+
+### Week 3: Polish
+- Full Svelte dashboard build (replace POC HTML)
+- WebSocket streaming from fabric to browser
+- Workflow panel (state machine visualization)
+- `notify` crate for file change tracking
+- E2E tests: mock CLIs + real CLI acceptance gate
+
+### Week 4: Armor
+- Crash recovery: kill daemon mid-workflow, restart, verify resume
+- Process management: graceful shutdown, signal handling, orphan prevention
+- OpenTelemetry tracing with GenAI semantic conventions
+- Chaos testing: process death, stream truncation
+- Reality-check matrix applied to everything
 
 ---
 
@@ -500,11 +545,26 @@ Deterministic mock CLIs (`mock-claude`, `mock-gemini`, `mock-codex`) for fast de
 
 The spec is done when:
 
-1. I can open a browser, go to `localhost:8080`, and have a conversation with all three agents simultaneously
-2. When I close the session, I get accurate notes about what actually happened — verified against git and tool results, decisions syntax-gated through `# DECISION:` + `# VALIDATE:`
-3. When I start a new session, all three agents know what we decided in the last one via shared SQLite memory
+1. I can open a browser, go to `localhost:8080`, and have a conversation with N agents simultaneously
+2. When I close the session, I get accurate notes about what actually happened — verified against git and tool results, decisions extracted by the daemon
+3. When I start a new session, all agents know what we decided in the last one via shared SQLite memory
 4. When something breaks, I see it immediately in the dashboard — not weeks later when my work gets destroyed
-5. All three agents are working simultaneously — the active one responding, the idle ones monitoring and doing background work
+5. All agents are working simultaneously — the active ones responding, the idle ones receiving mechanical digests and self-activating when relevant
 6. I can show someone the dashboard and they understand what it does in 30 seconds
+7. I can say "give me 3 Claudes on auth, 2 Codexes on API, 1 Gemini researching" and the fleet spins up, coordinates via worktrees, and merges results — all visible in the dashboard
 
-That's it. Build this. Everything else is a feature request for v2.
+That's it. Build this.
+
+---
+
+## Acknowledgments
+
+This spec was informed by the following open-source projects:
+
+- **Temporal** (temporalio/temporal, Apache 2.0) — workflow engine patterns, crash recovery, event sourcing
+- **Ruflo** (ruvnet/ruflo, open source) — multi-model agent orchestration, cost-optimized routing
+- **Clash** — real-time git worktree conflict detection
+- **swarms-rs** (open source) — Rust-native agent lifecycle management
+- **Claude Agent Teams** (Anthropic) — worktree isolation, shared task list, peer-to-peer mailbox patterns
+
+Specific code borrowed from these projects will be attributed inline and in NOTICE.md.
