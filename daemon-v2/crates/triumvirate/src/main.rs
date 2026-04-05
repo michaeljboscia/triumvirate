@@ -7,9 +7,11 @@ use rmcp::{
     transport::stdio,
 };
 use schemars::JsonSchema;
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
+    sync::Mutex,
     time::{Duration, sleep, timeout},
 };
 
@@ -32,14 +34,22 @@ enum CliCommand {
 #[derive(Debug, Clone)]
 struct McpBridge {
     tool_router: ToolRouter<Self>,
+    sessions: Arc<Mutex<HashMap<String, SessionState>>>,
 }
 
 impl McpBridge {
     fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct SessionState {
+    agent: String,
+    history: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
@@ -83,6 +93,35 @@ struct AgentResult {
 struct AskTwinsResponse {
     results: Vec<AgentResult>,
     lifecycle: Vec<LifecycleEvent>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct SpawnSessionRequest {
+    agent: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+struct SessionInfo {
+    name: String,
+    agent: String,
+    turns: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+struct SessionListResponse {
+    sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct AskSessionRequest {
+    name: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct DismissSessionRequest {
+    name: String,
 }
 
 #[tool_router]
@@ -235,6 +274,87 @@ impl McpBridge {
             ],
             lifecycle,
         }))
+    }
+
+    #[tool(description = "Create a persistent named session for an agent.")]
+    async fn spawn_session(
+        &self,
+        Parameters(req): Parameters<SpawnSessionRequest>,
+    ) -> Result<String, String> {
+        let agent = req.agent.to_lowercase();
+        if agent != "gemini" && agent != "codex" {
+            return Err("spawn_session supports only 'gemini' or 'codex'".to_string());
+        }
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(
+            req.name.clone(),
+            SessionState {
+                agent: agent.clone(),
+                history: Vec::new(),
+            },
+        );
+        Ok(format!("session '{}' spawned for {}", req.name, agent))
+    }
+
+    #[tool(description = "Ask within a named persistent session.")]
+    async fn ask_session(
+        &self,
+        Parameters(req): Parameters<AskSessionRequest>,
+    ) -> Result<String, String> {
+        let (agent, prompt) = {
+            let mut sessions = self.sessions.lock().await;
+            let state = sessions
+                .get_mut(&req.name)
+                .ok_or_else(|| format!("session '{}' not found", req.name))?;
+
+            let context = if state.history.is_empty() {
+                String::new()
+            } else {
+                format!("Previous turns:\n{}\n\n", state.history.join("\n"))
+            };
+            let prompt = format!("{context}New user message:\n{}", req.message);
+            state.history.push(req.message.clone());
+            (state.agent.clone(), prompt)
+        };
+
+        let response = run_named_agent(&agent, &prompt)
+            .await
+            .map_err(|e| format!("ask_session failed: {e}"))?;
+
+        let mut sessions = self.sessions.lock().await;
+        if let Some(state) = sessions.get_mut(&req.name) {
+            state.history.push(format!("assistant: {response}"));
+        }
+
+        Ok(response)
+    }
+
+    #[tool(description = "Dismiss a named session.")]
+    async fn dismiss_session(
+        &self,
+        Parameters(req): Parameters<DismissSessionRequest>,
+    ) -> Result<String, String> {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.remove(&req.name) {
+            Some(_) => Ok(format!("session '{}' dismissed", req.name)),
+            None => Err(format!("session '{}' not found", req.name)),
+        }
+    }
+
+    #[tool(description = "List active sessions.")]
+    async fn list_sessions(&self) -> Json<SessionListResponse> {
+        let sessions = self.sessions.lock().await;
+        let mut out = sessions
+            .iter()
+            .map(|(name, s)| SessionInfo {
+                name: name.clone(),
+                agent: s.agent.clone(),
+                turns: s.history.len(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Json(SessionListResponse { sessions: out })
     }
 }
 
@@ -639,6 +759,85 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
         client.cancel().await?;
         server_handle.await??;
         let _ = fs::remove_file(script_path);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_spawn_ask_list_dismiss() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let gemini_script = write_mock_agent_script("gemini", 0.0)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let spawn_args = serde_json::json!({
+            "agent": "gemini",
+            "name": "my-research"
+        });
+        let _spawn = client
+            .call_tool(
+                CallToolRequestParams::new("spawn_session")
+                    .with_arguments(spawn_args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        let ask_args = serde_json::json!({
+            "name": "my-research",
+            "message": "what is jwt?"
+        });
+        let ask = client
+            .call_tool(
+                CallToolRequestParams::new("ask_session")
+                    .with_arguments(ask_args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+        let ask_text = ask
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(ask_text.contains("gemini done"));
+
+        let list = client
+            .call_tool(CallToolRequestParams::new("list_sessions"))
+            .await?;
+        let list_text = list
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(list_text.contains("my-research"));
+
+        let dismiss_args = serde_json::json!({
+            "name": "my-research"
+        });
+        let _dismiss = client
+            .call_tool(
+                CallToolRequestParams::new("dismiss_session")
+                    .with_arguments(dismiss_args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        let _ = fs::remove_file(gemini_script);
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
