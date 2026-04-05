@@ -9,7 +9,7 @@ use daemon_core::{
     read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
     write_scratchpad as core_write_scratchpad,
 };
-use mcp_bridge::{build_role_adapted_prompts, is_supported_agent};
+use mcp_bridge::{build_role_adapted_prompts, is_supported_agent, is_supported_agent_name};
 use axum::{
     Json as AxumJson, Router,
     extract::State,
@@ -187,7 +187,7 @@ impl McpBridge {
         Parameters(req): Parameters<SpawnSessionRequest>,
     ) -> Result<String, String> {
         let agent = req.agent.to_lowercase();
-        if agent != "gemini" && agent != "codex" {
+        if !is_supported_agent_name(&agent) {
             return Err("spawn_session supports only 'gemini' or 'codex'".to_string());
         }
 
