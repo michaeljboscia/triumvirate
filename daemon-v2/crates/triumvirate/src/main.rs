@@ -685,11 +685,11 @@ async fn execute_ask_twins(req: &AskTwinsRequest) -> Result<AskTwinsResponse, St
         resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
     let gemini_prompt = format!(
         "[Gemini role: research/analysis]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-        req.message, req.cwd, req.repo, req.branch
+        req.message, resolved_cwd, resolved_repo, resolved_branch
     );
     let codex_prompt = format!(
         "[Codex role: implementation/testing]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-        req.message, req.cwd, req.repo, req.branch
+        req.message, resolved_cwd, resolved_repo, resolved_branch
     );
 
     let mut lifecycle = vec![
@@ -2286,6 +2286,109 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_HOME");
             std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_ask_twins_uses_daemon_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-mcp-twins-daemon-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "mcp-twins-daemon-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn ask_twins_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(_req): AxumJson<AskTwinsRequest>,
+        ) -> Result<AxumJson<AskTwinsResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(AskTwinsResponse {
+                request_id: "daemon-req-twins".to_string(),
+                results: vec![AgentResult {
+                    agent: "codex".to_string(),
+                    response: "daemon twins path used".to_string(),
+                    prompt_sent: "daemon prompt".to_string(),
+                }],
+                failures: vec![],
+                lifecycle: vec![LifecycleEvent {
+                    state: "DONE".to_string(),
+                    detail: "daemon twins served".to_string(),
+                }],
+            }))
+        }
+
+        let app = Router::new()
+            .route("/ask-twins", post(ask_twins_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_ASK_TWINS_URL",
+                format!("http://{addr}/ask-twins"),
+            );
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "message": "should proxy twins"
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_twins")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(raw_text.contains("daemon twins path used"));
+        assert!(raw_text.contains("daemon twins served"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_TWINS_URL");
         }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
