@@ -45,6 +45,8 @@ enum CliCommand {
     Mcp,
     /// Run the long-lived daemon (stub in Increment 1a).
     Daemon,
+    /// Install launchd configuration for zero-ceremony daemon startup.
+    Install,
 }
 
 #[derive(Debug, Clone)]
@@ -999,8 +1001,62 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Daemon => {
             run_daemon().await?;
         }
+        CliCommand::Install => {
+            run_install()?;
+        }
     }
 
+    Ok(())
+}
+
+fn launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.triumvirate.daemon-v2</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe_path}</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TRIUMVIRATE_HOME</key>
+    <string>{home_dir}</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{home_dir}/daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>{home_dir}/daemon.err.log</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+fn run_install() -> anyhow::Result<()> {
+    let home = triumvirate_home_dir()?;
+    fs::create_dir_all(&home)?;
+    let launch_agents = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?
+        .join("Library/LaunchAgents");
+    fs::create_dir_all(&launch_agents)?;
+
+    let plist_path = launch_agents.join("com.triumvirate.daemon-v2.plist");
+    let exe_path = std::env::current_exe()?;
+    let plist = launch_agent_plist(&exe_path.display().to_string(), &home.display().to_string());
+    fs::write(&plist_path, plist)?;
+
+    println!("Installed launchd plist at {}", plist_path.display());
+    println!("Load with: launchctl load {}", plist_path.display());
+    println!("Start now with: launchctl start com.triumvirate.daemon-v2");
     Ok(())
 }
 
@@ -2218,6 +2274,15 @@ exit 1\n",
         );
         assert!(is_authorized(&headers, token));
         assert!(!is_authorized(&headers, "wrong"));
+    }
+
+    #[test]
+    fn launch_agent_plist_contains_expected_values() {
+        let plist = launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri-home");
+        assert!(plist.contains("com.triumvirate.daemon-v2"));
+        assert!(plist.contains("<string>/usr/local/bin/triumvirate</string>"));
+        assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains("<string>/tmp/tri-home/daemon.log</string>"));
     }
 
     #[tokio::test]
