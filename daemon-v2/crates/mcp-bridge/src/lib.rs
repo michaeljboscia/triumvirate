@@ -45,6 +45,17 @@ pub fn should_use_daemon_proxy(var_value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+pub fn daemon_autostart_enabled(var_value: Option<&str>) -> bool {
+    var_value
+        .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+pub fn is_bearer_authorized(raw_auth_header: Option<&str>, token: &str) -> bool {
+    let expected = format!("Bearer {token}");
+    raw_auth_header.map(|v| v == expected).unwrap_or(false)
+}
+
 pub fn daemon_base_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
@@ -174,6 +185,21 @@ mod tests {
         assert!(super::should_use_daemon_proxy(Some("true")));
         assert!(!super::should_use_daemon_proxy(Some("false")));
         assert!(!super::should_use_daemon_proxy(None));
+    }
+
+    #[test]
+    fn daemon_autostart_toggle_defaults_true_and_respects_falsey_values() {
+        assert!(super::daemon_autostart_enabled(None));
+        assert!(super::daemon_autostart_enabled(Some("true")));
+        assert!(!super::daemon_autostart_enabled(Some("false")));
+        assert!(!super::daemon_autostart_enabled(Some("0")));
+    }
+
+    #[test]
+    fn bearer_authorization_compares_expected_token() {
+        assert!(super::is_bearer_authorized(Some("Bearer abc"), "abc"));
+        assert!(!super::is_bearer_authorized(Some("Bearer xyz"), "abc"));
+        assert!(!super::is_bearer_authorized(None, "abc"));
     }
 
     #[test]
