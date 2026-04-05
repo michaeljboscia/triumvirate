@@ -1,4 +1,8 @@
 use clap::{Parser, Subcommand};
+use daemon_core::{
+    acknowledge_dead_drop_ticket, count_dead_drop_tickets, create_dead_drop_ticket,
+    gc_dead_drop_tickets, list_dead_drop_tickets,
+};
 use axum::{
     Json as AxumJson, Router,
     extract::State,
@@ -1469,10 +1473,6 @@ fn outbox_file_path() -> anyhow::Result<PathBuf> {
     Ok(triumvirate_home_dir()?.join("outbox.jsonl"))
 }
 
-fn dead_drop_dir_path() -> anyhow::Result<PathBuf> {
-    Ok(triumvirate_home_dir()?.join("dead-drop"))
-}
-
 fn memory_file_path() -> anyhow::Result<PathBuf> {
     Ok(triumvirate_home_dir()?.join("memory.jsonl"))
 }
@@ -1659,81 +1659,33 @@ fn spawn_dead_drop(
     repo: &Option<String>,
     branch: &Option<String>,
 ) -> anyhow::Result<PathBuf> {
-    // Dead-drop ticket is the durable fallback handoff when an agent is unreachable.
-    let dir = dead_drop_dir_path()?;
-    fs::create_dir_all(&dir)?;
     let id = Uuid::new_v4().to_string();
-    let file = dir.join(format!("{}-{agent}.md", id));
-    let body = format!(
-        "# Dead Drop Fallback\n\nid: {id}\nagent: {agent}\nreason: {reason}\n\
-cwd: {}\nrepo: {}\nbranch: {}\n\n## Original Request\n{message}\n",
-        cwd.clone().unwrap_or_default(),
-        repo.clone().unwrap_or_default(),
-        branch.clone().unwrap_or_default()
-    );
-    fs::write(&file, body)?;
-    Ok(file)
+    create_dead_drop_ticket(
+        &triumvirate_home_dir()?,
+        agent,
+        message,
+        reason,
+        cwd,
+        repo,
+        branch,
+        &id,
+    )
 }
 
 fn count_pending_fallbacks() -> anyhow::Result<usize> {
-    let dir = dead_drop_dir_path()?;
-    if !dir.exists() {
-        return Ok(0);
-    }
-    Ok(fs::read_dir(dir)?.filter_map(Result::ok).count())
+    count_dead_drop_tickets(&triumvirate_home_dir()?)
 }
 
 fn list_pending_fallback_paths(limit: usize) -> anyhow::Result<Vec<PathBuf>> {
-    let dir = dead_drop_dir_path()?;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = fs::read_dir(dir)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .collect::<Vec<_>>();
-    files.sort();
-    files.reverse();
-    files.truncate(limit);
-    Ok(files)
+    list_dead_drop_tickets(&triumvirate_home_dir()?, limit)
 }
 
 fn acknowledge_fallback_path(path: &str) -> anyhow::Result<()> {
-    let root = dead_drop_dir_path()?;
-    let requested = PathBuf::from(path);
-    let canonical_requested = requested.canonicalize()?;
-    let canonical_root = root.canonicalize()?;
-    if !canonical_requested.starts_with(&canonical_root) {
-        anyhow::bail!("path is outside dead-drop directory");
-    }
-    fs::remove_file(canonical_requested)?;
-    Ok(())
+    acknowledge_dead_drop_ticket(&triumvirate_home_dir()?, path)
 }
 
 fn gc_fallbacks(max_age_days: u64) -> anyhow::Result<usize> {
-    let dir = dead_drop_dir_path()?;
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let max_age = Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
-    let now = std::time::SystemTime::now();
-    let mut removed = 0usize;
-    for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        let Ok(age) = now.duration_since(modified) else {
-            continue;
-        };
-        if age >= max_age && fs::remove_file(path).is_ok() {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    gc_dead_drop_tickets(&triumvirate_home_dir()?, max_age_days)
 }
 
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
