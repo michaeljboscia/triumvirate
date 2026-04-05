@@ -5,6 +5,7 @@ use daemon_core::{
     append_memory_entry as core_append_memory_entry,
     append_outbox_event as core_append_outbox_event, count_dead_drop_tickets,
     create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
+    daemon_bind_addr as core_daemon_bind_addr,
     launchd_plist_path as core_launchd_plist_path,
     render_launch_agent_plist as core_render_launch_agent_plist,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
@@ -1341,7 +1342,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/fallback/ack", post(fallback_ack_route))
         .route("/fallback/gc", post(fallback_gc_route))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+    let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
