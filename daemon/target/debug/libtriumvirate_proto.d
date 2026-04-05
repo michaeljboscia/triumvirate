@@ -1,1 +1,1 @@
-/Users/mikeboscia/projects/triumvirate/daemon/target/debug/libtriumvirate_proto.rlib: /Users/mikeboscia/projects/triumvirate/daemon/crates/proto/src/events.rs /Users/mikeboscia/projects/triumvirate/daemon/crates/proto/src/lib.rs
+/Users/mikeboscia/projects/triumvirate/daemon/target/debug/libtriumvirate_proto.rlib: /Users/mikeboscia/projects/triumvirate/daemon/crates/proto/src/claude_events.rs /Users/mikeboscia/projects/triumvirate/daemon/crates/proto/src/events.rs /Users/mikeboscia/projects/triumvirate/daemon/crates/proto/src/lib.rs
