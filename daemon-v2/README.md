@@ -92,5 +92,6 @@ cargo run -p triumvirate -- doctor
 ## Operational Notes
 
 - `doctor` prints token file path/existence, launchd plist path/existence, configured bind address, and daemon reachability.
-- `status` reports active sessions, supported agents, and fallback queue state.
+- daemon `/health` and `/status` payloads include `daemon_bind_addr` for runtime network observability.
+- `status` reports active sessions, supported agents, fallback queue state, and daemon bind address (when sourced from daemon snapshot).
 - Dead-drop fallback tickets live under `<TRIUMVIRATE_HOME>/dead-drop`.
