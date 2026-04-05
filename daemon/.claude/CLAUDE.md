@@ -6,19 +6,27 @@
 
 ## Session Startup
 
-1. Read `docs/v2/progress.txt` — where is the project
-2. Read `docs/v2/IMPLEMENTATION_PLAN.md` — what phase/step is next
-3. Read `docs/v2/LESSONS.md` — mistakes to avoid
+1. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` — where is the project
+2. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` — what phase/step is next
+3. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/LESSONS.md` — mistakes to avoid
 4. Check current branch: `git branch --show-current`
 
 ## Canonical Docs (Law)
 
-All at `/Users/mikeboscia/projects/triumvirate/docs/v2/`:
-- PRD.md — 27 features with FEAT-IDs
-- BACKEND_STRUCTURE.md — SQLite schema, REST API, agent protocols
-- TECH_STACK.md — exact crate versions
-- IMPLEMENTATION_PLAN.md — 8 phases, 60+ steps
-- TEST_PLAN.md — 170+ test cases across 7 sections
+| Doc | Full Path |
+|-----|-----------|
+| SPEC | `/Users/mikeboscia/projects/triumvirate/SPEC.md` |
+| PRD | `/Users/mikeboscia/projects/triumvirate/docs/v2/PRD.md` |
+| BACKEND_STRUCTURE | `/Users/mikeboscia/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md` |
+| TECH_STACK | `/Users/mikeboscia/projects/triumvirate/docs/v2/TECH_STACK.md` |
+| IMPLEMENTATION_PLAN | `/Users/mikeboscia/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` |
+| TEST_PLAN | `/Users/mikeboscia/projects/triumvirate/docs/v2/TEST_PLAN.md` |
+| DESIGN_SYSTEM | `/Users/mikeboscia/projects/triumvirate/docs/v2/DESIGN_SYSTEM.md` |
+| FRONTEND_GUIDELINES | `/Users/mikeboscia/projects/triumvirate/docs/v2/FRONTEND_GUIDELINES.md` |
+| APP_FLOW | `/Users/mikeboscia/projects/triumvirate/docs/v2/APP_FLOW.md` |
+| BUILD | `/Users/mikeboscia/projects/triumvirate/daemon/BUILD.md` |
+| progress | `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` |
+| LESSONS | `/Users/mikeboscia/projects/triumvirate/docs/v2/LESSONS.md` |
 
 ## Skills to Invoke
 
