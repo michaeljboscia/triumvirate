@@ -1,4 +1,5 @@
 mod agent;
+mod cost;
 mod config;
 mod digest;
 mod fabric;
@@ -153,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         health_registry,
         quota_registry,
         metrics_registry,
+        cfg.pricing.clone(),
         cfg.db_path.clone(),
         workflow_db_path,
         cfg.web_port,

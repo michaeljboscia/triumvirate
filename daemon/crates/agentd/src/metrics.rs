@@ -173,4 +173,22 @@ impl SharedMetricsRegistry {
 
         out
     }
+
+    pub async fn snapshot_tokens(&self) -> HashMap<AgentId, (u64, u64, u64)> {
+        let map = self.inner.read().await;
+        let mut out = HashMap::new();
+        for agent in [AgentId::Claude, AgentId::Gemini, AgentId::Codex] {
+            if let Some(counters) = map.get(&agent) {
+                out.insert(
+                    agent,
+                    (
+                        counters.turns_total.load(Ordering::Relaxed),
+                        counters.tokens_input_total.load(Ordering::Relaxed),
+                        counters.tokens_output_total.load(Ordering::Relaxed),
+                    ),
+                );
+            }
+        }
+        out
+    }
 }
