@@ -42,6 +42,9 @@ COMPLETED
 - Packaging/docs:
   - `daemon/NOTICE.md`
   - `daemon/README.md`
+- Frontend Phase 5.1 scaffold implemented:
+  - `daemon/frontend/` with Svelte 5 + Vite + Tailwind baseline
+  - build verified via `npm run build`
 - Debate scaffold implemented:
   - `DebateWorkflow` in workflow crate
   - `POST /api/debate/start`
