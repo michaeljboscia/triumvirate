@@ -1,10 +1,13 @@
 use clap::{Parser, Subcommand};
 use daemon_core::{
-    acknowledge_dead_drop_ticket, append_memory_entry as core_append_memory_entry,
+    QueueRegistry, acknowledge_dead_drop_ticket,
+    acquire_project_queue as core_acquire_project_queue,
+    append_memory_entry as core_append_memory_entry,
     append_outbox_event as core_append_outbox_event, count_dead_drop_tickets,
     create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
-    list_scratchpad as core_list_scratchpad, read_memory_entries as core_read_memory_entries,
-    read_outbox_events as core_read_outbox_events, write_scratchpad as core_write_scratchpad,
+    list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
+    read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
+    write_scratchpad as core_write_scratchpad,
 };
 use mcp_bridge::{build_role_adapted_prompts, is_supported_agent};
 use axum::{
@@ -1110,7 +1113,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     #[derive(Debug, Clone)]
     struct DaemonState {
         token: String,
-        queues: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+        queues: QueueRegistry,
     }
 
     async fn health(
@@ -1162,7 +1165,11 @@ async fn run_daemon() -> anyhow::Result<()> {
             ));
         }
         // Serialize agent execution per project to keep ordering predictable for concurrent bridges.
-        let queue = acquire_project_queue(&state.queues, project_queue_key(req.cwd.as_ref(), req.repo.as_ref())).await;
+        let queue = core_acquire_project_queue(
+            &state.queues,
+            core_project_queue_key(req.cwd.as_ref(), req.repo.as_ref()),
+        )
+        .await;
         let _guard = queue.lock().await;
         execute_ask_agent(&req).await.map(AxumJson).map_err(|e| {
             (
@@ -1183,7 +1190,11 @@ async fn run_daemon() -> anyhow::Result<()> {
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
             ));
         }
-        let queue = acquire_project_queue(&state.queues, project_queue_key(req.cwd.as_ref(), req.repo.as_ref())).await;
+        let queue = core_acquire_project_queue(
+            &state.queues,
+            core_project_queue_key(req.cwd.as_ref(), req.repo.as_ref()),
+        )
+        .await;
         let _guard = queue.lock().await;
         execute_ask_twins(&req).await.map(AxumJson).map_err(|e| {
             (
@@ -1536,27 +1547,6 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
-}
-
-fn project_queue_key(cwd: Option<&String>, repo: Option<&String>) -> String {
-    if let Some(repo) = repo {
-        return format!("repo:{repo}");
-    }
-    if let Some(cwd) = cwd {
-        return format!("cwd:{cwd}");
-    }
-    "global".to_string()
-}
-
-async fn acquire_project_queue(
-    registry: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    key: String,
-) -> Arc<Mutex<()>> {
-    let mut queues = registry.lock().await;
-    queues
-        .entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
 }
 
 fn spawn_dead_drop(
@@ -2679,14 +2669,14 @@ exit 1\n",
     #[test]
     fn project_queue_key_prefers_repo_then_cwd() {
         assert_eq!(
-            project_queue_key(Some(&"/tmp/a".to_string()), Some(&"triumvirate".to_string())),
+            core_project_queue_key(Some(&"/tmp/a".to_string()), Some(&"triumvirate".to_string())),
             "repo:triumvirate"
         );
         assert_eq!(
-            project_queue_key(Some(&"/tmp/a".to_string()), None),
+            core_project_queue_key(Some(&"/tmp/a".to_string()), None),
             "cwd:/tmp/a"
         );
-        assert_eq!(project_queue_key(None, None), "global");
+        assert_eq!(core_project_queue_key(None, None), "global");
     }
 
     #[tokio::test]
@@ -2752,10 +2742,9 @@ exit 1\n",
 
     #[tokio::test]
     async fn project_queue_serializes_same_project_requests() -> anyhow::Result<()> {
-        let registry: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let registry: QueueRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let key = "repo:triumvirate".to_string();
-        let queue = acquire_project_queue(&registry, key.clone()).await;
+        let queue = core_acquire_project_queue(&registry, key.clone()).await;
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2770,7 +2759,7 @@ exit 1\n",
 
         let registry_clone = registry.clone();
         let waiter = tokio::spawn(async move {
-            let queue2 = acquire_project_queue(&registry_clone, key).await;
+            let queue2 = core_acquire_project_queue(&registry_clone, key).await;
             let _guard = queue2.lock().await;
             "acquired"
         });
@@ -2782,7 +2771,7 @@ exit 1\n",
         holder.await?;
 
         // Run a fresh waiter after releasing to confirm queue drains normally.
-        let queue3 = acquire_project_queue(&registry, "repo:triumvirate".to_string()).await;
+        let queue3 = core_acquire_project_queue(&registry, "repo:triumvirate".to_string()).await;
         let _guard = queue3.lock().await;
         Ok(())
     }
