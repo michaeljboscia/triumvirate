@@ -1,0 +1,96 @@
+# Triumvirate Daemon v2
+
+A Rust workspace for the Triumvirate daemon + MCP bridge runtime.
+
+## Workspace Crates
+
+- `crates/triumvirate`: main binary (`mcp`, `daemon`, `install`, `uninstall`, `status`, `doctor`)
+- `crates/daemon-core`: daemon/runtime shared helpers (state IO, dead-drop, queue, launchd, context)
+- `crates/mcp-bridge`: MCP-facing bridge helpers (routing inputs, env/URL parsing, command resolution)
+- `crates/shared-types`: shared request/response DTOs used across crate boundaries
+
+## Build & Test
+
+```bash
+cargo build
+cargo test
+```
+
+## CLI Commands
+
+```bash
+# Run stdio MCP bridge
+cargo run -p triumvirate -- mcp
+
+# Run daemon HTTP process
+cargo run -p triumvirate -- daemon
+
+# Install launchd plist for autostart
+cargo run -p triumvirate -- install
+
+# Remove launchd plist
+cargo run -p triumvirate -- uninstall
+
+# Print status snapshot
+cargo run -p triumvirate -- status
+
+# Print local diagnostics
+cargo run -p triumvirate -- doctor
+```
+
+## Runtime Environment Variables
+
+### Daemon networking
+
+- `TRIUMVIRATE_DAEMON_BIND_ADDR`
+  - Daemon listen address for `daemon` mode.
+  - Default: `127.0.0.1:8080`
+- `TRIUMVIRATE_DAEMON_BASE_URL`
+  - Base URL for MCP-side daemon HTTP calls.
+  - If unset, bridge derives from `TRIUMVIRATE_DAEMON_BIND_ADDR` as `http://<bind-addr>`.
+  - Final fallback: `http://127.0.0.1:8080`
+
+### Explicit daemon endpoint overrides
+
+- `TRIUMVIRATE_DAEMON_URL` (`/status`)
+- `TRIUMVIRATE_DAEMON_ASK_AGENT_URL`
+- `TRIUMVIRATE_DAEMON_ASK_TWINS_URL`
+- `TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL`
+- `TRIUMVIRATE_DAEMON_MEMORY_READ_URL`
+- `TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL`
+- `TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL`
+- `TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL`
+- `TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL`
+- `TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL`
+- `TRIUMVIRATE_DAEMON_FALLBACK_GC_URL`
+
+### MCP/daemon execution mode
+
+- `TRIUMVIRATE_MCP_USE_DAEMON`
+  - Truthy values (`1`, `true`, `yes`, `on`) route MCP tools through daemon HTTP.
+  - Default: disabled/false.
+
+### Autostart behavior
+
+- `TRIUMVIRATE_DAEMON_AUTOSTART`
+  - Falsey values (`0`, `false`, `no`, `off`) disable one-shot autostart attempts.
+  - Default: enabled/true.
+- `TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN`
+  - Truthy values simulate autostart without spawning daemon process.
+
+### Agent command resolution
+
+- `TRIUMVIRATE_GEMINI_BIN`, `TRIUMVIRATE_GEMINI_ARGS`
+- `TRIUMVIRATE_CODEX_BIN`, `TRIUMVIRATE_CODEX_ARGS`
+
+### Data root
+
+- `TRIUMVIRATE_HOME`
+  - Root for daemon token, sessions, outbox, memory, scratchpad, and dead-drop.
+  - Default: `~/.triumvirate`
+
+## Operational Notes
+
+- `doctor` prints token file path/existence, launchd plist path/existence, configured bind address, and daemon reachability.
+- `status` reports active sessions, supported agents, and fallback queue state.
+- Dead-drop fallback tickets live under `<TRIUMVIRATE_HOME>/dead-drop`.
