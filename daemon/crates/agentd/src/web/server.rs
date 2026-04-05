@@ -28,10 +28,9 @@ use crate::shutdown::wait_for_shutdown_signal;
 use crate::web::ws_handler;
 
 /// Static assets embedded in the binary via rust-embed.
-/// In production, the Svelte build output goes here.
-/// For POC 1, it's a single index.html.
+/// Build output from daemon/frontend/dist is embedded at compile time.
 #[derive(Embed)]
-#[folder = "../../static/"]
+#[folder = "../../frontend/dist/"]
 struct Assets;
 
 /// Shared state available to all HTTP handlers.
