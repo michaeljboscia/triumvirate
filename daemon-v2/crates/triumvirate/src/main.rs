@@ -5,6 +5,8 @@ use daemon_core::{
     append_memory_entry as core_append_memory_entry,
     append_outbox_event as core_append_outbox_event, count_dead_drop_tickets,
     create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
+    launchd_plist_path as core_launchd_plist_path,
+    render_launch_agent_plist as core_render_launch_agent_plist,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
     read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
     resolve_context as core_resolve_context, write_scratchpad as core_write_scratchpad, ensure_daemon_token as core_ensure_daemon_token,
@@ -996,38 +998,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.triumvirate.daemon-v2</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe_path}</string>
-    <string>daemon</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>TRIUMVIRATE_HOME</key>
-    <string>{home_dir}</string>
-  </dict>
-  <key>StandardOutPath</key>
-  <string>{home_dir}/daemon.log</string>
-  <key>StandardErrorPath</key>
-  <string>{home_dir}/daemon.err.log</string>
-</dict>
-</plist>
-"#
-    )
-}
-
 fn run_install() -> anyhow::Result<()> {
     let home = triumvirate_home_dir()?;
     fs::create_dir_all(&home)?;
@@ -1036,9 +1006,9 @@ fn run_install() -> anyhow::Result<()> {
         .join("Library/LaunchAgents");
     fs::create_dir_all(&launch_agents)?;
 
-    let plist_path = launch_agents.join("com.triumvirate.daemon-v2.plist");
+    let plist_path = core_launchd_plist_path()?;
     let exe_path = std::env::current_exe()?;
-    let plist = launch_agent_plist(&exe_path.display().to_string(), &home.display().to_string());
+    let plist = core_render_launch_agent_plist(&exe_path.display().to_string(), &home.display().to_string());
     fs::write(&plist_path, plist)?;
 
     println!("Installed launchd plist at {}", plist_path.display());
@@ -1048,9 +1018,7 @@ fn run_install() -> anyhow::Result<()> {
 }
 
 fn launchd_plist_path() -> anyhow::Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?
-        .join("Library/LaunchAgents/com.triumvirate.daemon-v2.plist"))
+    core_launchd_plist_path()
 }
 
 fn run_uninstall() -> anyhow::Result<()> {
@@ -2537,7 +2505,7 @@ exit 1\n",
 
     #[test]
     fn launch_agent_plist_contains_expected_values() {
-        let plist = launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri-home");
+        let plist = core_render_launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri-home");
         assert!(plist.contains("com.triumvirate.daemon-v2"));
         assert!(plist.contains("<string>/usr/local/bin/triumvirate</string>"));
         assert!(plist.contains("<string>daemon</string>"));
