@@ -43,6 +43,10 @@ cargo build
 - `POST /api/fleet/peer`
 - `GET /api/fleet/status/{fleet_id}`
 
+## Observability
+
+- `GET /metrics` (Prometheus exposition format)
+
 ## Governance API
 
 - `POST /api/governance/check`

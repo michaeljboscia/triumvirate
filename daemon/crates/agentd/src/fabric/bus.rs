@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{broadcast, RwLock};
 use triumvirate_proto::{FabricMessage, Topic};
@@ -17,6 +18,7 @@ const CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct MessageBus {
     channels: Arc<RwLock<HashMap<TopicKey, broadcast::Sender<FabricMessage>>>>,
+    emitted_total: Arc<AtomicU64>,
 }
 
 /// Flattened topic key for HashMap lookup.
@@ -36,6 +38,7 @@ impl MessageBus {
     pub fn new() -> Self {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
+            emitted_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -97,6 +100,7 @@ impl MessageBus {
     /// Publish to both the topic channel AND the firehose.
     /// This is the primary publish method for production use.
     pub async fn emit(&self, msg: FabricMessage) {
+        self.emitted_total.fetch_add(1, Ordering::Relaxed);
         // Publish to specific topic
         self.publish(msg.clone()).await;
 
@@ -105,6 +109,10 @@ impl MessageBus {
         if let Some(tx) = channels.get("__firehose__") {
             let _ = tx.send(msg);
         }
+    }
+
+    pub fn emitted_total(&self) -> u64 {
+        self.emitted_total.load(Ordering::Relaxed)
     }
 }
 

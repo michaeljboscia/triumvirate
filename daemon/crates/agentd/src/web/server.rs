@@ -25,6 +25,7 @@ use crate::governance::{GovernanceEngine, GovernedAction};
 use crate::quota::SharedQuotaRegistry;
 use crate::routing::{RoutingDecision, decide_route};
 use crate::shutdown::wait_for_shutdown_signal;
+use crate::metrics::SharedMetricsRegistry;
 use crate::web::ws_handler;
 
 /// Static assets embedded in the binary via rust-embed.
@@ -39,6 +40,7 @@ pub struct AppState {
     pub bus: Arc<MessageBus>,
     pub health: SharedHealthRegistry,
     pub quota: SharedQuotaRegistry,
+    pub metrics: SharedMetricsRegistry,
     pub memory_db_path: PathBuf,
     pub workflow_db_path: PathBuf,
 }
@@ -51,6 +53,7 @@ pub async fn start_web_server(
     bus: Arc<MessageBus>,
     health: SharedHealthRegistry,
     quota: SharedQuotaRegistry,
+    metrics: SharedMetricsRegistry,
     memory_db_path: PathBuf,
     workflow_db_path: PathBuf,
     port: u16,
@@ -59,6 +62,7 @@ pub async fn start_web_server(
         bus,
         health,
         quota,
+        metrics,
         memory_db_path,
         workflow_db_path,
     };
@@ -66,6 +70,7 @@ pub async fn start_web_server(
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/governance/check", post(governance_check_handler))
         .route("/api/debate/start", post(debate_start_handler))
@@ -153,6 +158,19 @@ async fn quota_handler(State(state): State<AppState>) -> impl IntoResponse {
             "codex": snapshots.get(&AgentId::Codex),
         }
     }))
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let health = state.health.snapshot().await;
+    let quota = state.quota.snapshot_all().await;
+    let body = state
+        .metrics
+        .render_prometheus(state.bus.emitted_total(), health, quota)
+        .await;
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 #[derive(Debug, serde::Deserialize)]
