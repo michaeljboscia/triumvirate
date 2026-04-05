@@ -11,7 +11,7 @@ use rust_embed::Embed;
 use rusqlite::Connection;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 use triumvirate_workflow::WorkflowStore;
 use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
@@ -598,12 +598,23 @@ async fn message_handler(
                     .into_response();
             }
 
+            let enriched_content =
+                match inject_memory_context(&state.memory_db_path, agent, &content) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        warn!(agent = %agent, error = %e, "failed to inject memory context");
+                        content.clone()
+                    }
+                };
+
             state
                 .bus
                 .emit(FabricMessage::new(
                     AgentId::Human,
                     Topic::AgentInput(agent),
-                    Payload::HumanMessage { content },
+                    Payload::HumanMessage {
+                        content: enriched_content,
+                    },
                 ))
                 .await;
             let reason = if is_direct_mention {
@@ -668,6 +679,39 @@ async fn message_handler(
     }
 
     (StatusCode::ACCEPTED, Json(MessageResponse { accepted: true })).into_response()
+}
+
+fn inject_memory_context(
+    memory_db_path: &std::path::Path,
+    target_agent: AgentId,
+    content: &str,
+) -> anyhow::Result<String> {
+    let conn = Connection::open(memory_db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT decision_text, created_at
+         FROM decisions
+         ORDER BY id DESC
+         LIMIT 5",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut decisions = Vec::new();
+    for row in rows {
+        let (decision_text, created_at) = row?;
+        decisions.push(format!("- [{created_at}] {decision_text}"));
+    }
+
+    if decisions.is_empty() {
+        return Ok(content.to_string());
+    }
+
+    let context_block = decisions.join("\n");
+    Ok(format!(
+        "[TRIUMVIRATE CONTEXT]\nTarget agent: {target_agent}\nRecent decisions:\n{context_block}\n\n[USER REQUEST]\n{content}"
+    ))
 }
 
 fn status_label(status: HealthStatus) -> &'static str {
