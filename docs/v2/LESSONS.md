@@ -51,3 +51,13 @@ Mistakes made, patterns discovered, things that broke and why.
 **Why:** Projected my understanding of the existing spec onto what the user was saying, instead of asking what they actually meant.
 
 **Rule:** When the user describes something new, ask what they mean before assuming you know.
+
+---
+
+## L-006: Codex Reads Files Mid-Session (2026-04-05)
+
+**What went wrong:** Told the user Codex wouldn't pick up doc changes until its session restarted. Codex had already read the updated files and implemented the new features.
+
+**Why:** Assumed Codex only reads instruction files at boot. In reality, Codex re-reads files during its session — proven on YellingToad Go rewrite and again here.
+
+**Rule:** Codex picks up file changes mid-session. Updating progress.txt and canonical docs IS the communication mechanism. Don't waste time worrying about session restarts.
