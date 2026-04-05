@@ -11,13 +11,12 @@ mod web;
 
 use std::sync::Arc;
 
-use tracing::{error, info};
+use tracing::info;
 use triumvirate_workflow::WorkflowEngine;
 use uuid::Uuid;
 
 use agent::{
-    AgentConnector, ClaudeConnector, CodexConnector, GeminiConnector, HealthMonitor,
-    SharedHealthRegistry,
+    SharedHealthRegistry, spawn_claude_supervisor, spawn_codex_supervisor, spawn_gemini_supervisor,
 };
 use digest::DigestEngine;
 use fabric::MessageBus;
@@ -95,81 +94,26 @@ async fn main() -> anyhow::Result<()> {
     workflow_engine.complete(&boot_workflow_id, 1)?;
     info!(db = %workflow_db_path.display(), workflow_id = %boot_workflow_id, "workflow engine ready");
 
-    // Steps 5-7: Spawn agent connectors
+    // Steps 5-7: Spawn agent connectors under supervisor loops
     let health_registry = SharedHealthRegistry::default();
-    let mut health_monitor = HealthMonitor::new(bus.clone(), health_registry.clone());
-    let mut agents_ready = 0u8;
     let mut agents_total = 0u8;
 
     if cfg.agents.claude_enabled {
         agents_total += 1;
-        let mut claude = ClaudeConnector::new();
-        health_monitor.register(claude.agent_id(), claude.health_watch());
-        match claude.spawn(bus.clone()).await {
-            Ok(()) if claude.health() == triumvirate_proto::HealthStatus::Ready => {
-                agents_ready += 1;
-                health_registry
-                    .set(claude.agent_id(), triumvirate_proto::HealthStatus::Ready)
-                    .await;
-                info!("claude: READY");
-            }
-            Ok(()) => {
-                health_registry
-                    .set(claude.agent_id(), claude.health())
-                    .await;
-                info!("claude: NOT READY (CLI not found)");
-            }
-            Err(e) => error!("claude: FAILED to spawn: {e}"),
-        }
+        spawn_claude_supervisor(bus.clone(), health_registry.clone());
     }
 
     if cfg.agents.gemini_enabled {
         agents_total += 1;
-        let mut gemini = GeminiConnector::new();
-        health_monitor.register(gemini.agent_id(), gemini.health_watch());
-        match gemini.spawn(bus.clone()).await {
-            Ok(()) if gemini.health() == triumvirate_proto::HealthStatus::Ready => {
-                agents_ready += 1;
-                health_registry
-                    .set(gemini.agent_id(), triumvirate_proto::HealthStatus::Ready)
-                    .await;
-                info!("gemini: READY");
-            }
-            Ok(()) => {
-                health_registry
-                    .set(gemini.agent_id(), gemini.health())
-                    .await;
-                info!("gemini: NOT READY (CLI not found)");
-            }
-            Err(e) => error!("gemini: FAILED to spawn: {e}"),
-        }
+        spawn_gemini_supervisor(bus.clone(), health_registry.clone());
     }
 
     if cfg.agents.codex_enabled {
         agents_total += 1;
-        let mut codex = CodexConnector::new();
-        health_monitor.register(codex.agent_id(), codex.health_watch());
-        match codex.spawn(bus.clone()).await {
-            Ok(()) if codex.health() == triumvirate_proto::HealthStatus::Ready => {
-                agents_ready += 1;
-                health_registry
-                    .set(codex.agent_id(), triumvirate_proto::HealthStatus::Ready)
-                    .await;
-                info!("codex: READY");
-            }
-            Ok(()) => {
-                health_registry
-                    .set(codex.agent_id(), codex.health())
-                    .await;
-                info!("codex: NOT READY (CLI not found)");
-            }
-            Err(e) => error!("codex: FAILED to spawn: {e}"),
-        }
+        spawn_codex_supervisor(bus.clone(), health_registry.clone());
     }
 
-    // Start health monitor
-    health_monitor.run();
-    info!(ready = agents_ready, total = agents_total, "agent health monitor started");
+    info!(total = agents_total, "agent supervisors started");
 
     // Step 9: Start Stenographer
     let steno = Stenographer::new(bus.clone(), session_id, cfg.db_path.clone(), std::env::current_dir()?);
@@ -184,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     // Step 8: Start web dashboard (this blocks — it's the main event loop)
     info!(
         port = cfg.web_port,
-        agents_ready,
+        agents_ready = 0,
         agents_total,
         "triumvirate-agentd ready — dashboard at http://127.0.0.1:{}",
         cfg.web_port
