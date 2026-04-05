@@ -66,6 +66,8 @@ pub async fn start_web_server(
         .route("/api/quota", get(quota_handler))
         .route("/api/workflows", get(workflows_handler))
         .route("/api/decisions", get(decisions_handler))
+        .route("/api/fleet/tasks", get(fleet_tasks_handler))
+        .route("/api/fleet/spawn", post(fleet_spawn_handler))
         .route("/api/message", post(message_handler))
         .route("/ws", get(ws_handler))
         .fallback(static_handler)
@@ -218,6 +220,142 @@ async fn decisions_handler(State(state): State<AppState>) -> impl IntoResponse {
             }
 
             (StatusCode::OK, Json(serde_json::json!({ "decisions": decisions }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetSpawnRequest {
+    spec: String,
+}
+
+async fn fleet_spawn_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FleetSpawnRequest>,
+) -> impl IntoResponse {
+    let spec = req.spec.trim();
+    if spec.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "spec must not be empty" })),
+        )
+            .into_response();
+    }
+
+    let fleet_id = format!("fleet-{}", uuid::Uuid::new_v4());
+
+    match Connection::open(&state.memory_db_path) {
+        Ok(conn) => {
+            let tasks = [
+                ("contracts", "Define contracts", "pending", Option::<&str>::None),
+                ("implementation", "Parallel implementation", "blocked", Some("contracts")),
+                ("merge", "Sequential merge", "blocked", Some("implementation")),
+            ];
+
+            for (task_key, title, status, depends_on) in tasks {
+                if let Err(e) = conn.execute(
+                    "INSERT INTO fleet_tasks (fleet_id, task_key, title, status, depends_on)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![fleet_id, task_key, title, status, depends_on],
+                ) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("failed to create fleet tasks: {e}") })),
+                    )
+                        .into_response();
+                }
+            }
+
+            state
+                .bus
+                .emit(FabricMessage::new(
+                    AgentId::Human,
+                    Topic::TaskCreated,
+                    Payload::HumanMessage {
+                        content: format!("fleet spawned: {fleet_id} ({spec})"),
+                    },
+                ))
+                .await;
+
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "accepted": true,
+                    "fleet_id": fleet_id,
+                    "spec": spec,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to open memory db: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn fleet_tasks_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match Connection::open(&state.memory_db_path) {
+        Ok(conn) => {
+            let mut stmt = match conn.prepare(
+                "SELECT fleet_id, task_key, title, status, assigned_agent, depends_on, created_at, updated_at
+                 FROM fleet_tasks
+                 ORDER BY id DESC
+                 LIMIT 500",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("failed to prepare fleet_tasks query: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let rows = match stmt.query_map([], |row| {
+                Ok(serde_json::json!({
+                    "fleet_id": row.get::<_, String>(0)?,
+                    "task_key": row.get::<_, String>(1)?,
+                    "title": row.get::<_, String>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "assigned_agent": row.get::<_, Option<String>>(4)?,
+                    "depends_on": row.get::<_, Option<String>>(5)?,
+                    "created_at": row.get::<_, String>(6)?,
+                    "updated_at": row.get::<_, String>(7)?,
+                }))
+            }) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": format!("failed to query fleet_tasks: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let mut tasks = Vec::new();
+            for row in rows {
+                match row {
+                    Ok(value) => tasks.push(value),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": format!("failed to read fleet_tasks row: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({ "tasks": tasks }))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

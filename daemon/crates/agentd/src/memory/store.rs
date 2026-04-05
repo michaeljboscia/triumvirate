@@ -88,10 +88,23 @@ impl MemoryStore {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS fleet_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fleet_id TEXT NOT NULL,
+                task_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'blocked', 'completed', 'failed')),
+                assigned_agent TEXT,
+                depends_on TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
             CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
             CREATE INDEX IF NOT EXISTS idx_routing_log_session ON routing_log(session_id);
-            CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id);",
+            CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id);
+            CREATE INDEX IF NOT EXISTS idx_fleet_tasks_fleet ON fleet_tasks(fleet_id);",
         )?;
 
         info!(path = %path.display(), "memory store opened");
