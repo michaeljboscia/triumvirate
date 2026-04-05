@@ -301,4 +301,19 @@ instances = 1
 
 [quota]
 fallback_threshold_pct = 80   # auto-disable digests at this %
+
+[langfuse]
+enabled = true
+host = "https://langfuse.e5btools.com"
+public_key = "pk-..."
+secret_key = "sk-..."
+
+[pricing]
+# Per million tokens (USD). Override if your rates differ.
+claude_input_per_mtok = 5.0
+claude_output_per_mtok = 25.0
+gemini_input_per_mtok = 0.0    # subscription = free
+gemini_output_per_mtok = 0.0
+codex_input_per_mtok = 2.0     # adjust per OpenAI tier
+codex_output_per_mtok = 8.0
 ```
