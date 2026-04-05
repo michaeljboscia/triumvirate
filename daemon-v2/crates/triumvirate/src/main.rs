@@ -976,12 +976,7 @@ async fn main() -> anyhow::Result<()> {
             run_uninstall()?;
         }
         CliCommand::Status => {
-            let health = fetch_daemon_status().await?;
-            let snapshot = fetch_daemon_status_snapshot().await?;
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "health": health,
-                "snapshot": snapshot
-            }))?);
+            run_status().await?;
         }
         CliCommand::Doctor => {
             run_doctor().await?;
@@ -1037,6 +1032,45 @@ async fn run_doctor() -> anyhow::Result<()> {
         "daemon_reachable": daemon_health.is_some(),
         "daemon_health": daemon_health
     });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+async fn run_status() -> anyhow::Result<()> {
+    let daemon_bind_addr =
+        core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
+
+    let health = fetch_daemon_status().await.ok();
+    let snapshot = fetch_daemon_status_snapshot().await.ok();
+
+    let report = if let (Some(health), Some(snapshot)) = (health, snapshot) {
+        serde_json::json!({
+            "daemon_reachable": true,
+            "daemon_bind_addr": daemon_bind_addr,
+            "health": health,
+            "snapshot": snapshot
+        })
+    } else {
+        let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
+        let fallback_tickets = list_pending_fallback_paths(10)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "daemon_reachable": false,
+            "daemon_bind_addr": daemon_bind_addr,
+            "health": null,
+            "snapshot": {
+                "daemon_mode": "incremental-dev",
+                "supported_agents": ["gemini", "codex"],
+                "pending_fallbacks": pending_fallbacks,
+                "fallback_tickets": fallback_tickets
+            }
+        })
+    };
+
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
