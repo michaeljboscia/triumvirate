@@ -1845,11 +1845,12 @@ mod tests {
     use rmcp::{ClientHandler, model::ClientInfo};
     use rmcp::model::CallToolRequestParams;
     use std::{
+        future::Future,
         fs,
         net::SocketAddr,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
-        sync::{Mutex, OnceLock},
+        sync::{Arc, Mutex, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1859,6 +1860,47 @@ mod tests {
     impl ClientHandler for NoopClient {
         fn get_info(&self) -> ClientInfo {
             ClientInfo::default()
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingClient {
+        logging_messages: Arc<Mutex<Vec<String>>>,
+        progress_messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ClientHandler for RecordingClient {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::default()
+        }
+
+        fn on_progress(
+            &self,
+            params: ProgressNotificationParam,
+            _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+        ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+            let messages = self.progress_messages.clone();
+            async move {
+                if let Some(message) = params.message {
+                    messages.lock().expect("progress lock poisoned").push(message);
+                }
+            }
+        }
+
+        fn on_logging_message(
+            &self,
+            params: LoggingMessageNotificationParam,
+            _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+        ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+            let messages = self.logging_messages.clone();
+            async move {
+                if let Some(message) = params.data.as_str() {
+                    messages
+                        .lock()
+                        .expect("logging lock poisoned")
+                        .push(message.to_string());
+                }
+            }
         }
     }
 
@@ -1886,6 +1928,73 @@ mod tests {
 
         assert_eq!(text, "pong");
 
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_emits_progress_notifications() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let script_path = write_mock_agent_script("gemini", 1.0)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+
+        let client_handler = RecordingClient::default();
+        let client = client_handler.clone().serve(client_transport).await?;
+        {
+            let tool_future = client.call_tool(
+                CallToolRequestParams::new("ask_agent").with_arguments(
+                    serde_json::json!({
+                        "agent": "gemini",
+                        "message": "progress check"
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                ),
+            );
+            tokio::pin!(tool_future);
+
+            let result = tool_future.as_mut().await?;
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.raw.as_text())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            assert!(text.contains("\"state\":\"DONE\""));
+
+            let all_logs = client_handler
+                .logging_messages
+                .lock()
+                .expect("logging lock poisoned")
+                .clone();
+            assert!(all_logs.iter().any(|m| m.contains("Gemini: sent")));
+            assert!(all_logs.iter().any(|m| m.contains("Gemini: responded")));
+        }
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+        }
+        let _ = fs::remove_file(script_path);
         client.cancel().await?;
         server_handle.await??;
         Ok(())
