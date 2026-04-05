@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
-    time::{Duration, timeout},
+    time::{Duration, sleep, timeout},
 };
 
 #[derive(Debug, Parser)]
@@ -127,30 +127,52 @@ impl McpBridge {
             detail: "Gemini is processing request".to_string(),
         });
 
-        match run_gemini_mock(&req.message).await {
-            Ok(response) => {
-                lifecycle.push(LifecycleEvent {
-                    state: "DONE".to_string(),
-                    detail: "Gemini responded".to_string(),
-                });
-                Ok(Json(AskAgentResponse {
-                    agent: "gemini".to_string(),
-                    response,
-                    lifecycle,
-                }))
-            }
-            Err(e) => {
-                lifecycle.push(LifecycleEvent {
-                    state: "FAILED".to_string(),
-                    detail: format!("Gemini failed: {e}"),
-                });
-                Err(format!(
-                    "ask_agent failed after lifecycle {:?}: {}",
-                    lifecycle.iter().map(|e| e.state.as_str()).collect::<Vec<_>>(),
-                    e
-                ))
+        let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
+        let mut last_err: Option<String> = None;
+
+        for (idx, backoff) in backoffs.iter().enumerate() {
+            match run_gemini_mock(&req.message).await {
+                Ok(response) => {
+                    lifecycle.push(LifecycleEvent {
+                        state: "DONE".to_string(),
+                        detail: format!("Gemini responded on attempt {}", idx + 1),
+                    });
+                    return Ok(Json(AskAgentResponse {
+                        agent: "gemini".to_string(),
+                        response,
+                        lifecycle,
+                    }));
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("timed out") {
+                        lifecycle.push(LifecycleEvent {
+                            state: "TIMEOUT".to_string(),
+                            detail: format!("Gemini timed out on attempt {}", idx + 1),
+                        });
+                    }
+                    lifecycle.push(LifecycleEvent {
+                        state: "RETRY".to_string(),
+                        detail: format!("Retrying Gemini ({}/{}) after {}", idx + 1, backoffs.len(), msg),
+                    });
+                    last_err = Some(msg);
+                    sleep(*backoff).await;
+                }
             }
         }
+
+        lifecycle.push(LifecycleEvent {
+            state: "FAILED".to_string(),
+            detail: format!(
+                "Gemini failed after {} attempts",
+                backoffs.len()
+            ),
+        });
+        Err(format!(
+            "ask_agent failed after lifecycle {:?}: {}",
+            lifecycle.iter().map(|e| e.state.as_str()).collect::<Vec<_>>(),
+            last_err.unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 
     #[tool(description = "Fan out a request to Gemini and Codex in parallel with role-adapted prompts.")]
@@ -427,6 +449,35 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} done\"}}}}'\
         Ok(path)
     }
 
+    fn write_retry_agent_script(name: &str) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mock-{name}-retry-{now}.sh"));
+        let state_path = std::env::temp_dir().join(format!("mock-{name}-retry-state-{now}.txt"));
+        let script = format!(
+            "#!/bin/sh\n\
+state_file=\"{state_file}\"\n\
+count=0\n\
+if [ -f \"$state_file\" ]; then count=$(cat \"$state_file\"); fi\n\
+count=$((count+1))\n\
+echo \"$count\" > \"$state_file\"\n\
+IFS= read -r _line\n\
+if [ \"$count\" -eq 1 ]; then\n\
+  echo '{{\"jsonrpc\":\"2.0\",\"method\":\"session/ready\",\"params\":{{\"text\":\"{name} attempt1 no result\"}}}}'\n\
+  exit 0\n\
+fi\n\
+echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on retry\"}}}}'\n",
+            state_file = state_path.display(),
+            name = name
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     #[tokio::test]
     async fn ask_agent_gemini_happy_path_returns_lifecycle() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
@@ -543,6 +594,55 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} done\"}}}}'\
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
             std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_retries_and_recovers() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let script_path = write_retry_agent_script("gemini")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new().serve(server_transport).await?.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "agent": "gemini",
+            "message": "test retry",
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_agent")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(raw_text.contains("gemini recovered on retry"));
+        assert!(raw_text.contains("RETRY"));
+        assert!(raw_text.contains("DONE"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        let _ = fs::remove_file(script_path);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         Ok(())
     }
