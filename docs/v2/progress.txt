@@ -1,0 +1,36 @@
+TRIUMVIRATE V2 — PROGRESS TRACKER
+==================================
+
+Last updated: 2026-04-05
+Current phase: Phase 0 (Prior Art Research)
+Next step: 0.1 (Study Ruflo source)
+
+COMPLETED
+---------
+- POC 1: Rust scaffold compiles, boots in 13ms, finds all 3 CLIs (daemon/)
+- SPEC.md: Final (7 REQs, Goat Rodeo R1-R6, 17 decisions)
+- Canonical docs: PRD, APP_FLOW, TECH_STACK, DESIGN_SYSTEM, FRONTEND_GUIDELINES, BACKEND_STRUCTURE, IMPLEMENTATION_PLAN, CLAUDE.md written
+- Research: 33 artifacts including multi-agent coordination landscape (032), decision ledger (033)
+- Goat Rodeo: 6 rounds, REQ-7 (Dynamic Multi-Agent Fleet) added
+
+IN PROGRESS
+-----------
+(nothing currently in progress)
+
+BLOCKED
+-------
+(nothing blocked)
+
+NEXT UP
+-------
+Phase 0: Study Ruflo, Clash, swarms-rs, Temporal source code
+Phase 1: POC 2 — Claude live agent (stream-json over piped stdio)
+Phase 2: POC 3 — All 3 agents streaming simultaneously
+Phase 3: Foundation — memory, stenographer, workflow engine
+Phase 4: Fleet — worktrees, task list, sequential merge
+
+NOTES
+-----
+- All 3 CLIs present: claude at ~/.local/bin/claude, gemini at /opt/homebrew/bin/gemini, codex at ~/.local/bin/codex
+- Daemon target/ directory needs to be added to .gitignore (committed accidentally)
+- Svelte frontend not yet initialized (Phase 5)
