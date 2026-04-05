@@ -26,6 +26,13 @@ impl<'a> DebateWorkflow<'a> {
         &self.workflow_id
     }
 
+    pub fn attach(engine: &'a WorkflowEngine, workflow_id: impl Into<String>) -> Self {
+        Self {
+            engine,
+            workflow_id: workflow_id.into(),
+        }
+    }
+
     pub fn record_challenge(&self, challenger: &str, argument: &str) -> anyhow::Result<()> {
         let payload = serde_json::json!({
             "phase": "challenge",
@@ -56,4 +63,3 @@ impl<'a> DebateWorkflow<'a> {
         self.engine.complete(&self.workflow_id, 4)
     }
 }
-
