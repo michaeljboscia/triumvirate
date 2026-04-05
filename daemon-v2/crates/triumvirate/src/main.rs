@@ -189,7 +189,7 @@ struct DismissSessionRequest {
     name: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct MemoryWriteRequest {
     namespace: String,
     key: String,
@@ -202,7 +202,7 @@ struct MemoryWriteResponse {
     status: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct MemoryReadRequest {
     namespace: String,
     key: Option<String>,
@@ -223,7 +223,7 @@ struct MemoryReadResponse {
     entries: Vec<MemoryEntry>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct ScratchpadWriteRequest {
     project: String,
     topic: String,
@@ -235,7 +235,7 @@ struct ScratchpadWriteResponse {
     path: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct ScratchpadListRequest {
     project: String,
 }
@@ -395,6 +395,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryWriteRequest>,
     ) -> Result<Json<MemoryWriteResponse>, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_memory_write(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("memory_write via daemon failed: {e}"));
+        }
         let id = Uuid::new_v4().to_string();
         let entry = MemoryEntry {
             id: id.clone(),
@@ -415,6 +421,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryReadRequest>,
     ) -> Result<Json<MemoryReadResponse>, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_memory_read(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("memory_read via daemon failed: {e}"));
+        }
         let mut entries =
             read_memory_entries().map_err(|e| format!("memory_read failed: {e}"))?;
         entries.retain(|e| e.namespace == req.namespace);
@@ -433,6 +445,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadWriteRequest>,
     ) -> Result<Json<ScratchpadWriteResponse>, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_scratchpad_write(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("scratchpad_write via daemon failed: {e}"));
+        }
         let path = write_scratchpad(&req.project, &req.topic, &req.content)
             .map_err(|e| format!("scratchpad_write failed: {e}"))?;
         Ok(Json(ScratchpadWriteResponse {
@@ -445,6 +463,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadListRequest>,
     ) -> Result<Json<ScratchpadListResponse>, String> {
+        if use_daemon_for_mcp() {
+            return fetch_daemon_scratchpad_list(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("scratchpad_list via daemon failed: {e}"));
+        }
         let files = list_scratchpad(&req.project)
             .map_err(|e| format!("scratchpad_list failed: {e}"))?
             .into_iter()
@@ -1047,6 +1071,111 @@ async fn run_daemon() -> anyhow::Result<()> {
         })
     }
 
+    async fn memory_write_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<MemoryWriteRequest>,
+    ) -> Result<AxumJson<MemoryWriteResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let id = Uuid::new_v4().to_string();
+        let entry = MemoryEntry {
+            id: id.clone(),
+            namespace: req.namespace,
+            key: req.key,
+            value: req.value,
+            ts_ms: now_ms(),
+        };
+        append_memory_entry(&entry).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+        Ok(AxumJson(MemoryWriteResponse {
+            id,
+            status: "ok".to_string(),
+        }))
+    }
+
+    async fn memory_read_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<MemoryReadRequest>,
+    ) -> Result<AxumJson<MemoryReadResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let mut entries = read_memory_entries().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+        entries.retain(|e| e.namespace == req.namespace);
+        if let Some(key) = req.key {
+            entries.retain(|e| e.key == key);
+        }
+        entries.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        if let Some(limit) = req.limit {
+            entries.truncate(limit);
+        }
+        Ok(AxumJson(MemoryReadResponse { entries }))
+    }
+
+    async fn scratchpad_write_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<ScratchpadWriteRequest>,
+    ) -> Result<AxumJson<ScratchpadWriteResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let path = write_scratchpad(&req.project, &req.topic, &req.content).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+        Ok(AxumJson(ScratchpadWriteResponse {
+            path: path.display().to_string(),
+        }))
+    }
+
+    async fn scratchpad_list_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<ScratchpadListRequest>,
+    ) -> Result<AxumJson<ScratchpadListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_authorized(&headers, &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let files = list_scratchpad(&req.project)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(serde_json::json!({ "error": e.to_string() })),
+                )
+            })?
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+        Ok(AxumJson(ScratchpadListResponse { files }))
+    }
+
     let token = ensure_daemon_token()?;
     let state = DaemonState { token };
     let app = Router::new()
@@ -1054,6 +1183,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/status", get(status))
         .route("/ask-agent", post(ask_agent_route))
         .route("/ask-twins", post(ask_twins_route))
+        .route("/memory/write", post(memory_write_route))
+        .route("/memory/read", post(memory_read_route))
+        .route("/scratchpad/write", post(scratchpad_write_route))
+        .route("/scratchpad/list", post(scratchpad_list_route))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     axum::serve(listener, app).await?;
@@ -1344,6 +1477,26 @@ fn daemon_ask_twins_url() -> String {
         .unwrap_or_else(|_| format!("{}/ask-twins", daemon_base_url()))
 }
 
+fn daemon_memory_write_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL")
+        .unwrap_or_else(|_| format!("{}/memory/write", daemon_base_url()))
+}
+
+fn daemon_memory_read_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL")
+        .unwrap_or_else(|_| format!("{}/memory/read", daemon_base_url()))
+}
+
+fn daemon_scratchpad_write_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL")
+        .unwrap_or_else(|_| format!("{}/scratchpad/write", daemon_base_url()))
+}
+
+fn daemon_scratchpad_list_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL")
+        .unwrap_or_else(|_| format!("{}/scratchpad/list", daemon_base_url()))
+}
+
 async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
     let token = ensure_daemon_token()?;
     let url = daemon_ask_agent_url();
@@ -1364,6 +1517,70 @@ async fn fetch_daemon_ask_twins(req: &AskTwinsRequest) -> anyhow::Result<AskTwin
         anyhow::bail!("daemon responded with HTTP {}", response.status());
     }
     Ok(response.json::<AskTwinsResponse>().await?)
+}
+
+async fn fetch_daemon_memory_write(req: &MemoryWriteRequest) -> anyhow::Result<MemoryWriteResponse> {
+    let token = ensure_daemon_token()?;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(daemon_memory_write_url())
+        .bearer_auth(token)
+        .json(req)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("daemon responded with HTTP {}", response.status());
+    }
+    Ok(response.json::<MemoryWriteResponse>().await?)
+}
+
+async fn fetch_daemon_memory_read(req: &MemoryReadRequest) -> anyhow::Result<MemoryReadResponse> {
+    let token = ensure_daemon_token()?;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(daemon_memory_read_url())
+        .bearer_auth(token)
+        .json(req)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("daemon responded with HTTP {}", response.status());
+    }
+    Ok(response.json::<MemoryReadResponse>().await?)
+}
+
+async fn fetch_daemon_scratchpad_write(
+    req: &ScratchpadWriteRequest,
+) -> anyhow::Result<ScratchpadWriteResponse> {
+    let token = ensure_daemon_token()?;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(daemon_scratchpad_write_url())
+        .bearer_auth(token)
+        .json(req)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("daemon responded with HTTP {}", response.status());
+    }
+    Ok(response.json::<ScratchpadWriteResponse>().await?)
+}
+
+async fn fetch_daemon_scratchpad_list(
+    req: &ScratchpadListRequest,
+) -> anyhow::Result<ScratchpadListResponse> {
+    let token = ensure_daemon_token()?;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(daemon_scratchpad_list_url())
+        .bearer_auth(token)
+        .json(req)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("daemon responded with HTTP {}", response.status());
+    }
+    Ok(response.json::<ScratchpadListResponse>().await?)
 }
 
 #[cfg(test)]
@@ -2389,6 +2606,156 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_HOME");
             std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_TWINS_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_memory_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-mcp-memory-daemon-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "mcp-memory-daemon-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+            entries: Arc<Mutex<Vec<MemoryEntry>>>,
+        }
+
+        async fn memory_write_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(req): AxumJson<MemoryWriteRequest>,
+        ) -> Result<AxumJson<MemoryWriteResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let id = "daemon-memory-1".to_string();
+            let mut entries = state.entries.lock().expect("entries lock poisoned");
+            entries.push(MemoryEntry {
+                id: id.clone(),
+                namespace: req.namespace,
+                key: req.key,
+                value: req.value,
+                ts_ms: now_ms(),
+            });
+            Ok(AxumJson(MemoryWriteResponse {
+                id,
+                status: "ok".to_string(),
+            }))
+        }
+
+        async fn memory_read_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(req): AxumJson<MemoryReadRequest>,
+        ) -> Result<AxumJson<MemoryReadResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let entries = state.entries.lock().expect("entries lock poisoned");
+            let mut out = entries
+                .iter()
+                .filter(|e| e.namespace == req.namespace)
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(key) = req.key {
+                out.retain(|e| e.key == key);
+            }
+            Ok(AxumJson(MemoryReadResponse { entries: out }))
+        }
+
+        let app = Router::new()
+            .route("/memory/write", post(memory_write_handler))
+            .route("/memory/read", post(memory_read_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+                entries: Arc::new(Mutex::new(Vec::new())),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL",
+                format!("http://{addr}/memory/write"),
+            );
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_MEMORY_READ_URL",
+                format!("http://{addr}/memory/read"),
+            );
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let write_args = serde_json::json!({
+            "namespace": "proj-daemon",
+            "key": "decision",
+            "value": "ship-it"
+        });
+        let write = client
+            .call_tool(
+                CallToolRequestParams::new("memory_write")
+                    .with_arguments(write_args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+        let write_text = write
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(write_text.contains("daemon-memory-1"));
+
+        let read_args = serde_json::json!({
+            "namespace": "proj-daemon",
+            "key": "decision",
+            "limit": 10
+        });
+        let read = client
+            .call_tool(
+                CallToolRequestParams::new("memory_read")
+                    .with_arguments(read_args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+        let read_text = read
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(read_text.contains("ship-it"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL");
         }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
