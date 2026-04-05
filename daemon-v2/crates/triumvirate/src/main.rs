@@ -11,8 +11,9 @@ use daemon_core::{
     read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
     resolve_context as core_resolve_context, triumvirate_home_dir as core_triumvirate_home_dir,
     unix_time_ms as core_unix_time_ms, write_scratchpad as core_write_scratchpad, ensure_daemon_token as core_ensure_daemon_token,
-    sessions_file_path as core_sessions_file_path, load_json_file as core_load_json_file,
-    persist_json_file as core_persist_json_file,
+    sessions_file_path as core_sessions_file_path,
+    load_json_file_if_exists as core_load_json_file_if_exists,
+    persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
 use mcp_bridge::{
     build_role_adapted_prompts, daemon_ask_agent_url, daemon_ask_twins_url,
@@ -113,7 +114,7 @@ impl McpBridge {
         // Load persisted sessions on startup so sessions survive MCP bridge restarts.
         let sessions = sessions_file
             .as_ref()
-            .and_then(|path| load_sessions(path).ok())
+            .and_then(|path| core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok())
             .unwrap_or_default();
         Self {
             tool_router: Self::tool_router(),
@@ -207,7 +208,7 @@ impl McpBridge {
                 history: Vec::new(),
             },
         );
-        persist_sessions_if_enabled(&self.sessions_file, &sessions)
+        core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
             .map_err(|e| format!("failed to persist sessions: {e}"))?;
         Ok(format!("session '{}' spawned for {}", req.name, agent))
     }
@@ -241,7 +242,7 @@ impl McpBridge {
         if let Some(state) = sessions.get_mut(&req.name) {
             state.history.push(format!("assistant: {response}"));
         }
-        persist_sessions_if_enabled(&self.sessions_file, &sessions)
+        core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
             .map_err(|e| format!("failed to persist sessions: {e}"))?;
 
         Ok(response)
@@ -255,7 +256,7 @@ impl McpBridge {
         let mut sessions = self.sessions.lock().await;
         match sessions.remove(&req.name) {
             Some(_) => {
-                persist_sessions_if_enabled(&self.sessions_file, &sessions)
+                core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
                     .map_err(|e| format!("failed to persist sessions: {e}"))?;
                 Ok(format!("session '{}' dismissed", req.name))
             }
@@ -1362,27 +1363,6 @@ fn ensure_daemon_token() -> anyhow::Result<String> {
 
 fn sessions_file_path() -> anyhow::Result<PathBuf> {
     Ok(core_sessions_file_path(&core_triumvirate_home_dir()?))
-}
-
-fn load_sessions(path: &PathBuf) -> anyhow::Result<HashMap<String, SessionState>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    core_load_json_file::<HashMap<String, SessionState>>(path)
-}
-
-fn persist_sessions_if_enabled(
-    maybe_path: &Option<PathBuf>,
-    sessions: &HashMap<String, SessionState>,
-) -> anyhow::Result<()> {
-    let Some(path) = maybe_path else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    core_persist_json_file(path, sessions)?;
-    Ok(())
 }
 
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
@@ -3924,7 +3904,7 @@ exit 1\n",
                     history: vec!["hello".to_string()],
                 },
             );
-            persist_sessions_if_enabled(&first.sessions_file, &sessions)?;
+            core_persist_json_file_if_enabled(first.sessions_file.as_ref(), &*sessions)?;
         }
 
         let second = McpBridge::new();
