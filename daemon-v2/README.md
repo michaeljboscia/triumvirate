@@ -92,6 +92,7 @@ cargo run -p triumvirate -- doctor
 ## Operational Notes
 
 - `doctor` prints token file path/existence, launchd plist path/existence, configured bind address, and daemon reachability.
+- `doctor` also prints resolved daemon routing URLs (`daemon_base_url`, `daemon_status_url`) so env-derived endpoint behavior is explicit.
 - daemon `/health` and `/status` payloads include `daemon_bind_addr` for runtime network observability.
 - `status` reports active sessions, supported agents, fallback queue state, and daemon bind address.
 - `status` degrades gracefully: if daemon HTTP is unreachable, it still returns a local snapshot (with `daemon_reachable: false`) instead of exiting with an error.
