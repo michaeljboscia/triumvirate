@@ -42,6 +42,14 @@ Before writing Rust code, invoke the relevant skill:
 
 ## Rules
 
+### Commenting Rules
+- Every public struct, trait, function, and enum gets a `///` doc comment explaining WHAT it does
+- Inline `//` comments for any non-obvious logic — if you had to think about it, comment it
+- Every borrowed pattern gets attribution: `// Adapted from Ruflo's cost-router (ruvnet/ruflo, MIT)`
+- FEAT-ID in a comment at the top of each module: `// FEAT-002: Claude Connector`
+- No comment spam — don't comment obvious code
+
+### What's Forbidden
 - NO PTY for agent communication — piped stdio only (GR2-D2)
 - NO LLM summarization — mechanical extraction only (REQ-2)
 - NO `.unwrap()` in production code — use `?` or explicit handling
