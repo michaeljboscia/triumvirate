@@ -10,6 +10,7 @@
   import WorkflowPanel from '../lib/components/WorkflowPanel.svelte';
   import MergeResolver from '../lib/components/MergeResolver.svelte';
   import CostPanel from '../lib/components/CostPanel.svelte';
+  import LessonsPanel from '../lib/components/LessonsPanel.svelte';
   import { agents, refreshAgents } from '../lib/stores/agents';
   import { quota, refreshQuota } from '../lib/stores/quota';
   import { tasks, refreshTasks } from '../lib/stores/tasks';
@@ -23,6 +24,7 @@
     runFleetMerge,
   } from '../lib/stores/fleet';
   import { costs, refreshCosts } from '../lib/stores/costs';
+  import { lessons, refreshLessons } from '../lib/stores/lessons';
   import { connectFabric, disconnectFabric, fabricConnected, fabricEvents } from '../lib/stores/fabric';
   import { sendMessage, spawnFleet, startDebate } from '../lib/stores/commands';
 
@@ -39,6 +41,7 @@
       refreshWorkflows(),
       refreshDecisions(),
       refreshCosts(),
+      refreshLessons(),
     ]);
     if (!activeFleetId && $tasks.length > 0) {
       activeFleetId = $tasks[0].fleet_id;
@@ -78,6 +81,18 @@
     await refreshFleetStatus(fleetId);
   }
 
+  async function handleLessonFilter(
+    event: CustomEvent<{ outcome: string; agent_source: string; pattern: string; min_confidence: number }>,
+  ) {
+    const { outcome, agent_source, pattern, min_confidence } = event.detail;
+    await refreshLessons({
+      outcome: outcome || undefined,
+      agent_source: agent_source || undefined,
+      pattern: pattern || undefined,
+      min_confidence,
+    });
+  }
+
   onMount(() => {
     connectFabric();
     void refreshAll();
@@ -103,6 +118,7 @@
     <QuotaDashboard quota={$quota} />
     <WorkflowPanel workflows={$workflows} />
     <MemoryViewer decisions={$decisions} />
+    <LessonsPanel lessons={$lessons} on:refilter={handleLessonFilter} />
     <CostPanel costs={$costs} />
     <MergeResolver
       fleetId={activeFleetId}

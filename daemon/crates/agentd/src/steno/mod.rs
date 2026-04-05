@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use self::watcher::spawn_file_watcher;
 use crate::fabric::MessageBus;
-use crate::memory::extract_decisions;
+use crate::memory::{LessonOutcome, LessonWrite, extract_decisions, extract_self_reported_lessons, insert_lesson};
 
 /// Stenographer — mechanical extraction of session facts from the fabric.
 ///
@@ -112,6 +112,7 @@ impl Stenographer {
         if let Some(conn) = db_conn {
             self.maybe_log_routing(conn, msg);
             self.maybe_log_decisions(conn, msg);
+            self.maybe_log_lessons(conn, msg);
         }
     }
 
@@ -180,4 +181,47 @@ impl Stenographer {
             }
         }
     }
+
+    fn maybe_log_lessons(&self, conn: &Connection, msg: &FabricMessage) {
+        let source_agent = match msg.topic {
+            Topic::AgentOutput(agent) => agent.to_string(),
+            _ => return,
+        };
+
+        match &msg.payload {
+            Payload::Error { message, .. } => {
+                let lesson = LessonWrite {
+                    decision: format!("Agent error observed: {}", truncate(message, 200)),
+                    rationale: "Daemon captured agent error output during execution".to_string(),
+                    outcome: LessonOutcome::Failure,
+                    confidence_score: 0.9,
+                    pattern: "agent_error".to_string(),
+                    agent_source: source_agent,
+                };
+                if let Err(e) = insert_lesson(conn, &lesson) {
+                    warn!(error = %e, "failed to write failure lesson");
+                }
+            }
+            Payload::AgentResponse { content, .. }
+            | Payload::TextChunk {
+                content,
+                is_final: true,
+            } => {
+                for lesson in extract_self_reported_lessons(content, &source_agent) {
+                    if let Err(e) = insert_lesson(conn, &lesson) {
+                        warn!(error = %e, "failed to write self-reported lesson");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn truncate(value: &str, max_len: usize) -> String {
+    let mut out = value.chars().take(max_len).collect::<String>();
+    if value.chars().count() > max_len {
+        out.push_str("...");
+    }
+    out
 }

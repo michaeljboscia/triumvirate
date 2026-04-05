@@ -47,6 +47,8 @@ cargo build
 
 - `GET /metrics` (Prometheus exposition format)
 - `GET /api/costs` (per-agent token and estimated cost attribution)
+- `GET /api/lessons` (filtered machine-readable lessons ledger)
+- `POST /api/lessons` (manual lesson capture)
 
 ## Governance API
 
