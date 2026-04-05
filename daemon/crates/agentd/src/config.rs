@@ -82,5 +82,30 @@ pub fn ensure_dirs() -> anyhow::Result<()> {
         std::fs::create_dir_all(&dir)?;
         info!(path = %dir.display(), "created config directory");
     }
+
+    let policies_dir = dir.join("policies");
+    if !policies_dir.exists() {
+        std::fs::create_dir_all(&policies_dir)?;
+        info!(path = %policies_dir.display(), "created policy directory");
+    }
+
+    let default_policy = policies_dir.join("default.cedar");
+    if !default_policy.exists() {
+        std::fs::write(
+            &default_policy,
+            "permit(
+    principal == User::\"human\",
+    action in [Action::\"fleet_merge\", Action::\"git_push\", Action::\"file_delete\", Action::\"db_drop\"],
+    resource
+);
+
+forbid(
+    principal != User::\"human\",
+    action in [Action::\"fleet_merge\", Action::\"git_push\", Action::\"file_delete\", Action::\"db_drop\"],
+    resource
+);",
+        )?;
+        info!(path = %default_policy.display(), "seeded default governance policy");
+    }
     Ok(())
 }
