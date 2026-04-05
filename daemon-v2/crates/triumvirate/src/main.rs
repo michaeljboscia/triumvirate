@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use axum::{Json as AxumJson, Router, routing::get};
 use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -491,10 +492,25 @@ async fn main() -> anyhow::Result<()> {
             McpBridge::new().serve(stdio()).await?.waiting().await?;
         }
         CliCommand::Daemon => {
-            println!("daemon mode is not implemented in Increment 1a yet");
+            run_daemon().await?;
         }
     }
 
+    Ok(())
+}
+
+async fn run_daemon() -> anyhow::Result<()> {
+    async fn health() -> AxumJson<serde_json::Value> {
+        AxumJson(serde_json::json!({
+            "status": "ok",
+            "service": "triumvirate-daemon-v2",
+            "mode": "incremental-dev"
+        }))
+    }
+
+    let app = Router::new().route("/health", get(health));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
