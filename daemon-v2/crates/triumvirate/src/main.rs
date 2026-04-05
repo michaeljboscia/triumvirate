@@ -3567,6 +3567,109 @@ exit 1\n",
     }
 
     #[tokio::test]
+    async fn mcp_outbox_recent_uses_daemon_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-mcp-outbox-daemon-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "mcp-outbox-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn outbox_recent_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+            AxumJson(_req): AxumJson<OutboxRecentRequest>,
+        ) -> Result<AxumJson<OutboxRecentResponse>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(OutboxRecentResponse {
+                events: vec![OutboxEvent {
+                    ts_ms: 123,
+                    request_id: "daemon-event-1".to_string(),
+                    tool: "ask_agent".to_string(),
+                    status: "DONE".to_string(),
+                    agent: Some("gemini".to_string()),
+                    detail: "from daemon".to_string(),
+                    cwd: None,
+                    repo: None,
+                    branch: None,
+                }],
+            }))
+        }
+
+        let app = Router::new()
+            .route("/outbox/recent", post(outbox_recent_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL",
+                format!("http://{addr}/outbox/recent"),
+            );
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let out = client
+            .call_tool(
+                CallToolRequestParams::new("outbox_recent").with_arguments(
+                    serde_json::json!({ "limit": 5 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            )
+            .await?;
+        let out_text = out
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(out_text.contains("daemon-event-1"));
+        assert!(out_text.contains("from daemon"));
+
+        client.cancel().await?;
+        server_handle.await??;
+        server.abort();
+        let _ = server.await;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ask_agent_writes_outbox_events() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
         let now = SystemTime::now()
