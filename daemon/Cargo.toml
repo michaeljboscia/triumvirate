@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/agentd", "crates/proto", "crates/workflow"]
+members = [
+    "crates/agentd",
+    "crates/proto",
+    "crates/workflow",
+    "crates/mock-claude",
+    "crates/mock-gemini",
+    "crates/mock-codex",
+]
 
 [workspace.package]
 version = "0.1.0"
