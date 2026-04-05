@@ -410,3 +410,201 @@ Before `finishing-branch`, run every test. Produce:
 ```
 
 Gate rule: CANNOT proceed if any REQ is FAIL. Manual tests require user sign-off.
+
+---
+
+## Part 8: Extensive E2E Execution Plan
+
+This section is the executable E2E runbook. It defines exactly how to run end-to-end tests, what data to capture, and what constitutes pass/fail.
+
+### 8.1 E2E Objectives
+
+| Objective | Description | Primary REQs |
+|-----------|-------------|--------------|
+| API lifecycle integrity | Validate daemon REST lifecycle from clean boot through workflow/fleet operations | REQ-1, REQ-4, REQ-7 |
+| Real-time observability | Validate `/metrics`, `/api/costs`, WebSocket stream behavior under live operations | REQ-4, REQ-5, REQ-6 |
+| Persistent state correctness | Validate session/memory/workflow state continuity across restart boundaries | REQ-2, REQ-3, REQ-4 |
+| Fleet safety and merge controls | Validate worktree creation, task dependency enforcement, and merge gating/approval | REQ-7, FEAT-019..022 |
+| UX operability | Validate operator can understand system status/actions in one dashboard session | REQ-6 |
+
+### 8.2 Test Environments
+
+| Environment | Purpose | Connectors | Risk |
+|-------------|---------|------------|------|
+| `E2E-MOCK` | Deterministic CI and branch gating | mock binaries only | Low |
+| `E2E-HYBRID` | Real daemon + selective real agents | mixed | Medium |
+| `E2E-REAL` | Pre-release confidence against live CLIs | claude/gemini/codex live | High (nondeterministic) |
+
+Required environment controls:
+
+1. Isolated HOME per run (`HOME=<tmpdir>`) to isolate `~/.triumvirate`.
+2. Unique port per run (`web_port` set in temporary config).
+3. Ephemeral DB paths (`memory.db`, `workflow.db`) under temporary HOME.
+4. Run IDs stamped in logs/artifacts (`E2E_RUN_ID=<timestamp>`).
+
+### 8.3 Core E2E Scenarios
+
+#### Scenario A: Daemon Boot + Health Surface
+
+1. Start `triumvirate-agentd`.
+2. Poll `/api/health` until success or timeout (max 10s).
+3. Verify fields: `status`, `version`, `agents`.
+4. Verify `/metrics` returns Prometheus text with `# HELP` and `# TYPE`.
+5. Verify `/api/costs` returns `summary` and per-agent buckets.
+
+Pass criteria:
+
+- Health endpoint available <= 10s.
+- `metrics` and `costs` endpoints both parse as expected.
+
+#### Scenario B: Message and Routing Flow
+
+1. `POST /api/message` with plain text.
+2. `POST /api/message` with `@claude ...`.
+3. `POST /api/message` with `@codex ...`.
+4. Query SQLite `routing_log` and verify rows exist for routed turns.
+5. Verify reason tagging (`direct_mention`, `lead_default`) is present.
+
+Pass criteria:
+
+- All message calls return `202 accepted`.
+- Routing rows persisted with non-empty `target_agent` and `reason`.
+
+#### Scenario C: Debate Workflow Lifecycle
+
+1. `POST /api/debate/start`.
+2. `POST /api/debate/challenge`.
+3. `POST /api/debate/vote` (>=2 votes).
+4. `POST /api/debate/complete`.
+5. Validate workflow state/event progression in workflow store.
+
+Pass criteria:
+
+- Each phase returns success and references same `workflow_id`.
+- Event history reflects challenge -> vote -> complete.
+
+#### Scenario D: Fleet Task + Dependency Lifecycle
+
+1. `POST /api/fleet/spawn` with deterministic spec (`1 codex` in mock).
+2. `GET /api/fleet/tasks` and assert expected bootstrap tasks exist:
+   - `contracts`, `implementation`, `merge`
+3. Attempt to claim blocked dependency (`implementation`) before parent complete -> expect conflict.
+4. Claim/complete `contracts`.
+5. Re-attempt claim `implementation` -> expect success.
+6. `GET /api/fleet/status/{fleet_id}` validate summary counters.
+7. `POST /api/fleet/worktrees/teardown` cleanup.
+
+Pass criteria:
+
+- Dependency enforcement is strict.
+- Status and tasks reflect correct transitions.
+- Worktree teardown leaves no active rows for the fleet.
+
+#### Scenario E: Governance Gate Validation
+
+1. Call governed endpoint without approval where required (`/api/fleet/merge` with `human_approved=false`).
+2. Verify `403` with policy reason.
+3. Retry with `human_approved=true`.
+
+Pass criteria:
+
+- Unauthorized destructive operation blocked.
+- Explicit approval path allowed (or conflict if repo state blocks merge for unrelated reasons).
+
+#### Scenario F: Restart Recovery
+
+1. Start daemon and create in-progress workflow/fleet state.
+2. Kill daemon forcefully.
+3. Restart daemon on same DB path.
+4. Validate `/api/workflows` includes resumable workflow(s).
+
+Pass criteria:
+
+- Recoverable state visible post-restart.
+- No DB corruption, daemon boot succeeds.
+
+### 8.4 UI E2E Scenarios (Playwright)
+
+Required UI flow:
+
+1. Open dashboard, verify primary panels render:
+   - Header, AgentGrid, EventFeed, Quota, Workflow, Memory, Merge, Cost.
+2. Submit command-bar message.
+3. Wait for event-feed growth.
+4. Submit fleet command and verify fleet tasks/status panel update.
+5. Validate merge resolver form behavior.
+6. Validate responsive layout snapshot at:
+   - desktop (1440x900)
+   - tablet (1024x768)
+   - mobile (390x844)
+
+Artifact requirements:
+
+- Screenshot per viewport.
+- Trace/video on failure.
+- Console log capture.
+
+### 8.5 Command Matrix
+
+From `/Users/mikeboscia/projects/triumvirate/daemon`:
+
+```bash
+# Build gates
+cd frontend && npm install && npm run build && cd ..
+cargo check
+cargo test
+cargo clippy -- -D warnings
+cargo build
+cargo build --release
+
+# Deterministic API E2E
+cargo test --test e2e_api -- --nocapture
+
+# UI E2E (when Playwright suite is present)
+cd frontend
+npx playwright test
+```
+
+### 8.6 Artifact Bundle Per E2E Run
+
+Each run must produce:
+
+1. `artifacts/<run_id>/health.json`
+2. `artifacts/<run_id>/metrics.txt`
+3. `artifacts/<run_id>/costs.json`
+4. `artifacts/<run_id>/daemon.log`
+5. `artifacts/<run_id>/routing_log.sqlite_export.json`
+6. `artifacts/<run_id>/screenshots/*` (UI runs)
+7. `artifacts/<run_id>/trace.zip` (UI failures)
+
+### 8.7 Pass/Fail Gate
+
+Hard fail if any of the following occurs:
+
+1. Any scenario A-F fails.
+2. Any HTTP endpoint returns unexpected status schema.
+3. Any daemon panic/crash in logs.
+4. Any data integrity violation in SQLite checks.
+5. Any clippy warning (pipeline is `-D warnings`).
+
+Soft fail (ship-block unless waived):
+
+1. UI visual regression in primary panels.
+2. Startup > 10s median in 3-run sample.
+3. Missing artifact bundle files.
+
+### 8.8 Triage Playbook
+
+Failure triage order:
+
+1. `daemon.log` panic/error scan.
+2. Endpoint replay (`health`, `metrics`, `costs`, workflow/fleet APIs).
+3. DB integrity checks (`PRAGMA integrity_check;`, key table row counts).
+4. Worktree state (`git worktree list`, stale branch cleanup).
+5. Re-run failed scenario in isolation with `--nocapture`.
+
+Severity rubric:
+
+- `SEV-1`: data loss, crash loops, corrupted state -> immediate stop.
+- `SEV-2`: workflow/fleet correctness failure -> stop merge.
+- `SEV-3`: observability/UI-only inconsistency -> fix before release tag.
