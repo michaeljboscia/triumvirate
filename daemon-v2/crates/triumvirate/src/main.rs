@@ -51,6 +51,8 @@ enum CliCommand {
     Uninstall,
     /// Print daemon health and status snapshot.
     Status,
+    /// Run local diagnostics for daemon readiness.
+    Doctor,
 }
 
 #[derive(Debug, Clone)]
@@ -1147,6 +1149,9 @@ async fn main() -> anyhow::Result<()> {
                 "snapshot": snapshot
             }))?);
         }
+        CliCommand::Doctor => {
+            run_doctor().await?;
+        }
     }
 
     Ok(())
@@ -1218,6 +1223,22 @@ fn run_uninstall() -> anyhow::Result<()> {
         println!("No launchd plist found at {}", plist_path.display());
     }
     println!("Unload with: launchctl unload {}", plist_path.display());
+    Ok(())
+}
+
+async fn run_doctor() -> anyhow::Result<()> {
+    let token_path = daemon_token_path()?;
+    let plist_path = launchd_plist_path()?;
+    let daemon_health = fetch_daemon_status().await.ok();
+    let report = serde_json::json!({
+        "token_file_exists": token_path.exists(),
+        "token_file_path": token_path,
+        "launchd_plist_exists": plist_path.exists(),
+        "launchd_plist_path": plist_path,
+        "daemon_reachable": daemon_health.is_some(),
+        "daemon_health": daemon_health
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -2929,6 +2950,12 @@ exit 1\n",
     fn cli_parses_uninstall_subcommand() {
         let cli = Cli::try_parse_from(["triumvirate", "uninstall"]).expect("uninstall should parse");
         assert!(matches!(cli.command, CliCommand::Uninstall));
+    }
+
+    #[test]
+    fn cli_parses_doctor_subcommand() {
+        let cli = Cli::try_parse_from(["triumvirate", "doctor"]).expect("doctor should parse");
+        assert!(matches!(cli.command, CliCommand::Doctor));
     }
 
     #[test]
