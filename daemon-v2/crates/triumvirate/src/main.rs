@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
 use daemon_core::{
     acknowledge_dead_drop_ticket, append_memory_entry as core_append_memory_entry,
-    count_dead_drop_tickets, create_dead_drop_ticket, gc_dead_drop_tickets,
-    list_dead_drop_tickets, list_scratchpad as core_list_scratchpad,
-    read_memory_entries as core_read_memory_entries, write_scratchpad as core_write_scratchpad,
+    append_outbox_event as core_append_outbox_event, count_dead_drop_tickets,
+    create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
+    list_scratchpad as core_list_scratchpad, read_memory_entries as core_read_memory_entries,
+    read_outbox_events as core_read_outbox_events, write_scratchpad as core_write_scratchpad,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -1471,42 +1472,12 @@ fn persist_sessions_if_enabled(
     Ok(())
 }
 
-fn outbox_file_path() -> anyhow::Result<PathBuf> {
-    Ok(triumvirate_home_dir()?.join("outbox.jsonl"))
-}
-
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
-    let path = outbox_file_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut line = serde_json::to_string(event)?;
-    line.push('\n');
-    use std::io::Write as _;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    file.write_all(line.as_bytes())?;
-    Ok(())
+    core_append_outbox_event(&triumvirate_home_dir()?, event)
 }
 
 fn read_outbox_events() -> anyhow::Result<Vec<OutboxEvent>> {
-    let path = outbox_file_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let body = fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for line in body.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<OutboxEvent>(line) {
-            out.push(event);
-        }
-    }
-    Ok(out)
+    core_read_outbox_events(&triumvirate_home_dir()?)
 }
 
 fn append_memory_entry(entry: &MemoryEntry) -> anyhow::Result<()> {
