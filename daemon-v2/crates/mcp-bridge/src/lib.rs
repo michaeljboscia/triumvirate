@@ -45,6 +45,10 @@ pub fn should_use_daemon_proxy(var_value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+pub fn use_daemon_for_mcp_from_env() -> bool {
+    should_use_daemon_proxy(std::env::var("TRIUMVIRATE_MCP_USE_DAEMON").ok().as_deref())
+}
+
 pub fn daemon_autostart_enabled(var_value: Option<&str>) -> bool {
     var_value
         .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
@@ -185,6 +189,21 @@ mod tests {
         assert!(super::should_use_daemon_proxy(Some("true")));
         assert!(!super::should_use_daemon_proxy(Some("false")));
         assert!(!super::should_use_daemon_proxy(None));
+    }
+
+    #[test]
+    fn daemon_proxy_env_reader_respects_truthy_and_falsey() {
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON") };
+        assert!(!super::use_daemon_for_mcp_from_env());
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "1") };
+        assert!(super::use_daemon_for_mcp_from_env());
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "false") };
+        assert!(!super::use_daemon_for_mcp_from_env());
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON") };
     }
 
     #[test]

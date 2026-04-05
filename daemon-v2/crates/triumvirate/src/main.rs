@@ -23,6 +23,7 @@ use mcp_bridge::{
     daemon_memory_read_url, daemon_memory_write_url, daemon_outbox_recent_url,
     daemon_scratchpad_list_url, daemon_scratchpad_write_url, daemon_status_url, gemini_command,
     is_bearer_authorized, is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
+    use_daemon_for_mcp_from_env,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -165,7 +166,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskAgentRequest>,
     ) -> Result<Json<AskAgentResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_ask_agent(&req)
                 .await
                 .map(Json)
@@ -180,7 +181,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskTwinsRequest>,
     ) -> Result<Json<AskTwinsResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_ask_twins(&req)
                 .await
                 .map(Json)
@@ -282,7 +283,7 @@ impl McpBridge {
     #[tool(description = "Get current system status snapshot.")]
     async fn get_status(&self) -> Json<StatusResponse> {
         let sessions = self.sessions.lock().await;
-        if use_daemon_for_mcp()
+        if use_daemon_for_mcp_from_env()
             && let Ok(snapshot) = fetch_daemon_status_snapshot().await
         {
             return Json(StatusResponse {
@@ -324,7 +325,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryWriteRequest>,
     ) -> Result<Json<MemoryWriteResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_memory_write(&req)
                 .await
                 .map(Json)
@@ -350,7 +351,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryReadRequest>,
     ) -> Result<Json<MemoryReadResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_memory_read(&req)
                 .await
                 .map(Json)
@@ -374,7 +375,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadWriteRequest>,
     ) -> Result<Json<ScratchpadWriteResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_scratchpad_write(&req)
                 .await
                 .map(Json)
@@ -392,7 +393,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadListRequest>,
     ) -> Result<Json<ScratchpadListResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_scratchpad_list(&req)
                 .await
                 .map(Json)
@@ -411,7 +412,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<OutboxRecentRequest>,
     ) -> Result<Json<OutboxRecentResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_outbox_recent(&req)
                 .await
                 .map(Json)
@@ -428,7 +429,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FallbackListRequest>,
     ) -> Result<Json<FallbackListResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_fallback_list(&req)
                 .await
                 .map(Json)
@@ -444,7 +445,7 @@ impl McpBridge {
 
     #[tool(description = "Acknowledge a dead-drop fallback ticket by deleting it.")]
     async fn fallback_ack(&self, Parameters(req): Parameters<FallbackAckRequest>) -> Result<String, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_fallback_ack(&req)
                 .await
                 .map_err(|e| format!("fallback_ack via daemon failed: {e}"));
@@ -458,7 +459,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FallbackGcRequest>,
     ) -> Result<Json<FallbackGcResponse>, String> {
-        if use_daemon_for_mcp() {
+        if use_daemon_for_mcp_from_env() {
             return fetch_daemon_fallback_gc(&req)
                 .await
                 .map(Json)
@@ -468,12 +469,6 @@ impl McpBridge {
             .map_err(|e| format!("fallback_gc failed: {e}"))?;
         Ok(Json(FallbackGcResponse { removed }))
     }
-}
-
-fn use_daemon_for_mcp() -> bool {
-    // Bridge can be forced to proxy tool execution through daemon HTTP so ephemeral MCP lifetimes
-    // never own long-running agent work.
-    should_use_daemon_proxy(std::env::var("TRIUMVIRATE_MCP_USE_DAEMON").ok().as_deref())
 }
 
 async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, String> {
