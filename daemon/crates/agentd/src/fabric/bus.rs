@@ -8,8 +8,8 @@ use triumvirate_proto::{FabricMessage, Topic};
 /// In-process message bus backed by tokio broadcast channels.
 ///
 /// Each topic gets its own broadcast channel. Subscribers receive all messages
-/// on topics they subscribe to. When we add NATS, this becomes a thin wrapper
-/// around async-nats publish/subscribe — the Topic enum already maps 1:1.
+/// on topics they subscribe to. Topic enum maps to NATS subjects if a
+/// future swap is needed (GR2-D3).
 ///
 /// Capacity per channel: 256 messages. If a slow consumer falls behind,
 /// it receives a `RecvError::Lagged` and can catch up from the next message.
