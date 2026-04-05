@@ -15,9 +15,10 @@ use daemon_core::{
 };
 use mcp_bridge::{
     build_role_adapted_prompts, daemon_ask_agent_url, daemon_ask_twins_url,
+    codex_command,
     daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
     daemon_memory_read_url, daemon_memory_write_url, daemon_outbox_recent_url,
-    daemon_scratchpad_list_url, daemon_scratchpad_write_url, daemon_status_url,
+    daemon_scratchpad_list_url, daemon_scratchpad_write_url, daemon_status_url, gemini_command,
     is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
 };
 use axum::{
@@ -464,22 +465,6 @@ impl McpBridge {
             .map_err(|e| format!("fallback_gc failed: {e}"))?;
         Ok(Json(FallbackGcResponse { removed }))
     }
-}
-
-fn gemini_command() -> (String, Vec<String>) {
-    let bin = std::env::var("TRIUMVIRATE_GEMINI_BIN").unwrap_or_else(|_| "mock-gemini".to_string());
-    let args = std::env::var("TRIUMVIRATE_GEMINI_ARGS")
-        .map(|v| v.split_whitespace().map(ToString::to_string).collect())
-        .unwrap_or_else(|_| Vec::new());
-    (bin, args)
-}
-
-fn codex_command() -> (String, Vec<String>) {
-    let bin = std::env::var("TRIUMVIRATE_CODEX_BIN").unwrap_or_else(|_| "mock-codex".to_string());
-    let args = std::env::var("TRIUMVIRATE_CODEX_ARGS")
-        .map(|v| v.split_whitespace().map(ToString::to_string).collect())
-        .unwrap_or_else(|_| Vec::new());
-    (bin, args)
 }
 
 fn use_daemon_for_mcp() -> bool {
