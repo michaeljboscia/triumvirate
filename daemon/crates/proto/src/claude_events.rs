@@ -104,3 +104,38 @@ fn extract_text(value: &Value) -> Option<String> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_claude_event, ClaudeEventKind};
+
+    #[test]
+    fn parses_message_event_and_text() {
+        let line = r#"{"type":"message","content":"hello"}"#;
+        let parsed = parse_claude_event(line).expect("valid json").expect("non-empty");
+        assert!(matches!(parsed.kind, ClaudeEventKind::Message));
+        assert_eq!(parsed.text_content().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parses_result_event_and_nested_text() {
+        let line = r#"{"type":"result","result":{"text":"done"}}"#;
+        let parsed = parse_claude_event(line).expect("valid json").expect("non-empty");
+        assert!(matches!(parsed.kind, ClaudeEventKind::Result));
+        assert_eq!(parsed.text_content().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parses_error_event_and_message() {
+        let line = r#"{"type":"error","error":{"message":"boom"}}"#;
+        let parsed = parse_claude_event(line).expect("valid json").expect("non-empty");
+        assert!(matches!(parsed.kind, ClaudeEventKind::Error));
+        assert_eq!(parsed.error_message().as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn empty_line_is_ignored() {
+        let parsed = parse_claude_event("   ").expect("empty line should parse");
+        assert!(parsed.is_none());
+    }
+}
