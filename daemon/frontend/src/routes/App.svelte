@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import HeaderBar from '../lib/components/HeaderBar.svelte';
   import AgentGrid from '../lib/components/AgentGrid.svelte';
   import JsonPanel from '../lib/components/JsonPanel.svelte';
   import EventFeed from '../lib/components/EventFeed.svelte';
@@ -45,17 +46,13 @@
 </script>
 
 <main class="page">
-  <header class="hero">
-    <h1>{title}</h1>
-    <p>Live orchestration shell • fabric {$fabricConnected ? 'connected' : 'disconnected'}</p>
-  </header>
+  <HeaderBar title={title} fabricConnected={$fabricConnected} quota={$quota} />
 
   <CommandBar on:send={handleCommand} />
 
   <section class="grid two-up">
     <AgentGrid agents={$agents} />
     <EventFeed events={$fabricEvents} />
-    <JsonPanel title="Quota" data={$quota} />
     <JsonPanel title="Fleet Tasks" data={$tasks.slice(0, 12)} />
     <JsonPanel title="Workflows" data={$workflows} />
   </section>
@@ -68,17 +65,6 @@
     padding: 0 1rem 2rem;
     display: grid;
     gap: 1rem;
-  }
-
-  .hero h1 {
-    margin: 0;
-    font-size: 2.2rem;
-    letter-spacing: 0.02em;
-  }
-
-  .hero p {
-    color: var(--muted);
-    margin: 0.3rem 0 0;
   }
 
   .grid {
