@@ -27,6 +27,7 @@ use crate::fabric::MessageBus;
 ///
 /// POC 1 targets `codex exec --json`. POC 2 evaluates mcp-server for persistence.
 pub struct CodexConnector {
+    #[allow(dead_code)]
     session_id: Option<String>,
     health_status: HealthStatus,
     health_tx: watch::Sender<HealthStatus>,

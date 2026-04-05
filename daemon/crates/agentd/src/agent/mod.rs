@@ -4,7 +4,7 @@ mod gemini;
 mod codex;
 mod health;
 
-pub use connector::{AgentConnector, AgentHandle};
+pub use connector::AgentConnector;
 pub use claude::ClaudeConnector;
 pub use gemini::GeminiConnector;
 pub use codex::CodexConnector;

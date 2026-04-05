@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tracing::info;
 
 /// SQLite WAL-backed memory store.
@@ -69,6 +69,7 @@ impl MemoryStore {
     }
 
     /// Write or update a memory entry. Returns true if inserted, false if updated.
+    #[allow(dead_code)]
     pub fn upsert(
         &self,
         key: &str,
@@ -89,6 +90,7 @@ impl MemoryStore {
     }
 
     /// Read a memory by key.
+    #[allow(dead_code)]
     pub fn get(&self, key: &str) -> anyhow::Result<Option<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT value, memory_type FROM memories WHERE key = ?1",
@@ -102,6 +104,7 @@ impl MemoryStore {
     }
 
     /// List all memories, optionally filtered by type.
+    #[allow(dead_code)]
     pub fn list(&self, memory_type: Option<&str>) -> anyhow::Result<Vec<(String, String, String)>> {
         let mut results = Vec::new();
 
@@ -155,6 +158,7 @@ impl MemoryStore {
     }
 
     /// End a session with summary.
+    #[allow(dead_code)]
     pub fn end_session(
         &self,
         session_id: &str,
@@ -166,20 +170,5 @@ impl MemoryStore {
             params![session_id, summary],
         )?;
         Ok(())
-    }
-}
-
-/// rusqlite doesn't implement this by default for optional results
-trait OptionalExt<T> {
-    fn optional(self) -> rusqlite::Result<Option<T>>;
-}
-
-impl<T> OptionalExt<T> for rusqlite::Result<T> {
-    fn optional(self) -> rusqlite::Result<Option<T>> {
-        match self {
-            Ok(val) => Ok(Some(val)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 }
