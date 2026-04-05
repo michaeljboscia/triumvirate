@@ -60,7 +60,7 @@ impl FabricMessage {
 }
 
 /// Topics mirror the NATS topic structure from the spec.
-/// When we add real NATS, these map 1:1 to NATS subjects.
+/// These map 1:1 to NATS subjects if a future swap is needed (GR2-D3).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Topic {
