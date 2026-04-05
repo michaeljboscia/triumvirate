@@ -17,7 +17,7 @@ use daemon_core::{
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
 use mcp_bridge::{
-    build_role_adapted_prompts, daemon_ask_agent_url, daemon_ask_twins_url,
+    build_role_adapted_prompts, daemon_ask_agent_url, daemon_ask_twins_url, daemon_base_url,
     codex_command,
     daemon_autostart_enabled,
     daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
@@ -1023,12 +1023,16 @@ async fn run_doctor() -> anyhow::Result<()> {
     let daemon_health = fetch_daemon_status().await.ok();
     let daemon_bind_addr =
         core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
+    let daemon_base_url = daemon_base_url();
+    let daemon_status_url = daemon_status_url();
     let report = serde_json::json!({
         "token_file_exists": token_path.exists(),
         "token_file_path": token_path,
         "launchd_plist_exists": plist_path.exists(),
         "launchd_plist_path": plist_path,
         "daemon_bind_addr": daemon_bind_addr,
+        "daemon_base_url": daemon_base_url,
+        "daemon_status_url": daemon_status_url,
         "daemon_reachable": daemon_health.is_some(),
         "daemon_health": daemon_health
     });
