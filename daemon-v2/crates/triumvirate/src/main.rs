@@ -17,10 +17,11 @@ use daemon_core::{
 use mcp_bridge::{
     build_role_adapted_prompts, daemon_ask_agent_url, daemon_ask_twins_url,
     codex_command,
+    daemon_autostart_enabled,
     daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
     daemon_memory_read_url, daemon_memory_write_url, daemon_outbox_recent_url,
     daemon_scratchpad_list_url, daemon_scratchpad_write_url, daemon_status_url, gemini_command,
-    is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
+    is_bearer_authorized, is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -1452,23 +1453,13 @@ fn gc_fallbacks(max_age_days: u64) -> anyhow::Result<usize> {
 }
 
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
-    let Some(value) = headers.get(AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let expected = format!("Bearer {token}");
-    value == expected
+    is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()),
+        token,
+    )
 }
 
 static DAEMON_AUTOSTART_ATTEMPTED: AtomicBool = AtomicBool::new(false);
-
-fn daemon_autostart_enabled() -> bool {
-    std::env::var("TRIUMVIRATE_DAEMON_AUTOSTART")
-        .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
-        .unwrap_or(true)
-}
 
 #[cfg(test)]
 fn reset_daemon_autostart_flag_for_tests() {
@@ -1476,7 +1467,7 @@ fn reset_daemon_autostart_flag_for_tests() {
 }
 
 fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
-    if !daemon_autostart_enabled() {
+    if !daemon_autostart_enabled(std::env::var("TRIUMVIRATE_DAEMON_AUTOSTART").ok().as_deref()) {
         return Ok(false);
     }
     if DAEMON_AUTOSTART_ATTEMPTED.swap(true, Ordering::SeqCst) {
