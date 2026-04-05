@@ -7,5 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 shared-types = { path = "../shared-types" }
 tokio.workspace = true
+uuid.workspace = true

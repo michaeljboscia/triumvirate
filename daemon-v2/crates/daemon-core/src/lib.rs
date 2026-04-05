@@ -9,8 +9,10 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+use serde::{Serialize, de::DeserializeOwned};
 use shared_types::MemoryEntry;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
     root.join("dead-drop")
@@ -197,6 +199,43 @@ pub fn read_outbox_events(root: &Path) -> anyhow::Result<Vec<shared_types::Outbo
     Ok(out)
 }
 
+pub fn sessions_file_path(root: &Path) -> PathBuf {
+    root.join("sessions.json")
+}
+
+pub fn load_json_file<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+    if !path.exists() {
+        anyhow::bail!("file does not exist: {}", path.display());
+    }
+    let raw = fs::read_to_string(path)?;
+    Ok(serde_json::from_str::<T>(&raw)?)
+}
+
+pub fn persist_json_file<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(value)?)?;
+    Ok(())
+}
+
+pub fn ensure_daemon_token(root: &Path) -> anyhow::Result<String> {
+    let token_path = root.join("daemon.token");
+    if let Some(parent) = token_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if token_path.exists() {
+        let existing = fs::read_to_string(&token_path)?;
+        let token = existing.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+    let token = Uuid::new_v4().to_string();
+    fs::write(&token_path, format!("{token}\n"))?;
+    Ok(token)
+}
+
 fn sanitize_name(value: &str) -> String {
     value
         .chars()
@@ -232,6 +271,7 @@ pub async fn acquire_project_queue(registry: &QueueRegistry, key: String) -> Arc
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use shared_types::MemoryEntry;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -321,5 +361,26 @@ mod tests {
             "cwd:/tmp/a"
         );
         assert_eq!(super::project_queue_key(None, None), "global");
+    }
+
+    #[test]
+    fn token_and_sessions_roundtrip() -> anyhow::Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("daemon-core-state-{now}"));
+        std::fs::create_dir_all(&root)?;
+
+        let token_one = super::ensure_daemon_token(&root)?;
+        let token_two = super::ensure_daemon_token(&root)?;
+        assert_eq!(token_one, token_two);
+
+        let sessions = HashMap::from([("s1".to_string(), "gemini".to_string())]);
+        let path = super::sessions_file_path(&root);
+        super::persist_json_file(&path, &sessions)?;
+        let loaded: HashMap<String, String> = super::load_json_file(&path)?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("s1").map(String::as_str), Some("gemini"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 }

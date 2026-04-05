@@ -7,7 +7,9 @@ use daemon_core::{
     create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
     read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
-    write_scratchpad as core_write_scratchpad,
+    write_scratchpad as core_write_scratchpad, ensure_daemon_token as core_ensure_daemon_token,
+    sessions_file_path as core_sessions_file_path, load_json_file as core_load_json_file,
+    persist_json_file as core_persist_json_file,
 };
 use mcp_bridge::{build_role_adapted_prompts, is_supported_agent, is_supported_agent_name};
 use axum::{
@@ -1410,35 +1412,18 @@ fn daemon_token_path() -> anyhow::Result<PathBuf> {
 }
 
 fn ensure_daemon_token() -> anyhow::Result<String> {
-    let token_path = daemon_token_path()?;
-    if let Some(parent) = token_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    if token_path.exists() {
-        let existing = fs::read_to_string(&token_path)?;
-        let token = existing.trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    let token = Uuid::new_v4().to_string();
-    fs::write(&token_path, format!("{token}\n"))?;
-    Ok(token)
+    core_ensure_daemon_token(&triumvirate_home_dir()?)
 }
 
 fn sessions_file_path() -> anyhow::Result<PathBuf> {
-    Ok(triumvirate_home_dir()?.join("sessions.json"))
+    Ok(core_sessions_file_path(&triumvirate_home_dir()?))
 }
 
 fn load_sessions(path: &PathBuf) -> anyhow::Result<HashMap<String, SessionState>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let raw = fs::read_to_string(path)?;
-    let sessions = serde_json::from_str::<HashMap<String, SessionState>>(&raw)?;
-    Ok(sessions)
+    core_load_json_file::<HashMap<String, SessionState>>(path)
 }
 
 fn persist_sessions_if_enabled(
@@ -1451,8 +1436,7 @@ fn persist_sessions_if_enabled(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_string_pretty(sessions)?;
-    fs::write(path, body)?;
+    core_persist_json_file(path, sessions)?;
     Ok(())
 }
 
