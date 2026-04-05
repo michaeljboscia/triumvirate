@@ -31,7 +31,11 @@ pub fn build_role_adapted_prompts(req: &AskTwinsRequest) -> (String, String) {
 }
 
 pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
-    let agent = req.agent.to_lowercase();
+    is_supported_agent_name(&req.agent)
+}
+
+pub fn is_supported_agent_name(agent: &str) -> bool {
+    let agent = agent.to_lowercase();
     agent == "gemini" || agent == "codex"
 }
 
@@ -74,5 +78,7 @@ mod tests {
             repo: None,
             branch: None,
         }));
+        assert!(super::is_supported_agent_name("gemini"));
+        assert!(!super::is_supported_agent_name("claude"));
     }
 }
