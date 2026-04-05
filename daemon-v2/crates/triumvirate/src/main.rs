@@ -2125,6 +2125,10 @@ exit 1\n",
 
     #[tokio::test]
     async fn get_status_reports_active_sessions() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:7777") };
+
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         let server_handle = tokio::spawn(async move {
             McpBridge::new_ephemeral()
@@ -2158,9 +2162,12 @@ exit 1\n",
             .unwrap_or_default();
         assert!(status_text.contains("\"active_sessions\":1"));
         assert!(status_text.contains("\"supported_agents\":[\"gemini\",\"codex\"]"));
+        assert!(status_text.contains("\"daemon_bind_addr\":\"127.0.0.1:7777\""));
 
         client.cancel().await?;
         server_handle.await??;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR") };
         Ok(())
     }
 
