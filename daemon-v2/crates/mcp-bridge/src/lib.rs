@@ -39,6 +39,12 @@ pub fn is_supported_agent_name(agent: &str) -> bool {
     agent == "gemini" || agent == "codex"
 }
 
+pub fn should_use_daemon_proxy(var_value: Option<&str>) -> bool {
+    var_value
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use shared_types::{AskAgentRequest, AskTwinsRequest};
@@ -80,5 +86,13 @@ mod tests {
         }));
         assert!(super::is_supported_agent_name("gemini"));
         assert!(!super::is_supported_agent_name("claude"));
+    }
+
+    #[test]
+    fn daemon_proxy_toggle_parser_is_stable() {
+        assert!(super::should_use_daemon_proxy(Some("1")));
+        assert!(super::should_use_daemon_proxy(Some("true")));
+        assert!(!super::should_use_daemon_proxy(Some("false")));
+        assert!(!super::should_use_daemon_proxy(None));
     }
 }

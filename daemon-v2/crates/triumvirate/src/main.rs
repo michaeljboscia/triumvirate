@@ -11,7 +11,10 @@ use daemon_core::{
     sessions_file_path as core_sessions_file_path, load_json_file as core_load_json_file,
     persist_json_file as core_persist_json_file,
 };
-use mcp_bridge::{build_role_adapted_prompts, is_supported_agent, is_supported_agent_name};
+use mcp_bridge::{
+    build_role_adapted_prompts, is_supported_agent, is_supported_agent_name,
+    should_use_daemon_proxy,
+};
 use axum::{
     Json as AxumJson, Router,
     extract::State,
@@ -477,9 +480,7 @@ fn codex_command() -> (String, Vec<String>) {
 fn use_daemon_for_mcp() -> bool {
     // Bridge can be forced to proxy tool execution through daemon HTTP so ephemeral MCP lifetimes
     // never own long-running agent work.
-    std::env::var("TRIUMVIRATE_MCP_USE_DAEMON")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    should_use_daemon_proxy(std::env::var("TRIUMVIRATE_MCP_USE_DAEMON").ok().as_deref())
 }
 
 async fn execute_ask_agent(req: &AskAgentRequest) -> Result<AskAgentResponse, String> {
