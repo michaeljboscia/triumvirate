@@ -1092,7 +1092,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         State(state): State<DaemonState>,
         headers: HeaderMap,
     ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err(StatusCode::UNAUTHORIZED);
         }
         Ok(AxumJson(serde_json::json!({
@@ -1107,7 +1107,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         State(state): State<DaemonState>,
         headers: HeaderMap,
     ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err(StatusCode::UNAUTHORIZED);
         }
         let pending = count_pending_fallbacks().unwrap_or(0);
@@ -1132,7 +1132,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<AskAgentRequest>,
     ) -> Result<AxumJson<AskAgentResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1158,7 +1158,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<AskTwinsRequest>,
     ) -> Result<AxumJson<AskTwinsResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1183,7 +1183,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<MemoryWriteRequest>,
     ) -> Result<AxumJson<MemoryWriteResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1214,7 +1214,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<MemoryReadRequest>,
     ) -> Result<AxumJson<MemoryReadResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1242,7 +1242,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<ScratchpadWriteRequest>,
     ) -> Result<AxumJson<ScratchpadWriteResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1264,7 +1264,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<ScratchpadListRequest>,
     ) -> Result<AxumJson<ScratchpadListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1288,7 +1288,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<OutboxRecentRequest>,
     ) -> Result<AxumJson<OutboxRecentResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1310,7 +1310,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<FallbackListRequest>,
     ) -> Result<AxumJson<FallbackListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1334,7 +1334,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<FallbackAckRequest>,
     ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1357,7 +1357,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         headers: HeaderMap,
         AxumJson(req): AxumJson<FallbackGcRequest>,
     ) -> Result<AxumJson<FallbackGcResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_authorized(&headers, &state.token) {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(serde_json::json!({ "error": "unauthorized" })),
@@ -1463,13 +1463,6 @@ fn acknowledge_fallback_path(path: &str) -> anyhow::Result<()> {
 
 fn gc_fallbacks(max_age_days: u64) -> anyhow::Result<usize> {
     gc_dead_drop_tickets(&core_triumvirate_home_dir()?, max_age_days)
-}
-
-fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
-    is_bearer_authorized(
-        headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()),
-        token,
-    )
 }
 
 static DAEMON_AUTOSTART_ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -2300,7 +2293,7 @@ exit 1\n",
             State(state): State<TestState>,
             headers: HeaderMap,
         ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(serde_json::json!({
@@ -2428,8 +2421,14 @@ exit 1\n",
                 .parse()
                 .expect("header should parse"),
         );
-        assert!(is_authorized(&headers, token));
-        assert!(!is_authorized(&headers, "wrong"));
+        assert!(is_bearer_authorized(
+            headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            token
+        ));
+        assert!(!is_bearer_authorized(
+            headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            "wrong"
+        ));
     }
 
     #[test]
@@ -2515,7 +2514,7 @@ exit 1\n",
             State(state): State<TestState>,
             headers: HeaderMap,
         ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(serde_json::json!({
@@ -2613,7 +2612,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(req): AxumJson<AskAgentRequest>,
         ) -> Result<AxumJson<AskAgentResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(AskAgentResponse {
@@ -2690,7 +2689,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(_req): AxumJson<AskTwinsRequest>,
         ) -> Result<AxumJson<AskTwinsResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(AskTwinsResponse {
@@ -2770,7 +2769,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(req): AxumJson<AskAgentRequest>,
         ) -> Result<AxumJson<AskAgentResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(AskAgentResponse {
@@ -2870,7 +2869,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(_req): AxumJson<AskTwinsRequest>,
         ) -> Result<AxumJson<AskTwinsResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(AskTwinsResponse {
@@ -2974,7 +2973,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(req): AxumJson<MemoryWriteRequest>,
         ) -> Result<AxumJson<MemoryWriteResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             let id = "daemon-memory-1".to_string();
@@ -2997,7 +2996,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(req): AxumJson<MemoryReadRequest>,
         ) -> Result<AxumJson<MemoryReadResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             let entries = state.entries.lock().expect("entries lock poisoned");
@@ -3125,7 +3124,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(req): AxumJson<ScratchpadWriteRequest>,
         ) -> Result<AxumJson<ScratchpadWriteResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             let path = format!("/tmp/daemon-scratch/{}/notes.md", req.project);
@@ -3142,7 +3141,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(_req): AxumJson<ScratchpadListRequest>,
         ) -> Result<AxumJson<ScratchpadListResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             let files = state.files.lock().expect("files lock poisoned").clone();
@@ -3264,7 +3263,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(_req): AxumJson<FallbackListRequest>,
         ) -> Result<AxumJson<FallbackListResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             let tickets = state
@@ -3280,7 +3279,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(req): AxumJson<FallbackAckRequest>,
         ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             let mut tickets = state.tickets.lock().expect("tickets lock poisoned");
@@ -3412,7 +3411,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(_req): AxumJson<FallbackGcRequest>,
         ) -> Result<AxumJson<FallbackGcResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(FallbackGcResponse { removed: 2 }))
@@ -3502,7 +3501,7 @@ exit 1\n",
             headers: HeaderMap,
             AxumJson(_req): AxumJson<OutboxRecentRequest>,
         ) -> Result<AxumJson<OutboxRecentResponse>, StatusCode> {
-            if !is_authorized(&headers, &state.token) {
+            if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
             Ok(AxumJson(OutboxRecentResponse {
