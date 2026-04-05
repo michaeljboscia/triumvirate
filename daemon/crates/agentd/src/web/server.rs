@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-use triumvirate_workflow::WorkflowStore;
+use triumvirate_workflow::{FleetWorkflow, WorkflowEngine, WorkflowStore};
 use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 
 use crate::agent::SharedHealthRegistry;
@@ -257,6 +257,18 @@ async fn fleet_spawn_handler(
     }
 
     let fleet_id = format!("fleet-{}", uuid::Uuid::new_v4());
+    let workflow_id = match WorkflowEngine::open(&state.workflow_db_path)
+        .and_then(|engine| FleetWorkflow::start(&engine, &fleet_id, spec).map(|wf| wf.workflow_id().to_string()))
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to start fleet workflow: {e}") })),
+            )
+                .into_response();
+        }
+    };
 
     match Connection::open(&state.memory_db_path) {
         Ok(conn) => {
@@ -334,6 +346,7 @@ async fn fleet_spawn_handler(
                 Json(serde_json::json!({
                     "accepted": true,
                     "fleet_id": fleet_id,
+                    "workflow_id": workflow_id,
                     "spec": spec,
                     "members": members.into_iter().map(|m| m.member_key).collect::<Vec<_>>(),
                 })),

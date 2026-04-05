@@ -1,5 +1,6 @@
 pub mod conversation;
 pub mod engine;
+pub mod fleet;
 pub mod human_gate;
 pub mod persistence;
 pub mod recovery;
@@ -8,6 +9,7 @@ pub mod state;
 
 pub use conversation::ConversationWorkflow;
 pub use engine::WorkflowEngine;
+pub use fleet::FleetWorkflow;
 pub use human_gate::HumanGateTicket;
 pub use persistence::{WorkflowEventRow, WorkflowStore, WorkflowSummary};
 pub use recovery::{RecoveryReport, inspect_recovery};
