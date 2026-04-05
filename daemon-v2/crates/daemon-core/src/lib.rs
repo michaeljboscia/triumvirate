@@ -220,12 +220,29 @@ pub fn load_json_file<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     Ok(serde_json::from_str::<T>(&raw)?)
 }
 
+pub fn load_json_file_if_exists<T: DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    load_json_file(path)
+}
+
 pub fn persist_json_file<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, serde_json::to_string_pretty(value)?)?;
     Ok(())
+}
+
+pub fn persist_json_file_if_enabled<T: Serialize>(
+    maybe_path: Option<&PathBuf>,
+    value: &T,
+) -> anyhow::Result<()> {
+    let Some(path) = maybe_path else {
+        return Ok(());
+    };
+    persist_json_file(path, value)
 }
 
 pub fn ensure_daemon_token(root: &Path) -> anyhow::Result<String> {
@@ -470,6 +487,13 @@ mod tests {
         let loaded: HashMap<String, String> = super::load_json_file(&path)?;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get("s1").map(String::as_str), Some("gemini"));
+
+        let loaded_default: HashMap<String, String> =
+            super::load_json_file_if_exists(&root.join("missing.json"))?;
+        assert!(loaded_default.is_empty());
+
+        super::persist_json_file_if_enabled(Some(&path), &sessions)?;
+        super::persist_json_file_if_enabled::<HashMap<String, String>>(None, &HashMap::new())?;
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
