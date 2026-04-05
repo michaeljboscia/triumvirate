@@ -308,6 +308,14 @@ pub fn unix_time_ms() -> u128 {
         .unwrap_or(0)
 }
 
+pub fn daemon_bind_addr(var_value: Option<&str>) -> String {
+    var_value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("127.0.0.1:8080")
+        .to_string()
+}
+
 pub fn resolve_context(
     cwd: Option<&String>,
     repo: Option<&String>,
@@ -531,5 +539,15 @@ mod tests {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         Ok(())
+    }
+
+    #[test]
+    fn daemon_bind_addr_defaults_and_overrides() {
+        assert_eq!(super::daemon_bind_addr(None), "127.0.0.1:8080");
+        assert_eq!(
+            super::daemon_bind_addr(Some("0.0.0.0:9000")),
+            "0.0.0.0:9000"
+        );
+        assert_eq!(super::daemon_bind_addr(Some("   ")), "127.0.0.1:8080");
     }
 }
