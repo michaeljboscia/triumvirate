@@ -18,6 +18,7 @@ use triumvirate_proto::{AgentId, FabricMessage, HealthStatus, Payload, Topic};
 use crate::agent::SharedHealthRegistry;
 use crate::fabric::MessageBus;
 use crate::fleet::merge::merge_branches_sequentially;
+use crate::fleet::peer::{emit_peer_message, FleetPeerMessage};
 use crate::fleet::worktree::{git_repo_root, parse_fleet_members, provision_worktree, remove_worktree};
 use crate::quota::SharedQuotaRegistry;
 use crate::routing::{RoutingDecision, decide_route};
@@ -72,6 +73,7 @@ pub async fn start_web_server(
         .route("/api/fleet/worktrees", get(fleet_worktrees_handler))
         .route("/api/fleet/spawn", post(fleet_spawn_handler))
         .route("/api/fleet/merge", post(fleet_merge_handler))
+        .route("/api/fleet/peer", post(fleet_peer_handler))
         .route("/api/fleet/worktrees/teardown", post(fleet_teardown_handler))
         .route("/api/fleet/tasks/claim", post(fleet_claim_handler))
         .route("/api/fleet/tasks/complete", post(fleet_complete_handler))
@@ -634,6 +636,53 @@ async fn fleet_merge_handler(
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetPeerRequest {
+    fleet_id: String,
+    from_member: String,
+    to_member: String,
+    content: String,
+}
+
+async fn fleet_peer_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FleetPeerRequest>,
+) -> impl IntoResponse {
+    let fleet_id = req.fleet_id.trim();
+    let from_member = req.from_member.trim();
+    let to_member = req.to_member.trim();
+    let content = req.content.trim();
+    if fleet_id.is_empty() || from_member.is_empty() || to_member.is_empty() || content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "fleet_id, from_member, to_member, and content are required" })),
+        )
+            .into_response();
+    }
+
+    emit_peer_message(
+        state.bus.clone(),
+        FleetPeerMessage {
+            fleet_id: fleet_id.to_string(),
+            from_member: from_member.to_string(),
+            to_member: to_member.to_string(),
+            content: content.to_string(),
+        },
+    )
+    .await;
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "accepted": true,
+            "fleet_id": fleet_id,
+            "from_member": from_member,
+            "to_member": to_member,
+        })),
+    )
+        .into_response()
 }
 
 async fn fleet_tasks_handler(State(state): State<AppState>) -> impl IntoResponse {
