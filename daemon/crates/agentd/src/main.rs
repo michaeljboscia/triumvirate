@@ -1,7 +1,9 @@
 mod agent;
 mod config;
+mod digest;
 mod fabric;
 mod memory;
+mod routing;
 mod steno;
 mod web;
 
@@ -11,6 +13,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use agent::{AgentConnector, ClaudeConnector, CodexConnector, GeminiConnector, HealthMonitor};
+use digest::DigestEngine;
 use fabric::MessageBus;
 use memory::MemoryStore;
 use steno::Stenographer;
@@ -118,6 +121,11 @@ async fn main() -> anyhow::Result<()> {
     let steno = Stenographer::new(bus.clone());
     steno.run();
     info!("stenographer started");
+
+    // Step 9b: Start digest fan-out for idle peer agents
+    let digest = DigestEngine::new(bus.clone());
+    digest.run();
+    info!("digest engine started");
 
     // Step 8: Start web dashboard (this blocks — it's the main event loop)
     info!(
