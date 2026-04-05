@@ -179,6 +179,7 @@ pub struct StatusResponse {
     pub supported_agents: Vec<String>,
     pub pending_fallbacks: usize,
     pub fallback_tickets: Vec<String>,
+    pub daemon_bind_addr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

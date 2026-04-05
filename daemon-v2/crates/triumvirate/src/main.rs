@@ -286,6 +286,8 @@ impl McpBridge {
     #[tool(description = "Get current system status snapshot.")]
     async fn get_status(&self) -> Json<StatusResponse> {
         let sessions = self.sessions.lock().await;
+        let local_bind_addr =
+            core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
         if use_daemon_for_mcp_from_env()
             && let Ok(snapshot) = fetch_daemon_status_snapshot().await
         {
@@ -299,6 +301,7 @@ impl McpBridge {
                     .unwrap_or_else(|| vec!["gemini".to_string(), "codex".to_string()]),
                 pending_fallbacks: snapshot.pending_fallbacks.unwrap_or(0),
                 fallback_tickets: snapshot.fallback_tickets.unwrap_or_default(),
+                daemon_bind_addr: snapshot.daemon_bind_addr.unwrap_or(local_bind_addr),
             });
         }
         let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
@@ -312,6 +315,7 @@ impl McpBridge {
                 .into_iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            daemon_bind_addr: local_bind_addr,
         })
     }
 
