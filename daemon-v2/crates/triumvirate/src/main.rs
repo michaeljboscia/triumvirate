@@ -14,6 +14,10 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+use shared_types::{
+    AgentResult, AskAgentRequest, AskAgentResponse, AskTwinsRequest, AskTwinsResponse,
+    LifecycleEvent,
+};
 use std::{
     collections::HashMap,
     fs,
@@ -94,52 +98,6 @@ impl McpBridge {
 struct SessionState {
     agent: String,
     history: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct AskAgentRequest {
-    agent: String,
-    message: String,
-    cwd: Option<String>,
-    repo: Option<String>,
-    branch: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct LifecycleEvent {
-    state: String,
-    detail: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct AskAgentResponse {
-    request_id: String,
-    agent: String,
-    response: String,
-    lifecycle: Vec<LifecycleEvent>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct AskTwinsRequest {
-    message: String,
-    cwd: Option<String>,
-    repo: Option<String>,
-    branch: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct AgentResult {
-    agent: String,
-    response: String,
-    prompt_sent: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct AskTwinsResponse {
-    request_id: String,
-    results: Vec<AgentResult>,
-    failures: Vec<LifecycleEvent>,
-    lifecycle: Vec<LifecycleEvent>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
