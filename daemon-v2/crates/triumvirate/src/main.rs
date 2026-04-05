@@ -185,6 +185,14 @@ struct DaemonHealthResponse {
     auth: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct DaemonStatusSnapshot {
+    daemon_mode: Option<String>,
+    supported_agents: Option<Vec<String>>,
+    pending_fallbacks: Option<usize>,
+    fallback_tickets: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
 struct AskSessionRequest {
     name: String,
@@ -416,6 +424,21 @@ impl McpBridge {
     #[tool(description = "Get current system status snapshot.")]
     async fn get_status(&self) -> Json<StatusResponse> {
         let sessions = self.sessions.lock().await;
+        if use_daemon_for_mcp()
+            && let Ok(snapshot) = fetch_daemon_status_snapshot().await
+        {
+            return Json(StatusResponse {
+                daemon_mode: snapshot
+                    .daemon_mode
+                    .unwrap_or_else(|| "incremental-dev".to_string()),
+                active_sessions: sessions.len(),
+                supported_agents: snapshot
+                    .supported_agents
+                    .unwrap_or_else(|| vec!["gemini".to_string(), "codex".to_string()]),
+                pending_fallbacks: snapshot.pending_fallbacks.unwrap_or(0),
+                fallback_tickets: snapshot.fallback_tickets.unwrap_or_default(),
+            });
+        }
         let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
         let fallback_tickets = list_pending_fallback_paths(10).unwrap_or_default();
         Json(StatusResponse {
@@ -1193,9 +1216,19 @@ async fn run_daemon() -> anyhow::Result<()> {
         if !is_authorized(&headers, &state.token) {
             return Err(StatusCode::UNAUTHORIZED);
         }
+        let pending = count_pending_fallbacks().unwrap_or(0);
+        let tickets = list_pending_fallback_paths(10)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
         Ok(AxumJson(serde_json::json!({
             "daemon": "running",
-            "auth": "bearer-required"
+            "auth": "bearer-required",
+            "daemon_mode": "incremental-dev",
+            "supported_agents": ["gemini", "codex"],
+            "pending_fallbacks": pending,
+            "fallback_tickets": tickets
         })))
     }
 
@@ -1895,6 +1928,10 @@ async fn daemon_post_json<TReq: serde::Serialize, TResp: DeserializeOwned>(
 
 async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
     daemon_get_json::<DaemonHealthResponse>(daemon_status_url()).await
+}
+
+async fn fetch_daemon_status_snapshot() -> anyhow::Result<DaemonStatusSnapshot> {
+    daemon_get_json::<DaemonStatusSnapshot>(daemon_status_url()).await
 }
 
 fn daemon_base_url() -> String {
@@ -2652,6 +2689,72 @@ exit 1\n",
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_status_uses_daemon_snapshot_when_proxy_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-status-daemon-snapshot-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let token = "status-daemon-token-123";
+        fs::write(test_home.join("daemon.token"), format!("{token}\n"))?;
+
+        #[derive(Clone)]
+        struct TestState {
+            token: String,
+        }
+
+        async fn status_handler(
+            State(state): State<TestState>,
+            headers: HeaderMap,
+        ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
+            if !is_authorized(&headers, &state.token) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok(AxumJson(serde_json::json!({
+                "daemon_mode": "daemon-snapshot",
+                "supported_agents": ["gemini", "codex", "claude"],
+                "pending_fallbacks": 7,
+                "fallback_tickets": ["x.md", "y.md"]
+            })))
+        }
+
+        let app = Router::new()
+            .route("/status", get(status_handler))
+            .with_state(TestState {
+                token: token.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr: SocketAddr = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var("TRIUMVIRATE_DAEMON_URL", format!("http://{addr}/status"));
+        }
+
+        let bridge = McpBridge::new_ephemeral();
+        let status = bridge.get_status().await;
+        assert_eq!(status.0.daemon_mode, "daemon-snapshot");
+        assert_eq!(status.0.pending_fallbacks, 7);
+        assert_eq!(status.0.fallback_tickets.len(), 2);
+        assert!(status.0.supported_agents.contains(&"claude".to_string()));
+
+        server.abort();
+        let _ = server.await;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
+        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
