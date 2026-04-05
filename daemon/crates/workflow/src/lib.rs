@@ -1,4 +1,5 @@
 pub mod conversation;
+pub mod debate;
 pub mod engine;
 pub mod fleet;
 pub mod human_gate;
@@ -8,6 +9,7 @@ pub mod retry;
 pub mod state;
 
 pub use conversation::ConversationWorkflow;
+pub use debate::DebateWorkflow;
 pub use engine::WorkflowEngine;
 pub use fleet::FleetWorkflow;
 pub use human_gate::HumanGateTicket;
