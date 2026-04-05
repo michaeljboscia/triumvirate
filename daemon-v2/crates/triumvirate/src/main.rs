@@ -1028,22 +1028,39 @@ async fn run_named_agent(agent: &str, message: &str) -> anyhow::Result<String> {
     match agent {
         "gemini" => {
             let (bin, args) = gemini_command();
-            run_agent_process(&bin, &args, message).await
+            run_agent_process("gemini", &bin, &args, message).await
         }
         "codex" => {
             let (bin, args) = codex_command();
-            run_agent_process(&bin, &args, message).await
+            run_agent_process("codex", &bin, &args, message).await
         }
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
 
-async fn run_agent_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
+fn is_mock_connector(bin: &str) -> bool {
+    std::path::Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|name| name.starts_with("mock-"))
+        .unwrap_or(false)
+}
+
+fn connector_timeout() -> Duration {
+    std::env::var("TRIUMVIRATE_CONNECTOR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(90))
+}
+
+#[cfg(test)]
+async fn run_mock_connector_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
     let mut child = Command::new(&bin)
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
 
@@ -1085,13 +1102,181 @@ async fn run_agent_process(bin: &str, args: &[String], message: &str) -> anyhow:
 
     let response = match read_result {
         Ok(result) => result?,
-        Err(_) => anyhow::bail!("gemini connector timed out"),
+        Err(_) => anyhow::bail!("mock connector timed out"),
     };
 
     let _ = child.kill().await;
     let _ = child.wait().await;
 
     Ok(response)
+}
+
+fn has_any_arg(args: &[String], candidates: &[&str]) -> bool {
+    args.iter().any(|arg| candidates.iter().any(|c| arg == c))
+}
+
+async fn run_gemini_cli_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
+    let mut final_args = args.to_vec();
+    if !has_any_arg(&final_args, &["-p", "--prompt"]) {
+        final_args.push("-p".to_string());
+        final_args.push(message.to_string());
+    }
+
+    let output = timeout(
+        connector_timeout(),
+        Command::new(bin)
+            .args(&final_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("gemini connector timed out"))??;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("gemini exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        anyhow::bail!("gemini connector failed: {detail}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return Ok(stdout);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Ok(stderr);
+    }
+
+    anyhow::bail!("gemini connector returned empty output")
+}
+
+fn extract_text_from_jsonl(stdout: &str) -> Option<String> {
+    let mut candidate = None;
+    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if let Some(text) = json.get("text").and_then(|t| t.as_str()) {
+            candidate = Some(text.to_string());
+            continue;
+        }
+
+        if let Some(text) = json
+            .get("result")
+            .and_then(|r| r.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            candidate = Some(text.to_string());
+            continue;
+        }
+
+        if let Some(text) = json
+            .get("response")
+            .and_then(|r| r.get("output_text"))
+            .and_then(|t| t.as_str())
+        {
+            candidate = Some(text.to_string());
+        }
+    }
+    candidate
+}
+
+async fn run_codex_cli_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
+    let mut final_args = args.to_vec();
+    if final_args.first().map(|s| s.as_str()) != Some("exec") {
+        final_args.insert(0, "exec".to_string());
+    }
+    if !has_any_arg(&final_args, &["--json"]) {
+        final_args.push("--json".to_string());
+    }
+
+    let output_file = std::env::temp_dir().join(format!(
+        "triumvirate-codex-last-message-{}.txt",
+        Uuid::new_v4()
+    ));
+    final_args.push("--output-last-message".to_string());
+    final_args.push(output_file.display().to_string());
+    final_args.push(message.to_string());
+
+    let output = timeout(
+        connector_timeout(),
+        Command::new(bin)
+            .args(&final_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("codex connector timed out"))??;
+
+    let last_message = fs::read_to_string(&output_file).unwrap_or_default();
+    let _ = fs::remove_file(&output_file);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("codex exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        anyhow::bail!("codex connector failed: {detail}");
+    }
+
+    if !last_message.trim().is_empty() {
+        return Ok(last_message.trim().to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if let Some(text) = extract_text_from_jsonl(&stdout) {
+        return Ok(text);
+    }
+    let stdout_trimmed = stdout.trim().to_string();
+    if !stdout_trimmed.is_empty() {
+        return Ok(stdout_trimmed);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Ok(stderr);
+    }
+
+    anyhow::bail!("codex connector returned empty output")
+}
+
+async fn run_agent_process(
+    agent: &str,
+    bin: &str,
+    args: &[String],
+    message: &str,
+) -> anyhow::Result<String> {
+    if is_mock_connector(bin) {
+        #[cfg(test)]
+        {
+            return run_mock_connector_process(bin, args, message).await;
+        }
+        #[cfg(not(test))]
+        {
+            anyhow::bail!(
+                "mock connectors are test-only; set TRIUMVIRATE_{}_BIN to a real CLI binary",
+                agent.to_uppercase()
+            );
+        }
+    }
+
+    match agent {
+        "gemini" => run_gemini_cli_process(bin, args, message).await,
+        "codex" => run_codex_cli_process(bin, args, message).await,
+        _ => anyhow::bail!("unsupported agent: {agent}"),
+    }
 }
 
 #[tool_handler]
