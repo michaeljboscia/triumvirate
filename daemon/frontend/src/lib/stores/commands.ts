@@ -7,13 +7,22 @@ export async function sendMessage(content: string, baseUrl = ''): Promise<boolea
   return res.ok;
 }
 
-export async function spawnFleet(spec: string, baseUrl = ''): Promise<boolean> {
+export interface SpawnFleetResult {
+  accepted: boolean;
+  fleet_id: string;
+  workflow_id: string;
+  spec: string;
+  members: string[];
+}
+
+export async function spawnFleet(spec: string, baseUrl = ''): Promise<SpawnFleetResult | null> {
   const res = await fetch(`${baseUrl}/api/fleet/spawn`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ spec }),
   });
-  return res.ok;
+  if (!res.ok) return null;
+  return (await res.json()) as SpawnFleetResult;
 }
 
 export async function startDebate(topic: string, baseUrl = ''): Promise<boolean> {
