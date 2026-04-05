@@ -20,6 +20,7 @@ use crate::fabric::MessageBus;
 use crate::fleet::merge::merge_branches_sequentially;
 use crate::fleet::peer::{emit_peer_message, FleetPeerMessage};
 use crate::fleet::worktree::{git_repo_root, parse_fleet_members, provision_worktree, remove_worktree};
+use crate::governance::{GovernanceEngine, GovernedAction};
 use crate::quota::SharedQuotaRegistry;
 use crate::routing::{RoutingDecision, decide_route};
 use crate::shutdown::wait_for_shutdown_signal;
@@ -66,6 +67,7 @@ pub async fn start_web_server(
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
         .route("/api/agents", get(agents_handler))
+        .route("/api/governance/check", post(governance_check_handler))
         .route("/api/quota", get(quota_handler))
         .route("/api/workflows", get(workflows_handler))
         .route("/api/decisions", get(decisions_handler))
@@ -146,6 +148,40 @@ async fn quota_handler(State(state): State<AppState>) -> impl IntoResponse {
             "codex": snapshots.get(&AgentId::Codex),
         }
     }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GovernanceCheckRequest {
+    action: String,
+    human_approved: Option<bool>,
+}
+
+async fn governance_check_handler(Json(req): Json<GovernanceCheckRequest>) -> impl IntoResponse {
+    let action = match req.action.trim() {
+        "git_push" => GovernedAction::GitPush,
+        "file_delete" => GovernedAction::FileDelete,
+        "db_drop" => GovernedAction::DbDrop,
+        "fleet_merge" => GovernedAction::FleetMerge,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "unknown action" })),
+            )
+                .into_response();
+        }
+    };
+
+    let engine = GovernanceEngine::default();
+    let decision = engine.evaluate(action, req.human_approved.unwrap_or(false));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "policy_dir": engine.policy_dir().display().to_string(),
+        })),
+    )
+        .into_response()
 }
 
 async fn workflows_handler(State(state): State<AppState>) -> impl IntoResponse {

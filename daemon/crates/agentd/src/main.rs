@@ -3,6 +3,7 @@ mod config;
 mod digest;
 mod fabric;
 mod fleet;
+mod governance;
 mod memory;
 mod routing;
 mod quota;
