@@ -1322,7 +1322,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(FallbackGcResponse { removed }))
     }
 
-    let token = ensure_daemon_token()?;
+    let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
     let state = DaemonState {
         token,
         queues: Arc::new(Mutex::new(HashMap::new())),
@@ -1344,10 +1344,6 @@ async fn run_daemon() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-fn ensure_daemon_token() -> anyhow::Result<String> {
-    core_ensure_daemon_token(&core_triumvirate_home_dir()?)
 }
 
 fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
@@ -1454,7 +1450,7 @@ fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
 }
 
 async fn daemon_get_json<T: DeserializeOwned>(url: String) -> anyhow::Result<T> {
-    let token = ensure_daemon_token()?;
+    let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
     let client = reqwest::Client::new();
 
     let first = client.get(&url).bearer_auth(&token).send().await;
@@ -1483,7 +1479,7 @@ async fn daemon_post_json<TReq: serde::Serialize, TResp: DeserializeOwned>(
     url: String,
     payload: &TReq,
 ) -> anyhow::Result<TResp> {
-    let token = ensure_daemon_token()?;
+    let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
     let client = reqwest::Client::new();
 
     let first = client.post(&url).bearer_auth(&token).json(payload).send().await;
@@ -2346,8 +2342,8 @@ exit 1\n",
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::set_var("TRIUMVIRATE_HOME", &test_home) };
 
-        let token_one = ensure_daemon_token()?;
-        let token_two = ensure_daemon_token()?;
+        let token_one = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
+        let token_two = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
         assert_eq!(token_one, token_two);
         assert!(!token_one.is_empty());
 
