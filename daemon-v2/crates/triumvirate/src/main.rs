@@ -21,6 +21,7 @@ use mcp_bridge::{
     codex_command,
     daemon_autostart_enabled,
     daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
+    daemon_health_url,
     daemon_memory_read_url, daemon_memory_write_url, daemon_outbox_recent_url,
     daemon_scratchpad_list_url, daemon_scratchpad_write_url, daemon_status_url, gemini_command,
     is_bearer_authorized, is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
@@ -1072,6 +1073,8 @@ fn build_status_report(
     fallback_tickets: Vec<String>,
 ) -> serde_json::Value {
     if let (Some(health), Some(snapshot)) = (health, snapshot) {
+        // Normalize daemon snapshot payload so CLI output is stable even if the daemon
+        // omitted optional fields in older versions.
         let snapshot_value = serde_json::json!({
             "daemon_mode": snapshot.daemon_mode.unwrap_or_else(|| "incremental-dev".to_string()),
             "supported_agents": snapshot
@@ -1090,6 +1093,7 @@ fn build_status_report(
         });
     }
 
+    // Fallback path keeps `status` useful even when daemon HTTP is unavailable.
     serde_json::json!({
         "daemon_reachable": false,
         "daemon_bind_addr": daemon_bind_addr.clone(),
@@ -1579,7 +1583,40 @@ async fn daemon_post_json<TReq: serde::Serialize, TResp: DeserializeOwned>(
 }
 
 async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
-    daemon_get_json::<DaemonHealthResponse>(daemon_status_url()).await
+    if let Ok(health) = daemon_get_json::<DaemonHealthResponse>(daemon_health_url()).await {
+        return Ok(health);
+    }
+
+    // Backward-compat fallback: older setups may only expose `/status`.
+    let status_json = daemon_get_json::<serde_json::Value>(daemon_status_url()).await?;
+    Ok(DaemonHealthResponse {
+        status: status_json
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ok")
+            .to_string(),
+        service: status_json
+            .get("service")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        mode: status_json
+            .get("mode")
+            .or_else(|| status_json.get("daemon_mode"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        daemon: status_json
+            .get("daemon")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        auth: status_json
+            .get("auth")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        daemon_bind_addr: status_json
+            .get("daemon_bind_addr")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+    })
 }
 
 async fn fetch_daemon_status_snapshot() -> anyhow::Result<DaemonStatusSnapshot> {
@@ -2313,7 +2350,7 @@ exit 1\n",
             token: String,
         }
 
-        async fn status_handler(
+        async fn health_handler(
             State(state): State<TestState>,
             headers: HeaderMap,
         ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
@@ -2330,7 +2367,8 @@ exit 1\n",
         }
 
         let app = Router::new()
-            .route("/status", get(status_handler))
+            .route("/health", get(health_handler))
+            .route("/status", get(health_handler))
             .with_state(TestState {
                 token: token.to_string(),
             });
@@ -2560,6 +2598,7 @@ exit 1\n",
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_DAEMON_HEALTH_URL", format!("http://{addr}/health"));
             std::env::set_var("TRIUMVIRATE_DAEMON_URL", format!("http://{addr}/status"));
         }
 
@@ -2573,6 +2612,7 @@ exit 1\n",
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_HEALTH_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
         }
         let _ = fs::remove_dir_all(test_home);

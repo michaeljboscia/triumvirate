@@ -52,6 +52,7 @@ cargo run -p triumvirate -- doctor
 
 ### Explicit daemon endpoint overrides
 
+- `TRIUMVIRATE_DAEMON_HEALTH_URL` (`/health`)
 - `TRIUMVIRATE_DAEMON_URL` (`/status`)
 - `TRIUMVIRATE_DAEMON_ASK_AGENT_URL`
 - `TRIUMVIRATE_DAEMON_ASK_TWINS_URL`
