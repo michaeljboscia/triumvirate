@@ -24,5 +24,6 @@ mcp-bridge = { path = "../mcp-bridge" }
 agent-worker = { path = "../agent-worker" }
 mcp-tools = { path = "../mcp-tools" }
 daemon-http = { path = "../daemon-http" }
+fallback-outbox = { path = "../fallback-outbox" }
 
 [dev-dependencies]
