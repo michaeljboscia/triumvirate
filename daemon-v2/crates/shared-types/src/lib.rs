@@ -27,6 +27,36 @@ pub struct AskAgentResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SpawnSessionRequest {
+    pub agent: String,
+    pub name: String,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionInfo {
+    pub name: String,
+    pub agent: String,
+    pub turns: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionListResponse {
+    pub sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AskSessionRequest {
+    pub name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DismissSessionRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryWriteRequest {
     pub namespace: String,
     pub key: String,

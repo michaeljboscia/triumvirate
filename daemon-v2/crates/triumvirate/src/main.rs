@@ -49,14 +49,15 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
-use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use shared_types::{
-    AskAgentRequest, AskAgentResponse,
+    AskAgentRequest, AskAgentResponse, AskSessionRequest,
+    DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
     FallbackListResponse, LifecycleEvent, MemoryEntry, MemoryReadRequest, MemoryReadResponse,
     MemoryWriteRequest, MemoryWriteResponse, OutboxEvent, OutboxRecentRequest,
-    OutboxRecentResponse, ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
+    OutboxRecentResponse, SessionInfo, SessionListResponse, SpawnSessionRequest,
+    ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
     ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse, DaemonStatusSnapshot,
     SessionState,
 };
@@ -228,36 +229,6 @@ impl McpBridge {
             sessions_file,
         }
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct SpawnSessionRequest {
-    agent: String,
-    name: String,
-    cwd: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct SessionInfo {
-    name: String,
-    agent: String,
-    turns: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct SessionListResponse {
-    sessions: Vec<SessionInfo>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct AskSessionRequest {
-    name: String,
-    message: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-struct DismissSessionRequest {
-    name: String,
 }
 
 #[tool_router]
