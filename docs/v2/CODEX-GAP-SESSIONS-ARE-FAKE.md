@@ -118,3 +118,26 @@ Current error from ask_twins:
 ```
 "Codex failed: codex connector failed: Not inside a trusted directory and --skip-git-repo-check was not specified."
 ```
+
+---
+
+## Status Update (2026-04-06)
+
+### Done
+- Added daemon-managed persistent worker registry keyed by `(agent, cwd)`.
+- `ask_agent`, `ask_twins`, `spawn_session`, `ask_session`, and `dismiss_session` now route through the same persistent backend.
+- Added daemon HTTP session routes:
+  - `POST /session/spawn`
+  - `POST /session/ask`
+  - `POST /session/dismiss`
+  - `GET /session/list`
+- MCP session tools proxy through daemon when daemon mode is enabled, matching `ask_agent`/`ask_twins` behavior.
+- `ask_twins` defaults to raw prompt passthrough to both agents; role adaptation is opt-in via `TRIUMVIRATE_ASK_TWINS_ROLE_ADAPT`.
+- Added regression tests for:
+  - persistent worker reuse and faster second call,
+  - shared backend between session tools and `ask_twins`,
+  - passthrough prompt semantics.
+
+### Honest Semantics
+- Current implementation is **persistent session-backed orchestration**, not a single forever-running stdin process per agent.
+- Persistence uses connector-native resumable session/thread IDs and daemon-managed worker records.

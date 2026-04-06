@@ -173,3 +173,16 @@ This is not a nice-to-have. This is the product.
 > "I fire off a question to the twins and have NO IDEA if they've gotten it, if they're working, where they are, or if they've hung up" — Mike, the reason the entire rewrite exists
 
 Without progress notifications, the rewrite is a better-structured version of the same black box.
+
+---
+
+## Status Update (2026-04-06)
+
+### Done
+- `ask_agent` and `ask_twins` emit in-flight MCP lifecycle updates (`sent`, heartbeat `working`, `responded`, `failed`) via `ProgressEmitter`.
+- Lifecycle/outbox signals are emitted during execution, not only after final return.
+- Retry/failure/fallback transitions remain visible in lifecycle and outbox.
+- Coverage includes in-flight notification handling (`ask_agent_emits_progress_notifications`) and no-regression full `cargo test`.
+
+### Not Done
+- Stage-granularity parsing (`bootstrapping`, `reading files`, `planning`, `drafting`, `finalizing`) is still not implemented end-to-end from connector telemetry.
