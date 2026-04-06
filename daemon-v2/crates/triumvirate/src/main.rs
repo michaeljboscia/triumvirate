@@ -2509,7 +2509,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         sessions: Arc::new(Mutex::new(sessions)),
         sessions_file,
     };
-    prewarm_daemon_workers().await;
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
@@ -2529,6 +2528,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/list", get(session_list_route))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    tokio::spawn(async {
+        prewarm_daemon_workers().await;
+    });
     axum::serve(listener, app).await?;
     Ok(())
 }
