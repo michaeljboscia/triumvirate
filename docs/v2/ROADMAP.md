@@ -14,7 +14,7 @@ The product: "ask the twins" works with lifecycle visibility.
 |-----------|------|-----------|
 | 1a | Scaffold + rmcp ping tool | Foundation |
 | 1b | ask_agent happy path (Gemini) | US-2 |
-| 2 | ask_twins fan-out | US-1 |
+| 2 | Explicit session fan-out (`spawn_session` + parallel `ask_session`) | US-1 |
 | 3 | Timeout + retry + loud failure | US-4 |
 | 4 | Sessions (spawn/ask/dismiss) | US-8 |
 | 5 | Alive sessions + context | US-1, US-8 |

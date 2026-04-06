@@ -5,6 +5,8 @@
 **Builds from:** CONVERSATIONAL_PARITY.md + 9 rounds of architecture review
 **Built by:** Codex | **Reviewed by:** Claude + Gemini + Codex + Mike
 
+**2026-04-06 Update:** `ask_twins` has been removed from the runtime tool surface. Twin fan-out now requires explicit session orchestration (`spawn_session` + parallel `ask_session`).
+
 ---
 
 ## Constitution (Inviolable Principles)
