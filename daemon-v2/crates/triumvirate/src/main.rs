@@ -675,7 +675,6 @@ async fn execute_ask_agent(
 
         match attempt_result {
             Ok((response, next_session_id)) => {
-                worker_session_id = next_session_id.clone();
                 update_worker_session(&agent, &exec_cwd, next_session_id).await;
                 lifecycle.push(LifecycleEvent {
                     state: "DONE".to_string(),
@@ -854,11 +853,6 @@ async fn execute_ask_agent(
             .map(|p| format!("; dead drop launched at {}", p.display()))
             .unwrap_or_default()
     ))
-}
-
-async fn run_named_agent(agent: &str, message: &str, cwd: &str) -> anyhow::Result<String> {
-    let (response, _) = run_named_agent_with_session(agent, message, cwd, None).await?;
-    Ok(response)
 }
 
 async fn run_named_agent_with_session(
@@ -1079,15 +1073,6 @@ fn has_any_arg(args: &[String], candidates: &[&str]) -> bool {
     args.iter().any(|arg| candidates.iter().any(|c| arg == c))
 }
 
-async fn run_gemini_cli_process(
-    bin: &str,
-    args: &[String],
-    message: &str,
-    cwd: &str,
-) -> anyhow::Result<(String, Option<String>)> {
-    run_gemini_cli_process_with_session(bin, args, message, cwd, None).await
-}
-
 async fn run_gemini_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -1221,15 +1206,6 @@ fn is_git_worktree(path: &str) -> bool {
     }
 }
 
-async fn run_codex_cli_process(
-    bin: &str,
-    args: &[String],
-    message: &str,
-    cwd: &str,
-) -> anyhow::Result<(String, Option<String>)> {
-    run_codex_cli_process_with_session(bin, args, message, cwd, None).await
-}
-
 async fn run_codex_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -1322,16 +1298,6 @@ async fn run_codex_cli_process_with_session(
     }
 
     anyhow::bail!("codex connector returned empty output")
-}
-
-async fn run_agent_process(
-    agent: &str,
-    bin: &str,
-    args: &[String],
-    message: &str,
-    cwd: &str,
-) -> anyhow::Result<(String, Option<String>)> {
-    run_agent_process_with_session(agent, bin, args, message, cwd, None).await
 }
 
 async fn run_agent_process_with_session(
