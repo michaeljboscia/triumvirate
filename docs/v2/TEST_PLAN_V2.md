@@ -53,15 +53,14 @@ EXPECT:
 PASS: responses return in completion order, not call order
 ```
 
-### T-003: ask_twins with role-adapted prompts
+### T-003: ask_twins default prompt passthrough
 ```
 SETUP: daemon running with mock CLIs that echo received prompt
 ACTION: Claude calls ask_twins("Add authentication to the API")
 EXPECT:
-  - Gemini received research/analysis framing around the raw question
-  - Codex received implementation/tradeoffs framing around the raw question
-  - Both contain the original question text
-PASS: prompts are different per agent, both contain original question
+  - Gemini received the raw user prompt unchanged
+  - Codex received the raw user prompt unchanged
+PASS: default behavior is passthrough; no hidden role-twisting
 ```
 
 ### T-004: ask_twins synthesis
@@ -83,6 +82,15 @@ EXPECT:
   - No new process created for Gemini
   - Codex may be "spawned" if first use
 PASS: session_source: reused in lifecycle events
+```
+
+### T-005b: ask_twins + session tools share backend
+```
+SETUP: spawn_session("gemini", "shared"), ask_session("shared", "prime")
+ACTION: ask_twins("follow-up", cwd=same)
+EXPECT:
+  - Gemini lifecycle indicates reused persistent worker
+PASS: ask_twins/session tools hit same persistent backend
 ```
 
 ### T-006: ask_twins with one agent down
