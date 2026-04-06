@@ -389,6 +389,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fallback-outbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "daemon-core",
+ "shared-types",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1788,6 +1797,7 @@ dependencies = [
  "daemon-core",
  "daemon-http",
  "dirs",
+ "fallback-outbox",
  "mcp-bridge",
  "mcp-tools",
  "reqwest",

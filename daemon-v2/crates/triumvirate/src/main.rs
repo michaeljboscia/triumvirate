@@ -6,16 +6,14 @@ use agent_worker::{
 #[cfg(test)]
 use agent_worker::reset_worker_registry_for_tests;
 use daemon_core::{
-    QueueRegistry, acknowledge_dead_drop_ticket,
+    QueueRegistry,
     acquire_project_queue as core_acquire_project_queue,
     append_memory_entry as core_append_memory_entry,
-    append_outbox_event as core_append_outbox_event, count_dead_drop_tickets,
-    create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
     daemon_bind_addr as core_daemon_bind_addr,
     launchd_plist_path as core_launchd_plist_path,
     render_launch_agent_plist as core_render_launch_agent_plist,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
-    read_memory_entries as core_read_memory_entries, read_outbox_events as core_read_outbox_events,
+    read_memory_entries as core_read_memory_entries,
     resolve_context as core_resolve_context, triumvirate_home_dir as core_triumvirate_home_dir,
     unix_time_ms as core_unix_time_ms, write_scratchpad as core_write_scratchpad,
     ensure_daemon_token as core_ensure_daemon_token,
@@ -30,6 +28,10 @@ use daemon_http::{
     fetch_daemon_scratchpad_write, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
     fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
     fetch_daemon_status_snapshot, reset_daemon_autostart_flag_for_tests,
+};
+use fallback_outbox::{
+    acknowledge_fallback_path, append_outbox_event, count_pending_fallbacks, gc_fallbacks,
+    list_pending_fallback_paths, read_outbox_events, spawn_dead_drop as create_dead_drop_fallback,
 };
 use mcp_bridge::{
     daemon_base_url,
@@ -1942,14 +1944,6 @@ async fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn append_outbox_event(event: &OutboxEvent) -> anyhow::Result<()> {
-    core_append_outbox_event(&core_triumvirate_home_dir()?, event)
-}
-
-fn read_outbox_events() -> anyhow::Result<Vec<OutboxEvent>> {
-    core_read_outbox_events(&core_triumvirate_home_dir()?)
-}
-
 fn append_memory_entry(entry: &MemoryEntry) -> anyhow::Result<()> {
     core_append_memory_entry(&core_triumvirate_home_dir()?, entry)
 }
@@ -1981,8 +1975,7 @@ fn spawn_dead_drop(
     branch: &Option<String>,
 ) -> anyhow::Result<PathBuf> {
     let id = Uuid::new_v4().to_string();
-    create_dead_drop_ticket(
-        &core_triumvirate_home_dir()?,
+    create_dead_drop_fallback(
         agent,
         message,
         reason,
@@ -1991,22 +1984,6 @@ fn spawn_dead_drop(
         branch,
         &id,
     )
-}
-
-fn count_pending_fallbacks() -> anyhow::Result<usize> {
-    count_dead_drop_tickets(&core_triumvirate_home_dir()?)
-}
-
-fn list_pending_fallback_paths(limit: usize) -> anyhow::Result<Vec<PathBuf>> {
-    list_dead_drop_tickets(&core_triumvirate_home_dir()?, limit)
-}
-
-fn acknowledge_fallback_path(path: &str) -> anyhow::Result<()> {
-    acknowledge_dead_drop_ticket(&core_triumvirate_home_dir()?, path)
-}
-
-fn gc_fallbacks(max_age_days: u64) -> anyhow::Result<usize> {
-    gc_dead_drop_tickets(&core_triumvirate_home_dir()?, max_age_days)
 }
 
 #[cfg(test)]
