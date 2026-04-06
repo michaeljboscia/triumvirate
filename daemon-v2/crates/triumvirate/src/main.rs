@@ -1,15 +1,14 @@
 use clap::{Parser, Subcommand};
 use agent_worker::{
-    WorkerAcquireMode, acquire_worker, dismiss_worker, update_worker_session,
+    WorkerAcquireMode, acquire_worker, dismiss_worker,
 };
 #[cfg(test)]
-use agent_worker::reset_worker_registry_for_tests;
+use agent_worker::{reset_worker_registry_for_tests, update_worker_session};
 use daemon_core::{
     QueueRegistry,
     acquire_project_queue as core_acquire_project_queue,
     append_memory_entry as core_append_memory_entry,
     daemon_bind_addr as core_daemon_bind_addr,
-    render_launch_agent_plist as core_render_launch_agent_plist,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
     read_memory_entries as core_read_memory_entries,
     triumvirate_home_dir as core_triumvirate_home_dir,
@@ -19,6 +18,8 @@ use daemon_core::{
     load_json_file_if_exists as core_load_json_file_if_exists,
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
+#[cfg(test)]
+use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 use daemon_http::{
     fetch_daemon_ask_agent, fetch_daemon_fallback_ack,
     fetch_daemon_fallback_gc, fetch_daemon_fallback_list, fetch_daemon_memory_read,
@@ -34,10 +35,12 @@ use fallback_outbox::{
     list_pending_fallback_paths, read_outbox_events, spawn_dead_drop as create_dead_drop_fallback,
 };
 use mcp_bridge::{
-    is_bearer_authorized, is_supported_agent_name, should_use_daemon_proxy,
+    is_bearer_authorized, is_supported_agent_name,
 };
 #[cfg(not(test))]
 use mcp_bridge::use_daemon_for_mcp_from_env;
+#[cfg(test)]
+use mcp_bridge::should_use_daemon_proxy;
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use axum::{
     Json as AxumJson, Router,
@@ -61,13 +64,15 @@ use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest,
     DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
-    FallbackListResponse, LifecycleEvent, MemoryEntry, MemoryReadRequest, MemoryReadResponse,
-    MemoryWriteRequest, MemoryWriteResponse, OutboxEvent, OutboxRecentRequest,
+    FallbackListResponse, MemoryEntry, MemoryReadRequest, MemoryReadResponse,
+    MemoryWriteRequest, MemoryWriteResponse, OutboxRecentRequest,
     OutboxRecentResponse, SessionInfo, SessionListResponse, SpawnSessionRequest,
     ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
-    ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse, DaemonStatusSnapshot,
+    ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse,
     SessionState,
 };
+#[cfg(test)]
+use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -119,11 +124,11 @@ struct McpBridge {
 fn mcp_daemon_proxy_enabled() -> bool {
     #[cfg(test)]
     {
-        return should_use_daemon_proxy(std::env::var("TRIUMVIRATE_MCP_USE_DAEMON").ok().as_deref());
+        should_use_daemon_proxy(std::env::var("TRIUMVIRATE_MCP_USE_DAEMON").ok().as_deref())
     }
     #[cfg(not(test))]
     {
-        return use_daemon_for_mcp_from_env();
+        use_daemon_for_mcp_from_env()
     }
 }
 
@@ -604,6 +609,7 @@ async fn run_status() -> anyhow::Result<()> {
     cli_ops::run_status().await
 }
 
+#[cfg(test)]
 fn build_status_report(
     daemon_bind_addr: String,
     health: Option<DaemonHealthResponse>,
@@ -1178,6 +1184,7 @@ fn spawn_dead_drop(
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use rmcp::{ClientHandler, model::ClientInfo};
