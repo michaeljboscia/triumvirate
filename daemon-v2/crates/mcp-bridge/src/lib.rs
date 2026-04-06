@@ -389,13 +389,16 @@ mod tests {
         let _guard = env_lock().lock().expect("env lock poisoned");
         // SAFETY: test controls env var lifecycle in-process.
         unsafe { std::env::remove_var("TRIUMVIRATE_AGENT_VERBOSITY") };
-        assert_eq!(super::agent_verbosity(), AgentVerbosity::Normal);
+        assert_eq!(super::agent_verbosity(), AgentVerbosity::Standard);
         // SAFETY: test controls env var lifecycle in-process.
-        unsafe { std::env::set_var("TRIUMVIRATE_AGENT_VERBOSITY", "minimal") };
-        assert_eq!(super::agent_verbosity(), AgentVerbosity::Minimal);
+        unsafe { std::env::set_var("TRIUMVIRATE_AGENT_VERBOSITY", "quiet") };
+        assert_eq!(super::agent_verbosity(), AgentVerbosity::Quiet);
         // SAFETY: test controls env var lifecycle in-process.
-        unsafe { std::env::set_var("TRIUMVIRATE_AGENT_VERBOSITY", "verbose") };
-        assert_eq!(super::agent_verbosity(), AgentVerbosity::Verbose);
+        unsafe { std::env::set_var("TRIUMVIRATE_AGENT_VERBOSITY", "detailed") };
+        assert_eq!(super::agent_verbosity(), AgentVerbosity::Detailed);
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_AGENT_VERBOSITY", "raw") };
+        assert_eq!(super::agent_verbosity(), AgentVerbosity::Raw);
     }
 
     #[test]

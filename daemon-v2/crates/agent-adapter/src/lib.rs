@@ -104,10 +104,10 @@ mod tests {
 
     #[test]
     fn verbosity_matrix() {
-        assert!(should_display(&WorkingState::TurnStarted, AgentVerbosity::Minimal));
-        assert!(!should_display(&WorkingState::MessageDelta, AgentVerbosity::Minimal));
-        assert!(should_display(&WorkingState::ToolCallStarted, AgentVerbosity::Normal));
-        assert!(!should_display(&WorkingState::Unknown, AgentVerbosity::Normal));
-        assert!(should_display(&WorkingState::Unknown, AgentVerbosity::Verbose));
+        assert!(should_display(&WorkingState::TurnStarted, AgentVerbosity::Quiet));
+        assert!(!should_display(&WorkingState::MessageDelta, AgentVerbosity::Quiet));
+        assert!(should_display(&WorkingState::ToolCallStarted, AgentVerbosity::Standard));
+        assert!(!should_display(&WorkingState::Unknown, AgentVerbosity::Detailed));
+        assert!(should_display(&WorkingState::Unknown, AgentVerbosity::Raw));
     }
 }
