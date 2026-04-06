@@ -159,6 +159,16 @@ pub fn gemini_streaming_enabled() -> bool {
         .unwrap_or(true)
 }
 
+pub fn codex_protocol() -> String {
+    std::env::var("TRIUMVIRATE_CODEX_PROTOCOL")
+        .ok()
+        .map(|v| match v.to_lowercase().as_str() {
+            "app-server" => "app-server".to_string(),
+            _ => "exec".to_string(),
+        })
+        .unwrap_or_else(|| "exec".to_string())
+}
+
 fn resolve_connector_command(
     bin_env: &str,
     args_env: &str,
@@ -400,5 +410,19 @@ mod tests {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_STREAMING", "1") };
         assert!(super::gemini_streaming_enabled());
+    }
+
+    #[test]
+    fn codex_protocol_defaults_exec_and_allows_app_server() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_PROTOCOL") };
+        assert_eq!(super::codex_protocol(), "exec");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_CODEX_PROTOCOL", "app-server") };
+        assert_eq!(super::codex_protocol(), "app-server");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_CODEX_PROTOCOL", "unknown") };
+        assert_eq!(super::codex_protocol(), "exec");
     }
 }

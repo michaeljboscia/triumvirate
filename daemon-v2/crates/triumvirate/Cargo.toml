@@ -23,6 +23,7 @@ opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 prometheus.workspace = true
 uuid.workspace = true
+libc.workspace = true
 shared-types = { path = "../shared-types" }
 daemon-core = { path = "../daemon-core" }
 mcp-bridge = { path = "../mcp-bridge" }

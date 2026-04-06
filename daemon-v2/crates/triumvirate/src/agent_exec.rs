@@ -22,6 +22,42 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    // SAFETY: pre_exec runs in the spawned child process before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_process_group(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let pgid = -(pid as i32);
+        // SAFETY: kill is called with a process-group id derived from child pid.
+        unsafe {
+            let _ = libc::kill(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &mut tokio::process::Child) {}
+
+fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: WorkingStateEvent) {
+    if let Some(sender) = tx {
+        let _ = sender.try_send(event);
+    }
+}
+
 pub(crate) async fn execute_ask_agent(
     req: &AskAgentRequest,
     progress: Option<ProgressEmitter>,
@@ -632,14 +668,16 @@ async fn run_gemini_cli_process_with_session(
         final_args.push(message.to_string());
     }
 
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(&final_args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command.spawn()?;
 
     let stdout = child
         .stdout
@@ -668,17 +706,21 @@ async fn run_gemini_cli_process_with_session(
         while let Some(line) = reader.next_line().await? {
             raw_output.push_str(&line);
             raw_output.push('\n');
-            if let Some(event) = parser.parse_line(&line)
-                && let Some(tx) = events_tx.as_ref()
-            {
-                let _ = tx.send(event).await;
+            if let Some(event) = parser.parse_line(&line) {
+                emit_working_event(events_tx.as_ref(), event);
             }
         }
         anyhow::Ok(())
     };
-    timeout(timeout_duration, read)
-        .await
-        .map_err(|_| anyhow::anyhow!("gemini connector timed out"))??;
+    match timeout(timeout_duration, read).await {
+        Ok(result) => result?,
+        Err(_) => {
+            kill_process_group(&mut child);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!("gemini connector timed out");
+        }
+    }
 
     let status = child.wait().await?;
     if !status.success() {
@@ -826,14 +868,16 @@ async fn run_codex_cli_process_with_session(
     final_args.push(output_file.display().to_string());
     final_args.push(message.to_string());
 
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(&final_args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command.spawn()?;
 
     let stdout = child
         .stdout
@@ -862,17 +906,21 @@ async fn run_codex_cli_process_with_session(
         while let Some(line) = reader.next_line().await? {
             raw_output.push_str(&line);
             raw_output.push('\n');
-            if let Some(event) = parser.parse_line(&line)
-                && let Some(tx) = events_tx.as_ref()
-            {
-                let _ = tx.send(event).await;
+            if let Some(event) = parser.parse_line(&line) {
+                emit_working_event(events_tx.as_ref(), event);
             }
         }
         anyhow::Ok(())
     };
-    timeout(timeout_duration, read)
-        .await
-        .map_err(|_| anyhow::anyhow!("codex connector timed out"))??;
+    match timeout(timeout_duration, read).await {
+        Ok(result) => result?,
+        Err(_) => {
+            kill_process_group(&mut child);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!("codex connector timed out");
+        }
+    }
     let status = child.wait().await?;
 
     let last_message = fs::read_to_string(&output_file).unwrap_or_default();

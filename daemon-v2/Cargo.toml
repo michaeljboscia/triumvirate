@@ -26,3 +26,4 @@ opentelemetry_sdk = "0.28"
 opentelemetry-otlp = { version = "0.28", features = ["http-proto", "reqwest-client"] }
 prometheus = "0.13"
 uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
