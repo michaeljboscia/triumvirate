@@ -1,0 +1,30 @@
+TRIUMVIRATE v2.1 "FLOW STATE" — PROGRESS
+
+Status: SHIPPED
+Date: 2026-04-06
+
+Goatrodeo: COMPLETE (4 rounds, 27 REQs, 29 auto-resolves, 5 user decisions)
+Spec: docs/v2/FLOW_STATE_SPEC.md (FINAL)
+Ledger: docs/v2/GOATRODEO_FLOW_STATE.md
+PRD: docs/v2.1/PRD.md (10 features)
+Plan: docs/v2.1/IMPLEMENTATION_PLAN.md (6 phases)
+Tests: docs/v2.1/TEST_PLAN.md (27 REQ rows)
+Closeout: docs/v2.1/SPRINT_CLOSEOUT.md
+
+Phase 0: Types + Crate Scaffold ......... COMPLETE
+Phase 1: Gemini Stream-JSON Parser ...... COMPLETE
+Phase 2: Codex Exec-JSON Parser ......... COMPLETE
+Phase 3: Live Streaming (.spawn()) ...... COMPLETE
+Phase 4: Stuck Detection + Tokens ....... COMPLETE
+Phase 5: ask_twins Removal .............. COMPLETE
+Phase 6: Polish + Tests ................. COMPLETE
+
+Blockers: NONE
+
+Golden traces captured 2026-04-06:
+- tests/fixtures/gemini-stream-trace.jsonl
+- tests/fixtures/codex-exec-trace.jsonl
+
+Mock streaming fixtures:
+- tests/fixtures/gemini-mock-streaming.sh
+- tests/fixtures/codex-mock-streaming.sh
