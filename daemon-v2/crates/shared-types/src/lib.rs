@@ -27,29 +27,6 @@ pub struct AskAgentResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AskTwinsRequest {
-    pub message: String,
-    pub cwd: Option<String>,
-    pub repo: Option<String>,
-    pub branch: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AgentResult {
-    pub agent: String,
-    pub response: String,
-    pub prompt_sent: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AskTwinsResponse {
-    pub request_id: String,
-    pub results: Vec<AgentResult>,
-    pub failures: Vec<LifecycleEvent>,
-    pub lifecycle: Vec<LifecycleEvent>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryWriteRequest {
     pub namespace: String,
     pub key: String,
