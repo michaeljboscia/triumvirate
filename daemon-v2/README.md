@@ -7,6 +7,7 @@ A Rust workspace for the Triumvirate daemon + MCP bridge runtime.
 - `crates/triumvirate`: main binary (`mcp`, `daemon`, `install`, `uninstall`, `status`, `doctor`)
 - `crates/daemon-core`: daemon/runtime shared helpers (state IO, dead-drop, queue, launchd, context)
 - `crates/mcp-bridge`: MCP-facing bridge helpers (routing inputs, env/URL parsing, command resolution)
+- `crates/agent-adapter`: unified agent event/types/parsers (Gemini stream-json + Codex exec-json)
 - `crates/shared-types`: shared request/response DTOs used across crate boundaries
 
 ## Build & Test
@@ -55,7 +56,6 @@ cargo run -p triumvirate -- doctor
 - `TRIUMVIRATE_DAEMON_HEALTH_URL` (`/health`)
 - `TRIUMVIRATE_DAEMON_URL` (`/status`)
 - `TRIUMVIRATE_DAEMON_ASK_AGENT_URL`
-- `TRIUMVIRATE_DAEMON_ASK_TWINS_URL`
 - `TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL`
 - `TRIUMVIRATE_DAEMON_MEMORY_READ_URL`
 - `TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL`
@@ -83,6 +83,10 @@ cargo run -p triumvirate -- doctor
 
 - `TRIUMVIRATE_GEMINI_BIN`, `TRIUMVIRATE_GEMINI_ARGS`
 - `TRIUMVIRATE_CODEX_BIN`, `TRIUMVIRATE_CODEX_ARGS`
+- `TRIUMVIRATE_GEMINI_STREAMING`
+  - Falsey disables live stream parse path and falls back to batch parse.
+- `TRIUMVIRATE_AGENT_VERBOSITY`
+  - `minimal|normal|verbose` progress-event filter.
 
 ### Data root
 

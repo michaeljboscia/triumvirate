@@ -1,19 +1,25 @@
 use crate::{append_outbox_event, spawn_dead_drop};
+use agent_adapter::{
+    CodexExecParser, GeminiStreamParser, ParsedAgentResult, StuckDetector,
+    WorkingState, WorkingStateEvent, format_working_state, should_display,
+};
 use agent_worker::{
     WorkerAcquireMode, acquire_worker, dismiss_worker, should_invalidate_cached_session,
     update_worker_session,
 };
 use daemon_core::{resolve_context as core_resolve_context, unix_time_ms as core_unix_time_ms};
-use mcp_bridge::{codex_command, gemini_command, is_supported_agent};
+use mcp_bridge::{
+    agent_verbosity, codex_command, gemini_command, gemini_streaming_enabled, is_supported_agent,
+};
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use shared_types::{AskAgentRequest, AskAgentResponse, LifecycleEvent, OutboxEvent};
 use std::{fs, time::Duration};
 use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
+    sync::mpsc,
     time::{Instant, sleep, timeout},
 };
-#[cfg(test)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 pub(crate) async fn execute_ask_agent(
@@ -107,25 +113,51 @@ pub(crate) async fn execute_ask_agent(
     }
 
     let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
+    let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
 
     for (idx, backoff) in backoffs.iter().enumerate() {
         let session_for_attempt = worker_session_id.clone();
+        let (events_tx, mut events_rx) = mpsc::channel::<WorkingStateEvent>(1024);
+        let mut stuck_detector = StuckDetector::default();
         let mut attempt = Box::pin(run_named_agent_with_session(
             &agent,
             &execution_prompt,
             &exec_cwd,
             session_for_attempt.as_deref(),
+            Some(events_tx),
         ));
         let started = Instant::now();
-        let mut next_heartbeat = Duration::from_secs(10);
+        let mut next_heartbeat = Duration::from_secs(30);
 
         let attempt_result = loop {
             let sleep_duration = next_heartbeat.saturating_sub(started.elapsed());
             tokio::select! {
                 result = &mut attempt => break result,
+                Some(event) = events_rx.recv() => {
+                    if should_display(&event.state, verbosity) {
+                        if let Some(emitter) = progress.as_ref() {
+                            emitter.emit(format_working_state(&event)).await;
+                        }
+                    }
+                    if let Some(reason) = stuck_detector.observe(&event) {
+                        lifecycle.push(LifecycleEvent {
+                            state: "STUCK".to_string(),
+                            detail: format!("detected potential stuck state: {:?}", reason),
+                        });
+                    }
+                    if matches!(event.state, WorkingState::TurnStarted | WorkingState::ToolCallStarted | WorkingState::ToolCallCompleted | WorkingState::MessageDelta) {
+                        next_heartbeat = started.elapsed() + Duration::from_secs(30);
+                    }
+                }
                 _ = sleep(sleep_duration) => {
                     if started.elapsed() >= next_heartbeat {
+                        if let Some(reason) = stuck_detector.check_timeouts() {
+                            lifecycle.push(LifecycleEvent {
+                                state: "STUCK".to_string(),
+                                detail: format!("detected potential stuck timeout: {:?}", reason),
+                            });
+                        }
                         let elapsed = started.elapsed().as_secs();
                         let detail = format!("{agent} still working ({elapsed}s elapsed)");
                         lifecycle.push(LifecycleEvent {
@@ -144,7 +176,8 @@ pub(crate) async fn execute_ask_agent(
         };
 
         match attempt_result {
-            Ok((response, next_session_id)) => {
+            Ok(parsed) => {
+                let next_session_id = parsed.session_id.clone();
                 update_worker_session(&agent, &exec_cwd, next_session_id).await;
                 lifecycle.push(LifecycleEvent {
                     state: "DONE".to_string(),
@@ -172,7 +205,7 @@ pub(crate) async fn execute_ask_agent(
                 return Ok(AskAgentResponse {
                     request_id,
                     agent: agent.clone(),
-                    response,
+                    response: parsed.response_text,
                     lifecycle,
                 });
             }
@@ -330,15 +363,34 @@ async fn run_named_agent_with_session(
     message: &str,
     cwd: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<(String, Option<String>)> {
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+) -> anyhow::Result<ParsedAgentResult> {
     match agent {
         "gemini" => {
             let (bin, args) = gemini_command();
-            run_agent_process_with_session("gemini", &bin, &args, message, cwd, session_id).await
+            run_agent_process_with_session(
+                "gemini",
+                &bin,
+                &args,
+                message,
+                cwd,
+                session_id,
+                events_tx,
+            )
+            .await
         }
         "codex" => {
             let (bin, args) = codex_command();
-            run_agent_process_with_session("codex", &bin, &args, message, cwd, session_id).await
+            run_agent_process_with_session(
+                "codex",
+                &bin,
+                &args,
+                message,
+                cwd,
+                session_id,
+                events_tx,
+            )
+            .await
         }
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
@@ -349,13 +401,13 @@ async fn prewarm_worker(agent: &str, cwd: &str) {
     let warm_prompt = "Prewarm this session. Reply with only: ready";
     let warm_result = timeout(
         daemon_prewarm_timeout(),
-        run_named_agent_with_session(agent, warm_prompt, cwd, worker.session_id.as_deref()),
+        run_named_agent_with_session(agent, warm_prompt, cwd, worker.session_id.as_deref(), None),
     )
     .await;
 
     match warm_result {
-        Ok(Ok((_, session_id))) => {
-            update_worker_session(agent, cwd, session_id).await;
+        Ok(Ok(parsed)) => {
+            update_worker_session(agent, cwd, parsed.session_id).await;
             tracing::info!("prewarm complete for {agent} cwd={cwd}");
         }
         Ok(Err(err)) => {
@@ -445,11 +497,12 @@ fn daemon_prewarm_cwds() -> Vec<String> {
 
 #[cfg(test)]
 async fn run_mock_connector_process(
+    agent: &str,
     bin: &str,
     args: &[String],
     message: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<(String, Option<String>)> {
+) -> anyhow::Result<ParsedAgentResult> {
     use tokio::io::AsyncReadExt;
 
     let mut child = Command::new(&bin)
@@ -536,7 +589,15 @@ async fn run_mock_connector_process(
     let out_session = session_id
         .map(ToString::to_string)
         .or_else(|| Some(format!("mock-session-{}", Uuid::new_v4())));
-    Ok((response, out_session))
+    Ok(ParsedAgentResult {
+        response_text: response,
+        session_id: out_session,
+        events: vec![],
+        tool_calls: vec![],
+        token_usage: None,
+        cli_version: None,
+        parser_mode: format!("{agent}-mock"),
+    })
 }
 
 fn has_any_arg(args: &[String], candidates: &[&str]) -> bool {
@@ -549,7 +610,12 @@ async fn run_gemini_cli_process_with_session(
     message: &str,
     cwd: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<(String, Option<String>)> {
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+) -> anyhow::Result<ParsedAgentResult> {
+    if !gemini_streaming_enabled() {
+        return run_gemini_batch_process_with_session(bin, args, message, cwd, session_id).await;
+    }
+
     let mut final_args = args.to_vec();
     if !has_any_arg(&final_args, &["-o", "--output-format"]) {
         final_args.push("-o".to_string());
@@ -566,6 +632,91 @@ async fn run_gemini_cli_process_with_session(
         final_args.push(message.to_string());
     }
 
+    let mut child = Command::new(bin)
+        .args(&final_args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("gemini stdout missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("gemini stderr missing"))?;
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                tracing::debug!("gemini stderr: {trimmed}");
+            }
+        }
+    });
+
+    let mut parser = GeminiStreamParser::new();
+    let mut reader = BufReader::new(stdout).lines();
+    let mut raw_output = String::new();
+    let timeout_duration = connector_timeout();
+    let read = async {
+        while let Some(line) = reader.next_line().await? {
+            raw_output.push_str(&line);
+            raw_output.push('\n');
+            if let Some(event) = parser.parse_line(&line)
+                && let Some(tx) = events_tx.as_ref()
+            {
+                let _ = tx.send(event).await;
+            }
+        }
+        anyhow::Ok(())
+    };
+    timeout(timeout_duration, read)
+        .await
+        .map_err(|_| anyhow::anyhow!("gemini connector timed out"))??;
+
+    let status = child.wait().await?;
+    if !status.success() {
+        anyhow::bail!("gemini connector failed: exited with status {status}");
+    }
+
+    let mut parsed = parser.finish();
+    if parsed.response_text.trim().is_empty() {
+        parsed.response_text = raw_output.trim().to_string();
+    }
+    if parsed.session_id.is_none() {
+        parsed.session_id = session_id.map(ToString::to_string);
+    }
+    Ok(parsed)
+}
+
+async fn run_gemini_batch_process_with_session(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<ParsedAgentResult> {
+    let mut final_args = args.to_vec();
+    if !has_any_arg(&final_args, &["-o", "--output-format"]) {
+        final_args.push("-o".to_string());
+        final_args.push("stream-json".to_string());
+    }
+    if let Some(session_id) = session_id
+        && !has_any_arg(&final_args, &["-r", "--resume"])
+    {
+        final_args.push("-r".to_string());
+        final_args.push(session_id.to_string());
+    }
+    if !has_any_arg(&final_args, &["-p", "--prompt"]) {
+        final_args.push("-p".to_string());
+        final_args.push(message.to_string());
+    }
     let output = timeout(
         connector_timeout(),
         Command::new(bin)
@@ -580,55 +731,21 @@ async fn run_gemini_cli_process_with_session(
     .map_err(|_| anyhow::anyhow!("gemini connector timed out"))??;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!("gemini exited with status {}", output.status)
-        } else {
-            stderr
-        };
-        anyhow::bail!("gemini connector failed: {detail}");
+        anyhow::bail!("gemini connector failed: exited with status {}", output.status);
     }
-
+    let mut parser = GeminiStreamParser::new();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let mut discovered_session: Option<String> = None;
-    let mut assistant_chunks: Vec<String> = Vec::new();
     for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() || !line.starts_with('{') {
-            continue;
-        }
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if discovered_session.is_none() {
-            discovered_session = json
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
-        }
-        let role = json.get("role").and_then(|v| v.as_str()).unwrap_or_default();
-        let ty = json.get("type").and_then(|v| v.as_str()).unwrap_or_default();
-        if ty == "message" && role == "assistant"
-            && let Some(content) = json.get("content").and_then(|v| v.as_str())
-        {
-            assistant_chunks.push(content.to_string());
-        }
+        let _ = parser.parse_line(line);
     }
-    if !assistant_chunks.is_empty() {
-        return Ok((assistant_chunks.join(""), discovered_session.or_else(|| session_id.map(ToString::to_string))));
+    let mut parsed = parser.finish();
+    if parsed.response_text.trim().is_empty() {
+        parsed.response_text = stdout.trim().to_string();
     }
-
-    let stdout_trimmed = stdout.trim().to_string();
-    if !stdout_trimmed.is_empty() {
-        return Ok((stdout_trimmed, discovered_session.or_else(|| session_id.map(ToString::to_string))));
+    if parsed.session_id.is_none() {
+        parsed.session_id = session_id.map(ToString::to_string);
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return Ok((stderr, discovered_session.or_else(|| session_id.map(ToString::to_string))));
-    }
-
-    anyhow::bail!("gemini connector returned empty output")
+    Ok(parsed)
 }
 
 fn extract_text_from_jsonl(stdout: &str) -> Option<String> {
@@ -682,7 +799,8 @@ async fn run_codex_cli_process_with_session(
     message: &str,
     cwd: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<(String, Option<String>)> {
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+) -> anyhow::Result<ParsedAgentResult> {
     let mut final_args = args.to_vec();
     if session_id.is_some() {
         final_args.insert(0, "resume".to_string());
@@ -708,66 +826,76 @@ async fn run_codex_cli_process_with_session(
     final_args.push(output_file.display().to_string());
     final_args.push(message.to_string());
 
-    let output = timeout(
-        connector_timeout(),
-        Command::new(bin)
-            .args(&final_args)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("codex connector timed out"))??;
+    let mut child = Command::new(bin)
+        .args(&final_args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("codex stdout missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("codex stderr missing"))?;
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                tracing::debug!("codex stderr: {trimmed}");
+            }
+        }
+    });
+
+    let mut parser = CodexExecParser::new();
+    let mut reader = BufReader::new(stdout).lines();
+    let mut raw_output = String::new();
+    let timeout_duration = connector_timeout();
+    let read = async {
+        while let Some(line) = reader.next_line().await? {
+            raw_output.push_str(&line);
+            raw_output.push('\n');
+            if let Some(event) = parser.parse_line(&line)
+                && let Some(tx) = events_tx.as_ref()
+            {
+                let _ = tx.send(event).await;
+            }
+        }
+        anyhow::Ok(())
+    };
+    timeout(timeout_duration, read)
+        .await
+        .map_err(|_| anyhow::anyhow!("codex connector timed out"))??;
+    let status = child.wait().await?;
 
     let last_message = fs::read_to_string(&output_file).unwrap_or_default();
     let _ = fs::remove_file(&output_file);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!("codex exited with status {}", output.status)
-        } else {
-            stderr
-        };
-        anyhow::bail!("codex connector failed: {detail}");
+    if !status.success() {
+        anyhow::bail!("codex connector failed: exited with status {status}");
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let mut discovered_thread: Option<String> = None;
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if discovered_thread.is_none() {
-            discovered_thread = json
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
+    let mut parsed = parser.finish();
+    if !last_message.trim().is_empty() {
+        parsed.response_text = last_message.trim().to_string();
+    } else if parsed.response_text.trim().is_empty() {
+        if let Some(text) = extract_text_from_jsonl(&raw_output) {
+            parsed.response_text = text;
+        } else {
+            parsed.response_text = raw_output.trim().to_string();
         }
     }
-
-    let session_out = discovered_thread.or_else(|| session_id.map(ToString::to_string));
-
-    if !last_message.trim().is_empty() {
-        return Ok((last_message.trim().to_string(), session_out));
+    if parsed.session_id.is_none() {
+        parsed.session_id = session_id.map(ToString::to_string);
     }
-
-    if let Some(text) = extract_text_from_jsonl(&stdout) {
-        return Ok((text, session_out));
-    }
-    let stdout_trimmed = stdout.trim().to_string();
-    if !stdout_trimmed.is_empty() {
-        return Ok((stdout_trimmed, session_out));
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return Ok((stderr, session_out));
-    }
-
-    anyhow::bail!("codex connector returned empty output")
+    Ok(parsed)
 }
 
 async fn run_agent_process_with_session(
@@ -777,12 +905,13 @@ async fn run_agent_process_with_session(
     message: &str,
     cwd: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<(String, Option<String>)> {
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+) -> anyhow::Result<ParsedAgentResult> {
     if is_mock_connector(bin) {
         #[cfg(test)]
         {
             let _ = cwd;
-            return run_mock_connector_process(bin, args, message, session_id).await;
+            return run_mock_connector_process(agent, bin, args, message, session_id).await;
         }
         #[cfg(not(test))]
         {
@@ -794,8 +923,14 @@ async fn run_agent_process_with_session(
     }
 
     match agent {
-        "gemini" => run_gemini_cli_process_with_session(bin, args, message, cwd, session_id).await,
-        "codex" => run_codex_cli_process_with_session(bin, args, message, cwd, session_id).await,
+        "gemini" => {
+            run_gemini_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
+                .await
+        }
+        "codex" => {
+            run_codex_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
+                .await
+        }
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
