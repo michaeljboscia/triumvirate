@@ -175,6 +175,17 @@ fn next_heartbeat_offset(current: Duration) -> Duration {
     }
 }
 
+fn mcp_daemon_proxy_enabled() -> bool {
+    #[cfg(test)]
+    {
+        return should_use_daemon_proxy(std::env::var("TRIUMVIRATE_MCP_USE_DAEMON").ok().as_deref());
+    }
+    #[cfg(not(test))]
+    {
+        return use_daemon_for_mcp_from_env();
+    }
+}
+
 #[cfg(not(test))]
 fn daemon_sessions_file_path() -> Option<PathBuf> {
     core_triumvirate_home_dir()
@@ -447,7 +458,7 @@ impl McpBridge {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<AskAgentResponse>, String> {
         let emitter = ProgressEmitter::from_context(&context);
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             let display = display_agent_name(&req.agent);
             emitter.emit(format!("→ {display}: sent ✓")).await;
             let mut pending = Box::pin(fetch_daemon_ask_agent(&req));
@@ -492,7 +503,7 @@ impl McpBridge {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<AskTwinsResponse>, String> {
         let emitter = ProgressEmitter::from_context(&context);
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             emitter.emit("→ Gemini: sent ✓").await;
             emitter.emit("→ Codex: sent ✓").await;
             let mut pending = Box::pin(fetch_daemon_ask_twins(&req));
@@ -542,7 +553,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<SpawnSessionRequest>,
     ) -> Result<String, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_session_spawn(&req)
                 .await
                 .map_err(|e| format!("spawn_session via daemon failed: {e}"));
@@ -582,7 +593,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskSessionRequest>,
     ) -> Result<String, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_session_ask(&req)
                 .await
                 .map_err(|e| format!("ask_session via daemon failed: {e}"));
@@ -626,7 +637,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<DismissSessionRequest>,
     ) -> Result<String, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_session_dismiss(&req)
                 .await
                 .map_err(|e| format!("dismiss_session via daemon failed: {e}"));
@@ -651,7 +662,7 @@ impl McpBridge {
 
     #[tool(description = "List active sessions.")]
     async fn list_sessions(&self) -> Json<SessionListResponse> {
-        if use_daemon_for_mcp_from_env()
+        if mcp_daemon_proxy_enabled()
             && let Ok(response) = fetch_daemon_session_list().await
         {
             return Json(response);
@@ -674,7 +685,7 @@ impl McpBridge {
         let sessions = self.sessions.lock().await;
         let local_bind_addr =
             core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
-        if use_daemon_for_mcp_from_env()
+        if mcp_daemon_proxy_enabled()
             && let Ok(snapshot) = fetch_daemon_status_snapshot().await
         {
             return Json(StatusResponse {
@@ -718,7 +729,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryWriteRequest>,
     ) -> Result<Json<MemoryWriteResponse>, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_memory_write(&req)
                 .await
                 .map(Json)
@@ -744,7 +755,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryReadRequest>,
     ) -> Result<Json<MemoryReadResponse>, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_memory_read(&req)
                 .await
                 .map(Json)
@@ -768,7 +779,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadWriteRequest>,
     ) -> Result<Json<ScratchpadWriteResponse>, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_scratchpad_write(&req)
                 .await
                 .map(Json)
@@ -786,7 +797,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadListRequest>,
     ) -> Result<Json<ScratchpadListResponse>, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_scratchpad_list(&req)
                 .await
                 .map(Json)
@@ -805,7 +816,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<OutboxRecentRequest>,
     ) -> Result<Json<OutboxRecentResponse>, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_outbox_recent(&req)
                 .await
                 .map(Json)
@@ -822,7 +833,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FallbackListRequest>,
     ) -> Result<Json<FallbackListResponse>, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_fallback_list(&req)
                 .await
                 .map(Json)
@@ -838,7 +849,7 @@ impl McpBridge {
 
     #[tool(description = "Acknowledge a dead-drop fallback ticket by deleting it.")]
     async fn fallback_ack(&self, Parameters(req): Parameters<FallbackAckRequest>) -> Result<String, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_fallback_ack(&req)
                 .await
                 .map_err(|e| format!("fallback_ack via daemon failed: {e}"));
@@ -852,7 +863,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FallbackGcRequest>,
     ) -> Result<Json<FallbackGcResponse>, String> {
-        if use_daemon_for_mcp_from_env() {
+        if mcp_daemon_proxy_enabled() {
             return fetch_daemon_fallback_gc(&req)
                 .await
                 .map(Json)
@@ -878,7 +889,7 @@ async fn execute_ask_agent(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
-    let execution_prompt = daemon_session_prepare_prompt(&agent, &exec_cwd, &req.message).await;
+    let execution_prompt = req.message.clone();
     let worker = acquire_worker(&agent, &exec_cwd).await;
     let mut worker_session_id = worker.session_id.clone();
     let worker_mode = worker.mode.clone();
@@ -1018,7 +1029,6 @@ async fn execute_ask_agent(
                 if let Some(emitter) = progress.as_ref() {
                     emitter.emit(format!("→ {agent_display}: responded ✓")).await;
                 }
-                daemon_session_record_response(&agent, &exec_cwd, &response).await;
                 return Ok(AskAgentResponse {
                     request_id,
                     agent: agent.clone(),
@@ -1175,8 +1185,8 @@ async fn execute_ask_twins(
     let codex_worker = acquire_worker("codex", &exec_cwd).await;
     let gemini_worker_mode = gemini_worker.mode.clone();
     let codex_worker_mode = codex_worker.mode.clone();
-    let gemini_prompt = daemon_session_prepare_prompt("gemini", &exec_cwd, &gemini_prompt_raw).await;
-    let codex_prompt = daemon_session_prepare_prompt("codex", &exec_cwd, &codex_prompt_raw).await;
+    let gemini_prompt = gemini_prompt_raw;
+    let codex_prompt = codex_prompt_raw;
 
     let mut lifecycle = vec![
         LifecycleEvent {
@@ -1321,7 +1331,6 @@ async fn execute_ask_twins(
                         if let Some(emitter) = progress.as_ref() {
                             emitter.emit(format!("→ {display}: responded ✓")).await;
                         }
-                        daemon_session_record_response(&agent, &exec_cwd, &response_for_session).await;
                     }
                     Err(e) => {
                         let detail = format!("{display} failed: {e}");
@@ -1438,6 +1447,44 @@ async fn run_named_agent_with_session(
     }
 }
 
+async fn prewarm_worker(agent: &str, cwd: &str) {
+    let worker = acquire_worker(agent, cwd).await;
+    let warm_prompt = "Prewarm this session. Reply with only: ready";
+    let warm_result = timeout(
+        daemon_prewarm_timeout(),
+        run_named_agent_with_session(agent, warm_prompt, cwd, worker.session_id.as_deref()),
+    )
+    .await;
+
+    match warm_result {
+        Ok(Ok((_, session_id))) => {
+            update_worker_session(agent, cwd, session_id).await;
+            tracing::info!("prewarm complete for {agent} cwd={cwd}");
+        }
+        Ok(Err(err)) => {
+            tracing::warn!("prewarm failed for {agent} cwd={cwd}: {err}");
+            let _ = dismiss_worker(agent, cwd).await;
+        }
+        Err(_) => {
+            tracing::warn!("prewarm timeout for {agent} cwd={cwd}");
+            let _ = dismiss_worker(agent, cwd).await;
+        }
+    }
+}
+
+async fn prewarm_daemon_workers() {
+    if !daemon_prewarm_enabled() {
+        tracing::info!("daemon prewarm disabled");
+        return;
+    }
+
+    let cwds = daemon_prewarm_cwds();
+    for cwd in cwds {
+        prewarm_worker("gemini", &cwd).await;
+        prewarm_worker("codex", &cwd).await;
+    }
+}
+
 fn is_mock_connector(bin: &str) -> bool {
     std::path::Path::new(bin)
         .file_name()
@@ -1452,6 +1499,51 @@ fn connector_timeout() -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(90))
+}
+
+fn daemon_prewarm_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_DAEMON_PREWARM")
+        .ok()
+        .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+fn daemon_prewarm_timeout() -> Duration {
+    std::env::var("TRIUMVIRATE_DAEMON_PREWARM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(20))
+}
+
+fn daemon_prewarm_cwds() -> Vec<String> {
+    if let Ok(raw) = std::env::var("TRIUMVIRATE_DAEMON_PREWARM_CWDS") {
+        let cwds = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !cwds.is_empty() {
+            return cwds;
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.display().to_string());
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd = cwd.display().to_string();
+        if !out.iter().any(|v| v == &cwd) {
+            out.push(cwd);
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    vec![".".to_string()]
 }
 
 #[cfg(test)]
@@ -2401,6 +2493,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         sessions: Arc::new(Mutex::new(sessions)),
         sessions_file,
     };
+    prewarm_daemon_workers().await;
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
