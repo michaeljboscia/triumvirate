@@ -15,7 +15,7 @@ use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use shared_types::{AskAgentRequest, AskAgentResponse, LifecycleEvent, OutboxEvent};
 use std::{fs, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::mpsc,
     time::{Instant, sleep, timeout},
@@ -185,10 +185,10 @@ pub(crate) async fn execute_ask_agent(
                     }) {
                         tracing::warn!("failed to append outbox event: {e}");
                     }
-                    if should_display(&event.state, verbosity) {
-                        if let Some(emitter) = progress.as_ref() {
-                            emitter.emit(outbox_detail).await;
-                        }
+                    if should_display(&event.state, verbosity)
+                        && let Some(emitter) = progress.as_ref()
+                    {
+                        emitter.emit(outbox_detail).await;
                     }
                     if let Some(reason) = stuck_detector.observe(&event) {
                         let stuck_event = WorkingStateEvent {
@@ -607,9 +607,9 @@ async fn run_mock_connector_process(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<ParsedAgentResult> {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut child = Command::new(&bin)
+    let mut child = Command::new(bin)
         .args(args)
         .env("TRIUMVIRATE_WORKER_SESSION_ID", session_id.unwrap_or(""))
         .stdin(std::process::Stdio::piped())
