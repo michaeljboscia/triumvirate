@@ -22,13 +22,15 @@ use daemon_core::{
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
 use daemon_http::{
-    attempt_daemon_autostart_once, fetch_daemon_ask_agent, fetch_daemon_fallback_ack,
+    fetch_daemon_ask_agent, fetch_daemon_fallback_ack,
     fetch_daemon_fallback_gc, fetch_daemon_fallback_list, fetch_daemon_memory_read,
     fetch_daemon_memory_write, fetch_daemon_outbox_recent, fetch_daemon_scratchpad_list,
     fetch_daemon_scratchpad_write, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
     fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
-    fetch_daemon_status_snapshot, reset_daemon_autostart_flag_for_tests,
+    fetch_daemon_status_snapshot,
 };
+#[cfg(test)]
+use daemon_http::{attempt_daemon_autostart_once, reset_daemon_autostart_flag_for_tests};
 use fallback_outbox::{
     acknowledge_fallback_path, append_outbox_event, count_pending_fallbacks, gc_fallbacks,
     list_pending_fallback_paths, read_outbox_events, spawn_dead_drop as create_dead_drop_fallback,
@@ -39,6 +41,8 @@ use mcp_bridge::{
     daemon_status_url, gemini_command,
     is_bearer_authorized, is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
 };
+#[cfg(not(test))]
+use mcp_bridge::use_daemon_for_mcp_from_env;
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use axum::{
     Json as AxumJson, Router,
