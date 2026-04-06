@@ -93,6 +93,26 @@ pub fn daemon_ask_twins_url() -> String {
         .unwrap_or_else(|_| format!("{}/ask-twins", daemon_base_url()))
 }
 
+pub fn daemon_session_spawn_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SESSION_SPAWN_URL")
+        .unwrap_or_else(|_| format!("{}/session/spawn", daemon_base_url()))
+}
+
+pub fn daemon_session_ask_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SESSION_ASK_URL")
+        .unwrap_or_else(|_| format!("{}/session/ask", daemon_base_url()))
+}
+
+pub fn daemon_session_dismiss_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SESSION_DISMISS_URL")
+        .unwrap_or_else(|_| format!("{}/session/dismiss", daemon_base_url()))
+}
+
+pub fn daemon_session_list_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_SESSION_LIST_URL")
+        .unwrap_or_else(|_| format!("{}/session/list", daemon_base_url()))
+}
+
 pub fn daemon_memory_write_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL")
         .unwrap_or_else(|_| format!("{}/memory/write", daemon_base_url()))
