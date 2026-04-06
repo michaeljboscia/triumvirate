@@ -224,9 +224,7 @@ pub(crate) async fn execute_ask_agent(
                             emitter.emit(stuck_detail).await;
                         }
                     }
-                    if matches!(event.state, WorkingState::TurnStarted | WorkingState::ToolCallStarted | WorkingState::ToolCallCompleted | WorkingState::MessageDelta) {
-                        next_heartbeat = started.elapsed() + Duration::from_secs(30);
-                    }
+                    next_heartbeat = started.elapsed() + Duration::from_secs(30);
                 }
                 _ = sleep(sleep_duration) => {
                     if started.elapsed() >= next_heartbeat {
