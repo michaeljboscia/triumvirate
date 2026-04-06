@@ -191,10 +191,38 @@ pub(crate) async fn execute_ask_agent(
                         }
                     }
                     if let Some(reason) = stuck_detector.observe(&event) {
+                        let stuck_event = WorkingStateEvent {
+                            agent: agent.clone(),
+                            state: WorkingState::Stuck,
+                            detail: format!("detected potential stuck state: {:?}", reason),
+                            tool_name: None,
+                            tool_args_json: None,
+                            token_usage: None,
+                            ts_ms: Some(core_unix_time_ms()),
+                        };
                         lifecycle.push(LifecycleEvent {
                             state: "STUCK".to_string(),
-                            detail: format!("detected potential stuck state: {:?}", reason),
+                            detail: stuck_event.detail.clone(),
                         });
+                        let stuck_detail = format_working_state(&stuck_event);
+                        if let Err(e) = append_outbox_event(&OutboxEvent {
+                            ts_ms: core_unix_time_ms(),
+                            request_id: request_id.clone(),
+                            tool: "ask_agent".to_string(),
+                            status: "WORKING_EVENT".to_string(),
+                            agent: Some(agent.clone()),
+                            detail: stuck_detail.clone(),
+                            cwd: resolved_cwd.clone(),
+                            repo: resolved_repo.clone(),
+                            branch: resolved_branch.clone(),
+                        }) {
+                            tracing::warn!("failed to append outbox event: {e}");
+                        }
+                        if should_display(&stuck_event.state, verbosity)
+                            && let Some(emitter) = progress.as_ref()
+                        {
+                            emitter.emit(stuck_detail).await;
+                        }
                     }
                     if matches!(event.state, WorkingState::TurnStarted | WorkingState::ToolCallStarted | WorkingState::ToolCallCompleted | WorkingState::MessageDelta) {
                         next_heartbeat = started.elapsed() + Duration::from_secs(30);
@@ -203,10 +231,38 @@ pub(crate) async fn execute_ask_agent(
                 _ = sleep(sleep_duration) => {
                     if started.elapsed() >= next_heartbeat {
                         if let Some(reason) = stuck_detector.check_timeouts() {
+                            let stuck_event = WorkingStateEvent {
+                                agent: agent.clone(),
+                                state: WorkingState::Stuck,
+                                detail: format!("detected potential stuck timeout: {:?}", reason),
+                                tool_name: None,
+                                tool_args_json: None,
+                                token_usage: None,
+                                ts_ms: Some(core_unix_time_ms()),
+                            };
                             lifecycle.push(LifecycleEvent {
                                 state: "STUCK".to_string(),
-                                detail: format!("detected potential stuck timeout: {:?}", reason),
+                                detail: stuck_event.detail.clone(),
                             });
+                            let stuck_detail = format_working_state(&stuck_event);
+                            if let Err(e) = append_outbox_event(&OutboxEvent {
+                                ts_ms: core_unix_time_ms(),
+                                request_id: request_id.clone(),
+                                tool: "ask_agent".to_string(),
+                                status: "WORKING_EVENT".to_string(),
+                                agent: Some(agent.clone()),
+                                detail: stuck_detail.clone(),
+                                cwd: resolved_cwd.clone(),
+                                repo: resolved_repo.clone(),
+                                branch: resolved_branch.clone(),
+                            }) {
+                                tracing::warn!("failed to append outbox event: {e}");
+                            }
+                            if should_display(&stuck_event.state, verbosity)
+                                && let Some(emitter) = progress.as_ref()
+                            {
+                                emitter.emit(stuck_detail).await;
+                            }
                         }
                         let elapsed = started.elapsed().as_secs();
                         let detail = format!("{agent} still working ({elapsed}s elapsed)");
