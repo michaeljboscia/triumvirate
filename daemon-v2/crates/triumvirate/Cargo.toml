@@ -23,5 +23,6 @@ daemon-core = { path = "../daemon-core" }
 mcp-bridge = { path = "../mcp-bridge" }
 agent-worker = { path = "../agent-worker" }
 mcp-tools = { path = "../mcp-tools" }
+daemon-http = { path = "../daemon-http" }
 
 [dev-dependencies]
