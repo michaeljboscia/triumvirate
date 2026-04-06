@@ -357,6 +357,23 @@ async fn acquire_worker(agent: &str, cwd: &str) -> WorkerAcquireResult {
     result
 }
 
+async fn require_reused_worker(agent: &str, cwd: &str) -> Result<WorkerState, String> {
+    let key = worker_key(agent, cwd);
+    let mut workers = worker_registry_store().lock().await;
+    let now = core_unix_time_ms();
+    let Some(state) = workers.get_mut(&key) else {
+        return Err(format!("worker_missing agent={agent} cwd={cwd}"));
+    };
+    if state.session_id.is_none() {
+        return Err(format!("worker_missing_session agent={agent} cwd={cwd}"));
+    }
+    state.ask_count = state.ask_count.saturating_add(1);
+    state.last_used_ms = now;
+    let out = state.clone();
+    persist_worker_registry_if_enabled(&workers);
+    Ok(out)
+}
+
 async fn update_worker_session(agent: &str, cwd: &str, session_id: Option<String>) {
     let key = worker_key(agent, cwd);
     let mut workers = worker_registry_store().lock().await;
@@ -1181,51 +1198,51 @@ async fn execute_ask_twins(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
-    let gemini_worker = acquire_worker("gemini", &exec_cwd).await;
-    let codex_worker = acquire_worker("codex", &exec_cwd).await;
-    let gemini_worker_mode = gemini_worker.mode.clone();
-    let codex_worker_mode = codex_worker.mode.clone();
+    let mut lifecycle = vec![LifecycleEvent {
+        state: "DAEMON_DISPATCHED".to_string(),
+        detail: "Daemon dispatched request to persistent workers".to_string(),
+    }];
+    let gemini_worker = require_reused_worker("gemini", &exec_cwd).await;
+    let codex_worker = require_reused_worker("codex", &exec_cwd).await;
+    let mut missing = Vec::new();
+    if let Err(err) = &gemini_worker {
+        missing.push(format!("gemini: {err}"));
+    }
+    if let Err(err) = &codex_worker {
+        missing.push(format!("codex: {err}"));
+    }
+    if !missing.is_empty() {
+        for detail in &missing {
+            lifecycle.push(LifecycleEvent {
+                state: "WORKER_MISSING".to_string(),
+                detail: detail.clone(),
+            });
+        }
+        if let Some(emitter) = progress.as_ref() {
+            emitter.emit("→ Twins: WORKER_MISSING ✗").await;
+        }
+        return Err(format!(
+            "DAEMON_WORKERS_NOT_READY: {}",
+            missing.join(" | ")
+        ));
+    }
+    let gemini_worker = gemini_worker.expect("checked above");
+    let codex_worker = codex_worker.expect("checked above");
     let gemini_prompt = gemini_prompt_raw;
     let codex_prompt = codex_prompt_raw;
 
-    let mut lifecycle = vec![
-        LifecycleEvent {
-            state: match gemini_worker_mode {
-                WorkerAcquireMode::Spawned => "SPAWNED",
-                WorkerAcquireMode::Reused => "REUSED",
-            }
-            .to_string(),
-            detail: format!(
-                "Gemini worker {} (spawn_count={})",
-                if gemini_worker_mode == WorkerAcquireMode::Spawned {
-                    "started"
-                } else {
-                    "reused"
-                },
-                gemini_worker.spawn_count
-            ),
-        },
-        LifecycleEvent {
-            state: match codex_worker_mode {
-                WorkerAcquireMode::Spawned => "SPAWNED",
-                WorkerAcquireMode::Reused => "REUSED",
-            }
-            .to_string(),
-            detail: format!(
-                "Codex worker {} (spawn_count={})",
-                if codex_worker_mode == WorkerAcquireMode::Spawned {
-                    "started"
-                } else {
-                    "reused"
-                },
-                codex_worker.spawn_count
-            ),
-        },
-        LifecycleEvent {
-            state: "WORKING".to_string(),
-            detail: "Gemini and Codex processing in parallel".to_string(),
-        },
-    ];
+    lifecycle.push(LifecycleEvent {
+        state: "WORKER_REUSED".to_string(),
+        detail: format!("Gemini worker reused (spawn_count={})", gemini_worker.spawn_count),
+    });
+    lifecycle.push(LifecycleEvent {
+        state: "WORKER_REUSED".to_string(),
+        detail: format!("Codex worker reused (spawn_count={})", codex_worker.spawn_count),
+    });
+    lifecycle.push(LifecycleEvent {
+        state: "WORKING".to_string(),
+        detail: "Gemini and Codex processing in parallel".to_string(),
+    });
     if let Some(emitter) = progress.as_ref() {
         emitter.emit("→ Gemini: sent ✓").await;
         emitter.emit("→ Codex: sent ✓").await;
@@ -1249,7 +1266,7 @@ async fn execute_ask_twins(
 
     let mut handles = tokio::task::JoinSet::new();
     let gemini_exec_cwd = exec_cwd.clone();
-    let gemini_session_id = gemini_worker.session_id.clone();
+    let gemini_session_id = gemini_worker.session_id.clone().expect("checked above");
     handles.spawn(async move {
         let prompt_sent = gemini_prompt.clone();
         (
@@ -1259,13 +1276,13 @@ async fn execute_ask_twins(
                 "gemini",
                 &gemini_prompt,
                 &gemini_exec_cwd,
-                gemini_session_id.as_deref(),
+                Some(gemini_session_id.as_str()),
             )
             .await,
         )
     });
     let codex_exec_cwd = exec_cwd.clone();
-    let codex_session_id = codex_worker.session_id.clone();
+    let codex_session_id = codex_worker.session_id.clone().expect("checked above");
     handles.spawn(async move {
         let prompt_sent = codex_prompt.clone();
         (
@@ -1275,7 +1292,7 @@ async fn execute_ask_twins(
                 "codex",
                 &codex_prompt,
                 &codex_exec_cwd,
-                codex_session_id.as_deref(),
+                Some(codex_session_id.as_str()),
             )
             .await,
         )
@@ -1307,7 +1324,6 @@ async fn execute_ask_twins(
                 match outcome {
                     Ok((response, session_id)) => {
                         update_worker_session(&agent, &exec_cwd, session_id).await;
-                        let response_for_session = response.clone();
                         lifecycle.push(LifecycleEvent {
                             state: "DONE".to_string(),
                             detail: format!("{display} responded"),
@@ -1498,7 +1514,7 @@ fn connector_timeout() -> Duration {
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(90))
+        .unwrap_or(Duration::from_secs(180))
 }
 
 fn daemon_prewarm_enabled() -> bool {
@@ -1513,7 +1529,7 @@ fn daemon_prewarm_timeout() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(20))
+        .unwrap_or(Duration::from_secs(60))
 }
 
 fn daemon_prewarm_cwds() -> Vec<String> {
