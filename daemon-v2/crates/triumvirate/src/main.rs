@@ -384,6 +384,14 @@ async fn update_worker_session(agent: &str, cwd: &str, session_id: Option<String
     }
 }
 
+fn should_invalidate_cached_session(error_text: &str) -> bool {
+    let msg = error_text.to_lowercase();
+    msg.contains("invalid session identifier")
+        || msg.contains("error resuming session")
+        || msg.contains("session not found")
+        || msg.contains("unknown session")
+}
+
 async fn dismiss_worker(agent: &str, cwd: &str) -> bool {
     let key = worker_key(agent, cwd);
     let mut workers = worker_registry_store().lock().await;
@@ -1003,6 +1011,35 @@ async fn execute_ask_agent(
             }
             Err(e) => {
                 let msg = e.to_string();
+                if session_for_attempt.is_some() && should_invalidate_cached_session(&msg) {
+                    worker_session_id = None;
+                    update_worker_session(&agent, &exec_cwd, None).await;
+                    let invalidated_detail = format!(
+                        "{agent} session invalidated after stale resume ID; retrying with a fresh session"
+                    );
+                    lifecycle.push(LifecycleEvent {
+                        state: "SESSION_INVALIDATED".to_string(),
+                        detail: invalidated_detail.clone(),
+                    });
+                    if let Err(e) = append_outbox_event(&OutboxEvent {
+                        ts_ms: core_unix_time_ms(),
+                        request_id: request_id.clone(),
+                        tool: "ask_agent".to_string(),
+                        status: "SESSION_INVALIDATED".to_string(),
+                        agent: Some(agent.clone()),
+                        detail: invalidated_detail,
+                        cwd: resolved_cwd.clone(),
+                        repo: resolved_repo.clone(),
+                        branch: resolved_branch.clone(),
+                    }) {
+                        tracing::warn!("failed to append outbox event: {e}");
+                    }
+                    if let Some(emitter) = progress.as_ref() {
+                        emitter
+                            .emit(format!("→ {agent_display}: stale session detected, respawning..."))
+                            .await;
+                    }
+                }
                 if msg.contains("timed out") {
                     lifecycle.push(LifecycleEvent {
                         state: "TIMEOUT".to_string(),
@@ -1251,6 +1288,8 @@ async fn run_mock_connector_process(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<(String, Option<String>)> {
+    use tokio::io::AsyncReadExt;
+
     let mut child = Command::new(&bin)
         .args(args)
         .env("TRIUMVIRATE_WORKER_SESSION_ID", session_id.unwrap_or(""))
@@ -1271,7 +1310,12 @@ async fn run_mock_connector_process(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("gemini stdout missing"))?;
+    let mut stderr_reader = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("gemini stderr missing"))?;
     let mut lines = BufReader::new(stdout).lines();
+    let mut non_json_line: Option<String> = None;
 
     // The mock connector may emit readiness notifications before the final result; scan until we
     // find a JSON-RPC payload with result.text.
@@ -1290,15 +1334,38 @@ async fn run_mock_connector_process(
                 {
                     return Ok(text.to_string());
                 }
+            } else {
+                non_json_line = Some(trimmed.to_string());
             }
         }
-        Err(anyhow::anyhow!("no result.text message from gemini connector"))
+        if let Some(line) = non_json_line {
+            Err(anyhow::anyhow!("mock connector output: {line}"))
+        } else {
+            Err(anyhow::anyhow!("no result.text message from gemini connector"))
+        }
     })
     .await;
 
     let response = match read_result {
-        Ok(result) => result?,
-        Err(_) => anyhow::bail!("mock connector timed out"),
+        Ok(result) => match result {
+            Ok(response) => response,
+            Err(err) => {
+                let _ = child.kill().await;
+                let mut stderr = String::new();
+                let _ = stderr_reader.read_to_string(&mut stderr).await;
+                let _ = child.wait().await;
+                let stderr = stderr.trim();
+                if !stderr.is_empty() {
+                    anyhow::bail!("mock connector failed: {stderr}");
+                }
+                return Err(err);
+            }
+        },
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!("mock connector timed out")
+        }
     };
 
     let _ = child.kill().await;
@@ -2767,6 +2834,28 @@ exit 1\n",
         Ok(path)
     }
 
+    fn write_invalid_session_recovery_script(name: &str) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mock-{name}-invalid-session-{now}.sh"));
+        let script = format!(
+            "#!/bin/sh\n\
+if [ -n \"$TRIUMVIRATE_WORKER_SESSION_ID\" ]; then\n\
+  echo 'Error resuming session: Invalid session identifier \"'$TRIUMVIRATE_WORKER_SESSION_ID'\".' 1>&2\n\
+  exit 1\n\
+fi\n\
+IFS= read -r _line\n\
+echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered with fresh session\"}}}}'\n",
+            name = name
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     #[tokio::test]
     async fn ask_agent_gemini_happy_path_returns_lifecycle() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
@@ -2937,6 +3026,51 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_invalid_stale_session_recovers_with_fresh_spawn() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        reset_worker_registry_for_tests().await;
+        let script_path = write_invalid_session_recovery_script("gemini")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let cwd = "/tmp/invalid-session-recovery";
+        let _ = acquire_worker("gemini", cwd).await;
+        update_worker_session("gemini", cwd, Some("stale-session-id".to_string())).await;
+
+        let response = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: "recover please".to_string(),
+                cwd: Some(cwd.to_string()),
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+        assert!(response.response.contains("gemini recovered with fresh session"));
+        assert!(response
+            .lifecycle
+            .iter()
+            .any(|e| e.state == "SESSION_INVALIDATED"));
+        assert!(response.lifecycle.iter().any(|e| e.state == "RETRY"));
+        assert!(response.lifecycle.iter().any(|e| e.state == "DONE"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        let _ = fs::remove_file(script_path);
         Ok(())
     }
 
