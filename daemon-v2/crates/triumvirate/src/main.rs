@@ -42,10 +42,17 @@ use mcp_bridge::{
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use axum::{
     Json as AxumJson, Router,
+    body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
 };
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGauge, Registry, TextEncoder};
 use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -80,6 +87,7 @@ use tokio::{
 };
 #[cfg(test)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -1360,15 +1368,66 @@ impl ServerHandler for McpBridge {
     }
 }
 
+fn init_tracing() -> anyhow::Result<()> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "triumvirate=info".into());
+    let json_logs = should_use_daemon_proxy(std::env::var("TRIUMVIRATE_JSON_LOGS").ok().as_deref());
+    let otel_endpoint = std::env::var("TRIUMVIRATE_OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+
+    match (json_logs, otel_endpoint) {
+        (true, Some(endpoint)) => {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint)
+                .build()?;
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(Resource::builder().with_service_name("triumvirate-daemon-v2").build())
+                .build();
+            let tracer = provider.tracer("triumvirate-daemon-v2");
+            opentelemetry::global::set_tracer_provider(provider);
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().json().with_target(false))
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .init();
+        }
+        (false, Some(endpoint)) => {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint)
+                .build()?;
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(Resource::builder().with_service_name("triumvirate-daemon-v2").build())
+                .build();
+            let tracer = provider.tracer("triumvirate-daemon-v2");
+            opentelemetry::global::set_tracer_provider(provider);
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().with_target(false))
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .init();
+        }
+        (true, None) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().json().with_target(false))
+                .init();
+        }
+        (false, None) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().with_target(false))
+                .init();
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "triumvirate=info".into()),
-        )
-        .with_target(false)
-        .init();
+    init_tracing()?;
 
     match Cli::parse().command {
         CliCommand::Mcp => {
@@ -1517,12 +1576,95 @@ fn build_status_report(
 
 async fn run_daemon() -> anyhow::Result<()> {
     #[derive(Debug, Clone)]
+    struct DaemonMetrics {
+        registry: Registry,
+        requests_total: IntCounterVec,
+        request_duration_seconds: HistogramVec,
+        in_flight_requests: IntGauge,
+    }
+
+    impl DaemonMetrics {
+        fn new() -> anyhow::Result<Self> {
+            let registry = Registry::new();
+            let requests_total = IntCounterVec::new(
+                prometheus::Opts::new("triumvirate_http_requests_total", "HTTP requests by route and status"),
+                &["route", "status"],
+            )?;
+            let request_duration_seconds = HistogramVec::new(
+                prometheus::HistogramOpts::new(
+                    "triumvirate_http_request_duration_seconds",
+                    "HTTP request durations by route",
+                ),
+                &["route"],
+            )?;
+            let in_flight_requests = IntGauge::new(
+                "triumvirate_http_requests_in_flight",
+                "In-flight HTTP requests",
+            )?;
+            registry.register(Box::new(requests_total.clone()))?;
+            registry.register(Box::new(request_duration_seconds.clone()))?;
+            registry.register(Box::new(in_flight_requests.clone()))?;
+            Ok(Self {
+                registry,
+                requests_total,
+                request_duration_seconds,
+                in_flight_requests,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
     struct DaemonState {
         token: String,
         queues: QueueRegistry,
         bind_addr: String,
         sessions: Arc<Mutex<HashMap<String, SessionState>>>,
         sessions_file: Option<PathBuf>,
+        metrics: Arc<DaemonMetrics>,
+    }
+
+    async fn metrics_route(
+        State(state): State<DaemonState>,
+    ) -> Result<String, (StatusCode, AxumJson<serde_json::Value>)> {
+        let metric_families = state.metrics.registry.gather();
+        let mut body = Vec::<u8>::new();
+        TextEncoder::new().encode(&metric_families, &mut body).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+        String::from_utf8(body).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })
+    }
+
+    async fn metrics_middleware(
+        State(state): State<DaemonState>,
+        request: Request<Body>,
+        next: Next,
+    ) -> Response {
+        let route = request.uri().path().to_string();
+        state.metrics.in_flight_requests.inc();
+        let started = Instant::now();
+        let response = next.run(request).await;
+        let elapsed = started.elapsed().as_secs_f64();
+        let status = response.status().as_u16().to_string();
+        state
+            .metrics
+            .requests_total
+            .with_label_values(&[route.as_str(), status.as_str()])
+            .inc();
+        state
+            .metrics
+            .request_duration_seconds
+            .with_label_values(&[route.as_str()])
+            .observe(elapsed);
+        state.metrics.in_flight_requests.dec();
+        response
     }
 
     async fn health(
@@ -1918,8 +2060,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         bind_addr: bind_addr.clone(),
         sessions: Arc::new(Mutex::new(sessions)),
         sessions_file,
+        metrics: Arc::new(DaemonMetrics::new()?),
     };
     let app = Router::new()
+        .route("/metrics", get(metrics_route))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/ask-agent", post(ask_agent_route))
@@ -1935,7 +2079,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/ask", post(session_ask_route))
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
-        .with_state(state);
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, metrics_middleware));
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tokio::spawn(async {
         prewarm_daemon_workers().await;
