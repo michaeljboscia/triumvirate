@@ -22,5 +22,6 @@ shared-types = { path = "../shared-types" }
 daemon-core = { path = "../daemon-core" }
 mcp-bridge = { path = "../mcp-bridge" }
 agent-worker = { path = "../agent-worker" }
+mcp-tools = { path = "../mcp-tools" }
 
 [dev-dependencies]
