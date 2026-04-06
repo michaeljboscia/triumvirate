@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/daemon-core","crates/mcp-bridge", "crates/shared-types","crates/triumvirate"]
+members = ["crates/agent-worker","crates/daemon-core","crates/mcp-bridge", "crates/shared-types","crates/triumvirate"]
 
 [workspace.package]
 version = "0.1.0"
