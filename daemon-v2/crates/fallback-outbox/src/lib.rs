@@ -2,6 +2,7 @@ use daemon_core::{
     acknowledge_dead_drop_ticket, append_outbox_event as core_append_outbox_event,
     count_dead_drop_tickets, create_dead_drop_ticket, gc_dead_drop_tickets, list_dead_drop_tickets,
     read_outbox_events as core_read_outbox_events, triumvirate_home_dir as core_triumvirate_home_dir,
+    DeadDropTicket,
 };
 use shared_types::OutboxEvent;
 use std::path::PathBuf;
@@ -23,16 +24,15 @@ pub fn spawn_dead_drop(
     branch: &Option<String>,
     ticket_id: &str,
 ) -> anyhow::Result<PathBuf> {
-    create_dead_drop_ticket(
-        &core_triumvirate_home_dir()?,
+    create_dead_drop_ticket(&core_triumvirate_home_dir()?, DeadDropTicket {
         agent,
         message,
         reason,
-        cwd,
-        repo,
-        branch,
-        ticket_id,
-    )
+        cwd: cwd.as_deref(),
+        repo: repo.as_deref(),
+        branch: branch.as_deref(),
+        id: ticket_id,
+    })
 }
 
 pub fn count_pending_fallbacks() -> anyhow::Result<usize> {
