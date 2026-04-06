@@ -1,0 +1,11 @@
+[package]
+name = "mcp-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rmcp.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

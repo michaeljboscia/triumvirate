@@ -1,8 +1,10 @@
 use daemon_core::{
     load_json_file_if_exists as core_load_json_file_if_exists,
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
-    triumvirate_home_dir as core_triumvirate_home_dir, unix_time_ms as core_unix_time_ms,
+    unix_time_ms as core_unix_time_ms,
 };
+#[cfg(not(test))]
+use daemon_core::triumvirate_home_dir as core_triumvirate_home_dir;
 use std::{
     collections::HashMap,
     path::PathBuf,
