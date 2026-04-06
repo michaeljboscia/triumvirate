@@ -27,25 +27,33 @@ pub fn triumvirate_home_dir() -> anyhow::Result<PathBuf> {
     Ok(home.join(".triumvirate"))
 }
 
+pub struct DeadDropTicket<'a> {
+    pub agent: &'a str,
+    pub message: &'a str,
+    pub reason: &'a str,
+    pub cwd: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub id: &'a str,
+}
+
 pub fn create_dead_drop_ticket(
     root: &Path,
-    agent: &str,
-    message: &str,
-    reason: &str,
-    cwd: &Option<String>,
-    repo: &Option<String>,
-    branch: &Option<String>,
-    id: &str,
+    ticket: DeadDropTicket<'_>,
 ) -> anyhow::Result<PathBuf> {
     let dir = dead_drop_dir(root);
     fs::create_dir_all(&dir)?;
-    let file = dir.join(format!("{id}-{agent}.md"));
+    let file = dir.join(format!("{}-{}.md", ticket.id, ticket.agent));
     let body = format!(
-        "# Dead Drop Fallback\n\nid: {id}\nagent: {agent}\nreason: {reason}\n\
+        "# Dead Drop Fallback\n\nid: {}\nagent: {}\nreason: {}\n\
 cwd: {}\nrepo: {}\nbranch: {}\n\n## Original Request\n{message}\n",
-        cwd.clone().unwrap_or_default(),
-        repo.clone().unwrap_or_default(),
-        branch.clone().unwrap_or_default()
+        ticket.id,
+        ticket.agent,
+        ticket.reason,
+        ticket.cwd.unwrap_or_default(),
+        ticket.repo.unwrap_or_default(),
+        ticket.branch.unwrap_or_default(),
+        message = ticket.message
     );
     fs::write(&file, body)?;
     Ok(file)
@@ -396,16 +404,15 @@ mod tests {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let root = std::env::temp_dir().join(format!("daemon-core-dd-{now}"));
         let id = "abc";
-        let _ = super::create_dead_drop_ticket(
-            &root,
-            "gemini",
-            "hello",
-            "timeout",
-            &None,
-            &None,
-            &None,
+        let _ = super::create_dead_drop_ticket(&root, super::DeadDropTicket {
+            agent: "gemini",
+            message: "hello",
+            reason: "timeout",
+            cwd: None,
+            repo: None,
+            branch: None,
             id,
-        )?;
+        })?;
         assert_eq!(super::count_dead_drop_tickets(&root)?, 1);
         let _ = std::fs::remove_dir_all(root);
         Ok(())
