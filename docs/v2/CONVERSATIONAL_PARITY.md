@@ -4,6 +4,8 @@
 **Author:** Claude (the orchestrator, writing from lived experience)
 **Status:** SPEC — no code until this is approved. Then goatrodeo.
 
+**2026-04-06 Update:** `ask_twins` has been retired from the daemon/MCP surface. Equivalent behavior is now explicit session orchestration.
+
 ---
 
 ## How Mike Uses The System Today

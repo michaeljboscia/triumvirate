@@ -5,6 +5,8 @@
 **Traces to:** SPEC_FINAL.md (user stories + parity checklist), GOATRODEO_LEDGER.md (decisions)
 **Built by:** Claude (scaffold) + Codex (flesh out)
 
+**2026-04-06 Update:** `ask_twins` tests are legacy references. Active fan-out validation now uses explicit session flow (`spawn_session` + parallel `ask_session` + `dismiss_session`).
+
 ---
 
 ## Part 1: REQ → User Story → Test Traceability

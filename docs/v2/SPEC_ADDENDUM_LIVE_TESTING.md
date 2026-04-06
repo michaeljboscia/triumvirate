@@ -4,6 +4,8 @@
 **Context:** First live test of triumvirate v2 daemon
 **Status:** MANDATORY — these clarify intent that was ambiguous in SPEC_FINAL.md
 
+**2026-04-06 Update:** This addendum captures historical `ask_twins` semantics. The tool has now been removed; keep the session-backed lifecycle requirements, but execute fan-out through explicit sessions.
+
 ---
 
 ## Clarification 1: ALL agent interaction is session-backed

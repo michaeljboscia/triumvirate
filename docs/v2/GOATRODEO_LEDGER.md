@@ -68,7 +68,7 @@
 | 25 | R9 | Thread-safe concurrent access |
 | 26 | R9 | Real e2e test at every increment |
 | 27 | R9 | Daemon stays HTTP-only, no native MCP |
-| 28 | R10 | ask_twins defaults to raw prompt passthrough; role adaptation becomes explicit opt-in |
+| 28 | R10 | (Historical) ask_twins prompt semantics were passthrough-by-default; tool retired on 2026-04-06 in favor of explicit session fan-out |
 
 ## Contradictions Resolved
 
