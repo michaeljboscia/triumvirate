@@ -3,7 +3,7 @@
 //! This crate will own tool routing and stdio-facing concerns as we continue
 //! extracting logic from the monolithic `triumvirate` binary crate.
 
-use shared_types::{AskAgentRequest, AskTwinsRequest};
+use shared_types::AskAgentRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
@@ -16,18 +16,6 @@ impl Default for BridgeInfo {
             name: "triumvirate-mcp-bridge",
         }
     }
-}
-
-pub fn build_role_adapted_prompts(req: &AskTwinsRequest) -> (String, String) {
-    let gemini_prompt = format!(
-        "[Gemini role: research/analysis]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-        req.message, req.cwd, req.repo, req.branch
-    );
-    let codex_prompt = format!(
-        "[Codex role: implementation/testing]\nQuestion: {}\nContext: cwd={:?} repo={:?} branch={:?}",
-        req.message, req.cwd, req.repo, req.branch
-    );
-    (gemini_prompt, codex_prompt)
 }
 
 pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
@@ -89,11 +77,6 @@ pub fn daemon_health_url() -> String {
 pub fn daemon_ask_agent_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL")
         .unwrap_or_else(|_| format!("{}/ask-agent", daemon_base_url()))
-}
-
-pub fn daemon_ask_twins_url() -> String {
-    std::env::var("TRIUMVIRATE_DAEMON_ASK_TWINS_URL")
-        .unwrap_or_else(|_| format!("{}/ask-twins", daemon_base_url()))
 }
 
 pub fn daemon_session_spawn_url() -> String {
@@ -180,7 +163,7 @@ fn resolve_connector_command(
 mod tests {
     use std::sync::{Mutex, OnceLock};
 
-    use shared_types::{AskAgentRequest, AskTwinsRequest};
+    use shared_types::AskAgentRequest;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -191,19 +174,6 @@ mod tests {
     fn default_name_is_stable() {
         let info = super::BridgeInfo::default();
         assert_eq!(info.name, "triumvirate-mcp-bridge");
-    }
-
-    #[test]
-    fn prompt_builder_includes_role_labels() {
-        let req = AskTwinsRequest {
-            message: "Add auth".to_string(),
-            cwd: Some("/tmp".to_string()),
-            repo: Some("triumvirate".to_string()),
-            branch: Some("feat/mcp-first".to_string()),
-        };
-        let (gemini, codex) = super::build_role_adapted_prompts(&req);
-        assert!(gemini.contains("[Gemini role: research/analysis]"));
-        assert!(codex.contains("[Codex role: implementation/testing]"));
     }
 
     #[test]
