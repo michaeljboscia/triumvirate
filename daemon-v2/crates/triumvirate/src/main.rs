@@ -17,12 +17,14 @@ use daemon_core::{
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
 use mcp_bridge::{
-    build_role_adapted_prompts, daemon_ask_agent_url, daemon_ask_twins_url, daemon_base_url,
+    daemon_ask_agent_url, daemon_ask_twins_url, daemon_base_url,
     codex_command,
     daemon_autostart_enabled,
     daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
     daemon_health_url,
     daemon_memory_read_url, daemon_memory_write_url, daemon_outbox_recent_url,
+    daemon_session_ask_url, daemon_session_dismiss_url, daemon_session_list_url,
+    daemon_session_spawn_url,
     daemon_scratchpad_list_url, daemon_scratchpad_write_url, daemon_status_url, gemini_command,
     is_bearer_authorized, is_supported_agent, is_supported_agent_name, should_use_daemon_proxy,
     use_daemon_for_mcp_from_env,
@@ -60,12 +62,11 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
+        OnceLock,
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
-#[cfg(not(test))]
-use std::sync::OnceLock;
 use tokio::{
     process::Command,
     sync::Mutex,
@@ -253,6 +254,124 @@ async fn daemon_session_record_response(agent: &str, cwd: &str, response: &str) 
 #[cfg(test)]
 async fn daemon_session_record_response(_agent: &str, _cwd: &str, _response: &str) {}
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorkerState {
+    agent: String,
+    cwd: String,
+    session_id: Option<String>,
+    spawn_count: u64,
+    ask_count: u64,
+    last_used_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerAcquireMode {
+    Spawned,
+    Reused,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerAcquireResult {
+    mode: WorkerAcquireMode,
+    session_id: Option<String>,
+    spawn_count: u64,
+}
+
+type WorkerRegistry = Arc<Mutex<HashMap<String, WorkerState>>>;
+
+fn worker_key(agent: &str, cwd: &str) -> String {
+    format!("{agent}::{cwd}")
+}
+
+#[cfg(not(test))]
+fn worker_store_path() -> Option<PathBuf> {
+    core_triumvirate_home_dir()
+        .ok()
+        .map(|home| home.join("workers.json"))
+}
+
+#[cfg(test)]
+fn worker_store_path() -> Option<PathBuf> {
+    None
+}
+
+fn load_worker_registry_from_disk() -> HashMap<String, WorkerState> {
+    worker_store_path()
+        .as_ref()
+        .and_then(|path| core_load_json_file_if_exists::<HashMap<String, WorkerState>>(path).ok())
+        .unwrap_or_default()
+}
+
+fn persist_worker_registry_if_enabled(workers: &HashMap<String, WorkerState>) {
+    if let Some(path) = worker_store_path()
+        && let Err(err) = core_persist_json_file_if_enabled(Some(&path), workers)
+    {
+        tracing::warn!("failed to persist worker registry: {err}");
+    }
+}
+
+fn worker_registry_store() -> &'static WorkerRegistry {
+    static STORE: OnceLock<WorkerRegistry> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(Mutex::new(load_worker_registry_from_disk())))
+}
+
+async fn acquire_worker(agent: &str, cwd: &str) -> WorkerAcquireResult {
+    let key = worker_key(agent, cwd);
+    let mut workers = worker_registry_store().lock().await;
+    let now = core_unix_time_ms();
+    let state = workers.entry(key).or_insert_with(|| WorkerState {
+        agent: agent.to_string(),
+        cwd: cwd.to_string(),
+        session_id: None,
+        spawn_count: 0,
+        ask_count: 0,
+        last_used_ms: now,
+    });
+    let mode = if state.ask_count == 0 {
+        WorkerAcquireMode::Spawned
+    } else {
+        WorkerAcquireMode::Reused
+    };
+    if mode == WorkerAcquireMode::Spawned {
+        state.spawn_count = state.spawn_count.saturating_add(1);
+    }
+    state.ask_count = state.ask_count.saturating_add(1);
+    state.last_used_ms = now;
+    let result = WorkerAcquireResult {
+        mode,
+        session_id: state.session_id.clone(),
+        spawn_count: state.spawn_count,
+    };
+    persist_worker_registry_if_enabled(&workers);
+    result
+}
+
+async fn update_worker_session(agent: &str, cwd: &str, session_id: Option<String>) {
+    let key = worker_key(agent, cwd);
+    let mut workers = worker_registry_store().lock().await;
+    if let Some(state) = workers.get_mut(&key) {
+        state.session_id = session_id;
+        state.last_used_ms = core_unix_time_ms();
+        persist_worker_registry_if_enabled(&workers);
+    }
+}
+
+async fn dismiss_worker(agent: &str, cwd: &str) -> bool {
+    let key = worker_key(agent, cwd);
+    let mut workers = worker_registry_store().lock().await;
+    let removed = workers.remove(&key).is_some();
+    if removed {
+        persist_worker_registry_if_enabled(&workers);
+    }
+    removed
+}
+
+#[cfg(test)]
+async fn reset_worker_registry_for_tests() {
+    let mut workers = worker_registry_store().lock().await;
+    workers.clear();
+}
+
 impl McpBridge {
     fn new() -> Self {
         Self::with_persistence(true)
@@ -284,32 +403,32 @@ impl McpBridge {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct SpawnSessionRequest {
     agent: String,
     name: String,
     cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct SessionInfo {
     name: String,
     agent: String,
     turns: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct SessionListResponse {
     sessions: Vec<SessionInfo>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct AskSessionRequest {
     name: String,
     message: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 struct DismissSessionRequest {
     name: String,
 }
@@ -366,7 +485,7 @@ impl McpBridge {
             .map(Json)
     }
 
-    #[tool(description = "Fan out a request to Gemini and Codex in parallel with role-adapted prompts.")]
+    #[tool(description = "Fan out a request to Gemini and Codex in parallel using persistent session-backed workers.")]
     async fn ask_twins(
         &self,
         Parameters(req): Parameters<AskTwinsRequest>,
@@ -423,23 +542,39 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<SpawnSessionRequest>,
     ) -> Result<String, String> {
+        if use_daemon_for_mcp_from_env() {
+            return fetch_daemon_session_spawn(&req)
+                .await
+                .map_err(|e| format!("spawn_session via daemon failed: {e}"));
+        }
         let agent = req.agent.to_lowercase();
         if !is_supported_agent_name(&agent) {
             return Err("spawn_session supports only 'gemini' or 'codex'".to_string());
         }
+        let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
+        let worker = acquire_worker(&agent, &cwd).await;
 
         let mut sessions = self.sessions.lock().await;
         sessions.insert(
             req.name.clone(),
             SessionState {
                 agent: agent.clone(),
-                cwd: req.cwd.clone(),
+                cwd: Some(cwd),
                 history: Vec::new(),
             },
         );
         core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
             .map_err(|e| format!("failed to persist sessions: {e}"))?;
-        Ok(format!("session '{}' spawned for {}", req.name, agent))
+        Ok(format!(
+            "session '{}' {} for {}",
+            req.name,
+            if worker.mode == WorkerAcquireMode::Spawned {
+                "spawned"
+            } else {
+                "reused"
+            },
+            agent
+        ))
     }
 
     #[tool(description = "Ask within a named persistent session.")]
@@ -447,28 +582,37 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskSessionRequest>,
     ) -> Result<String, String> {
-        let (agent, prompt, cwd) = {
+        if use_daemon_for_mcp_from_env() {
+            return fetch_daemon_session_ask(&req)
+                .await
+                .map_err(|e| format!("ask_session via daemon failed: {e}"));
+        }
+
+        let (agent, cwd) = {
             let mut sessions = self.sessions.lock().await;
             let state = sessions
                 .get_mut(&req.name)
                 .ok_or_else(|| format!("session '{}' not found", req.name))?;
-
-            let context = if state.history.is_empty() {
-                String::new()
-            } else {
-                format!("Previous turns:\n{}\n\n", state.history.join("\n"))
-            };
-            let prompt = format!("{context}New user message:\n{}", req.message);
-            state.history.push(req.message.clone());
-            (state.agent.clone(), prompt, state.cwd.clone())
+            (state.agent.clone(), state.cwd.clone())
         };
 
-        let response = run_named_agent(&agent, &prompt, cwd.as_deref().unwrap_or("."))
-            .await
-            .map_err(|e| format!("ask_session failed: {e}"))?;
+        let response = execute_ask_agent(
+            &AskAgentRequest {
+                agent: agent.clone(),
+                message: req.message.clone(),
+                cwd: cwd.clone(),
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(|e| format!("ask_session failed: {e}"))?
+        .response;
 
         let mut sessions = self.sessions.lock().await;
         if let Some(state) = sessions.get_mut(&req.name) {
+            state.history.push(format!("user: {}", req.message));
             state.history.push(format!("assistant: {response}"));
         }
         core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
@@ -482,9 +626,21 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<DismissSessionRequest>,
     ) -> Result<String, String> {
+        if use_daemon_for_mcp_from_env() {
+            return fetch_daemon_session_dismiss(&req)
+                .await
+                .map_err(|e| format!("dismiss_session via daemon failed: {e}"));
+        }
         let mut sessions = self.sessions.lock().await;
         match sessions.remove(&req.name) {
-            Some(_) => {
+            Some(removed_session) => {
+                let should_drop_worker = !sessions.values().any(|s| {
+                    s.agent == removed_session.agent && s.cwd == removed_session.cwd
+                });
+                if should_drop_worker {
+                    let cwd = removed_session.cwd.unwrap_or_else(|| ".".to_string());
+                    let _ = dismiss_worker(&removed_session.agent, &cwd).await;
+                }
                 core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
                     .map_err(|e| format!("failed to persist sessions: {e}"))?;
                 Ok(format!("session '{}' dismissed", req.name))
@@ -495,6 +651,11 @@ impl McpBridge {
 
     #[tool(description = "List active sessions.")]
     async fn list_sessions(&self) -> Json<SessionListResponse> {
+        if use_daemon_for_mcp_from_env()
+            && let Ok(response) = fetch_daemon_session_list().await
+        {
+            return Json(response);
+        }
         let sessions = self.sessions.lock().await;
         let mut out = sessions
             .iter()
@@ -718,12 +879,21 @@ async fn execute_ask_agent(
         .clone()
         .unwrap_or_else(|| ".".to_string());
     let execution_prompt = daemon_session_prepare_prompt(&agent, &exec_cwd, &req.message).await;
+    let worker = acquire_worker(&agent, &exec_cwd).await;
+    let mut worker_session_id = worker.session_id.clone();
+    let worker_mode = worker.mode.clone();
+    let worker_mode_state = "SPAWNED";
 
     let agent_display = display_agent_name(&agent);
     let mut lifecycle = vec![LifecycleEvent {
-        state: "SPAWNED".to_string(),
+        state: worker_mode_state.to_string(),
         detail: format!(
-            "Started {} connector{}{}{}",
+            "{} {} worker{}{}{} (spawn_count={})",
+            if worker_mode == WorkerAcquireMode::Spawned {
+                "Started"
+            } else {
+                "Reused"
+            },
             agent,
             req.cwd
                 .as_ref()
@@ -736,7 +906,8 @@ async fn execute_ask_agent(
             req.branch
                 .as_ref()
                 .map(|v| format!(" branch={v}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            worker.spawn_count
         ),
     }];
     if let Err(e) = append_outbox_event(&OutboxEvent {
@@ -787,10 +958,12 @@ async fn execute_ask_agent(
     let mut last_err: Option<String> = None;
 
     for (idx, backoff) in backoffs.iter().enumerate() {
-        let mut attempt = Box::pin(run_named_agent(
+        let session_for_attempt = worker_session_id.clone();
+        let mut attempt = Box::pin(run_named_agent_with_session(
             &agent,
             &execution_prompt,
             &exec_cwd,
+            session_for_attempt.as_deref(),
         ));
         let started = Instant::now();
         let mut next_heartbeat = Duration::from_secs(10);
@@ -819,7 +992,9 @@ async fn execute_ask_agent(
         };
 
         match attempt_result {
-            Ok(response) => {
+            Ok((response, next_session_id)) => {
+                worker_session_id = next_session_id.clone();
+                update_worker_session(&agent, &exec_cwd, next_session_id).await;
                 lifecycle.push(LifecycleEvent {
                     state: "DONE".to_string(),
                     detail: format!("{agent} responded on attempt {}", idx + 1),
@@ -978,26 +1153,63 @@ async fn execute_ask_twins(
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
-    let (gemini_prompt_raw, codex_prompt_raw) = build_role_adapted_prompts(&AskTwinsRequest {
-        message: req.message.clone(),
-        cwd: resolved_cwd.clone(),
-        repo: resolved_repo.clone(),
-        branch: resolved_branch.clone(),
-    });
+    let role_adapt = should_use_daemon_proxy(
+        std::env::var("TRIUMVIRATE_ASK_TWINS_ROLE_ADAPT")
+            .ok()
+            .as_deref(),
+    );
+    let (gemini_prompt_raw, codex_prompt_raw) = if role_adapt {
+        mcp_bridge::build_role_adapted_prompts(&AskTwinsRequest {
+            message: req.message.clone(),
+            cwd: resolved_cwd.clone(),
+            repo: resolved_repo.clone(),
+            branch: resolved_branch.clone(),
+        })
+    } else {
+        (req.message.clone(), req.message.clone())
+    };
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
+    let gemini_worker = acquire_worker("gemini", &exec_cwd).await;
+    let codex_worker = acquire_worker("codex", &exec_cwd).await;
+    let gemini_worker_mode = gemini_worker.mode.clone();
+    let codex_worker_mode = codex_worker.mode.clone();
     let gemini_prompt = daemon_session_prepare_prompt("gemini", &exec_cwd, &gemini_prompt_raw).await;
     let codex_prompt = daemon_session_prepare_prompt("codex", &exec_cwd, &codex_prompt_raw).await;
 
     let mut lifecycle = vec![
         LifecycleEvent {
-            state: "SPAWNED".to_string(),
-            detail: "Gemini request sent".to_string(),
+            state: match gemini_worker_mode {
+                WorkerAcquireMode::Spawned => "SPAWNED",
+                WorkerAcquireMode::Reused => "REUSED",
+            }
+            .to_string(),
+            detail: format!(
+                "Gemini worker {} (spawn_count={})",
+                if gemini_worker_mode == WorkerAcquireMode::Spawned {
+                    "started"
+                } else {
+                    "reused"
+                },
+                gemini_worker.spawn_count
+            ),
         },
         LifecycleEvent {
-            state: "SPAWNED".to_string(),
-            detail: "Codex request sent".to_string(),
+            state: match codex_worker_mode {
+                WorkerAcquireMode::Spawned => "SPAWNED",
+                WorkerAcquireMode::Reused => "REUSED",
+            }
+            .to_string(),
+            detail: format!(
+                "Codex worker {} (spawn_count={})",
+                if codex_worker_mode == WorkerAcquireMode::Spawned {
+                    "started"
+                } else {
+                    "reused"
+                },
+                codex_worker.spawn_count
+            ),
         },
         LifecycleEvent {
             state: "WORKING".to_string(),
@@ -1027,29 +1239,33 @@ async fn execute_ask_twins(
 
     let mut handles = tokio::task::JoinSet::new();
     let gemini_exec_cwd = exec_cwd.clone();
+    let gemini_session_id = gemini_worker.session_id.clone();
     handles.spawn(async move {
         let prompt_sent = gemini_prompt.clone();
         (
             "gemini".to_string(),
             prompt_sent,
-            run_named_agent(
+            run_named_agent_with_session(
                 "gemini",
                 &gemini_prompt,
                 &gemini_exec_cwd,
+                gemini_session_id.as_deref(),
             )
             .await,
         )
     });
     let codex_exec_cwd = exec_cwd.clone();
+    let codex_session_id = codex_worker.session_id.clone();
     handles.spawn(async move {
         let prompt_sent = codex_prompt.clone();
         (
             "codex".to_string(),
             prompt_sent,
-            run_named_agent(
+            run_named_agent_with_session(
                 "codex",
                 &codex_prompt,
                 &codex_exec_cwd,
+                codex_session_id.as_deref(),
             )
             .await,
         )
@@ -1079,7 +1295,8 @@ async fn execute_ask_twins(
                 pending.remove(&agent);
                 let display = display_agent_name(&agent);
                 match outcome {
-                    Ok(response) => {
+                    Ok((response, session_id)) => {
+                        update_worker_session(&agent, &exec_cwd, session_id).await;
                         let response_for_session = response.clone();
                         lifecycle.push(LifecycleEvent {
                             state: "DONE".to_string(),
@@ -1198,14 +1415,24 @@ async fn execute_ask_twins(
 }
 
 async fn run_named_agent(agent: &str, message: &str, cwd: &str) -> anyhow::Result<String> {
+    let (response, _) = run_named_agent_with_session(agent, message, cwd, None).await?;
+    Ok(response)
+}
+
+async fn run_named_agent_with_session(
+    agent: &str,
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
     match agent {
         "gemini" => {
             let (bin, args) = gemini_command();
-            run_agent_process("gemini", &bin, &args, message, cwd).await
+            run_agent_process_with_session("gemini", &bin, &args, message, cwd, session_id).await
         }
         "codex" => {
             let (bin, args) = codex_command();
-            run_agent_process("codex", &bin, &args, message, cwd).await
+            run_agent_process_with_session("codex", &bin, &args, message, cwd, session_id).await
         }
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
@@ -1228,9 +1455,15 @@ fn connector_timeout() -> Duration {
 }
 
 #[cfg(test)]
-async fn run_mock_connector_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
+async fn run_mock_connector_process(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
     let mut child = Command::new(&bin)
         .args(args)
+        .env("TRIUMVIRATE_WORKER_SESSION_ID", session_id.unwrap_or(""))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1281,7 +1514,10 @@ async fn run_mock_connector_process(bin: &str, args: &[String], message: &str) -
     let _ = child.kill().await;
     let _ = child.wait().await;
 
-    Ok(response)
+    let out_session = session_id
+        .map(ToString::to_string)
+        .or_else(|| Some(format!("mock-session-{}", Uuid::new_v4())));
+    Ok((response, out_session))
 }
 
 fn has_any_arg(args: &[String], candidates: &[&str]) -> bool {
@@ -1293,8 +1529,28 @@ async fn run_gemini_cli_process(
     args: &[String],
     message: &str,
     cwd: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<String>)> {
+    run_gemini_cli_process_with_session(bin, args, message, cwd, None).await
+}
+
+async fn run_gemini_cli_process_with_session(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
     let mut final_args = args.to_vec();
+    if !has_any_arg(&final_args, &["-o", "--output-format"]) {
+        final_args.push("-o".to_string());
+        final_args.push("stream-json".to_string());
+    }
+    if let Some(session_id) = session_id
+        && !has_any_arg(&final_args, &["-r", "--resume"])
+    {
+        final_args.push("-r".to_string());
+        final_args.push(session_id.to_string());
+    }
     if !has_any_arg(&final_args, &["-p", "--prompt"]) {
         final_args.push("-p".to_string());
         final_args.push(message.to_string());
@@ -1323,14 +1579,43 @@ async fn run_gemini_cli_process(
         anyhow::bail!("gemini connector failed: {detail}");
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !stdout.is_empty() {
-        return Ok(stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut discovered_session: Option<String> = None;
+    let mut assistant_chunks: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if discovered_session.is_none() {
+            discovered_session = json
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+        }
+        let role = json.get("role").and_then(|v| v.as_str()).unwrap_or_default();
+        let ty = json.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        if ty == "message" && role == "assistant"
+            && let Some(content) = json.get("content").and_then(|v| v.as_str())
+        {
+            assistant_chunks.push(content.to_string());
+        }
+    }
+    if !assistant_chunks.is_empty() {
+        return Ok((assistant_chunks.join(""), discovered_session.or_else(|| session_id.map(ToString::to_string))));
+    }
+
+    let stdout_trimmed = stdout.trim().to_string();
+    if !stdout_trimmed.is_empty() {
+        return Ok((stdout_trimmed, discovered_session.or_else(|| session_id.map(ToString::to_string))));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stderr.is_empty() {
-        return Ok(stderr);
+        return Ok((stderr, discovered_session.or_else(|| session_id.map(ToString::to_string))));
     }
 
     anyhow::bail!("gemini connector returned empty output")
@@ -1386,9 +1671,25 @@ async fn run_codex_cli_process(
     args: &[String],
     message: &str,
     cwd: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<String>)> {
+    run_codex_cli_process_with_session(bin, args, message, cwd, None).await
+}
+
+async fn run_codex_cli_process_with_session(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
     let mut final_args = args.to_vec();
-    if final_args.first().map(|s| s.as_str()) != Some("exec") {
+    if session_id.is_some() {
+        final_args.insert(0, "resume".to_string());
+        final_args.insert(0, "exec".to_string());
+        if let Some(session_id) = session_id {
+            final_args.push(session_id.to_string());
+        }
+    } else if final_args.first().map(|s| s.as_str()) != Some("exec") {
         final_args.insert(0, "exec".to_string());
     }
     if !has_any_arg(&final_args, &["--json"]) {
@@ -1432,22 +1733,37 @@ async fn run_codex_cli_process(
         anyhow::bail!("codex connector failed: {detail}");
     }
 
-    if !last_message.trim().is_empty() {
-        return Ok(last_message.trim().to_string());
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut discovered_thread: Option<String> = None;
+    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if discovered_thread.is_none() {
+            discovered_thread = json
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let session_out = discovered_thread.or_else(|| session_id.map(ToString::to_string));
+
+    if !last_message.trim().is_empty() {
+        return Ok((last_message.trim().to_string(), session_out));
+    }
+
     if let Some(text) = extract_text_from_jsonl(&stdout) {
-        return Ok(text);
+        return Ok((text, session_out));
     }
     let stdout_trimmed = stdout.trim().to_string();
     if !stdout_trimmed.is_empty() {
-        return Ok(stdout_trimmed);
+        return Ok((stdout_trimmed, session_out));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stderr.is_empty() {
-        return Ok(stderr);
+        return Ok((stderr, session_out));
     }
 
     anyhow::bail!("codex connector returned empty output")
@@ -1459,12 +1775,23 @@ async fn run_agent_process(
     args: &[String],
     message: &str,
     cwd: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<String>)> {
+    run_agent_process_with_session(agent, bin, args, message, cwd, None).await
+}
+
+async fn run_agent_process_with_session(
+    agent: &str,
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
     if is_mock_connector(bin) {
         #[cfg(test)]
         {
             let _ = cwd;
-            return run_mock_connector_process(bin, args, message).await;
+            return run_mock_connector_process(bin, args, message, session_id).await;
         }
         #[cfg(not(test))]
         {
@@ -1476,8 +1803,8 @@ async fn run_agent_process(
     }
 
     match agent {
-        "gemini" => run_gemini_cli_process(bin, args, message, cwd).await,
-        "codex" => run_codex_cli_process(bin, args, message, cwd).await,
+        "gemini" => run_gemini_cli_process_with_session(bin, args, message, cwd, session_id).await,
+        "codex" => run_codex_cli_process_with_session(bin, args, message, cwd, session_id).await,
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
@@ -1651,6 +1978,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         token: String,
         queues: QueueRegistry,
         bind_addr: String,
+        sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+        sessions_file: Option<PathBuf>,
     }
 
     async fn health(
@@ -1937,12 +2266,140 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(FallbackGcResponse { removed }))
     }
 
+    async fn session_spawn_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<SpawnSessionRequest>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
+        }
+        let agent = req.agent.to_lowercase();
+        if !is_supported_agent_name(&agent) {
+            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'gemini' or 'codex'" }))));
+        }
+        let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
+        let worker = acquire_worker(&agent, &cwd).await;
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(
+            req.name.clone(),
+            SessionState {
+                agent: agent.clone(),
+                cwd: Some(cwd),
+                history: Vec::new(),
+            },
+        );
+        core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(serde_json::json!({ "error": e.to_string() })))
+        })?;
+        Ok(AxumJson(serde_json::json!({
+            "status": "ok",
+            "message": format!("session '{}' {} for {}", req.name, if worker.mode == WorkerAcquireMode::Spawned { "spawned" } else { "reused" }, agent)
+        })))
+    }
+
+    async fn session_ask_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<AskSessionRequest>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
+        }
+        let (agent, cwd) = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions.get(&req.name).ok_or_else(|| {
+                (StatusCode::NOT_FOUND, AxumJson(serde_json::json!({ "error": format!("session '{}' not found", req.name) })))
+            })?;
+            (session.agent.clone(), session.cwd.clone())
+        };
+        let response = execute_ask_agent(
+            &AskAgentRequest {
+                agent,
+                message: req.message.clone(),
+                cwd,
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, AxumJson(serde_json::json!({ "error": e }))))?
+        .response;
+
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&req.name) {
+            session.history.push(format!("user: {}", req.message));
+            session.history.push(format!("assistant: {response}"));
+        }
+        core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(serde_json::json!({ "error": e.to_string() })))
+        })?;
+
+        Ok(AxumJson(serde_json::json!({ "status": "ok", "response": response })))
+    }
+
+    async fn session_dismiss_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<DismissSessionRequest>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
+        }
+        let mut sessions = state.sessions.lock().await;
+        let Some(removed) = sessions.remove(&req.name) else {
+            return Err((StatusCode::NOT_FOUND, AxumJson(serde_json::json!({ "error": format!("session '{}' not found", req.name) }))));
+        };
+        let should_drop_worker = !sessions.values().any(|s| s.agent == removed.agent && s.cwd == removed.cwd);
+        if should_drop_worker {
+            let cwd = removed.cwd.unwrap_or_else(|| ".".to_string());
+            let _ = dismiss_worker(&removed.agent, &cwd).await;
+        }
+        core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(serde_json::json!({ "error": e.to_string() })))
+        })?;
+        Ok(AxumJson(serde_json::json!({
+            "status": "ok",
+            "message": format!("session '{}' dismissed", req.name)
+        })))
+    }
+
+    async fn session_list_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+    ) -> Result<AxumJson<SessionListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
+        }
+        let sessions = state.sessions.lock().await;
+        let mut out = sessions
+            .iter()
+            .map(|(name, s)| SessionInfo {
+                name: name.clone(),
+                agent: s.agent.clone(),
+                turns: s.history.len(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(AxumJson(SessionListResponse { sessions: out }))
+    }
+
     let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
     let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
+    let sessions_file = core_triumvirate_home_dir()
+        .ok()
+        .map(|home| core_sessions_file_path(&home));
+    let sessions = sessions_file
+        .as_ref()
+        .and_then(|path| core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok())
+        .unwrap_or_default();
     let state = DaemonState {
         token,
         queues: Arc::new(Mutex::new(HashMap::new())),
         bind_addr: bind_addr.clone(),
+        sessions: Arc::new(Mutex::new(sessions)),
+        sessions_file,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -1957,6 +2414,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/fallback/list", post(fallback_list_route))
         .route("/fallback/ack", post(fallback_ack_route))
         .route("/fallback/gc", post(fallback_gc_route))
+        .route("/session/spawn", post(session_spawn_route))
+        .route("/session/ask", post(session_ask_route))
+        .route("/session/dismiss", post(session_dismiss_route))
+        .route("/session/list", get(session_list_route))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app).await?;
@@ -2166,6 +2627,47 @@ async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgen
 
 async fn fetch_daemon_ask_twins(req: &AskTwinsRequest) -> anyhow::Result<AskTwinsResponse> {
     daemon_post_json::<AskTwinsRequest, AskTwinsResponse>(daemon_ask_twins_url(), req).await
+}
+
+async fn fetch_daemon_session_spawn(req: &SpawnSessionRequest) -> anyhow::Result<String> {
+    let json = daemon_post_json::<SpawnSessionRequest, serde_json::Value>(
+        daemon_session_spawn_url(),
+        req,
+    )
+    .await?;
+    Ok(json
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("session spawned")
+        .to_string())
+}
+
+async fn fetch_daemon_session_ask(req: &AskSessionRequest) -> anyhow::Result<String> {
+    let json =
+        daemon_post_json::<AskSessionRequest, serde_json::Value>(daemon_session_ask_url(), req)
+            .await?;
+    Ok(json
+        .get("response")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
+async fn fetch_daemon_session_dismiss(req: &DismissSessionRequest) -> anyhow::Result<String> {
+    let json = daemon_post_json::<DismissSessionRequest, serde_json::Value>(
+        daemon_session_dismiss_url(),
+        req,
+    )
+    .await?;
+    Ok(json
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("session dismissed")
+        .to_string())
+}
+
+async fn fetch_daemon_session_list() -> anyhow::Result<SessionListResponse> {
+    daemon_get_json::<SessionListResponse>(daemon_session_list_url()).await
 }
 
 async fn fetch_daemon_memory_write(req: &MemoryWriteRequest) -> anyhow::Result<MemoryWriteResponse> {
@@ -2431,6 +2933,29 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} done\"}}}}'\
         Ok(path)
     }
 
+    fn write_mock_worker_warm_script(name: &str) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mock-{name}-warm-{now}.sh"));
+        let script = format!(
+            "#!/bin/sh\n\
+if [ -z \"$TRIUMVIRATE_WORKER_SESSION_ID\" ]; then\n\
+  sleep 0.8\n\
+else\n\
+  sleep 0.05\n\
+fi\n\
+IFS= read -r _line\n\
+echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} warm worker done\"}}}}'\n",
+            name = name
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     fn write_retry_agent_script(name: &str) -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -2600,7 +3125,7 @@ exit 1\n",
     }
 
     #[tokio::test]
-    async fn ask_twins_parallel_and_role_adapted() -> anyhow::Result<()> {
+    async fn ask_twins_parallel_and_prompt_passthrough() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
         let gemini_script = write_mock_agent_script("gemini", 1.0)?;
         let codex_script = write_mock_agent_script("codex", 0.2)?;
@@ -2649,8 +3174,7 @@ exit 1\n",
         assert!(elapsed < Duration::from_secs(2));
         assert!(raw_text.contains("gemini done"));
         assert!(raw_text.contains("codex done"));
-        assert!(raw_text.contains("[Gemini role: research/analysis]"));
-        assert!(raw_text.contains("[Codex role: implementation/testing]"));
+        assert!(raw_text.contains("\"prompt_sent\":\"Add auth module\""));
 
         client.cancel().await?;
         server_handle.await??;
@@ -2776,6 +3300,121 @@ exit 1\n",
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_worker_reuse_second_call_is_faster_and_marked_reused() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        reset_worker_registry_for_tests().await;
+        let script_path = write_mock_worker_warm_script("gemini")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let req = AskAgentRequest {
+            agent: "gemini".to_string(),
+            message: "first".to_string(),
+            cwd: Some("/tmp/worker-reuse".to_string()),
+            repo: None,
+            branch: None,
+        };
+        let first_start = Instant::now();
+        let first = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
+        let first_elapsed = first_start.elapsed();
+
+        let second_start = Instant::now();
+        let second = execute_ask_agent(
+            &AskAgentRequest {
+                message: "second".to_string(),
+                ..req
+            },
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let second_elapsed = second_start.elapsed();
+
+        assert!(first
+            .lifecycle
+            .iter()
+            .any(|e| e.state == "SPAWNED"));
+        assert!(second
+            .lifecycle
+            .iter()
+            .any(|e| e.detail.contains("Reused gemini worker")));
+        assert!(
+            second_elapsed < first_elapsed,
+            "expected second call ({second_elapsed:?}) to be faster than first ({first_elapsed:?})"
+        );
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        let _ = fs::remove_file(script_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_twins_and_session_tools_share_persistent_backend() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        reset_worker_registry_for_tests().await;
+        let gemini_script = write_mock_agent_script("gemini", 0.0)?;
+        let codex_script = write_mock_agent_script("codex", 0.0)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+
+        let bridge = McpBridge::new_ephemeral();
+        let _ = bridge
+            .spawn_session(Parameters(SpawnSessionRequest {
+                agent: "gemini".to_string(),
+                name: "shared-worker".to_string(),
+                cwd: Some("/tmp/shared-worker".to_string()),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let _ = bridge
+            .ask_session(Parameters(AskSessionRequest {
+                name: "shared-worker".to_string(),
+                message: "prime worker".to_string(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let twins = execute_ask_twins(
+            &AskTwinsRequest {
+                message: "same backend check".to_string(),
+                cwd: Some("/tmp/shared-worker".to_string()),
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert!(twins
+            .lifecycle
+            .iter()
+            .any(|e| e.detail.contains("Gemini worker reused")));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+        let _ = fs::remove_file(gemini_script);
+        let _ = fs::remove_file(codex_script);
         Ok(())
     }
 
