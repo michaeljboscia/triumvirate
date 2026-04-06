@@ -30,5 +30,6 @@ agent-worker = { path = "../agent-worker" }
 mcp-tools = { path = "../mcp-tools" }
 daemon-http = { path = "../daemon-http" }
 fallback-outbox = { path = "../fallback-outbox" }
+agent-adapter = { path = "../agent-adapter" }
 
 [dev-dependencies]

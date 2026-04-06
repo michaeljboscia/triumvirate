@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "agent-adapter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-worker"
 version = "0.1.0"
 dependencies = [
@@ -964,6 +975,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 name = "mcp-bridge"
 version = "0.1.0"
 dependencies = [
+ "agent-adapter",
  "shared-types",
 ]
 
@@ -2110,6 +2122,7 @@ dependencies = [
 name = "triumvirate"
 version = "0.1.0"
 dependencies = [
+ "agent-adapter",
  "agent-worker",
  "anyhow",
  "axum",

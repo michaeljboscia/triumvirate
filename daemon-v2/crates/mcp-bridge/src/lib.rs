@@ -4,6 +4,7 @@
 //! extracting logic from the monolithic `triumvirate` binary crate.
 
 use shared_types::AskAgentRequest;
+use agent_adapter::AgentVerbosity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
@@ -147,6 +148,17 @@ pub fn codex_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "mock-codex")
 }
 
+pub fn agent_verbosity() -> AgentVerbosity {
+    AgentVerbosity::from_env(std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok().as_deref())
+}
+
+pub fn gemini_streaming_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_GEMINI_STREAMING")
+        .ok()
+        .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
+
 fn resolve_connector_command(
     bin_env: &str,
     args_env: &str,
@@ -163,6 +175,7 @@ fn resolve_connector_command(
 mod tests {
     use std::sync::{Mutex, OnceLock};
 
+    use agent_adapter::AgentVerbosity;
     use shared_types::AskAgentRequest;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -359,5 +372,33 @@ mod tests {
             std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
         }
+    }
+
+    #[test]
+    fn agent_verbosity_reader_defaults_and_overrides() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::remove_var("TRIUMVIRATE_AGENT_VERBOSITY") };
+        assert_eq!(super::agent_verbosity(), AgentVerbosity::Normal);
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_AGENT_VERBOSITY", "minimal") };
+        assert_eq!(super::agent_verbosity(), AgentVerbosity::Minimal);
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_AGENT_VERBOSITY", "verbose") };
+        assert_eq!(super::agent_verbosity(), AgentVerbosity::Verbose);
+    }
+
+    #[test]
+    fn gemini_streaming_toggle_defaults_true_and_respects_falsey() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_STREAMING") };
+        assert!(super::gemini_streaming_enabled());
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_STREAMING", "false") };
+        assert!(!super::gemini_streaming_enabled());
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_STREAMING", "1") };
+        assert!(super::gemini_streaming_enabled());
     }
 }

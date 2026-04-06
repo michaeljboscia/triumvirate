@@ -1,0 +1,214 @@
+use crate::types::{
+    ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState, WorkingStateEvent,
+};
+
+#[derive(Debug, Default)]
+pub struct GeminiStreamParser {
+    session_id: Option<String>,
+    response_chunks: Vec<String>,
+    events: Vec<WorkingStateEvent>,
+    tool_calls: Vec<ToolCallRecord>,
+    token_usage: Option<TokenUsage>,
+    cli_version: Option<String>,
+}
+
+impl GeminiStreamParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn parse_line(&mut self, line: &str) -> Option<WorkingStateEvent> {
+        let json: serde_json::Value = serde_json::from_str(line).ok()?;
+        let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        match event_type {
+            "init" => {
+                self.session_id = json
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                self.cli_version = json.get("model").and_then(|v| v.as_str()).map(ToString::to_string);
+                let event = WorkingStateEvent {
+                    agent: "gemini".to_string(),
+                    state: WorkingState::TurnStarted,
+                    detail: "turn started".to_string(),
+                    tool_name: None,
+                    tool_args_json: None,
+                    token_usage: None,
+                    ts_ms: None,
+                };
+                self.events.push(event.clone());
+                Some(event)
+            }
+            "message" => {
+                let role = json.get("role").and_then(|v| v.as_str()).unwrap_or_default();
+                if role == "assistant" {
+                    let content = json
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !content.is_empty() {
+                        self.response_chunks.push(content.clone());
+                    }
+                    let event = WorkingStateEvent {
+                        agent: "gemini".to_string(),
+                        state: WorkingState::MessageDelta,
+                        detail: "assistant response chunk".to_string(),
+                        tool_name: None,
+                        tool_args_json: None,
+                        token_usage: None,
+                        ts_ms: None,
+                    };
+                    self.events.push(event.clone());
+                    return Some(event);
+                }
+                None
+            }
+            "tool_use" => {
+                let tool_name = json
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let args_json = json.get("parameters").map(|v| v.to_string());
+                self.tool_calls.push(ToolCallRecord {
+                    id: json.get("tool_id").and_then(|v| v.as_str()).map(ToString::to_string),
+                    tool: tool_name.to_string(),
+                    kind: map_tool_kind(tool_name),
+                    success: None,
+                    duration_ms: None,
+                    args_json: args_json.clone(),
+                });
+                let event = WorkingStateEvent {
+                    agent: "gemini".to_string(),
+                    state: WorkingState::ToolCallStarted,
+                    detail: format!("calling {tool_name}"),
+                    tool_name: Some(tool_name.to_string()),
+                    tool_args_json: args_json,
+                    token_usage: None,
+                    ts_ms: None,
+                };
+                self.events.push(event.clone());
+                Some(event)
+            }
+            "tool_result" => {
+                let status = json.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let tool_id = json.get("tool_id").and_then(|v| v.as_str());
+                if let Some(id) = tool_id
+                    && let Some(existing) = self.tool_calls.iter_mut().find(|r| r.id.as_deref() == Some(id))
+                {
+                    existing.success = Some(status.eq_ignore_ascii_case("success"));
+                }
+                let event = WorkingStateEvent {
+                    agent: "gemini".to_string(),
+                    state: WorkingState::ToolCallCompleted,
+                    detail: format!("tool result: {status}"),
+                    tool_name: None,
+                    tool_args_json: None,
+                    token_usage: None,
+                    ts_ms: None,
+                };
+                self.events.push(event.clone());
+                Some(event)
+            }
+            "error" => {
+                let msg = json
+                    .get("message")
+                    .or_else(|| json.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("gemini error")
+                    .to_string();
+                let is_stuck = msg.to_lowercase().contains("loopdetected");
+                let event = WorkingStateEvent {
+                    agent: "gemini".to_string(),
+                    state: if is_stuck {
+                        WorkingState::Stuck
+                    } else {
+                        WorkingState::Error
+                    },
+                    detail: msg,
+                    tool_name: None,
+                    tool_args_json: None,
+                    token_usage: None,
+                    ts_ms: None,
+                };
+                self.events.push(event.clone());
+                Some(event)
+            }
+            "result" => {
+                let stats = json.get("stats").cloned().unwrap_or_default();
+                let usage = TokenUsage {
+                    input: stats
+                        .get("input_tokens")
+                        .or_else(|| stats.get("input"))
+                        .and_then(|v| v.as_u64()),
+                    output: stats.get("output_tokens").and_then(|v| v.as_u64()),
+                    cached: stats.get("cached").and_then(|v| v.as_u64()),
+                    total: stats.get("total_tokens").and_then(|v| v.as_u64()),
+                };
+                self.token_usage = Some(usage.clone());
+                let event = WorkingStateEvent {
+                    agent: "gemini".to_string(),
+                    state: WorkingState::TurnCompleted,
+                    detail: "turn completed".to_string(),
+                    tool_name: None,
+                    tool_args_json: None,
+                    token_usage: Some(usage),
+                    ts_ms: None,
+                };
+                self.events.push(event.clone());
+                Some(event)
+            }
+            _ => {
+                tracing::debug!("unknown gemini event type: {event_type}");
+                None
+            }
+        }
+    }
+
+    pub fn finish(self) -> ParsedAgentResult {
+        ParsedAgentResult {
+            response_text: self.response_chunks.join(""),
+            session_id: self.session_id,
+            events: self.events,
+            tool_calls: self.tool_calls,
+            token_usage: self.token_usage,
+            cli_version: self.cli_version,
+            parser_mode: "gemini-stream-json".to_string(),
+        }
+    }
+}
+
+fn map_tool_kind(name: &str) -> ToolKind {
+    match name.to_lowercase().as_str() {
+        "read_file" => ToolKind::ReadFile,
+        "write_file" => ToolKind::WriteFile,
+        "edit_file" => ToolKind::EditFile,
+        "bash" => ToolKind::Bash,
+        "grep" => ToolKind::Grep,
+        "glob" => ToolKind::Glob,
+        "request_user_input" => ToolKind::RequestUserInput,
+        _ => ToolKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_golden_trace() {
+        let mut parser = GeminiStreamParser::new();
+        let raw = include_str!("../../../tests/fixtures/gemini-stream-trace.jsonl");
+        let mut count = 0;
+        for line in raw.lines() {
+            if parser.parse_line(line).is_some() {
+                count += 1;
+            }
+        }
+        let result = parser.finish();
+        assert!(count >= 5);
+        assert_eq!(result.session_id.as_deref(), Some("9396020a-f4d8-43e9-82e0-386da5df7cb1"));
+        assert!(result.response_text.contains("8 crates"));
+        assert_eq!(result.token_usage.as_ref().and_then(|t| t.total), Some(43893));
+    }
+}
