@@ -149,7 +149,21 @@ pub fn codex_command() -> (String, Vec<String>) {
 }
 
 pub fn agent_verbosity() -> AgentVerbosity {
-    AgentVerbosity::from_env(std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok().as_deref())
+    let raw = std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok();
+    let parsed = AgentVerbosity::from_env(raw.as_deref());
+    if let Some(value) = raw.as_deref() {
+        let normalized = value.to_lowercase();
+        let valid = matches!(
+            normalized.as_str(),
+            "quiet" | "minimal" | "standard" | "normal" | "detailed" | "verbose" | "raw" | "debug"
+        );
+        if !valid {
+            tracing::warn!(
+                "invalid TRIUMVIRATE_AGENT_VERBOSITY={value:?}, defaulting to standard"
+            );
+        }
+    }
+    parsed
 }
 
 pub fn gemini_streaming_enabled() -> bool {

@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 agent-adapter = { path = "../agent-adapter" }
 shared-types = { path = "../shared-types" }
+tracing.workspace = true
