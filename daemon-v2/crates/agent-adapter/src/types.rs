@@ -3,17 +3,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentVerbosity {
-    Minimal,
-    Normal,
-    Verbose,
+    Quiet,
+    Standard,
+    Detailed,
+    Raw,
 }
 
 impl AgentVerbosity {
     pub fn from_env(raw: Option<&str>) -> Self {
         match raw.unwrap_or("normal").to_lowercase().as_str() {
-            "minimal" | "quiet" => Self::Minimal,
-            "verbose" | "debug" => Self::Verbose,
-            _ => Self::Normal,
+            "quiet" | "minimal" => Self::Quiet,
+            "standard" | "normal" => Self::Standard,
+            "detailed" | "verbose" => Self::Detailed,
+            "raw" | "debug" => Self::Raw,
+            _ => Self::Standard,
         }
     }
 }
@@ -91,14 +94,27 @@ pub struct ParsedAgentResult {
 
 pub fn should_display(state: &WorkingState, verbosity: AgentVerbosity) -> bool {
     match verbosity {
-        AgentVerbosity::Minimal => matches!(
+        AgentVerbosity::Quiet => matches!(
             state,
             WorkingState::TurnStarted
                 | WorkingState::TurnCompleted
                 | WorkingState::Stuck
                 | WorkingState::Error
+                | WorkingState::InputRequested
         ),
-        AgentVerbosity::Normal => !matches!(state, WorkingState::MessageDelta | WorkingState::Unknown),
-        AgentVerbosity::Verbose => true,
+        AgentVerbosity::Standard => matches!(
+            state,
+            WorkingState::TurnStarted
+                | WorkingState::TurnCompleted
+                | WorkingState::ToolCallStarted
+                | WorkingState::ToolCallCompleted
+                | WorkingState::CommandStarted
+                | WorkingState::CommandCompleted
+                | WorkingState::InputRequested
+                | WorkingState::Stuck
+                | WorkingState::Error
+        ),
+        AgentVerbosity::Detailed => !matches!(state, WorkingState::Unknown),
+        AgentVerbosity::Raw => true,
     }
 }

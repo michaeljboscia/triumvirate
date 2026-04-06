@@ -171,9 +171,23 @@ pub(crate) async fn execute_ask_agent(
             tokio::select! {
                 result = &mut attempt => break result,
                 Some(event) = events_rx.recv() => {
+                    let outbox_detail = format_working_state(&event);
+                    if let Err(e) = append_outbox_event(&OutboxEvent {
+                        ts_ms: core_unix_time_ms(),
+                        request_id: request_id.clone(),
+                        tool: "ask_agent".to_string(),
+                        status: "WORKING_EVENT".to_string(),
+                        agent: Some(agent.clone()),
+                        detail: outbox_detail.clone(),
+                        cwd: resolved_cwd.clone(),
+                        repo: resolved_repo.clone(),
+                        branch: resolved_branch.clone(),
+                    }) {
+                        tracing::warn!("failed to append outbox event: {e}");
+                    }
                     if should_display(&event.state, verbosity) {
                         if let Some(emitter) = progress.as_ref() {
-                            emitter.emit(format_working_state(&event)).await;
+                            emitter.emit(outbox_detail).await;
                         }
                     }
                     if let Some(reason) = stuck_detector.observe(&event) {
