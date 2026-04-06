@@ -19,5 +19,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.29"
+opentelemetry = "0.28"
+opentelemetry_sdk = "0.28"
+opentelemetry-otlp = { version = "0.28", features = ["http-proto", "reqwest-client"] }
+prometheus = "0.13"
 uuid = { version = "1", features = ["v4"] }
