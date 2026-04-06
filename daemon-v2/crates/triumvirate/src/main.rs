@@ -65,11 +65,12 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Mutex,
     time::{Duration, Instant, sleep, sleep_until, timeout},
 };
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -318,7 +319,7 @@ impl McpBridge {
             (state.agent.clone(), prompt)
         };
 
-        let response = run_named_agent(&agent, &prompt)
+        let response = run_named_agent(&agent, &prompt, ".")
             .await
             .map_err(|e| format!("ask_session failed: {e}"))?;
 
@@ -638,7 +639,11 @@ async fn execute_ask_agent(
     let mut last_err: Option<String> = None;
 
     for (idx, backoff) in backoffs.iter().enumerate() {
-        let mut attempt = Box::pin(run_named_agent(&agent, &req.message));
+        let mut attempt = Box::pin(run_named_agent(
+            &agent,
+            &req.message,
+            resolved_cwd.as_deref().unwrap_or("."),
+        ));
         let started = Instant::now();
         let mut next_heartbeat = Duration::from_secs(10);
 
@@ -830,6 +835,9 @@ async fn execute_ask_twins(
         repo: resolved_repo.clone(),
         branch: resolved_branch.clone(),
     });
+    let exec_cwd = resolved_cwd
+        .clone()
+        .unwrap_or_else(|| ".".to_string());
 
     let mut lifecycle = vec![
         LifecycleEvent {
@@ -867,20 +875,32 @@ async fn execute_ask_twins(
     }
 
     let mut handles = tokio::task::JoinSet::new();
+    let gemini_exec_cwd = exec_cwd.clone();
     handles.spawn(async move {
         let prompt_sent = gemini_prompt.clone();
         (
             "gemini".to_string(),
             prompt_sent,
-            run_named_agent("gemini", &gemini_prompt).await,
+            run_named_agent(
+                "gemini",
+                &gemini_prompt,
+                &gemini_exec_cwd,
+            )
+            .await,
         )
     });
+    let codex_exec_cwd = exec_cwd.clone();
     handles.spawn(async move {
         let prompt_sent = codex_prompt.clone();
         (
             "codex".to_string(),
             prompt_sent,
-            run_named_agent("codex", &codex_prompt).await,
+            run_named_agent(
+                "codex",
+                &codex_prompt,
+                &codex_exec_cwd,
+            )
+            .await,
         )
     });
 
@@ -1024,15 +1044,15 @@ async fn execute_ask_twins(
     })
 }
 
-async fn run_named_agent(agent: &str, message: &str) -> anyhow::Result<String> {
+async fn run_named_agent(agent: &str, message: &str, cwd: &str) -> anyhow::Result<String> {
     match agent {
         "gemini" => {
             let (bin, args) = gemini_command();
-            run_agent_process("gemini", &bin, &args, message).await
+            run_agent_process("gemini", &bin, &args, message, cwd).await
         }
         "codex" => {
             let (bin, args) = codex_command();
-            run_agent_process("codex", &bin, &args, message).await
+            run_agent_process("codex", &bin, &args, message, cwd).await
         }
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
@@ -1115,7 +1135,12 @@ fn has_any_arg(args: &[String], candidates: &[&str]) -> bool {
     args.iter().any(|arg| candidates.iter().any(|c| arg == c))
 }
 
-async fn run_gemini_cli_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
+async fn run_gemini_cli_process(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+) -> anyhow::Result<String> {
     let mut final_args = args.to_vec();
     if !has_any_arg(&final_args, &["-p", "--prompt"]) {
         final_args.push("-p".to_string());
@@ -1126,6 +1151,7 @@ async fn run_gemini_cli_process(bin: &str, args: &[String], message: &str) -> an
         connector_timeout(),
         Command::new(bin)
             .args(&final_args)
+            .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1189,13 +1215,34 @@ fn extract_text_from_jsonl(stdout: &str) -> Option<String> {
     candidate
 }
 
-async fn run_codex_cli_process(bin: &str, args: &[String], message: &str) -> anyhow::Result<String> {
+fn is_git_worktree(path: &str) -> bool {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == "true",
+        _ => false,
+    }
+}
+
+async fn run_codex_cli_process(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+) -> anyhow::Result<String> {
     let mut final_args = args.to_vec();
     if final_args.first().map(|s| s.as_str()) != Some("exec") {
         final_args.insert(0, "exec".to_string());
     }
     if !has_any_arg(&final_args, &["--json"]) {
         final_args.push("--json".to_string());
+    }
+    if !is_git_worktree(cwd) && !has_any_arg(&final_args, &["--skip-git-repo-check"]) {
+        final_args.push("--skip-git-repo-check".to_string());
     }
 
     let output_file = std::env::temp_dir().join(format!(
@@ -1210,6 +1257,7 @@ async fn run_codex_cli_process(bin: &str, args: &[String], message: &str) -> any
         connector_timeout(),
         Command::new(bin)
             .args(&final_args)
+            .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1257,10 +1305,12 @@ async fn run_agent_process(
     bin: &str,
     args: &[String],
     message: &str,
+    cwd: &str,
 ) -> anyhow::Result<String> {
     if is_mock_connector(bin) {
         #[cfg(test)]
         {
+            let _ = cwd;
             return run_mock_connector_process(bin, args, message).await;
         }
         #[cfg(not(test))]
@@ -1273,8 +1323,8 @@ async fn run_agent_process(
     }
 
     match agent {
-        "gemini" => run_gemini_cli_process(bin, args, message).await,
-        "codex" => run_codex_cli_process(bin, args, message).await,
+        "gemini" => run_gemini_cli_process(bin, args, message, cwd).await,
+        "codex" => run_codex_cli_process(bin, args, message, cwd).await,
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
