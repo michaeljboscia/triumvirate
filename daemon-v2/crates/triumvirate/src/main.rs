@@ -62,6 +62,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        OnceLock,
     },
 };
 use tokio::{
@@ -172,6 +173,85 @@ fn next_heartbeat_offset(current: Duration) -> Duration {
     }
 }
 
+#[cfg(not(test))]
+fn daemon_sessions_file_path() -> Option<PathBuf> {
+    core_triumvirate_home_dir()
+        .ok()
+        .map(|home| core_sessions_file_path(&home))
+}
+
+#[cfg(not(test))]
+fn daemon_sessions_store() -> &'static Arc<Mutex<HashMap<String, SessionState>>> {
+    static STORE: OnceLock<Arc<Mutex<HashMap<String, SessionState>>>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        let initial = daemon_sessions_file_path()
+            .as_ref()
+            .and_then(|path| {
+                core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok()
+            })
+            .unwrap_or_default();
+        Arc::new(Mutex::new(initial))
+    })
+}
+
+#[cfg(not(test))]
+fn persist_daemon_sessions(sessions: &HashMap<String, SessionState>) {
+    if let Some(path) = daemon_sessions_file_path() {
+        if let Err(err) = core_persist_json_file_if_enabled(Some(&path), sessions) {
+            tracing::warn!("failed to persist daemon sessions: {err}");
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn daemon_session_key(agent: &str, cwd: &str) -> String {
+    format!("daemon::{agent}::{cwd}")
+}
+
+#[cfg(not(test))]
+async fn daemon_session_prepare_prompt(agent: &str, cwd: &str, message: &str) -> String {
+    let key = daemon_session_key(agent, cwd);
+    let mut sessions = daemon_sessions_store().lock().await;
+    let state = sessions.entry(key).or_insert_with(|| SessionState {
+        agent: agent.to_string(),
+        cwd: Some(cwd.to_string()),
+        history: Vec::new(),
+    });
+    let prompt = if state.history.is_empty() {
+        message.to_string()
+    } else {
+        format!(
+            "Previous turns:\n{}\n\nNew user message:\n{}",
+            state.history.join("\n"),
+            message
+        )
+    };
+    state.history.push(format!("user: {message}"));
+    persist_daemon_sessions(&sessions);
+    prompt
+}
+
+#[cfg(test)]
+async fn daemon_session_prepare_prompt(_agent: &str, _cwd: &str, message: &str) -> String {
+    message.to_string()
+}
+
+#[cfg(not(test))]
+async fn daemon_session_record_response(agent: &str, cwd: &str, response: &str) {
+    let key = daemon_session_key(agent, cwd);
+    let mut sessions = daemon_sessions_store().lock().await;
+    let state = sessions.entry(key).or_insert_with(|| SessionState {
+        agent: agent.to_string(),
+        cwd: Some(cwd.to_string()),
+        history: Vec::new(),
+    });
+    state.history.push(format!("assistant: {response}"));
+    persist_daemon_sessions(&sessions);
+}
+
+#[cfg(test)]
+async fn daemon_session_record_response(_agent: &str, _cwd: &str, _response: &str) {}
+
 impl McpBridge {
     fn new() -> Self {
         Self::with_persistence(true)
@@ -207,6 +287,7 @@ impl McpBridge {
 struct SpawnSessionRequest {
     agent: String,
     name: String,
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, JsonSchema)]
@@ -245,14 +326,41 @@ impl McpBridge {
         Parameters(req): Parameters<AskAgentRequest>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<AskAgentResponse>, String> {
+        let emitter = ProgressEmitter::from_context(&context);
         if use_daemon_for_mcp_from_env() {
-            return fetch_daemon_ask_agent(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("ask_agent via daemon failed: {e}"));
+            let display = display_agent_name(&req.agent);
+            emitter.emit(format!("→ {display}: sent ✓")).await;
+            let mut pending = Box::pin(fetch_daemon_ask_agent(&req));
+            let started = Instant::now();
+            let mut next_heartbeat = Duration::from_secs(10);
+            loop {
+                let sleep_duration = next_heartbeat.saturating_sub(started.elapsed());
+                tokio::select! {
+                    result = &mut pending => {
+                        match result {
+                            Ok(response) => {
+                                emitter.emit(format!("→ {display}: responded ✓")).await;
+                                return Ok(Json(response));
+                            }
+                            Err(err) => {
+                                emitter.emit(format!("→ {display}: FAILED ✗ ({err})")).await;
+                                return Err(format!("ask_agent via daemon failed: {err}"));
+                            }
+                        }
+                    }
+                    _ = sleep(sleep_duration) => {
+                        if started.elapsed() >= next_heartbeat {
+                            emitter
+                                .emit(format!("→ {display}: working... ({}s elapsed)", started.elapsed().as_secs()))
+                                .await;
+                            next_heartbeat = next_heartbeat_offset(next_heartbeat);
+                        }
+                    }
+                }
+            }
         }
 
-        execute_ask_agent(&req, Some(ProgressEmitter::from_context(&context)))
+        execute_ask_agent(&req, Some(emitter))
             .await
             .map(Json)
     }
@@ -263,14 +371,48 @@ impl McpBridge {
         Parameters(req): Parameters<AskTwinsRequest>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<AskTwinsResponse>, String> {
+        let emitter = ProgressEmitter::from_context(&context);
         if use_daemon_for_mcp_from_env() {
-            return fetch_daemon_ask_twins(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("ask_twins via daemon failed: {e}"));
+            emitter.emit("→ Gemini: sent ✓").await;
+            emitter.emit("→ Codex: sent ✓").await;
+            let mut pending = Box::pin(fetch_daemon_ask_twins(&req));
+            let started = Instant::now();
+            let mut next_heartbeat = Duration::from_secs(10);
+            loop {
+                let sleep_duration = next_heartbeat.saturating_sub(started.elapsed());
+                tokio::select! {
+                    result = &mut pending => {
+                        match result {
+                            Ok(response) => {
+                                for r in &response.results {
+                                    emitter.emit(format!("→ {}: responded ✓", display_agent_name(&r.agent))).await;
+                                }
+                                for f in &response.failures {
+                                    if f.state == "FAILED" {
+                                        emitter.emit(format!("→ FAILURE: {}", f.detail)).await;
+                                    }
+                                }
+                                return Ok(Json(response));
+                            }
+                            Err(err) => {
+                                emitter.emit(format!("→ Twins FAILED ✗ ({err})")).await;
+                                return Err(format!("ask_twins via daemon failed: {err}"));
+                            }
+                        }
+                    }
+                    _ = sleep(sleep_duration) => {
+                        if started.elapsed() >= next_heartbeat {
+                            emitter
+                                .emit(format!("→ Gemini/Codex: working... ({}s elapsed)", started.elapsed().as_secs()))
+                                .await;
+                            next_heartbeat = next_heartbeat_offset(next_heartbeat);
+                        }
+                    }
+                }
+            }
         }
 
-        execute_ask_twins(&req, Some(ProgressEmitter::from_context(&context)))
+        execute_ask_twins(&req, Some(emitter))
             .await
             .map(Json)
     }
@@ -290,6 +432,7 @@ impl McpBridge {
             req.name.clone(),
             SessionState {
                 agent: agent.clone(),
+                cwd: req.cwd.clone(),
                 history: Vec::new(),
             },
         );
@@ -303,7 +446,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AskSessionRequest>,
     ) -> Result<String, String> {
-        let (agent, prompt) = {
+        let (agent, prompt, cwd) = {
             let mut sessions = self.sessions.lock().await;
             let state = sessions
                 .get_mut(&req.name)
@@ -316,10 +459,10 @@ impl McpBridge {
             };
             let prompt = format!("{context}New user message:\n{}", req.message);
             state.history.push(req.message.clone());
-            (state.agent.clone(), prompt)
+            (state.agent.clone(), prompt, state.cwd.clone())
         };
 
-        let response = run_named_agent(&agent, &prompt, ".")
+        let response = run_named_agent(&agent, &prompt, cwd.as_deref().unwrap_or("."))
             .await
             .map_err(|e| format!("ask_session failed: {e}"))?;
 
@@ -570,6 +713,10 @@ async fn execute_ask_agent(
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
+    let exec_cwd = resolved_cwd
+        .clone()
+        .unwrap_or_else(|| ".".to_string());
+    let execution_prompt = daemon_session_prepare_prompt(&agent, &exec_cwd, &req.message).await;
 
     let agent_display = display_agent_name(&agent);
     let mut lifecycle = vec![LifecycleEvent {
@@ -641,8 +788,8 @@ async fn execute_ask_agent(
     for (idx, backoff) in backoffs.iter().enumerate() {
         let mut attempt = Box::pin(run_named_agent(
             &agent,
-            &req.message,
-            resolved_cwd.as_deref().unwrap_or("."),
+            &execution_prompt,
+            &exec_cwd,
         ));
         let started = Instant::now();
         let mut next_heartbeat = Duration::from_secs(10);
@@ -695,6 +842,7 @@ async fn execute_ask_agent(
                 if let Some(emitter) = progress.as_ref() {
                     emitter.emit(format!("→ {agent_display}: responded ✓")).await;
                 }
+                daemon_session_record_response(&agent, &exec_cwd, &response).await;
                 return Ok(AskAgentResponse {
                     request_id,
                     agent: agent.clone(),
@@ -829,7 +977,7 @@ async fn execute_ask_twins(
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
-    let (gemini_prompt, codex_prompt) = build_role_adapted_prompts(&AskTwinsRequest {
+    let (gemini_prompt_raw, codex_prompt_raw) = build_role_adapted_prompts(&AskTwinsRequest {
         message: req.message.clone(),
         cwd: resolved_cwd.clone(),
         repo: resolved_repo.clone(),
@@ -838,6 +986,8 @@ async fn execute_ask_twins(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
+    let gemini_prompt = daemon_session_prepare_prompt("gemini", &exec_cwd, &gemini_prompt_raw).await;
+    let codex_prompt = daemon_session_prepare_prompt("codex", &exec_cwd, &codex_prompt_raw).await;
 
     let mut lifecycle = vec![
         LifecycleEvent {
@@ -929,6 +1079,7 @@ async fn execute_ask_twins(
                 let display = display_agent_name(&agent);
                 match outcome {
                     Ok(response) => {
+                        let response_for_session = response.clone();
                         lifecycle.push(LifecycleEvent {
                             state: "DONE".to_string(),
                             detail: format!("{display} responded"),
@@ -952,6 +1103,7 @@ async fn execute_ask_twins(
                         if let Some(emitter) = progress.as_ref() {
                             emitter.emit(format!("→ {display}: responded ✓")).await;
                         }
+                        daemon_session_record_response(&agent, &exec_cwd, &response_for_session).await;
                     }
                     Err(e) => {
                         let detail = format!("{display} failed: {e}");
@@ -4545,6 +4697,7 @@ exit 1\n",
                 "persisted".to_string(),
                 SessionState {
                     agent: "gemini".to_string(),
+                    cwd: None,
                     history: vec!["hello".to_string()],
                 },
             );

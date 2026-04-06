@@ -185,6 +185,8 @@ pub struct StatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionState {
     pub agent: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub history: Vec<String>,
 }
 
