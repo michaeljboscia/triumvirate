@@ -62,9 +62,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        OnceLock,
     },
 };
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use tokio::{
     process::Command,
     sync::Mutex,
