@@ -35,6 +35,7 @@ fallback-outbox = { path = "../fallback-outbox" }
 agent-adapter = { path = "../agent-adapter" }
 ledger = { path = "../ledger" }
 fleet = { path = "../fleet" }
+peer-review = { path = "../peer-review" }
 
 [dev-dependencies]
 tempfile = "3"
