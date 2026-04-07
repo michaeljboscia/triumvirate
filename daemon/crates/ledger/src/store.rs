@@ -30,6 +30,26 @@ CREATE TABLE IF NOT EXISTS summaries (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts
+USING fts5(title, narrative, facts_json, content='summaries', content_rowid='id');
+
+CREATE TRIGGER IF NOT EXISTS summaries_ai AFTER INSERT ON summaries BEGIN
+    INSERT INTO summaries_fts(rowid, title, narrative, facts_json)
+    VALUES (new.id, new.title, new.narrative, new.facts_json);
+END;
+
+CREATE TRIGGER IF NOT EXISTS summaries_ad AFTER DELETE ON summaries BEGIN
+    INSERT INTO summaries_fts(summaries_fts, rowid, title, narrative, facts_json)
+    VALUES('delete', old.id, old.title, old.narrative, old.facts_json);
+END;
+
+CREATE TRIGGER IF NOT EXISTS summaries_au AFTER UPDATE ON summaries BEGIN
+    INSERT INTO summaries_fts(summaries_fts, rowid, title, narrative, facts_json)
+    VALUES('delete', old.id, old.title, old.narrative, old.facts_json);
+    INSERT INTO summaries_fts(rowid, title, narrative, facts_json)
+    VALUES (new.id, new.title, new.narrative, new.facts_json);
+END;
+
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
@@ -61,6 +81,26 @@ CREATE TABLE IF NOT EXISTS lessons (
     tags_json TEXT,
     req_ids_json TEXT
 );
+
+CREATE VIRTUAL TABLE IF NOT EXISTS lessons_fts
+USING fts5(title, body, tags_json, content='lessons', content_rowid='lesson_id');
+
+CREATE TRIGGER IF NOT EXISTS lessons_ai AFTER INSERT ON lessons BEGIN
+    INSERT INTO lessons_fts(rowid, title, body, tags_json)
+    VALUES (new.lesson_id, new.title, new.body, new.tags_json);
+END;
+
+CREATE TRIGGER IF NOT EXISTS lessons_ad AFTER DELETE ON lessons BEGIN
+    INSERT INTO lessons_fts(lessons_fts, rowid, title, body, tags_json)
+    VALUES('delete', old.lesson_id, old.title, old.body, old.tags_json);
+END;
+
+CREATE TRIGGER IF NOT EXISTS lessons_au AFTER UPDATE ON lessons BEGIN
+    INSERT INTO lessons_fts(lessons_fts, rowid, title, body, tags_json)
+    VALUES('delete', old.lesson_id, old.title, old.body, old.tags_json);
+    INSERT INTO lessons_fts(rowid, title, body, tags_json)
+    VALUES (new.lesson_id, new.title, new.body, new.tags_json);
+END;
 "#;
 
 pub(crate) fn open(project_root: PathBuf) -> anyhow::Result<LedgerStore> {
