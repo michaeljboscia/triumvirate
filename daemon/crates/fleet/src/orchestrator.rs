@@ -17,6 +17,7 @@ pub struct FleetSpawnRequest {
     pub project_root: PathBuf,
     pub agents: Vec<String>,
     pub dry_run: bool,
+    pub wait: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,13 +70,13 @@ impl AgentLauncher for ShellAgentLauncher {
     }
 }
 
-impl<G: GitOps + Clone> FleetOrchestrator<G, ShellAgentLauncher> {
+impl<G: GitOps + Clone + 'static> FleetOrchestrator<G, ShellAgentLauncher> {
     pub fn new(git_ops: G) -> Self {
         Self::with_launcher(git_ops, ShellAgentLauncher)
     }
 }
 
-impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
+impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
     pub fn with_launcher(git_ops: G, launcher: L) -> Self {
         Self {
             worktree: WorktreeManager::new(git_ops.clone()),
@@ -103,54 +104,27 @@ impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
 
         let mut worktree_paths = Vec::new();
         if !req.dry_run {
-            let base = req.project_root.join(".triumvirate").join("worktrees");
-            fs::create_dir_all(&base)?;
-            let store = LedgerStore::open(req.project_root.clone())?;
-            for (idx, agent) in req.agents.iter().enumerate() {
-                let task_id = format!("T-{:03}", idx + 1);
-                let branch = format!("fleet/{fleet_id}/{task_id}");
-                let worktree_path = base.join(format!("{fleet_id}-{task_id}-{agent}"));
-                self.worktree
-                    .create_worktree(&worktree_path, &branch)
+            if req.wait.unwrap_or(false) {
+                worktree_paths = self
+                    .spawn_fleet_members(
+                        req.project_root.clone(),
+                        fleet_id.clone(),
+                        head_sha.clone(),
+                        req.agents.clone(),
+                    )
                     .await?;
-                fs::create_dir_all(worktree_path.join(".triumvirate"))?;
-                fs::write(
-                    worktree_path.join(".triumvirate").join("fleet-task.md"),
-                    format!(
-                        "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\ndepends_on: []\n---\n\nImplement the assigned fleet task for {agent}.\nDocument changes and tests in your final report.\n"
-                    ),
-                )?;
-                self.launcher
-                    .launch(agent, &req.project_root, &worktree_path)
-                    .await?;
-                let sequence = event_sequence_for(&req.project_root, &fleet_id, "agent_started")?;
-                store.ingest_event(RawEvent {
-                    session_id: fleet_id.clone(),
-                    event_type: "agent_started".to_string(),
-                    sequence,
-                    timestamp: "2030-01-01T00:00:00Z".to_string(),
-                    payload_json: serde_json::json!({
-                        "fleet_id": fleet_id,
-                        "task_id": task_id,
-                        "agent": agent
-                    })
-                    .to_string(),
-                })?;
-                worktree_paths.push(worktree_path);
+            } else {
+                let orchestrator = self.clone();
+                let project_root = req.project_root.clone();
+                let agents = req.agents.clone();
+                let fleet_id_bg = fleet_id.clone();
+                let head_sha_bg = head_sha.clone();
+                tokio::spawn(async move {
+                    let _ = orchestrator
+                        .spawn_fleet_members(project_root, fleet_id_bg, head_sha_bg, agents)
+                        .await;
+                });
             }
-
-            store.ingest_event(RawEvent {
-                session_id: fleet_id.clone(),
-                event_type: "fleet_spawned".to_string(),
-                sequence: 1,
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                payload_json: serde_json::json!({
-                    "fleet_id": fleet_id,
-                    "head_sha": head_sha,
-                    "agent_count": req.agents.len()
-                })
-                .to_string(),
-            })?;
         }
 
         Ok(FleetSpawnResult {
@@ -159,6 +133,64 @@ impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
             head_sha,
             worktree_paths,
         })
+    }
+
+    async fn spawn_fleet_members(
+        &self,
+        project_root: PathBuf,
+        fleet_id: String,
+        head_sha: String,
+        agents: Vec<String>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let base = project_root.join(".triumvirate").join("worktrees");
+        fs::create_dir_all(&base)?;
+        let store = LedgerStore::open(project_root.clone())?;
+        let mut worktree_paths = Vec::new();
+        for (idx, agent) in agents.iter().enumerate() {
+            let task_id = format!("T-{:03}", idx + 1);
+            let branch = format!("fleet/{fleet_id}/{task_id}");
+            let worktree_path = base.join(format!("{fleet_id}-{task_id}-{agent}"));
+            self.worktree
+                .create_worktree(&worktree_path, &branch)
+                .await?;
+            fs::create_dir_all(worktree_path.join(".triumvirate"))?;
+            fs::write(
+                worktree_path.join(".triumvirate").join("fleet-task.md"),
+                format!(
+                    "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\ndepends_on: []\n---\n\nImplement the assigned fleet task for {agent}.\nDocument changes and tests in your final report.\n"
+                ),
+            )?;
+            self.launcher
+                .launch(agent, &project_root, &worktree_path)
+                .await?;
+            let sequence = event_sequence_for(&project_root, &fleet_id, "agent_started")?;
+            store.ingest_event(RawEvent {
+                session_id: fleet_id.clone(),
+                event_type: "agent_started".to_string(),
+                sequence,
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                payload_json: serde_json::json!({
+                    "fleet_id": fleet_id,
+                    "task_id": task_id,
+                    "agent": agent
+                })
+                .to_string(),
+            })?;
+            worktree_paths.push(worktree_path);
+        }
+
+        store.ingest_event(RawEvent {
+            session_id: fleet_id,
+            event_type: "fleet_spawned".to_string(),
+            sequence: 1,
+            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            payload_json: serde_json::json!({
+                "head_sha": head_sha,
+                "agent_count": agents.len()
+            })
+            .to_string(),
+        })?;
+        Ok(worktree_paths)
     }
 }
 
@@ -271,6 +303,7 @@ mod tests {
                 project_root: project_root.clone(),
                 agents: vec!["codex".to_string(), "gemini".to_string()],
                 dry_run: true,
+                wait: None,
             })
             .await
             .expect("dry run");
@@ -283,6 +316,7 @@ mod tests {
                 project_root: project_root.clone(),
                 agents: vec!["codex".to_string(), "gemini".to_string()],
                 dry_run: false,
+                wait: Some(true),
             })
             .await
             .expect("execute");
@@ -336,11 +370,13 @@ mod tests {
             project_root: project_a.clone(),
             agents: vec!["codex".to_string()],
             dry_run: false,
+            wait: Some(true),
         });
         let spawn_b = orchestrator.fleet_spawn(FleetSpawnRequest {
             project_root: project_b.clone(),
             agents: vec!["gemini".to_string()],
             dry_run: false,
+            wait: Some(true),
         });
         let (res_a, res_b) = tokio::join!(spawn_a, spawn_b);
         res_a.expect("spawn a");
@@ -372,6 +408,7 @@ mod tests {
                 project_root: project_root.clone(),
                 agents: vec!["codex".to_string()],
                 dry_run: false,
+                wait: Some(true),
             })
             .await
             .expect("spawn");
@@ -414,5 +451,50 @@ mod tests {
                 .expect("count lifecycle event");
             assert!(count >= 1, "missing event type: {event_type}");
         }
+    }
+
+    #[tokio::test]
+    async fn fleet_spawn_wait_true_blocks_and_wait_false_returns_spawning_fast() {
+        use tokio::time::Instant;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+
+        let launcher = RecordingLauncher::default();
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps {
+                touched: Arc::new(Mutex::new(Vec::new())),
+            },
+            launcher,
+        );
+
+        let t0 = Instant::now();
+        let no_wait = orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.clone(),
+                agents: vec!["codex".to_string()],
+                dry_run: false,
+                wait: Some(false),
+            })
+            .await
+            .expect("spawn no-wait");
+        assert!(t0.elapsed() < Duration::from_millis(20));
+        assert!(no_wait.worktree_paths.is_empty());
+
+        let t1 = Instant::now();
+        let wait = orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root,
+                agents: vec!["gemini".to_string()],
+                dry_run: false,
+                wait: Some(true),
+            })
+            .await
+            .expect("spawn wait");
+        assert!(t1.elapsed() >= Duration::from_millis(20));
+        assert_eq!(wait.worktree_paths.len(), 1);
     }
 }

@@ -240,6 +240,7 @@ pub struct FleetSpawnRequest {
     pub project_root: Option<String>,
     pub agents: Option<Vec<String>>,
     pub dry_run: Option<bool>,
+    pub wait: Option<bool>,
     pub task_description: Option<String>,
 }
 
