@@ -362,6 +362,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             });
             join_handles.push(jh);
         }
+        // Await all agent completions
+        for jh in join_handles {
+            let _ = jh.await;
+        }
         Ok(worktree_paths)
     }
 
