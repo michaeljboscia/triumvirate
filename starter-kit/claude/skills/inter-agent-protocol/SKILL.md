@@ -20,20 +20,20 @@ All three share: Supabase, GitHub, HubSpot, Google Drive, ClickUp.
 
 ## Sending Messages (MCP — Primary)
 
-### DEFAULT: spawn_daemon + ask_daemon
+### DEFAULT: spawn_session + ask_session
 
 **To Gemini:**
 ```
-mcp__inter-agent-gemini__spawn_daemon(cwd: "/path/to/project")  → daemon_id
-mcp__inter-agent-gemini__ask_daemon(daemon_id, question)
-mcp__inter-agent-gemini__dismiss_daemon(daemon_id)
+mcp__triumvirate__spawn_session(cwd: "/path/to/project")  → session_name
+mcp__triumvirate__ask_session(session_name, question)
+mcp__triumvirate__dismiss_session(session_name)
 ```
 
 **To Codex:**
 ```
-mcp__inter-agent-codex__spawn_daemon(cwd: "/path/to/project")  → daemon_id
-mcp__inter-agent-codex__ask_daemon(daemon_id, question)
-mcp__inter-agent-codex__dismiss_daemon(daemon_id)
+mcp__triumvirate__spawn_session(cwd: "/path/to/project")  → session_name
+mcp__triumvirate__ask_session(session_name, question)
+mcp__triumvirate__dismiss_session(session_name)
 ```
 
 ### Performance Rules (v2.1)

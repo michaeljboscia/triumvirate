@@ -52,7 +52,7 @@ Use the `send-to-claude` skill:
 ### Sending to Gemini
 Use the inter-agent MCP server (if configured in config.toml):
 ```
-mcp__inter-agent-gemini__spawn_daemon → ask_daemon → dismiss_daemon
+mcp__triumvirate__spawn_session → ask_session → dismiss_session
 ```
 
 ### Receiving Messages

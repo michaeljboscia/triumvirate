@@ -22,14 +22,14 @@ Compile from Phase 1 output:
 
 **Gemini daemon:** Spawn or resume daemon. Send the same payload and questions.
 ```
-mcp__inter-agent-gemini__spawn_daemon(cwd: "<project-dir>")
-mcp__inter-agent-gemini__ask_daemon(daemon_id, "<payload + questions>")
+mcp__triumvirate__spawn_session(cwd: "<project-dir>")
+mcp__triumvirate__ask_session(session_name, "<payload + questions>")
 ```
 
 **Codex daemon:** Spawn daemon. Send the same payload and questions.
 ```
-mcp__inter-agent-codex__spawn_daemon(cwd: "<project-dir>")
-mcp__inter-agent-codex__ask_daemon(daemon_id, "<payload + questions>")
+mcp__triumvirate__spawn_session(cwd: "<project-dir>")
+mcp__triumvirate__ask_session(session_name, "<payload + questions>")
 ```
 
 ### If Triumvirate Already Happened

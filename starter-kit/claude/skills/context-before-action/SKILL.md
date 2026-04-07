@@ -37,7 +37,7 @@ Before writing any plan, investigation conclusion, or architectural recommendati
 
 **The right way:**
 ```
-spawn_daemon(session_name: "<task>-oracle", cwd: "<project-dir>")
+spawn_session(session_name: "<task>-oracle", cwd: "<project-dir>")
 → "Read these files: [list every file in affected directories]"
 → "What is the current state of [thing I'm about to plan around]?"
 ```
@@ -121,8 +121,8 @@ Send the revised plan to Gemini AND Codex. Both review independently, in paralle
 
 **The right way:**
 ```
-ask_daemon(gemini_id, "Review this plan: ...")
-ask_daemon(codex_id, "Review this plan: ...")
+ask_session(gemini_id, "Review this plan: ...")
+ask_session(codex_id, "Review this plan: ...")
 ```
 Parallel. 30 seconds. Every time. No exceptions for "small" tasks.
 
