@@ -329,6 +329,7 @@ Every atomic work product populates these artifacts. They are append-only during
   "current_wave": 2,
   "tasks_completed": ["T-001", "T-002", "T-003"],
   "tasks_remaining": ["T-004", "T-005", "T-006"],
+  "tasks_running": ["T-004"],
   "tasks_failed": [],
   "validation_pass_rate": 1.0,
   "collateral_fix_count": 0,
