@@ -8,11 +8,19 @@ pub struct CompletedWork {
     pub branch: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeConflictRecord {
+    pub task_id: String,
+    pub files: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MergeCoordinator<G: GitOps> {
     git_ops: G,
     completion_queue: VecDeque<CompletedWork>,
     merged_order: Vec<String>,
+    paused: bool,
+    conflicts: Vec<MergeConflictRecord>,
 }
 
 impl<G: GitOps> MergeCoordinator<G> {
@@ -21,6 +29,8 @@ impl<G: GitOps> MergeCoordinator<G> {
             git_ops,
             completion_queue: VecDeque::new(),
             merged_order: Vec::new(),
+            paused: false,
+            conflicts: Vec::new(),
         }
     }
 
@@ -32,6 +42,9 @@ impl<G: GitOps> MergeCoordinator<G> {
     }
 
     pub async fn merge_next(&mut self) -> anyhow::Result<Option<String>> {
+        if self.paused {
+            anyhow::bail!("merge queue paused due to previous conflict");
+        }
         let Some(next) = self.completion_queue.pop_front() else {
             return Ok(None);
         };
@@ -42,10 +55,15 @@ impl<G: GitOps> MergeCoordinator<G> {
                 Ok(Some(next.task_id))
             }
             MergeResult::Conflict { files } => {
+                self.paused = true;
+                self.conflicts.push(MergeConflictRecord {
+                    task_id: next.task_id.clone(),
+                    files: files.clone(),
+                });
                 anyhow::bail!(
-                    "merge conflict while merging task {} ({} files)",
+                    "merge conflict while merging task {}: {}; queue paused",
                     next.task_id,
-                    files.len()
+                    files.join(", ")
                 );
             }
         }
@@ -53,6 +71,14 @@ impl<G: GitOps> MergeCoordinator<G> {
 
     pub fn merged_order(&self) -> &[String] {
         &self.merged_order
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn conflicts(&self) -> &[MergeConflictRecord] {
+        &self.conflicts
     }
 }
 
@@ -90,7 +116,13 @@ mod tests {
 
         async fn merge(&self, branch: &str) -> anyhow::Result<MergeResult> {
             self.merged_branches.lock().await.push(branch.to_string());
-            Ok(MergeResult::Success)
+            if branch.contains("conflict") {
+                Ok(MergeResult::Conflict {
+                    files: vec!["src/lib.rs".to_string()],
+                })
+            } else {
+                Ok(MergeResult::Success)
+            }
         }
 
         async fn diff(&self, _branch: &str) -> anyhow::Result<String> {
@@ -128,5 +160,37 @@ mod tests {
             merged_branches,
             vec!["fleet/task-2".to_string(), "fleet/task-1".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn conflict_pauses_queue_and_blocks_subsequent_merges() {
+        let merged = Arc::new(Mutex::new(Vec::new()));
+        let git_ops = MockGitOps {
+            merged_branches: Arc::clone(&merged),
+        };
+        let mut coordinator = MergeCoordinator::new(git_ops);
+
+        coordinator.enqueue_completed("task-ok", "fleet/task-ok");
+        coordinator.enqueue_completed("task-conflict", "fleet/task-conflict");
+        coordinator.enqueue_completed("task-after", "fleet/task-after");
+
+        let first = coordinator.merge_next().await.expect("first merge");
+        assert_eq!(first.as_deref(), Some("task-ok"));
+
+        let conflict_err = coordinator
+            .merge_next()
+            .await
+            .expect_err("second merge should conflict");
+        let conflict_text = conflict_err.to_string();
+        assert!(conflict_text.contains("src/lib.rs"));
+        assert!(coordinator.is_paused());
+        assert_eq!(coordinator.conflicts().len(), 1);
+        assert_eq!(coordinator.conflicts()[0].task_id, "task-conflict");
+
+        let paused_err = coordinator
+            .merge_next()
+            .await
+            .expect_err("queue should remain paused");
+        assert!(paused_err.to_string().contains("paused"));
     }
 }
