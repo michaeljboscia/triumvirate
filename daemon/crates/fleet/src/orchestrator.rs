@@ -43,51 +43,38 @@ pub struct FleetOrchestrator<G: GitOps, L: AgentLauncher = ShellAgentLauncher> {
 
 #[async_trait]
 pub trait AgentLauncher: Clone + Send + Sync + 'static {
+    /// Launch an agent in the given worktree. Returns when the agent completes.
+    /// Uses the daemon's ask_agent path — not a raw subprocess.
     async fn launch(
         &self,
         agent: &str,
         project_root: &Path,
         worktree_path: &Path,
-    ) -> anyhow::Result<tokio::process::Child>;
+        task_prompt: &str,
+    ) -> anyhow::Result<String>;
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ShellAgentLauncher;
+pub struct DaemonAgentLauncher;
 
 #[async_trait]
-impl AgentLauncher for ShellAgentLauncher {
+impl AgentLauncher for DaemonAgentLauncher {
     async fn launch(
         &self,
         agent: &str,
-        project_root: &Path,
+        _project_root: &Path,
         worktree_path: &Path,
-    ) -> anyhow::Result<tokio::process::Child> {
-        let task_file = worktree_path.join(".triumvirate").join("fleet-task.md");
-        let prompt = format!(
-            "You are a fleet agent. Read your task assignment at {} and complete the work. Commit your changes when done.",
-            task_file.display()
-        );
-        let (cmd, args) = match agent {
-            "codex" => (
-                "codex",
-                vec![
-                    "exec".to_string(),
-                    "--message".to_string(),
-                    prompt,
-                ],
-            ),
-            "gemini" => ("gemini", vec!["-p".to_string(), prompt]),
-            _ => anyhow::bail!("unsupported fleet agent: {agent}"),
+        task_prompt: &str,
+    ) -> anyhow::Result<String> {
+        let req = shared_types::AskAgentRequest {
+            agent: agent.to_string(),
+            message: task_prompt.to_string(),
+            cwd: Some(worktree_path.to_string_lossy().to_string()),
+            repo: None,
+            branch: None,
         };
-        let child = Command::new(cmd)
-            .args(args)
-            .current_dir(worktree_path)
-            .env("TRIUMVIRATE_PROJECT_ROOT", project_root.as_os_str())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        Ok(child)
+        let resp = daemon_http::fetch_daemon_ask_agent(&req).await?;
+        Ok(resp.response)
     }
 }
 
