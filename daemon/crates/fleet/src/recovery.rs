@@ -126,10 +126,13 @@ mod tests {
         assert_eq!(fleet_state.0, "failed");
         assert!(fleet_state.1.contains("crash recovery"));
 
-        let events = LedgerStore::open(project_root)
-            .expect("open ledger")
-            .query("fleet_recovery", 10)
-            .expect("query recovery events");
-        assert!(!events.is_empty());
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'fleet_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count recovery events");
+        assert!(events >= 1);
     }
 }

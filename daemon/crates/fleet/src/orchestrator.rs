@@ -200,11 +200,17 @@ mod tests {
             assert!(contents.contains("assigned_agent:"));
         }
 
-        let event_count = ledger::LedgerStore::open(project_root)
-            .expect("open ledger")
-            .query("fleet_spawned", 10)
-            .expect("query fleet events")
-            .len();
+        let conn = rusqlite::Connection::open(
+            project_root.join(".triumvirate").join("ledger.db"),
+        )
+        .expect("open sqlite");
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'fleet_spawned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count fleet events");
         assert!(event_count >= 1);
     }
 }
