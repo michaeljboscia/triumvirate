@@ -1,8 +1,12 @@
 //! Shared DTOs for MCP bridge <-> daemon communication.
 
 mod git_ops;
+mod ledger;
 
 pub use git_ops::{GitOps, MergeResult};
+pub use ledger::{
+    DrainResult, GcResult, HealthStatus, ManualRecord, NewLesson, RawEvent, SessionDetail, Summary,
+};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
