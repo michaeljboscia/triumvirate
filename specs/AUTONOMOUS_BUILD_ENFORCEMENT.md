@@ -86,6 +86,8 @@ Gemini is never dispatched — it's queried. Two modes:
 
 Both use the existing Triumvirate daemon → Gemini CLI pathway. No new infrastructure needed beyond the MCP tool wrappers.
 
+**Phase 1 acceptance test:** Dispatch a Codex worker that creates a file and commits it. Poll `get_task_status` until complete. Call `get_task_output` to retrieve the commit SHA. Run `query_gemini_review` on the resulting diff. All three operations (dispatch, monitor, audit) must succeed end-to-end. `cancel_task` tested separately on a long-running task.
+
 ---
 
 ## Phase 2: Mechanical Enforcement Stack
