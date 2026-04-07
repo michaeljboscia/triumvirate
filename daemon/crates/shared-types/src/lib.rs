@@ -218,6 +218,66 @@ pub struct LessonListResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetSpawnRequest {
+    pub project_root: Option<String>,
+    pub agents: Option<Vec<String>>,
+    pub dry_run: Option<bool>,
+    pub task_description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetSpawnResponse {
+    pub fleet_id: String,
+    pub plan: String,
+    pub head_sha: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetStatusRequest {
+    pub fleet_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetStatusResponse {
+    pub fleet_id: String,
+    pub state: String,
+    pub worktree_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetTaskListRequest {
+    pub fleet_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetTaskListResponse {
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetClaimTaskRequest {
+    pub project_root: Option<String>,
+    pub task_id: String,
+    pub assigned_agent: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetClaimTaskResponse {
+    pub claimed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetCancelRequest {
+    pub fleet_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FleetCancelResponse {
+    pub canceled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonHealthResponse {
     pub status: String,
     pub service: Option<String>,

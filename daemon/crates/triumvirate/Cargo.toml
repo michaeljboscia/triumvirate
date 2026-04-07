@@ -34,6 +34,7 @@ daemon-http = { path = "../daemon-http" }
 fallback-outbox = { path = "../fallback-outbox" }
 agent-adapter = { path = "../agent-adapter" }
 ledger = { path = "../ledger" }
+fleet = { path = "../fleet" }
 
 [dev-dependencies]
 tempfile = "3"

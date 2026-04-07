@@ -36,6 +36,8 @@ use fallback_outbox::{
     acknowledge_fallback_path, append_outbox_event, count_pending_fallbacks, gc_fallbacks,
     list_pending_fallback_paths, read_outbox_events, spawn_dead_drop as create_dead_drop_fallback,
 };
+use fleet::orchestrator::{FleetOrchestrator, FleetSpawnRequest as FleetSpawnRunRequest};
+use fleet::tasks::FleetTaskStore;
 use ledger::LedgerStore;
 use mcp_bridge::{
     is_bearer_authorized, is_supported_agent_name,
@@ -69,6 +71,9 @@ use shared_types::{
     DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
     FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest,
+    FleetCancelRequest, FleetCancelResponse, FleetClaimTaskRequest, FleetClaimTaskResponse,
+    FleetSpawnRequest, FleetSpawnResponse, FleetStatusRequest, FleetStatusResponse, FleetTaskListRequest,
+    FleetTaskListResponse,
     Lesson, LessonAddResponse, LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse,
     LessonValidateRequest, ManualRecord, MemoryEntry,
     MemoryReadRequest, MemoryReadResponse,
@@ -84,6 +89,7 @@ use shared_types::{
 use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
     collections::{HashMap, VecDeque},
+    fs,
     path::PathBuf,
     sync::{
         Arc,
@@ -130,6 +136,7 @@ struct McpBridge {
     tool_router: ToolRouter<Self>,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     sessions_file: Option<PathBuf>,
+    fleet_states: Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
 }
 
 fn mcp_daemon_proxy_enabled() -> bool {
@@ -170,6 +177,7 @@ impl McpBridge {
             tool_router: Self::tool_router(),
             sessions: Arc::new(Mutex::new(sessions)),
             sessions_file,
+            fleet_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -702,6 +710,128 @@ impl McpBridge {
             .list_lessons(tags_ref, req.stale_days)
             .map_err(|e| format!("lesson_list failed: {e}"))?;
         Ok(Json(LessonListResponse { lessons }))
+    }
+
+    #[tool(description = "Spawn a multi-agent fleet (dry_run defaults to true).")]
+    async fn fleet_spawn(
+        &self,
+        Parameters(req): Parameters<FleetSpawnRequest>,
+    ) -> Result<Json<FleetSpawnResponse>, String> {
+        let project_root = req
+            .project_root
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to resolve project root".to_string())?;
+        let agents = req
+            .agents
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["codex".to_string(), "gemini".to_string()]);
+        let dry_run = req.dry_run.unwrap_or(true);
+
+        let git_ops = git_ops_impl::RealGitOps::new(project_root.clone())
+            .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
+        let orchestrator = FleetOrchestrator::new(git_ops);
+        let result = orchestrator
+            .fleet_spawn(FleetSpawnRunRequest {
+                project_root: project_root.clone(),
+                agents: agents.clone(),
+                dry_run,
+            })
+            .await
+            .map_err(|e| format!("fleet_spawn failed: {e}"))?;
+
+        let status = FleetStatusResponse {
+            fleet_id: result.fleet_id.clone(),
+            state: if dry_run {
+                "planned".to_string()
+            } else {
+                "running".to_string()
+            },
+            worktree_paths: result
+                .worktree_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+        };
+        let mut fleet_states = self.fleet_states.lock().await;
+        fleet_states.insert(result.fleet_id.clone(), status);
+
+        Ok(Json(FleetSpawnResponse {
+            fleet_id: result.fleet_id,
+            plan: result.plan_text,
+            head_sha: result.head_sha,
+            state: if dry_run {
+                "planned".to_string()
+            } else {
+                "running".to_string()
+            },
+        }))
+    }
+
+    #[tool(description = "Return fleet status by fleet_id.")]
+    async fn fleet_status(
+        &self,
+        Parameters(req): Parameters<FleetStatusRequest>,
+    ) -> Result<Json<FleetStatusResponse>, String> {
+        let fleet_states = self.fleet_states.lock().await;
+        let status = fleet_states
+            .get(&req.fleet_id)
+            .cloned()
+            .ok_or_else(|| format!("fleet not found: {}", req.fleet_id))?;
+        Ok(Json(status))
+    }
+
+    #[tool(description = "List known fleet task IDs for a fleet.")]
+    async fn fleet_task_list(
+        &self,
+        Parameters(req): Parameters<FleetTaskListRequest>,
+    ) -> Result<Json<FleetTaskListResponse>, String> {
+        let fleet_states = self.fleet_states.lock().await;
+        let status = fleet_states
+            .get(&req.fleet_id)
+            .ok_or_else(|| format!("fleet not found: {}", req.fleet_id))?;
+        let task_ids = status
+            .worktree_paths
+            .iter()
+            .filter_map(|path| {
+                let task_file = PathBuf::from(path)
+                    .join(".triumvirate")
+                    .join("fleet-task.md");
+                let contents = fs::read_to_string(task_file).ok()?;
+                contents
+                    .lines()
+                    .find_map(|line| line.strip_prefix("task_id: ").map(str::to_string))
+            })
+            .collect::<Vec<_>>();
+        Ok(Json(FleetTaskListResponse { task_ids }))
+    }
+
+    #[tool(description = "Claim a fleet task in SQLite.")]
+    async fn fleet_claim_task(
+        &self,
+        Parameters(req): Parameters<FleetClaimTaskRequest>,
+    ) -> Result<Json<FleetClaimTaskResponse>, String> {
+        let project_root = req
+            .project_root
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to resolve project root".to_string())?;
+        let store = FleetTaskStore::new(project_root)
+            .map_err(|e| format!("fleet_claim_task store init failed: {e}"))?;
+        let claimed = store
+            .claim_task(&req.task_id, &req.assigned_agent)
+            .map_err(|e| format!("fleet_claim_task failed: {e}"))?;
+        Ok(Json(FleetClaimTaskResponse { claimed }))
+    }
+
+    #[tool(description = "Cancel a fleet by fleet_id.")]
+    async fn fleet_cancel(
+        &self,
+        Parameters(req): Parameters<FleetCancelRequest>,
+    ) -> Result<Json<FleetCancelResponse>, String> {
+        let mut fleet_states = self.fleet_states.lock().await;
+        let canceled = fleet_states.remove(&req.fleet_id).is_some();
+        Ok(Json(FleetCancelResponse { canceled }))
     }
 }
 
@@ -4480,6 +4610,81 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             .map(|lesson| lesson.last_validated_at.clone())
             .unwrap_or_default();
         assert!(!after.is_empty());
+
+        std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fleet_spawn_and_status_tools_round_trip() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let original_cwd = std::env::current_dir()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-fleet-mcp-{now}"));
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))?;
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&project_root)
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.email", "fleet@test.local"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.name", "Fleet Test"])
+            .status()?;
+        fs::write(project_root.join("README.md"), "fleet test\n")?;
+        fs::write(project_root.join(".gitignore"), ".triumvirate/\n")?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["add", "README.md", ".gitignore"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["commit", "-m", "init"])
+            .status()?;
+
+        std::env::set_current_dir(&project_root)?;
+        let bridge = McpBridge::new_ephemeral();
+        let dry = bridge
+            .fleet_spawn(Parameters(FleetSpawnRequest {
+                project_root: None,
+                agents: Some(vec!["codex".to_string(), "gemini".to_string()]),
+                dry_run: Some(true),
+                task_description: Some("test".to_string()),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(dry.0.plan.contains("agent count: 2"));
+        assert!(dry.0.plan.contains("head sha:"));
+
+        let execute = bridge
+            .fleet_spawn(Parameters(FleetSpawnRequest {
+                project_root: None,
+                agents: Some(vec!["codex".to_string(), "gemini".to_string()]),
+                dry_run: Some(false),
+                task_description: Some("test".to_string()),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let status = bridge
+            .fleet_status(Parameters(FleetStatusRequest {
+                fleet_id: execute.0.fleet_id.clone(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(status.0.fleet_id, execute.0.fleet_id);
+        assert_eq!(status.0.state, "running");
+        assert_eq!(status.0.worktree_paths.len(), 2);
 
         std::env::set_current_dir(&original_cwd)?;
         let _ = fs::remove_dir_all(project_root);
