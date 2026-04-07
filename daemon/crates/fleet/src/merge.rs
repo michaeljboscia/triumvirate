@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use shared_types::{GitOps, MergeResult};
 
@@ -21,6 +21,15 @@ pub struct MergeCoordinator<G: GitOps> {
     merged_order: Vec<String>,
     paused: bool,
     conflicts: Vec<MergeConflictRecord>,
+    review_status: HashMap<String, ReviewGateState>,
+    review_comments: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewGateState {
+    Approved,
+    Pending,
+    RequestChanges,
 }
 
 impl<G: GitOps> MergeCoordinator<G> {
@@ -31,6 +40,8 @@ impl<G: GitOps> MergeCoordinator<G> {
             merged_order: Vec::new(),
             paused: false,
             conflicts: Vec::new(),
+            review_status: HashMap::new(),
+            review_comments: HashMap::new(),
         }
     }
 
@@ -48,6 +59,29 @@ impl<G: GitOps> MergeCoordinator<G> {
         let Some(next) = self.completion_queue.pop_front() else {
             return Ok(None);
         };
+
+        match self
+            .review_status
+            .get(&next.task_id)
+            .copied()
+            .unwrap_or(ReviewGateState::Pending)
+        {
+            ReviewGateState::Approved => {}
+            ReviewGateState::Pending => {
+                self.completion_queue.push_front(next);
+                anyhow::bail!("pending review for task; merge blocked");
+            }
+            ReviewGateState::RequestChanges => {
+                self.paused = true;
+                let comment = self
+                    .review_comments
+                    .get(&next.task_id)
+                    .cloned()
+                    .unwrap_or_else(|| "request_changes".to_string());
+                self.completion_queue.push_front(next);
+                anyhow::bail!("merge paused due to request_changes: {comment}");
+            }
+        }
 
         match self.git_ops.merge(&next.branch).await? {
             MergeResult::Success => {
@@ -80,6 +114,19 @@ impl<G: GitOps> MergeCoordinator<G> {
     pub fn conflicts(&self) -> &[MergeConflictRecord] {
         &self.conflicts
     }
+
+    pub fn set_review_status(
+        &mut self,
+        task_id: impl Into<String>,
+        state: ReviewGateState,
+        comments: Option<String>,
+    ) {
+        let task_id = task_id.into();
+        self.review_status.insert(task_id.clone(), state);
+        if let Some(comments) = comments {
+            self.review_comments.insert(task_id, comments);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -89,7 +136,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Mutex;
 
-    use super::{GitOps, MergeCoordinator, MergeResult};
+    use super::{GitOps, MergeCoordinator, MergeResult, ReviewGateState};
 
     #[derive(Debug, Clone)]
     struct MockGitOps {
@@ -145,6 +192,8 @@ mod tests {
         // Agent 2 completes first, then agent 1.
         coordinator.enqueue_completed("task-2", "fleet/task-2");
         coordinator.enqueue_completed("task-1", "fleet/task-1");
+        coordinator.set_review_status("task-2", ReviewGateState::Approved, None);
+        coordinator.set_review_status("task-1", ReviewGateState::Approved, None);
 
         let first = coordinator.merge_next().await.expect("merge 1");
         let second = coordinator.merge_next().await.expect("merge 2");
@@ -173,6 +222,9 @@ mod tests {
         coordinator.enqueue_completed("task-ok", "fleet/task-ok");
         coordinator.enqueue_completed("task-conflict", "fleet/task-conflict");
         coordinator.enqueue_completed("task-after", "fleet/task-after");
+        coordinator.set_review_status("task-ok", ReviewGateState::Approved, None);
+        coordinator.set_review_status("task-conflict", ReviewGateState::Approved, None);
+        coordinator.set_review_status("task-after", ReviewGateState::Approved, None);
 
         let first = coordinator.merge_next().await.expect("first merge");
         assert_eq!(first.as_deref(), Some("task-ok"));
@@ -192,5 +244,40 @@ mod tests {
             .await
             .expect_err("queue should remain paused");
         assert!(paused_err.to_string().contains("paused"));
+    }
+
+    #[tokio::test]
+    async fn review_gate_blocks_until_approved_and_pauses_on_request_changes() {
+        let merged = Arc::new(Mutex::new(Vec::new()));
+        let git_ops = MockGitOps {
+            merged_branches: Arc::clone(&merged),
+        };
+        let mut coordinator = MergeCoordinator::new(git_ops);
+
+        coordinator.enqueue_completed("task-1", "fleet/task-1");
+        coordinator.enqueue_completed("task-2", "fleet/task-2");
+        coordinator.set_review_status("task-1", ReviewGateState::Pending, None);
+        coordinator.set_review_status(
+            "task-2",
+            ReviewGateState::RequestChanges,
+            Some("needs refactor".to_string()),
+        );
+
+        let pending_err = coordinator
+            .merge_next()
+            .await
+            .expect_err("pending review should block merge");
+        assert!(pending_err.to_string().contains("pending review"));
+
+        coordinator.set_review_status("task-1", ReviewGateState::Approved, None);
+        let first = coordinator.merge_next().await.expect("approved merge");
+        assert_eq!(first.as_deref(), Some("task-1"));
+
+        let changes_err = coordinator
+            .merge_next()
+            .await
+            .expect_err("request_changes should pause merge");
+        assert!(changes_err.to_string().contains("request_changes"));
+        assert!(coordinator.is_paused());
     }
 }
