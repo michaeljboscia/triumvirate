@@ -227,8 +227,8 @@ All three agents (Claude, Codex, Gemini) read/write session logs in this format 
 5. **Installs config.toml** template for Codex (skips if exists)
 6. **Copies Gemini hooks** (3 files) to `~/.gemini/hooks/`
 7. **Installs GEMINI.md** starter template (skips if exists)
-8. **Builds the inter-agent MCP server** (`npm install && npm run build`)
-9. **Wires MCP configs** for all three agents (Claude → Gemini+Codex, Gemini → Codex, Codex → Gemini)
+8. **Builds the Triumvirate daemon** (`cargo build --release`) if not already built
+9. **Wires MCP configs** for all three agents (triumvirate daemon registered in Claude, Gemini, and Codex)
 10. **Installs Stenographer** to `~/.triumvirate/stenographer/` (checks for Ollama + model)
 11. **Copies .env.example** and **taxonomy.json.example** as reference
 12. **Creates `~/.ai-memory/`** — git-initialized central session log store
