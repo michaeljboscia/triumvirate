@@ -313,42 +313,12 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             );
                         }
                     }
-                    Ok(status) => {
-                        tracing::error!(
-                            fleet_id = %fleet_id,
-                            task_id = %task_id,
-                            code = ?status.code(),
-                            "fleet agent failed"
-                        );
-                        let db_path = project_root.join(".triumvirate").join("ledger.db");
-                        if let Ok(conn) = rusqlite::Connection::open(db_path) {
-                            let _ = conn.execute(
-                                "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
-                                [task_id.as_str()],
-                            );
-                        }
-                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                            let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                .unwrap_or(1);
-                            let _ = store.ingest_event(RawEvent {
-                                session_id: fleet_id.clone(),
-                                event_type: "task_failed".to_string(),
-                                sequence,
-                                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                payload_json: serde_json::json!({
-                                    "task_id": task_id,
-                                    "code": status.code()
-                                })
-                                .to_string(),
-                            });
-                        }
-                    }
                     Err(err) => {
                         tracing::error!(
                             fleet_id = %fleet_id,
                             task_id = %task_id,
                             error = %err,
-                            "fleet agent process error"
+                            "fleet agent failed via ask_agent"
                         );
                         let db_path = project_root.join(".triumvirate").join("ledger.db");
                         if let Ok(conn) = rusqlite::Connection::open(db_path) {
