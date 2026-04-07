@@ -338,6 +338,8 @@ Every atomic work product populates these artifacts. They are append-only during
 
 `build_timeout_sec` is optional — no default. Set it after you have real build duration data. Per-task timeout (`task_timeout_sec` in contract.json) is mandatory. Elapsed wall-clock = `now() - build_started_at`. Per-task durations are recorded in BUILD_MANIFEST.md timestamps.
 
+**Resume protocol:** If the orchestrator session dies (rate limit, crash, user closes terminal), the human starts a new session and says "resume." Claude reads BUILD_STATE.json, calls `get_task_status` for each task in `tasks_remaining` to reconcile with the daemon, and continues at the first incomplete task. No new tools needed — BUILD_STATE.json IS the resume file.
+
 **Crash recovery:** On session start, if BUILD_STATE.json shows `tasks_remaining` with no live PID/heartbeat:
 1. Detect interrupted tasks (status=running but no process alive)
 2. If worktree has uncommitted changes: save forensic snapshot (`.triumvirate/interrupted.patch`), quarantine the worktree
