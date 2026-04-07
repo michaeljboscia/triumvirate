@@ -8,7 +8,21 @@ use daemon_http::{fetch_daemon_status, fetch_daemon_status_snapshot};
 use fallback_outbox::{count_pending_fallbacks, list_pending_fallback_paths};
 use mcp_bridge::{daemon_base_url, daemon_status_url};
 use shared_types::{DaemonHealthResponse, DaemonStatusSnapshot};
-use std::fs;
+use std::{fs, io::Write as _};
+
+fn write_line_stdout(line: &str) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(line.as_bytes())?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+fn write_json_stdout(value: &serde_json::Value) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
 
 pub(crate) fn run_install() -> anyhow::Result<()> {
     let home = core_triumvirate_home_dir()?;
@@ -23,9 +37,9 @@ pub(crate) fn run_install() -> anyhow::Result<()> {
     let plist = core_render_launch_agent_plist(&exe_path.display().to_string(), &home.display().to_string());
     fs::write(&plist_path, plist)?;
 
-    println!("Installed launchd plist at {}", plist_path.display());
-    println!("Load with: launchctl load {}", plist_path.display());
-    println!("Start now with: launchctl start com.triumvirate.daemon-v2");
+    write_line_stdout(&format!("Installed launchd plist at {}", plist_path.display()))?;
+    write_line_stdout(&format!("Load with: launchctl load {}", plist_path.display()))?;
+    write_line_stdout("Start now with: launchctl start com.triumvirate.daemon-v2")?;
     Ok(())
 }
 
@@ -33,11 +47,11 @@ pub(crate) fn run_uninstall() -> anyhow::Result<()> {
     let plist_path = core_launchd_plist_path()?;
     if plist_path.exists() {
         fs::remove_file(&plist_path)?;
-        println!("Removed launchd plist at {}", plist_path.display());
+        write_line_stdout(&format!("Removed launchd plist at {}", plist_path.display()))?;
     } else {
-        println!("No launchd plist found at {}", plist_path.display());
+        write_line_stdout(&format!("No launchd plist found at {}", plist_path.display()))?;
     }
-    println!("Unload with: launchctl unload {}", plist_path.display());
+    write_line_stdout(&format!("Unload with: launchctl unload {}", plist_path.display()))?;
     Ok(())
 }
 
@@ -60,7 +74,7 @@ pub(crate) async fn run_doctor() -> anyhow::Result<()> {
         "daemon_reachable": daemon_health.is_some(),
         "daemon_health": daemon_health
     });
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    write_json_stdout(&report)?;
     Ok(())
 }
 
@@ -84,7 +98,7 @@ pub(crate) async fn run_status() -> anyhow::Result<()> {
         fallback_tickets,
     );
 
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    write_json_stdout(&report)?;
     Ok(())
 }
 

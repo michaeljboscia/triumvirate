@@ -84,6 +84,7 @@ use tokio::{
     sync::Mutex,
     time::{Duration, Instant, sleep},
 };
+use tracing::info;
 use uuid::Uuid;
 
 mod agent_exec;
@@ -1099,6 +1100,7 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
     let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
+    info!(%bind_addr, "starting triumvirate daemon");
     let sessions_file = core_triumvirate_home_dir()
         .ok()
         .map(|home| core_sessions_file_path(&home));
@@ -1134,6 +1136,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, metrics_middleware));
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    info!(%bind_addr, "daemon listener bound");
     tokio::spawn(async {
         prewarm_daemon_workers().await;
     });
