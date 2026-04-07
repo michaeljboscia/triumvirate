@@ -756,6 +756,9 @@ start it with: triumvirate daemon"
             .unwrap_or_else(|| vec!["codex".to_string(), "gemini".to_string()]);
         let dry_run = req.dry_run.unwrap_or(true);
         let wait = req.wait.unwrap_or(false);
+        let task_description = req
+            .task_description
+            .unwrap_or_else(|| "Implement the assigned fleet task.".to_string());
 
         let git_ops = git_ops_impl::RealGitOps::new(project_root.clone())
             .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
@@ -766,6 +769,7 @@ start it with: triumvirate daemon"
                 agents: agents.clone(),
                 dry_run,
                 wait: Some(wait),
+                task_description,
             })
             .await
             .map_err(|e| format!("fleet_spawn failed: {e}"))?;
