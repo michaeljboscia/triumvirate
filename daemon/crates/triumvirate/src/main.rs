@@ -828,6 +828,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         sessions: Arc<Mutex<HashMap<String, SessionState>>>,
         sessions_file: Option<PathBuf>,
         ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
+        marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
         metrics: Arc<DaemonMetrics>,
     }
 
@@ -938,11 +939,49 @@ async fn run_daemon() -> anyhow::Result<()> {
         state.metrics.agent_requests_total.inc();
         state.metrics.agent_duration_seconds.observe(started.elapsed().as_secs_f64());
         match result {
-            Ok(response) => Ok(AxumJson(response)),
+            Ok(response) => {
+                record_marker_parse_result(&state, &response.response).await;
+                Ok(AxumJson(response))
+            }
             Err(e) => Err((
                 StatusCode::BAD_GATEWAY,
                 AxumJson(serde_json::json!({ "error": e })),
             )),
+        }
+    }
+
+    async fn record_marker_parse_result(state: &DaemonState, response: &str) {
+        let parse_ok = match agent_adapter::parse_tool_call_marker(response) {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!("tool marker parse failed: {err}");
+                false
+            }
+        };
+
+        let mut window = state.marker_parse_window.lock().await;
+        let now = Instant::now();
+        window.push_back((now, parse_ok));
+        while let Some((ts, _)) = window.front() {
+            if now.duration_since(*ts) > Duration::from_secs(3600) {
+                let _ = window.pop_front();
+            } else {
+                break;
+            }
+        }
+        let total = window.len();
+        if total == 0 {
+            return;
+        }
+        let successes = window.iter().filter(|(_, ok)| *ok).count();
+        let rate = successes as f64 / total as f64;
+        state.metrics.marker_parse_success_rate.set(rate);
+        if total >= 10 && rate < 0.5 {
+            tracing::warn!(
+                marker_parse_success_rate = rate,
+                sample_count = total,
+                "marker parse success rate degraded below 50% over rolling 1h window"
+            );
         }
     }
 
@@ -1583,6 +1622,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         sessions: Arc::new(Mutex::new(sessions)),
         sessions_file,
         ledger_project_lru: Arc::new(Mutex::new(VecDeque::new())),
+        marker_parse_window: Arc::new(Mutex::new(VecDeque::new())),
         metrics: Arc::new(DaemonMetrics::new()?),
     };
     let app = Router::new()
@@ -1856,6 +1896,28 @@ echo '{"jsonrpc":"2.0","id":1,"result":{"text":"mock-gemini received: test messa
         Ok(path)
     }
 
+    fn write_mock_gemini_marker_probe_script() -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mock-gemini-marker-probe-{now}.sh"));
+        let script = r#"#!/bin/sh
+echo '{"jsonrpc":"2.0","method":"session/ready","params":{"text":"mock ready"}}'
+payload="$(cat)"
+echo "$payload" | grep -q '<triumvirate_tool name="ledger_record">'
+if [ $? -eq 0 ]; then
+  echo '{"jsonrpc":"2.0","id":1,"result":{"text":"marker_probe=present"}}'
+else
+  echo '{"jsonrpc":"2.0","id":1,"result":{"text":"marker_probe=missing"}}'
+fi
+"#;
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     fn write_mock_agent_script(name: &str, delay_s: f32) -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -2013,7 +2075,8 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             .map(|t| t.text.clone())
             .unwrap_or_default();
 
-        assert!(raw_text.contains("mock-gemini received: test message"));
+        assert!(raw_text.contains("mock-gemini received:"));
+        assert!(raw_text.contains("test message"));
         assert!(raw_text.contains("SPAWNED"));
         assert!(raw_text.contains("WORKING"));
         assert!(raw_text.contains("DONE"));
@@ -2021,6 +2084,57 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         client.cancel().await?;
         server_handle.await??;
 
+        let _ = fs::remove_file(script_path);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_gemini_injects_tool_marker_instructions() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let script_path = write_mock_gemini_marker_probe_script()?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "agent": "gemini",
+            "message": "test message",
+            "cwd": "/tmp/project"
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_agent")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await?;
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert!(raw_text.contains("marker_probe=present"));
+
+        client.cancel().await?;
+        server_handle.await??;
         let _ = fs::remove_file(script_path);
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
