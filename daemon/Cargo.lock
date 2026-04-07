@@ -294,6 +294,7 @@ dependencies = [
  "serde_json",
  "shared-types",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
