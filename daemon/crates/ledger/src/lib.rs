@@ -461,6 +461,55 @@ mod tests {
     }
 
     #[test]
+    fn compression_auto_creates_lessons_for_selected_summary_types() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        store
+            .ingest_event(RawEvent {
+                session_id: "lesson-session".to_string(),
+                event_type: "PostToolUse".to_string(),
+                sequence: 1,
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                payload_json: "{\"tool\":\"Edit\",\"summary_type\":\"bug_fix\"}".to_string(),
+            })
+            .expect("ingest bug_fix event");
+
+        store
+            .ingest_event(RawEvent {
+                session_id: "lesson-session".to_string(),
+                event_type: "PostToolUse".to_string(),
+                sequence: 2,
+                timestamp: "2030-01-01T00:00:01Z".to_string(),
+                payload_json: "{\"tool\":\"Read\",\"summary_type\":\"extractive\"}".to_string(),
+            })
+            .expect("ingest extractive event");
+
+        let lessons = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT title, initial_confidence FROM lessons ORDER BY lesson_id ASC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .expect("read lessons");
+
+        assert_eq!(lessons.len(), 1);
+        assert!(lessons[0].0.contains("Event"));
+        assert!((lessons[0].1 - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn compression_ttl_reclaim_resets_only_stale_running_jobs() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root = temp.path().join("project");
