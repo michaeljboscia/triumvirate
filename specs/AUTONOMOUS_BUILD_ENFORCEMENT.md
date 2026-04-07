@@ -334,6 +334,7 @@ Every atomic work product populates these artifacts. They are append-only during
   "collateral_fix_count": 0,
   "last_commit_sha": "i7j8k9l",
   "wave_0_sha": "a1b2c3d",
+  "max_parallel": 2,
   "build_timeout_sec": null,
   "build_started_at": "2026-04-07T14:00:00Z",
   "updated_at": "2026-04-07T14:55:00Z"
