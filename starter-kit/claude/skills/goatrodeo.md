@@ -27,7 +27,7 @@ When this skill is invoked:
 Before Round 1 starts, check existing knowledge infrastructure:
 
 1. **Pythia** — call `mcp__pythia__pythia_corpus_health` for the project. If indexed, run `mcp__pythia__lcs_investigate` with queries relevant to the spec's domain.
-2. **Live oracle daemons** — call `mcp__inter-agent__list_daemons`. If one exists for this project, query it for relevant context.
+2. **Live oracle daemons** — call `mcp__triumvirate__list_sessions`. If one exists for this project, query it for relevant context.
 3. Store context results — they feed into every subsequent step.
 
 If neither exists, proceed without. This step is opportunistic, not blocking.
@@ -79,7 +79,7 @@ For each interrogator question, record which source answered it and what the ans
 
 ### Step 4: Twin Review
 
-Dispatch to both twins via daemon pattern (`mcp__inter-agent__spawn_daemon` or `mcp__inter-agent__ask_daemon` if already alive):
+Dispatch to both twins via daemon pattern (`mcp__triumvirate__spawn_session` or `mcp__triumvirate__ask_session` if already alive):
 
 **Package sent to each twin:**
 - The full spec with REQ-IDs

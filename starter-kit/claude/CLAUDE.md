@@ -88,8 +88,8 @@ HOME sessions go to `~/.claude/session-logs/`.
 
 | Agent | Spawn | Best For |
 |-------|-------|----------|
-| Gemini | `mcp__inter-agent-gemini__spawn_daemon()` | Research, large context (2M), web search |
-| Codex | `mcp__inter-agent-codex__spawn_daemon()` | Code generation, refactoring |
+| Gemini | `mcp__triumvirate__spawn_session()` | Research, large context (2M), web search |
+| Codex | `mcp__triumvirate__spawn_session()` | Code generation, refactoring |
 
 **Pre-digest context.** Read files, extract key details, send inline. Never tell siblings "full context in session log" — send the actual context.
 

@@ -18,8 +18,8 @@ mode = "auto-edit"
 # Inter-agent communication with Gemini via Triumvirate MCP server
 # Uncomment and set the path to your Triumvirate MCP start script:
 #
-# [mcp_servers.inter-agent-gemini]
-# command = "/path/to/triumvirate/mcp-server/start-gemini.sh"
+# [mcp_servers.triumvirate]
+# command = "/path/to/triumvirate/daemon/target/release/triumvirate"
 # env = {}
 
 # ── Hooks ──────────────────────────────────────────────────────

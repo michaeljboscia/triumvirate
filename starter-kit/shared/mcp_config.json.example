@@ -3,22 +3,22 @@
     "MCP server configuration for Claude Code.",
     "Copy this to ~/.claude.json (or merge into existing).",
     "Replace <TRIUMVIRATE_PATH> with your clone path (e.g., ~/projects/triumvirate).",
-    "The inter-agent servers are the core of the triumvirate system.",
+    "The triumvirate servers are the core of the triumvirate system.",
     "Other servers (supabase, github, etc.) are optional and configured separately."
   ],
   "mcpServers": {
-    "inter-agent-gemini": {
+    "triumvirate": {
       "command": "node",
-      "args": ["<TRIUMVIRATE_PATH>/mcp-server/dist/gemini/server.js"],
+      "args": ["<TRIUMVIRATE_PATH>/daemon/target/release/triumvirate"],
       "env": {
         "GEMINI_API_KEY": "${GEMINI_API_KEY}",
         "PYTHIA_HOME": "${HOME}/.pythia",
         "AI_MEMORY_DIR": "${HOME}/.ai-memory"
       }
     },
-    "inter-agent-codex": {
+    "triumvirate": {
       "command": "node",
-      "args": ["<TRIUMVIRATE_PATH>/mcp-server/dist/codex/server.js"],
+      "args": ["<TRIUMVIRATE_PATH>/daemon/target/release/triumvirate"],
       "env": {}
     }
   }

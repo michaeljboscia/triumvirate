@@ -37,7 +37,7 @@ Before Round 1 starts, check existing knowledge infrastructure:
 1. **Brand guidelines** — scan for brand guide files in the project (colors, typography, forbidden combinations). These are constraints the interrogator must respect.
 2. **Existing design artifacts** — scan `.design/` for any prior design deliverables (briefs, tokens, IA docs). Feed context into every step.
 3. **Reference site analysis** — check for reference site research docs. Competitive visual context matters for design review.
-4. **Live oracle daemons** — call `mcp__inter-agent__list_daemons`. If one exists for this project, query it for relevant design context.
+4. **Live oracle daemons** — call `mcp__triumvirate__list_sessions`. If one exists for this project, query it for relevant design context.
 5. **Content model** — scan for content model specs (CPTs, taxonomies, field groups). Content structure constrains design decisions.
 
 If none exist, proceed without. This step is opportunistic, not blocking.

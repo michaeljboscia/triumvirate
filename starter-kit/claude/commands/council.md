@@ -86,7 +86,7 @@ Hold this in context. Do NOT revise after reading siblings' responses.
 
 Invoke the `inter-agent-protocol` skill if not already loaded. Spawn both daemons with `cwd` set to the project directory.
 
-Send to both **in a single message** (parallel `ask_daemon` calls):
+Send to both **in a single message** (parallel `ask_session` calls):
 
 **To Gemini:**
 ```
