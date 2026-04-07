@@ -292,7 +292,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    - Reality test passed but with unexpected behavior
   │   │   │    If NONE of the above: append "T-{ID}: clean — no deviations"
   │   │   │
-  │   │   ├─ 7d. query_gemini_review(diff) — async code review
+  │   │   ├─ 6d. query_gemini_review(diff) — async code review
   │   │   │    (On PASS: Gemini reviews diff BLIND — no briefing, preserving independence)
   │   │   │    Returns: concerns, suggestions, or "clean"
   │   │   │    IF concerns → append to DEVIATION_LOG.md AND
