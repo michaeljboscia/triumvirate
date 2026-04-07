@@ -452,8 +452,8 @@ mod tests {
             std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
         }
-        assert_eq!(super::gemini_command().0, "mock-gemini");
-        assert_eq!(super::codex_command().0, "mock-codex");
+        assert_eq!(super::gemini_command().0, "gemini");
+        assert_eq!(super::codex_command().0, "codex");
 
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
