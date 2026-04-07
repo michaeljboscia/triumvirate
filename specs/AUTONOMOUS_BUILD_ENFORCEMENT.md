@@ -246,7 +246,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │      validate-task.sh runs (mechanical)
   │   │      Claude reads .triumvirate/VALIDATION_LOG.md
   │   │
-  │   ├─ 6. IF BLOCKED:
+  │   ├─ 5. IF BLOCKED:
   │   │   │
   │   │   ├─ 6a. MECHANICAL failure classification (by evidence, not LLM judgment):
   │   │   │    - worker-error: validate-task.sh found stub markers or test failures in worker code
