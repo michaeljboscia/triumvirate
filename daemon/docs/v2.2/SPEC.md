@@ -3,7 +3,7 @@
 **Author:** Claude (orchestrator), with Gemini + Codex twin review
 **Date:** 2026-04-07
 **Branch:** TBD (feat/v2.2-accountability)
-**Status:** DRAFT — goat rodeo Round 1 complete, Round 2 in progress
+**Status:** DRAFT — goat rodeo Round 7 complete, pending Decision Ledger
 
 ---
 
