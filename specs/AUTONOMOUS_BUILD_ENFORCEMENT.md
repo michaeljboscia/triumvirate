@@ -272,13 +272,15 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    If NONE of the above: append "T-{ID}: clean — no deviations"
   │   │   │
   │   │   ├─ 7d. query_gemini_review(diff) — async code review
+  │   │   │    (On PASS: Gemini reviews diff BLIND — no briefing, preserving independence)
   │   │   │    Returns: concerns, suggestions, or "clean"
   │   │   │    IF concerns → append to DEVIATION_LOG.md AND
   │   │   │    incorporate into next task's briefing
   │   │   │
-  │   │   └─ 7e. Claude updates running tally:
+  │   │   └─ 7e. Claude updates BUILD_STATE.json:
   │   │        tasks_completed, tasks_remaining, current_wave,
-  │   │        validation_pass_rate, collateral_fix_count
+  │   │        validation_pass_rate, collateral_fix_count, last_commit_sha
+  │   │        (BUILD_STATE.json is the quick-resume checkpoint — survives session crashes)
   │   │
   │   └─ 8. CONTEXT DIES
   │          Codex session is gone. Worktree may be kept (if more
