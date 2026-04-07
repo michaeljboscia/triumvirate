@@ -51,7 +51,7 @@ use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use axum::{
     Json as AxumJson, Router,
     body::Body,
-    extract::State,
+    extract::{State, WebSocketUpgrade, ws::Message},
     http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::Response,
@@ -99,7 +99,7 @@ use std::{
     },
 };
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, broadcast},
     time::{Duration, Instant, sleep},
 };
 use tracing::info;
@@ -1119,6 +1119,63 @@ async fn run_daemon() -> anyhow::Result<()> {
         ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
         marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
         metrics: Arc<DaemonMetrics>,
+        ws_events: broadcast::Sender<String>,
+    }
+
+    fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": event_type,
+            "ts_ms": core_unix_time_ms(),
+            "payload": payload
+        })
+        .to_string()
+    }
+
+    fn publish_ws_event(state: &DaemonState, event_type: &str, payload: serde_json::Value) {
+        let _ = state.ws_events.send(encode_ws_event(event_type, payload));
+    }
+
+    async fn ws_route(
+        State(state): State<DaemonState>,
+        ws: WebSocketUpgrade,
+    ) -> Response {
+        ws.on_upgrade(move |mut socket| async move {
+            let mut rx = state.ws_events.subscribe();
+            for bootstrap in [
+                encode_ws_event(
+                    "agent_state",
+                    serde_json::json!({ "agent": "system", "state": "idle" }),
+                ),
+                encode_ws_event(
+                    "fleet_progress",
+                    serde_json::json!({ "active_fleets": 0, "state": "idle" }),
+                ),
+                encode_ws_event(
+                    "ledger_health",
+                    serde_json::json!({ "status": "unknown" }),
+                ),
+                encode_ws_event(
+                    "review_completed",
+                    serde_json::json!({ "review_id": null, "verdict": null }),
+                ),
+            ] {
+                if socket.send(Message::Text(bootstrap.into())).await.is_err() {
+                    return;
+                }
+            }
+
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if socket.send(Message::Text(event.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
     }
 
     async fn metrics_route(
@@ -1230,6 +1287,15 @@ async fn run_daemon() -> anyhow::Result<()> {
         match result {
             Ok(response) => {
                 record_marker_parse_result(&state, &response.response).await;
+                publish_ws_event(
+                    &state,
+                    "agent_state",
+                    serde_json::json!({
+                        "agent": response.agent,
+                        "request_id": response.request_id,
+                        "state": "done"
+                    }),
+                );
                 Ok(AxumJson(response))
             }
             Err(e) => Err((
@@ -1392,6 +1458,9 @@ async fn run_daemon() -> anyhow::Result<()> {
             })?;
 
         state.metrics.ledger_queue_lag_seconds.set(queue_lag_seconds);
+        if let Ok(payload) = serde_json::to_value(&health) {
+            publish_ws_event(&state, "ledger_health", payload);
+        }
 
         Ok(AxumJson(health))
     }
@@ -2089,9 +2158,11 @@ async fn run_daemon() -> anyhow::Result<()> {
         ledger_project_lru: Arc::new(Mutex::new(VecDeque::new())),
         marker_parse_window: Arc::new(Mutex::new(VecDeque::new())),
         metrics: Arc::new(DaemonMetrics::new()?),
+        ws_events: broadcast::channel(256).0,
     };
     let app = Router::new()
         .route("/metrics", get(metrics_route))
+        .route("/ws", get(ws_route))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/ledger/wake", post(ledger_wake_route))
