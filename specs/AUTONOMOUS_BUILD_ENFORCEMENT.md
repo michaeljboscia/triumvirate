@@ -59,6 +59,8 @@ The daemon exposes an MCP server that Claude Code connects to. Tools available:
 | `get_task_output` | Returns the stdout/commit info from a completed task. |
 | `cancel_task` | Kills a running task. |
 
+**MCP tool schemas:** Exact JSON parameter schemas for all 7 tools are deferred to the implementation plan (Phase 4 canonical docs). The spec defines behavior; the plan defines the type signatures.
+
 **Daemon-down behavior:** If the daemon is unreachable, all dispatch/query tools return `DAEMON_UNAVAILABLE` with structured error. The orchestrator attempts one bounded auto-restart **via local shell script** (not MCP — the MCP server IS the daemon, so MCP tools are unavailable when the daemon is down). If still down, halt the wave and escalate to human. Never dispatch locally or silently degrade.
 
 ### REQ-A1.2: Codex Dispatch Interface
