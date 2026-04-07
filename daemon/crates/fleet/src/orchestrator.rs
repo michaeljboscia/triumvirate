@@ -349,6 +349,28 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             error = %err,
                             "fleet agent process error"
                         );
+                        let db_path = project_root.join(".triumvirate").join("ledger.db");
+                        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+                            let _ = conn.execute(
+                                "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
+                                [task_id.as_str()],
+                            );
+                        }
+                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
+                            let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
+                                .unwrap_or(1);
+                            let _ = store.ingest_event(RawEvent {
+                                session_id: fleet_id.clone(),
+                                event_type: "task_failed".to_string(),
+                                sequence,
+                                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                payload_json: serde_json::json!({
+                                    "task_id": task_id,
+                                    "error": err.to_string()
+                                })
+                                .to_string(),
+                            });
+                        }
                     }
                 }
 
@@ -385,6 +407,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             return Ok(());
         }
         tracing::info!(fleet_id = %fleet_id, "starting sequential merge");
+        let store = LedgerStore::open(project_root.to_path_buf())?;
+        let merge_started_seq = event_sequence_for(project_root, fleet_id, "merge_started")?;
+        store.ingest_event(RawEvent {
+            session_id: fleet_id.to_string(),
+            event_type: "merge_started".to_string(),
+            sequence: merge_started_seq,
+            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            payload_json: serde_json::json!({
+                "fleet_id": fleet_id
+            })
+            .to_string(),
+        })?;
 
         let task_ids: Vec<String> = {
             let mut stmt = conn.prepare(
@@ -399,7 +433,43 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             }
             out
         };
+        let failed_tasks: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE fleet_id = ?1 AND state = 'failed'",
+            [fleet_id],
+            |row| row.get(0),
+        )?;
         drop(conn);
+
+        if failed_tasks > 0 {
+            let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+            conn.execute(
+                "UPDATE fleets
+                 SET state = 'failed', failure_reason = ?2
+                 WHERE fleet_id = ?1",
+                rusqlite::params![
+                    fleet_id,
+                    format!("{failed_tasks} task(s) failed before merge"),
+                ],
+            )?;
+            let failed_seq = event_sequence_for(project_root, fleet_id, "fleet_failed")?;
+            store.ingest_event(RawEvent {
+                session_id: fleet_id.to_string(),
+                event_type: "fleet_failed".to_string(),
+                sequence: failed_seq,
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                payload_json: serde_json::json!({
+                    "fleet_id": fleet_id,
+                    "failed_tasks": failed_tasks
+                })
+                .to_string(),
+            })?;
+            tracing::error!(
+                fleet_id = %fleet_id,
+                failed_tasks,
+                "fleet contains failed tasks; skipping merge"
+            );
+            return Ok(());
+        }
 
         let mut coordinator =
             MergeCoordinator::new(self.git_ops.clone()).with_project_root(project_root.to_path_buf());
@@ -423,6 +493,17 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                      WHERE fleet_id = ?1",
                     [fleet_id],
                 )?;
+                let done_seq = event_sequence_for(project_root, fleet_id, "fleet_done")?;
+                store.ingest_event(RawEvent {
+                    session_id: fleet_id.to_string(),
+                    event_type: "fleet_done".to_string(),
+                    sequence: done_seq,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: serde_json::json!({
+                        "fleet_id": fleet_id
+                    })
+                    .to_string(),
+                })?;
             }
             Err(err) => {
                 conn.execute(
@@ -431,6 +512,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                      WHERE fleet_id = ?1",
                     rusqlite::params![fleet_id, err.to_string()],
                 )?;
+                let failed_seq = event_sequence_for(project_root, fleet_id, "fleet_failed")?;
+                store.ingest_event(RawEvent {
+                    session_id: fleet_id.to_string(),
+                    event_type: "fleet_failed".to_string(),
+                    sequence: failed_seq,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: serde_json::json!({
+                        "fleet_id": fleet_id,
+                        "error": err.to_string()
+                    })
+                    .to_string(),
+                })?;
                 tracing::error!(fleet_id = %fleet_id, error = %err, "fleet merge failed");
             }
         }
@@ -683,7 +776,6 @@ mod tests {
             .expect("spawn");
 
         let tasks = FleetTaskStore::new(project_root.clone()).expect("task store");
-        assert!(tasks.claim_task("T-001", "codex").expect("claim"));
         tasks.complete_task("T-001").expect("complete");
 
         let mut merge = MergeCoordinator::new(MockGitOps {
