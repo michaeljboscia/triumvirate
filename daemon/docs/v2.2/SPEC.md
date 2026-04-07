@@ -226,7 +226,8 @@ Svelte 5 + Tailwind 4 web UI embedded in the daemon binary.
 
 ## Feature 8: App-Server Auto-Approve (REQ-024 from v2.1)
 
-- **REQ-054:** When `TRIUMVIRATE_CODEX_AUTO_APPROVE=1`, the daemon MUST respond to Codex approval requests with `ProceedOnce` within 100ms. This enables unattended Codex execution in fleet scenarios.
+- **REQ-054:** When `TRIUMVIRATE_CODEX_AUTO_APPROVE=1`, the daemon MUST append `--full-auto` (or the current equivalent flag) to the Codex CLI command when spawning the subprocess. This enables unattended Codex execution in fleet scenarios without depending on the app-server JSON-RPC approval response channel (which is broken as of early 2026).
+- **REQ-054a:** On Codex subprocess startup, the daemon MUST probe whether the app-server approval response channel is functional. If functional, the daemon MAY use JSON-RPC `ProceedOnce` responses instead of `--full-auto`. If non-functional, `--full-auto` is the mandatory fallback.
 - **REQ-055:** Auto-approved actions MUST be logged to the Ledger with `summary_type = "auto_approved"` for audit trail.
 
 ---
