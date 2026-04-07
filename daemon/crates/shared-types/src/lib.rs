@@ -147,6 +147,18 @@ pub struct FallbackGcResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OutboxEvent {
     pub ts_ms: u128,
     pub request_id: String,
@@ -157,6 +169,12 @@ pub struct OutboxEvent {
     pub cwd: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
