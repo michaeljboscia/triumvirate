@@ -1,0 +1,12 @@
+[package]
+name = "fleet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+shared-types = { path = "../shared-types" }
+daemon-core = { path = "../daemon-core" }
+agent-worker = { path = "../agent-worker" }
+ledger = { path = "../ledger" }
