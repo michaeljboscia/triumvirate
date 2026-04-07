@@ -437,14 +437,20 @@ The model file is at models/code-embed.gguf. Use llama_cpp::Model::load().
 
 ### REQ-A3.6: Escalation Protocol
 
-| Condition | Action |
-|-----------|--------|
-| Worker fails validation 1st time | Repair briefing, new session |
-| Worker fails validation 2nd time | Repair briefing with Gemini diagnosis |
-| Worker fails validation 3rd time | **STOP. Escalate to human.** Log full failure chain. |
-| Gemini flags regression concern | Claude evaluates. If confirmed: halt and repair before next task. |
-| Wave boundary gate fails | **STOP. Escalate to human.** Full wave summary in BUILD_MANIFEST. |
-| All tasks complete | End-of-execution report + /postrodeo |
+Escalation is failure-class-aware (see REQ-A5 failure taxonomy):
+
+| Condition | Failure Class | Action |
+|-----------|--------------|--------|
+| Worker fails validation 1st time | `worker-error` | Repair briefing, new session |
+| Worker fails validation 2nd time | `worker-error` | Repair briefing with Gemini diagnosis |
+| Worker fails validation 3rd time | `worker-error` | **STOP. Escalate to human.** Payload includes ALL briefings. |
+| Contract is wrong (missing file, bad test cmd) | `contract-error` | Orchestrator fixes contract, redispatches. No retry count consumed. |
+| Briefing is misleading (Gemini diagnoses) | `orchestrator-briefing-error` | Claude rewrites briefing with Gemini help, redispatches. Counts as 1 retry. |
+| Sandbox/dependency/build tool issue | `environment-error` | **HALT immediately.** No retries. Escalate to human. |
+| Gemini flags regression concern | — | Claude evaluates. If confirmed: halt and repair before next task. |
+| Wave boundary gate fails | — | **STOP. Escalate to human.** Full wave summary in BUILD_MANIFEST. |
+| Daemon unreachable | `environment-error` | One auto-restart attempt, then **HALT.** |
+| All tasks complete | — | End-of-execution report + /postrodeo |
 
 ---
 
