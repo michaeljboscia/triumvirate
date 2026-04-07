@@ -213,12 +213,12 @@ pub fn daemon_lesson_list_url() -> String {
 
 #[instrument(skip_all)]
 pub fn gemini_command() -> (String, Vec<String>) {
-    resolve_connector_command("TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_GEMINI_ARGS", "mock-gemini")
+    resolve_connector_command("TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_GEMINI_ARGS", "gemini")
 }
 
 #[instrument(skip_all)]
 pub fn codex_command() -> (String, Vec<String>) {
-    resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "mock-codex")
+    resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "codex")
 }
 
 #[instrument(skip_all)]
