@@ -2,6 +2,7 @@ mod compression;
 mod health;
 mod init;
 mod ingest;
+mod lessons;
 mod pool;
 mod query;
 mod spool;
@@ -53,20 +54,28 @@ impl LedgerStore {
         health::health(self)
     }
 
-    pub fn add_lesson(&self, _lesson: NewLesson) -> anyhow::Result<i64> {
-        anyhow::bail!("not implemented")
+    pub fn add_lesson(&self, lesson: NewLesson) -> anyhow::Result<i64> {
+        lessons::add_lesson(self, lesson)
     }
 
     pub fn query_lessons(
         &self,
-        _query: &str,
-        _min_confidence: f64,
+        query: &str,
+        min_confidence: f64,
     ) -> anyhow::Result<Vec<Lesson>> {
-        anyhow::bail!("not implemented")
+        lessons::query_lessons(self, query, min_confidence)
     }
 
-    pub fn validate_lesson(&self, _lesson_id: i64) -> anyhow::Result<()> {
-        anyhow::bail!("not implemented")
+    pub fn validate_lesson(&self, lesson_id: i64) -> anyhow::Result<()> {
+        lessons::validate_lesson(self, lesson_id)
+    }
+
+    pub fn list_lessons(
+        &self,
+        tags: Option<&[String]>,
+        stale_days: Option<f64>,
+    ) -> anyhow::Result<Vec<Lesson>> {
+        lessons::list_lessons(self, tags, stale_days)
     }
 
     pub fn gc(&self) -> anyhow::Result<GcResult> {
@@ -716,6 +725,64 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Architecture decision: use WAL");
         assert_eq!(results[0].summary_type, "architecture_decision");
+    }
+
+    #[test]
+    fn lessons_decay_and_validate_behave_as_expected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        let lesson_id = store
+            .add_lesson(shared_types::NewLesson {
+                title: "WAL lesson".to_string(),
+                body: "Use WAL for concurrent readers".to_string(),
+                source_session_id: Some("sess-1".to_string()),
+                initial_confidence: 0.8,
+                tags_json: Some("[\"sqlite\",\"wal\"]".to_string()),
+                req_ids_json: Some("[\"REQ-019\"]".to_string()),
+            })
+            .expect("insert lesson");
+
+        let immediate = store.query_lessons("WAL", 0.0).expect("query immediate");
+        assert_eq!(immediate.len(), 1);
+        assert!((immediate[0].initial_confidence - 0.8).abs() < 0.05);
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE lessons SET last_validated_at = datetime('now', '-80 days') WHERE lesson_id = ?1",
+                    [lesson_id],
+                )?;
+                Ok(())
+            })
+            .expect("backdate lesson");
+
+        let decayed = store.query_lessons("WAL", 0.0).expect("query decayed");
+        assert_eq!(decayed.len(), 1);
+        assert!((decayed[0].initial_confidence - 0.36).abs() < 0.08);
+
+        let filtered = store.query_lessons("WAL", 0.4).expect("query min confidence");
+        assert!(filtered.is_empty());
+
+        let stale = store
+            .list_lessons(None, Some(30.0))
+            .expect("list stale lessons");
+        assert_eq!(stale.len(), 1);
+
+        store.validate_lesson(lesson_id).expect("validate lesson");
+        let after_validate = store
+            .query_lessons("WAL", 0.7)
+            .expect("query validated lesson");
+        assert_eq!(after_validate.len(), 1);
+        assert!((after_validate[0].initial_confidence - 0.8).abs() < 0.08);
+
+        let tagged = store
+            .list_lessons(Some(&["sqlite".to_string()]), None)
+            .expect("list tagged lessons");
+        assert_eq!(tagged.len(), 1);
     }
 
 }
