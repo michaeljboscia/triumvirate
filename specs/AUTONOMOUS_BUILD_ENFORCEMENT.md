@@ -380,7 +380,7 @@ Every atomic work product populates these artifacts. They are append-only during
 - Gemini concerns: 1 (T-002 missing index — noted, not blocking)
 ```
 
-**Trigger:** Orchestrator appends after step 7b (task PASS). Wave summaries appended at wave boundary gate.
+**Trigger:** Orchestrator appends after step 6b (task PASS). Wave summaries appended at wave boundary gate.
 
 **DEVIATION_LOG.md** — Every departure from the plan, successful or failed. Append-only.
 
