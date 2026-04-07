@@ -1,11 +1,14 @@
 use std::{
     fs,
+    path::Path,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use ledger::LedgerStore;
 use shared_types::{GitOps, RawEvent};
+use tokio::process::Command;
 
 use crate::worktree::WorktreeManager;
 
@@ -25,16 +28,59 @@ pub struct FleetSpawnResult {
 }
 
 #[derive(Debug, Clone)]
-pub struct FleetOrchestrator<G: GitOps> {
+pub struct FleetOrchestrator<G: GitOps, L: AgentLauncher = ShellAgentLauncher> {
     worktree: WorktreeManager<G>,
     git_ops: G,
+    launcher: L,
 }
 
-impl<G: GitOps + Clone> FleetOrchestrator<G> {
+#[async_trait]
+pub trait AgentLauncher: Clone + Send + Sync + 'static {
+    async fn launch(
+        &self,
+        agent: &str,
+        project_root: &Path,
+        worktree_path: &Path,
+    ) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShellAgentLauncher;
+
+#[async_trait]
+impl AgentLauncher for ShellAgentLauncher {
+    async fn launch(
+        &self,
+        _agent: &str,
+        project_root: &Path,
+        worktree_path: &Path,
+    ) -> anyhow::Result<()> {
+        let mut child = Command::new("sh")
+            .arg("-lc")
+            .arg("true")
+            .current_dir(worktree_path)
+            .env("TRIUMVIRATE_PROJECT_ROOT", project_root.as_os_str())
+            .spawn()?;
+        let status = child.wait().await?;
+        if !status.success() {
+            anyhow::bail!("agent subprocess failed to start");
+        }
+        Ok(())
+    }
+}
+
+impl<G: GitOps + Clone> FleetOrchestrator<G, ShellAgentLauncher> {
     pub fn new(git_ops: G) -> Self {
+        Self::with_launcher(git_ops, ShellAgentLauncher)
+    }
+}
+
+impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
+    pub fn with_launcher(git_ops: G, launcher: L) -> Self {
         Self {
             worktree: WorktreeManager::new(git_ops.clone()),
             git_ops,
+            launcher,
         }
     }
 
@@ -73,12 +119,10 @@ impl<G: GitOps + Clone> FleetOrchestrator<G> {
                         "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\n---\n"
                     ),
                 )?;
+                self.launcher
+                    .launch(agent, &req.project_root, &worktree_path)
+                    .await?;
                 worktree_paths.push(worktree_path);
-            }
-
-            // SAFETY: process-level env var is intentionally set for fleet child process context.
-            unsafe {
-                std::env::set_var("TRIUMVIRATE_PROJECT_ROOT", req.project_root.as_os_str());
             }
 
             let store = LedgerStore::open(req.project_root.clone())?;
@@ -107,17 +151,18 @@ impl<G: GitOps + Clone> FleetOrchestrator<G> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::{path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
+    use tokio::sync::Mutex;
 
     use shared_types::MergeResult;
 
-    use super::{FleetOrchestrator, FleetSpawnRequest, GitOps, PathBuf};
+    use super::{AgentLauncher, FleetOrchestrator, FleetSpawnRequest, GitOps, PathBuf};
 
     #[derive(Debug, Clone)]
     struct MockGitOps {
-        touched: Arc<tokio::sync::Mutex<Vec<PathBuf>>>,
+        touched: Arc<Mutex<Vec<PathBuf>>>,
     }
 
     #[async_trait]
@@ -157,6 +202,28 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct RecordingLauncher {
+        seen_project_roots: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl AgentLauncher for RecordingLauncher {
+        async fn launch(
+            &self,
+            _agent: &str,
+            project_root: &Path,
+            _worktree_path: &Path,
+        ) -> anyhow::Result<()> {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.seen_project_roots
+                .lock()
+                .await
+                .push(project_root.to_path_buf());
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn fleet_spawn_dry_run_and_execute_behave_realistically() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -166,7 +233,7 @@ mod tests {
         let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
 
         let orchestrator = FleetOrchestrator::new(MockGitOps {
-            touched: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            touched: Arc::new(Mutex::new(Vec::new())),
         });
 
         let dry_run = orchestrator
@@ -212,5 +279,44 @@ mod tests {
             )
             .expect("count fleet events");
         assert!(event_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_fleet_spawns_keep_project_root_scoped_per_launch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_a = temp.path().join("project-a");
+        let project_b = temp.path().join("project-b");
+        std::fs::create_dir_all(project_a.join(".triumvirate").join("spool")).expect("spool a");
+        std::fs::create_dir_all(project_b.join(".triumvirate").join("spool")).expect("spool b");
+        let _ = ledger::LedgerStore::open(project_a.clone()).expect("open ledger a");
+        let _ = ledger::LedgerStore::open(project_b.clone()).expect("open ledger b");
+
+        let launcher = RecordingLauncher::default();
+        let seen = launcher.seen_project_roots.clone();
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps {
+                touched: Arc::new(Mutex::new(Vec::new())),
+            },
+            launcher,
+        );
+
+        let spawn_a = orchestrator.fleet_spawn(FleetSpawnRequest {
+            project_root: project_a.clone(),
+            agents: vec!["codex".to_string()],
+            dry_run: false,
+        });
+        let spawn_b = orchestrator.fleet_spawn(FleetSpawnRequest {
+            project_root: project_b.clone(),
+            agents: vec!["gemini".to_string()],
+            dry_run: false,
+        });
+        let (res_a, res_b) = tokio::join!(spawn_a, spawn_b);
+        res_a.expect("spawn a");
+        res_b.expect("spawn b");
+
+        let captured = seen.lock().await.clone();
+        assert_eq!(captured.len(), 2);
+        assert!(captured.iter().any(|p| p == &project_a));
+        assert!(captured.iter().any(|p| p == &project_b));
     }
 }
