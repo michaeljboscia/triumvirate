@@ -60,6 +60,7 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 
 - **REQ-006:** The Ledger MUST use SQLite in WAL (Write-Ahead Logging) mode. No JSON state files. No mutable coordination flags.
 - **REQ-007:** The Ledger database MUST be per-project at `<project>/.triumvirate/ledger.db`. Projects MUST NOT share mutable state. An optional global read-only index at `~/.triumvirate/ledger-index.db` MAY aggregate across projects for cross-project search.
+- **REQ-007a:** Project root resolution algorithm (in priority order): (1) `TRIUMVIRATE_PROJECT_ROOT` env var if set (absolute path required), (2) `git rev-parse --show-toplevel` from hook CWD, (3) nearest ancestor directory containing `.triumvirate/`, (4) `~/.triumvirate/scratch/<sha256(cwd)>` as last resort. Raw `$HOME` MUST NOT be used as a project root.
 - **REQ-008:** The Ledger MUST define these tables:
   - `events` — append-only raw hook payloads (session_id, event_type, sequence, timestamp, payload_json). Idempotency key: `session_id + event_type + sequence`.
   - `summaries` — compressed observations (event_id FK, title, narrative, facts_json, concepts_json, affected_files_json, summary_type).
