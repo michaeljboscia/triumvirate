@@ -378,8 +378,8 @@ Every atomic work product populates these artifacts. They are append-only during
 ## Interfaces You Build Against
 [Wave 0 contracts — types, traits, function signatures]
 
-## Current File State
-[git show HEAD:src/engine.rs — relevant sections only]
+## Files to Read First
+[From <files> — read these from the worktree filesystem. Full files, not excerpts.]
 
 ## What Happened Before You
 [Synthesized by Claude — 10-20 lines max. NOT raw prior output.]
