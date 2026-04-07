@@ -110,6 +110,48 @@ CREATE TRIGGER IF NOT EXISTS lessons_au AFTER UPDATE ON lessons BEGIN
     INSERT INTO lessons_fts(rowid, title, body, tags_json)
     VALUES (new.lesson_id, new.title, new.body, new.tags_json);
 END;
+
+CREATE TABLE IF NOT EXISTS fleets (
+    fleet_id TEXT PRIMARY KEY,
+    task_description TEXT NOT NULL,
+    agent_composition TEXT NOT NULL,
+    source_project_root TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'spawning',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    failure_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    fleet_id TEXT NOT NULL REFERENCES fleets(fleet_id),
+    title TEXT NOT NULL,
+    description TEXT,
+    assigned_agent TEXT,
+    state TEXT NOT NULL DEFAULT 'pending',
+    depends_on TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_fleet ON tasks(fleet_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
+
+CREATE TABLE IF NOT EXISTS reviews (
+    review_id TEXT PRIMARY KEY,
+    fleet_id TEXT,
+    author_agent TEXT NOT NULL,
+    reviewer_agent TEXT,
+    artifact TEXT NOT NULL,
+    review_type TEXT NOT NULL,
+    verdict TEXT,
+    comments TEXT,
+    requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    reviewed_at TEXT,
+    state TEXT NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state);
 "#;
 
 pub(crate) fn open(project_root: PathBuf) -> anyhow::Result<LedgerStore> {

@@ -152,8 +152,84 @@ mod tests {
             })
             .expect("read sqlite_master tables");
 
-        for expected in ["events", "summaries", "sessions", "health", "lessons"] {
+        for expected in [
+            "events",
+            "summaries",
+            "sessions",
+            "health",
+            "lessons",
+            "fleets",
+            "tasks",
+            "reviews",
+        ] {
             assert!(tables.contains(expected), "missing table: {expected}");
+        }
+    }
+
+    #[test]
+    fn fleet_tables_have_expected_columns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        let columns = |table: &str| -> anyhow::Result<Vec<String>> {
+            store.with_conn(|conn| {
+                let sql = format!("PRAGMA table_info({table})");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+        };
+
+        let fleets_cols = columns("fleets").expect("fleets columns");
+        for col in [
+            "fleet_id",
+            "task_description",
+            "agent_composition",
+            "source_project_root",
+            "state",
+            "created_at",
+            "completed_at",
+            "failure_reason",
+        ] {
+            assert!(fleets_cols.iter().any(|c| c == col), "missing fleets.{col}");
+        }
+
+        let tasks_cols = columns("tasks").expect("tasks columns");
+        for col in [
+            "task_id",
+            "fleet_id",
+            "title",
+            "description",
+            "assigned_agent",
+            "state",
+            "depends_on",
+            "created_at",
+            "completed_at",
+        ] {
+            assert!(tasks_cols.iter().any(|c| c == col), "missing tasks.{col}");
+        }
+
+        let reviews_cols = columns("reviews").expect("reviews columns");
+        for col in [
+            "review_id",
+            "fleet_id",
+            "author_agent",
+            "reviewer_agent",
+            "artifact",
+            "review_type",
+            "verdict",
+            "comments",
+            "requested_at",
+            "reviewed_at",
+            "state",
+        ] {
+            assert!(reviews_cols.iter().any(|c| c == col), "missing reviews.{col}");
         }
     }
 
