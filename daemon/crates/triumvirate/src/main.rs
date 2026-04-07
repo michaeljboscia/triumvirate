@@ -39,6 +39,7 @@ use fallback_outbox::{
 use fleet::orchestrator::{FleetOrchestrator, FleetSpawnRequest as FleetSpawnRunRequest};
 use fleet::tasks::FleetTaskStore;
 use ledger::LedgerStore;
+use peer_review::{PeerReviewEngine, ReviewRequest as PersistedReviewRequest};
 use mcp_bridge::{
     is_bearer_authorized, is_supported_agent_name,
 };
@@ -74,6 +75,8 @@ use shared_types::{
     FleetCancelRequest, FleetCancelResponse, FleetClaimTaskRequest, FleetClaimTaskResponse,
     FleetSpawnRequest, FleetSpawnResponse, FleetStatusRequest, FleetStatusResponse, FleetTaskListRequest,
     FleetTaskListResponse,
+    ReviewRequestResponse, ReviewRequestTool, ReviewStatusRequest, ReviewStatusResponse,
+    ReviewSubmitRequest,
     Lesson, LessonAddResponse, LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse,
     LessonValidateRequest, ManualRecord, MemoryEntry,
     MemoryReadRequest, MemoryReadResponse,
@@ -832,6 +835,76 @@ impl McpBridge {
         let mut fleet_states = self.fleet_states.lock().await;
         let canceled = fleet_states.remove(&req.fleet_id).is_some();
         Ok(Json(FleetCancelResponse { canceled }))
+    }
+
+    #[tool(description = "Request a peer review and receive assigned reviewer + review_id.")]
+    async fn review_request(
+        &self,
+        Parameters(req): Parameters<ReviewRequestTool>,
+    ) -> Result<Json<ReviewRequestResponse>, String> {
+        let project_root = req
+            .project_root
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to resolve project root".to_string())?;
+        let engine = PeerReviewEngine::new(project_root)
+            .map_err(|e| format!("review_request engine init failed: {e}"))?;
+        let record = engine
+            .request_review(PersistedReviewRequest {
+                fleet_id: req.fleet_id,
+                author_agent: req.author_agent,
+                artifact: req.artifact,
+                review_type: req.review_type,
+            })
+            .map_err(|e| format!("review_request failed: {e}"))?;
+        Ok(Json(ReviewRequestResponse {
+            review_id: record.review_id,
+            reviewer_agent: record.reviewer_agent,
+            state: record.state,
+        }))
+    }
+
+    #[tool(description = "Submit peer review verdict and comments.")]
+    async fn review_submit(
+        &self,
+        Parameters(req): Parameters<ReviewSubmitRequest>,
+    ) -> Result<String, String> {
+        let project_root = req
+            .project_root
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to resolve project root".to_string())?;
+        let engine = PeerReviewEngine::new(project_root)
+            .map_err(|e| format!("review_submit engine init failed: {e}"))?;
+        engine
+            .submit_review(&req.review_id, &req.verdict, req.comments.as_deref())
+            .map_err(|e| format!("review_submit failed: {e}"))?;
+        Ok("ok".to_string())
+    }
+
+    #[tool(description = "Get current peer review status by review_id.")]
+    async fn review_status(
+        &self,
+        Parameters(req): Parameters<ReviewStatusRequest>,
+    ) -> Result<Json<ReviewStatusResponse>, String> {
+        let project_root = req
+            .project_root
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to resolve project root".to_string())?;
+        let engine = PeerReviewEngine::new(project_root)
+            .map_err(|e| format!("review_status engine init failed: {e}"))?;
+        let record = engine
+            .get_review(&req.review_id)
+            .map_err(|e| format!("review_status failed: {e}"))?
+            .ok_or_else(|| format!("review not found: {}", req.review_id))?;
+        Ok(Json(ReviewStatusResponse {
+            review_id: record.review_id,
+            reviewer_agent: record.reviewer_agent,
+            verdict: record.verdict,
+            comments: record.comments,
+            state: record.state,
+        }))
     }
 }
 
@@ -4685,6 +4758,56 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         assert_eq!(status.0.fleet_id, execute.0.fleet_id);
         assert_eq!(status.0.state, "running");
         assert_eq!(status.0.worktree_paths.len(), 2);
+
+        std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_tools_round_trip() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let original_cwd = std::env::current_dir()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-review-mcp-{now}"));
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))?;
+        let _ = LedgerStore::open(project_root.clone())?;
+        std::env::set_current_dir(&project_root)?;
+
+        let bridge = McpBridge::new_ephemeral();
+        let requested = bridge
+            .review_request(Parameters(ReviewRequestTool {
+                project_root: None,
+                fleet_id: Some("fleet-1".to_string()),
+                author_agent: "codex".to_string(),
+                artifact: "diff -- fake".to_string(),
+                review_type: "code".to_string(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(!requested.0.review_id.is_empty());
+        assert_ne!(requested.0.reviewer_agent.as_deref(), Some("codex"));
+
+        bridge
+            .review_submit(Parameters(ReviewSubmitRequest {
+                project_root: None,
+                review_id: requested.0.review_id.clone(),
+                verdict: "approve".to_string(),
+                comments: Some("looks good".to_string()),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let status = bridge
+            .review_status(Parameters(ReviewStatusRequest {
+                project_root: None,
+                review_id: requested.0.review_id.clone(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(status.0.state, "done");
+        assert_eq!(status.0.verdict.as_deref(), Some("approve"));
 
         std::env::set_current_dir(&original_cwd)?;
         let _ = fs::remove_dir_all(project_root);

@@ -1251,6 +1251,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
+name = "peer-review"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ledger",
+ "rusqlite",
+ "shared-types",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2284,6 +2296,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "peer-review",
  "prometheus",
  "reqwest",
  "rmcp",

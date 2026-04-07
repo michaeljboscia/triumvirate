@@ -278,6 +278,45 @@ pub struct FleetCancelResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewRequestTool {
+    pub project_root: Option<String>,
+    pub fleet_id: Option<String>,
+    pub author_agent: String,
+    pub artifact: String,
+    pub review_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewRequestResponse {
+    pub review_id: String,
+    pub reviewer_agent: Option<String>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewSubmitRequest {
+    pub project_root: Option<String>,
+    pub review_id: String,
+    pub verdict: String,
+    pub comments: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewStatusRequest {
+    pub project_root: Option<String>,
+    pub review_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewStatusResponse {
+    pub review_id: String,
+    pub reviewer_agent: Option<String>,
+    pub verdict: Option<String>,
+    pub comments: Option<String>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonHealthResponse {
     pub status: String,
     pub service: Option<String>,
