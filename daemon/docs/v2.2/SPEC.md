@@ -53,6 +53,26 @@ v2.2 adds 4 new crates to the workspace. Each crate owns one concern. No crate r
 
 ---
 
+## Feature 0: Observability Foundation
+
+The daemon declares tracing, OpenTelemetry, and Prometheus deps but has zero instrumentation. Every v2.2 feature must be observable from day 1.
+
+- **REQ-059:** The daemon MUST initialize a `tracing-subscriber` with `env-filter` and JSON formatting on startup. `RUST_LOG` controls verbosity. Default: `info` for daemon crates, `warn` for deps.
+- **REQ-060:** The daemon MUST initialize an OpenTelemetry tracing pipeline via `tracing-opentelemetry`. Traces export to OTLP endpoint configured via `OTEL_EXPORTER_OTLP_ENDPOINT` (default: disabled if unset). Every `ask_agent` call MUST be a span with agent type, duration, token count, and outcome.
+- **REQ-061:** The daemon MUST expose `GET /metrics` returning Prometheus text format. Metrics MUST include:
+  - `triumvirate_agent_requests_total{agent, status}` — counter
+  - `triumvirate_agent_duration_seconds{agent}` — histogram
+  - `triumvirate_agent_tokens_total{agent, direction}` — counter (input/output)
+  - `triumvirate_ledger_events_ingested_total{project}` — counter
+  - `triumvirate_ledger_queue_lag_seconds{project}` — gauge (REQ-009a)
+  - `triumvirate_ledger_spool_size_bytes{project}` — gauge
+  - `triumvirate_fleet_active_total` — gauge
+  - `triumvirate_reviews_total{verdict}` — counter
+  - `triumvirate_marker_parse_success_rate` — gauge (REQ-014b)
+- **REQ-062:** Every new crate (`ledger`, `fleet`, `peer-review`) MUST use `tracing::instrument` on public API methods. No `println!` or `eprintln!` for operational logging — all logging via `tracing` macros (`info!`, `warn!`, `error!`, `debug!`).
+
+---
+
 ## Feature 1: Triumvirate Ledger
 
 Replaces the broken stenographer. SQLite-backed session persistence with health visibility.
