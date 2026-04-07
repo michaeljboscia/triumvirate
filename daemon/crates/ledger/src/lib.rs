@@ -73,6 +73,13 @@ impl LedgerStore {
         &self.project_root
     }
 
+    pub fn journal_mode(&self) -> anyhow::Result<String> {
+        self.with_conn(|conn| {
+            let mode: String = conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0))?;
+            Ok(mode)
+        })
+    }
+
     pub(crate) fn with_conn<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&Connection) -> anyhow::Result<T>,
