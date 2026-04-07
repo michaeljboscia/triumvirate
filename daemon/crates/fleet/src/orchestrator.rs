@@ -120,9 +120,44 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 let fleet_id_bg = fleet_id.clone();
                 let head_sha_bg = head_sha.clone();
                 tokio::spawn(async move {
-                    let _ = orchestrator
-                        .spawn_fleet_members(project_root, fleet_id_bg, head_sha_bg, agents)
-                        .await;
+                    if let Err(err) = orchestrator
+                        .spawn_fleet_members(
+                            project_root.clone(),
+                            fleet_id_bg.clone(),
+                            head_sha_bg,
+                            agents,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            fleet_id = %fleet_id_bg,
+                            error = %err,
+                            "fleet background spawn failed"
+                        );
+                        let db_path = project_root.join(".triumvirate").join("ledger.db");
+                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                            let _ = conn.execute(
+                                "UPDATE fleets
+                                 SET state = 'failed', failure_reason = ?2
+                                 WHERE fleet_id = ?1",
+                                rusqlite::params![fleet_id_bg.as_str(), err.to_string()],
+                            );
+                        }
+                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
+                            let sequence = event_sequence_for(&project_root, &fleet_id_bg, "fleet_failed")
+                                .unwrap_or(1);
+                            let _ = store.ingest_event(RawEvent {
+                                session_id: fleet_id_bg.clone(),
+                                event_type: "fleet_failed".to_string(),
+                                sequence,
+                                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                payload_json: serde_json::json!({
+                                    "error": err.to_string()
+                                })
+                                .to_string(),
+                            });
+                        }
+                    }
                 });
             }
         }
@@ -283,6 +318,21 @@ mod tests {
                 .await
                 .push(project_root.to_path_buf());
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FailingLauncher;
+
+    #[async_trait]
+    impl AgentLauncher for FailingLauncher {
+        async fn launch(
+            &self,
+            _agent: &str,
+            _project_root: &Path,
+            _worktree_path: &Path,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("launcher failure");
         }
     }
 
@@ -496,5 +546,48 @@ mod tests {
             .expect("spawn wait");
         assert!(t1.elapsed() >= Duration::from_millis(20));
         assert_eq!(wait.worktree_paths.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_false_background_spawn_failure_records_fleet_failed_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps {
+                touched: Arc::new(Mutex::new(Vec::new())),
+            },
+            FailingLauncher,
+        );
+        let spawned = orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.clone(),
+                agents: vec!["codex".to_string()],
+                dry_run: false,
+                wait: Some(false),
+            })
+            .await
+            .expect("spawn no-wait");
+
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+            .expect("open sqlite");
+        let mut failed_events = 0_i64;
+        for _ in 0..20 {
+            failed_events = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = 'fleet_failed'",
+                    rusqlite::params![spawned.fleet_id],
+                    |row| row.get(0),
+                )
+                .expect("count failed events");
+            if failed_events >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(failed_events >= 1);
     }
 }

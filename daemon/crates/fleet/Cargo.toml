@@ -14,6 +14,7 @@ ledger = { path = "../ledger" }
 tokio.workspace = true
 rusqlite = "0.32"
 serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
