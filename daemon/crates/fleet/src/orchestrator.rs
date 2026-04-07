@@ -117,7 +117,7 @@ impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
                 fs::write(
                     worktree_path.join(".triumvirate").join("fleet-task.md"),
                     format!(
-                        "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\n---\n"
+                        "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\ndepends_on: []\n---\n\nImplement the assigned fleet task for {agent}.\nDocument changes and tests in your final report.\n"
                     ),
                 )?;
                 self.launcher
@@ -295,6 +295,8 @@ mod tests {
             assert!(contents.contains("task_id:"));
             assert!(contents.contains("fleet_id:"));
             assert!(contents.contains("assigned_agent:"));
+            assert!(contents.contains("depends_on: []"));
+            assert!(contents.contains("Implement the assigned fleet task"));
         }
 
         let conn = rusqlite::Connection::open(
