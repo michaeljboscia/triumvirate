@@ -46,6 +46,7 @@ v2.2 adds 4 new crates to the workspace. Each crate owns one concern. No crate r
 
 - **REQ-001:** New crates MUST depend only on `shared-types` and crates listed in their dependency column. No crate may depend on `triumvirate` (the binary). No circular dependencies.
 - **REQ-002:** The `ledger` crate MUST NOT depend on `daemon-core`. It owns its own SQLite database and file paths. `daemon-core` continues to own JSONL/JSON storage for backward compatibility during migration.
+- **REQ-002a:** The `ledger` crate API MUST accept only fully-resolved absolute `PathBuf` arguments for project roots. It MUST NOT shell out to `git` or perform directory traversal for project resolution. The project root resolution algorithm (REQ-007a) is implemented by the `triumvirate` binary (for MCP tool calls) and bash hooks (for `/ledger/wake` POSTs). The `ledger` crate is a pure storage library — callers resolve, `ledger` stores.
 - **REQ-003:** The `fleet` crate MUST NOT shell out to `git` directly. It MUST use a `GitOps` trait defined in `shared-types` so the binary provides the real implementation and tests provide a mock.
 - **REQ-004:** The `dashboard` crate MUST produce static HTML/CSS/JS at build time. The `triumvirate` binary embeds these via `rust-embed`. No Node.js runtime at deployment.
 - **REQ-005:** Every new MCP tool introduced in v2.2 MUST be defined in `shared-types` (request/response DTOs) and registered in the `triumvirate` binary's MCP bridge. Crates provide the logic; the binary provides the wiring.
