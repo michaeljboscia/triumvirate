@@ -500,6 +500,9 @@ Escalation is failure-class-aware (see REQ-A5 failure taxonomy):
 - **Dashboard integration** — Triumvirate v2 dashboard (REQ-6) is separate. This spec's artifacts (BUILD_MANIFEST, validation logs, after-actions) should feed into the dashboard but the integration is out of scope.
 - **Fleet scaling beyond 3 agents** — This spec is for the Claude+Gemini+Codex trio. REQ-7 (dynamic multi-agent fleet) extends this pattern but is a separate spec.
 - **Conversational workflows** — REQ-1 (N-agent conversation) is for interactive collaboration. This spec is for autonomous build execution where the human is absent.
+- **Daemon Rust rewrite** — The daemon is currently TypeScript. A Rust rewrite is planned for the sprint after ABE Phase 1. The enforcement stack is language-agnostic — the MCP interface is the contract, not the implementation. The Rust rewrite changes the daemon's internals (subprocess management, concurrent monitoring, memory) without modifying this spec.
+
+**Language note:** Examples in this spec use TypeScript/npm conventions to match the current daemon implementation (the first build target). The enforcement stack (contract.json, hooks, validate-task.sh) is language-agnostic — swap `npm test` for `cargo test` and it works unchanged.
 
 ---
 
