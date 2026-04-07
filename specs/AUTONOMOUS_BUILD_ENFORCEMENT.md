@@ -466,9 +466,10 @@ Escalation is failure-class-aware (see REQ-A5 failure taxonomy):
 | Worker fails validation 1st time | `worker-error` | Repair briefing, new session |
 | Worker fails validation 2nd time | `worker-error` | Repair briefing with Gemini diagnosis |
 | Worker fails validation 3rd time | `worker-error` | **STOP. Escalate to human.** Payload includes ALL briefings. |
-| Contract is wrong (missing file, bad test cmd) | `contract-error` | Orchestrator fixes contract, redispatches. No retry count consumed. |
-| Briefing is misleading (Gemini diagnoses) | `orchestrator-briefing-error` | Claude rewrites briefing with Gemini help, redispatches. Counts as 1 retry. |
+| Contract is wrong (missing file, bad test cmd) | `contract-error` | Orchestrator fixes contract, redispatches. Max 2 per task. |
+| Briefing is misleading | `orchestrator-briefing-error` | Claude rewrites briefing with Gemini help, redispatches. Max 2 per task. |
 | Sandbox/dependency/build tool issue | `environment-error` | **HALT immediately.** No retries. Escalate to human. |
+| Total retries across all classes | — | **Max 5 per task.** On cap breach → escalate as orchestrator/system fault. |
 | Gemini flags regression concern | — | Claude evaluates. If confirmed: halt and repair before next task. |
 | Wave boundary gate fails | — | **STOP. Escalate to human.** Full wave summary in BUILD_MANIFEST. |
 | Daemon unreachable | `environment-error` | One auto-restart attempt, then **HALT.** |
