@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
+use ledger::LedgerStore;
 use rusqlite::{Connection, OptionalExtension};
+use shared_types::RawEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetTask {
@@ -14,6 +16,7 @@ pub struct FleetTask {
 
 #[derive(Debug, Clone)]
 pub struct FleetTaskStore {
+    project_root: PathBuf,
     db_path: PathBuf,
 }
 
@@ -23,6 +26,7 @@ impl FleetTaskStore {
             anyhow::bail!("project_root must be absolute");
         }
         Ok(Self {
+            project_root: project_root.clone(),
             db_path: project_root.join(".triumvirate").join("ledger.db"),
         })
     }
@@ -98,15 +102,15 @@ impl FleetTaskStore {
         let conn = self.open_conn()?;
         conn.execute_batch("BEGIN IMMEDIATE")?;
 
-        let pending_and_deps: Option<(String, Option<String>)> = conn
+        let pending_and_deps: Option<(String, String, Option<String>)> = conn
             .query_row(
-                "SELECT state, depends_on FROM tasks WHERE task_id = ?1",
+                "SELECT fleet_id, state, depends_on FROM tasks WHERE task_id = ?1",
                 [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
 
-        let Some((state, depends_on_json)) = pending_and_deps else {
+        let Some((fleet_id, state, depends_on_json)) = pending_and_deps else {
             conn.execute_batch("ROLLBACK")?;
             return Ok(false);
         };
@@ -131,6 +135,14 @@ impl FleetTaskStore {
 
         if updated == 1 {
             conn.execute_batch("COMMIT")?;
+            self.record_event(
+                &fleet_id,
+                "task_claimed",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "assigned_agent": assigned_agent
+                }),
+            )?;
             Ok(true)
         } else {
             conn.execute_batch("ROLLBACK")?;
@@ -140,10 +152,26 @@ impl FleetTaskStore {
 
     pub fn complete_task(&self, task_id: &str) -> anyhow::Result<()> {
         let conn = self.open_conn()?;
+        let fleet_id: Option<String> = conn
+            .query_row(
+                "SELECT fleet_id FROM tasks WHERE task_id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         conn.execute(
             "UPDATE tasks SET state = 'done', completed_at = datetime('now') WHERE task_id = ?1",
             [task_id],
         )?;
+        if let Some(fleet_id) = fleet_id {
+            self.record_event(
+                &fleet_id,
+                "task_completed",
+                serde_json::json!({
+                    "task_id": task_id
+                }),
+            )?;
+        }
         Ok(())
     }
 
@@ -154,6 +182,34 @@ impl FleetTaskStore {
         let conn = Connection::open(&self.db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(conn)
+    }
+
+    fn record_event(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let store = LedgerStore::open(self.project_root.clone())?;
+        let sequence = self.next_event_sequence(session_id, event_type)?;
+        store.ingest_event(RawEvent {
+            session_id: session_id.to_string(),
+            event_type: event_type.to_string(),
+            sequence,
+            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            payload_json: payload.to_string(),
+        })
+    }
+
+    fn next_event_sequence(&self, session_id: &str, event_type: &str) -> anyhow::Result<i64> {
+        let conn = self.open_conn()?;
+        let max_seq: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(sequence) FROM events WHERE session_id = ?1 AND event_type = ?2",
+                rusqlite::params![session_id, event_type],
+                |row| row.get::<_, Option<i64>>(0),
+            )?;
+        Ok(max_seq.unwrap_or(0) + 1)
     }
 }
 

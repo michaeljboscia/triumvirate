@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use ledger::LedgerStore;
 use shared_types::ManualRecord;
-use shared_types::{GitOps, MergeResult};
+use shared_types::{GitOps, MergeResult, RawEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedWork {
@@ -70,6 +70,15 @@ impl<G: GitOps> MergeCoordinator<G> {
             return Ok(None);
         };
 
+        self.record_merge_event(
+            &next,
+            "merge_started",
+            serde_json::json!({
+                "task_id": next.task_id,
+                "branch": next.branch
+            }),
+        )?;
+
         if !skip_review_enabled() {
             match self
                 .review_status
@@ -109,6 +118,25 @@ impl<G: GitOps> MergeCoordinator<G> {
         match self.git_ops.merge(&next.branch).await? {
             MergeResult::Success => {
                 self.merged_order.push(next.task_id.clone());
+                self.record_merge_event(
+                    &next,
+                    "merge_result",
+                    serde_json::json!({
+                        "task_id": next.task_id,
+                        "branch": next.branch,
+                        "result": "success"
+                    }),
+                )?;
+                if self.completion_queue.is_empty() {
+                    self.record_merge_event(
+                        &next,
+                        "fleet_done",
+                        serde_json::json!({
+                            "task_id": next.task_id,
+                            "branch": next.branch
+                        }),
+                    )?;
+                }
                 Ok(Some(next.task_id))
             }
             MergeResult::Conflict { files } => {
@@ -117,6 +145,16 @@ impl<G: GitOps> MergeCoordinator<G> {
                     task_id: next.task_id.clone(),
                     files: files.clone(),
                 });
+                self.record_merge_event(
+                    &next,
+                    "merge_result",
+                    serde_json::json!({
+                        "task_id": next.task_id,
+                        "branch": next.branch,
+                        "result": "conflict",
+                        "files": files
+                    }),
+                )?;
                 anyhow::bail!(
                     "merge conflict while merging task {}: {}; queue paused",
                     next.task_id,
@@ -149,6 +187,46 @@ impl<G: GitOps> MergeCoordinator<G> {
         if let Some(comments) = comments {
             self.review_comments.insert(task_id, comments);
         }
+    }
+
+    fn record_merge_event(
+        &self,
+        work: &CompletedWork,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let Some(project_root) = self.project_root.clone() else {
+            return Ok(());
+        };
+        let Some(fleet_id) = fleet_id_from_branch(&work.branch) else {
+            return Ok(());
+        };
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+        let max_seq: Option<i64> = conn.query_row(
+            "SELECT MAX(sequence) FROM events WHERE session_id = ?1 AND event_type = ?2",
+            rusqlite::params![fleet_id, event_type],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        let store = LedgerStore::open(project_root)?;
+        store.ingest_event(RawEvent {
+            session_id: fleet_id.to_string(),
+            event_type: event_type.to_string(),
+            sequence: max_seq.unwrap_or(0) + 1,
+            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            payload_json: payload.to_string(),
+        })?;
+        Ok(())
+    }
+}
+
+fn fleet_id_from_branch(branch: &str) -> Option<&str> {
+    let mut parts = branch.split('/');
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if first == "fleet" && !second.is_empty() {
+        Some(second)
+    } else {
+        None
     }
 }
 

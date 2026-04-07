@@ -105,6 +105,7 @@ impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
         if !req.dry_run {
             let base = req.project_root.join(".triumvirate").join("worktrees");
             fs::create_dir_all(&base)?;
+            let store = LedgerStore::open(req.project_root.clone())?;
             for (idx, agent) in req.agents.iter().enumerate() {
                 let task_id = format!("T-{:03}", idx + 1);
                 let branch = format!("fleet/{fleet_id}/{task_id}");
@@ -122,10 +123,22 @@ impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
                 self.launcher
                     .launch(agent, &req.project_root, &worktree_path)
                     .await?;
+                let sequence = event_sequence_for(&req.project_root, &fleet_id, "agent_started")?;
+                store.ingest_event(RawEvent {
+                    session_id: fleet_id.clone(),
+                    event_type: "agent_started".to_string(),
+                    sequence,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: serde_json::json!({
+                        "fleet_id": fleet_id,
+                        "task_id": task_id,
+                        "agent": agent
+                    })
+                    .to_string(),
+                })?;
                 worktree_paths.push(worktree_path);
             }
 
-            let store = LedgerStore::open(req.project_root.clone())?;
             store.ingest_event(RawEvent {
                 session_id: fleet_id.clone(),
                 event_type: "fleet_spawned".to_string(),
@@ -149,6 +162,20 @@ impl<G: GitOps + Clone, L: AgentLauncher> FleetOrchestrator<G, L> {
     }
 }
 
+fn event_sequence_for(
+    project_root: &Path,
+    session_id: &str,
+    event_type: &str,
+) -> anyhow::Result<i64> {
+    let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+    let max_seq: Option<i64> = conn.query_row(
+        "SELECT MAX(sequence) FROM events WHERE session_id = ?1 AND event_type = ?2",
+        rusqlite::params![session_id, event_type],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(max_seq.unwrap_or(0) + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
@@ -157,6 +184,9 @@ mod tests {
     use tokio::sync::Mutex;
 
     use shared_types::MergeResult;
+
+    use crate::merge::{MergeCoordinator, ReviewGateState};
+    use crate::tasks::FleetTaskStore;
 
     use super::{AgentLauncher, FleetOrchestrator, FleetSpawnRequest, GitOps, PathBuf};
 
@@ -318,5 +348,69 @@ mod tests {
         assert_eq!(captured.len(), 2);
         assert!(captured.iter().any(|p| p == &project_a));
         assert!(captured.iter().any(|p| p == &project_b));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_events_include_all_required_progress_types() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+
+        let launcher = RecordingLauncher::default();
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps {
+                touched: Arc::new(Mutex::new(Vec::new())),
+            },
+            launcher,
+        );
+        let spawned = orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.clone(),
+                agents: vec!["codex".to_string()],
+                dry_run: false,
+            })
+            .await
+            .expect("spawn");
+
+        let tasks = FleetTaskStore::new(project_root.clone()).expect("task store");
+        tasks
+            .insert_fleet(&spawned.fleet_id, "test lifecycle")
+            .expect("insert fleet");
+        tasks
+            .insert_task("T-001", &spawned.fleet_id, "task", &[])
+            .expect("insert task");
+        assert!(tasks.claim_task("T-001", "codex").expect("claim"));
+        tasks.complete_task("T-001").expect("complete");
+
+        let mut merge = MergeCoordinator::new(MockGitOps {
+            touched: Arc::new(Mutex::new(Vec::new())),
+        })
+        .with_project_root(project_root.clone());
+        merge.enqueue_completed("T-001", format!("fleet/{}/T-001", spawned.fleet_id));
+        merge.set_review_status("T-001", ReviewGateState::Approved, None);
+        let merged = merge.merge_next().await.expect("merge");
+        assert_eq!(merged.as_deref(), Some("T-001"));
+
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+            .expect("open sqlite");
+        for event_type in [
+            "agent_started",
+            "task_claimed",
+            "task_completed",
+            "merge_started",
+            "merge_result",
+            "fleet_done",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = ?2",
+                    rusqlite::params![spawned.fleet_id, event_type],
+                    |row| row.get(0),
+                )
+                .expect("count lifecycle event");
+            assert!(count >= 1, "missing event type: {event_type}");
+        }
     }
 }
