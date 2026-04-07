@@ -275,7 +275,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │
   │   ├─ 6. IF PASS:
   │   │   │
-  │   │   ├─ 7a. Claude writes AFTER_ACTION.md:
+  │   │   ├─ 6a. Claude writes AFTER_ACTION.md:
   │   │   │    task_id, commit_sha, files_modified,
   │   │   │    validation_result, notes_for_next_task
   │   │   │
