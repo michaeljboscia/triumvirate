@@ -2276,6 +2276,7 @@ dependencies = [
  "daemon-http",
  "dirs",
  "fallback-outbox",
+ "fleet",
  "ledger",
  "libc",
  "mcp-bridge",
