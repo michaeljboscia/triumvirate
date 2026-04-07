@@ -98,6 +98,7 @@ use uuid::Uuid;
 
 mod agent_exec;
 mod cli_ops;
+mod git_ops_impl;
 mod tracing_setup;
 
 #[derive(Debug, Parser)]
