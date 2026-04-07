@@ -98,7 +98,8 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 
 ### Health
 
-- **REQ-015:** The daemon MUST expose a `GET /ledger/health` HTTP endpoint returning: last event timestamp, events in last 5 minutes, compression queue depth, spool file size, database size, stale running jobs count.
+- **REQ-015:** The daemon MUST expose a `GET /ledger/health` HTTP endpoint returning: last event timestamp, events in last 5 minutes, compression queue depth, spool directory size, database size, stale running jobs count.
+- **REQ-015a:** The Ledger MUST expose a `ledger_health()` MCP tool returning the same data as the HTTP endpoint (REQ-015). This ships in Phase 1 alongside the HTTP endpoint — it is NOT gated behind Phase 2 retrieval tools.
 - **REQ-016:** If no events have been written in the last 5 minutes during an active session, the health endpoint MUST return status `degraded`. The dashboard MUST display this prominently.
 - **REQ-017-L:** The `triumvirate doctor` CLI subcommand MUST include Ledger diagnostics: DB exists, WAL mode enabled, spool empty, no stale jobs, last event recency.
 
