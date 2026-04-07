@@ -163,7 +163,9 @@ Error messages follow Fleek's pattern — state the rule, show the violation, pr
 
 Already built (`~/.claude/scripts/validate-task.sh`). Runs after each commit. Checks commit message, stub markers, file scope, and full test suite. Exit codes: 0=PASS, 1=BLOCKED, 2=WARN.
 
-Enhancement: validate-task.sh also writes results to `VALIDATION_LOG.md` in the worktree. The orchestrator reads this when building the after-action report.
+Enhancement: validate-task.sh also writes results to `.triumvirate/VALIDATION_LOG.md` in the worktree. The orchestrator reads this when building the after-action report.
+
+Note: validate-task.sh is copied into `.triumvirate/` during dispatch (REQ-A1.2 step 4) because Codex's workspace-write sandbox cannot reach `~/.claude/scripts/`.
 
 ### REQ-A2.6: Wave Boundary Gate
 
