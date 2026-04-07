@@ -243,6 +243,24 @@ Svelte 5 + Tailwind 4 web UI embedded in the daemon binary.
 
 ---
 
+## Phased Implementation Order
+
+v2.2 ships incrementally. Each phase is independently shippable and testable. Later phases depend on earlier ones but not vice versa.
+
+| Phase | Crate(s) | REQs | Ships | Rollback? |
+|-------|----------|------|-------|-----------|
+| **1 — Data** | `shared-types` (DTOs), `ledger` (ingestion/spool/drain/health) | REQ-006–018 | Fixes stenographer. Ledger captures events. | Yes — JSONL still works (REQ-018) |
+| **2 — Knowledge** | `ledger` (retrieval + lessons) | REQ-014–014b, REQ-019–022 | FTS5 search, lesson CRUD, confidence decay | Yes — Phase 1 still captures without retrieval |
+| **3 — Fleet Core** | `fleet` (worktrees/tasks/claiming/progress) | REQ-028–037 | Parallel agents with task lists. No review gate yet. | Yes — behind `TRIUMVIRATE_FLEET_ENABLED` flag |
+| **4 — Review** | `peer-review`, fleet merge gating | REQ-023–027b, REQ-040–040b | Cross-model review. Fleet merge gate. | Yes — `TRIUMVIRATE_FLEET_SKIP_REVIEW=1` disables |
+| **5 — Visibility** | `dashboard` (Svelte + rust-embed + WebSocket) | REQ-041–048 | Dashboard with all views. | Yes — daemon works without dashboard |
+| **6 — Codex Protocol** | `agent-adapter` (app-server parser + auto-approve) | REQ-049–055 | Codex app-server support. | Yes — falls back to exec protocol |
+| **7 — Polish** | GC/retention | REQ-056–058 | Outbox rotation, automatic cleanup. | Yes — no GC = unbounded growth but not broken |
+
+**Dependency chain:** Phase 1 → Phase 2 → (Phase 3 and Phase 5 can run in parallel) → Phase 4 requires Phase 3 → Phase 6 and 7 are independent of 3-5.
+
+---
+
 ## Non-Goals for v2.2
 
 - **NG-001:** Vector search / embeddings. FTS5 is sufficient. Revisit if recall is measurably bad.
