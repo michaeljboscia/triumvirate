@@ -67,6 +67,7 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
   - `sessions` — session metadata (session_id, project, branch, started_at, ended_at, event_count, summary_count).
   - `health` — heartbeat records (timestamp, last_event_id, db_size_bytes, queue_depth).
 - **REQ-009:** The Ledger MUST enable FTS5 on the `summaries` table for full-text search over title, narrative, and facts.
+- **REQ-009a:** The daemon's SQLite write coordinator MUST prioritize event ingestion writes over task-state updates. Under burst load (fleet agents claiming tasks while hooks write events), ingestion MUST NOT be starved. The daemon MUST expose a `ledger_queue_lag` Prometheus metric and emit `degraded` health status if ingestion lag exceeds 5 seconds.
 
 ### Ingestion
 
