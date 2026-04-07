@@ -274,7 +274,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let project_root = project_root.clone();
             let fleet_id = fleet_id.clone();
             let worktree_path = worktree_paths[join_handles.len()].clone();
-            let handle = tokio::spawn(async move {
+            let jh = tokio::spawn(async move {
                 tracing::info!(fleet_id = %fleet_id, task_id = %task_id, agent = %agent_name, "launching fleet agent via ask_agent");
                 let result = launcher.launch(&agent_name, &project_root, &worktree_path, &task_prompt).await;
                 match result {
