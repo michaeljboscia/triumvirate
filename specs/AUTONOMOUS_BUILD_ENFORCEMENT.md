@@ -227,17 +227,29 @@ Claude (orchestrator — stateful, full project visibility)
   │   │
   │   ├─ 6. IF BLOCKED:
   │   │   │
-  │   │   ├─ 6a. Claude reads failure details
+  │   │   ├─ 6a. Claude reads failure details and CLASSIFIES the failure:
+  │   │   │    - worker-error: bad code → repair briefing, new worker
+  │   │   │    - contract-error: wrong contract → fix contract, redispatch
+  │   │   │    - orchestrator-briefing-error: bad briefing → Claude rewrites with Gemini help
+  │   │   │    - environment-error: sandbox/dependency issue → HALT, escalate immediately
+  │   │   │
   │   │   ├─ 6b. Claude APPENDS to DEVIATION_LOG.md (MANDATORY):
-  │   │   │    Log the failure: task_id, attempt number, failure type,
+  │   │   │    Log: task_id, attempt number, failure CLASS, failure details,
   │   │   │    validate-task.sh output, root cause diagnosis
-  │   │   ├─ 6c. query_gemini_review(diff + failure)
-  │   │   ├─ 6d. Claude writes REPAIR_BRIEFING.md:
-  │   │   │    "Task T-003 failed. Here's what happened.
-  │   │   │     Here's the specific fix. Here's what NOT to touch."
+  │   │   │
+  │   │   ├─ 6c. query_gemini_review(diff + failure + briefing + contract)
+  │   │   │    (Gemini sees the briefing on failure to diagnose orchestrator errors)
+  │   │   │
+  │   │   ├─ 6d. Claude writes REPAIR_BRIEFING.md (rigid template, size-capped):
+  │   │   │    Sections: What Failed → Root Cause → The Fix → Do NOT
+  │   │   │    No raw log paste. No conversation history. Diff-focused only.
+  │   │   │
   │   │   ├─ 6e. dispatch_codex_worktree(sha, repair_briefing, contract)
   │   │   │    NEW session — no memory of prior failure
-  │   │   └─ Loop: max 3 attempts, then escalate to human
+  │   │   │
+  │   │   └─ Loop: max 3 attempts per failure class, then escalate to human
+  │   │        Escalation payload MUST include all briefings Claude generated
+  │   │        (enables human to diagnose orchestrator fault vs worker fault)
   │   │        Each attempt gets its own DEVIATION_LOG entry
   │   │
   │   ├─ 7. IF PASS:
