@@ -3,6 +3,7 @@ mod health;
 mod init;
 mod ingest;
 mod pool;
+mod query;
 mod spool;
 mod store;
 
@@ -36,8 +37,8 @@ impl LedgerStore {
         spool::drain_spool(self, _spool_dir)
     }
 
-    pub fn query(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<Summary>> {
-        anyhow::bail!("not implemented")
+    pub fn query(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Summary>> {
+        query::query_summaries(self, query, limit)
     }
 
     pub fn get_session(&self, _session_id: &str) -> anyhow::Result<SessionDetail> {
@@ -521,5 +522,44 @@ mod tests {
         let stats_with_cap = crate::pool::pool_stats();
         assert_eq!(stats_with_cap.active_pools, 10);
         assert_eq!(stats_with_cap.queued_projects, 1);
+    }
+
+    #[test]
+    fn query_returns_ranked_fts_summary_results() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO summaries (title, narrative, facts_json, summary_type)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "authentication middleware bug",
+                        "fixed auth ordering in middleware",
+                        "[\"authentication\"]",
+                        "bug_fix"
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT INTO summaries (title, narrative, facts_json, summary_type)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "cache refresh issue",
+                        "resolved stale cache reads",
+                        "[\"cache\"]",
+                        "bug_fix"
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("seed summaries");
+
+        let hits = store.query("authentication", 10).expect("fts query");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].title.contains("authentication"));
     }
 }
