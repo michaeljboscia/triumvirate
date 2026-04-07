@@ -1,7 +1,8 @@
 use crate::{append_outbox_event, spawn_dead_drop};
 use agent_adapter::{
-    CodexExecParser, GeminiStreamParser, ParsedAgentResult, StuckDetector,
-    WorkingState, WorkingStateEvent, format_working_state, should_display,
+    ApprovalChannelMode, CodexAppServerEvent, CodexAppServerParser, CodexExecParser,
+    GeminiStreamParser, ParsedAgentResult, StuckDetector, WorkingState, WorkingStateEvent,
+    format_working_state, probe_approval_response_channel, should_display,
 };
 use agent_worker::{
     WorkerAcquireMode, acquire_worker, dismiss_worker, should_invalidate_cached_session,
@@ -10,12 +11,13 @@ use agent_worker::{
 use daemon_core::{resolve_context as core_resolve_context, unix_time_ms as core_unix_time_ms};
 use ledger::LedgerStore;
 use mcp_bridge::{
-    agent_verbosity, codex_command, gemini_command, gemini_streaming_enabled, is_supported_agent,
+    agent_verbosity, codex_command, codex_protocol, gemini_command, gemini_streaming_enabled,
+    is_supported_agent,
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
 use shared_types::{
-    AskAgentRequest, AskAgentResponse, LifecycleEvent, OutboxEvent,
+    AskAgentRequest, AskAgentResponse, LifecycleEvent, ManualRecord, OutboxEvent,
     TokenUsage as SharedTokenUsage,
 };
 use std::{fs, path::PathBuf, time::Duration};
@@ -962,6 +964,58 @@ fn has_any_arg(args: &[String], candidates: &[&str]) -> bool {
     args.iter().any(|arg| candidates.iter().any(|c| arg == c))
 }
 
+fn codex_auto_approve_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_CODEX_AUTO_APPROVE")
+        .ok()
+        .or_else(|| std::env::var("CODEX_AUTO_APPROVE").ok())
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn codex_approval_channel_mode() -> ApprovalChannelMode {
+    let probe_response = match std::env::var("TRIUMVIRATE_CODEX_APPROVAL_PROBE_RESPONSE") {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                "TRIUMVIRATE_CODEX_APPROVAL_PROBE_RESPONSE not set; using --full-auto fallback"
+            );
+            return ApprovalChannelMode::FullAutoFallback;
+        }
+    };
+
+    match probe_approval_response_channel(&probe_response) {
+        Ok(mode) => mode,
+        Err(err) => {
+            tracing::warn!(
+                "codex app-server approval response channel probe failed ({err}); using --full-auto fallback"
+            );
+            ApprovalChannelMode::FullAutoFallback
+        }
+    }
+}
+
+fn record_auto_approved_action(cwd: &str, action: &str, mode: &str) {
+    let store = match LedgerStore::open(PathBuf::from(cwd)) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!("failed to open ledger for auto-approval record: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = store.record(ManualRecord {
+        session_id: None,
+        title: "Codex auto-approved action".to_string(),
+        narrative: format!("mode={mode}; action={action}"),
+        facts_json: None,
+        concepts_json: None,
+        affected_files_json: None,
+        summary_type: "auto_approved".to_string(),
+    }) {
+        tracing::warn!("failed to write auto-approval record: {err}");
+    }
+}
+
 async fn run_gemini_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -1165,6 +1219,14 @@ async fn run_codex_cli_process_with_session(
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
 ) -> anyhow::Result<ParsedAgentResult> {
+    let protocol = codex_protocol();
+    let auto_approve_enabled = codex_auto_approve_enabled();
+    let approval_mode = if protocol == "app-server" {
+        Some(codex_approval_channel_mode())
+    } else {
+        None
+    };
+
     let mut final_args = args.to_vec();
     if session_id.is_some() {
         final_args.insert(0, "resume".to_string());
@@ -1178,6 +1240,16 @@ async fn run_codex_cli_process_with_session(
     if !has_any_arg(&final_args, &["--json"]) {
         final_args.push("--json".to_string());
     }
+
+    let should_use_full_auto = auto_approve_enabled
+        && approval_mode
+            .as_ref()
+            .map(|mode| matches!(mode, ApprovalChannelMode::FullAutoFallback))
+            .unwrap_or(true);
+    if should_use_full_auto && !has_any_arg(&final_args, &["--full-auto"]) {
+        final_args.push("--full-auto".to_string());
+    }
+
     if !is_git_worktree(cwd) && !has_any_arg(&final_args, &["--skip-git-repo-check"]) {
         final_args.push("--skip-git-repo-check".to_string());
     }
@@ -1221,6 +1293,8 @@ async fn run_codex_cli_process_with_session(
     });
 
     let mut parser = CodexExecParser::new();
+    let mut app_server_parser = CodexAppServerParser::new();
+    let mut app_server_approval_requests: Vec<String> = Vec::new();
     let mut reader = BufReader::new(stdout).lines();
     let mut raw_output = String::new();
     let timeout_duration = connector_timeout();
@@ -1228,7 +1302,66 @@ async fn run_codex_cli_process_with_session(
         while let Some(line) = reader.next_line().await? {
             raw_output.push_str(&line);
             raw_output.push('\n');
-            if let Some(event) = parser.parse_line(&line) {
+            if protocol == "app-server" {
+                if let Some(event) = app_server_parser.parse_event_line(&line)? {
+                    match event {
+                        CodexAppServerEvent::Working(event) => {
+                            emit_working_event(events_tx.as_ref(), event);
+                        }
+                        CodexAppServerEvent::ApprovalRequest(request) => {
+                            let action = request
+                                .reason
+                                .clone()
+                                .or(request.id.clone())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            app_server_approval_requests.push(action.clone());
+                            if auto_approve_enabled {
+                                emit_working_event(
+                                    events_tx.as_ref(),
+                                    WorkingStateEvent {
+                                        agent: "codex".to_string(),
+                                        state: WorkingState::ToolCallCompleted,
+                                        detail: format!(
+                                            "auto-approved codex action ({})",
+                                            approval_mode
+                                                .as_ref()
+                                                .map(|mode| match mode {
+                                                    ApprovalChannelMode::ProceedOnce => "ProceedOnce",
+                                                    ApprovalChannelMode::FullAutoFallback => "--full-auto",
+                                                })
+                                                .unwrap_or("--full-auto")
+                                        ),
+                                        tool_name: Some("approval_request".to_string()),
+                                        tool_args_json: Some(format!(
+                                            "{{\"action\":{}}}",
+                                            serde_json::to_string(&action)
+                                                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                                        )),
+                                        token_usage: None,
+                                        ts_ms: Some(core_unix_time_ms()),
+                                    },
+                                );
+                            } else {
+                                emit_working_event(
+                                    events_tx.as_ref(),
+                                    WorkingStateEvent {
+                                        agent: "codex".to_string(),
+                                        state: WorkingState::InputRequested,
+                                        detail: format!("approval requested: {action}"),
+                                        tool_name: Some("approval_request".to_string()),
+                                        tool_args_json: request
+                                            .id
+                                            .as_ref()
+                                            .map(|id| format!("{{\"id\":\"{id}\"}}")),
+                                        token_usage: None,
+                                        ts_ms: Some(core_unix_time_ms()),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            } else if let Some(event) = parser.parse_line(&line) {
                 emit_working_event(events_tx.as_ref(), event);
             }
         }
@@ -1252,7 +1385,11 @@ async fn run_codex_cli_process_with_session(
         anyhow::bail!("codex connector failed: exited with status {status}");
     }
 
-    let mut parsed = parser.finish();
+    let mut parsed = if protocol == "app-server" {
+        app_server_parser.finish()
+    } else {
+        parser.finish()
+    };
     if !last_message.trim().is_empty() {
         parsed.response_text = last_message.trim().to_string();
     } else if parsed.response_text.trim().is_empty() {
@@ -1265,6 +1402,15 @@ async fn run_codex_cli_process_with_session(
     if parsed.session_id.is_none() {
         parsed.session_id = session_id.map(ToString::to_string);
     }
+
+    if should_use_full_auto {
+        record_auto_approved_action(cwd, "global --full-auto", "--full-auto");
+    } else if auto_approve_enabled && matches!(approval_mode, Some(ApprovalChannelMode::ProceedOnce)) {
+        for action in app_server_approval_requests {
+            record_auto_approved_action(cwd, &action, "ProceedOnce");
+        }
+    }
+
     Ok(parsed)
 }
 
