@@ -63,9 +63,10 @@ impl GitOps for RealGitOps {
     }
 
     async fn is_clean(&self) -> anyhow::Result<bool> {
-        let output = self.git(&["status", "--porcelain"]).await?;
-        Self::ensure_success(&output, "git status --porcelain")?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
+        // Check tracked files only — untracked files (.pythia, build artifacts) are not dirty.
+        let staged = self.git(&["diff", "--quiet", "--cached"]).await?;
+        let unstaged = self.git(&["diff", "--quiet"]).await?;
+        Ok(staged.status.success() && unstaged.status.success())
     }
 
     async fn current_head(&self) -> anyhow::Result<String> {
