@@ -1,4 +1,5 @@
 mod ingest;
+mod spool;
 mod store;
 
 use std::{
@@ -28,7 +29,7 @@ impl LedgerStore {
     }
 
     pub fn drain_spool(&self, _spool_dir: &Path) -> anyhow::Result<DrainResult> {
-        anyhow::bail!("not implemented")
+        spool::drain_spool(self, _spool_dir)
     }
 
     pub fn query(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<Summary>> {
@@ -206,5 +207,91 @@ mod tests {
             })
             .expect("count events");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn drain_spool_ingests_and_deletes_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        let spool_dir = project_root.join(".triumvirate").join("spool");
+        fs::create_dir_all(&spool_dir).expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        for idx in 1..=3 {
+            let raw = serde_json::json!({
+                "session_id": "session-drain",
+                "event_type": "PostToolUse",
+                "sequence": idx,
+                "timestamp": format!("2026-04-07T00:00:0{idx}Z"),
+                "payload_json": "{\"ok\":true}"
+            });
+            let file = spool_dir.join(format!("event-{idx}.ndjson"));
+            fs::write(file, serde_json::to_string(&raw).expect("serialize event"))
+                .expect("write spool event");
+        }
+
+        let result = store.drain_spool(&spool_dir).expect("drain spool");
+        assert_eq!(result.ingested_count, 3);
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.skipped_count, 0);
+
+        let count = store
+            .with_conn(|conn| {
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM events WHERE session_id = ?1", ["session-drain"], |row| row.get(0))?;
+                Ok(count)
+            })
+            .expect("count drained events");
+        assert_eq!(count, 3);
+
+        let remaining = fs::read_dir(&spool_dir)
+            .expect("read spool dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn drain_spool_truncates_large_json_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        let spool_dir = project_root.join(".triumvirate").join("spool");
+        fs::create_dir_all(&spool_dir).expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        let large_payload = serde_json::json!({
+            "tool_output": "x".repeat(100_000),
+            "message": "ok"
+        });
+        let raw = serde_json::json!({
+            "session_id": "session-large",
+            "event_type": "PostToolUse",
+            "sequence": 1,
+            "timestamp": "2026-04-07T00:00:01Z",
+            "payload_json": serde_json::to_string(&large_payload).expect("serialize payload")
+        });
+        fs::write(
+            spool_dir.join("event-large.ndjson"),
+            serde_json::to_string(&raw).expect("serialize event"),
+        )
+        .expect("write spool file");
+
+        let result = store.drain_spool(&spool_dir).expect("drain spool");
+        assert_eq!(result.ingested_count, 1);
+
+        let stored_payload = store
+            .with_conn(|conn| {
+                let payload: String = conn.query_row(
+                    "SELECT payload_json FROM events WHERE session_id = ?1",
+                    ["session-large"],
+                    |row| row.get(0),
+                )?;
+                Ok(payload)
+            })
+            .expect("read stored payload");
+        assert!(stored_payload.contains("[...truncated]"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stored_payload).expect("payload should remain valid json");
+        assert_eq!(parsed["message"], "ok");
     }
 }
