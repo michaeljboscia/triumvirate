@@ -320,12 +320,18 @@ Every atomic work product populates these artifacts. They are append-only during
   "last_commit_sha": "i7j8k9l",
   "wave_0_sha": "a1b2c3d",
   "build_timeout_sec": null,
-  "elapsed_sec": 1920,
+  "build_started_at": "2026-04-07T14:00:00Z",
   "updated_at": "2026-04-07T14:55:00Z"
 }
 ```
 
-`build_timeout_sec` is optional — no default. Set it after you have real build duration data. Per-task timeout (`task_timeout_sec` in contract.json) is mandatory.
+`build_timeout_sec` is optional — no default. Set it after you have real build duration data. Per-task timeout (`task_timeout_sec` in contract.json) is mandatory. Elapsed wall-clock = `now() - build_started_at`. Per-task durations are recorded in BUILD_MANIFEST.md timestamps.
+
+**Crash recovery:** On session start, if BUILD_STATE.json shows `tasks_remaining` with no live PID/heartbeat:
+1. Detect interrupted tasks (status=running but no process alive)
+2. If worktree has uncommitted changes: save forensic snapshot (`.triumvirate/interrupted.patch`), quarantine the worktree
+3. Redispatch fresh worker from last stable SHA — never resume dirty context
+4. Old worktree is kept quarantined for audit, cleaned up after resolution
 
 **BUILD_MANIFEST.md** — The permanent record of what was built. One entry per completed task.
 
