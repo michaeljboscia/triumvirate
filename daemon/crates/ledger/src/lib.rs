@@ -127,4 +127,51 @@ mod tests {
             assert!(tables.contains(expected), "missing table: {expected}");
         }
     }
+
+    #[test]
+    fn summaries_fts_match_returns_expected_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO summaries (title, narrative, facts_json, summary_type) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "authentication middleware bug",
+                        "fixed auth ordering",
+                        "[\"authentication\",\"middleware\"]",
+                        "bug_fix"
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("insert summary");
+
+        let match_count = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM summaries_fts WHERE summaries_fts MATCH 'authentication'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("fts match query");
+        assert_eq!(match_count, 1);
+
+        let miss_count = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM summaries_fts WHERE summaries_fts MATCH 'nonexistent'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("fts miss query");
+        assert_eq!(miss_count, 0);
+    }
 }
