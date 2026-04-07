@@ -193,6 +193,9 @@ Claude (orchestrator — stateful, full project visibility)
   ├─ Reads IMPLEMENTATION_PLAN.md + Execution Contract
   ├─ Holds: all task XML, all prior validation results,
   │         all deviation history, cumulative build state
+  ├─ Persists: BUILD_STATE.json (quick-resume checkpoint),
+  │            BUILD_MANIFEST.md + DEVIATION_LOG.md (full audit trail)
+  │            All written per-task, all on disk, neither depends on context survival
   │
   ├─ For each task in wave order:
   │   │
