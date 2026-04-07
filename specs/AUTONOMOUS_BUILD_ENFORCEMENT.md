@@ -227,11 +227,11 @@ Claude (orchestrator — stateful, full project visibility)
   │   │
   │   ├─ 6. IF BLOCKED:
   │   │   │
-  │   │   ├─ 6a. Claude reads failure details and CLASSIFIES the failure:
-  │   │   │    - worker-error: bad code → repair briefing, new worker
-  │   │   │    - contract-error: wrong contract → fix contract, redispatch
-  │   │   │    - orchestrator-briefing-error: bad briefing → Claude rewrites with Gemini help
-  │   │   │    - environment-error: sandbox/dependency issue → HALT, escalate immediately
+  │   │   ├─ 6a. MECHANICAL failure classification (by evidence, not LLM judgment):
+  │   │   │    - worker-error: validate-task.sh found stub markers or test failures in worker code
+  │   │   │    - contract-error: pre-commit hook blocked a file the worker legitimately needs
+  │   │   │    - environment-error: subprocess exit indicates missing binary or sandbox error
+  │   │   │    - orchestrator-briefing-error: everything else (conservative default → Gemini reviews)
   │   │   │
   │   │   ├─ 6b. Claude APPENDS to DEVIATION_LOG.md (MANDATORY):
   │   │   │    Log: task_id, attempt number, failure CLASS, failure details,
