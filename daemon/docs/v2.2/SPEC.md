@@ -124,7 +124,7 @@ Machine-readable lessons with confidence decay, stored in the Ledger's SQLite.
 Agents cannot approve their own work. Every approval requires a different model.
 
 - **REQ-023:** The `peer-review` crate MUST define a `ReviewRequest` struct: review_id, author_agent (claude|gemini|codex), artifact (diff, file path, or inline content), review_type (code|architecture|decision), requested_at.
-- **REQ-024-PR:** A review MUST be assigned to an agent that is NOT the author. Assignment strategy: round-robin among available non-author agents. If only one other agent is available, it gets the review.
+- **REQ-024-PR:** A review MUST be assigned to a full agent that is NOT the author. Assignment strategy: round-robin among registered non-author agent types (claude, gemini, codex). The daemon MUST spawn a reviewer on demand via `ask_agent` if one is not already running. Reviews use full agent sessions, not lightweight models.
 - **REQ-025-PR:** Review results MUST be stored in the Ledger's SQLite: review_id, reviewer_agent, verdict (approve|request_changes|reject), comments, reviewed_at.
 - **REQ-026:** MCP tools for peer review:
   - `review_request(artifact, review_type, author_agent)` — Creates a review request and assigns a reviewer.
