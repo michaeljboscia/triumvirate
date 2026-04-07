@@ -273,7 +273,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │        (enables human to diagnose orchestrator fault vs worker fault)
   │   │        Each attempt gets its own DEVIATION_LOG entry
   │   │
-  │   ├─ 7. IF PASS:
+  │   ├─ 6. IF PASS:
   │   │   │
   │   │   ├─ 7a. Claude writes AFTER_ACTION.md:
   │   │   │    task_id, commit_sha, files_modified,
