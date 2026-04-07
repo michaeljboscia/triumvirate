@@ -6,6 +6,8 @@ use crate::pool::{reap_idle, register_activity};
 use crate::store::with_ingest_priority;
 
 pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Result<()> {
+    let session_id = event.session_id.clone();
+    let event_timestamp = event.timestamp.clone();
     register_activity(store.project_root());
     reap_idle();
     with_ingest_priority(|| {
@@ -20,6 +22,17 @@ pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Resu
                     event.sequence,
                     event.timestamp,
                     event.payload_json
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO sessions (session_id, project, branch, started_at, event_count, summary_count)
+                 VALUES (?1, ?2, NULL, ?3, 1, 0)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    event_count = sessions.event_count + 1",
+                rusqlite::params![
+                    session_id,
+                    store.project_root().display().to_string(),
+                    event_timestamp
                 ],
             )?;
             Ok(())

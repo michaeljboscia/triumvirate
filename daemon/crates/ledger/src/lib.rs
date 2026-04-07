@@ -14,8 +14,8 @@ use std::{
 
 use rusqlite::Connection;
 use shared_types::{
-    DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
-    Summary,
+    DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent,
+    SessionDetail, Summary,
 };
 
 #[derive(Debug)]
@@ -41,8 +41,8 @@ impl LedgerStore {
         query::query_summaries(self, query, limit)
     }
 
-    pub fn get_session(&self, _session_id: &str) -> anyhow::Result<SessionDetail> {
-        anyhow::bail!("not implemented")
+    pub fn get_session(&self, session_id: &str) -> anyhow::Result<SessionDetail> {
+        query::get_session_detail(self, session_id)
     }
 
     pub fn record(&self, _record: ManualRecord) -> anyhow::Result<()> {
@@ -641,4 +641,55 @@ mod tests {
         let lag = store.queue_lag_seconds().expect("queue lag");
         assert!(lag >= 0.0);
     }
+
+    #[test]
+    fn get_session_reconstructs_events_and_summaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        for seq in 1..=10_i64 {
+            store
+                .ingest_event(RawEvent {
+                    session_id: "abc".to_string(),
+                    event_type: "PostToolUse".to_string(),
+                    sequence: seq,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: "{\"tool\":\"Edit\"}".to_string(),
+                })
+                .expect("ingest event");
+        }
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO summaries (event_id, title, narrative, facts_json, summary_type) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![1_i64, "sum1", "n1", "[]", "extractive"],
+                )?;
+                conn.execute(
+                    "INSERT INTO summaries (event_id, title, narrative, facts_json, summary_type) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![2_i64, "sum2", "n2", "[]", "extractive"],
+                )?;
+                Ok(())
+            })
+            .expect("insert summaries");
+
+        let detail = store.get_session("abc").expect("session detail");
+        assert_eq!(detail.events.len(), 10);
+        assert!(detail.summaries.len() >= 2);
+        let titles = detail
+            .summaries
+            .iter()
+            .map(|s| s.title.as_str())
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"sum1"));
+        assert!(titles.contains(&"sum2"));
+        assert_eq!(detail.session_id, "abc");
+
+        let err = store.get_session("nonexistent");
+        assert!(err.is_err());
+    }
+
 }

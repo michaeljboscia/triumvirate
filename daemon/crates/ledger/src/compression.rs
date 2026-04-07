@@ -87,6 +87,12 @@ pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usiz
                          VALUES (?1, ?2, ?3, ?4, 'extractive')",
                         rusqlite::params![event_id, title, narrative, facts_json],
                     )?;
+                    conn.execute(
+                        "UPDATE sessions
+                         SET summary_count = summary_count + 1
+                         WHERE session_id IN (SELECT session_id FROM events WHERE id = ?1)",
+                        [event_id],
+                    )?;
                     Ok(())
                 })?;
             }
