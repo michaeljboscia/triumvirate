@@ -360,6 +360,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     let _ = orchestrator.complete_fleet(&fleet_id, &project_root).await;
                 }
             });
+            join_handles.push(jh);
         }
         Ok(worktree_paths)
     }
