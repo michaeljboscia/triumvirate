@@ -71,6 +71,7 @@ use shared_types::{
     OutboxRecentResponse, SessionInfo, SessionListResponse, SpawnSessionRequest,
     ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
     ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse,
+    HealthStatus,
     SessionState,
 };
 #[cfg(test)]
@@ -942,6 +943,50 @@ async fn run_daemon() -> anyhow::Result<()> {
         })))
     }
 
+    async fn ledger_health_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+    ) -> Result<AxumJson<HealthStatus>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        let health = tokio::task::spawn_blocking(move || -> anyhow::Result<HealthStatus> {
+            let store = LedgerStore::open(project_root)?;
+            store.health()
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(health))
+    }
+
     fn ledger_sweep_interval() -> Duration {
         std::env::var("TRIUMVIRATE_LEDGER_SWEEP_SECONDS")
             .ok()
@@ -1326,6 +1371,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/ledger/wake", post(ledger_wake_route))
+        .route("/ledger/health", get(ledger_health_route))
         .route("/ask-agent", post(ask_agent_route))
         .route("/memory/write", post(memory_write_route))
         .route("/memory/read", post(memory_read_route))
