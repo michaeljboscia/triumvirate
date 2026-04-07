@@ -261,7 +261,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   ├─ 5c. query_gemini_review(diff + failure + briefing + contract)
   │   │   │    (Gemini sees the briefing on failure to diagnose orchestrator errors)
   │   │   │
-  │   │   ├─ 6d. Claude writes REPAIR_BRIEFING.md (rigid template, size-capped):
+  │   │   ├─ 5d. Claude writes REPAIR_BRIEFING.md (rigid template, size-capped):
   │   │   │    Sections: What Failed → Root Cause → The Fix → Do NOT
   │   │   │    No raw log paste. No conversation history. Diff-focused only.
   │   │   │
