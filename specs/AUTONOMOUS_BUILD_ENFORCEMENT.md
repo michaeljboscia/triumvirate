@@ -258,7 +258,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    Log: task_id, attempt number, failure CLASS, failure details,
   │   │   │    validate-task.sh output, root cause diagnosis
   │   │   │
-  │   │   ├─ 6c. query_gemini_review(diff + failure + briefing + contract)
+  │   │   ├─ 5c. query_gemini_review(diff + failure + briefing + contract)
   │   │   │    (Gemini sees the briefing on failure to diagnose orchestrator errors)
   │   │   │
   │   │   ├─ 6d. Claude writes REPAIR_BRIEFING.md (rigid template, size-capped):
