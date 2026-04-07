@@ -182,13 +182,12 @@ Svelte 5 + Tailwind 4 web UI embedded in the daemon binary.
 
 ### Views
 
-- **REQ-045:** The dashboard MUST have these views:
-  - **Sessions** — Active and recent sessions. Agent states (idle/working/stuck). Live working-state streaming per agent.
-  - **Fleet** — Active fleets. Task board (kanban). Worktree status. Merge queue.
-  - **Ledger** — Session history. Search (FTS5). Compression queue. Health indicators.
-  - **Lessons** — Lesson list with confidence bars. Stale lessons highlighted. Add/validate actions.
-  - **Reviews** — Pending reviews. Review history. Approval rates per agent.
-  - **Metrics** — Prometheus metrics visualization. Per-agent token usage. Cost attribution. Latency histograms.
+- **REQ-045:** The dashboard MUST have a **Sessions** view: active and recent sessions, agent states (idle/working/stuck), live working-state streaming per agent.
+- **REQ-045a:** The dashboard MUST have a **Fleet** view: active fleets, task board (kanban-style columns: pending/claimed/in_progress/done/failed), worktree status, merge queue position.
+- **REQ-045b:** The dashboard MUST have a **Ledger** view: session history list, FTS5 search input, compression queue depth, health status indicator.
+- **REQ-045c:** The dashboard MUST have a **Lessons** view: lesson list with confidence bars (0.0–1.0), stale lessons (confidence < 0.1) highlighted, add/validate action buttons.
+- **REQ-045d:** The dashboard MUST have a **Reviews** view: pending reviews with age, review history, approval rate per agent.
+- **REQ-045e:** The dashboard MUST have a **Metrics** view: per-agent token usage, cost per session, latency histograms. Data sourced from Prometheus `/metrics` endpoint.
 - **REQ-046:** The Sessions view MUST show agent verbosity-filtered working state. The verbosity level (quiet/standard/detailed/raw) MUST be selectable per-agent in the UI, using the `AgentVerbosity` enum from `agent-adapter`.
 - **REQ-047:** The Ledger health view MUST prominently display a status indicator: green (healthy — events in last 5 min), yellow (degraded — no events but no active session), red (dead — active session + no events in 5 min). This is the "never silently die" requirement.
 
