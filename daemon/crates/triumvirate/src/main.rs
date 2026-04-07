@@ -2540,6 +2540,26 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} warm worker 
         Ok(path)
     }
 
+    fn write_codex_args_capture_script(args_path: &PathBuf, response_text: &str) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("codex-args-capture-{now}.sh"));
+        let script = format!(
+            "#!/bin/sh\n\
+printf '%s\n' \"$@\" > \"{args_path}\"\n\
+IFS= read -r _line\n\
+echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{response_text}\"}}}}'\n",
+            args_path = args_path.display(),
+            response_text = response_text
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     fn write_gemini_stream_usage_script() -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -2852,6 +2872,97 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_codex_adds_full_auto_only_when_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-codex-full-auto-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let args_file = test_home.join("codex-args.txt");
+        let script_path = write_codex_args_capture_script(&args_file, "codex args capture done")?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::set_var("TRIUMVIRATE_CODEX_AUTO_APPROVE", "1");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+
+        let req = AskAgentRequest {
+            agent: "codex".to_string(),
+            message: "capture args".to_string(),
+            cwd: Some(test_home.display().to_string()),
+            repo: Some("triumvirate".to_string()),
+            branch: Some("feat/mcp-first".to_string()),
+        };
+        let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
+        let captured = fs::read_to_string(&args_file)?;
+        assert!(captured.lines().any(|line| line == "--full-auto"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE") };
+        let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
+        let captured_without = fs::read_to_string(&args_file)?;
+        assert!(!captured_without.lines().any(|line| line == "--full-auto"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_agent_codex_auto_approve_writes_ledger_record() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let test_home =
+            std::env::temp_dir().join(format!("triumvirate-codex-auto-approve-ledger-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let args_file = test_home.join("codex-args.txt");
+        let script_path = write_codex_args_capture_script(&args_file, "codex auto approve done")?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::set_var("TRIUMVIRATE_CODEX_AUTO_APPROVE", "1");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+
+        let req = AskAgentRequest {
+            agent: "codex".to_string(),
+            message: "auto approve ledger".to_string(),
+            cwd: Some(test_home.display().to_string()),
+            repo: Some("triumvirate".to_string()),
+            branch: Some("feat/mcp-first".to_string()),
+        };
+        let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
+
+        let store = LedgerStore::open(test_home.clone())?;
+        let summaries = store.query("Codex", 10)?;
+        assert!(summaries.iter().any(|summary| summary.summary_type == "auto_approved"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
 
