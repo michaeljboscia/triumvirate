@@ -1,9 +1,17 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::Duration,
+};
 
 use rusqlite::Connection;
 
 use crate::LedgerStore;
 use crate::init::ensure_triumvirate_gitignore;
+
+static INGEST_WRITES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -123,4 +131,35 @@ pub(crate) fn open(project_root: PathBuf) -> anyhow::Result<LedgerStore> {
         project_root,
         conn: std::sync::Mutex::new(conn),
     })
+}
+
+pub(crate) fn with_ingest_priority<T, F>(f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    INGEST_WRITES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    let out = f();
+    INGEST_WRITES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    out
+}
+
+pub(crate) fn with_task_state_priority<T, F>(f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    if INGEST_WRITES_IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+        thread::sleep(Duration::from_millis(2));
+    }
+    f()
+}
+
+pub(crate) fn queue_lag_seconds_conn(conn: &Connection) -> anyhow::Result<f64> {
+    let lag = conn.query_row(
+        "SELECT COALESCE((julianday('now') - julianday(MIN(created_at))) * 86400.0, 0.0)
+         FROM events
+         WHERE compression_state = 'pending'",
+        [],
+        |row| row.get::<_, f64>(0),
+    )?;
+    Ok(if lag.is_sign_negative() { 0.0 } else { lag })
 }

@@ -921,12 +921,14 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
         }
 
-        let drain_result = tokio::task::spawn_blocking({
+        let (drain_result, queue_lag_seconds) = tokio::task::spawn_blocking({
             let project_root = project_root.clone();
-            move || -> anyhow::Result<shared_types::DrainResult> {
+            move || -> anyhow::Result<(shared_types::DrainResult, f64)> {
                 let store = LedgerStore::open(project_root.clone())?;
                 let spool_dir = project_root.join(".triumvirate").join("spool");
-                store.drain_spool(&spool_dir)
+                let drained = store.drain_spool(&spool_dir)?;
+                let lag = store.queue_lag_seconds()?;
+                Ok((drained, lag))
             }
         })
         .await
@@ -947,6 +949,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             .metrics
             .ledger_events_ingested_total
             .inc_by(drain_result.ingested_count as u64);
+        state.metrics.ledger_queue_lag_seconds.set(queue_lag_seconds);
 
         Ok(AxumJson(serde_json::json!({
             "status": "ok",
@@ -978,23 +981,28 @@ async fn run_daemon() -> anyhow::Result<()> {
             )
         })?;
 
-        let health = tokio::task::spawn_blocking(move || -> anyhow::Result<HealthStatus> {
-            let store = LedgerStore::open(project_root)?;
-            store.health()
-        })
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
-            )
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(serde_json::json!({ "error": e.to_string() })),
-            )
-        })?;
+        let (health, queue_lag_seconds) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(HealthStatus, f64)> {
+                let store = LedgerStore::open(project_root)?;
+                let health = store.health()?;
+                let lag = store.queue_lag_seconds()?;
+                Ok((health, lag))
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(serde_json::json!({ "error": e.to_string() })),
+                )
+            })?;
+
+        state.metrics.ledger_queue_lag_seconds.set(queue_lag_seconds);
 
         Ok(AxumJson(health))
     }
@@ -1015,20 +1023,23 @@ async fn run_daemon() -> anyhow::Result<()> {
         for project_root in project_roots {
             let result = tokio::task::spawn_blocking({
                 let project_root = project_root.clone();
-                move || -> anyhow::Result<shared_types::DrainResult> {
+                move || -> anyhow::Result<(shared_types::DrainResult, f64)> {
                     let store = LedgerStore::open(project_root.clone())?;
                     let spool_dir = project_root.join(".triumvirate").join("spool");
-                    store.drain_spool(&spool_dir)
+                    let drained = store.drain_spool(&spool_dir)?;
+                    let lag = store.queue_lag_seconds()?;
+                    Ok((drained, lag))
                 }
             })
             .await;
 
             match result {
-                Ok(Ok(drain_result)) => {
+                Ok(Ok((drain_result, lag))) => {
                     state
                         .metrics
                         .ledger_events_ingested_total
                         .inc_by(drain_result.ingested_count as u64);
+                    state.metrics.ledger_queue_lag_seconds.set(lag);
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(
