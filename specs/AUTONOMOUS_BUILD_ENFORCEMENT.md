@@ -52,10 +52,12 @@ The daemon exposes an MCP server that Claude Code connects to. Tools available:
 | `dispatch_codex` | Spawns a fresh Codex session with a given prompt. Returns task ID. |
 | `dispatch_codex_worktree` | Same, but in a git worktree branched from a specified SHA. |
 | `query_gemini` | Sends a query to Gemini and returns the response. Synchronous. |
-| `query_gemini_review` | Sends code diff to Gemini for review. Returns concerns/clean. |
+| `query_gemini_review` | Sends code diff to Gemini for review. On failure cases, also sends briefing + contract. Returns concerns/clean. |
 | `get_task_status` | Returns status of a dispatched task (working/completed/failed). |
 | `get_task_output` | Returns the stdout/commit info from a completed task. |
 | `cancel_task` | Kills a running task. |
+
+**Daemon-down behavior:** If the daemon is unreachable, all dispatch/query tools return `DAEMON_UNAVAILABLE` with structured error. The orchestrator attempts one bounded auto-restart. If still down, halt the wave and escalate to human. Never dispatch locally or silently degrade.
 
 ### REQ-A1.2: Codex Dispatch Interface
 
