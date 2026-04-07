@@ -199,7 +199,8 @@ impl McpBridge {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<AskAgentResponse>, String> {
         let emitter = ProgressEmitter::from_context(&context);
-        if mcp_daemon_proxy_enabled() {
+        let local_test_execution_allowed = cfg!(test) && !mcp_daemon_proxy_enabled();
+        if !local_test_execution_allowed {
             let display = display_agent_name(&req.agent);
             emitter.emit(format!("→ {display}: sent ✓")).await;
             let mut pending = Box::pin(fetch_daemon_ask_agent(&req));
@@ -216,7 +217,10 @@ impl McpBridge {
                             }
                             Err(err) => {
                                 emitter.emit(format!("→ {display}: FAILED ✗ ({err})")).await;
-                                return Err(format!("ask_agent via daemon failed: {err}"));
+                                return Err(format!(
+                                    "ask_agent requires triumvirate daemon; daemon request failed: {err}. \
+start it with: triumvirate daemon"
+                                ));
                             }
                         }
                     }
@@ -3723,6 +3727,70 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         unsafe {
             std::env::remove_var("TRIUMVIRATE_HOME");
             std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+        }
+        let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_ask_agent_returns_daemon_recovery_error_when_unreachable() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-mcp-daemon-down-{now}"));
+        fs::create_dir_all(&test_home)?;
+        fs::write(test_home.join("daemon.token"), "daemon-down-token\n")?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_MCP_USE_DAEMON", "true");
+            std::env::set_var("TRIUMVIRATE_DAEMON_AUTOSTART", "0");
+            std::env::set_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL", "http://127.0.0.1:9/ask-agent");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let args = serde_json::json!({
+            "agent": "gemini",
+            "message": "daemon down case"
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_agent")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await
+            .expect("call should return MCP error payload");
+        assert_eq!(result.is_error, Some(true));
+        let err_text = result
+            .content
+            .first()
+            .and_then(|content| content.raw.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        assert!(err_text.contains("daemon"));
+        assert!(err_text.contains("triumvirate daemon"));
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
         }
         let _ = fs::remove_dir_all(test_home);
