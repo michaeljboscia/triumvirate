@@ -24,7 +24,7 @@ use daemon_http::{
     fetch_daemon_ask_agent, fetch_daemon_fallback_ack,
     fetch_daemon_fallback_gc, fetch_daemon_fallback_list, fetch_daemon_memory_read,
     fetch_daemon_lesson_add, fetch_daemon_lesson_list, fetch_daemon_lesson_query, fetch_daemon_lesson_validate,
-    fetch_daemon_ledger_query, fetch_daemon_ledger_record, fetch_daemon_ledger_session,
+    fetch_daemon_ledger_gc, fetch_daemon_ledger_query, fetch_daemon_ledger_record, fetch_daemon_ledger_session,
     fetch_daemon_memory_write, fetch_daemon_outbox_recent, fetch_daemon_scratchpad_list,
     fetch_daemon_scratchpad_write, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
     fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
@@ -86,7 +86,7 @@ use shared_types::{
     OutboxRecentResponse, SessionInfo, SessionListResponse, SpawnSessionRequest,
     ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
     ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse,
-    HealthStatus, SessionDetail, Summary,
+    GcResult, HealthStatus, SessionDetail, Summary,
     SessionState,
 };
 #[cfg(test)]
@@ -641,6 +641,22 @@ start it with: triumvirate daemon"
             .record(req)
             .map_err(|e| format!("ledger_record failed: {e}"))?;
         Ok("ok".to_string())
+    }
+
+    #[tool(description = "Run ledger garbage collection for stale events and dead-drop tickets.")]
+    async fn ledger_gc(&self) -> Result<Json<GcResult>, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_ledger_gc()
+                .await
+                .map(Json)
+                .map_err(|e| format!("ledger_gc via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        let result = store.gc().map_err(|e| format!("ledger_gc failed: {e}"))?;
+        Ok(Json(result))
     }
 
     #[tool(description = "Add a reusable lesson to the ledger knowledge base.")]
@@ -1635,6 +1651,53 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(serde_json::json!({ "status": "ok" })))
     }
 
+    async fn ledger_gc_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+    ) -> Result<AxumJson<GcResult>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(
+            headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            &state.token,
+        ) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<GcResult> {
+            let store = LedgerStore::open(project_root)?;
+            store.gc()
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(result))
+    }
+
     async fn lesson_add_route(
         State(state): State<DaemonState>,
         headers: HeaderMap,
@@ -1857,6 +1920,49 @@ async fn run_daemon() -> anyhow::Result<()> {
                         project_root.display()
                     );
                 }
+            }
+        }
+    }
+
+    async fn run_startup_gc_if_needed(state: &DaemonState) {
+        let Some(project_root) = std::env::current_dir().ok() else {
+            tracing::warn!("startup GC skipped: unable to resolve current_dir");
+            return;
+        };
+
+        let result = tokio::task::spawn_blocking({
+            let project_root = project_root.clone();
+            move || -> anyhow::Result<Option<GcResult>> {
+                let store = LedgerStore::open(project_root)?;
+                if !store.should_run_startup_gc()? {
+                    return Ok(None);
+                }
+                Ok(Some(store.gc()?))
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(Some(gc_result))) => {
+                tracing::info!(
+                    events_scanned = gc_result.events_scanned,
+                    events_deleted = gc_result.events_deleted,
+                    space_reclaimed_bytes = gc_result.space_reclaimed_bytes,
+                    dead_drop_deleted = gc_result.dead_drop_deleted,
+                    "startup ledger GC completed"
+                );
+                if let Ok(payload) = serde_json::to_value(&gc_result) {
+                    publish_ws_event(state, "ledger_gc", payload);
+                }
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!("startup ledger GC skipped");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!("startup ledger GC failed: {err}");
+            }
+            Err(err) => {
+                tracing::warn!("startup ledger GC join failure: {err}");
             }
         }
     }
@@ -2195,6 +2301,11 @@ async fn run_daemon() -> anyhow::Result<()> {
         metrics: Arc::new(DaemonMetrics::new()?),
         ws_events: broadcast::channel(256).0,
     };
+    if let Ok(project_root) = std::env::current_dir() {
+        let mut lru = state.ledger_project_lru.lock().await;
+        lru.push_back(project_root);
+    }
+    run_startup_gc_if_needed(&state).await;
     let app = Router::new()
         .route("/", get(dashboard_root_route))
         .route("/assets/{*path}", get(dashboard_assets_route))
@@ -2207,6 +2318,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/ledger/query", post(ledger_query_route))
         .route("/ledger/session", post(ledger_session_route))
         .route("/ledger/record", post(ledger_record_route))
+        .route("/ledger/gc", post(ledger_gc_route))
         .route("/lesson/add", post(lesson_add_route))
         .route("/lesson/query", post(lesson_query_route))
         .route("/lesson/validate", post(lesson_validate_route))
@@ -5025,6 +5137,30 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             .await
             .map_err(anyhow::Error::msg)?;
         assert!(out.0.summaries.iter().any(|summary| summary.title == "test"));
+
+        std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ledger_gc_tool_returns_gc_counts() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let original_cwd = std::env::current_dir()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-ledger-gc-mcp-{now}"));
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))?;
+        std::env::set_current_dir(&project_root)?;
+
+        let _store = LedgerStore::open(project_root.clone())?;
+
+        let bridge = McpBridge::new_ephemeral();
+        let gc = bridge.ledger_gc().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(gc.0.events_scanned, 0);
+        assert_eq!(gc.0.events_deleted, 0);
+        assert_eq!(gc.0.dead_drop_deleted, 0);
 
         std::env::set_current_dir(&original_cwd)?;
         let _ = fs::remove_dir_all(project_root);
