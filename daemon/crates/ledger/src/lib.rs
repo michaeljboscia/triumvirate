@@ -45,8 +45,8 @@ impl LedgerStore {
         query::get_session_detail(self, session_id)
     }
 
-    pub fn record(&self, _record: ManualRecord) -> anyhow::Result<()> {
-        anyhow::bail!("not implemented")
+    pub fn record(&self, record: ManualRecord) -> anyhow::Result<()> {
+        ingest::record_manual(self, record)
     }
 
     pub fn health(&self) -> anyhow::Result<HealthStatus> {
@@ -104,7 +104,7 @@ impl LedgerStore {
 mod tests {
     use std::{collections::HashSet, fs, path::PathBuf};
 
-    use shared_types::RawEvent;
+    use shared_types::{ManualRecord, RawEvent};
 
     use super::LedgerStore;
 
@@ -690,6 +690,32 @@ mod tests {
 
         let err = store.get_session("nonexistent");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn record_inserts_manual_summary_and_is_searchable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        store
+            .record(ManualRecord {
+                session_id: None,
+                title: "Architecture decision: use WAL".to_string(),
+                narrative: "Prefer WAL journaling for concurrent reads".to_string(),
+                facts_json: Some("[\"wal\"]".to_string()),
+                concepts_json: None,
+                affected_files_json: None,
+                summary_type: "architecture_decision".to_string(),
+            })
+            .expect("record manual summary");
+
+        let results = store.query("WAL", 10).expect("query manual record");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Architecture decision: use WAL");
+        assert_eq!(results[0].summary_type, "architecture_decision");
     }
 
 }
