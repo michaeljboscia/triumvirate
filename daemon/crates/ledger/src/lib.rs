@@ -508,6 +508,22 @@ mod tests {
     }
 
     #[test]
+    fn health_degrades_when_spool_exceeds_100mb() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        let spool_dir = project_root.join(".triumvirate").join("spool");
+        fs::create_dir_all(&spool_dir).expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        let oversized = vec![0u8; 100_000_001];
+        fs::write(spool_dir.join("oversized.ndjson"), oversized).expect("write oversized spool file");
+
+        let status = store.health().expect("health status");
+        assert!(status.spool_size_bytes > 100_000_000);
+        assert_eq!(status.status, "degraded");
+    }
+
+    #[test]
     fn open_adds_triumvirate_gitignore_entry_once() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root = temp.path().join("project");
