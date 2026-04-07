@@ -12,12 +12,15 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use shared_types::MemoryEntry;
 use tokio::sync::Mutex;
+use tracing::instrument;
 use uuid::Uuid;
 
+#[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
     root.join("dead-drop")
 }
 
+#[instrument(skip_all)]
 pub fn triumvirate_home_dir() -> anyhow::Result<PathBuf> {
     if let Ok(override_dir) = std::env::var("TRIUMVIRATE_HOME") {
         return Ok(PathBuf::from(override_dir));
@@ -37,6 +40,7 @@ pub struct DeadDropTicket<'a> {
     pub id: &'a str,
 }
 
+#[instrument(skip_all)]
 pub fn create_dead_drop_ticket(
     root: &Path,
     ticket: DeadDropTicket<'_>,
@@ -59,6 +63,7 @@ cwd: {}\nrepo: {}\nbranch: {}\n\n## Original Request\n{message}\n",
     Ok(file)
 }
 
+#[instrument(skip_all)]
 pub fn count_dead_drop_tickets(root: &Path) -> anyhow::Result<usize> {
     let dir = dead_drop_dir(root);
     if !dir.exists() {
@@ -67,6 +72,7 @@ pub fn count_dead_drop_tickets(root: &Path) -> anyhow::Result<usize> {
     Ok(fs::read_dir(dir)?.filter_map(Result::ok).count())
 }
 
+#[instrument(skip_all)]
 pub fn list_dead_drop_tickets(root: &Path, limit: usize) -> anyhow::Result<Vec<PathBuf>> {
     let dir = dead_drop_dir(root);
     if !dir.exists() {
@@ -82,6 +88,7 @@ pub fn list_dead_drop_tickets(root: &Path, limit: usize) -> anyhow::Result<Vec<P
     Ok(files)
 }
 
+#[instrument(skip_all)]
 pub fn acknowledge_dead_drop_ticket(root: &Path, path: &str) -> anyhow::Result<()> {
     let root = dead_drop_dir(root).canonicalize()?;
     let requested = PathBuf::from(path).canonicalize()?;
@@ -92,6 +99,7 @@ pub fn acknowledge_dead_drop_ticket(root: &Path, path: &str) -> anyhow::Result<(
     Ok(())
 }
 
+#[instrument(skip_all)]
 pub fn gc_dead_drop_tickets(root: &Path, max_age_days: u64) -> anyhow::Result<usize> {
     let dir = dead_drop_dir(root);
     if !dir.exists() {
@@ -118,6 +126,7 @@ pub fn gc_dead_drop_tickets(root: &Path, max_age_days: u64) -> anyhow::Result<us
     Ok(removed)
 }
 
+#[instrument(skip_all)]
 pub fn append_memory_entry(root: &Path, entry: &MemoryEntry) -> anyhow::Result<()> {
     let path = root.join("memory.jsonl");
     if let Some(parent) = path.parent() {
@@ -134,6 +143,7 @@ pub fn append_memory_entry(root: &Path, entry: &MemoryEntry) -> anyhow::Result<(
     Ok(())
 }
 
+#[instrument(skip_all)]
 pub fn read_memory_entries(root: &Path) -> anyhow::Result<Vec<MemoryEntry>> {
     let path = root.join("memory.jsonl");
     if !path.exists() {
@@ -152,6 +162,7 @@ pub fn read_memory_entries(root: &Path) -> anyhow::Result<Vec<MemoryEntry>> {
     Ok(out)
 }
 
+#[instrument(skip_all)]
 pub fn write_scratchpad(
     root: &Path,
     project: &str,
@@ -168,6 +179,7 @@ pub fn write_scratchpad(
     Ok(path)
 }
 
+#[instrument(skip_all)]
 pub fn list_scratchpad(root: &Path, project: &str) -> anyhow::Result<Vec<PathBuf>> {
     let safe_project = sanitize_name(project);
     let dir = root.join("scratchpad").join(safe_project);
@@ -182,6 +194,7 @@ pub fn list_scratchpad(root: &Path, project: &str) -> anyhow::Result<Vec<PathBuf
     Ok(files)
 }
 
+#[instrument(skip_all)]
 pub fn append_outbox_event(root: &Path, event: &shared_types::OutboxEvent) -> anyhow::Result<()> {
     let path = root.join("outbox.jsonl");
     if let Some(parent) = path.parent() {
@@ -198,6 +211,7 @@ pub fn append_outbox_event(root: &Path, event: &shared_types::OutboxEvent) -> an
     Ok(())
 }
 
+#[instrument(skip_all)]
 pub fn read_outbox_events(root: &Path) -> anyhow::Result<Vec<shared_types::OutboxEvent>> {
     let path = root.join("outbox.jsonl");
     if !path.exists() {
@@ -216,10 +230,12 @@ pub fn read_outbox_events(root: &Path) -> anyhow::Result<Vec<shared_types::Outbo
     Ok(out)
 }
 
+#[instrument(skip_all)]
 pub fn sessions_file_path(root: &Path) -> PathBuf {
     root.join("sessions.json")
 }
 
+#[instrument(skip_all)]
 pub fn load_json_file<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     if !path.exists() {
         anyhow::bail!("file does not exist: {}", path.display());
@@ -228,6 +244,7 @@ pub fn load_json_file<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     Ok(serde_json::from_str::<T>(&raw)?)
 }
 
+#[instrument(skip_all)]
 pub fn load_json_file_if_exists<T: DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
     if !path.exists() {
         return Ok(T::default());
@@ -235,6 +252,7 @@ pub fn load_json_file_if_exists<T: DeserializeOwned + Default>(path: &Path) -> a
     load_json_file(path)
 }
 
+#[instrument(skip_all)]
 pub fn persist_json_file<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -243,6 +261,7 @@ pub fn persist_json_file<T: Serialize>(path: &Path, value: &T) -> anyhow::Result
     Ok(())
 }
 
+#[instrument(skip_all)]
 pub fn persist_json_file_if_enabled<T: Serialize>(
     maybe_path: Option<&PathBuf>,
     value: &T,
@@ -253,6 +272,7 @@ pub fn persist_json_file_if_enabled<T: Serialize>(
     persist_json_file(path, value)
 }
 
+#[instrument(skip_all)]
 pub fn ensure_daemon_token(root: &Path) -> anyhow::Result<String> {
     let token_path = root.join("daemon.token");
     if let Some(parent) = token_path.parent() {
@@ -270,12 +290,14 @@ pub fn ensure_daemon_token(root: &Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
+#[instrument(skip_all)]
 pub fn launchd_plist_path() -> anyhow::Result<PathBuf> {
     Ok(dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to determine user home directory"))?
         .join("Library/LaunchAgents/com.triumvirate.daemon-v2.plist"))
 }
 
+#[instrument(skip_all)]
 pub fn render_launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -308,6 +330,7 @@ pub fn render_launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
     )
 }
 
+#[instrument(skip_all)]
 pub fn unix_time_ms() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -316,6 +339,7 @@ pub fn unix_time_ms() -> u128 {
         .unwrap_or(0)
 }
 
+#[instrument(skip_all)]
 pub fn daemon_bind_addr(var_value: Option<&str>) -> String {
     var_value
         .map(str::trim)
@@ -324,6 +348,7 @@ pub fn daemon_bind_addr(var_value: Option<&str>) -> String {
         .to_string()
 }
 
+#[instrument(skip_all)]
 pub fn resolve_context(
     cwd: Option<&String>,
     repo: Option<&String>,
@@ -372,6 +397,7 @@ fn sanitize_name(value: &str) -> String {
         .collect::<String>()
 }
 
+#[instrument(skip_all)]
 pub fn project_queue_key(cwd: Option<&String>, repo: Option<&String>) -> String {
     if let Some(repo) = repo {
         return format!("repo:{repo}");
@@ -384,6 +410,7 @@ pub fn project_queue_key(cwd: Option<&String>, repo: Option<&String>) -> String 
 
 pub type QueueRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
+#[instrument(skip_all)]
 pub async fn acquire_project_queue(registry: &QueueRegistry, key: String) -> Arc<Mutex<()>> {
     let mut queues = registry.lock().await;
     queues

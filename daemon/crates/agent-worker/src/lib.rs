@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use tokio::sync::Mutex;
+use tracing::instrument;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerState {
@@ -73,6 +74,7 @@ fn worker_registry_store() -> &'static WorkerRegistry {
     STORE.get_or_init(|| Arc::new(Mutex::new(load_worker_registry_from_disk())))
 }
 
+#[instrument(skip_all)]
 pub async fn acquire_worker(agent: &str, cwd: &str) -> WorkerAcquireResult {
     let key = worker_key(agent, cwd);
     let mut workers = worker_registry_store().lock().await;
@@ -104,6 +106,7 @@ pub async fn acquire_worker(agent: &str, cwd: &str) -> WorkerAcquireResult {
     result
 }
 
+#[instrument(skip_all)]
 pub async fn require_reused_worker(agent: &str, cwd: &str) -> Result<WorkerState, String> {
     let key = worker_key(agent, cwd);
     let mut workers = worker_registry_store().lock().await;
@@ -121,6 +124,7 @@ pub async fn require_reused_worker(agent: &str, cwd: &str) -> Result<WorkerState
     Ok(out)
 }
 
+#[instrument(skip_all)]
 pub async fn update_worker_session(agent: &str, cwd: &str, session_id: Option<String>) {
     let key = worker_key(agent, cwd);
     let mut workers = worker_registry_store().lock().await;
@@ -131,6 +135,7 @@ pub async fn update_worker_session(agent: &str, cwd: &str, session_id: Option<St
     }
 }
 
+#[instrument(skip_all)]
 pub async fn dismiss_worker(agent: &str, cwd: &str) -> bool {
     let key = worker_key(agent, cwd);
     let mut workers = worker_registry_store().lock().await;
@@ -141,6 +146,7 @@ pub async fn dismiss_worker(agent: &str, cwd: &str) -> bool {
     removed
 }
 
+#[instrument(skip_all)]
 pub fn should_invalidate_cached_session(error_text: &str) -> bool {
     let msg = error_text.to_lowercase();
     msg.contains("invalid session identifier")
@@ -149,6 +155,7 @@ pub fn should_invalidate_cached_session(error_text: &str) -> bool {
         || msg.contains("unknown session")
 }
 
+#[instrument(skip_all)]
 pub async fn reset_worker_registry_for_tests() {
     let mut workers = worker_registry_store().lock().await;
     workers.clear();

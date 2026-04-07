@@ -5,6 +5,7 @@
 
 use shared_types::AskAgentRequest;
 use agent_adapter::AgentVerbosity;
+use tracing::instrument;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
@@ -19,21 +20,25 @@ impl Default for BridgeInfo {
     }
 }
 
+#[instrument(skip_all)]
 pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
     is_supported_agent_name(&req.agent)
 }
 
+#[instrument(skip_all)]
 pub fn is_supported_agent_name(agent: &str) -> bool {
     let agent = agent.to_lowercase();
     agent == "gemini" || agent == "codex"
 }
 
+#[instrument(skip_all)]
 pub fn should_use_daemon_proxy(var_value: Option<&str>) -> bool {
     var_value
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
 
+#[instrument(skip_all)]
 pub fn use_daemon_for_mcp_from_env() -> bool {
     std::env::var("TRIUMVIRATE_MCP_USE_DAEMON")
         .ok()
@@ -41,17 +46,20 @@ pub fn use_daemon_for_mcp_from_env() -> bool {
         .unwrap_or(true)
 }
 
+#[instrument(skip_all)]
 pub fn daemon_autostart_enabled(var_value: Option<&str>) -> bool {
     var_value
         .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
         .unwrap_or(true)
 }
 
+#[instrument(skip_all)]
 pub fn is_bearer_authorized(raw_auth_header: Option<&str>, token: &str) -> bool {
     let expected = format!("Bearer {token}");
     raw_auth_header.map(|v| v == expected).unwrap_or(false)
 }
 
+#[instrument(skip_all)]
 pub fn daemon_base_url() -> String {
     if let Ok(base) = std::env::var("TRIUMVIRATE_DAEMON_BASE_URL") {
         return base;
@@ -65,89 +73,107 @@ pub fn daemon_base_url() -> String {
     "http://127.0.0.1:8080".to_string()
 }
 
+#[instrument(skip_all)]
 pub fn daemon_status_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_URL")
         .unwrap_or_else(|_| format!("{}/status", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_health_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_HEALTH_URL")
         .unwrap_or_else(|_| format!("{}/health", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_ask_agent_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL")
         .unwrap_or_else(|_| format!("{}/ask-agent", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_session_spawn_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_SESSION_SPAWN_URL")
         .unwrap_or_else(|_| format!("{}/session/spawn", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_session_ask_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_SESSION_ASK_URL")
         .unwrap_or_else(|_| format!("{}/session/ask", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_session_dismiss_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_SESSION_DISMISS_URL")
         .unwrap_or_else(|_| format!("{}/session/dismiss", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_session_list_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_SESSION_LIST_URL")
         .unwrap_or_else(|_| format!("{}/session/list", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_memory_write_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL")
         .unwrap_or_else(|_| format!("{}/memory/write", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_memory_read_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL")
         .unwrap_or_else(|_| format!("{}/memory/read", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_scratchpad_write_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL")
         .unwrap_or_else(|_| format!("{}/scratchpad/write", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_scratchpad_list_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL")
         .unwrap_or_else(|_| format!("{}/scratchpad/list", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_outbox_recent_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL")
         .unwrap_or_else(|_| format!("{}/outbox/recent", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_fallback_list_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL")
         .unwrap_or_else(|_| format!("{}/fallback/list", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_fallback_ack_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL")
         .unwrap_or_else(|_| format!("{}/fallback/ack", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn daemon_fallback_gc_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_FALLBACK_GC_URL")
         .unwrap_or_else(|_| format!("{}/fallback/gc", daemon_base_url()))
 }
 
+#[instrument(skip_all)]
 pub fn gemini_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_GEMINI_ARGS", "mock-gemini")
 }
 
+#[instrument(skip_all)]
 pub fn codex_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "mock-codex")
 }
 
+#[instrument(skip_all)]
 pub fn agent_verbosity() -> AgentVerbosity {
     let raw = std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok();
     let parsed = AgentVerbosity::from_env(raw.as_deref());
@@ -166,6 +192,7 @@ pub fn agent_verbosity() -> AgentVerbosity {
     parsed
 }
 
+#[instrument(skip_all)]
 pub fn gemini_streaming_enabled() -> bool {
     std::env::var("TRIUMVIRATE_GEMINI_STREAMING")
         .ok()
@@ -173,6 +200,7 @@ pub fn gemini_streaming_enabled() -> bool {
         .unwrap_or(true)
 }
 
+#[instrument(skip_all)]
 pub fn codex_protocol() -> String {
     std::env::var("TRIUMVIRATE_CODEX_PROTOCOL")
         .ok()

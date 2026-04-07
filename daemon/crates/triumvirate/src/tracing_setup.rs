@@ -1,6 +1,7 @@
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub(crate) fn init_tracing() -> anyhow::Result<()> {
@@ -23,14 +24,24 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
             opentelemetry::global::set_tracer_provider(provider);
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json().with_target(false))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_target(false)
+                        .with_span_events(FmtSpan::CLOSE),
+                )
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
         }
         None => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json().with_target(false))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_target(false)
+                        .with_span_events(FmtSpan::CLOSE),
+                )
                 .init();
         }
     }
