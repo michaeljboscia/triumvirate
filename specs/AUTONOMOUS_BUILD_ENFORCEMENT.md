@@ -432,7 +432,7 @@ The model file is at models/code-embed.gguf. Use llama_cpp::Model::load().
 | Agent | Role | State | What it sees |
 |-------|------|-------|-------------|
 | **Claude** | Orchestrator | Stateful — holds full project context for entire build | Everything: all task XML, all after-actions, all validation results, all Gemini reviews, cumulative BUILD_MANIFEST |
-| **Gemini** | Auditor | Stateful — holds review history for this build | Code diffs, failure details, and its own prior review comments. Does NOT see briefings or orchestration decisions. Independent judgment. |
+| **Gemini** | Auditor | Stateful — holds review history for this build | On PASS: code diffs only (independent blind review). On FAIL: code diffs + briefing + contract (to diagnose orchestrator errors). Its own prior review comments. |
 | **Codex** | Worker | Stateless — one session per task | ONLY: BRIEFING.md + contract.json + repo state. Nothing else. Born, executes, commits, dies. |
 
 ### REQ-A3.6: Escalation Protocol
