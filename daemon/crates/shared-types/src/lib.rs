@@ -5,7 +5,8 @@ mod ledger;
 
 pub use git_ops::{GitOps, MergeResult};
 pub use ledger::{
-    DrainResult, GcResult, HealthStatus, ManualRecord, NewLesson, RawEvent, SessionDetail, Summary,
+    DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
+    Summary,
 };
 
 use schemars::JsonSchema;

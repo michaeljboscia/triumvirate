@@ -52,6 +52,19 @@ pub struct NewLesson {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Lesson {
+    pub lesson_id: i64,
+    pub title: String,
+    pub body: String,
+    pub source_session_id: Option<String>,
+    pub created_at: String,
+    pub last_validated_at: String,
+    pub initial_confidence: f64,
+    pub tags_json: Option<String>,
+    pub req_ids_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct GcResult {
     pub removed_events: usize,
     pub removed_summaries: usize,
@@ -83,8 +96,8 @@ pub struct SessionDetail {
 #[cfg(test)]
 mod tests {
     use super::{
-        DrainResult, GcResult, HealthStatus, ManualRecord, NewLesson, RawEvent, SessionDetail,
-        Summary,
+        DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent,
+        SessionDetail, Summary,
     };
 
     fn assert_roundtrip<T>(value: &T)
@@ -136,6 +149,17 @@ mod tests {
             source_session_id: Some("sess-1".to_string()),
             initial_confidence: 0.8,
             tags_json: Some("[\"sqlite\",\"wal\"]".to_string()),
+            req_ids_json: Some("[\"REQ-008\"]".to_string()),
+        });
+        assert_roundtrip(&Lesson {
+            lesson_id: 9,
+            title: "WAL avoids write lock contention".to_string(),
+            body: "Enable WAL mode before ingestion.".to_string(),
+            source_session_id: Some("sess-1".to_string()),
+            created_at: "2026-04-07T00:00:02Z".to_string(),
+            last_validated_at: "2026-04-07T00:00:03Z".to_string(),
+            initial_confidence: 0.8,
+            tags_json: Some("[\"sqlite\"]".to_string()),
             req_ids_json: Some("[\"REQ-008\"]".to_string()),
         });
         assert_roundtrip(&GcResult {
