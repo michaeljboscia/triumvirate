@@ -156,7 +156,7 @@ Parallel agent execution with worktrees, task lists, and sequential merge.
 
 - **REQ-034:** A fleet is defined by: fleet_id, task (description), agent_composition (map of agent_type → count), created_at, state (spawning|running|merging|done|failed).
 - **REQ-035:** MCP tools for fleet:
-  - `fleet_spawn(task: string, agents: {claude?: int, gemini?: int, codex?: int})` — Creates fleet, worktrees, and task list. Returns fleet_id.
+  - `fleet_spawn(task: string, agents: {claude?: int, gemini?: int, codex?: int}, wait?: bool)` — Confirms with user before creating ("Spawning 3 agents with worktrees — wait for completion or run in background?"). Returns fleet_id immediately with `state=spawning`. If `wait=true`, blocks until all worktrees are created and agents are running. Streams progress via WebSocket (REQ-044) regardless of wait mode.
   - `fleet_status(fleet_id)` — Agent states, task progress, worktree status.
   - `fleet_task_list(fleet_id)` — All tasks with state and assignment.
   - `fleet_cancel(fleet_id)` — Kills agents, cleans up worktrees.
