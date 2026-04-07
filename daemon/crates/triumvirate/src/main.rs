@@ -942,6 +942,53 @@ async fn run_daemon() -> anyhow::Result<()> {
         })))
     }
 
+    fn ledger_sweep_interval() -> Duration {
+        std::env::var("TRIUMVIRATE_LEDGER_SWEEP_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(60))
+    }
+
+    async fn run_ledger_sweep_once(state: &DaemonState) {
+        let project_roots = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.iter().cloned().collect::<Vec<_>>()
+        };
+        for project_root in project_roots {
+            let result = tokio::task::spawn_blocking({
+                let project_root = project_root.clone();
+                move || -> anyhow::Result<shared_types::DrainResult> {
+                    let store = LedgerStore::open(project_root.clone())?;
+                    let spool_dir = project_root.join(".triumvirate").join("spool");
+                    store.drain_spool(&spool_dir)
+                }
+            })
+            .await;
+
+            match result {
+                Ok(Ok(drain_result)) => {
+                    state
+                        .metrics
+                        .ledger_events_ingested_total
+                        .inc_by(drain_result.ingested_count as u64);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        "ledger background sweep failed for {}: {err}",
+                        project_root.display()
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "ledger background sweep join failure for {}: {err}",
+                        project_root.display()
+                    );
+                }
+            }
+        }
+    }
+
     async fn memory_write_route(
         State(state): State<DaemonState>,
         headers: HeaderMap,
@@ -1293,11 +1340,21 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(state, metrics_middleware));
+        .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(%bind_addr, "daemon listener bound");
     tokio::spawn(async {
         prewarm_daemon_workers().await;
+    });
+    tokio::spawn({
+        let sweep_state = state.clone();
+        async move {
+            let interval = ledger_sweep_interval();
+            loop {
+                sleep(interval).await;
+                run_ledger_sweep_once(&sweep_state).await;
+            }
+        }
     });
     axum::serve(listener, app).await?;
     Ok(())
