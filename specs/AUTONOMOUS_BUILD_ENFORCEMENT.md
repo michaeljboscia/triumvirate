@@ -298,7 +298,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    IF concerns → append to DEVIATION_LOG.md AND
   │   │   │    incorporate into next task's briefing
   │   │   │
-  │   │   └─ 7e. Claude updates BUILD_STATE.json:
+  │   │   └─ 6e. Claude updates BUILD_STATE.json:
   │   │        tasks_completed, tasks_remaining, current_wave,
   │   │        validation_pass_rate, collateral_fix_count, last_commit_sha
   │   │        (BUILD_STATE.json is the quick-resume checkpoint — survives session crashes)
