@@ -1,4 +1,4 @@
-use shared_types::RawEvent;
+use shared_types::{ManualRecord, RawEvent};
 
 use crate::LedgerStore;
 use crate::compression::process_pending_events;
@@ -40,4 +40,24 @@ pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Resu
     })?;
     let _ = process_pending_events(store)?;
     Ok(())
+}
+
+pub(crate) fn record_manual(store: &LedgerStore, record: ManualRecord) -> anyhow::Result<()> {
+    with_ingest_priority(|| {
+        store.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO summaries (event_id, title, narrative, facts_json, concepts_json, affected_files_json, summary_type)
+                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    record.title,
+                    record.narrative,
+                    record.facts_json,
+                    record.concepts_json,
+                    record.affected_files_json,
+                    record.summary_type
+                ],
+            )?;
+            Ok(())
+        })
+    })
 }
