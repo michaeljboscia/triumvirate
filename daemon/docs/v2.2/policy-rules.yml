@@ -1,0 +1,71 @@
+# Policy Rules — Triumvirate v2.2 Build Enforcement
+# Source: SPEC.md (8-round goat rodeo, Phase 3 CLEAN)
+
+enforcement:
+  # Every task MUST have a reality_test. Compilation-only verify is insufficient.
+  reality_tests_mandatory: true
+
+  # Worktree dispatch requires committed Wave 0
+  worktree_sha_gate: true
+
+  # No stub implementations
+  stub_detection:
+    patterns:
+      - "todo!()"
+      - "unimplemented!()"
+      - "unreachable!()"
+      - "placeholder"
+      - "NotImplementedError"
+      - "not implemented"
+    fail_on_match: true
+
+  # Dependency rules (REQ-001 through REQ-005)
+  crate_rules:
+    - ledger_no_daemon_core: "ledger crate must not depend on daemon-core"
+    - fleet_no_direct_git: "fleet crate must use GitOps trait, never shell out to git"
+    - ledger_absolute_paths: "ledger API accepts only absolute PathBuf, never resolves project roots"
+    - dashboard_static_only: "dashboard produces static HTML/CSS/JS, no Node.js at runtime"
+    - mcp_tools_in_shared_types: "all new MCP tool DTOs defined in shared-types"
+
+  # Hook rules (REQ-010, REQ-010a)
+  hook_rules:
+    - no_sqlite3_cli: "hooks must not call sqlite3 directly"
+    - no_synchronous_http: "hooks must not make blocking HTTP calls"
+    - posix_builtins_only: "hooks use date, $$, $RANDOM — no uuidgen, no python3"
+    - atomic_rename: "spool writes use tmp→ndjson rename, never direct append"
+
+  # Build verification levels
+  verification:
+    per_task: "cargo check + reality test"
+    per_wave: "cargo test for affected crates"
+    per_phase: "full cargo test + cargo clippy + integration tests"
+    pre_ship: "all success criteria verified + user sign-off"
+
+phases:
+  - id: 1
+    name: "Data (Ledger)"
+    gate: "triumvirate doctor reports green. Hook→spool→drain→SQLite→health works."
+
+  - id: 2
+    name: "Knowledge (Retrieval + Lessons)"
+    gate: "ledger_query returns results. Lesson confidence decay correct."
+
+  - id: 3
+    name: "Fleet Core"
+    gate: "2-agent fleet spawns, claims, works, merges. Crash recovery works."
+
+  - id: 4
+    name: "Review"
+    gate: "Self-review rejected. Fleet merge blocked without approval. Skip flag works."
+
+  - id: 5
+    name: "Visibility (Dashboard)"
+    gate: "localhost:8080 loads. All 6 views render. Health indicator correct."
+
+  - id: 6
+    name: "Enrichment + Codex"
+    gate: "OutboxEvent has new fields. Codex app-server connects. Auto-approve works."
+
+  - id: 7
+    name: "Polish (GC)"
+    gate: "Stale events deleted. Active fleet blocks GC."
