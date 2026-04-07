@@ -583,19 +583,15 @@ mod tests {
             &self,
             _agent: &str,
             project_root: &Path,
-            worktree_path: &Path,
-        ) -> anyhow::Result<tokio::process::Child> {
+            _worktree_path: &Path,
+            _task_prompt: &str,
+        ) -> anyhow::Result<String> {
             tokio::time::sleep(Duration::from_millis(25)).await;
             self.seen_project_roots
                 .lock()
                 .await
                 .push(project_root.to_path_buf());
-            let child = tokio::process::Command::new("sh")
-                .arg("-lc")
-                .arg("sleep 0.05")
-                .current_dir(worktree_path)
-                .spawn()?;
-            Ok(child)
+            Ok("mock agent completed".to_string())
         }
     }
 
@@ -609,7 +605,8 @@ mod tests {
             _agent: &str,
             _project_root: &Path,
             _worktree_path: &Path,
-        ) -> anyhow::Result<tokio::process::Child> {
+            _task_prompt: &str,
+        ) -> anyhow::Result<String> {
             anyhow::bail!("launcher failure");
         }
     }
