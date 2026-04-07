@@ -2303,10 +2303,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         metrics: Arc::new(DaemonMetrics::new()?),
         ws_events: broadcast::channel(256).0,
     };
-    if let Ok(project_root) = std::env::current_dir() {
-        let mut lru = state.ledger_project_lru.lock().await;
-        lru.push_back(project_root);
-    }
     run_startup_gc_if_needed(&state).await;
     let app = Router::new()
         .route("/", get(dashboard_root_route))
