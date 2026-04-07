@@ -544,6 +544,18 @@ impl McpBridge {
             .map_err(|e| format!("fallback_gc failed: {e}"))?;
         Ok(Json(FallbackGcResponse { removed }))
     }
+
+    #[tool(description = "Get Ledger health status for the current project.")]
+    async fn ledger_health(&self) -> Result<Json<HealthStatus>, String> {
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        let health = store
+            .health()
+            .map_err(|e| format!("failed to query ledger health: {e}"))?;
+        Ok(Json(health))
+    }
 }
 
 async fn execute_ask_agent(
@@ -3774,6 +3786,15 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ledger_health_tool_returns_health_payload() -> anyhow::Result<()> {
+        let bridge = McpBridge::new_ephemeral();
+        let out = bridge.ledger_health().await.map_err(anyhow::Error::msg)?;
+        assert!(!out.0.status.is_empty());
+        assert!(out.0.db_size_bytes >= 0);
         Ok(())
     }
 }
