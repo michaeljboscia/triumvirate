@@ -276,7 +276,7 @@ v2.2 ships incrementally. Each phase is independently shippable and testable. La
 
 ## Success Criteria
 
-1. A session on the Triumvirate project produces Ledger entries visible in the dashboard within 5 seconds of each tool call.
+1. A session on the Triumvirate project produces Ledger entries visible in the dashboard with p95 event-to-dashboard latency under 2 seconds. Measured as: hook spool write → daemon drain → SQLite insert → WebSocket broadcast → dashboard render.
 2. `triumvirate doctor` reports Ledger health as green during active work.
 3. Kill the daemon mid-session, restart it, and verify: zero events lost (spool replay), session resumable.
 4. Spawn a 3-agent fleet (1 Claude, 1 Gemini, 1 Codex) on a real task. All three get worktrees, claim tasks, produce output. Merge succeeds with peer review gate.
