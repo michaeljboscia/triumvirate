@@ -2,14 +2,12 @@ use std::{
     fs,
     path::Path,
     path::PathBuf,
-    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use ledger::LedgerStore;
 use shared_types::{GitOps, RawEvent};
-use tokio::process::Command;
 
 use crate::{
     merge::{MergeCoordinator, ReviewGateState},
