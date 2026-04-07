@@ -255,120 +255,94 @@ ok "Gemini hooks installed ($(ls "$SCRIPT_DIR"/gemini/hooks/*.sh 2>/dev/null | w
 
 ok "Gemini configuration installed"
 
-# ── 5. Inter-Agent MCP Server ─────────────────────────────────
-# This is the core of the Triumvirate — without it, the agents can't
-# spawn daemons or do multi-turn inter-agent conversations.
-# Each agent registers the OTHER agents' MCP servers so they are
-# first-party participants with spawn_daemon / ask_daemon support.
-info "Building and wiring inter-agent MCP server..."
+# ── 5. Triumvirate Daemon ────────────────────────────────────────
+# The Rust daemon is the coordination layer. It provides MCP tools
+# (spawn_session, ask_session, dismiss_session, etc.) that let any
+# agent talk to any other agent with persistent sessions.
+info "Setting up Triumvirate daemon..."
 
-MCP_SERVER_DIR="$(cd "$SCRIPT_DIR/../mcp-server" 2>/dev/null && pwd)" || {
-  err "Cannot find mcp-server/ directory. Make sure you cloned the full triumvirate repo."
-  err "Expected: $(dirname "$SCRIPT_DIR")/mcp-server"
+DAEMON_DIR="$(cd "$SCRIPT_DIR/../daemon" 2>/dev/null && pwd)" || {
+  err "Cannot find daemon/ directory. Make sure you cloned the full triumvirate repo."
+  err "Expected: $(dirname "$SCRIPT_DIR")/daemon"
   exit 1
 }
 
-# Check node is available
-if ! command -v node &>/dev/null; then
-  err "Node.js is required to build the MCP server."
-  err "  macOS:  brew install node"
-  err "  Ubuntu: apt-get install nodejs npm"
-  exit 1
+DAEMON_BIN="$DAEMON_DIR/target/release/triumvirate"
+
+# Build if not already built
+if [[ -f "$DAEMON_BIN" ]]; then
+  ok "Daemon already built: $DAEMON_BIN"
+else
+  if ! command -v cargo &>/dev/null; then
+    err "Rust/Cargo is required to build the daemon."
+    err "  Install: https://rustup.rs"
+    err "  Then re-run this installer."
+    exit 1
+  fi
+  info "Building daemon (this may take a minute)..."
+  (cd "$DAEMON_DIR" && cargo build --release 2>&1) || {
+    err "Daemon build failed. Check Rust version (requires 1.82+)."
+    exit 1
+  }
+  ok "Daemon built: $DAEMON_BIN"
 fi
-if ! command -v npm &>/dev/null; then
-  err "npm is required to build the MCP server."
-  exit 1
-fi
 
-# Build the MCP server
-info "Installing MCP server dependencies and building..."
-if [[ ! -f "$MCP_SERVER_DIR/package.json" ]]; then
-  err "MCP server submodule not initialized. Run: git submodule update --init --recursive"
-  exit 1
-fi
-(cd "$MCP_SERVER_DIR" && npm install --silent && npm run build --silent) || {
-  err "MCP server build failed. Check Node.js version (requires >=20)."
-  exit 1
-}
-ok "MCP server built: $MCP_SERVER_DIR/dist/"
-
-# Generate portable start scripts (resolve node at runtime, not install time)
-DIST_DIR="$MCP_SERVER_DIR/dist"
-
-cat > "$MCP_SERVER_DIR/start-gemini.sh" << STARTEOF
-#!/usr/bin/env bash
-NODE=\$(which node 2>/dev/null || echo "/usr/local/bin/node")
-echo "\$(date) inter-agent-gemini START pid=\$\$" >> /tmp/inter-agent-debug.log
-exec "\$NODE" "$DIST_DIR/gemini/server.js" 2>> /tmp/inter-agent-debug.log
-STARTEOF
-
-cat > "$MCP_SERVER_DIR/start-unified.sh" << STARTEOF
-#!/usr/bin/env bash
-NODE=\$(which node 2>/dev/null || echo "/usr/local/bin/node")
-export GEMINI_SPAWN_MODEL="\${GEMINI_SPAWN_MODEL:-gemini-2.5-flash}"
-echo "\$(date) inter-agent START pid=\$\$ spawn_model=\$GEMINI_SPAWN_MODEL" >> /tmp/inter-agent-debug.log
-exec "\$NODE" "$DIST_DIR/server.js" 2>> /tmp/inter-agent-debug.log
-STARTEOF
-
-chmod +x "$MCP_SERVER_DIR/start-gemini.sh" "$MCP_SERVER_DIR/start-unified.sh"
-ok "Start scripts generated (node: $NODE_PATH)"
-
-# ── Wire Claude: add unified server to ~/.claude.json ──────────
+# ── Wire Claude: register triumvirate as MCP server ──────────
 CLAUDE_JSON="$HOME/.claude.json"
-UNIFIED_START="$MCP_SERVER_DIR/start-unified.sh"
 
 if [[ -f "$CLAUDE_JSON" ]]; then
+  if jq -e '.mcpServers.triumvirate' "$CLAUDE_JSON" &>/dev/null; then
+    info "Triumvirate already registered in ~/.claude.json — updating path"
+  fi
   backup_if_exists "$CLAUDE_JSON"
-  # Merge mcpServers into existing config (preserves all other keys)
-  # Ensure mcpServers object exists before adding to it
-  jq --arg us "$UNIFIED_START" '
+  jq --arg bin "$DAEMON_BIN" '
     .mcpServers //= {} |
-    .mcpServers["inter-agent"] = {"command": $us}
+    .mcpServers.triumvirate = {command: $bin}
   ' "$CLAUDE_JSON" > "${CLAUDE_JSON}.tmp" && mv "${CLAUDE_JSON}.tmp" "$CLAUDE_JSON"
 else
-  jq -n --arg us "$UNIFIED_START" '{
+  jq -n --arg bin "$DAEMON_BIN" '{
     mcpServers: {
-      "inter-agent": {command: $us}
+      triumvirate: {command: $bin}
     }
   }' > "$CLAUDE_JSON"
 fi
-ok "Claude wired: inter-agent → $CLAUDE_JSON"
+ok "Claude wired: triumvirate → $CLAUDE_JSON"
 
-# ── Wire Gemini: add inter-agent to ~/.gemini/settings.json ──
+# ── Wire Gemini: add triumvirate to ~/.gemini/settings.json ──
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 if [[ -f "$GEMINI_SETTINGS" ]]; then
   backup_if_exists "$GEMINI_SETTINGS"
-  jq --arg us "$UNIFIED_START" '
+  jq --arg bin "$DAEMON_BIN" '
     .mcpServers //= {} |
-    .mcpServers["inter-agent"] = {"command": $us}
+    .mcpServers.triumvirate = {command: $bin}
   ' "$GEMINI_SETTINGS" > "${GEMINI_SETTINGS}.tmp" && mv "${GEMINI_SETTINGS}.tmp" "$GEMINI_SETTINGS"
-  ok "Gemini wired: inter-agent → $GEMINI_SETTINGS"
+  ok "Gemini wired: triumvirate → $GEMINI_SETTINGS"
 else
   warn "~/.gemini/settings.json not found — Gemini MCP not configured."
   warn "After installing Gemini CLI, add manually:"
-  warn "  {mcpServers: {\"inter-agent\": {command: \"$UNIFIED_START\"}}}"
+  warn "  {mcpServers: {\"triumvirate\": {command: \"$DAEMON_BIN\"}}}"
 fi
 
-# ── Wire Codex: add inter-agent to config.toml ──
+# ── Wire Codex: add triumvirate to config.toml ──
 CODEX_CONFIG="$HOME/.codex/config.toml"
 if [[ -f "$CODEX_CONFIG" ]]; then
-  if grep -q "inter-agent" "$CODEX_CONFIG" && ! grep -q "^#.*inter-agent" "$CODEX_CONFIG"; then
-    info "Codex config.toml already has inter-agent — skipping."
+  if grep -q "triumvirate" "$CODEX_CONFIG" && ! grep -q "^#.*triumvirate" "$CODEX_CONFIG"; then
+    info "Codex config.toml already has triumvirate — skipping."
   else
     backup_if_exists "$CODEX_CONFIG"
     cat >> "$CODEX_CONFIG" <<EOF
 
-# ── Inter-agent MCP server (added by Triumvirate installer) ──────────
-[mcp_servers.inter-agent]
-command = "$UNIFIED_START"
+# ── Triumvirate daemon (added by Triumvirate installer) ──────────
+[mcp_servers.triumvirate]
+command = "$DAEMON_BIN"
 EOF
-    ok "Codex wired: inter-agent → $CODEX_CONFIG"
+    ok "Codex wired: triumvirate → $CODEX_CONFIG"
   fi
 else
   warn "~/.codex/config.toml not found — Codex MCP not configured."
 fi
 
-ok "Inter-agent MCP server wired into all 3 agents"
+ok "Triumvirate daemon wired into all detected agents"
 
 # ── 6. Stenographer (Local Session Notes) ─────────────────────
 info "Installing Stenographer (local Ollama session notes)..."
