@@ -225,7 +225,7 @@ Svelte 5 + Tailwind 4 web UI embedded in the daemon binary.
 
 - **REQ-056:** Outbox events written to the Ledger's `events` table MUST have a retention policy: events older than 30 days with no associated summary are eligible for deletion. Events WITH summaries are retained indefinitely (the summary is the compressed record).
 - **REQ-057:** A `ledger_gc()` MCP tool MUST trigger garbage collection. It MUST return: events scanned, events deleted, space reclaimed. GC MUST also clear acknowledged dead-drop tickets older than 7 days.
-- **REQ-058:** The daemon SHOULD run GC automatically on startup if last GC was >24 hours ago. GC MUST NOT run during active fleet operations.
+- **REQ-058:** The daemon MUST run GC automatically on startup if last GC was >24 hours ago. GC MUST NOT run during active fleet operations (check `fleets` table for state != `done` and state != `failed`).
 
 ---
 
