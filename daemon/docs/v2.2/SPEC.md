@@ -167,7 +167,7 @@ Parallel agent execution with worktrees, task lists, and sequential merge.
   - `fleet_cancel(fleet_id)` — Kills agents, cleans up worktrees.
 - **REQ-036:** The fleet engine (running in the daemon) MUST emit progress events to the source project's Ledger: fleet spawned, agent started, task claimed, task completed, merge started, merge result, fleet done. Fleet members in `/tmp/` worktrees MUST have `TRIUMVIRATE_PROJECT_ROOT` set to the source project root so all events route to the correct `ledger.db`.
 - **REQ-037:** Each fleet member agent MUST receive task assignments via two channels:
-  - A machine-readable file at `.triumvirate/fleet-task.md` in the worktree, containing frontmatter (task_id, fleet_id, assigned_agent, depends_on) and prose description. This file is UNTRACKED — the fleet engine MUST add `.triumvirate/` to the project's root `.gitignore` (if not already present) and commit that `.gitignore` change as the initialization commit before spawning agents. The task file itself is runtime metadata, invisible to `git status`, and immune to merge conflicts.
+  - A machine-readable file at `.triumvirate/fleet-task.md` in the worktree, containing frontmatter (task_id, fleet_id, assigned_agent, depends_on) and prose description. This file is UNTRACKED runtime metadata — invisible to `git status` because `.triumvirate/` is in `.gitignore` (owned by Ledger Phase 1 initialization, REQ-018a). The task file is immune to merge conflicts.
   - A startup prompt summarizing the task and referencing the file: "Your task assignment is at .triumvirate/fleet-task.md — read it before starting."
   Fleet members MUST NOT receive accumulated conversation history from other agents.
 
