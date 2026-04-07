@@ -901,7 +901,7 @@ start it with: triumvirate daemon"
             .ok_or_else(|| "failed to resolve project root".to_string())?;
         let engine = PeerReviewEngine::new(project_root)
             .map_err(|e| format!("review_submit engine init failed: {e}"))?;
-        engine
+        let _ = engine
             .submit_review(&req.review_id, &req.verdict, req.comments.as_deref())
             .map_err(|e| format!("review_submit failed: {e}"))?;
         Ok("ok".to_string())

@@ -84,7 +84,7 @@ impl PeerReviewEngine {
         review_id: &str,
         verdict: &str,
         comments: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         let conn = self.open_conn()?;
         let updated = conn.execute(
             "UPDATE reviews
@@ -95,7 +95,39 @@ impl PeerReviewEngine {
         if updated == 0 {
             anyhow::bail!("review not found: {review_id}");
         }
-        Ok(())
+
+        let inflight: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reviews WHERE state = 'in_progress'",
+            [],
+            |row| row.get(0),
+        )?;
+        if inflight >= max_inflight_limit() as i64 {
+            return Ok(None);
+        }
+
+        let next_pending: Option<String> = conn
+            .query_row(
+                "SELECT review_id
+                 FROM reviews
+                 WHERE state = 'pending'
+                 ORDER BY datetime(requested_at) ASC, rowid ASC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(next_review_id) = next_pending {
+            conn.execute(
+                "UPDATE reviews
+                 SET state = 'in_progress'
+                 WHERE review_id = ?1 AND state = 'pending'",
+                [next_review_id.as_str()],
+            )?;
+            return Ok(Some(next_review_id));
+        }
+
+        Ok(None)
     }
 
     pub fn get_review(&self, review_id: &str) -> anyhow::Result<Option<ReviewRecord>> {
@@ -251,5 +283,74 @@ mod tests {
         unsafe {
             std::env::remove_var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT");
         }
+    }
+
+    #[test]
+    fn submit_review_promotes_oldest_pending_when_slot_frees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
+        let _store = LedgerStore::open(project_root.clone()).expect("open ledger");
+        let engine = PeerReviewEngine::new(project_root).expect("engine");
+        let first = engine
+            .request_review(ReviewRequest {
+                fleet_id: Some("fleet-1".to_string()),
+                author_agent: "codex".to_string(),
+                artifact: "diff-1".to_string(),
+                review_type: "code".to_string(),
+            })
+            .expect("request first");
+        let second = engine
+            .request_review(ReviewRequest {
+                fleet_id: Some("fleet-1".to_string()),
+                author_agent: "codex".to_string(),
+                artifact: "diff-2".to_string(),
+                review_type: "code".to_string(),
+            })
+            .expect("request second");
+        let third = engine
+            .request_review(ReviewRequest {
+                fleet_id: Some("fleet-1".to_string()),
+                author_agent: "codex".to_string(),
+                artifact: "diff-3".to_string(),
+                review_type: "code".to_string(),
+            })
+            .expect("request third");
+
+        let conn = engine.open_conn().expect("open conn");
+        conn.execute(
+            "UPDATE reviews SET state = 'pending', requested_at = datetime('now', '+1 second')
+             WHERE review_id = ?1",
+            [second.review_id.as_str()],
+        )
+        .expect("set second pending");
+        conn.execute(
+            "UPDATE reviews SET state = 'pending', requested_at = datetime('now', '+2 seconds')
+             WHERE review_id = ?1",
+            [third.review_id.as_str()],
+        )
+        .expect("set third pending");
+        drop(conn);
+
+        let promoted = engine
+            .submit_review(&first.review_id, "approve", Some("ok"))
+            .expect("submit first");
+        assert_eq!(promoted.as_deref(), Some(second.review_id.as_str()));
+        let second_after = engine
+            .get_review(&second.review_id)
+            .expect("get second")
+            .expect("second present");
+        assert_eq!(second_after.state, "in_progress");
+
+        let promoted = engine
+            .submit_review(&second.review_id, "approve", Some("ok"))
+            .expect("submit second");
+        assert_eq!(promoted.as_deref(), Some(third.review_id.as_str()));
+        let third_after = engine
+            .get_review(&third.review_id)
+            .expect("get third")
+            .expect("third present");
+        assert_eq!(third_after.state, "in_progress");
+
     }
 }

@@ -661,7 +661,7 @@ async fn enforce_mandatory_peer_review(
             .await;
     }
 
-    engine
+    let _ = engine
         .submit_review(
             &review.review_id,
             "approve",
