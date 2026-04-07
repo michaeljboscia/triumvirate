@@ -8,3 +8,8 @@ license.workspace = true
 anyhow.workspace = true
 shared-types = { path = "../shared-types" }
 ledger = { path = "../ledger" }
+rusqlite = "0.32"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
