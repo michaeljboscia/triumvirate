@@ -2540,6 +2540,26 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} warm worker 
         Ok(path)
     }
 
+    fn write_gemini_stream_usage_script() -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("gemini-stream-usage-{now}.sh"));
+        let script = r#"#!/bin/sh
+IFS= read -r _line
+echo '{"type":"init","session_id":"session-usage-1","model":"gemini-pro"}'
+echo '{"type":"tool_use","tool_id":"tool-1","tool_name":"read_file","parameters":{"path":"src/lib.rs"}}'
+echo '{"type":"tool_result","tool_id":"tool-1","status":"success"}'
+echo '{"type":"message","role":"assistant","content":"stream usage done"}'
+echo '{"type":"result","stats":{"input_tokens":123,"output_tokens":45,"cached":10,"total_tokens":178}}'
+"#;
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     fn write_retry_agent_script(name: &str) -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -4395,6 +4415,9 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
                     cwd: None,
                     repo: None,
                     branch: None,
+                    working_state: None,
+                    token_usage: None,
+                    tool_name: None,
                 }],
             }))
         }
@@ -4471,7 +4494,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             .as_nanos();
         let test_home = std::env::temp_dir().join(format!("triumvirate-outbox-{now}"));
         fs::create_dir_all(&test_home)?;
-        let script_path = write_mock_agent_script("gemini", 0.0)?;
+        let script_path = write_gemini_stream_usage_script()?;
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -4483,7 +4506,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         let response = execute_ask_agent(&AskAgentRequest {
             agent: "gemini".to_string(),
             message: "outbox check".to_string(),
-            cwd: Some("/tmp/project".to_string()),
+            cwd: Some(test_home.display().to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
         }, None)
@@ -4497,6 +4520,8 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         assert!(outbox.contains("\"status\":\"SPAWNED\""));
         assert!(outbox.contains("\"status\":\"DONE\""));
         assert!(outbox.contains(&response.request_id));
+        assert!(outbox.contains("\"tool_name\":\"read_file\""));
+        assert!(outbox.contains("\"token_usage\":{\"input\":123,\"output\":45,\"cached\":10,\"total\":178}"));
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -4675,6 +4700,9 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             cwd: None,
             repo: None,
             branch: None,
+            working_state: None,
+            token_usage: None,
+            tool_name: None,
         })?;
         append_outbox_event(&OutboxEvent {
             ts_ms: 20,
@@ -4686,6 +4714,9 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             cwd: None,
             repo: None,
             branch: None,
+            working_state: None,
+            token_usage: None,
+            tool_name: None,
         })?;
 
         let bridge = McpBridge::new_ephemeral();
