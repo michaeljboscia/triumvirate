@@ -267,7 +267,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         })?;
 
         // Launch all agents in parallel via daemon's ask_agent
-        let mut join_handles = Vec::new();
+        let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for (task_prompt, task_id, agent_name) in running_agents {
             let launcher = self.launcher.clone();
             let orchestrator = self.clone();
