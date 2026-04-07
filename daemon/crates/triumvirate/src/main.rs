@@ -2772,6 +2772,93 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
     }
 
     #[tokio::test]
+    async fn ask_agent_requires_peer_review_when_env_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let script_path = write_mock_gemini_script()?;
+        let temp = tempfile::tempdir()?;
+        let project_root = temp.path().join("peer-review-required");
+        fs::create_dir_all(&project_root)?;
+        let project_root_str = project_root.display().to_string();
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
+        }
+
+        let reviewed = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: "test message".to_string(),
+                cwd: Some(project_root_str.clone()),
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert!(reviewed.response.contains("mock-gemini received"));
+        assert!(reviewed
+            .lifecycle
+            .iter()
+            .any(|event| event.state == "REVIEW_PENDING"));
+        assert!(reviewed
+            .lifecycle
+            .iter()
+            .any(|event| event.state == "REVIEW_DONE"));
+        let pending_detail = reviewed
+            .lifecycle
+            .iter()
+            .find(|event| event.state == "REVIEW_PENDING")
+            .map(|event| event.detail.clone())
+            .expect("review pending lifecycle detail");
+        let review_id = pending_detail
+            .split(": ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("review id in lifecycle detail");
+        let engine = PeerReviewEngine::new(project_root.clone())?;
+        let stored = engine
+            .get_review(review_id)?
+            .expect("stored review should exist");
+        assert_eq!(stored.state, "done");
+        assert_eq!(stored.verdict.as_deref(), Some("approve"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+        let unreviewed = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: "test message".to_string(),
+                cwd: Some(project_root_str),
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert!(unreviewed.response.contains("mock-gemini received"));
+        assert!(!unreviewed
+            .lifecycle
+            .iter()
+            .any(|event| event.state == "REVIEW_PENDING"));
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+        let _ = fs::remove_file(script_path);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn persistent_worker_reuse_second_call_is_faster_and_marked_reused() -> anyhow::Result<()> {
         let _guard = env_lock().lock().expect("env lock poisoned");
         reset_worker_registry_for_tests().await;
