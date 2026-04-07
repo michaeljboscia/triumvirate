@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait = "0.1"
 shared-types = { path = "../shared-types" }
 daemon-core = { path = "../daemon-core" }
 agent-worker = { path = "../agent-worker" }
 ledger = { path = "../ledger" }
+tokio.workspace = true
