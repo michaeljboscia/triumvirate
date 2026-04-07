@@ -321,6 +321,18 @@ mod tests {
             })
             .expect("count events");
         assert_eq!(count, 1);
+
+        let session_count = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT event_count FROM sessions WHERE session_id = ?1",
+                    rusqlite::params!["session-a"],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("read session event_count");
+        assert_eq!(session_count, 1);
     }
 
     #[test]

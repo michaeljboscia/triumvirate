@@ -11,7 +11,7 @@ pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Resu
     reap_idle();
     with_ingest_priority(|| {
         store.with_conn(|conn| {
-            conn.execute(
+            let inserted = conn.execute(
                 "INSERT INTO events (session_id, event_type, sequence, timestamp, payload_json)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(session_id, event_type, sequence) DO NOTHING",
@@ -23,17 +23,19 @@ pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Resu
                     event.payload_json
                 ],
             )?;
-            conn.execute(
-                "INSERT INTO sessions (session_id, project, branch, started_at, event_count, summary_count)
-                 VALUES (?1, ?2, NULL, ?3, 1, 0)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                    event_count = sessions.event_count + 1",
-                rusqlite::params![
-                    session_id,
-                    store.project_root().display().to_string(),
-                    event_timestamp
-                ],
-            )?;
+            if inserted == 1 {
+                conn.execute(
+                    "INSERT INTO sessions (session_id, project, branch, started_at, event_count, summary_count)
+                     VALUES (?1, ?2, NULL, ?3, 1, 0)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                        event_count = sessions.event_count + 1",
+                    rusqlite::params![
+                        session_id,
+                        store.project_root().display().to_string(),
+                        event_timestamp
+                    ],
+                )?;
+            }
             Ok(())
         })
     })?;
