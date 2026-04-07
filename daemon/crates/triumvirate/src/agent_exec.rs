@@ -23,6 +23,14 @@ use tokio::{
 use tracing::{Span, instrument};
 use uuid::Uuid;
 
+const TOOL_MARKER_INSTRUCTIONS: &str = "\
+When you need to call a Triumvirate tool, emit exactly one XML block with this shape:
+<triumvirate_tool name=\"ledger_record\">{\"title\":\"...\",\"narrative\":\"...\"}</triumvirate_tool>
+Rules:
+- Use name values only from supported tools: ledger_query, ledger_session, ledger_record, lesson_add, lesson_query, lesson_validate, lesson_list.
+- The body must be valid JSON object parameters for that tool.
+- Emit normal prose outside the XML block when needed.";
+
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
     // SAFETY: pre_exec runs in the spawned child process before exec.
@@ -100,7 +108,7 @@ pub(crate) async fn execute_ask_agent(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
-    let execution_prompt = req.message.clone();
+    let execution_prompt = inject_tool_marker_prompt(&req.message);
     let worker = acquire_worker(&agent, &exec_cwd).await;
     let mut worker_session_id = worker.session_id.clone();
     let worker_mode = worker.mode.clone();
@@ -495,6 +503,10 @@ pub(crate) async fn execute_ask_agent(
             .map(|p| format!("; dead drop launched at {}", p.display()))
             .unwrap_or_default()
     ))
+}
+
+fn inject_tool_marker_prompt(user_prompt: &str) -> String {
+    format!("{TOOL_MARKER_INSTRUCTIONS}\n\nUser request:\n{user_prompt}")
 }
 
 async fn run_named_agent_with_session(
