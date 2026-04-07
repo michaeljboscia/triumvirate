@@ -631,38 +631,114 @@ async fn run_daemon() -> anyhow::Result<()> {
     #[derive(Debug, Clone)]
     struct DaemonMetrics {
         registry: Registry,
-        requests_total: IntCounterVec,
-        request_duration_seconds: HistogramVec,
-        in_flight_requests: IntGauge,
+        agent_requests_total: prometheus::IntCounter,
+        agent_duration_seconds: prometheus::Histogram,
+        agent_tokens_total: prometheus::IntCounter,
+        ledger_events_ingested_total: prometheus::IntCounter,
+        ledger_queue_lag_seconds: prometheus::Gauge,
+        ledger_spool_size_bytes: IntGauge,
+        fleet_active_total: IntGauge,
+        reviews_total: prometheus::IntCounter,
+        marker_parse_success_rate: prometheus::Gauge,
+        http_requests_total: IntCounterVec,
+        http_request_duration_seconds: HistogramVec,
+        http_in_flight_requests: IntGauge,
     }
 
     impl DaemonMetrics {
         fn new() -> anyhow::Result<Self> {
             let registry = Registry::new();
-            let requests_total = IntCounterVec::new(
+            let agent_requests_total = prometheus::IntCounter::new(
+                "triumvirate_agent_requests_total",
+                "Total ask_agent requests handled by daemon",
+            )?;
+            let agent_duration_seconds = prometheus::Histogram::with_opts(
+                prometheus::HistogramOpts::new(
+                    "triumvirate_agent_duration_seconds",
+                    "Duration of ask_agent requests in seconds",
+                ),
+            )?;
+            let agent_tokens_total = prometheus::IntCounter::new(
+                "triumvirate_agent_tokens_total",
+                "Total tokens reported by ask_agent requests",
+            )?;
+            let ledger_events_ingested_total = prometheus::IntCounter::new(
+                "triumvirate_ledger_events_ingested_total",
+                "Total ledger events ingested",
+            )?;
+            let ledger_queue_lag_seconds = prometheus::Gauge::new(
+                "triumvirate_ledger_queue_lag_seconds",
+                "Ledger queue lag in seconds",
+            )?;
+            let ledger_spool_size_bytes = IntGauge::new(
+                "triumvirate_ledger_spool_size_bytes",
+                "Current ledger spool directory size in bytes",
+            )?;
+            let fleet_active_total = IntGauge::new(
+                "triumvirate_fleet_active_total",
+                "Active fleet count",
+            )?;
+            let reviews_total = prometheus::IntCounter::new(
+                "triumvirate_reviews_total",
+                "Total reviews completed",
+            )?;
+            let marker_parse_success_rate = prometheus::Gauge::new(
+                "triumvirate_marker_parse_success_rate",
+                "Marker parse success rate",
+            )?;
+            let http_requests_total = IntCounterVec::new(
                 prometheus::Opts::new("triumvirate_http_requests_total", "HTTP requests by route and status"),
                 &["route", "status"],
             )?;
-            let request_duration_seconds = HistogramVec::new(
+            let http_request_duration_seconds = HistogramVec::new(
                 prometheus::HistogramOpts::new(
                     "triumvirate_http_request_duration_seconds",
                     "HTTP request durations by route",
                 ),
                 &["route"],
             )?;
-            let in_flight_requests = IntGauge::new(
+            let http_in_flight_requests = IntGauge::new(
                 "triumvirate_http_requests_in_flight",
                 "In-flight HTTP requests",
             )?;
-            registry.register(Box::new(requests_total.clone()))?;
-            registry.register(Box::new(request_duration_seconds.clone()))?;
-            registry.register(Box::new(in_flight_requests.clone()))?;
+            registry.register(Box::new(agent_requests_total.clone()))?;
+            registry.register(Box::new(agent_duration_seconds.clone()))?;
+            registry.register(Box::new(agent_tokens_total.clone()))?;
+            registry.register(Box::new(ledger_events_ingested_total.clone()))?;
+            registry.register(Box::new(ledger_queue_lag_seconds.clone()))?;
+            registry.register(Box::new(ledger_spool_size_bytes.clone()))?;
+            registry.register(Box::new(fleet_active_total.clone()))?;
+            registry.register(Box::new(reviews_total.clone()))?;
+            registry.register(Box::new(marker_parse_success_rate.clone()))?;
+            registry.register(Box::new(http_requests_total.clone()))?;
+            registry.register(Box::new(http_request_duration_seconds.clone()))?;
+            registry.register(Box::new(http_in_flight_requests.clone()))?;
+            marker_parse_success_rate.set(1.0);
             Ok(Self {
                 registry,
-                requests_total,
-                request_duration_seconds,
-                in_flight_requests,
+                agent_requests_total,
+                agent_duration_seconds,
+                agent_tokens_total,
+                ledger_events_ingested_total,
+                ledger_queue_lag_seconds,
+                ledger_spool_size_bytes,
+                fleet_active_total,
+                reviews_total,
+                marker_parse_success_rate,
+                http_requests_total,
+                http_request_duration_seconds,
+                http_in_flight_requests,
             })
+        }
+
+        fn snapshot_keepalive(&self) {
+            let _ = self.agent_tokens_total.get();
+            let _ = self.ledger_events_ingested_total.get();
+            let _ = self.ledger_queue_lag_seconds.get();
+            let _ = self.ledger_spool_size_bytes.get();
+            let _ = self.fleet_active_total.get();
+            let _ = self.reviews_total.get();
+            let _ = self.marker_parse_success_rate.get();
         }
     }
 
@@ -679,6 +755,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     async fn metrics_route(
         State(state): State<DaemonState>,
     ) -> Result<String, (StatusCode, AxumJson<serde_json::Value>)> {
+        state.metrics.snapshot_keepalive();
         let metric_families = state.metrics.registry.gather();
         let mut body = Vec::<u8>::new();
         TextEncoder::new().encode(&metric_families, &mut body).map_err(|e| {
@@ -701,22 +778,22 @@ async fn run_daemon() -> anyhow::Result<()> {
         next: Next,
     ) -> Response {
         let route = request.uri().path().to_string();
-        state.metrics.in_flight_requests.inc();
+        state.metrics.http_in_flight_requests.inc();
         let started = Instant::now();
         let response = next.run(request).await;
         let elapsed = started.elapsed().as_secs_f64();
         let status = response.status().as_u16().to_string();
         state
             .metrics
-            .requests_total
+            .http_requests_total
             .with_label_values(&[route.as_str(), status.as_str()])
             .inc();
         state
             .metrics
-            .request_duration_seconds
+            .http_request_duration_seconds
             .with_label_values(&[route.as_str()])
             .observe(elapsed);
-        state.metrics.in_flight_requests.dec();
+        state.metrics.http_in_flight_requests.dec();
         response
     }
 
@@ -777,12 +854,17 @@ async fn run_daemon() -> anyhow::Result<()> {
         )
         .await;
         let _guard = queue.lock().await;
-        execute_ask_agent(&req, None).await.map(AxumJson).map_err(|e| {
-            (
+        let started = Instant::now();
+        let result = execute_ask_agent(&req, None).await;
+        state.metrics.agent_requests_total.inc();
+        state.metrics.agent_duration_seconds.observe(started.elapsed().as_secs_f64());
+        match result {
+            Ok(response) => Ok(AxumJson(response)),
+            Err(e) => Err((
                 StatusCode::BAD_GATEWAY,
                 AxumJson(serde_json::json!({ "error": e })),
-            )
-        })
+            )),
+        }
     }
 
     async fn memory_write_route(
