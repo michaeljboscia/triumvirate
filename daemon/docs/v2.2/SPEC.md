@@ -161,7 +161,10 @@ Parallel agent execution with worktrees, task lists, and sequential merge.
   - `fleet_task_list(fleet_id)` — All tasks with state and assignment.
   - `fleet_cancel(fleet_id)` — Kills agents, cleans up worktrees.
 - **REQ-036:** The fleet engine MUST emit progress events to the Ledger: fleet spawned, agent started, task claimed, task completed, merge started, merge result, fleet done.
-- **REQ-037:** Each fleet member agent MUST receive: the task description, the task list (their assigned tasks), and the worktree path. They do NOT receive accumulated conversation history from other agents.
+- **REQ-037:** Each fleet member agent MUST receive task assignments via two channels:
+  - A machine-readable file at `.triumvirate/fleet-task.md` in the worktree, containing frontmatter (task_id, fleet_id, assigned_agent, depends_on) and prose description.
+  - A startup prompt summarizing the task and referencing the file: "Your task assignment is at .triumvirate/fleet-task.md — read it before starting."
+  Fleet members MUST NOT receive accumulated conversation history from other agents.
 
 ### Merge
 
