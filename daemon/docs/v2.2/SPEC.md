@@ -74,7 +74,9 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 - **REQ-011a:** A replay daemon MUST drain the spool into SQLite on the next successful DB connection. Spool entries MUST be replayed in order. Successfully replayed entries MUST be removed from the spool file.
 - **REQ-012:** An async compression worker MUST consume raw events and produce summaries using Tier 0: local extractive summary — deterministic, zero API cost. This is the default and always-on path.
 - **REQ-012a:** Tier 1 LLM-powered abstraction MUST activate only when a session window contains 3+ error events, 5+ file edits, or a user-tagged `ledger_record` call. Tier 1 is capped at `TRIUMVIRATE_LEDGER_LLM_MAX_CALLS_PER_DAY` (default: 20). When the cap is reached, Tier 0 handles all remaining compression for the day.
-- **REQ-013:** The compression worker MUST be decoupled from ingestion. Worker failure MUST NOT block or lose raw event capture. Worker state uses a per-job state machine in the `events` table: `pending → running → done | failed`. Running jobs require a heartbeat timestamp. Jobs with stale heartbeats (>90 seconds) auto-reset to `pending`.
+- **REQ-013:** The compression worker MUST be decoupled from ingestion. Worker failure MUST NOT block or lose raw event capture.
+- **REQ-013a:** Worker state MUST use a per-job state machine in the `events` table: `pending → running → done | failed`.
+- **REQ-013b:** Running jobs MUST update a heartbeat timestamp at least every 30 seconds. Jobs with heartbeats older than 90 seconds MUST auto-reset to `pending`.
 
 ### Retrieval
 
