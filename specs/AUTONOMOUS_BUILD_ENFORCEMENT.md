@@ -94,12 +94,14 @@ Goat rodeo Phase 4.3 produces the execution contract as a markdown appendix in I
   "task_id": "T-003",
   "req_ids": ["REQ-002"],
   "wave": 1,
+  "file_policy": "default-deny",
   "allowed_files": ["src/engine.rs", "src/engine/mod.rs"],
   "forbidden_files": ["src/cli.rs", "Cargo.toml"],
-  "allowed_commands": ["cargo check -p my-crate", "cargo test -p my-crate"],
-  "forbidden_commands": ["cargo add", "rm -rf"],
+  "allowed_commands": [["cargo", "check", "-p", "my-crate"], ["cargo", "test", "-p", "my-crate"]],
+  "forbidden_commands": [["cargo", "add"], ["rm", "-rf"]],
   "commit_format": "^T-003:",
   "test_command": "cargo test --workspace",
+  "task_timeout_sec": 600,
   "done_when": "Engine processes input X and produces output Y with property Z",
   "reality_test": "Specific behavioral test description"
 }
