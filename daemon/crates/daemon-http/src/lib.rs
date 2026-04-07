@@ -2,6 +2,7 @@ use daemon_core::{ensure_daemon_token as core_ensure_daemon_token, triumvirate_h
 use mcp_bridge::{
     daemon_ask_agent_url, daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
     daemon_autostart_enabled, daemon_health_url, daemon_memory_read_url, daemon_memory_write_url,
+    daemon_lesson_add_url, daemon_lesson_list_url, daemon_lesson_query_url, daemon_lesson_validate_url,
     daemon_ledger_query_url, daemon_ledger_record_url, daemon_ledger_session_url,
     daemon_outbox_recent_url, daemon_scratchpad_list_url, daemon_scratchpad_write_url,
     daemon_session_ask_url, daemon_session_dismiss_url, daemon_session_list_url, daemon_session_spawn_url,
@@ -10,8 +11,9 @@ use mcp_bridge::{
 use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest, DaemonHealthResponse, DaemonStatusSnapshot,
     DismissSessionRequest, FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
-    FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest, ManualRecord,
-    MemoryReadRequest, MemoryReadResponse, MemoryWriteRequest, MemoryWriteResponse, SessionDetail,
+    FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest, LessonAddResponse,
+    LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse, LessonValidateRequest, ManualRecord,
+    MemoryReadRequest, MemoryReadResponse, MemoryWriteRequest, MemoryWriteResponse, NewLesson, SessionDetail,
     OutboxRecentRequest, OutboxRecentResponse, ScratchpadListRequest, ScratchpadListResponse,
     ScratchpadWriteRequest, ScratchpadWriteResponse, SessionListResponse, SpawnSessionRequest,
 };
@@ -241,4 +243,26 @@ pub async fn fetch_daemon_ledger_record(req: &ManualRecord) -> anyhow::Result<St
         .and_then(|v| v.as_str())
         .unwrap_or("ok")
         .to_string())
+}
+
+pub async fn fetch_daemon_lesson_add(req: &NewLesson) -> anyhow::Result<LessonAddResponse> {
+    daemon_post_json::<NewLesson, LessonAddResponse>(daemon_lesson_add_url(), req).await
+}
+
+pub async fn fetch_daemon_lesson_query(req: &LessonQueryRequest) -> anyhow::Result<LessonQueryResponse> {
+    daemon_post_json::<LessonQueryRequest, LessonQueryResponse>(daemon_lesson_query_url(), req).await
+}
+
+pub async fn fetch_daemon_lesson_validate(req: &LessonValidateRequest) -> anyhow::Result<String> {
+    let json =
+        daemon_post_json::<LessonValidateRequest, serde_json::Value>(daemon_lesson_validate_url(), req).await?;
+    Ok(json
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ok")
+        .to_string())
+}
+
+pub async fn fetch_daemon_lesson_list(req: &LessonListRequest) -> anyhow::Result<LessonListResponse> {
+    daemon_post_json::<LessonListRequest, LessonListResponse>(daemon_lesson_list_url(), req).await
 }

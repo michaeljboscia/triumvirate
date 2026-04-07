@@ -23,6 +23,7 @@ use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 use daemon_http::{
     fetch_daemon_ask_agent, fetch_daemon_fallback_ack,
     fetch_daemon_fallback_gc, fetch_daemon_fallback_list, fetch_daemon_memory_read,
+    fetch_daemon_lesson_add, fetch_daemon_lesson_list, fetch_daemon_lesson_query, fetch_daemon_lesson_validate,
     fetch_daemon_ledger_query, fetch_daemon_ledger_record, fetch_daemon_ledger_session,
     fetch_daemon_memory_write, fetch_daemon_outbox_recent, fetch_daemon_scratchpad_list,
     fetch_daemon_scratchpad_write, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
@@ -67,8 +68,11 @@ use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest,
     DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
-    FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest, ManualRecord, MemoryEntry,
+    FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest,
+    Lesson, LessonAddResponse, LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse,
+    LessonValidateRequest, ManualRecord, MemoryEntry,
     MemoryReadRequest, MemoryReadResponse,
+    NewLesson,
     MemoryWriteRequest, MemoryWriteResponse, OutboxRecentRequest,
     OutboxRecentResponse, SessionInfo, SessionListResponse, SpawnSessionRequest,
     ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
@@ -616,6 +620,87 @@ impl McpBridge {
             .record(req)
             .map_err(|e| format!("ledger_record failed: {e}"))?;
         Ok("ok".to_string())
+    }
+
+    #[tool(description = "Add a reusable lesson to the ledger knowledge base.")]
+    async fn lesson_add(&self, Parameters(req): Parameters<NewLesson>) -> Result<Json<LessonAddResponse>, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_lesson_add(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("lesson_add via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        let lesson_id = store
+            .add_lesson(req)
+            .map_err(|e| format!("lesson_add failed: {e}"))?;
+        Ok(Json(LessonAddResponse { lesson_id }))
+    }
+
+    #[tool(description = "Query lessons using full-text search and confidence filtering.")]
+    async fn lesson_query(
+        &self,
+        Parameters(req): Parameters<LessonQueryRequest>,
+    ) -> Result<Json<LessonQueryResponse>, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_lesson_query(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("lesson_query via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        let lessons = store
+            .query_lessons(&req.query, req.min_confidence.unwrap_or(0.0))
+            .map_err(|e| format!("lesson_query failed: {e}"))?;
+        Ok(Json(LessonQueryResponse { lessons }))
+    }
+
+    #[tool(description = "Mark a lesson as validated and reset confidence decay anchor.")]
+    async fn lesson_validate(
+        &self,
+        Parameters(req): Parameters<LessonValidateRequest>,
+    ) -> Result<String, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_lesson_validate(&req)
+                .await
+                .map_err(|e| format!("lesson_validate via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        store
+            .validate_lesson(req.lesson_id)
+            .map_err(|e| format!("lesson_validate failed: {e}"))?;
+        Ok("ok".to_string())
+    }
+
+    #[tool(description = "List lessons with optional tag and staleness filters.")]
+    async fn lesson_list(
+        &self,
+        Parameters(req): Parameters<LessonListRequest>,
+    ) -> Result<Json<LessonListResponse>, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_lesson_list(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("lesson_list via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        let tags_ref = req.tags.as_deref();
+        let lessons = store
+            .list_lessons(tags_ref, req.stale_days)
+            .map_err(|e| format!("lesson_list failed: {e}"))?;
+        Ok(Json(LessonListResponse { lessons }))
     }
 }
 
@@ -1242,6 +1327,182 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(serde_json::json!({ "status": "ok" })))
     }
 
+    async fn lesson_add_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<NewLesson>,
+    ) -> Result<AxumJson<LessonAddResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        let lesson_id = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+            let store = LedgerStore::open(project_root)?;
+            store.add_lesson(req)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(LessonAddResponse { lesson_id }))
+    }
+
+    async fn lesson_query_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<LessonQueryRequest>,
+    ) -> Result<AxumJson<LessonQueryResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        let lessons = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Lesson>> {
+            let store = LedgerStore::open(project_root)?;
+            store.query_lessons(&req.query, req.min_confidence.unwrap_or(0.0))
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(LessonQueryResponse { lessons }))
+    }
+
+    async fn lesson_validate_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<LessonValidateRequest>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let store = LedgerStore::open(project_root)?;
+            store.validate_lesson(req.lesson_id)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(serde_json::json!({ "status": "ok" })))
+    }
+
+    async fn lesson_list_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<LessonListRequest>,
+    ) -> Result<AxumJson<LessonListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        let lessons = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Lesson>> {
+            let store = LedgerStore::open(project_root)?;
+            store.list_lessons(req.tags.as_deref(), req.stale_days)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(LessonListResponse { lessons }))
+    }
+
     fn ledger_sweep_interval() -> Duration {
         std::env::var("TRIUMVIRATE_LEDGER_SWEEP_SECONDS")
             .ok()
@@ -1634,6 +1895,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/ledger/query", post(ledger_query_route))
         .route("/ledger/session", post(ledger_session_route))
         .route("/ledger/record", post(ledger_record_route))
+        .route("/lesson/add", post(lesson_add_route))
+        .route("/lesson/query", post(lesson_query_route))
+        .route("/lesson/validate", post(lesson_validate_route))
+        .route("/lesson/list", post(lesson_list_route))
         .route("/ask-agent", post(ask_agent_route))
         .route("/memory/write", post(memory_write_route))
         .route("/memory/read", post(memory_read_route))
@@ -4154,6 +4419,66 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             .await
             .map_err(anyhow::Error::msg)?;
         assert!(out.0.summaries.iter().any(|summary| summary.title == "test"));
+
+        std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lesson_tools_round_trip() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let original_cwd = std::env::current_dir()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-lesson-mcp-{now}"));
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))?;
+        std::env::set_current_dir(&project_root)?;
+
+        let bridge = McpBridge::new_ephemeral();
+        let lesson_id = bridge
+            .lesson_add(Parameters(NewLesson {
+                title: "WAL lesson".to_string(),
+                body: "Use WAL for contention".to_string(),
+                source_session_id: Some("sess-1".to_string()),
+                initial_confidence: 0.8,
+                tags_json: Some("[\"sqlite\",\"wal\"]".to_string()),
+                req_ids_json: Some("[\"REQ-021\"]".to_string()),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?
+            .0
+            .lesson_id;
+
+        let queried = bridge
+            .lesson_query(Parameters(LessonQueryRequest {
+                query: "WAL".to_string(),
+                min_confidence: Some(0.1),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(queried.0.lessons.iter().any(|lesson| lesson.lesson_id == lesson_id));
+
+        bridge
+            .lesson_validate(Parameters(LessonValidateRequest { lesson_id }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let listed = bridge
+            .lesson_list(Parameters(LessonListRequest {
+                tags: Some(vec!["sqlite".to_string()]),
+                stale_days: None,
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let after = listed
+            .0
+            .lessons
+            .iter()
+            .find(|lesson| lesson.lesson_id == lesson_id)
+            .map(|lesson| lesson.last_validated_at.clone())
+            .unwrap_or_default();
+        assert!(!after.is_empty());
 
         std::env::set_current_dir(&original_cwd)?;
         let _ = fs::remove_dir_all(project_root);
