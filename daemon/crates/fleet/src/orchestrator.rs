@@ -18,6 +18,7 @@ pub struct FleetSpawnRequest {
     pub agents: Vec<String>,
     pub dry_run: bool,
     pub wait: Option<bool>,
+    pub task_description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +112,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         fleet_id.clone(),
                         head_sha.clone(),
                         req.agents.clone(),
+                        req.task_description.clone(),
                     )
                     .await?;
             } else {
@@ -119,6 +121,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 let agents = req.agents.clone();
                 let fleet_id_bg = fleet_id.clone();
                 let head_sha_bg = head_sha.clone();
+                let task_description = req.task_description.clone();
                 tokio::spawn(async move {
                     if let Err(err) = orchestrator
                         .spawn_fleet_members(
@@ -126,6 +129,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             fleet_id_bg.clone(),
                             head_sha_bg,
                             agents,
+                            task_description,
                         )
                         .await
                     {
@@ -176,6 +180,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         fleet_id: String,
         head_sha: String,
         agents: Vec<String>,
+        task_description: String,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let base = project_root.join(".triumvirate").join("worktrees");
         fs::create_dir_all(&base)?;
@@ -192,7 +197,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             fs::write(
                 worktree_path.join(".triumvirate").join("fleet-task.md"),
                 format!(
-                    "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\ndepends_on: []\n---\n\nImplement the assigned fleet task for {agent}.\nDocument changes and tests in your final report.\n"
+                    "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\ndepends_on: []\n---\n\n{task_description}\n"
                 ),
             )?;
             self.launcher
@@ -354,6 +359,7 @@ mod tests {
                 agents: vec!["codex".to_string(), "gemini".to_string()],
                 dry_run: true,
                 wait: None,
+                task_description: "test task".to_string(),
             })
             .await
             .expect("dry run");
@@ -367,6 +373,7 @@ mod tests {
                 agents: vec!["codex".to_string(), "gemini".to_string()],
                 dry_run: false,
                 wait: Some(true),
+                task_description: "real task description".to_string(),
             })
             .await
             .expect("execute");
@@ -380,7 +387,7 @@ mod tests {
             assert!(contents.contains("fleet_id:"));
             assert!(contents.contains("assigned_agent:"));
             assert!(contents.contains("depends_on: []"));
-            assert!(contents.contains("Implement the assigned fleet task"));
+            assert!(contents.contains("real task description"));
         }
 
         let conn = rusqlite::Connection::open(
@@ -421,12 +428,14 @@ mod tests {
             agents: vec!["codex".to_string()],
             dry_run: false,
             wait: Some(true),
+            task_description: "task a".to_string(),
         });
         let spawn_b = orchestrator.fleet_spawn(FleetSpawnRequest {
             project_root: project_b.clone(),
             agents: vec!["gemini".to_string()],
             dry_run: false,
             wait: Some(true),
+            task_description: "task b".to_string(),
         });
         let (res_a, res_b) = tokio::join!(spawn_a, spawn_b);
         res_a.expect("spawn a");
@@ -459,6 +468,7 @@ mod tests {
                 agents: vec!["codex".to_string()],
                 dry_run: false,
                 wait: Some(true),
+                task_description: "lifecycle task".to_string(),
             })
             .await
             .expect("spawn");
@@ -528,6 +538,7 @@ mod tests {
                 agents: vec!["codex".to_string()],
                 dry_run: false,
                 wait: Some(false),
+                task_description: "wait false task".to_string(),
             })
             .await
             .expect("spawn no-wait");
@@ -541,6 +552,7 @@ mod tests {
                 agents: vec!["gemini".to_string()],
                 dry_run: false,
                 wait: Some(true),
+                task_description: "wait true task".to_string(),
             })
             .await
             .expect("spawn wait");
@@ -568,6 +580,7 @@ mod tests {
                 agents: vec!["codex".to_string()],
                 dry_run: false,
                 wait: Some(false),
+                task_description: "failing background task".to_string(),
             })
             .await
             .expect("spawn no-wait");
