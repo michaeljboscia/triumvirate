@@ -11,6 +11,7 @@ shared-types = { path = "../shared-types" }
 daemon-core = { path = "../daemon-core" }
 agent-worker = { path = "../agent-worker" }
 ledger = { path = "../ledger" }
+peer-review = { path = "../peer-review" }
 tokio.workspace = true
 rusqlite = "0.32"
 serde_json.workspace = true

@@ -507,6 +507,7 @@ dependencies = [
  "async-trait",
  "daemon-core",
  "ledger",
+ "peer-review",
  "rusqlite",
  "serde_json",
  "shared-types",

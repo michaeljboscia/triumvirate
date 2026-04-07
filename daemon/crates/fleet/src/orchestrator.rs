@@ -2,6 +2,7 @@ use std::{
     fs,
     path::Path,
     path::PathBuf,
+    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,7 +11,11 @@ use ledger::LedgerStore;
 use shared_types::{GitOps, RawEvent};
 use tokio::process::Command;
 
-use crate::worktree::WorktreeManager;
+use crate::{
+    merge::{MergeCoordinator, ReviewGateState},
+    tasks::FleetTaskStore,
+    worktree::WorktreeManager,
+};
 
 #[derive(Debug, Clone)]
 pub struct FleetSpawnRequest {
@@ -43,7 +48,7 @@ pub trait AgentLauncher: Clone + Send + Sync + 'static {
         agent: &str,
         project_root: &Path,
         worktree_path: &Path,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<tokio::process::Child>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,21 +58,36 @@ pub struct ShellAgentLauncher;
 impl AgentLauncher for ShellAgentLauncher {
     async fn launch(
         &self,
-        _agent: &str,
+        agent: &str,
         project_root: &Path,
         worktree_path: &Path,
-    ) -> anyhow::Result<()> {
-        let mut child = Command::new("sh")
-            .arg("-lc")
-            .arg("true")
+    ) -> anyhow::Result<tokio::process::Child> {
+        let task_file = worktree_path.join(".triumvirate").join("fleet-task.md");
+        let prompt = format!(
+            "You are a fleet agent. Read your task assignment at {} and complete the work. Commit your changes when done.",
+            task_file.display()
+        );
+        let (cmd, args) = match agent {
+            "codex" => (
+                "codex",
+                vec![
+                    "exec".to_string(),
+                    "--message".to_string(),
+                    prompt,
+                ],
+            ),
+            "gemini" => ("gemini", vec!["-p".to_string(), prompt]),
+            _ => anyhow::bail!("unsupported fleet agent: {agent}"),
+        };
+        let child = Command::new(cmd)
+            .args(args)
             .current_dir(worktree_path)
             .env("TRIUMVIRATE_PROJECT_ROOT", project_root.as_os_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
-        let status = child.wait().await?;
-        if !status.success() {
-            anyhow::bail!("agent subprocess failed to start");
-        }
-        Ok(())
+        Ok(child)
     }
 }
 
@@ -185,11 +205,15 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         let base = project_root.join(".triumvirate").join("worktrees");
         fs::create_dir_all(&base)?;
         let store = LedgerStore::open(project_root.clone())?;
+        let task_store = FleetTaskStore::new(project_root.clone())?;
+        task_store.insert_fleet(&fleet_id, &task_description)?;
         let mut worktree_paths = Vec::new();
+        let mut running_agents = Vec::new();
         for (idx, agent) in agents.iter().enumerate() {
             let task_id = format!("T-{:03}", idx + 1);
             let branch = format!("fleet/{fleet_id}/{task_id}");
             let worktree_path = base.join(format!("{fleet_id}-{task_id}-{agent}"));
+            task_store.insert_task(&task_id, &fleet_id, &task_id, &[])?;
             self.worktree
                 .create_worktree(&worktree_path, &branch)
                 .await?;
@@ -200,7 +224,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\ndepends_on: []\n---\n\n{task_description}\n"
                 ),
             )?;
-            self.launcher
+            let child = self
+                .launcher
                 .launch(agent, &project_root, &worktree_path)
                 .await?;
             let sequence = event_sequence_for(&project_root, &fleet_id, "agent_started")?;
@@ -216,11 +241,17 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 })
                 .to_string(),
             })?;
+            running_agents.push((child, task_id.clone(), agent.to_string()));
             worktree_paths.push(worktree_path);
         }
 
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+        conn.execute(
+            "UPDATE fleets SET state = 'running' WHERE fleet_id = ?1",
+            [fleet_id.as_str()],
+        )?;
         store.ingest_event(RawEvent {
-            session_id: fleet_id,
+            session_id: fleet_id.clone(),
             event_type: "fleet_spawned".to_string(),
             sequence: 1,
             timestamp: "2030-01-01T00:00:00Z".to_string(),
@@ -230,7 +261,150 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             })
             .to_string(),
         })?;
+
+        for (mut child, task_id, agent_name) in running_agents {
+            let orchestrator = self.clone();
+            let project_root = project_root.clone();
+            let fleet_id = fleet_id.clone();
+            tokio::spawn(async move {
+                let wait_result = child.wait().await;
+                match wait_result {
+                    Ok(status) if status.success() => {
+                        if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
+                            let _ = task_store.complete_task(&task_id);
+                        }
+                        if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.clone()) {
+                            let _ = review_engine.request_review(peer_review::ReviewRequest {
+                                fleet_id: Some(fleet_id.clone()),
+                                author_agent: agent_name.clone(),
+                                artifact: format!("fleet/{fleet_id}/{task_id}"),
+                                review_type: "code".to_string(),
+                            });
+                        }
+                    }
+                    Ok(status) => {
+                        tracing::error!(
+                            fleet_id = %fleet_id,
+                            task_id = %task_id,
+                            code = ?status.code(),
+                            "fleet agent failed"
+                        );
+                        let db_path = project_root.join(".triumvirate").join("ledger.db");
+                        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+                            let _ = conn.execute(
+                                "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
+                                [task_id.as_str()],
+                            );
+                        }
+                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
+                            let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
+                                .unwrap_or(1);
+                            let _ = store.ingest_event(RawEvent {
+                                session_id: fleet_id.clone(),
+                                event_type: "task_failed".to_string(),
+                                sequence,
+                                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                payload_json: serde_json::json!({
+                                    "task_id": task_id,
+                                    "code": status.code()
+                                })
+                                .to_string(),
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            fleet_id = %fleet_id,
+                            task_id = %task_id,
+                            error = %err,
+                            "fleet agent process error"
+                        );
+                    }
+                }
+
+                let db_path = project_root.join(".triumvirate").join("ledger.db");
+                let pending = rusqlite::Connection::open(db_path)
+                    .and_then(|conn| {
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM tasks
+                             WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed')",
+                            [fleet_id.as_str()],
+                            |row| row.get::<_, i64>(0),
+                        )
+                    })
+                    .unwrap_or(1);
+                if pending == 0 {
+                    tracing::info!(fleet_id = %fleet_id, "all fleet agents complete, starting merge phase");
+                    let _ = orchestrator.complete_fleet(&fleet_id, &project_root).await;
+                }
+            });
+        }
         Ok(worktree_paths)
+    }
+
+    async fn complete_fleet(&self, fleet_id: &str, project_root: &Path) -> anyhow::Result<()> {
+        let db_path = project_root.join(".triumvirate").join("ledger.db");
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let updated = conn.execute(
+            "UPDATE fleets
+             SET state = 'merging'
+             WHERE fleet_id = ?1 AND state IN ('spawning', 'running')",
+            [fleet_id],
+        )?;
+        if updated == 0 {
+            return Ok(());
+        }
+        tracing::info!(fleet_id = %fleet_id, "starting sequential merge");
+
+        let task_ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT task_id FROM tasks
+                 WHERE fleet_id = ?1 AND state = 'done'
+                 ORDER BY task_id ASC",
+            )?;
+            let rows = stmt.query_map([fleet_id], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+        drop(conn);
+
+        let mut coordinator =
+            MergeCoordinator::new(self.git_ops.clone()).with_project_root(project_root.to_path_buf());
+        for task_id in task_ids {
+            coordinator.enqueue_completed(task_id.clone(), format!("fleet/{fleet_id}/{task_id}"));
+            coordinator.set_review_status(task_id, ReviewGateState::Approved, None);
+        }
+
+        let merge_result = async {
+            while coordinator.merge_next().await?.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+        match merge_result {
+            Ok(()) => {
+                conn.execute(
+                    "UPDATE fleets
+                     SET state = 'done', completed_at = datetime('now')
+                     WHERE fleet_id = ?1",
+                    [fleet_id],
+                )?;
+            }
+            Err(err) => {
+                conn.execute(
+                    "UPDATE fleets
+                     SET state = 'failed', failure_reason = ?2
+                     WHERE fleet_id = ?1",
+                    rusqlite::params![fleet_id, err.to_string()],
+                )?;
+                tracing::error!(fleet_id = %fleet_id, error = %err, "fleet merge failed");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -315,14 +489,19 @@ mod tests {
             &self,
             _agent: &str,
             project_root: &Path,
-            _worktree_path: &Path,
-        ) -> anyhow::Result<()> {
+            worktree_path: &Path,
+        ) -> anyhow::Result<tokio::process::Child> {
             tokio::time::sleep(Duration::from_millis(25)).await;
             self.seen_project_roots
                 .lock()
                 .await
                 .push(project_root.to_path_buf());
-            Ok(())
+            let child = tokio::process::Command::new("sh")
+                .arg("-lc")
+                .arg("sleep 0.05")
+                .current_dir(worktree_path)
+                .spawn()?;
+            Ok(child)
         }
     }
 
@@ -336,7 +515,7 @@ mod tests {
             _agent: &str,
             _project_root: &Path,
             _worktree_path: &Path,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<tokio::process::Child> {
             anyhow::bail!("launcher failure");
         }
     }
@@ -474,12 +653,6 @@ mod tests {
             .expect("spawn");
 
         let tasks = FleetTaskStore::new(project_root.clone()).expect("task store");
-        tasks
-            .insert_fleet(&spawned.fleet_id, "test lifecycle")
-            .expect("insert fleet");
-        tasks
-            .insert_task("T-001", &spawned.fleet_id, "task", &[])
-            .expect("insert task");
         assert!(tasks.claim_task("T-001", "codex").expect("claim"));
         tasks.complete_task("T-001").expect("complete");
 
