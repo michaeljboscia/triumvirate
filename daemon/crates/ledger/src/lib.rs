@@ -1,4 +1,5 @@
 mod health;
+mod init;
 mod ingest;
 mod spool;
 mod store;
@@ -354,5 +355,30 @@ mod tests {
         let status = store.health().expect("health status");
         assert_eq!(status.events_last_5min, 0);
         assert_eq!(status.status, "degraded");
+    }
+
+    #[test]
+    fn open_adds_triumvirate_gitignore_entry_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg(&project_root)
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init failed");
+
+        LedgerStore::open(project_root.clone()).expect("first open");
+        LedgerStore::open(project_root.clone()).expect("second open");
+
+        let gitignore = fs::read_to_string(project_root.join(".gitignore"))
+            .expect("read .gitignore");
+        let occurrences = gitignore
+            .lines()
+            .filter(|line| line.trim() == ".triumvirate/")
+            .count();
+        assert_eq!(occurrences, 1);
     }
 }

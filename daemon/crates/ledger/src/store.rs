@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf, time::Duration};
 use rusqlite::Connection;
 
 use crate::LedgerStore;
+use crate::init::ensure_triumvirate_gitignore;
 
 const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -116,6 +117,7 @@ pub(crate) fn open(project_root: PathBuf) -> anyhow::Result<LedgerStore> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(CREATE_SCHEMA_SQL)?;
+    ensure_triumvirate_gitignore(&project_root)?;
 
     Ok(LedgerStore {
         project_root,
