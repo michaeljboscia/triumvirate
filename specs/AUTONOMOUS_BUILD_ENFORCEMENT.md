@@ -68,8 +68,9 @@ Codex sessions are ephemeral. Each dispatch:
 4. Copies `validate-task.sh` into `.triumvirate/` (Codex sandbox can't reach `~/.claude/scripts/`)
 5. Configures per-worktree hooks: `git config --worktree core.hooksPath .triumvirate/hooks/` and installs the contract-aware pre-commit hook there
 6. Spawns `codex -p @.triumvirate/BRIEFING.md --approval-policy full-auto --sandbox workspace-write`
-7. Monitors for completion (commit detected) or timeout (`task_timeout_sec` from contract.json — enforced by killing the subprocess)
-8. Returns: commit SHA, modified files, test output, or failure details
+7. Sets task-local build env: `CARGO_TARGET_DIR=.triumvirate/target/<task_id>` (prevents build artifact collisions in parallel waves)
+8. Monitors for completion (commit detected) or timeout (`task_timeout_sec` from contract.json — enforced by SIGTERM with 10s grace, then SIGKILL + `rm -f .git/index.lock` to prevent dangling git locks)
+9. Returns: commit SHA, modified files, test output, or failure details
 
 ### REQ-A1.3: Gemini Query Interface
 
