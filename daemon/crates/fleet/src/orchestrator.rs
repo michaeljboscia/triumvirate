@@ -78,9 +78,9 @@ impl AgentLauncher for DaemonAgentLauncher {
     }
 }
 
-impl<G: GitOps + Clone + 'static> FleetOrchestrator<G, ShellAgentLauncher> {
+impl<G: GitOps + Clone + 'static> FleetOrchestrator<G, DaemonAgentLauncher> {
     pub fn new(git_ops: G) -> Self {
-        Self::with_launcher(git_ops, ShellAgentLauncher)
+        Self::with_launcher(git_ops, DaemonAgentLauncher)
     }
 }
 
