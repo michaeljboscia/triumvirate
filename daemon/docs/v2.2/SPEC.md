@@ -160,7 +160,8 @@ Parallel agent execution with worktrees, task lists, and sequential merge.
 
 ### Fleet Orchestration
 
-- **REQ-034:** A fleet is defined by: fleet_id, task (description), agent_composition (map of agent_type → count), created_at, state (spawning|running|merging|done|failed).
+- **REQ-034:** A fleet is defined by: fleet_id, task (description), agent_composition (map of agent_type → count), created_at, state (spawning|running|merging|done|failed|recovery_required).
+- **REQ-034a:** On daemon startup, the `fleet` crate MUST reconcile all fleets in non-terminal states (`spawning`, `running`, `merging`). For each: verify agent PIDs are alive. If dead: mark fleet as `failed` (reason: "daemon crash recovery"), reset `in_progress` tasks to `pending`, clean up orphaned worktrees, emit recovery events to the Ledger, and surface a notification to the user on next MCP connection.
 - **REQ-035:** MCP tools for fleet:
   - `fleet_spawn(task: string, agents: {claude?: int, gemini?: int, codex?: int}, dry_run?: bool, wait?: bool)` — When `dry_run=true` (or omitted), returns a plan summary: agent count, worktree locations, estimated tasks, current HEAD. Claude presents this to the user for confirmation. When `dry_run=false`, executes the plan: creates worktrees, spawns agents, returns fleet_id with `state=spawning`. If `wait=true`, blocks until all worktrees are created and agents are running. Streams progress via WebSocket (REQ-044) regardless of wait mode.
   - `fleet_status(fleet_id)` — Agent states, task progress, worktree status.
