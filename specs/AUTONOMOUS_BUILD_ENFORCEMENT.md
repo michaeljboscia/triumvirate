@@ -61,7 +61,11 @@ The daemon exposes an MCP server that Claude Code connects to. Tools available:
 
 ### REQ-A1.2: Codex Dispatch Interface
 
-Codex sessions are ephemeral. Claude calls one MCP tool (`dispatch_codex_worktree`). Steps 1-9 are the daemon's internal implementation — Claude does NOT execute these via Bash serially. Each dispatch:
+Codex sessions are ephemeral. Claude calls one MCP tool (`dispatch_codex_worktree`). Steps 1-9 are the daemon's internal implementation — Claude does NOT execute these via Bash serially. The dispatch is **non-blocking** — it returns a `task_id` immediately. Claude monitors completion via `get_task_status` polling.
+
+**Atomic rollback:** If any setup step fails (hook installation, Codex spawn, etc.), the daemon cleans up: `git worktree remove --force`, delete `.triumvirate/`, return clean error to Claude. No partial worktrees leak. Optional `keep_failed_worktree=true` debug flag for forensics.
+
+Each dispatch:
 1. Creates a git worktree from a specified commit SHA
 2. Creates `.triumvirate/` directory in the worktree, adds it to `.git/info/exclude`
 3. Writes `BRIEFING.md` and `contract.json` to `.triumvirate/` (not worktree root — prevents accidental commits)
