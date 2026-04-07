@@ -174,8 +174,8 @@ Parallel agent execution with worktrees, task lists, and sequential merge.
 - **REQ-039:** If a merge produces conflicts, the fleet engine MUST log the conflict details (files, conflict markers, authoring agent) to the Ledger.
 - **REQ-039a:** The fleet engine MUST surface merge conflicts to the user via MCP notification within 1 second of detection. The notification MUST name the conflicting files and the agents involved.
 - **REQ-039b:** The merge queue MUST pause on conflict. No subsequent worktrees merge until the conflict is resolved. The fleet engine MUST NOT auto-resolve conflicts.
-- **REQ-040:** Before merging any worktree, the fleet engine MUST request peer review (REQ-023) of the worktree's diff from an agent that did NOT author the changes.
-- **REQ-040a:** Merge MUST NOT proceed until the review verdict is `approve`. A `request_changes` or `reject` verdict MUST pause the merge and surface the reviewer's comments to the user.
+- **REQ-040:** The fleet engine MUST request peer review (REQ-023) of each worktree's diff as soon as the authoring agent completes its task — NOT at merge time. Reviews run in parallel with other agents still working. By the time the merge phase begins, most reviews are already complete.
+- **REQ-040a:** The merge phase (REQ-038) MUST check review status before each sequential merge. Merge MUST NOT proceed for a worktree until its review verdict is `approve`. A `request_changes` or `reject` verdict MUST pause the merge queue and surface the reviewer's comments to the user.
 - **REQ-040b:** Setting `TRIUMVIRATE_FLEET_SKIP_REVIEW=1` MUST bypass the peer review gate for fleet merges. Skipped reviews MUST be logged to the Ledger with `summary_type = "review_skipped"`.
 
 ---
