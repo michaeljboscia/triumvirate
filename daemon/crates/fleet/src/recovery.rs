@@ -40,6 +40,14 @@ pub fn recover_crashed_fleets(project_root: PathBuf) -> anyhow::Result<RecoveryR
              WHERE fleet_id = ?1",
             [fleet_id],
         )?;
+        conn.execute(
+            "UPDATE tasks
+             SET state = 'pending',
+                 assigned_agent = NULL
+             WHERE fleet_id = ?1
+               AND state IN ('claimed', 'in_progress')",
+            [fleet_id],
+        )?;
 
         if worktree_base.exists() {
             for entry in fs::read_dir(&worktree_base)? {
@@ -103,6 +111,24 @@ mod tests {
             [project_root.display().to_string()],
         )
         .expect("insert fleet");
+        conn.execute(
+            "INSERT INTO tasks (fleet_id, task_id, title, assigned_agent, state, depends_on)
+             VALUES ('fleet-1', 'T-001', 'task one', 'codex', 'claimed', '[]')",
+            [],
+        )
+        .expect("insert claimed task");
+        conn.execute(
+            "INSERT INTO tasks (fleet_id, task_id, title, assigned_agent, state, depends_on)
+             VALUES ('fleet-1', 'T-002', 'task two', 'gemini', 'in_progress', '[]')",
+            [],
+        )
+        .expect("insert in progress task");
+        conn.execute(
+            "INSERT INTO tasks (fleet_id, task_id, title, assigned_agent, state, depends_on)
+             VALUES ('fleet-1', 'T-003', 'task three', 'claude', 'done', '[]')",
+            [],
+        )
+        .expect("insert done task");
 
         let wt = project_root
             .join(".triumvirate")
@@ -125,6 +151,42 @@ mod tests {
             .expect("read fleet state");
         assert_eq!(fleet_state.0, "failed");
         assert!(fleet_state.1.contains("crash recovery"));
+
+        let reset_tasks: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT state, assigned_agent
+                     FROM tasks
+                     WHERE fleet_id = 'fleet-1' AND task_id IN ('T-001', 'T-002')
+                     ORDER BY task_id ASC",
+                )
+                .expect("prepare reset tasks query");
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+                .expect("query reset tasks");
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.expect("row"));
+            }
+            out
+        };
+        assert_eq!(reset_tasks.len(), 2);
+        assert_eq!(reset_tasks[0].0, "pending");
+        assert!(reset_tasks[0].1.is_none());
+        assert_eq!(reset_tasks[1].0, "pending");
+        assert!(reset_tasks[1].1.is_none());
+
+        let done_task: (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, assigned_agent
+                 FROM tasks
+                 WHERE fleet_id = 'fleet-1' AND task_id = 'T-003'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read done task");
+        assert_eq!(done_task.0, "done");
+        assert_eq!(done_task.1.as_deref(), Some("claude"));
 
         let events: i64 = conn
             .query_row(
