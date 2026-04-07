@@ -188,7 +188,7 @@ Svelte 5 + Tailwind 4 web UI embedded in the daemon binary.
 - **REQ-042:** Static assets MUST be embedded in the `triumvirate` binary via `rust-embed`. The daemon serves them at `GET /` and `GET /assets/*`.
 - **REQ-043:** The dashboard MUST connect to the daemon's existing REST API and a new WebSocket endpoint for real-time updates.
 - **REQ-044:** The daemon MUST expose `GET /ws` (WebSocket) that streams: agent working state events, fleet progress, Ledger health heartbeats, outbox events.
-- **REQ-044a:** The MCP stdio bridge (`triumvirate mcp`) MUST operate exclusively as a proxy to the daemon. Local agent execution (without the daemon) MUST be removed. If the daemon is unreachable and auto-start fails, the MCP bridge MUST return an error, not silently execute locally. This eliminates dashboard blind spots.
+- **REQ-044a:** The MCP stdio bridge (`triumvirate mcp`) MUST operate exclusively as a proxy to the daemon. Local agent execution (without the daemon) MUST be removed. If the daemon is unreachable and auto-start fails, the MCP bridge MUST return an explicit error including recovery instructions (`triumvirate daemon` to start manually). The daemon MUST implement auto-restart with exponential backoff on crash.
 
 ### Views
 
