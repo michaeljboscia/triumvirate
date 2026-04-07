@@ -109,7 +109,7 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 Machine-readable lessons with confidence decay, stored in the Ledger's SQLite.
 
 - **REQ-019:** The `ledger` crate MUST define a `lessons` table: lesson_id, title, body, source_session_id, created_at, last_validated_at, confidence (float 0.0–1.0), tags_json, req_ids_json.
-- **REQ-020-LL:** Lessons MUST decay in confidence over time. The decay function: `confidence = initial_confidence * e^(-lambda * days_since_last_validation)`. Default lambda = 0.01 (half-life ~69 days). Lessons below confidence 0.1 are marked `stale`.
+- **REQ-020-LL:** Lessons MUST decay in confidence over time. The decay function: `confidence = initial_confidence * e^(-lambda * days_since_last_validation)`. Default lambda = 0.01 (half-life ~69 days). Lessons below confidence 0.1 are marked `stale`. Decay MUST be calculated at query time (not background mutation). The dashboard MAY cache a daily materialized snapshot for display performance.
 - **REQ-021:** MCP tools for lessons:
   - `lesson_add(title, body, tags, confidence?)` — Creates a lesson. Default confidence = 0.8.
   - `lesson_query(query, min_confidence?)` — FTS5 search filtered by confidence threshold.
