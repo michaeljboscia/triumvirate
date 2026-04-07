@@ -284,7 +284,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    permanent record of what was built. If it's not in
   │   │   │    the manifest, it didn't happen.
   │   │   │
-  │   │   ├─ 7c. Claude APPENDS to DEVIATION_LOG.md IF any of:
+  │   │   ├─ 6c. Claude APPENDS to DEVIATION_LOG.md IF any of:
   │   │   │    - Collateral files were modified outside <files>
   │   │   │    - Task required >1 attempt (repair dispatch)
   │   │   │    - Gemini flagged concerns (even if advisory)
