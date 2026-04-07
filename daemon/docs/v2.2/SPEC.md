@@ -85,11 +85,12 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 
 ### Retrieval
 
-- **REQ-014:** The Ledger MUST expose MCP tools accessible to ALL three agents (Claude, Gemini, Codex):
+- **REQ-014:** The Ledger MUST expose MCP tools accessible to Claude directly via MCP protocol:
   - `ledger_query(query: string, project?: string, limit?: int)` — FTS5 search over summaries. Returns ranked results with session context.
   - `ledger_session(session_id: string)` — Full session reconstruction: metadata + events + summaries.
   - `ledger_record(title: string, narrative: string, facts: string[], concepts: string[])` — Manual high-signal recording by any agent. Writes directly to `summaries`.
   - `ledger_health()` — Returns last event timestamp, queue depth, spool size, DB size, stale job count.
+- **REQ-014a:** Gemini and Codex (text-in/text-out subprocesses) MUST access ledger tools via structured markers in their stdout. The `agent-adapter` crate MUST parse XML-style tags (e.g., `<triumvirate_tool name="ledger_record">...</triumvirate_tool>`) from agent output, execute the tool in the daemon, and inject the result back into the agent's context. The daemon performs the actual Ledger write.
 
 ### Health
 
