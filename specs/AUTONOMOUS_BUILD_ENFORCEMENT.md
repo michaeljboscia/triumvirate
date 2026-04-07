@@ -303,7 +303,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │        validation_pass_rate, collateral_fix_count, last_commit_sha
   │   │        (BUILD_STATE.json is the quick-resume checkpoint — survives session crashes)
   │   │
-  │   └─ 8. CONTEXT DIES
+  │   └─ 7. CONTEXT DIES
   │          Codex session is gone. Worktree may be kept (if more
   │          tasks touch same files) or deleted. The only surviving
   │          artifacts are: git commits and Claude's after-action report.
