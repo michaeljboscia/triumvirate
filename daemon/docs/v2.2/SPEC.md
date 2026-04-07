@@ -76,7 +76,8 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 - **REQ-011a:** The daemon MUST drain the spool into SQLite on startup and every 30 seconds while the spool is non-empty. Spool entries MUST be replayed in strict append order. Successfully replayed entries MUST be removed from the spool file.
 - **REQ-011b:** The spool file MUST NOT exceed 100MB. When the limit is reached, the spool MUST rotate to `.ndjson.1` / `.ndjson.2` and the Ledger health endpoint MUST return status `degraded`.
 - **REQ-011c:** Spool replay MUST use idempotency keys (`session_id + event_type + sequence`) to deduplicate events that may have been partially written to both spool and DB.
-- **REQ-012:** An async compression worker MUST consume raw events and produce summaries using Tier 0: local extractive summary — deterministic, zero API cost. This is the default and always-on path.
+- **REQ-012:** An async compression worker MUST consume raw events and produce summaries using Tier 0: local extractive summary — deterministic, zero API cost. This is the default and always-on path. The worker MUST run as a background Tokio task inside the daemon process, sharing the daemon's SQLite connection pool.
+- **REQ-012b:** The daemon MUST run one compression worker pool per project DB. Concurrency MUST be configurable via `TRIUMVIRATE_LEDGER_WORKER_CONCURRENCY` (default: 1).
 - **REQ-012a:** Tier 1 LLM-powered abstraction MUST activate only when a session window contains 3+ error events, 5+ file edits, or a user-tagged `ledger_record` call. Tier 1 is capped at `TRIUMVIRATE_LEDGER_LLM_MAX_CALLS_PER_DAY` (default: 20). When the cap is reached, Tier 0 handles all remaining compression for the day.
 - **REQ-013:** The compression worker MUST be decoupled from ingestion. Worker failure MUST NOT block or lose raw event capture.
 - **REQ-013a:** Worker state MUST use a per-job state machine in the `events` table: `pending → running → done | failed`.
