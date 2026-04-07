@@ -2,6 +2,51 @@
 
 ---
 
+## Phase 0.5: Observability Foundation
+
+**Crates:** `triumvirate` (binary wiring)
+**REQs:** 059–062
+
+- [ ] **0.1** Wire tracing-subscriber with env-filter + JSON.
+
+<task id="T-001" req="REQ-059" wave="1" depends="">
+  <description>Initialize tracing_subscriber with EnvFilter (RUST_LOG, default info for daemon crates, warn for deps) and JSON formatting layer on daemon startup.</description>
+  <files>triumvirate/src/main.rs</files>
+  <verify>cargo check -p triumvirate</verify>
+  <reality_test>Start daemon with RUST_LOG=debug. Stderr contains JSON-formatted log lines with level, target, span fields. Start with RUST_LOG unset. Only info+ lines appear. grep for println/eprintln in all daemon crate src/ — zero hits. A stub with no subscriber produces no structured logs.</reality_test>
+</task>
+
+- [ ] **0.2** Wire OpenTelemetry tracing pipeline.
+
+<task id="T-002" req="REQ-060" wave="1" depends="T-001">
+  <description>Initialize OTel tracing layer via tracing-opentelemetry. Export to OTEL_EXPORTER_OTLP_ENDPOINT. Disabled if env unset. Instrument ask_agent with span: agent type, duration, token count, outcome.</description>
+  <files>triumvirate/src/main.rs, triumvirate/src/agent_exec.rs</files>
+  <verify>cargo check -p triumvirate</verify>
+  <reality_test>Set OTEL_EXPORTER_OTLP_ENDPOINT to a mock collector (or Jaeger). Run ask_agent. Collector receives a span named "ask_agent" with attributes agent.type, agent.tokens, agent.outcome. Unset env var — no export attempt, no errors. A stub that initializes OTel but doesn't instrument ask_agent produces spans with no agent attributes.</reality_test>
+</task>
+
+- [ ] **0.3** Wire Prometheus /metrics endpoint.
+
+<task id="T-003" req="REQ-061" wave="1" depends="">
+  <description>Implement GET /metrics returning Prometheus text format. Register all metrics: agent_requests_total, agent_duration_seconds, agent_tokens_total, ledger_events_ingested_total, ledger_queue_lag_seconds, ledger_spool_size_bytes, fleet_active_total, reviews_total, marker_parse_success_rate.</description>
+  <files>triumvirate/src/main.rs</files>
+  <verify>cargo check -p triumvirate</verify>
+  <reality_test>curl localhost:8080/metrics returns text/plain with Prometheus format. Output contains all 9 metric names. After running ask_agent, triumvirate_agent_requests_total counter > 0. A stub returning empty 200 fails the metric name check.</reality_test>
+</task>
+
+- [ ] **0.4** Establish tracing::instrument convention.
+
+<task id="T-004" req="REQ-062" wave="1" depends="T-001">
+  <description>Add #[tracing::instrument] to existing public API methods in daemon-core, agent-worker, mcp-bridge. Establish pattern for new crates. grep -r 'println!\|eprintln!' in all crate src/ must return zero hits.</description>
+  <files>daemon-core/src/lib.rs, agent-worker/src/lib.rs, mcp-bridge/src/lib.rs</files>
+  <verify>cargo check --workspace</verify>
+  <reality_test>Run daemon with RUST_LOG=debug. Call ask_agent. Logs show spans for daemon-core, agent-worker, mcp-bridge methods with function names and args. grep -r 'println!\|eprintln!' daemon/crates/*/src/ returns zero matches. A crate with println! fails the grep check.</reality_test>
+</task>
+
+**Gate:** `curl /metrics` returns all 9 metric names. RUST_LOG=debug produces JSON spans. OTel exports to collector when configured. Zero println/eprintln in codebase.
+
+---
+
 ## Phase 1: Data (Ledger Ingestion + Health)
 
 **Crates:** `shared-types` (new DTOs + GitOps trait), `ledger` (new crate)
