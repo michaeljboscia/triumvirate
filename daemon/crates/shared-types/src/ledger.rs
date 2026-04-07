@@ -91,6 +91,8 @@ pub struct SessionDetail {
     pub ended_at: Option<String>,
     pub event_count: i64,
     pub summary_count: i64,
+    pub events: Vec<RawEvent>,
+    pub summaries: Vec<Summary>,
 }
 
 #[cfg(test)]
@@ -184,6 +186,24 @@ mod tests {
             ended_at: Some("2026-04-07T00:10:00Z".to_string()),
             event_count: 10,
             summary_count: 3,
+            events: vec![RawEvent {
+                session_id: "sess-1".to_string(),
+                event_type: "PostToolUse".to_string(),
+                sequence: 1,
+                timestamp: "2026-04-07T00:00:01Z".to_string(),
+                payload_json: "{}".to_string(),
+            }],
+            summaries: vec![Summary {
+                id: Some(1),
+                event_id: Some(1),
+                title: "A".to_string(),
+                narrative: "B".to_string(),
+                facts_json: None,
+                concepts_json: None,
+                affected_files_json: None,
+                summary_type: "extractive".to_string(),
+                created_at: Some("2026-04-07T00:00:02Z".to_string()),
+            }],
         });
     }
 }
