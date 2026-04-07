@@ -34,6 +34,7 @@ use fallback_outbox::{
     acknowledge_fallback_path, append_outbox_event, count_pending_fallbacks, gc_fallbacks,
     list_pending_fallback_paths, read_outbox_events, spawn_dead_drop as create_dead_drop_fallback,
 };
+use ledger::LedgerStore;
 use mcp_bridge::{
     is_bearer_authorized, is_supported_agent_name,
 };
@@ -60,6 +61,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
+use serde::Deserialize;
 use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest,
     DismissSessionRequest,
@@ -74,7 +76,7 @@ use shared_types::{
 #[cfg(test)]
 use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -628,6 +630,8 @@ fn build_status_report(
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
+    const LEDGER_PROJECT_LRU_CAPACITY: usize = 128;
+
     #[derive(Debug, Clone)]
     struct DaemonMetrics {
         registry: Registry,
@@ -749,6 +753,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         bind_addr: String,
         sessions: Arc<Mutex<HashMap<String, SessionState>>>,
         sessions_file: Option<PathBuf>,
+        ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
         metrics: Arc<DaemonMetrics>,
     }
 
@@ -865,6 +870,76 @@ async fn run_daemon() -> anyhow::Result<()> {
                 AxumJson(serde_json::json!({ "error": e })),
             )),
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LedgerWakeRequest {
+        project_root: String,
+    }
+
+    async fn ledger_wake_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<LedgerWakeRequest>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+
+        let project_root = PathBuf::from(&req.project_root);
+        if !project_root.is_absolute() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                AxumJson(serde_json::json!({ "error": "project_root must be absolute" })),
+            ));
+        }
+
+        {
+            let mut lru = state.ledger_project_lru.lock().await;
+            if let Some(existing_index) = lru.iter().position(|p| p == &project_root) {
+                lru.remove(existing_index);
+            }
+            lru.push_back(project_root.clone());
+            while lru.len() > LEDGER_PROJECT_LRU_CAPACITY {
+                lru.pop_front();
+            }
+        }
+
+        let drain_result = tokio::task::spawn_blocking({
+            let project_root = project_root.clone();
+            move || -> anyhow::Result<shared_types::DrainResult> {
+                let store = LedgerStore::open(project_root.clone())?;
+                let spool_dir = project_root.join(".triumvirate").join("spool");
+                store.drain_spool(&spool_dir)
+            }
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        state
+            .metrics
+            .ledger_events_ingested_total
+            .inc_by(drain_result.ingested_count as u64);
+
+        Ok(AxumJson(serde_json::json!({
+            "status": "ok",
+            "project_root": req.project_root,
+            "drain_result": drain_result
+        })))
     }
 
     async fn memory_write_route(
@@ -1196,12 +1271,14 @@ async fn run_daemon() -> anyhow::Result<()> {
         bind_addr: bind_addr.clone(),
         sessions: Arc::new(Mutex::new(sessions)),
         sessions_file,
+        ledger_project_lru: Arc::new(Mutex::new(VecDeque::new())),
         metrics: Arc::new(DaemonMetrics::new()?),
     };
     let app = Router::new()
         .route("/metrics", get(metrics_route))
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/ledger/wake", post(ledger_wake_route))
         .route("/ask-agent", post(ask_agent_route))
         .route("/memory/write", post(memory_write_route))
         .route("/memory/read", post(memory_read_route))
