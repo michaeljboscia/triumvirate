@@ -154,6 +154,8 @@ Codex workers are NOT protected by Claude Code hooks. They are constrained by th
 
 The Codex sandbox and git hooks are the mechanical enforcement. validate-task.sh is the verification layer. All three are independent — any one of them catching a violation is sufficient to block the task.
 
+**Threat model:** The enforcement stack prevents out-of-contract WRITES and COMMANDS. It does NOT constrain reads inside the repo — workers need full read access for compilers, linters, and tests. If secrets isolation is required, use ephemeral cloud containers, not local sandbox. For local builds, ensure no ambient credentials or home-dir secrets are mounted into the worktree.
+
 ### REQ-A2.4: Git Pre-Commit Hook
 
 Installed per-worktree via `git config --worktree core.hooksPath .triumvirate/hooks/` during dispatch setup (REQ-A1.2 step 5). The hook reads contract.json from `.triumvirate/contract.json`. Checks:
