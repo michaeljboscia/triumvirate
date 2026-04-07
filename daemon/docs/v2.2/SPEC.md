@@ -72,9 +72,8 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 - **REQ-010:** Claude Code hooks (SessionStart, PostToolUse, Stop, SessionEnd) MUST write raw events to the `events` table. The hook's ONLY job is: validate payload, append event, return. No summarization in the hook path.
 - **REQ-011:** If the SQLite write fails, the hook MUST append the event as NDJSON to a spool file at `<project>/.triumvirate/ledger-spool.ndjson`.
 - **REQ-011a:** A replay daemon MUST drain the spool into SQLite on the next successful DB connection. Spool entries MUST be replayed in order. Successfully replayed entries MUST be removed from the spool file.
-- **REQ-012:** An async compression worker MUST consume raw events and produce summaries. Compression uses a two-tier model:
-  - Tier 0 (always): Local extractive summary — deterministic, zero API cost.
-  - Tier 1 (optional): LLM-powered abstraction for high-value windows (configurable, budget-capped).
+- **REQ-012:** An async compression worker MUST consume raw events and produce summaries using Tier 0: local extractive summary — deterministic, zero API cost. This is the default and always-on path.
+- **REQ-012a:** Tier 1 LLM-powered abstraction MUST activate only when a session window contains 3+ error events, 5+ file edits, or a user-tagged `ledger_record` call. Tier 1 is capped at `TRIUMVIRATE_LEDGER_LLM_MAX_CALLS_PER_DAY` (default: 20). When the cap is reached, Tier 0 handles all remaining compression for the day.
 - **REQ-013:** The compression worker MUST be decoupled from ingestion. Worker failure MUST NOT block or lose raw event capture. Worker state uses a per-job state machine in the `events` table: `pending → running → done | failed`. Running jobs require a heartbeat timestamp. Jobs with stale heartbeats (>90 seconds) auto-reset to `pending`.
 
 ### Retrieval
