@@ -63,11 +63,13 @@ The daemon exposes an MCP server that Claude Code connects to. Tools available:
 
 Codex sessions are ephemeral. Each dispatch:
 1. Creates a git worktree from a specified commit SHA
-2. Writes a `BRIEFING.md` to the worktree root
-3. Writes a `contract.json` to the worktree root (file scope, allowed commands, commit format)
-4. Spawns `codex -p @BRIEFING.md --approval-policy full-auto --sandbox workspace-write`
-5. Monitors for completion (commit detected) or timeout
-6. Returns: commit SHA, modified files, test output, or failure details
+2. Creates `.triumvirate/` directory in the worktree, adds it to `.git/info/exclude`
+3. Writes `BRIEFING.md` and `contract.json` to `.triumvirate/` (not worktree root — prevents accidental commits)
+4. Copies `validate-task.sh` into `.triumvirate/` (Codex sandbox can't reach `~/.claude/scripts/`)
+5. Configures per-worktree hooks: `git config --worktree core.hooksPath .triumvirate/hooks/` and installs the contract-aware pre-commit hook there
+6. Spawns `codex -p @.triumvirate/BRIEFING.md --approval-policy full-auto --sandbox workspace-write`
+7. Monitors for completion (commit detected) or timeout (`task_timeout_sec` from contract.json — enforced by killing the subprocess)
+8. Returns: commit SHA, modified files, test output, or failure details
 
 ### REQ-A1.3: Gemini Query Interface
 
