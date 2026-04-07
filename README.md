@@ -160,44 +160,38 @@ triumvirate-daemon (single Rust binary, ~7,300 lines)
 
 ## Quick Start
 
-### 1. Build the daemon
-
 ```bash
 git clone https://github.com/michaeljboscia/triumvirate
-cd triumvirate/daemon
-cargo build --release
+cd triumvirate
+./install.sh
 ```
 
-### 2. Register as an MCP server
+The installer detects your environment and asks what you want:
 
-Add to your Claude Code config (`~/.claude.json`):
+| Option | What You Get | Build Required |
+|--------|-------------|----------------|
+| **Full Stack** | Daemon + skills + hooks + configs + stenographer | Yes (Rust) |
+| **Daemon + Skills** | Daemon binary + goatrodeo/postrodeo | Yes (Rust) |
+| **Daemon Only** | Just the MCP server | Yes (Rust) |
+| **Skills Only** | Goatrodeo/postrodeo for Claude | No |
 
-```json
-{
-  "mcpServers": {
-    "triumvirate": {
-      "command": "/path/to/triumvirate/daemon/target/release/triumvirate",
-      "args": []
-    }
-  }
-}
-```
-
-### 3. Install the operating environment (optional)
+Or do it manually:
 
 ```bash
-cd starter-kit && ./install.sh
-```
+# Just the daemon
+cd daemon && cargo build --release
 
-### 4. Install the skills (optional)
-
-```bash
+# Just the skills (no build)
 cp skills/claude/*.md ~/.claude/skills/
+
+# Full operating environment
+cd starter-kit && ./install.sh
 ```
 
 ### Requirements
 
-- **Rust 1.82+** (`rustup update stable`)
+- **Rust 1.82+** (`rustup update stable`) — for daemon builds
+- **jq** — for MCP server registration
 - At least one agent CLI:
   - `claude` — [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
   - `gemini` — [Gemini CLI](https://github.com/google-gemini/gemini-cli)
