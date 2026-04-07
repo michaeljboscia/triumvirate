@@ -124,7 +124,9 @@ Agents cannot approve their own work. Every approval requires a different model.
   - `review_request(artifact, review_type, author_agent)` — Creates a review request and assigns a reviewer.
   - `review_submit(review_id, verdict, comments)` — Submits review from the assigned reviewer.
   - `review_status(review_id?)` — Status of pending/completed reviews.
-- **REQ-027:** Peer review is OPTIONAL by default. It becomes MANDATORY when triggered by fleet merge (REQ-040) or when the user enables `TRIUMVIRATE_REQUIRE_PEER_REVIEW=1`.
+- **REQ-027:** Peer review is OPTIONAL for standalone agent work by default.
+- **REQ-027a:** Peer review MUST be MANDATORY for fleet merge operations (REQ-040).
+- **REQ-027b:** Setting `TRIUMVIRATE_REQUIRE_PEER_REVIEW=1` MUST make peer review mandatory for ALL agent output, not just fleet merges.
 
 ---
 
