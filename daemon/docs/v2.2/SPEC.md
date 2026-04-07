@@ -105,6 +105,7 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 ### Migration
 
 - **REQ-018:** The existing `outbox.jsonl` and `memory.jsonl` MUST continue to function during migration. The Ledger runs alongside, not instead of, until v2.3 removes the JSONL paths. The `ledger` crate MUST NOT modify or depend on daemon-core's JSONL files.
+- **REQ-018a:** Ledger Phase 1 initialization MUST ensure `.triumvirate/` is listed in the project's root `.gitignore`. If not present, the Ledger MUST append it. This prevents `ledger.db`, spool directory, and runtime artifacts from polluting `git status`. This is a Ledger responsibility, not a fleet responsibility — it ships in Phase 1 before fleet exists.
 
 ---
 
