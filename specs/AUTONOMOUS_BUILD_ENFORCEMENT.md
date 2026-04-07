@@ -202,6 +202,13 @@ Claude (orchestrator — stateful, full project visibility)
   │            BUILD_MANIFEST.md + DEVIATION_LOG.md (full audit trail)
   │            All written per-task, all on disk, neither depends on context survival
   │
+  ├─ Wave dispatch model: CONCURRENT with cap
+  │   - max_parallel configurable in BUILD_STATE.json (default: 2)
+  │   - dispatch_codex_worktree is non-blocking (returns task_id)
+  │   - Claude dispatches up to max_parallel tasks, then polls get_task_status
+  │   - As tasks complete, dispatch next until wave is done
+  │   - BRIEFING.md is advisory (focus attention). contract.json is enforcement.
+  │
   ├─ For each task in wave order:
   │   │
   │   ├─ 1. BRIEFING GENERATION
