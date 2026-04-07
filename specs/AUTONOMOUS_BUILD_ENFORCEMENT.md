@@ -407,9 +407,9 @@ Every atomic work product populates these artifacts. They are append-only during
 ```
 
 **Triggers:**
-- Step 6b: Every failed validation attempt
-- Step 7c: Every task completion (even if clean — "no deviations" entry)
-- Step 7d: Every Gemini concern
+- Step 5b: Every failed validation attempt
+- Step 6c: Every task completion (even if clean — "no deviations" entry)
+- Step 6d: Every Gemini concern
 - Collateral fixes, scope_out violations, unexpected reality test behavior
 
 **Rule:** If a task completed but has no DEVIATION_LOG entry, the orchestrator failed its obligation. Every task gets at minimum a "clean — no deviations" line. Absence of an entry is a bug in the orchestrator, not evidence that nothing happened.
