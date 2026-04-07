@@ -109,7 +109,7 @@ Machine-readable lessons with confidence decay, stored in the Ledger's SQLite.
   - `lesson_query(query, min_confidence?)` — FTS5 search filtered by confidence threshold.
   - `lesson_validate(lesson_id)` — Resets `last_validated_at` to now, restoring confidence.
   - `lesson_list(tags?, stale?)` — List lessons, optionally filtered.
-- **REQ-022:** When the Ledger's compression worker produces a summary containing an error resolution, bug fix, or architectural decision, it SHOULD auto-propose a lesson via `lesson_add` with confidence 0.6 (lower than manual lessons).
+- **REQ-022:** When the Ledger's compression worker produces a summary with `summary_type` of `error_resolution`, `bug_fix`, or `architecture_decision`, it MUST auto-create a lesson via `lesson_add` with confidence 0.6 (lower than the 0.8 default for manual lessons).
 
 ---
 
