@@ -324,6 +324,51 @@ mod tests {
     }
 
     #[test]
+    fn ingest_succeeds_when_compression_path_is_broken() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_compression_running
+                     BEFORE UPDATE OF compression_state ON events
+                     WHEN NEW.compression_state = 'running'
+                     BEGIN
+                         SELECT RAISE(FAIL, 'compression broken');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .expect("install failing compression trigger");
+
+        store
+            .ingest_event(RawEvent {
+                session_id: "session-broken-compression".to_string(),
+                event_type: "PostToolUse".to_string(),
+                sequence: 1,
+                timestamp: "2026-04-07T00:00:00Z".to_string(),
+                payload_json: "{\"tool\":\"Edit\"}".to_string(),
+            })
+            .expect("ingest should not depend on compression");
+
+        let count = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+                    rusqlite::params!["session-broken-compression"],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("count events");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn drain_spool_ingests_and_deletes_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root = temp.path().join("project");
@@ -513,6 +558,7 @@ mod tests {
                 })
                 .expect("ingest event");
         }
+        crate::compression::process_pending_events(&store).expect("run compression");
 
         let summary_count = store
             .with_conn(|conn| {
@@ -576,6 +622,7 @@ mod tests {
                 payload_json: "{\"tool\":\"Read\",\"summary_type\":\"extractive\"}".to_string(),
             })
             .expect("ingest extractive event");
+        crate::compression::process_pending_events(&store).expect("run compression");
 
         let lessons = store
             .with_conn(|conn| {

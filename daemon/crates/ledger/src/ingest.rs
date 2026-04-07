@@ -1,7 +1,6 @@
 use shared_types::{ManualRecord, RawEvent};
 
 use crate::LedgerStore;
-use crate::compression::process_pending_events;
 use crate::pool::{reap_idle, register_activity};
 use crate::store::with_ingest_priority;
 
@@ -38,7 +37,6 @@ pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Resu
             Ok(())
         })
     })?;
-    let _ = process_pending_events(store)?;
     Ok(())
 }
 
