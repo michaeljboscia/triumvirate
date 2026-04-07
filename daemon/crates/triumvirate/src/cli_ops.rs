@@ -6,6 +6,7 @@ use daemon_core::{
 };
 use daemon_http::{fetch_daemon_status, fetch_daemon_status_snapshot};
 use fallback_outbox::{count_pending_fallbacks, list_pending_fallback_paths};
+use ledger::LedgerStore;
 use mcp_bridge::{daemon_base_url, daemon_status_url};
 use shared_types::{DaemonHealthResponse, DaemonStatusSnapshot};
 use std::{fs, io::Write as _};
@@ -63,18 +64,69 @@ pub(crate) async fn run_doctor() -> anyhow::Result<()> {
         core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     let daemon_base_url = daemon_base_url();
     let daemon_status_url = daemon_status_url();
-    let report = serde_json::json!({
-        "token_file_exists": token_path.exists(),
-        "token_file_path": token_path,
-        "launchd_plist_exists": plist_path.exists(),
-        "launchd_plist_path": plist_path,
-        "daemon_bind_addr": daemon_bind_addr,
-        "daemon_base_url": daemon_base_url,
-        "daemon_status_url": daemon_status_url,
-        "daemon_reachable": daemon_health.is_some(),
-        "daemon_health": daemon_health
-    });
-    write_json_stdout(&report)?;
+    let project_root = std::env::current_dir()?;
+    let ledger_dir = project_root.join(".triumvirate");
+    let ledger_db_path = ledger_dir.join("ledger.db");
+    let spool_dir = ledger_dir.join("spool");
+    let db_exists = ledger_db_path.exists();
+    let spool_files = if spool_dir.exists() {
+        fs::read_dir(&spool_dir)?
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_file())
+            .count()
+    } else {
+        0
+    };
+
+    let mut wal_enabled = false;
+    let mut stale_jobs = 0_i64;
+    let mut events_last_5min = 0_i64;
+    if let Ok(store) = LedgerStore::open(project_root) {
+        wal_enabled = store
+            .journal_mode()
+            .map(|mode| mode.eq_ignore_ascii_case("wal"))
+            .unwrap_or(false);
+        if let Ok(health) = store.health() {
+            stale_jobs = health.stale_jobs;
+            events_last_5min = health.events_last_5min;
+        }
+    }
+
+    write_line_stdout("Daemon:")?;
+    write_line_stdout(&format!("  token_file_exists: {}", token_path.exists()))?;
+    write_line_stdout(&format!("  launchd_plist_exists: {}", plist_path.exists()))?;
+    write_line_stdout(&format!("  daemon_bind_addr: {daemon_bind_addr}"))?;
+    write_line_stdout(&format!("  daemon_base_url: {daemon_base_url}"))?;
+    write_line_stdout(&format!("  daemon_status_url: {daemon_status_url}"))?;
+    write_line_stdout(&format!("  daemon_reachable: {}", daemon_health.is_some()))?;
+
+    write_line_stdout("Ledger:")?;
+    write_line_stdout(&format!(
+        "  db_file_exists: {} ({})",
+        if db_exists { "PASS" } else { "FAIL" },
+        ledger_db_path.display()
+    ))?;
+    write_line_stdout(&format!(
+        "  wal_mode_enabled: {}",
+        if wal_enabled { "PASS" } else { "FAIL" }
+    ))?;
+    write_line_stdout(&format!(
+        "  spool_empty_or_draining: {} (files={spool_files})",
+        if spool_files == 0 || events_last_5min > 0 {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    ))?;
+    write_line_stdout(&format!(
+        "  stale_jobs: {} ({})",
+        if stale_jobs == 0 { "PASS" } else { "FAIL" },
+        stale_jobs
+    ))?;
+    write_line_stdout(&format!(
+        "  last_event_recent: {} (events_last_5min={events_last_5min})",
+        if events_last_5min > 0 { "PASS" } else { "FAIL" }
+    ))?;
     Ok(())
 }
 
