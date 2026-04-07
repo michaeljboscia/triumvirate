@@ -272,6 +272,7 @@ v2.2 ships incrementally. Each phase is independently shippable and testable. La
 - **NG-004:** Plugin system for new agent types. Gemini + Codex only.
 - **NG-005:** Cedar governance / policy engine. Peer review is the governance layer for v2.2.
 - **NG-006:** API-mode (direct Anthropic/OpenAI/Google API). CLI-first stays.
+- **NG-007:** Automatic session-end narrative generation (replacing `/session-notes-full`). Deferred to v2.3 — the Ledger needs to work reliably first before we layer narrative synthesis on top.
 
 ---
 
