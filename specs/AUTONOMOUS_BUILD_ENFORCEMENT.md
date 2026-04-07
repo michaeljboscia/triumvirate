@@ -219,21 +219,22 @@ Claude (orchestrator — stateful, full project visibility)
   │
   ├─ For each task in wave order:
   │   │
-  │   ├─ 1. BRIEFING GENERATION
-  │   │      Claude writes BRIEFING.md containing:
+  │   ├─ 1. BRIEFING + CONTRACT GENERATION
+  │   │      Claude generates briefing content (markdown string) containing:
   │   │      - Task XML block (all 8 fields)
   │   │      - Wave 0 contracts (interfaces/types)
   │   │      - Which files to read first (NOT file contents — worker reads full files from worktree FS)
   │   │      - Synthesized context from prior tasks (10-20 lines max)
   │   │      - Known hazards from prior failures
   │   │      - Execution contract (commit format, done definition)
+  │   │      Claude also generates contract fields (JSON object) from task XML.
+  │   │      Claude does NOT write files — it passes both as structured
+  │   │      parameters to dispatch_codex_worktree.
   │   │
-  │   ├─ 2. CONTRACT GENERATION
-  │   │      Claude generates contract.json from task XML
-  │   │      Installs pre-commit hook in worktree
-  │   │
-  │   ├─ 3. DISPATCH
-  │   │      dispatch_codex_worktree(sha, briefing, contract)
+  │   ├─ 2. DISPATCH (single MCP call)
+  │   │      dispatch_codex_worktree(sha, briefing_content, contract_fields)
+  │   │      Daemon atomically: creates worktree, writes .triumvirate/BRIEFING.md
+  │   │      + contract.json, copies hook script, spawns Codex.
   │   │      Codex session is born. Receives only BRIEFING.md + repo.
   │   │      Zero accumulated context. Zero memory of prior tasks.
   │   │
