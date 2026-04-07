@@ -17,8 +17,27 @@ fn extract_tool_hint(payload_json: &str) -> String {
     }
 }
 
+fn reclaim_stale_running_conn(conn: &rusqlite::Connection) -> anyhow::Result<usize> {
+    let rows = conn.execute(
+        "UPDATE events
+         SET compression_state = 'pending', compression_heartbeat = NULL
+         WHERE compression_state = 'running'
+           AND compression_heartbeat IS NOT NULL
+           AND datetime(compression_heartbeat) < datetime('now', '-90 seconds')",
+        [],
+    )?;
+    Ok(rows)
+}
+
+#[allow(dead_code)]
+pub(crate) fn reclaim_stale_running(store: &LedgerStore) -> anyhow::Result<usize> {
+    store.with_conn(reclaim_stale_running_conn)
+}
+
 pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usize> {
     store.with_conn(|conn| {
+        let _ = reclaim_stale_running_conn(conn)?;
+
         let mut stmt = conn.prepare(
             "SELECT id, event_type, payload_json
              FROM events
@@ -36,6 +55,14 @@ pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usiz
         let mut processed = 0usize;
         for row in rows {
             let (event_id, event_type, payload_json) = row?;
+            conn.execute(
+                "UPDATE events
+                 SET compression_state = 'running',
+                     compression_heartbeat = datetime('now')
+                 WHERE id = ?1",
+                [event_id],
+            )?;
+
             let tool_hint = extract_tool_hint(&payload_json);
             let title = format!("Event {event_id}: {event_type}");
             let narrative = format!("Extractive summary from {event_type}; tool={tool_hint}");
