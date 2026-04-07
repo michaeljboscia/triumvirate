@@ -66,7 +66,18 @@ impl GitOps for RealGitOps {
         // Check tracked files only — untracked files (.pythia, build artifacts) are not dirty.
         let staged = self.git(&["diff", "--quiet", "--cached"]).await?;
         let unstaged = self.git(&["diff", "--quiet"]).await?;
-        Ok(staged.status.success() && unstaged.status.success())
+        let clean = staged.status.success() && unstaged.status.success();
+        if !clean {
+            tracing::warn!(
+                repo = %self.repo_root.display(),
+                staged_ok = staged.status.success(),
+                unstaged_ok = unstaged.status.success(),
+                staged_stderr = %String::from_utf8_lossy(&staged.stderr),
+                unstaged_stderr = %String::from_utf8_lossy(&unstaged.stderr),
+                "is_clean check failed"
+            );
+        }
+        Ok(clean)
     }
 
     async fn current_head(&self) -> anyhow::Result<String> {
