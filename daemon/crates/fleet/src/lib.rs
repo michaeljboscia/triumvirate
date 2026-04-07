@@ -1,6 +1,7 @@
 //! Fleet orchestration crate.
 
 pub mod worktree;
+pub mod tasks;
 
 use shared_types::GitOps;
 
