@@ -203,7 +203,7 @@ Svelte 5 + Tailwind 4 web UI embedded in the daemon binary.
 
 ### Design System
 
-- **REQ-048:** The dashboard MUST follow a design system document (`DESIGN_SYSTEM.md`) specifying: color palette (hex values), typography (font families, sizes, weights), spacing scale, border radius, shadows, breakpoints, and component variants. No ad-hoc styling.
+- **REQ-048:** The dashboard MUST follow a design system document at `dashboard/DESIGN_SYSTEM.md` specifying: color palette (hex values), typography (font families, sizes, weights), spacing scale, border radius, shadows, breakpoints, and component variants. No ad-hoc styling. This document is a spec deliverable — it MUST be written and approved before dashboard development begins. It is source-controlled and dashboard PRs MUST reference updated design tokens when applicable.
 
 ---
 
