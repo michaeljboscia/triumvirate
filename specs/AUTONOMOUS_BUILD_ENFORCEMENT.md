@@ -304,6 +304,28 @@ Claude (orchestrator — stateful, full project visibility)
 
 Every atomic work product populates these artifacts. They are append-only during the build. The orchestrator writes them — workers never touch them.
 
+**BUILD_STATE.json** — Quick-resume checkpoint. Updated after every task completion and wave boundary. On session start or post-compaction, the orchestrator reads this FIRST to recover state.
+
+```json
+{
+  "build_id": "abe-2026-04-07-001",
+  "plan_path": "IMPLEMENTATION_PLAN.md",
+  "current_wave": 2,
+  "tasks_completed": ["T-001", "T-002", "T-003"],
+  "tasks_remaining": ["T-004", "T-005", "T-006"],
+  "tasks_failed": [],
+  "validation_pass_rate": 1.0,
+  "collateral_fix_count": 0,
+  "last_commit_sha": "i7j8k9l",
+  "wave_0_sha": "a1b2c3d",
+  "build_timeout_sec": null,
+  "elapsed_sec": 1920,
+  "updated_at": "2026-04-07T14:55:00Z"
+}
+```
+
+`build_timeout_sec` is optional — no default. Set it after you have real build duration data. Per-task timeout (`task_timeout_sec` in contract.json) is mandatory.
+
 **BUILD_MANIFEST.md** — The permanent record of what was built. One entry per completed task.
 
 ```markdown
