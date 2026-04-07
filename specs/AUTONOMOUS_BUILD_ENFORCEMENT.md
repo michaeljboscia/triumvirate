@@ -33,7 +33,7 @@ Each task in an IMPLEMENTATION_PLAN.md is executed by a fresh agent session that
 Claude (orchestrator) and Gemini (auditor) maintain full project visibility throughout the build. Claude writes briefings and after-action reports. Gemini reviews committed code between tasks. Workers (Codex) see only their briefing. The supervisors see everything.
 
 ### REQ-A5: Self-Correcting Failure Loops
-When a worker fails validation, the orchestrator diagnoses the failure, Gemini provides a second opinion, and a NEW worker session receives a repair briefing. The failed session's context is discarded — the repair worker inherits the solution, not the failure.
+When a worker fails validation, the orchestrator classifies the failure into one of four types: `worker-error` (bad code — repair briefing), `contract-error` (wrong contract — orchestrator fixes contract, redispatches), `orchestrator-briefing-error` (misleading briefing — Claude self-diagnoses with Gemini, rewrites briefing), or `environment-error` (dependency/sandbox issue — halt immediately, escalate). Each class gets a different retry strategy. The failed session's context is discarded — the repair worker inherits the solution, not the failure.
 
 ---
 
