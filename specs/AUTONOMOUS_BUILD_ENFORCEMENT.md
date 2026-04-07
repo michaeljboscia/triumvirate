@@ -43,6 +43,8 @@ When a worker fails validation, the orchestrator classifies the failure into one
 
 **Depends on:** Triumvirate v2 daemon (agent pool, message fabric)
 
+**Bootstrap note:** Phase 1 builds the tools that make Phase 2+ autonomous. Phase 1 itself is built the way you build now — hand Codex the spec, watch it build, Claude reviews commits. The autonomous loop kicks in at Phase 2.
+
 ### REQ-A1.1: Daemon MCP Adapter
 
 The daemon exposes an MCP server that Claude Code connects to. Tools available:
