@@ -87,11 +87,11 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 
 ### Retrieval
 
-- **REQ-014:** The Ledger MUST expose MCP tools accessible to Claude directly via MCP protocol:
+- **REQ-014:** The Ledger MUST expose retrieval MCP tools accessible to Claude directly via MCP protocol (Phase 2):
   - `ledger_query(query: string, project?: string, limit?: int)` — FTS5 search over summaries. Returns ranked results with session context.
   - `ledger_session(session_id: string)` — Full session reconstruction: metadata + events + summaries.
   - `ledger_record(title: string, narrative: string, facts: string[], concepts: string[])` — Manual high-signal recording by any agent. Writes directly to `summaries`.
-  - `ledger_health()` — (Moved to REQ-015a in Health section — ships in Phase 1).
+  Note: `ledger_health()` is in REQ-015a (Health section, Phase 1).
 - **REQ-014a:** Gemini and Codex (text-in/text-out subprocesses) MAY access ledger tools via structured XML markers in their stdout (e.g., `<triumvirate_tool name="ledger_record">...</triumvirate_tool>`). This is an OPPORTUNISTIC high-signal capture path, not the primary durability mechanism. The `agent-adapter` crate MUST parse these markers when present, execute the tool in the daemon, and inject the result back into the agent's context. If the agent outputs malformed XML, the adapter MUST return a synthetic error message to trigger self-correction.
 - **REQ-014b:** The daemon MUST inject XML tool usage instructions into the startup prompt for Gemini and Codex agents. Core session capture (REQ-010) remains the primary durability path — XML markers are additive, not required. The daemon MUST track `marker_parse_success_rate` as a Prometheus metric and emit a `degraded` health warning if the rate falls below 50% over a 1-hour window.
 
