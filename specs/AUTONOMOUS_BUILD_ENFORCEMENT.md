@@ -87,7 +87,7 @@ Both use the existing Triumvirate daemon → Gemini CLI pathway. No new infrastr
 
 ### REQ-A2.1: contract.json Per Task
 
-Goat rodeo Phase 4.3 produces the execution contract as a markdown appendix in IMPLEMENTATION_PLAN.md. For mechanical enforcement, Phase 4.3 ALSO generates a `contract.json` per task:
+Goat rodeo Phase 4.3 produces the execution contract as a markdown appendix in IMPLEMENTATION_PLAN.md. For mechanical enforcement, Phase 4.3 ALSO generates a `contract.json` per task, written to `.triumvirate/contract.json` in the worktree (NOT the worktree root — see REQ-A1.2):
 
 ```json
 {
