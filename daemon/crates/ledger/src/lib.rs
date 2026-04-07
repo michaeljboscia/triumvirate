@@ -2,6 +2,7 @@ mod compression;
 mod health;
 mod init;
 mod ingest;
+mod pool;
 mod spool;
 mod store;
 
@@ -491,5 +492,34 @@ mod tests {
             .expect("query states");
         assert_eq!(states[0].1, "pending");
         assert_eq!(states[1].1, "running");
+    }
+
+    #[test]
+    fn pool_manager_enforces_idle_ttl_and_capacity() {
+        crate::pool::reset_pool_state_for_tests();
+        let t0 = 1_000_u64;
+
+        let p1 = PathBuf::from("/tmp/pool-a");
+        let p2 = PathBuf::from("/tmp/pool-b");
+        let p3 = PathBuf::from("/tmp/pool-c");
+        crate::pool::register_activity_at(&p1, t0);
+        crate::pool::register_activity_at(&p2, t0);
+        crate::pool::register_activity_at(&p3, t0);
+        let stats = crate::pool::pool_stats();
+        assert_eq!(stats.active_pools, 3);
+        assert_eq!(stats.queued_projects, 0);
+
+        crate::pool::reap_idle_at(t0 + 16 * 60 * 1000);
+        let stats_after_idle = crate::pool::pool_stats();
+        assert_eq!(stats_after_idle.active_pools, 0);
+
+        crate::pool::reset_pool_state_for_tests();
+        for idx in 0..11 {
+            let path = PathBuf::from(format!("/tmp/pool-{idx}"));
+            crate::pool::register_activity_at(&path, t0);
+        }
+        let stats_with_cap = crate::pool::pool_stats();
+        assert_eq!(stats_with_cap.active_pools, 10);
+        assert_eq!(stats_with_cap.queued_projects, 1);
     }
 }
