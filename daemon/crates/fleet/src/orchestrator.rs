@@ -218,10 +218,9 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     "---\ntask_id: {task_id}\nfleet_id: {fleet_id}\nassigned_agent: {agent}\ndepends_on: []\n---\n\n{task_description}\n"
                 ),
             )?;
-            let child = self
-                .launcher
-                .launch(agent, &project_root, &worktree_path)
-                .await?;
+            let task_prompt = format!(
+                "You are a fleet agent working in a git worktree. Read your task assignment at .triumvirate/fleet-task.md and complete the work. Commit your changes when done.\n\nTask: {task_description}"
+            );
             let sequence = event_sequence_for(&project_root, &fleet_id, "agent_started")?;
             store.ingest_event(RawEvent {
                 session_id: fleet_id.clone(),
@@ -247,7 +246,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 })
                 .to_string(),
             })?;
-            running_agents.push((child, task_id.clone(), agent.to_string()));
+            // Launch via daemon's ask_agent — blocks until agent completes
+            running_agents.push((task_prompt, task_id.clone(), agent.to_string()));
             worktree_paths.push(worktree_path);
         }
 
