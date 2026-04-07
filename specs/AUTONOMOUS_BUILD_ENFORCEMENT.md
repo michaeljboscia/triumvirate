@@ -265,7 +265,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    Sections: What Failed → Root Cause → The Fix → Do NOT
   │   │   │    No raw log paste. No conversation history. Diff-focused only.
   │   │   │
-  │   │   ├─ 6e. dispatch_codex_worktree(sha, repair_briefing, contract)
+  │   │   ├─ 5e. dispatch_codex_worktree(sha, repair_briefing, contract)
   │   │   │    NEW session — no memory of prior failure
   │   │   │
   │   │   └─ Loop: max 3 attempts per failure class, then escalate to human
