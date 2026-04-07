@@ -1,5 +1,9 @@
 //! Shared DTOs for MCP bridge <-> daemon communication.
 
+mod git_ops;
+
+pub use git_ops::{GitOps, MergeResult};
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
