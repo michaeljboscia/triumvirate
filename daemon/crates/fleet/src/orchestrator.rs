@@ -214,6 +214,13 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let branch = format!("fleet/{fleet_id}/{task_id}");
             let worktree_path = base.join(format!("{fleet_id}-{task_id}-{agent}"));
             task_store.insert_task(&task_id, &fleet_id, &task_id, &[])?;
+            let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+            conn.execute(
+                "UPDATE tasks
+                 SET state = 'in_progress', assigned_agent = ?2
+                 WHERE task_id = ?1",
+                rusqlite::params![task_id.as_str(), agent.as_str()],
+            )?;
             self.worktree
                 .create_worktree(&worktree_path, &branch)
                 .await?;
@@ -238,6 +245,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     "fleet_id": fleet_id,
                     "task_id": task_id,
                     "agent": agent
+                })
+                .to_string(),
+            })?;
+            let sequence = event_sequence_for(&project_root, &fleet_id, "task_claimed")?;
+            store.ingest_event(RawEvent {
+                session_id: fleet_id.clone(),
+                event_type: "task_claimed".to_string(),
+                sequence,
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                payload_json: serde_json::json!({
+                    "task_id": task_id,
+                    "assigned_agent": agent
                 })
                 .to_string(),
             })?;
@@ -270,6 +289,11 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 let wait_result = child.wait().await;
                 match wait_result {
                     Ok(status) if status.success() => {
+                        tracing::info!(
+                            fleet_id = %fleet_id,
+                            task_id = %task_id,
+                            "fleet agent completed successfully"
+                        );
                         if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                             let _ = task_store.complete_task(&task_id);
                         }
@@ -280,6 +304,12 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 artifact: format!("fleet/{fleet_id}/{task_id}"),
                                 review_type: "code".to_string(),
                             });
+                            tracing::info!(
+                                fleet_id = %fleet_id,
+                                task_id = %task_id,
+                                reviewer_target = %agent_name,
+                                "peer review requested for completed task"
+                            );
                         }
                     }
                     Ok(status) => {
