@@ -203,7 +203,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │      Claude writes BRIEFING.md containing:
   │   │      - Task XML block (all 8 fields)
   │   │      - Wave 0 contracts (interfaces/types)
-  │   │      - Current state of files this task touches (git show)
+  │   │      - Which files to read first (NOT file contents — worker reads full files from worktree FS)
   │   │      - Synthesized context from prior tasks (10-20 lines max)
   │   │      - Known hazards from prior failures
   │   │      - Execution contract (commit format, done definition)
