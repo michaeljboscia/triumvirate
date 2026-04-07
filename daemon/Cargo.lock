@@ -506,6 +506,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "daemon-core",
+ "daemon-http",
  "ledger",
  "peer-review",
  "rusqlite",
