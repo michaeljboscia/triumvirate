@@ -169,12 +169,15 @@ Note: validate-task.sh is copied into `.triumvirate/` during dispatch (REQ-A1.2 
 
 ### REQ-A2.6: Wave Boundary Gate
 
+**No-overlap invariant:** Before dispatching any wave, the orchestrator statically validates that no two tasks in the same wave share `allowed_files` entries. If overlap is detected, the later task is moved to the next wave. This prevents merge conflicts and eliminates the need for conflict resolution logic.
+
 Between waves, the orchestrator:
 1. Collects all validation results from completed wave tasks
 2. Dispatches Gemini review of all committed code in the wave
 3. Runs full test suite against merged state
 4. Blocks next wave if any task failed validation or Gemini raised concerns
 5. Writes wave summary to BUILD_MANIFEST.md
+6. Updates BUILD_STATE.json (current wave, completed tasks, validation pass rate, last commit SHA)
 
 ---
 
