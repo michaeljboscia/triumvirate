@@ -149,7 +149,7 @@ Parallel agent execution with worktrees, task lists, and sequential merge.
 ### Task Management
 
 - **REQ-031:** The `fleet` crate MUST define a task list stored in the Ledger's SQLite: task_id, fleet_id, title, description, assigned_agent, state (pending|claimed|in_progress|done|failed|blocked), depends_on (list of task_ids), created_at, completed_at.
-- **REQ-032:** Task claiming MUST be atomic — two agents cannot claim the same task. SQLite row-level locking handles this.
+- **REQ-032:** Task claiming MUST be atomic — two agents cannot claim the same task. The daemon owns the single write connection to the source project's `ledger.db`. Agents claim tasks by calling `fleet_claim_task` MCP tool, which the daemon executes as a single SQLite transaction (`UPDATE tasks SET state='claimed', assigned_agent=? WHERE task_id=? AND state='pending'` + check `changes() == 1`).
 - **REQ-033:** Tasks with unmet `depends_on` MUST NOT be claimable. The fleet engine resolves the dependency graph and exposes only unblocked tasks.
 
 ### Fleet Orchestration
