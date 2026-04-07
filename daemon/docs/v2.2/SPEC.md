@@ -274,6 +274,7 @@ v2.2 ships incrementally. Each phase is independently shippable and testable. La
 
 | Phase | Crate(s) | REQs | Ships | Rollback? |
 |-------|----------|------|-------|-----------|
+| **0.5 — Observability** | `triumvirate` (wiring existing deps) | REQ-059–062 | tracing + OTel + Prometheus /metrics. All subsequent phases are instrumented. | Yes — disable via RUST_LOG/OTEL env vars |
 | **1 — Data** | `shared-types` (DTOs + GitOps trait), `ledger` (ingestion/spool/drain/health) | REQ-001–005, 006–013b, 015–018a (excl. 014 block) | Fixes stenographer. Ledger captures events. Health visible. | Yes — JSONL still works (REQ-018) |
 | **2 — Knowledge** | `ledger` (retrieval + lessons) | REQ-014–014b, 019–022 | FTS5 search, lesson CRUD, confidence decay | Yes — Phase 1 still captures without retrieval |
 | **3 — Fleet Core** | `fleet` (worktrees/tasks/claiming/progress) | REQ-028–037 | Parallel agents with task lists. No review gate yet. | Yes — behind `TRIUMVIRATE_FLEET_ENABLED` flag |
