@@ -170,6 +170,22 @@ pub struct OutboxRecentResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LedgerQueryRequest {
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LedgerQueryResponse {
+    pub summaries: Vec<Summary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LedgerSessionRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonHealthResponse {
     pub status: String,
     pub service: Option<String>,
@@ -249,5 +265,17 @@ mod tests {
         let decoded: super::StatusResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.active_sessions, 2);
         assert_eq!(decoded.daemon_bind_addr, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn ledger_query_request_roundtrips_json() {
+        let req = super::LedgerQueryRequest {
+            query: "wal".to_string(),
+            limit: Some(5),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let decoded: super::LedgerQueryRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.query, "wal");
+        assert_eq!(decoded.limit, Some(5));
     }
 }
