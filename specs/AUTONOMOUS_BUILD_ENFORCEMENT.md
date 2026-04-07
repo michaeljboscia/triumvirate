@@ -254,7 +254,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    - environment-error: subprocess exit indicates missing binary or sandbox error
   │   │   │    - orchestrator-briefing-error: everything else (conservative default → Gemini reviews)
   │   │   │
-  │   │   ├─ 6b. Claude APPENDS to DEVIATION_LOG.md (MANDATORY):
+  │   │   ├─ 5b. Claude APPENDS to DEVIATION_LOG.md (MANDATORY):
   │   │   │    Log: task_id, attempt number, failure CLASS, failure details,
   │   │   │    validate-task.sh output, root cause diagnosis
   │   │   │
