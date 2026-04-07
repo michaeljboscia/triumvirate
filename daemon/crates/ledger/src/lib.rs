@@ -1,3 +1,4 @@
+mod compression;
 mod health;
 mod init;
 mod ingest;
@@ -380,5 +381,67 @@ mod tests {
             .filter(|line| line.trim() == ".triumvirate/")
             .count();
         assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn compression_creates_extractive_summaries_and_marks_done() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        let payloads = [
+            "{\"tool\":\"Edit\",\"file\":\"src/lib.rs\"}",
+            "{\"tool\":\"Bash\",\"cmd\":\"cargo test\"}",
+            "{\"tool\":\"Read\",\"file\":\"README.md\"}",
+            "{\"tool\":\"Edit\",\"file\":\"src/main.rs\"}",
+            "{\"tool\":\"Bash\",\"cmd\":\"cargo check\"}",
+        ];
+        for (idx, payload) in payloads.iter().enumerate() {
+            store
+                .ingest_event(RawEvent {
+                    session_id: "compression-session".to_string(),
+                    event_type: "PostToolUse".to_string(),
+                    sequence: (idx + 1) as i64,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: (*payload).to_string(),
+                })
+                .expect("ingest event");
+        }
+
+        let summary_count = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))?;
+                Ok(count)
+            })
+            .expect("count summaries");
+        assert!(summary_count >= 1);
+
+        let narratives = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT narrative FROM summaries ORDER BY id ASC")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .expect("read narratives");
+        let joined = narratives.join(" ");
+        assert!(joined.contains("Edit") || joined.contains("Bash") || joined.contains("Read"));
+
+        let done_count = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE compression_state = 'done'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("count done events");
+        assert_eq!(done_count, payloads.len() as i64);
     }
 }

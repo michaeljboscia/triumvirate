@@ -1,6 +1,7 @@
 use shared_types::RawEvent;
 
 use crate::LedgerStore;
+use crate::compression::process_pending_events;
 
 pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Result<()> {
     store.with_conn(|conn| {
@@ -17,5 +18,7 @@ pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Resu
             ],
         )?;
         Ok(())
-    })
+    })?;
+    let _ = process_pending_events(store)?;
+    Ok(())
 }
