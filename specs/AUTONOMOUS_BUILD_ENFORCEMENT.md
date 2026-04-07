@@ -238,13 +238,13 @@ Claude (orchestrator — stateful, full project visibility)
   │   │      Codex session is born. Receives only BRIEFING.md + repo.
   │   │      Zero accumulated context. Zero memory of prior tasks.
   │   │
-  │   ├─ 4. MONITOR
+  │   ├─ 3. MONITOR
   │   │      Wait for completion, timeout, or failure
   │   │      get_task_status() polling or event subscription
   │   │
-  │   ├─ 5. VALIDATE
+  │   ├─ 4. VALIDATE
   │   │      validate-task.sh runs (mechanical)
-  │   │      Claude reads VALIDATION_LOG.md
+  │   │      Claude reads .triumvirate/VALIDATION_LOG.md
   │   │
   │   ├─ 6. IF BLOCKED:
   │   │   │
