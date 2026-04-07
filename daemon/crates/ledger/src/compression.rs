@@ -18,6 +18,24 @@ fn extract_tool_hint(payload_json: &str) -> String {
     }
 }
 
+fn extract_summary_type(payload_json: &str) -> String {
+    match serde_json::from_str::<Value>(payload_json) {
+        Ok(value) => value
+            .get("summary_type")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "extractive".to_string()),
+        Err(_) => "extractive".to_string(),
+    }
+}
+
+fn should_auto_create_lesson(summary_type: &str) -> bool {
+    matches!(
+        summary_type,
+        "error_resolution" | "bug_fix" | "architecture_decision"
+    )
+}
+
 fn reclaim_stale_running_conn(conn: &rusqlite::Connection) -> anyhow::Result<usize> {
     let rows = with_task_state_priority(|| {
         let rows = conn.execute(
@@ -71,6 +89,7 @@ pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usiz
             })?;
 
             let tool_hint = extract_tool_hint(&payload_json);
+            let summary_type = extract_summary_type(&payload_json);
             let title = format!("Event {event_id}: {event_type}");
             let narrative = format!("Extractive summary from {event_type}; tool={tool_hint}");
             let facts_json = serde_json::json!([format!("tool:{tool_hint}"), format!("event_type:{event_type}")]).to_string();
@@ -84,8 +103,8 @@ pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usiz
                 with_task_state_priority(|| {
                     conn.execute(
                         "INSERT INTO summaries (event_id, title, narrative, facts_json, summary_type)
-                         VALUES (?1, ?2, ?3, ?4, 'extractive')",
-                        rusqlite::params![event_id, title, narrative, facts_json],
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![event_id, title, narrative, facts_json, summary_type],
                     )?;
                     conn.execute(
                         "UPDATE sessions
@@ -93,6 +112,25 @@ pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usiz
                          WHERE session_id IN (SELECT session_id FROM events WHERE id = ?1)",
                         [event_id],
                     )?;
+                    if should_auto_create_lesson(&summary_type) {
+                        conn.execute(
+                            "INSERT INTO lessons (title, body, source_session_id, initial_confidence, tags_json, req_ids_json)
+                             VALUES (
+                                ?1,
+                                ?2,
+                                (SELECT session_id FROM events WHERE id = ?3),
+                                0.6,
+                                ?4,
+                                NULL
+                             )",
+                            rusqlite::params![
+                                title,
+                                narrative,
+                                event_id,
+                                serde_json::json!([summary_type]).to_string()
+                            ],
+                        )?;
+                    }
                     Ok(())
                 })?;
             }
