@@ -755,6 +755,7 @@ start it with: triumvirate daemon"
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec!["codex".to_string(), "gemini".to_string()]);
         let dry_run = req.dry_run.unwrap_or(true);
+        let wait = req.wait.unwrap_or(false);
 
         let git_ops = git_ops_impl::RealGitOps::new(project_root.clone())
             .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
@@ -764,17 +765,22 @@ start it with: triumvirate daemon"
                 project_root: project_root.clone(),
                 agents: agents.clone(),
                 dry_run,
+                wait: Some(wait),
             })
             .await
             .map_err(|e| format!("fleet_spawn failed: {e}"))?;
 
+        let state = if dry_run {
+            "planned".to_string()
+        } else if wait {
+            "running".to_string()
+        } else {
+            "spawning".to_string()
+        };
+
         let status = FleetStatusResponse {
             fleet_id: result.fleet_id.clone(),
-            state: if dry_run {
-                "planned".to_string()
-            } else {
-                "running".to_string()
-            },
+            state: state.clone(),
             worktree_paths: result
                 .worktree_paths
                 .iter()
@@ -788,11 +794,7 @@ start it with: triumvirate daemon"
             fleet_id: result.fleet_id,
             plan: result.plan_text,
             head_sha: result.head_sha,
-            state: if dry_run {
-                "planned".to_string()
-            } else {
-                "running".to_string()
-            },
+            state,
         }))
     }
 
@@ -5270,6 +5272,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
                 project_root: None,
                 agents: Some(vec!["codex".to_string(), "gemini".to_string()]),
                 dry_run: Some(true),
+                wait: Some(false),
                 task_description: Some("test".to_string()),
             }))
             .await
@@ -5282,6 +5285,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
                 project_root: None,
                 agents: Some(vec!["codex".to_string(), "gemini".to_string()]),
                 dry_run: Some(false),
+                wait: Some(true),
                 task_description: Some("test".to_string()),
             }))
             .await
