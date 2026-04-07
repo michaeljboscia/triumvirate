@@ -23,6 +23,7 @@ use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 use daemon_http::{
     fetch_daemon_ask_agent, fetch_daemon_fallback_ack,
     fetch_daemon_fallback_gc, fetch_daemon_fallback_list, fetch_daemon_memory_read,
+    fetch_daemon_ledger_query, fetch_daemon_ledger_record, fetch_daemon_ledger_session,
     fetch_daemon_memory_write, fetch_daemon_outbox_recent, fetch_daemon_scratchpad_list,
     fetch_daemon_scratchpad_write, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
     fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
@@ -66,12 +67,13 @@ use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest,
     DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
-    FallbackListResponse, MemoryEntry, MemoryReadRequest, MemoryReadResponse,
+    FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest, ManualRecord, MemoryEntry,
+    MemoryReadRequest, MemoryReadResponse,
     MemoryWriteRequest, MemoryWriteResponse, OutboxRecentRequest,
     OutboxRecentResponse, SessionInfo, SessionListResponse, SpawnSessionRequest,
     ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
     ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse,
-    HealthStatus,
+    HealthStatus, SessionDetail, Summary,
     SessionState,
 };
 #[cfg(test)]
@@ -556,6 +558,65 @@ impl McpBridge {
             .map_err(|e| format!("failed to query ledger health: {e}"))?;
         Ok(Json(health))
     }
+
+    #[tool(description = "Search ledger summaries via FTS5.")]
+    async fn ledger_query(
+        &self,
+        Parameters(req): Parameters<LedgerQueryRequest>,
+    ) -> Result<Json<LedgerQueryResponse>, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_ledger_query(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("ledger_query via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        let summaries = store
+            .query(&req.query, req.limit.unwrap_or(10))
+            .map_err(|e| format!("ledger_query failed: {e}"))?;
+        Ok(Json(LedgerQueryResponse { summaries }))
+    }
+
+    #[tool(description = "Fetch full ledger session reconstruction for a session_id.")]
+    async fn ledger_session(
+        &self,
+        Parameters(req): Parameters<LedgerSessionRequest>,
+    ) -> Result<Json<SessionDetail>, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_ledger_session(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("ledger_session via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        store
+            .get_session(&req.session_id)
+            .map(Json)
+            .map_err(|e| format!("ledger_session failed: {e}"))
+    }
+
+    #[tool(description = "Insert a manual high-signal summary record into ledger.")]
+    async fn ledger_record(&self, Parameters(req): Parameters<ManualRecord>) -> Result<String, String> {
+        if mcp_daemon_proxy_enabled() {
+            return fetch_daemon_ledger_record(&req)
+                .await
+                .map_err(|e| format!("ledger_record via daemon failed: {e}"));
+        }
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let store = LedgerStore::open(project_root)
+            .map_err(|e| format!("failed to open ledger store: {e}"))?;
+        store
+            .record(req)
+            .map_err(|e| format!("ledger_record failed: {e}"))?;
+        Ok("ok".to_string())
+    }
 }
 
 async fn execute_ask_agent(
@@ -1007,6 +1068,141 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(health))
     }
 
+    async fn ledger_query_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<LedgerQueryRequest>,
+    ) -> Result<AxumJson<LedgerQueryResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        let summaries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Summary>> {
+            let store = LedgerStore::open(project_root)?;
+            store.query(&req.query, req.limit.unwrap_or(10))
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(LedgerQueryResponse { summaries }))
+    }
+
+    async fn ledger_session_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<LedgerSessionRequest>,
+    ) -> Result<AxumJson<SessionDetail>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        let session = tokio::task::spawn_blocking(move || -> anyhow::Result<SessionDetail> {
+            let store = LedgerStore::open(project_root)?;
+            store.get_session(&req.session_id)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(session))
+    }
+
+    async fn ledger_record_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<ManualRecord>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            ));
+        }
+
+        let project_root = {
+            let lru = state.ledger_project_lru.lock().await;
+            lru.back().cloned()
+        }
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+            )
+        })?;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let store = LedgerStore::open(project_root)?;
+            store.record(req)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        Ok(AxumJson(serde_json::json!({ "status": "ok" })))
+    }
+
     fn ledger_sweep_interval() -> Duration {
         std::env::var("TRIUMVIRATE_LEDGER_SWEEP_SECONDS")
             .ok()
@@ -1395,6 +1591,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/status", get(status))
         .route("/ledger/wake", post(ledger_wake_route))
         .route("/ledger/health", get(ledger_health_route))
+        .route("/ledger/query", post(ledger_query_route))
+        .route("/ledger/session", post(ledger_session_route))
+        .route("/ledger/record", post(ledger_record_route))
         .route("/ask-agent", post(ask_agent_route))
         .route("/memory/write", post(memory_write_route))
         .route("/memory/read", post(memory_read_route))
@@ -3806,6 +4005,44 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         let out = bridge.ledger_health().await.map_err(anyhow::Error::msg)?;
         assert!(!out.0.status.is_empty());
         assert!(out.0.db_size_bytes >= 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ledger_record_and_query_tools_round_trip() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let original_cwd = std::env::current_dir()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-ledger-mcp-{now}"));
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))?;
+        std::env::set_current_dir(&project_root)?;
+
+        let bridge = McpBridge::new_ephemeral();
+        bridge
+            .ledger_record(Parameters(ManualRecord {
+                session_id: None,
+                title: "test".to_string(),
+                narrative: "round trip".to_string(),
+                facts_json: None,
+                concepts_json: None,
+                affected_files_json: None,
+                summary_type: "architecture_decision".to_string(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let out = bridge
+            .ledger_query(Parameters(LedgerQueryRequest {
+                query: "test".to_string(),
+                limit: Some(10),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(out.0.summaries.iter().any(|summary| summary.title == "test"));
+
+        std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_dir_all(project_root);
         Ok(())
     }
 }

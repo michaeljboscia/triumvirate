@@ -164,6 +164,24 @@ pub fn daemon_fallback_gc_url() -> String {
 }
 
 #[instrument(skip_all)]
+pub fn daemon_ledger_query_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LEDGER_QUERY_URL")
+        .unwrap_or_else(|_| format!("{}/ledger/query", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
+pub fn daemon_ledger_session_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LEDGER_SESSION_URL")
+        .unwrap_or_else(|_| format!("{}/ledger/session", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
+pub fn daemon_ledger_record_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LEDGER_RECORD_URL")
+        .unwrap_or_else(|_| format!("{}/ledger/record", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
 pub fn gemini_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_GEMINI_ARGS", "mock-gemini")
 }
