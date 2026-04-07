@@ -24,7 +24,7 @@ A three-phase system that lets the human walk away after approving the spec. Pha
 Claude can programmatically dispatch tasks to Codex and query Gemini without human intermediation. The daemon MCP adapter exposes these capabilities as tool calls within a Claude Code session. This is the prerequisite for everything else.
 
 ### REQ-A2: Mechanical Enforcement
-No enforcement rule depends on the agent choosing to comply. Claude Code hooks block out-of-scope file writes before they happen. Git pre-commit hooks reject non-compliant commits with error messages designed for AI self-correction. validate-task.sh checks compliance after the fact. Three layers, all mechanical.
+No enforcement rule depends on the agent choosing to comply. Enforcement is split by agent type: Claude Code PreToolUse hooks guard the orchestrator (Claude). Codex workers are constrained by OS-level sandbox (Seatbelt/Landlock) + git pre-commit hooks + post-commit validate-task.sh. Git pre-commit hooks reject non-compliant commits with error messages designed for AI self-correction. Three layers per agent, all mechanical.
 
 ### REQ-A3: Atomic Dispatch
 Each task in an IMPLEMENTATION_PLAN.md is executed by a fresh agent session that receives only a briefing document, the repo state, and the execution contract. No accumulated context from prior tasks. Context dies with the session. State lives in the orchestrator.
