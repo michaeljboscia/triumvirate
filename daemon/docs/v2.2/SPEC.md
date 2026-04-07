@@ -199,7 +199,9 @@ Svelte 5 + Tailwind 4 web UI embedded in the daemon binary.
 
 ## Feature 6: OutboxEvent Enrichment (REQ-017 from v2.1)
 
-- **REQ-049:** The `OutboxEvent` struct in `shared-types` MUST be extended with optional fields: `working_state: Option<String>`, `token_usage: Option<TokenUsage>`, `tool_name: Option<String>`. These fields are backward-compatible — old readers ignore them.
+- **REQ-049:** The `OutboxEvent` struct in `shared-types` MUST be extended with `working_state: Option<String>` — backward-compatible, old readers ignore it.
+- **REQ-049a:** The `OutboxEvent` struct MUST be extended with `token_usage: Option<TokenUsage>` — populated from `ParsedAgentResult`.
+- **REQ-049b:** The `OutboxEvent` struct MUST be extended with `tool_name: Option<String>` — the last tool call name from agent output.
 - **REQ-050:** The agent execution path in `triumvirate/src/agent_exec.rs` MUST populate these fields from the `ParsedAgentResult` returned by `agent-adapter` parsers.
 
 ---
