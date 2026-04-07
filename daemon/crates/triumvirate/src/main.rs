@@ -51,12 +51,13 @@ use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use axum::{
     Json as AxumJson, Router,
     body::Body,
-    extract::{State, WebSocketUpgrade, ws::Message},
-    http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
+    extract::{Path, State, WebSocketUpgrade, ws::Message},
+    http::{HeaderMap, Request, Response as HttpResponse, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use rust_embed::RustEmbed;
 use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGauge, Registry, TextEncoder};
 use rmcp::{
     Json, ServerHandler, ServiceExt,
@@ -109,6 +110,10 @@ mod agent_exec;
 mod cli_ops;
 mod git_ops_impl;
 mod tracing_setup;
+
+#[derive(RustEmbed)]
+#[folder = "../../../dashboard/dist"]
+struct DashboardAssets;
 
 #[derive(Debug, Parser)]
 #[command(name = "triumvirate")]
@@ -1182,6 +1187,32 @@ async fn run_daemon() -> anyhow::Result<()> {
         })
     }
 
+    fn dashboard_asset_response(path: &str) -> Option<HttpResponse<Body>> {
+        let normalized = path.trim_start_matches('/');
+        let asset = DashboardAssets::get(normalized)?;
+        let mime = mime_guess::from_path(normalized).first_or_octet_stream();
+        let headers = [(axum::http::header::CONTENT_TYPE, mime.as_ref())];
+        Some((headers, asset.data.into_owned()).into_response())
+    }
+
+    async fn dashboard_root_route() -> Response {
+        dashboard_asset_response("index.html")
+            .unwrap_or_else(|| (StatusCode::NOT_FOUND, "dashboard index not found").into_response())
+    }
+
+    async fn dashboard_assets_route(Path(path): Path<String>) -> Response {
+        let asset_path = format!("assets/{path}");
+        dashboard_asset_response(&asset_path)
+            .unwrap_or_else(|| (StatusCode::NOT_FOUND, "asset not found").into_response())
+    }
+
+    async fn dashboard_spa_fallback_route(Path(path): Path<String>) -> Response {
+        dashboard_asset_response(&path).unwrap_or_else(|| {
+            dashboard_asset_response("index.html")
+                .unwrap_or_else(|| (StatusCode::NOT_FOUND, "dashboard index not found").into_response())
+        })
+    }
+
     async fn metrics_route(
         State(state): State<DaemonState>,
     ) -> Result<String, (StatusCode, AxumJson<serde_json::Value>)> {
@@ -2165,6 +2196,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         ws_events: broadcast::channel(256).0,
     };
     let app = Router::new()
+        .route("/", get(dashboard_root_route))
+        .route("/assets/{*path}", get(dashboard_assets_route))
         .route("/metrics", get(metrics_route))
         .route("/ws", get(ws_route))
         .route("/health", get(health))
@@ -2191,6 +2224,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/ask", post(session_ask_route))
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
+        .route("/{*path}", get(dashboard_spa_fallback_route))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
