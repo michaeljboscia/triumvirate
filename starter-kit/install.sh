@@ -3,14 +3,14 @@
 # Triumvirate Starter Kit — Installer
 #
 # Builds and wires the complete Triumvirate operating environment:
-#   mcp-server/          — Builds the inter-agent MCP server (npm install + tsc)
+#   daemon/              — Builds the Rust daemon (cargo build --release)
 #   ~/.claude/hooks/     — Claude Code hooks (session lifecycle + safety gates)
 #   ~/.claude/           — Claude Code settings and instructions
-#   ~/.claude.json       — MCP server registration (inter-agent-gemini + inter-agent-codex)
+#   ~/.claude.json       — MCP server registration (triumvirate daemon)
 #   ~/.codex/            — Codex CLI config, hooks, and skills
-#   ~/.codex/config.toml — MCP server registration (inter-agent-gemini)
+#   ~/.codex/config.toml — MCP server registration (triumvirate daemon)
 #   ~/.gemini/           — Gemini CLI instructions
-#   ~/.gemini/settings.json — MCP server registration (inter-agent-codex)
+#   ~/.gemini/settings.json — MCP server registration (triumvirate daemon)
 #
 # Usage:
 #   cd triumvirate/starter-kit
