@@ -20,6 +20,7 @@ use tokio::{
     sync::mpsc,
     time::{Instant, sleep, timeout},
 };
+use tracing::{Span, instrument};
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -58,11 +59,38 @@ fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: Worki
     }
 }
 
+#[instrument(
+    name = "ask_agent",
+    skip(req, progress),
+    fields(
+        agent.type = %req.agent,
+        agent.tokens = tracing::field::Empty,
+        agent.outcome = tracing::field::Empty,
+        agent.duration_ms = tracing::field::Empty
+    )
+)]
 pub(crate) async fn execute_ask_agent(
     req: &AskAgentRequest,
     progress: Option<ProgressEmitter>,
 ) -> Result<AskAgentResponse, String> {
+    #[allow(clippy::cast_possible_truncation)]
+    fn token_total(parsed: &ParsedAgentResult) -> u64 {
+        if let Some(usage) = parsed.token_usage.as_ref() {
+            if let Some(total) = usage.total {
+                return total;
+            }
+            return usage.input.unwrap_or(0) + usage.output.unwrap_or(0) + usage.cached.unwrap_or(0);
+        }
+        0
+    }
+
+    let started = Instant::now();
+    let span = Span::current();
+
     if !is_supported_agent(req) {
+        span.record("agent.outcome", "rejected");
+        span.record("agent.tokens", 0_u64);
+        span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
         return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
     }
     let agent = req.agent.to_lowercase();
@@ -281,6 +309,10 @@ pub(crate) async fn execute_ask_agent(
 
         match attempt_result {
             Ok(parsed) => {
+                let tokens = token_total(&parsed);
+                span.record("agent.outcome", "success");
+                span.record("agent.tokens", tokens);
+                span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                 let next_session_id = parsed.session_id.clone();
                 update_worker_session(&agent, &exec_cwd, next_session_id).await;
                 lifecycle.push(LifecycleEvent {
@@ -449,6 +481,9 @@ pub(crate) async fn execute_ask_agent(
                 .await;
         }
     }
+    span.record("agent.outcome", "failure");
+    span.record("agent.tokens", 0_u64);
+    span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
     Err(format!(
         "ask_agent failed after lifecycle {:?}: {}{}",
         lifecycle

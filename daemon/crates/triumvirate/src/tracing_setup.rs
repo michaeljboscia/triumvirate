@@ -8,7 +8,7 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
         .unwrap_or_else(|_| {
             "triumvirate=info,daemon_core=info,daemon_http=info,agent_worker=info,agent_adapter=info,mcp_bridge=info,mcp_tools=info,fallback_outbox=info,shared_types=info,warn".into()
         });
-    let otel_endpoint = std::env::var("TRIUMVIRATE_OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     match otel_endpoint {
         Some(endpoint) => {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
