@@ -248,7 +248,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │
   │   ├─ 5. IF BLOCKED:
   │   │   │
-  │   │   ├─ 6a. MECHANICAL failure classification (by evidence, not LLM judgment):
+  │   │   ├─ 5a. MECHANICAL failure classification (by evidence, not LLM judgment):
   │   │   │    - worker-error: validate-task.sh found stub markers or test failures in worker code
   │   │   │    - contract-error: pre-commit hook blocked a file the worker legitimately needs
   │   │   │    - environment-error: subprocess exit indicates missing binary or sandbox error
