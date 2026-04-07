@@ -4,6 +4,7 @@ pub mod worktree;
 pub mod tasks;
 pub mod orchestrator;
 pub mod merge;
+pub mod recovery;
 
 use shared_types::GitOps;
 
