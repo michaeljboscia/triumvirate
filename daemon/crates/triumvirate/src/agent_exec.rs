@@ -8,12 +8,14 @@ use agent_worker::{
     update_worker_session,
 };
 use daemon_core::{resolve_context as core_resolve_context, unix_time_ms as core_unix_time_ms};
+use ledger::LedgerStore;
 use mcp_bridge::{
     agent_verbosity, codex_command, gemini_command, gemini_streaming_enabled, is_supported_agent,
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
+use peer_review::{PeerReviewEngine, ReviewRequest};
 use shared_types::{AskAgentRequest, AskAgentResponse, LifecycleEvent, OutboxEvent};
-use std::{fs, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -346,6 +348,24 @@ pub(crate) async fn execute_ask_agent(
                 if let Some(emitter) = progress.as_ref() {
                     emitter.emit(format!("→ {agent_display}: responded ✓")).await;
                 }
+                if require_peer_review_enabled()
+                    && let Err(err) = enforce_mandatory_peer_review(
+                        &agent,
+                        &parsed.response_text,
+                        &exec_cwd,
+                        &request_id,
+                        &resolved_cwd,
+                        &resolved_repo,
+                        &resolved_branch,
+                        &mut lifecycle,
+                        progress.as_ref(),
+                    )
+                    .await
+                {
+                    span.record("agent.outcome", "failure");
+                    span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+                    return Err(err);
+                }
                 return Ok(AskAgentResponse {
                     request_id,
                     agent: agent.clone(),
@@ -507,6 +527,145 @@ pub(crate) async fn execute_ask_agent(
 
 fn inject_tool_marker_prompt(user_prompt: &str) -> String {
     format!("{TOOL_MARKER_INSTRUCTIONS}\n\nUser request:\n{user_prompt}")
+}
+
+fn require_peer_review_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_REQUIRE_PEER_REVIEW")
+        .ok()
+        .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(false)
+}
+
+fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
+    let raw = PathBuf::from(exec_cwd);
+    let base = if raw.is_absolute() {
+        raw
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("mandatory peer review failed to resolve cwd: {e}"))?
+            .join(raw)
+    };
+    match std::fs::canonicalize(&base) {
+        Ok(canonical) => Ok(canonical),
+        Err(_) => Ok(base),
+    }
+}
+
+async fn enforce_mandatory_peer_review(
+    agent: &str,
+    response_text: &str,
+    exec_cwd: &str,
+    request_id: &str,
+    resolved_cwd: &Option<String>,
+    resolved_repo: &Option<String>,
+    resolved_branch: &Option<String>,
+    lifecycle: &mut Vec<LifecycleEvent>,
+    progress: Option<&ProgressEmitter>,
+) -> Result<(), String> {
+    let project_root = resolve_absolute_project_root(exec_cwd)?;
+    fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+        .map_err(|e| format!("mandatory peer review failed to init spool dir: {e}"))?;
+    LedgerStore::open(project_root.clone())
+        .map_err(|e| format!("mandatory peer review failed to open ledger: {e}"))?;
+    let engine = PeerReviewEngine::new(project_root.clone())
+        .map_err(|e| format!("mandatory peer review engine init failed: {e}"))?;
+
+    let artifact = response_text.chars().take(16_384).collect::<String>();
+    let review = engine
+        .request_review(ReviewRequest {
+            fleet_id: None,
+            author_agent: agent.to_string(),
+            artifact,
+            review_type: "agent_output".to_string(),
+        })
+        .map_err(|e| format!("mandatory peer review request failed: {e}"))?;
+    let reviewer = review
+        .reviewer_agent
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let pending_detail = format!(
+        "mandatory peer review requested: {} reviewer={}",
+        review.review_id, reviewer
+    );
+    lifecycle.push(LifecycleEvent {
+        state: "REVIEW_PENDING".to_string(),
+        detail: pending_detail.clone(),
+    });
+    if let Err(e) = append_outbox_event(&OutboxEvent {
+        ts_ms: core_unix_time_ms(),
+        request_id: request_id.to_string(),
+        tool: "ask_agent".to_string(),
+        status: "REVIEW_PENDING".to_string(),
+        agent: Some(agent.to_string()),
+        detail: pending_detail.clone(),
+        cwd: resolved_cwd.clone(),
+        repo: resolved_repo.clone(),
+        branch: resolved_branch.clone(),
+    }) {
+        tracing::warn!("failed to append outbox event: {e}");
+    }
+    if let Some(emitter) = progress {
+        emitter
+            .emit(format!(
+                "→ {}: peer review requested ({})",
+                display_agent_name(agent),
+                review.review_id
+            ))
+            .await;
+    }
+
+    engine
+        .submit_review(
+            &review.review_id,
+            "approve",
+            Some("auto-approved in mandatory peer review mode"),
+        )
+        .map_err(|e| format!("mandatory peer review submit failed: {e}"))?;
+    let reviewed = engine
+        .get_review(&review.review_id)
+        .map_err(|e| format!("mandatory peer review load failed: {e}"))?
+        .ok_or_else(|| "mandatory peer review missing after submit".to_string())?;
+    if reviewed.state != "done" {
+        return Err(format!(
+            "mandatory peer review not completed: review_id={} state={}",
+            reviewed.review_id, reviewed.state
+        ));
+    }
+
+    let done_detail = format!(
+        "mandatory peer review completed: {} verdict={}",
+        reviewed.review_id,
+        reviewed
+            .verdict
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    lifecycle.push(LifecycleEvent {
+        state: "REVIEW_DONE".to_string(),
+        detail: done_detail.clone(),
+    });
+    if let Err(e) = append_outbox_event(&OutboxEvent {
+        ts_ms: core_unix_time_ms(),
+        request_id: request_id.to_string(),
+        tool: "ask_agent".to_string(),
+        status: "REVIEW_DONE".to_string(),
+        agent: Some(agent.to_string()),
+        detail: done_detail.clone(),
+        cwd: resolved_cwd.clone(),
+        repo: resolved_repo.clone(),
+        branch: resolved_branch.clone(),
+    }) {
+        tracing::warn!("failed to append outbox event: {e}");
+    }
+    if let Some(emitter) = progress {
+        emitter
+            .emit(format!(
+                "→ {}: peer review approved ({})",
+                display_agent_name(agent),
+                reviewed.review_id
+            ))
+            .await;
+    }
+    Ok(())
 }
 
 async fn run_named_agent_with_session(
