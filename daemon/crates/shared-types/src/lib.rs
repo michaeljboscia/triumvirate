@@ -186,6 +186,38 @@ pub struct LedgerSessionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LessonQueryRequest {
+    pub query: String,
+    pub min_confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LessonAddResponse {
+    pub lesson_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LessonQueryResponse {
+    pub lessons: Vec<Lesson>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LessonValidateRequest {
+    pub lesson_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LessonListRequest {
+    pub tags: Option<Vec<String>>,
+    pub stale_days: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LessonListResponse {
+    pub lessons: Vec<Lesson>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonHealthResponse {
     pub status: String,
     pub service: Option<String>,

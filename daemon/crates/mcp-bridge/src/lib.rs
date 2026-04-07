@@ -182,6 +182,30 @@ pub fn daemon_ledger_record_url() -> String {
 }
 
 #[instrument(skip_all)]
+pub fn daemon_lesson_add_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LESSON_ADD_URL")
+        .unwrap_or_else(|_| format!("{}/lesson/add", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
+pub fn daemon_lesson_query_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LESSON_QUERY_URL")
+        .unwrap_or_else(|_| format!("{}/lesson/query", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
+pub fn daemon_lesson_validate_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LESSON_VALIDATE_URL")
+        .unwrap_or_else(|_| format!("{}/lesson/validate", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
+pub fn daemon_lesson_list_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LESSON_LIST_URL")
+        .unwrap_or_else(|_| format!("{}/lesson/list", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
 pub fn gemini_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_GEMINI_ARGS", "mock-gemini")
 }
