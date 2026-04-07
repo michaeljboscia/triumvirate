@@ -151,7 +151,7 @@ The Codex sandbox and git hooks are the mechanical enforcement. validate-task.sh
 
 ### REQ-A2.4: Git Pre-Commit Hook
 
-Installed in every worktree. Checks:
+Installed per-worktree via `git config --worktree core.hooksPath .triumvirate/hooks/` during dispatch setup (REQ-A1.2 step 5). The hook reads contract.json from `.triumvirate/contract.json`. Checks:
 1. Commit message matches `commit_format` from contract.json
 2. Modified files (`git diff --cached --name-only`) are within `allowed_files`
 3. No stub markers in modified files (TODO, FIXME, unimplemented!, placeholder)
