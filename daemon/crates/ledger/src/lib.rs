@@ -1,3 +1,4 @@
+mod ingest;
 mod store;
 
 use std::{
@@ -22,8 +23,8 @@ impl LedgerStore {
         store::open(project_root)
     }
 
-    pub fn ingest_event(&self, _event: RawEvent) -> anyhow::Result<()> {
-        anyhow::bail!("not implemented")
+    pub fn ingest_event(&self, event: RawEvent) -> anyhow::Result<()> {
+        ingest::ingest_event(self, event)
     }
 
     pub fn drain_spool(&self, _spool_dir: &Path) -> anyhow::Result<DrainResult> {
@@ -85,6 +86,8 @@ impl LedgerStore {
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, fs, path::PathBuf};
+
+    use shared_types::RawEvent;
 
     use super::LedgerStore;
 
@@ -173,5 +176,35 @@ mod tests {
             })
             .expect("fts miss query");
         assert_eq!(miss_count, 0);
+    }
+
+    #[test]
+    fn ingest_event_is_idempotent_on_duplicate_keys() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+        let event = RawEvent {
+            session_id: "session-a".to_string(),
+            event_type: "PostToolUse".to_string(),
+            sequence: 7,
+            timestamp: "2026-04-07T00:00:00Z".to_string(),
+            payload_json: "{\"tool\":\"Edit\"}".to_string(),
+        };
+        store.ingest_event(event.clone()).expect("first ingest");
+        store.ingest_event(event).expect("duplicate ingest");
+
+        let count = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+                    rusqlite::params!["session-a"],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("count events");
+        assert_eq!(count, 1);
     }
 }
