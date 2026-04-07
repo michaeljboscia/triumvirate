@@ -360,7 +360,7 @@ Every atomic work product populates these artifacts. They are append-only during
 - All tests must pass. Not just yours.
 ```
 
-### REQ-A3.3: Repair Briefing Format
+### REQ-A3.4: Repair Briefing Format
 
 ```markdown
 # Repair Briefing: T-003 (Attempt 2 of 3)
