@@ -1,10 +1,12 @@
 pub mod codex;
 pub mod gemini;
+pub mod markers;
 pub mod stuck;
 pub mod types;
 
 pub use codex::CodexExecParser;
 pub use gemini::GeminiStreamParser;
+pub use markers::{ToolCallRequest, parse_tool_call_marker};
 pub use stuck::{StuckDetector, StuckReason};
 pub use types::{
     AgentVerbosity, ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState,
