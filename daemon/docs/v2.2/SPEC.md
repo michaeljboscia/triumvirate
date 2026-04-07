@@ -70,7 +70,8 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 
 ### Ingestion
 
-- **REQ-010:** Claude Code hooks (SessionStart, PostToolUse, Stop, SessionEnd) MUST write raw events to the `events` table. The hook's ONLY job is: validate payload, append event, return. No summarization in the hook path.
+- **REQ-010:** Claude Code hooks (SessionStart, PostToolUse, Stop, SessionEnd) MUST send raw events to the daemon via HTTP POST to `POST /ledger/ingest` with a 200ms timeout. The hook's ONLY job is: validate payload, POST to daemon, return. No summarization in the hook path. The daemon is the single SQLite writer — hooks MUST NOT open direct SQLite connections.
+- **REQ-010a:** Hooks MUST NOT use `sqlite3` CLI or any direct database access. The daemon owns all write connections to `ledger.db`. If the daemon HTTP POST fails (timeout or connection refused), the hook falls back to spool (REQ-011).
 - **REQ-011:** If the SQLite write fails, the hook MUST append the event as NDJSON to a spool file at `<project>/.triumvirate/ledger-spool.ndjson`.
 - **REQ-011a:** A replay daemon MUST drain the spool into SQLite on the next successful DB connection. Spool entries MUST be replayed in order. Successfully replayed entries MUST be removed from the spool file.
 - **REQ-012:** An async compression worker MUST consume raw events and produce summaries using Tier 0: local extractive summary — deterministic, zero API cost. This is the default and always-on path.
