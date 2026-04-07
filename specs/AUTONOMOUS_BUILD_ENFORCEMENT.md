@@ -279,7 +279,7 @@ Claude (orchestrator — stateful, full project visibility)
   │   │   │    task_id, commit_sha, files_modified,
   │   │   │    validation_result, notes_for_next_task
   │   │   │
-  │   │   ├─ 7b. Claude APPENDS to BUILD_MANIFEST.md (MANDATORY):
+  │   │   ├─ 6b. Claude APPENDS to BUILD_MANIFEST.md (MANDATORY):
   │   │   │    One row per task. See format below. This is the
   │   │   │    permanent record of what was built. If it's not in
   │   │   │    the manifest, it didn't happen.
