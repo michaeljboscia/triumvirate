@@ -268,14 +268,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             .to_string(),
         })?;
 
-        for (mut child, task_id, agent_name) in running_agents {
-            let orchestrator = self.clone();
+        // Launch all agents in parallel via daemon's ask_agent
+        let mut join_handles = Vec::new();
+        for (task_prompt, task_id, agent_name) in running_agents {
+            let launcher = self.launcher.clone();
             let project_root = project_root.clone();
             let fleet_id = fleet_id.clone();
-            tokio::spawn(async move {
-                let wait_result = child.wait().await;
-                match wait_result {
-                    Ok(status) if status.success() => {
+            let worktree_path = worktree_paths[join_handles.len()].clone();
+            let handle = tokio::spawn(async move {
+                tracing::info!(fleet_id = %fleet_id, task_id = %task_id, agent = %agent_name, "launching fleet agent via ask_agent");
+                let result = launcher.launch(&agent_name, &project_root, &worktree_path, &task_prompt).await;
+                match result {
+                    Ok(response) => {
                         tracing::info!(
                             fleet_id = %fleet_id,
                             task_id = %task_id,
@@ -283,6 +287,16 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         );
                         if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                             let _ = task_store.complete_task(&task_id);
+                        }
+                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
+                            let seq = event_sequence_for(&project_root, &fleet_id, "task_completed").unwrap_or(1);
+                            let _ = store.ingest_event(RawEvent {
+                                session_id: fleet_id.clone(),
+                                event_type: "task_completed".to_string(),
+                                sequence: seq,
+                                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                payload_json: serde_json::json!({"task_id": task_id, "agent": agent_name}).to_string(),
+                            });
                         }
                         if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.clone()) {
                             let _ = review_engine.request_review(peer_review::ReviewRequest {
