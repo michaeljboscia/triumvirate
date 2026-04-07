@@ -388,7 +388,7 @@ The model file is at models/code-embed.gguf. Use llama_cpp::Model::load().
 [Same as original briefing: interfaces, file state, commit rules]
 ```
 
-### REQ-A3.4: Supervisor Roles
+### REQ-A3.5: Supervisor Roles
 
 | Agent | Role | State | What it sees |
 |-------|------|-------|-------------|
