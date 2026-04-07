@@ -1,4 +1,5 @@
 mod compression;
+mod gc;
 mod health;
 mod init;
 mod ingest;
@@ -79,7 +80,19 @@ impl LedgerStore {
     }
 
     pub fn gc(&self) -> anyhow::Result<GcResult> {
-        anyhow::bail!("not implemented")
+        gc::gc(self)
+    }
+
+    pub fn has_active_fleets(&self) -> anyhow::Result<bool> {
+        gc::has_active_fleets(self)
+    }
+
+    pub fn last_gc_timestamp(&self) -> anyhow::Result<Option<String>> {
+        gc::last_gc_timestamp(self)
+    }
+
+    pub fn should_run_startup_gc(&self) -> anyhow::Result<bool> {
+        gc::should_run_startup_gc(self)
     }
 
     pub fn project_root(&self) -> &Path {

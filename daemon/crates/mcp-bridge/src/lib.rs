@@ -182,6 +182,12 @@ pub fn daemon_ledger_record_url() -> String {
 }
 
 #[instrument(skip_all)]
+pub fn daemon_ledger_gc_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_LEDGER_GC_URL")
+        .unwrap_or_else(|_| format!("{}/ledger/gc", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
 pub fn daemon_lesson_add_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_LESSON_ADD_URL")
         .unwrap_or_else(|_| format!("{}/lesson/add", daemon_base_url()))
@@ -351,6 +357,7 @@ mod tests {
             std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_LEDGER_GC_URL");
         }
 
         assert_eq!(super::daemon_base_url(), "http://127.0.0.1:8080");
@@ -360,6 +367,7 @@ mod tests {
             super::daemon_ask_agent_url(),
             "http://127.0.0.1:8080/ask-agent"
         );
+        assert_eq!(super::daemon_ledger_gc_url(), "http://127.0.0.1:8080/ledger/gc");
 
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
@@ -371,12 +379,17 @@ mod tests {
                 "TRIUMVIRATE_DAEMON_ASK_AGENT_URL",
                 "http://127.0.0.1:9002/ask-agent",
             );
+            std::env::set_var(
+                "TRIUMVIRATE_DAEMON_LEDGER_GC_URL",
+                "http://127.0.0.1:9002/ledger/gc",
+            );
         }
 
         assert_eq!(super::daemon_base_url(), "http://127.0.0.1:9000");
         assert_eq!(super::daemon_health_url(), "http://127.0.0.1:9001/health");
         assert_eq!(super::daemon_status_url(), "http://127.0.0.1:9001/status");
         assert_eq!(super::daemon_ask_agent_url(), "http://127.0.0.1:9002/ask-agent");
+        assert_eq!(super::daemon_ledger_gc_url(), "http://127.0.0.1:9002/ledger/gc");
 
         // SAFETY: test controls env var lifecycle in-process.
         unsafe {
@@ -385,6 +398,7 @@ mod tests {
             std::env::remove_var("TRIUMVIRATE_DAEMON_HEALTH_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
             std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_LEDGER_GC_URL");
         }
     }
 

@@ -66,9 +66,11 @@ pub struct Lesson {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct GcResult {
-    pub removed_events: usize,
-    pub removed_summaries: usize,
-    pub removed_lessons: usize,
+    pub events_scanned: usize,
+    pub events_deleted: usize,
+    pub space_reclaimed_bytes: u64,
+    #[serde(default)]
+    pub dead_drop_deleted: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -165,9 +167,10 @@ mod tests {
             req_ids_json: Some("[\"REQ-008\"]".to_string()),
         });
         assert_roundtrip(&GcResult {
-            removed_events: 2,
-            removed_summaries: 1,
-            removed_lessons: 0,
+            events_scanned: 8,
+            events_deleted: 2,
+            space_reclaimed_bytes: 1024,
+            dead_drop_deleted: 1,
         });
         assert_roundtrip(&ManualRecord {
             session_id: Some("sess-1".to_string()),
