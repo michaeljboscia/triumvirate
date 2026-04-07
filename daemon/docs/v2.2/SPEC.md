@@ -70,7 +70,8 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 ### Ingestion
 
 - **REQ-010:** Claude Code hooks (SessionStart, PostToolUse, Stop, SessionEnd) MUST write raw events to the `events` table. The hook's ONLY job is: validate payload, append event, return. No summarization in the hook path.
-- **REQ-011:** If the SQLite write fails, the hook MUST append the event as NDJSON to a spool file at `<project>/.triumvirate/ledger-spool.ndjson`. A replay mechanism MUST drain the spool into SQLite on the next successful connection.
+- **REQ-011:** If the SQLite write fails, the hook MUST append the event as NDJSON to a spool file at `<project>/.triumvirate/ledger-spool.ndjson`.
+- **REQ-011a:** A replay daemon MUST drain the spool into SQLite on the next successful DB connection. Spool entries MUST be replayed in order. Successfully replayed entries MUST be removed from the spool file.
 - **REQ-012:** An async compression worker MUST consume raw events and produce summaries. Compression uses a two-tier model:
   - Tier 0 (always): Local extractive summary — deterministic, zero API cost.
   - Tier 1 (optional): LLM-powered abstraction for high-value windows (configurable, budget-capped).
