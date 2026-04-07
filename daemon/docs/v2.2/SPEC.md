@@ -70,8 +70,8 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
 
 ### Ingestion
 
-- **REQ-010:** Claude Code hooks (SessionStart, PostToolUse, Stop, SessionEnd) MUST send raw events to the daemon via HTTP POST to `POST /ledger/ingest` with a 200ms timeout. The hook's ONLY job is: validate payload, POST to daemon, return. No summarization in the hook path. The daemon is the single SQLite writer — hooks MUST NOT open direct SQLite connections.
-- **REQ-010a:** Hooks MUST NOT use `sqlite3` CLI or any direct database access. The daemon owns all write connections to `ledger.db`. If the daemon HTTP POST fails (timeout or connection refused), the hook falls back to spool (REQ-011).
+- **REQ-010:** Claude Code hooks (SessionStart, PostToolUse, Stop, SessionEnd) MUST append raw events to the local spool file (`<project>/.triumvirate/ledger-spool.ndjson`) as their PRIMARY action (<1ms local disk I/O). After appending, the hook MUST fire a non-blocking background HTTP ping to the daemon (`POST /ledger/wake` with no response wait) to trigger spool draining. The hook's ONLY job is: validate payload, append to spool, ping daemon, return. No summarization in the hook path.
+- **REQ-010a:** Hooks MUST NOT use `sqlite3` CLI, direct database access, or synchronous HTTP calls. The spool file is the durable ingestion path. The daemon is the single SQLite writer — it drains the spool asynchronously. The hook cannot fail unless the local filesystem is unavailable.
 - **REQ-011:** If the SQLite write fails, the hook MUST append the event as NDJSON to a spool file at `<project>/.triumvirate/ledger-spool.ndjson`.
 - **REQ-011a:** The daemon MUST drain the spool into SQLite on startup and every 30 seconds while the spool is non-empty. Spool entries MUST be replayed in strict append order. Successfully replayed entries MUST be removed from the spool file.
 - **REQ-011b:** The spool file MUST NOT exceed 100MB. When the limit is reached, the spool MUST rotate to `.ndjson.1` / `.ndjson.2` and the Ledger health endpoint MUST return status `degraded`.
