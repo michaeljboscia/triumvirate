@@ -444,4 +444,52 @@ mod tests {
             .expect("count done events");
         assert_eq!(done_count, payloads.len() as i64);
     }
+
+    #[test]
+    fn compression_ttl_reclaim_resets_only_stale_running_jobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO events (session_id, event_type, sequence, timestamp, payload_json, compression_state, compression_heartbeat)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'running', datetime('now', '-2 minutes'))",
+                    rusqlite::params!["ttl-session", "PostToolUse", 1, "2026-04-07T00:00:00Z", "{}"],
+                )?;
+                conn.execute(
+                    "INSERT INTO events (session_id, event_type, sequence, timestamp, payload_json, compression_state, compression_heartbeat)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'running', datetime('now', '-10 seconds'))",
+                    rusqlite::params!["ttl-session", "PostToolUse", 2, "2026-04-07T00:00:01Z", "{}"],
+                )?;
+                Ok(())
+            })
+            .expect("insert running jobs");
+
+        let reclaimed = crate::compression::reclaim_stale_running(&store).expect("reclaim stale");
+        assert_eq!(reclaimed, 1);
+
+        let states = store
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT sequence, compression_state FROM events
+                     WHERE session_id = 'ttl-session'
+                     ORDER BY sequence ASC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .expect("query states");
+        assert_eq!(states[0].1, "pending");
+        assert_eq!(states[1].1, "running");
+    }
 }
