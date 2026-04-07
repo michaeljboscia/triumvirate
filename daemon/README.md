@@ -1,107 +1,104 @@
-# triumvirate-agentd (v2)
+# Triumvirate Daemon v2
 
-Rust daemon coordinating Claude, Gemini, and Codex in one shared orchestration runtime.
+A Rust workspace for the Triumvirate daemon + MCP bridge runtime.
 
-## What It Does
+## Workspace Crates
 
-- Runs persistent agent connectors with health supervision and auto-restart.
-- Routes human input to agent(s), captures output, tracks quota, and logs decisions.
-- Persists workflows and memory to SQLite.
-- Provisions fleet worktrees and orchestrates task/merge lifecycle.
-- Serves a web API + WebSocket stream on `127.0.0.1:8080` by default.
+- `crates/triumvirate`: main binary (`mcp`, `daemon`, `install`, `uninstall`, `status`, `doctor`)
+- `crates/daemon-core`: daemon/runtime shared helpers (state IO, dead-drop, queue, launchd, context)
+- `crates/mcp-bridge`: MCP-facing bridge helpers (routing inputs, env/URL parsing, command resolution)
+- `crates/agent-adapter`: unified agent event/types/parsers (Gemini stream-json + Codex exec-json)
+- `crates/shared-types`: shared request/response DTOs used across crate boundaries
 
-## Run
-
-```bash
-cd /Users/mikeboscia/projects/triumvirate/daemon
-cd frontend && npm install && cd ..
-cargo run
-```
-
-`cargo run` and `cargo build` now invoke a build script in `crates/agentd/build.rs` that runs
-`npm run build` in `frontend/` and embeds `frontend/dist` into the Rust binary via `rust-embed`.
-Set `TRIUMVIRATE_SKIP_FRONTEND_BUILD=1` to skip this in constrained environments.
-
-## CLI Usage (Operator Flow)
-
-Use the helper scripts in `daemon/scripts/` for day-to-day usage:
+## Build & Test
 
 ```bash
-cd /Users/mikeboscia/projects/triumvirate
-./daemon/scripts/triumvirate-cli.sh health
-./daemon/scripts/triumvirate-cli.sh ask "what changed in auth?"
-./daemon/scripts/ask-the-twins "review this migration plan"
-./daemon/scripts/triumvirate-cli.sh debate "Redis vs Postgres for caching"
-./daemon/scripts/triumvirate-cli.sh fleet "1 codex: build e2e harness"
-```
-
-Notes:
-- `ask-the-twins` sends both `@claude` and `@gemini` via the v2 `/api/message` endpoint.
-- `TRIUMVIRATE_URL` can override the default `http://127.0.0.1:8080`.
-- If Claude responds with `Not logged in · Please run /login`, authenticate with the Claude CLI first.
-
-## Keep Daemon Running (macOS launchd)
-
-For reliable background operation, install the launchd service:
-
-```bash
-cd /Users/mikeboscia/projects/triumvirate/daemon
-./scripts/triumvirate-service.sh install
-./scripts/triumvirate-service.sh status
-./scripts/triumvirate-service.sh logs
-```
-
-Service management commands:
-- `install`
-- `start`
-- `stop`
-- `restart`
-- `status`
-- `logs`
-- `uninstall`
-
-## Quality Gate
-
-```bash
-cargo check
-cargo test
-cargo clippy -- -D warnings
 cargo build
+cargo test
 ```
 
-## Fleet APIs
+## CLI Commands
 
-- `POST /api/fleet/spawn`
-- `GET /api/fleet/tasks`
-- `POST /api/fleet/tasks/claim`
-- `POST /api/fleet/tasks/complete`
-- `GET /api/fleet/worktrees`
-- `POST /api/fleet/worktrees/teardown`
-- `POST /api/fleet/merge`
-- `POST /api/fleet/peer`
-- `GET /api/fleet/status/{fleet_id}`
+```bash
+# Run stdio MCP bridge
+cargo run -p triumvirate -- mcp
 
-## Observability
+# Run daemon HTTP process
+cargo run -p triumvirate -- daemon
 
-- `GET /metrics` (Prometheus exposition format)
-- `GET /api/costs` (per-agent token and estimated cost attribution)
-- `GET /api/lessons` (filtered machine-readable lessons ledger)
-- `POST /api/lessons` (manual lesson capture)
+# Install launchd plist for autostart
+cargo run -p triumvirate -- install
 
-## Governance API
+# Remove launchd plist
+cargo run -p triumvirate -- uninstall
 
-- `POST /api/governance/check`
+# Print status snapshot
+cargo run -p triumvirate -- status
 
-## Mock CLIs
+# Print local diagnostics
+cargo run -p triumvirate -- doctor
+```
 
-Workspace includes deterministic mock binaries for test/integration work:
+## Runtime Environment Variables
 
-- `mock-claude`
-- `mock-gemini`
-- `mock-codex`
+### Daemon networking
 
-Connectors can be redirected via env vars:
+- `TRIUMVIRATE_DAEMON_BIND_ADDR`
+  - Daemon listen address for `daemon` mode.
+  - Default: `127.0.0.1:8080`
+- `TRIUMVIRATE_DAEMON_BASE_URL`
+  - Base URL for MCP-side daemon HTTP calls.
+  - If unset, bridge derives from `TRIUMVIRATE_DAEMON_BIND_ADDR` as `http://<bind-addr>`.
+  - Final fallback: `http://127.0.0.1:8080`
 
-- `TRIUMVIRATE_CLAUDE_BIN`
-- `TRIUMVIRATE_GEMINI_BIN`
-- `TRIUMVIRATE_CODEX_BIN`
+### Explicit daemon endpoint overrides
+
+- `TRIUMVIRATE_DAEMON_HEALTH_URL` (`/health`)
+- `TRIUMVIRATE_DAEMON_URL` (`/status`)
+- `TRIUMVIRATE_DAEMON_ASK_AGENT_URL`
+- `TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL`
+- `TRIUMVIRATE_DAEMON_MEMORY_READ_URL`
+- `TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL`
+- `TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL`
+- `TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL`
+- `TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL`
+- `TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL`
+- `TRIUMVIRATE_DAEMON_FALLBACK_GC_URL`
+
+### MCP/daemon execution mode
+
+- `TRIUMVIRATE_MCP_USE_DAEMON`
+  - Truthy values (`1`, `true`, `yes`, `on`) route MCP tools through daemon HTTP.
+  - Default: disabled/false.
+
+### Autostart behavior
+
+- `TRIUMVIRATE_DAEMON_AUTOSTART`
+  - Falsey values (`0`, `false`, `no`, `off`) disable one-shot autostart attempts.
+  - Default: enabled/true.
+- `TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN`
+  - Truthy values simulate autostart without spawning daemon process.
+
+### Agent command resolution
+
+- `TRIUMVIRATE_GEMINI_BIN`, `TRIUMVIRATE_GEMINI_ARGS`
+- `TRIUMVIRATE_CODEX_BIN`, `TRIUMVIRATE_CODEX_ARGS`
+- `TRIUMVIRATE_GEMINI_STREAMING`
+  - Falsey disables live stream parse path and falls back to batch parse.
+- `TRIUMVIRATE_AGENT_VERBOSITY`
+  - `minimal|normal|verbose` progress-event filter.
+
+### Data root
+
+- `TRIUMVIRATE_HOME`
+  - Root for daemon token, sessions, outbox, memory, scratchpad, and dead-drop.
+  - Default: `~/.triumvirate`
+
+## Operational Notes
+
+- `doctor` prints token file path/existence, launchd plist path/existence, configured bind address, and daemon reachability.
+- `doctor` also prints resolved daemon routing URLs (`daemon_base_url`, `daemon_status_url`) so env-derived endpoint behavior is explicit.
+- daemon `/health` and `/status` payloads include `daemon_bind_addr` for runtime network observability.
+- `status` reports active sessions, supported agents, fallback queue state, and daemon bind address.
+- `status` degrades gracefully: if daemon HTTP is unreachable, it still returns a local snapshot (with `daemon_reachable: false`) instead of exiting with an error.
+- Dead-drop fallback tickets live under `<TRIUMVIRATE_HOME>/dead-drop`.

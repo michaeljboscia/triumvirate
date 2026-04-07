@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentd",
+    "crates/proto",
+    "crates/workflow",
+    "crates/mock-claude",
+    "crates/mock-gemini",
+    "crates/mock-codex",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/michaeljboscia/triumvirate-agentd"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP / WebSocket
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Async trait (still needed for dyn dispatch)
+async-trait = "0.1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+notify = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+
+# Static file embedding
+rust-embed = { version = "8", features = ["mime-guess"] }
+
+# Internal crates
+triumvirate-proto = { path = "crates/proto" }
+triumvirate-workflow = { path = "crates/workflow" }
+
+[profile.dev]
+# Use Cranelift backend for faster dev builds (requires nightly or cargo-cranelift)
+# codegen-backend = "cranelift"
+
+[profile.release]
+lto = "thin"
+strip = true
