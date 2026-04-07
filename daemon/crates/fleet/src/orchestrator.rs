@@ -270,6 +270,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         let mut join_handles = Vec::new();
         for (task_prompt, task_id, agent_name) in running_agents {
             let launcher = self.launcher.clone();
+            let orchestrator = self.clone();
             let project_root = project_root.clone();
             let fleet_id = fleet_id.clone();
             let worktree_path = worktree_paths[join_handles.len()].clone();
