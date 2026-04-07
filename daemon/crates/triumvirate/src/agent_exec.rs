@@ -14,7 +14,10 @@ use mcp_bridge::{
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
-use shared_types::{AskAgentRequest, AskAgentResponse, LifecycleEvent, OutboxEvent};
+use shared_types::{
+    AskAgentRequest, AskAgentResponse, LifecycleEvent, OutboxEvent,
+    TokenUsage as SharedTokenUsage,
+};
 use std::{fs, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -94,6 +97,15 @@ pub(crate) async fn execute_ask_agent(
         0
     }
 
+    fn map_token_usage(token_usage: Option<&agent_adapter::TokenUsage>) -> Option<SharedTokenUsage> {
+        token_usage.map(|usage| SharedTokenUsage {
+            input: usage.input,
+            output: usage.output,
+            cached: usage.cached,
+            total: usage.total,
+        })
+    }
+
     let started = Instant::now();
     let span = Span::current();
 
@@ -155,6 +167,9 @@ pub(crate) async fn execute_ask_agent(
         cwd: resolved_cwd.clone(),
         repo: resolved_repo.clone(),
         branch: resolved_branch.clone(),
+        working_state: Some("SPAWNED".to_string()),
+        token_usage: None,
+        tool_name: None,
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
@@ -179,6 +194,9 @@ pub(crate) async fn execute_ask_agent(
         cwd: resolved_cwd.clone(),
         repo: resolved_repo.clone(),
         branch: resolved_branch.clone(),
+        working_state: Some("WORKING".to_string()),
+        token_usage: None,
+        tool_name: None,
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
@@ -220,6 +238,9 @@ pub(crate) async fn execute_ask_agent(
                         cwd: resolved_cwd.clone(),
                         repo: resolved_repo.clone(),
                         branch: resolved_branch.clone(),
+                        working_state: Some(format!("{:?}", event.state)),
+                        token_usage: map_token_usage(event.token_usage.as_ref()),
+                        tool_name: event.tool_name.clone(),
                     }) {
                         tracing::warn!("failed to append outbox event: {e}");
                     }
@@ -253,6 +274,9 @@ pub(crate) async fn execute_ask_agent(
                             cwd: resolved_cwd.clone(),
                             repo: resolved_repo.clone(),
                             branch: resolved_branch.clone(),
+                            working_state: Some("STUCK".to_string()),
+                            token_usage: None,
+                            tool_name: None,
                         }) {
                             tracing::warn!("failed to append outbox event: {e}");
                         }
@@ -291,6 +315,9 @@ pub(crate) async fn execute_ask_agent(
                                 cwd: resolved_cwd.clone(),
                                 repo: resolved_repo.clone(),
                                 branch: resolved_branch.clone(),
+                                working_state: Some("STUCK".to_string()),
+                                token_usage: None,
+                                tool_name: None,
                             }) {
                                 tracing::warn!("failed to append outbox event: {e}");
                             }
@@ -342,6 +369,9 @@ pub(crate) async fn execute_ask_agent(
                     cwd: resolved_cwd.clone(),
                     repo: resolved_repo.clone(),
                     branch: resolved_branch.clone(),
+                    working_state: Some("DONE".to_string()),
+                    token_usage: map_token_usage(parsed.token_usage.as_ref()),
+                    tool_name: parsed.tool_calls.last().map(|call| call.tool.clone()),
                 }) {
                     tracing::warn!("failed to append outbox event: {e}");
                 }
@@ -395,6 +425,9 @@ pub(crate) async fn execute_ask_agent(
                         cwd: resolved_cwd.clone(),
                         repo: resolved_repo.clone(),
                         branch: resolved_branch.clone(),
+                        working_state: Some("SESSION_INVALIDATED".to_string()),
+                        token_usage: None,
+                        tool_name: None,
                     }) {
                         tracing::warn!("failed to append outbox event: {e}");
                     }
@@ -438,6 +471,9 @@ pub(crate) async fn execute_ask_agent(
                     cwd: resolved_cwd.clone(),
                     repo: resolved_repo.clone(),
                     branch: resolved_branch.clone(),
+                    working_state: Some("RETRY".to_string()),
+                    token_usage: None,
+                    tool_name: None,
                 }) {
                     tracing::warn!("failed to append outbox event: {e}");
                 }
@@ -469,6 +505,9 @@ pub(crate) async fn execute_ask_agent(
         cwd: resolved_cwd.clone(),
         repo: resolved_repo.clone(),
         branch: resolved_branch.clone(),
+        working_state: Some("FAILED".to_string()),
+        token_usage: None,
+        tool_name: None,
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
@@ -502,6 +541,9 @@ pub(crate) async fn execute_ask_agent(
             cwd: resolved_cwd.clone(),
             repo: resolved_repo.clone(),
             branch: resolved_branch.clone(),
+            working_state: Some("FALLBACK".to_string()),
+            token_usage: None,
+            tool_name: None,
         });
         if let Some(emitter) = progress.as_ref() {
             emitter
@@ -601,6 +643,9 @@ async fn enforce_mandatory_peer_review(
         cwd: resolved_cwd.clone(),
         repo: resolved_repo.clone(),
         branch: resolved_branch.clone(),
+        working_state: Some("REVIEW_PENDING".to_string()),
+        token_usage: None,
+        tool_name: None,
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
@@ -653,6 +698,9 @@ async fn enforce_mandatory_peer_review(
         cwd: resolved_cwd.clone(),
         repo: resolved_repo.clone(),
         branch: resolved_branch.clone(),
+        working_state: Some("REVIEW_DONE".to_string()),
+        token_usage: None,
+        tool_name: None,
     }) {
         tracing::warn!("failed to append outbox event: {e}");
     }
