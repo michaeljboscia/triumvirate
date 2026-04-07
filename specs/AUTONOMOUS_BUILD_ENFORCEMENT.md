@@ -396,7 +396,7 @@ The model file is at models/code-embed.gguf. Use llama_cpp::Model::load().
 | **Gemini** | Auditor | Stateful — holds review history for this build | Code diffs, failure details, and its own prior review comments. Does NOT see briefings or orchestration decisions. Independent judgment. |
 | **Codex** | Worker | Stateless — one session per task | ONLY: BRIEFING.md + contract.json + repo state. Nothing else. Born, executes, commits, dies. |
 
-### REQ-A3.5: Escalation Protocol
+### REQ-A3.6: Escalation Protocol
 
 | Condition | Action |
 |-----------|--------|
