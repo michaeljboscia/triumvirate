@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use crate::LedgerStore;
+use crate::store::with_task_state_priority;
 
 fn extract_tool_hint(payload_json: &str) -> String {
     match serde_json::from_str::<Value>(payload_json) {
@@ -18,14 +19,17 @@ fn extract_tool_hint(payload_json: &str) -> String {
 }
 
 fn reclaim_stale_running_conn(conn: &rusqlite::Connection) -> anyhow::Result<usize> {
-    let rows = conn.execute(
-        "UPDATE events
-         SET compression_state = 'pending', compression_heartbeat = NULL
-         WHERE compression_state = 'running'
-           AND compression_heartbeat IS NOT NULL
-           AND datetime(compression_heartbeat) < datetime('now', '-90 seconds')",
-        [],
-    )?;
+    let rows = with_task_state_priority(|| {
+        let rows = conn.execute(
+            "UPDATE events
+             SET compression_state = 'pending', compression_heartbeat = NULL
+             WHERE compression_state = 'running'
+               AND compression_heartbeat IS NOT NULL
+               AND datetime(compression_heartbeat) < datetime('now', '-90 seconds')",
+            [],
+        )?;
+        Ok(rows)
+    })?;
     Ok(rows)
 }
 
@@ -55,13 +59,16 @@ pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usiz
         let mut processed = 0usize;
         for row in rows {
             let (event_id, event_type, payload_json) = row?;
-            conn.execute(
-                "UPDATE events
-                 SET compression_state = 'running',
-                     compression_heartbeat = datetime('now')
-                 WHERE id = ?1",
-                [event_id],
-            )?;
+            with_task_state_priority(|| {
+                conn.execute(
+                    "UPDATE events
+                     SET compression_state = 'running',
+                         compression_heartbeat = datetime('now')
+                     WHERE id = ?1",
+                    [event_id],
+                )?;
+                Ok(())
+            })?;
 
             let tool_hint = extract_tool_hint(&payload_json);
             let title = format!("Event {event_id}: {event_type}");
@@ -74,19 +81,25 @@ pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usiz
                 |r| r.get(0),
             )?;
             if existing_count == 0 {
-                conn.execute(
-                    "INSERT INTO summaries (event_id, title, narrative, facts_json, summary_type)
-                     VALUES (?1, ?2, ?3, ?4, 'extractive')",
-                    rusqlite::params![event_id, title, narrative, facts_json],
-                )?;
+                with_task_state_priority(|| {
+                    conn.execute(
+                        "INSERT INTO summaries (event_id, title, narrative, facts_json, summary_type)
+                         VALUES (?1, ?2, ?3, ?4, 'extractive')",
+                        rusqlite::params![event_id, title, narrative, facts_json],
+                    )?;
+                    Ok(())
+                })?;
             }
 
-            conn.execute(
-                "UPDATE events
-                 SET compression_state = 'done', compression_heartbeat = NULL
-                 WHERE id = ?1",
-                [event_id],
-            )?;
+            with_task_state_priority(|| {
+                conn.execute(
+                    "UPDATE events
+                     SET compression_state = 'done', compression_heartbeat = NULL
+                     WHERE id = ?1",
+                    [event_id],
+                )?;
+                Ok(())
+            })?;
             processed += 1;
         }
 

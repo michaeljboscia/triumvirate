@@ -84,6 +84,10 @@ impl LedgerStore {
         })
     }
 
+    pub fn queue_lag_seconds(&self) -> anyhow::Result<f64> {
+        self.with_conn(store::queue_lag_seconds_conn)
+    }
+
     pub(crate) fn with_conn<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&Connection) -> anyhow::Result<T>,
@@ -561,5 +565,80 @@ mod tests {
         let hits = store.query("authentication", 10).expect("fts query");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].title.contains("authentication"));
+    }
+
+    #[test]
+    fn ingest_is_prioritized_under_concurrent_task_updates() {
+        use std::{sync::Arc, thread, time::Instant};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = Arc::new(LedgerStore::open(project_root).expect("open ledger store"));
+
+        store
+            .with_conn(|conn| {
+                for seq in 0..50_i64 {
+                    conn.execute(
+                        "INSERT INTO events (session_id, event_type, sequence, timestamp, payload_json, compression_state)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+                        rusqlite::params!["task-session", "PostToolUse", seq, "2026-04-07T00:00:00Z", "{}"],
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("seed task rows");
+
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for idx in 0..50_i64 {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                s.with_conn(|conn| {
+                    crate::store::with_task_state_priority(|| {
+                        conn.execute(
+                            "UPDATE events SET compression_state = 'running' WHERE sequence = ?1 AND session_id = 'task-session'",
+                            [idx],
+                        )?;
+                        Ok(())
+                    })
+                })
+                .expect("task update");
+            }));
+        }
+        for seq in 0..50_i64 {
+            let s = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                s.ingest_event(RawEvent {
+                    session_id: "ingest-session".to_string(),
+                    event_type: "PostToolUse".to_string(),
+                    sequence: seq,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: "{\"tool\":\"Edit\"}".to_string(),
+                })
+                .expect("ingest event");
+            }));
+        }
+        for h in handles {
+            h.join().expect("join thread");
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        assert!(elapsed < 5.0, "ingestion burst took too long: {elapsed:.3}s");
+
+        let ingested = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = 'ingest-session'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("count ingested");
+        assert_eq!(ingested, 50);
+
+        let lag = store.queue_lag_seconds().expect("queue lag");
+        assert!(lag >= 0.0);
     }
 }
