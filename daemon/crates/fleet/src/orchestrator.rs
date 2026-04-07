@@ -33,7 +33,7 @@ pub struct FleetSpawnResult {
 }
 
 #[derive(Debug, Clone)]
-pub struct FleetOrchestrator<G: GitOps, L: AgentLauncher = ShellAgentLauncher> {
+pub struct FleetOrchestrator<G: GitOps, L: AgentLauncher = DaemonAgentLauncher> {
     worktree: WorktreeManager<G>,
     git_ops: G,
     launcher: L,
