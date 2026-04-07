@@ -182,6 +182,10 @@ Enhancement: validate-task.sh also writes results to `.triumvirate/VALIDATION_LO
 
 Note: validate-task.sh is copied into `.triumvirate/` during dispatch (REQ-A1.2 step 4) because Codex's workspace-write sandbox cannot reach `~/.claude/scripts/`.
 
+**Pre-Phase 2 update required:** The existing validate-task.sh needs minor updates: (1) write results to `.triumvirate/VALIDATION_LOG.md`, (2) emit machine-readable classification hints for the mechanical failure classifier, (3) `.triumvirate/` path awareness for contract.json, (4) add Python `pass` stub pattern. Core logic unchanged.
+
+**Pre-commit hook testing:** The static pre-commit hook script requires its own unit tests (contract parsing, file matching, error message formatting) BEFORE the Phase 2 red team integration test.
+
 ### REQ-A2.6: Wave Boundary Gate
 
 **No-overlap invariant:** Before dispatching any wave, the orchestrator statically validates that no two tasks in the same wave share `allowed_files` entries. If overlap is detected, the later task is moved to the next wave. This prevents merge conflicts and eliminates the need for conflict resolution logic.
