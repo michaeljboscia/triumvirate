@@ -6,7 +6,10 @@ pub mod stuck;
 pub mod types;
 
 pub use codex::CodexExecParser;
-pub use codex_app_server::CodexAppServerParser;
+pub use codex_app_server::{
+    ApprovalChannelMode, ApprovalRequestEvent, CodexAppServerEvent, CodexAppServerParser,
+    probe_approval_response_channel,
+};
 pub use gemini::GeminiStreamParser;
 pub use markers::{ToolCallRequest, parse_tool_call_marker};
 pub use stuck::{StuckDetector, StuckReason};

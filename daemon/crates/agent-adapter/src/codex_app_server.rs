@@ -2,6 +2,24 @@ use crate::types::{
     ParsedAgentResult, TokenUsage, ToolCallRecord, WorkingState, WorkingStateEvent,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequestEvent {
+    pub id: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalChannelMode {
+    ProceedOnce,
+    FullAutoFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexAppServerEvent {
+    Working(WorkingStateEvent),
+    ApprovalRequest(ApprovalRequestEvent),
+}
+
 #[derive(Debug, Default)]
 pub struct CodexAppServerParser {
     thread_id: Option<String>,
@@ -18,6 +36,13 @@ impl CodexAppServerParser {
     }
 
     pub fn parse_line(&mut self, line: &str) -> anyhow::Result<Option<WorkingStateEvent>> {
+        Ok(match self.parse_event_line(line)? {
+            Some(CodexAppServerEvent::Working(event)) => Some(event),
+            Some(CodexAppServerEvent::ApprovalRequest(_)) | None => None,
+        })
+    }
+
+    pub fn parse_event_line(&mut self, line: &str) -> anyhow::Result<Option<CodexAppServerEvent>> {
         let json: serde_json::Value = serde_json::from_str(line)?;
 
         // Guardrail: exec JSON lines are incompatible with app-server mode.
@@ -42,7 +67,7 @@ impl CodexAppServerParser {
         &mut self,
         method: &str,
         params: Option<&serde_json::Value>,
-    ) -> Option<WorkingStateEvent> {
+    ) -> Option<CodexAppServerEvent> {
         match method {
             "initialized" => {
                 let event = WorkingStateEvent {
@@ -55,7 +80,7 @@ impl CodexAppServerParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
-                Some(event)
+                Some(CodexAppServerEvent::Working(event))
             }
             "thread/start" => {
                 self.thread_id = params
@@ -72,7 +97,7 @@ impl CodexAppServerParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
-                Some(event)
+                Some(CodexAppServerEvent::Working(event))
             }
             "turn/start" => {
                 let event = WorkingStateEvent {
@@ -85,7 +110,7 @@ impl CodexAppServerParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
-                Some(event)
+                Some(CodexAppServerEvent::Working(event))
             }
             "turn/text-delta" | "stream/text-delta" => {
                 if let Some(delta) = params
@@ -104,7 +129,19 @@ impl CodexAppServerParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
-                Some(event)
+                Some(CodexAppServerEvent::Working(event))
+            }
+            "approval/request" | "approval_request" => {
+                let request = ApprovalRequestEvent {
+                    id: params
+                        .and_then(|p| p.get("id"))
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string),
+                    reason: params
+                        .and_then(|p| p.get("reason").and_then(|v| v.as_str()))
+                        .map(ToString::to_string),
+                };
+                Some(CodexAppServerEvent::ApprovalRequest(request))
             }
             "turn/completed" => {
                 let usage = params
@@ -140,7 +177,7 @@ impl CodexAppServerParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
-                Some(event)
+                Some(CodexAppServerEvent::Working(event))
             }
             _ => None,
         }
@@ -159,9 +196,31 @@ impl CodexAppServerParser {
     }
 }
 
+pub fn probe_approval_response_channel(probe_response: &str) -> anyhow::Result<ApprovalChannelMode> {
+    let json: serde_json::Value = serde_json::from_str(probe_response)?;
+    if json.get("error").is_none() {
+        return Ok(ApprovalChannelMode::ProceedOnce);
+    }
+
+    let method_unsupported = json
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(|m| m.to_lowercase().contains("method not supported"))
+        .unwrap_or(false);
+    if method_unsupported {
+        anyhow::bail!("approval response channel method not supported");
+    }
+
+    anyhow::bail!("approval response channel probe failed")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CodexAppServerParser;
+    use super::{
+        ApprovalChannelMode, CodexAppServerEvent, CodexAppServerParser,
+        probe_approval_response_channel,
+    };
 
     #[test]
     fn parses_app_server_jsonrpc_trace() {
@@ -194,5 +253,37 @@ mod tests {
             .expect_err("exec format must error");
         assert!(err.to_string().contains("exec-format"));
     }
-}
 
+    #[test]
+    fn detects_approval_request_events() {
+        let mut parser = CodexAppServerParser::new();
+        let event = parser
+            .parse_event_line(
+                r#"{"jsonrpc":"2.0","method":"approval_request","params":{"id":"apr-1","reason":"edit file"}}"#,
+            )
+            .expect("parse approval event");
+        match event {
+            Some(CodexAppServerEvent::ApprovalRequest(req)) => {
+                assert_eq!(req.id.as_deref(), Some("apr-1"));
+                assert_eq!(req.reason.as_deref(), Some("edit file"));
+            }
+            other => panic!("expected approval request event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_probe_accepts_supported_channel() {
+        let mode = probe_approval_response_channel(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#)
+            .expect("probe should succeed");
+        assert_eq!(mode, ApprovalChannelMode::ProceedOnce);
+    }
+
+    #[test]
+    fn approval_probe_rejects_unsupported_channel() {
+        let err = probe_approval_response_channel(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not supported"}}"#,
+        )
+        .expect_err("probe should fail");
+        assert!(err.to_string().contains("method not supported"));
+    }
+}
