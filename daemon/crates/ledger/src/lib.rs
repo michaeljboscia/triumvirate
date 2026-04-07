@@ -1,3 +1,4 @@
+mod health;
 mod ingest;
 mod spool;
 mod store;
@@ -45,7 +46,7 @@ impl LedgerStore {
     }
 
     pub fn health(&self) -> anyhow::Result<HealthStatus> {
-        anyhow::bail!("not implemented")
+        health::health(self)
     }
 
     pub fn add_lesson(&self, _lesson: NewLesson) -> anyhow::Result<i64> {
@@ -293,5 +294,58 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&stored_payload).expect("payload should remain valid json");
         assert_eq!(parsed["message"], "ok");
+    }
+
+    #[test]
+    fn health_reports_recent_event_counts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        for seq in 1..=5 {
+            store
+                .ingest_event(RawEvent {
+                    session_id: "health-session".to_string(),
+                    event_type: "PostToolUse".to_string(),
+                    sequence: seq,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: "{}".to_string(),
+                })
+                .expect("ingest event");
+        }
+
+        let status = store.health().expect("health status");
+        assert!(status.events_last_5min >= 5);
+        assert!(status.db_size_bytes > 0);
+    }
+
+    #[test]
+    fn health_degrades_when_active_session_has_no_recent_events() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO sessions (session_id, project, branch, started_at, ended_at, event_count, summary_count)
+                     VALUES (?1, ?2, NULL, ?3, NULL, 0, 0)",
+                    rusqlite::params![
+                        "active-session",
+                        "/tmp/project",
+                        "2026-04-07T00:00:00Z"
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("insert active session");
+
+        let status = store.health().expect("health status");
+        assert_eq!(status.events_last_5min, 0);
+        assert_eq!(status.status, "degraded");
     }
 }
