@@ -1,5 +1,11 @@
-use std::path::{Path, PathBuf};
+mod store;
 
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
+
+use rusqlite::Connection;
 use shared_types::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
     Summary,
@@ -8,14 +14,12 @@ use shared_types::{
 #[derive(Debug)]
 pub struct LedgerStore {
     project_root: PathBuf,
+    conn: Mutex<Connection>,
 }
 
 impl LedgerStore {
     pub fn open(project_root: PathBuf) -> anyhow::Result<Self> {
-        if !project_root.is_absolute() {
-            anyhow::bail!("project_root must be an absolute path");
-        }
-        Ok(Self { project_root })
+        store::open(project_root)
     }
 
     pub fn ingest_event(&self, _event: RawEvent) -> anyhow::Result<()> {
@@ -46,7 +50,11 @@ impl LedgerStore {
         anyhow::bail!("not implemented")
     }
 
-    pub fn query_lessons(&self, _query: &str, _min_confidence: f64) -> anyhow::Result<Vec<Lesson>> {
+    pub fn query_lessons(
+        &self,
+        _query: &str,
+        _min_confidence: f64,
+    ) -> anyhow::Result<Vec<Lesson>> {
         anyhow::bail!("not implemented")
     }
 
@@ -61,11 +69,22 @@ impl LedgerStore {
     pub fn project_root(&self) -> &Path {
         &self.project_root
     }
+
+    pub(crate) fn with_conn<T, F>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<T>,
+    {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ledger connection mutex poisoned"))?;
+        f(&guard)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::HashSet, fs, path::PathBuf};
 
     use super::LedgerStore;
 
@@ -77,9 +96,35 @@ mod tests {
     }
 
     #[test]
-    fn open_accepts_absolute_paths() {
-        let store = LedgerStore::open(PathBuf::from("/tmp/triumvirate-project"))
-            .expect("absolute paths should be accepted");
-        assert_eq!(store.project_root(), PathBuf::from("/tmp/triumvirate-project"));
+    fn open_sets_wal_and_creates_tables() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+        let journal_mode = store
+            .with_conn(|conn| {
+                let mode: String = conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0))?;
+                Ok(mode)
+            })
+            .expect("query pragma journal_mode");
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+
+        let tables = store
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                let mut names = HashSet::new();
+                for row in rows {
+                    names.insert(row?);
+                }
+                Ok(names)
+            })
+            .expect("read sqlite_master tables");
+
+        for expected in ["events", "summaries", "sessions", "health", "lessons"] {
+            assert!(tables.contains(expected), "missing table: {expected}");
+        }
     }
 }
