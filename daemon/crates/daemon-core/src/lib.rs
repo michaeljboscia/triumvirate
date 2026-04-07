@@ -490,6 +490,9 @@ mod tests {
                 cwd: None,
                 repo: None,
                 branch: None,
+                working_state: None,
+                token_usage: None,
+                tool_name: None,
             },
         )?;
         let events = super::read_outbox_events(&root)?;
