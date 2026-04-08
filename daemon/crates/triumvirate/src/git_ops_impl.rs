@@ -183,7 +183,7 @@ mod tests {
         assert!(worktree_path.join(".git").exists());
 
         assert!(git.is_clean().await?);
-        fs::write(repo.join("dirty.txt"), "dirty\n")?;
+        fs::write(repo.join("README.md"), "dirty\n")?;
         assert!(!git.is_clean().await?);
 
         git.worktree_remove(&worktree_path).await?;
