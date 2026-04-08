@@ -5,6 +5,7 @@ pub mod codex_spawn;
 pub mod failure_handler;
 #[allow(dead_code)]
 pub mod orchestrator;
+pub mod post_exit_validator;
 #[allow(dead_code)]
 pub mod resume;
 #[allow(dead_code)]
