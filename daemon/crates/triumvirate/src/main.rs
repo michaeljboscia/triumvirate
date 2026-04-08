@@ -898,7 +898,6 @@ start it with: triumvirate daemon"
         let (cmd, mut args) = codex_command();
         args.push("exec".to_string());
         args.push("--full-auto".to_string());
-        args.push("--message".to_string());
         args.push(prompt);
 
         let child = abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
