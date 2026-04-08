@@ -951,6 +951,7 @@ start it with: triumvirate daemon"
         let project_root_for_cleanup = project_root.clone();
         let task_id_for_monitor = task_id.clone();
         let start_sha = req.sha.clone();
+        let contract_for_validation = req.contract_fields.clone();
         tokio::spawn(async move {
             let timed_out =
                 abe::codex_spawn::enforce_timeout(child.clone(), timeout_sec, &worktree_path)
