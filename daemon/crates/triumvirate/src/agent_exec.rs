@@ -595,6 +595,7 @@ fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enforce_mandatory_peer_review(
     agent: &str,
     response_text: &str,

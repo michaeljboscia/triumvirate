@@ -3,6 +3,7 @@ use serde_json::Value;
 use crate::LedgerStore;
 use crate::store::with_task_state_priority;
 
+#[allow(dead_code)]
 fn extract_tool_hint(payload_json: &str) -> String {
     match serde_json::from_str::<Value>(payload_json) {
         Ok(value) => {
@@ -18,6 +19,7 @@ fn extract_tool_hint(payload_json: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn extract_summary_type(payload_json: &str) -> String {
     match serde_json::from_str::<Value>(payload_json) {
         Ok(value) => value
@@ -29,6 +31,7 @@ fn extract_summary_type(payload_json: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn should_auto_create_lesson(summary_type: &str) -> bool {
     matches!(
         summary_type,
@@ -56,6 +59,7 @@ pub(crate) fn reclaim_stale_running(store: &LedgerStore) -> anyhow::Result<usize
     store.with_conn(reclaim_stale_running_conn)
 }
 
+#[allow(dead_code)]
 pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usize> {
     store.with_conn(|conn| {
         let _ = reclaim_stale_running_conn(conn)?;

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -44,8 +44,8 @@ pub(crate) fn register_activity_at(project_root: &Path, now: u64) {
         Err(_) => return,
     };
     let project = project_root.to_path_buf();
-    if guard.active.contains_key(&project) {
-        guard.active.insert(project, now);
+    if let Entry::Occupied(mut entry) = guard.active.entry(project.clone()) {
+        entry.insert(now);
         return;
     }
     if guard.active.len() < MAX_ACTIVE_POOLS {
