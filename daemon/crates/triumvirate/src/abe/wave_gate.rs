@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveTask {
@@ -20,7 +21,14 @@ pub fn validate_no_overlap(tasks: &[WaveTask]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn gate_wave(tasks: &[WaveTask]) -> anyhow::Result<String> {
+pub fn gate_wave<F>(
+    tasks: &[WaveTask],
+    test_command: &str,
+    gemini_review: F,
+) -> anyhow::Result<String>
+where
+    F: Fn(&[WaveTask]) -> anyhow::Result<String>,
+{
     validate_no_overlap(tasks)?;
     if tasks
         .iter()
@@ -28,11 +36,23 @@ pub fn gate_wave(tasks: &[WaveTask]) -> anyhow::Result<String> {
     {
         anyhow::bail!("wave gate failed: at least one task is not PASS");
     }
+    if !test_command.trim().is_empty() {
+        let output = Command::new("sh")
+            .arg("-lc")
+            .arg(test_command)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("wave gate test suite failed: {}", stderr.trim());
+        }
+    }
+    let gemini_summary = gemini_review(tasks)?;
 
     let summary = format!(
-        "wave_gate=PASS tasks={} files={} ",
+        "wave_gate=PASS tasks={} files={} review={}",
         tasks.len(),
-        tasks.iter().map(|t| t.allowed_files.len()).sum::<usize>()
+        tasks.iter().map(|t| t.allowed_files.len()).sum::<usize>(),
+        gemini_summary
     );
     Ok(summary)
 }
@@ -72,6 +92,18 @@ mod tests {
                 validation_status: "BLOCKED".to_string(),
             },
         ];
-        assert!(gate_wave(&tasks).is_err());
+        assert!(gate_wave(&tasks, "true", |_| Ok("clean".to_string())).is_err());
+    }
+
+    #[test]
+    fn gate_runs_test_command_and_review() {
+        let tasks = vec![WaveTask {
+            task_id: "T-1".to_string(),
+            allowed_files: vec!["a.rs".to_string()],
+            validation_status: "PASS".to_string(),
+        }];
+        let summary = gate_wave(&tasks, "true", |_| Ok("clean".to_string())).expect("gate pass");
+        assert!(summary.contains("review=clean"));
+        assert!(gate_wave(&tasks, "false", |_| Ok("clean".to_string())).is_err());
     }
 }
