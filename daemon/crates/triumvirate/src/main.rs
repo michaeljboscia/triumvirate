@@ -757,7 +757,8 @@ start it with: triumvirate daemon"
         let cwd = req
             .cwd
             .clone()
-            .unwrap_or_else(|| ".".to_string());
+            .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
+            .ok_or_else(|| "failed to resolve cwd".to_string())?;
         let timeout_sec = req.timeout_sec.unwrap_or(600);
 
         let (cmd, mut args) = codex_command();
@@ -869,8 +870,12 @@ start it with: triumvirate daemon"
             return Err(err);
         }
 
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to resolve project_root: {e}"))?;
+        let project_root = req
+            .project_root
+            .clone()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to resolve project_root".to_string())?;
         let setup = abe::worktree_setup::setup_worktree(&abe::worktree_setup::WorktreeSetupRequest {
             project_root: project_root.clone(),
             sha: req.sha.clone(),
@@ -5871,6 +5876,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
         let dispatched = bridge
             .dispatch_codex_worktree(Parameters(DispatchCodexWorktreeRequest {
+                project_root: Some(project_root.display().to_string()),
                 sha: head_sha.clone(),
                 briefing_content: "Do the required change and commit".to_string(),
                 contract_fields: contract.clone(),
@@ -6057,6 +6063,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             }
             let dispatched = bridge
                 .dispatch_codex_worktree(Parameters(DispatchCodexWorktreeRequest {
+                    project_root: Some(project_root.display().to_string()),
                     sha: head_sha.clone(),
                     briefing_content: "Non-compliant attempt for red-team validation".to_string(),
                     contract_fields: mk_contract(&task_id),
