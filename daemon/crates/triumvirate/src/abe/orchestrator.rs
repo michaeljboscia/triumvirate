@@ -1,8 +1,10 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
+use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
+use shared_types::{ContractFields, FilePolicy};
 
-use super::build_artifacts::{append_deviation, append_manifest, read_state, update_state, BuildState};
+use super::build_artifacts::{append_deviation, append_manifest, read_state, update_state};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanTask {
@@ -10,6 +12,10 @@ pub struct PlanTask {
     pub wave: u32,
     pub req: String,
     pub description: String,
+    pub scope_out: String,
+    pub tools: String,
+    pub verify: String,
+    pub contract_fields: ContractFields,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +23,8 @@ pub struct TaskResult {
     pub task_id: String,
     pub status: String,
     pub commit_sha: String,
+    pub modified_files: Vec<String>,
+    pub attempts: u32,
 }
 
 #[async_trait::async_trait]
@@ -29,26 +37,87 @@ pub fn parse_plan(path: &Path) -> anyhow::Result<Vec<PlanTask>> {
     let content = fs::read_to_string(path)?;
     let mut tasks = Vec::new();
 
-    for line in content.lines() {
-        if line.trim_start().starts_with("<task ") {
-            let task_id = extract_attr(line, "id").unwrap_or_default();
-            let wave = extract_attr(line, "wave")
-                .and_then(|w| w.parse::<u32>().ok())
-                .unwrap_or(0);
-            let req = extract_attr(line, "req").unwrap_or_default();
-            let description = extract_between(&content, &format!("<task id=\"{task_id}\""), "<description>", "</description>")
-                .unwrap_or_default();
-            tasks.push(PlanTask {
-                task_id,
-                wave,
-                req,
-                description,
-            });
-        }
+    let mut cursor = 0usize;
+    while let Some(start_rel) = content[cursor..].find("<task ") {
+        let start = cursor + start_rel;
+        let Some(end_rel) = content[start..].find("</task>") else {
+            anyhow::bail!("unclosed <task> block starting at byte {start}");
+        };
+        let end = start + end_rel + "</task>".len();
+        let block = &content[start..end];
+        tasks.push(parse_task_block(block)?);
+        cursor = end;
     }
 
     tasks.sort_by(|a, b| a.wave.cmp(&b.wave).then(a.task_id.cmp(&b.task_id)));
     Ok(tasks)
+}
+
+fn parse_task_block(block: &str) -> anyhow::Result<PlanTask> {
+    let first_line = block.lines().next().unwrap_or_default();
+    let task_id = extract_attr(first_line, "id").unwrap_or_default();
+    let wave = extract_attr(first_line, "wave")
+        .and_then(|w| w.parse::<u32>().ok())
+        .unwrap_or_default();
+    let req = extract_attr(first_line, "req").unwrap_or_default();
+    let description = extract_between(block, "<description>", "</description>").unwrap_or_default();
+    let files = extract_between(block, "<files>", "</files>").unwrap_or_default();
+    let scope_out = extract_between(block, "<scope_out>", "</scope_out>").unwrap_or_default();
+    let tools = extract_between(block, "<tools>", "</tools>").unwrap_or_default();
+    let verify = extract_between(block, "<verify>", "</verify>").unwrap_or_default();
+    let reality_test = extract_between(block, "<reality_test>", "</reality_test>").unwrap_or_default();
+    let done_when = extract_between(block, "<done_when>", "</done_when>").unwrap_or_default();
+
+    if task_id.trim().is_empty() {
+        anyhow::bail!("task block missing id attribute");
+    }
+    if reality_test.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing <reality_test>");
+    }
+    if done_when.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing <done_when>");
+    }
+    if files.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing <files>");
+    }
+    if tools.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing <tools>");
+    }
+    if verify.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing <verify>");
+    }
+
+    let allowed_files = parse_csv_items(&files);
+    let req_ids = parse_csv_items(&req);
+    let allowed_commands = parse_tool_commands(&tools);
+    let test_command = verify.trim().to_string();
+
+    let contract_fields = ContractFields {
+        task_id: task_id.clone(),
+        req_ids,
+        wave,
+        file_policy: FilePolicy::DefaultDeny,
+        allowed_files,
+        forbidden_files: Vec::new(),
+        allowed_commands,
+        forbidden_commands: Vec::new(),
+        commit_format: format!("^{task_id}:"),
+        test_command,
+        task_timeout_sec: 1_800,
+        done_when,
+        reality_test,
+    };
+
+    Ok(PlanTask {
+        task_id,
+        wave,
+        req,
+        description,
+        scope_out,
+        tools,
+        verify,
+        contract_fields,
+    })
 }
 
 pub async fn run_orchestrator<B: DispatchBackend>(
@@ -81,28 +150,35 @@ pub async fn run_orchestrator<B: DispatchBackend>(
                 let Some(task) = pending.next() else {
                     break;
                 };
-                let ticket = backend.dispatch_task(&task).await?;
                 state.tasks_running.push(task.task_id.clone());
                 update_state(state_path, &state)?;
-                running.push(async move { (task, ticket) });
+                running.push(async move {
+                    let ticket = backend.dispatch_task(&task).await?;
+                    let result = backend.wait_task(&ticket).await?;
+                    Ok::<_, anyhow::Error>((task, result))
+                });
             }
 
-            let Some((task, ticket)) = running.next().await else {
+            let Some(outcome) = running.next().await else {
                 break;
             };
-            let result = backend.wait_task(&ticket).await?;
+            let (task, result) = outcome?;
             state.tasks_running.retain(|t| t != &task.task_id);
             if result.status.eq_ignore_ascii_case("completed") {
                 state.tasks_completed.push(task.task_id.clone());
                 state.tasks_remaining.retain(|t| t != &task.task_id);
+                let timestamp = Utc::now().to_rfc3339();
                 append_manifest(
                     manifest_path,
                     &task.task_id,
                     std::slice::from_ref(&task.req),
                     &result.commit_sha,
+                    task.wave,
+                    &result.modified_files,
+                    result.attempts,
                     "PASS",
                     "clean",
-                    "2026-04-08T00:00:00Z",
+                    &timestamp,
                 )?;
                 append_deviation(
                     deviation_path,
@@ -110,17 +186,18 @@ pub async fn run_orchestrator<B: DispatchBackend>(
                     "info",
                     "clean - no deviations",
                     "none",
-                    "2026-04-08T00:00:00Z",
+                    &timestamp,
                 )?;
             } else {
                 state.tasks_failed.push(task.task_id.clone());
+                let timestamp = Utc::now().to_rfc3339();
                 append_deviation(
                     deviation_path,
                     &task.task_id,
                     "error",
                     "task failed",
                     "worker-error",
-                    "2026-04-08T00:00:00Z",
+                    &timestamp,
                 )?;
             }
             update_state(state_path, &state)?;
@@ -138,13 +215,27 @@ fn extract_attr(line: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn extract_between(content: &str, task_anchor: &str, start_tag: &str, end_tag: &str) -> Option<String> {
-    let anchor_pos = content.find(task_anchor)?;
-    let tail = &content[anchor_pos..];
-    let start = tail.find(start_tag)? + start_tag.len();
-    let remaining = &tail[start..];
+fn extract_between(content: &str, start_tag: &str, end_tag: &str) -> Option<String> {
+    let start = content.find(start_tag)? + start_tag.len();
+    let remaining = &content[start..];
     let end = remaining.find(end_tag)?;
     Some(remaining[..end].trim().to_string())
+}
+
+fn parse_csv_items(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_tool_commands(raw: &str) -> Vec<Vec<String>> {
+    parse_csv_items(raw)
+        .into_iter()
+        .map(|cmd| cmd.split_whitespace().map(ToString::to_string).collect::<Vec<_>>())
+        .filter(|parts| !parts.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -168,6 +259,8 @@ mod tests {
                 task_id: task_id.to_string(),
                 status: "completed".to_string(),
                 commit_sha: format!("sha-{task_id}"),
+                modified_files: vec!["src/lib.rs".to_string()],
+                attempts: 1,
             })
         }
     }
@@ -180,9 +273,21 @@ mod tests {
             &plan,
             r#"<task id="T-001" req="REQ-A1.1" wave="0" depends="">
 <description>Hello</description>
+<files>mcp-server/src/abe/types.ts</files>
+<scope_out>none</scope_out>
+<tools>npx tsc --noEmit</tools>
+<verify>npx tsc --noEmit</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
 </task>
 <task id="T-002" req="REQ-A1.2" wave="1" depends="T-001">
 <description>World</description>
+<files>mcp-server/src/abe/contract-schema.ts</files>
+<scope_out>none</scope_out>
+<tools>npm test</tools>
+<verify>npm test</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
 </task>
 "#,
         )
@@ -192,6 +297,32 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].task_id, "T-001");
         assert_eq!(tasks[1].task_id, "T-002");
+        assert_eq!(tasks[0].contract_fields.allowed_files, vec!["mcp-server/src/abe/types.ts"]);
+        assert_eq!(
+            tasks[0].contract_fields.allowed_commands,
+            vec![vec!["npx".to_string(), "tsc".to_string(), "--noEmit".to_string()]]
+        );
+    }
+
+    #[test]
+    fn parse_plan_requires_reality_test() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plan = tmp.path().join("plan.md");
+        std::fs::write(
+            &plan,
+            r#"<task id="T-001" req="REQ-A1.1" wave="0" depends="">
+<description>Hello</description>
+<files>a.rs</files>
+<scope_out>x</scope_out>
+<tools>cargo test</tools>
+<verify>cargo test</verify>
+<done_when>done</done_when>
+</task>"#,
+        )
+        .expect("write plan");
+
+        let err = parse_plan(&plan).expect_err("missing reality_test should fail");
+        assert!(err.to_string().contains("missing <reality_test>"));
     }
 
     #[tokio::test]
@@ -206,9 +337,21 @@ mod tests {
             &plan,
             r#"<task id="T-001" req="REQ-A1.1" wave="0" depends="">
 <description>Hello</description>
+<files>mcp-server/src/abe/types.ts</files>
+<scope_out>none</scope_out>
+<tools>npx tsc --noEmit</tools>
+<verify>npx tsc --noEmit</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
 </task>
 <task id="T-002" req="REQ-A1.2" wave="1" depends="T-001">
 <description>World</description>
+<files>mcp-server/src/abe/contract-schema.ts</files>
+<scope_out>none</scope_out>
+<tools>npm test</tools>
+<verify>npm test</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
 </task>
 "#,
         )
