@@ -167,8 +167,8 @@ if [[ ! -f "$contract" ]]; then
 fi
 
 msg=$(git log -1 --pretty=%B 2>/dev/null || true)
-mapfile -t staged < <(git diff --cached --name-only)
-for file in "${staged[@]}"; do
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
   if [[ "$file" == .triumvirate/* ]]; then
     continue
   fi
@@ -180,7 +180,7 @@ for file in "${staged[@]}"; do
     echo "BLOCKED: stub marker detected in $file"
     exit 1
   fi
-done
+done < <(git diff --cached --name-only)
 
 test_cmd=$(jq -r '.test_command // empty' "$contract")
 if [[ -n "$test_cmd" ]]; then
