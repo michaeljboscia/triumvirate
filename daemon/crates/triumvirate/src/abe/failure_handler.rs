@@ -34,8 +34,8 @@ pub fn classify_failure(log_text: &str) -> Classification {
         };
     }
     Classification {
-        class: FailureClass::WorkerError,
-        reason: "worker produced invalid output".to_string(),
+        class: FailureClass::OrchestratorBriefingError,
+        reason: "unclassified failure — conservative default, send to Gemini".to_string(),
     }
 }
 
@@ -71,7 +71,7 @@ mod tests {
         );
         assert_eq!(
             classify_failure("stub marker TODO found").class,
-            FailureClass::WorkerError
+            FailureClass::OrchestratorBriefingError
         );
     }
 
