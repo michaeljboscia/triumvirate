@@ -240,7 +240,9 @@ fn parse_tool_commands(raw: &str) -> Vec<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use super::{parse_plan, run_orchestrator, DispatchBackend, PlanTask, TaskResult};
     use crate::abe::build_artifacts::{update_state, BuildState};
@@ -390,5 +392,174 @@ mod tests {
         let manifest_body = std::fs::read_to_string(manifest).expect("manifest read");
         assert!(manifest_body.contains("T-001"));
         assert!(manifest_body.contains("T-002"));
+    }
+
+    struct FailOnceBackend {
+        attempts: Mutex<HashMap<String, u32>>,
+    }
+
+    impl Default for FailOnceBackend {
+        fn default() -> Self {
+            Self {
+                attempts: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DispatchBackend for FailOnceBackend {
+        async fn dispatch_task(&self, task: &PlanTask) -> anyhow::Result<String> {
+            Ok(task.task_id.clone())
+        }
+
+        async fn wait_task(&self, task_id: &str) -> anyhow::Result<TaskResult> {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .expect("attempt mutex poisoned");
+            let count = attempts.entry(task_id.to_string()).or_insert(0);
+            *count += 1;
+            let n = *count;
+
+            if task_id == "T-003" && n == 1 {
+                return Ok(TaskResult {
+                    task_id: task_id.to_string(),
+                    status: "failed".to_string(),
+                    commit_sha: String::new(),
+                    modified_files: Vec::new(),
+                    attempts: n,
+                });
+            }
+
+            Ok(TaskResult {
+                task_id: task_id.to_string(),
+                status: "completed".to_string(),
+                commit_sha: format!("sha-{task_id}-{n}"),
+                modified_files: vec!["src/lib.rs".to_string()],
+                attempts: n,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_recovers_after_failed_attempt_on_resume() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plan = tmp.path().join("plan.md");
+        let state_path = tmp.path().join("BUILD_STATE.json");
+        let manifest = tmp.path().join("BUILD_MANIFEST.md");
+        let deviation = tmp.path().join("DEVIATION_LOG.md");
+
+        std::fs::write(
+            &plan,
+            r#"<task id="T-001" req="REQ-A1.1" wave="0" depends="">
+<description>First</description>
+<files>a.rs</files>
+<scope_out>none</scope_out>
+<tools>cargo test</tools>
+<verify>true</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
+</task>
+<task id="T-002" req="REQ-A1.2" wave="0" depends="">
+<description>Second</description>
+<files>b.rs</files>
+<scope_out>none</scope_out>
+<tools>cargo test</tools>
+<verify>true</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
+</task>
+<task id="T-003" req="REQ-A1.3" wave="1" depends="T-002">
+<description>Third</description>
+<files>c.rs</files>
+<scope_out>none</scope_out>
+<tools>cargo test</tools>
+<verify>true</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
+</task>
+<task id="T-004" req="REQ-A1.4" wave="1" depends="T-003">
+<description>Fourth</description>
+<files>d.rs</files>
+<scope_out>none</scope_out>
+<tools>cargo test</tools>
+<verify>true</verify>
+<reality_test>real</reality_test>
+<done_when>done</done_when>
+</task>
+"#,
+        )
+        .expect("write plan");
+
+        let state = BuildState {
+            build_id: "abe-recovery".to_string(),
+            plan_path: "plan.md".to_string(),
+            current_wave: 0,
+            tasks_completed: vec![],
+            tasks_remaining: vec![
+                "T-001".to_string(),
+                "T-002".to_string(),
+                "T-003".to_string(),
+                "T-004".to_string(),
+            ],
+            tasks_running: vec![],
+            tasks_failed: vec![],
+            validation_pass_rate: 1.0,
+            collateral_fix_count: 0,
+            last_commit_sha: "base".to_string(),
+            wave_0_sha: "base".to_string(),
+            max_parallel: 2,
+            build_timeout_sec: None,
+            build_started_at: "2026-04-08T00:00:00Z".to_string(),
+            updated_at: "2026-04-08T00:00:00Z".to_string(),
+        };
+        update_state(&state_path, &state).expect("write initial state");
+
+        let backend = FailOnceBackend::default();
+
+        run_orchestrator(
+            &backend,
+            Path::new(&plan),
+            Path::new(&state_path),
+            Path::new(&manifest),
+            Path::new(&deviation),
+            2,
+        )
+        .await
+        .expect("first run");
+
+        let state_after_first = crate::abe::build_artifacts::read_state(&state_path)
+            .expect("read state first");
+        assert!(state_after_first.tasks_failed.contains(&"T-003".to_string()));
+        assert!(
+            state_after_first.tasks_remaining.contains(&"T-003".to_string()),
+            "failed task should remain for recovery run"
+        );
+
+        run_orchestrator(
+            &backend,
+            Path::new(&plan),
+            Path::new(&state_path),
+            Path::new(&manifest),
+            Path::new(&deviation),
+            2,
+        )
+        .await
+        .expect("second run");
+
+        let final_state =
+            crate::abe::build_artifacts::read_state(&state_path).expect("read final state");
+        assert!(final_state.tasks_remaining.is_empty());
+        assert!(final_state.tasks_completed.contains(&"T-003".to_string()));
+
+        let manifest_body = std::fs::read_to_string(&manifest).expect("manifest read");
+        assert!(manifest_body.contains("T-001"));
+        assert!(manifest_body.contains("T-002"));
+        assert!(manifest_body.contains("T-003"));
+        assert!(manifest_body.contains("T-004"));
+
+        let deviation_body = std::fs::read_to_string(&deviation).expect("deviation read");
+        assert!(deviation_body.contains("task failed"));
+        assert!(deviation_body.contains("clean - no deviations"));
     }
 }
