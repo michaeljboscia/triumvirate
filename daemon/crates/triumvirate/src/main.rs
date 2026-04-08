@@ -897,6 +897,7 @@ start it with: triumvirate daemon"
         let prompt = "Read .triumvirate/BRIEFING.md and implement the task contract. Commit when complete.".to_string();
         let (cmd, mut args) = codex_command();
         args.push("exec".to_string());
+        args.push("--full-auto".to_string());
         args.push("--message".to_string());
         args.push(prompt);
 
