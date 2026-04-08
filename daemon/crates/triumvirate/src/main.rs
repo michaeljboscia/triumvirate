@@ -41,7 +41,7 @@ use fleet::tasks::FleetTaskStore;
 use ledger::LedgerStore;
 use peer_review::{PeerReviewEngine, ReviewRequest as PersistedReviewRequest};
 use mcp_bridge::{
-    is_bearer_authorized, is_supported_agent_name,
+    codex_command, is_bearer_authorized, is_supported_agent_name,
 };
 #[cfg(not(test))]
 use mcp_bridge::use_daemon_for_mcp_from_env;
@@ -70,6 +70,11 @@ use rmcp::{
 use serde::Deserialize;
 use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest,
+    CancelTaskRequest as AbeCancelTaskRequest, CancelTaskResponse as AbeCancelTaskResponse,
+    DispatchCodexRequest, DispatchCodexResponse,
+    DispatchCodexWorktreeRequest, DispatchCodexWorktreeResponse, GetTaskOutputRequest,
+    GetTaskOutputResponse, GetTaskStatusRequest, GetTaskStatusResponse, GeminiReviewVerdict,
+    QueryGeminiRequest, QueryGeminiResponse, QueryGeminiReviewRequest, QueryGeminiReviewResponse,
     DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
     FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest,
@@ -107,6 +112,7 @@ use tracing::info;
 use uuid::Uuid;
 
 mod agent_exec;
+mod abe;
 mod cli_ops;
 mod git_ops_impl;
 mod tracing_setup;
@@ -145,6 +151,7 @@ struct McpBridge {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     sessions_file: Option<PathBuf>,
     fleet_states: Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
+    abe_tasks: abe::task_tracker::TaskTracker,
 }
 
 fn mcp_daemon_proxy_enabled() -> bool {
@@ -186,6 +193,7 @@ impl McpBridge {
             sessions: Arc::new(Mutex::new(sessions)),
             sessions_file,
             fleet_states: Arc::new(Mutex::new(HashMap::new())),
+            abe_tasks: abe::task_tracker::TaskTracker::default(),
         }
     }
 }
@@ -738,6 +746,330 @@ start it with: triumvirate daemon"
             .list_lessons(tags_ref, req.stale_days)
             .map_err(|e| format!("lesson_list failed: {e}"))?;
         Ok(Json(LessonListResponse { lessons }))
+    }
+
+    #[tool(description = "Dispatch a one-off Codex task without worktree isolation.")]
+    async fn dispatch_codex(
+        &self,
+        Parameters(req): Parameters<DispatchCodexRequest>,
+    ) -> Result<Json<DispatchCodexResponse>, String> {
+        let task_id = format!("abe-{}", Uuid::new_v4().simple());
+        let cwd = req
+            .cwd
+            .clone()
+            .unwrap_or_else(|| ".".to_string());
+        let timeout_sec = req.timeout_sec.unwrap_or(600);
+
+        let (cmd, mut args) = codex_command();
+        args.push("exec".to_string());
+        args.push("--message".to_string());
+        args.push(req.prompt.clone());
+
+        let child = abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
+            cmd,
+            args,
+            cwd: cwd.clone(),
+            envs: HashMap::new(),
+        })
+        .await
+        .map_err(|e| format!("dispatch_codex failed: {e}"))?;
+
+        self.abe_tasks
+            .register(task_id.clone(), child.clone(), None)
+            .await;
+
+        let tracker = self.abe_tasks.clone();
+        let task_id_for_monitor = task_id.clone();
+        tokio::spawn(async move {
+            let timed_out = abe::codex_spawn::enforce_timeout(
+                child.clone(),
+                timeout_sec,
+                PathBuf::from(&cwd).as_path(),
+            )
+            .await
+            .unwrap_or(false);
+            if timed_out {
+                tracker.mark_timeout(&task_id_for_monitor).await;
+                return;
+            }
+            let exit = {
+                let mut locked = child.lock().await;
+                match locked.wait().await {
+                    Ok(status) => status,
+                    Err(err) => {
+                        tracker
+                            .mark_failed(&task_id_for_monitor, None, err.to_string())
+                            .await;
+                        return;
+                    }
+                }
+            };
+            if exit.success() {
+                let cwd_path = PathBuf::from(&cwd);
+                let (commit_sha, files) = abe::codex_spawn::resolve_commit_outputs(&cwd_path);
+                tracker
+                    .mark_completed(
+                        &task_id_for_monitor,
+                        commit_sha,
+                        files,
+                        String::new(),
+                        None,
+                        None,
+                    )
+                    .await;
+            } else {
+                tracker
+                    .mark_failed(
+                        &task_id_for_monitor,
+                        exit.code(),
+                        "codex process failed".to_string(),
+                    )
+                    .await;
+            }
+        });
+
+        Ok(Json(DispatchCodexResponse {
+            task_id,
+            status: "dispatched".to_string(),
+        }))
+    }
+
+    #[tool(description = "Dispatch a one-off Codex task in an isolated worktree with .triumvirate artifacts.")]
+    async fn dispatch_codex_worktree(
+        &self,
+        Parameters(req): Parameters<DispatchCodexWorktreeRequest>,
+    ) -> Result<Json<DispatchCodexWorktreeResponse>, String> {
+        let task_id = req.contract_fields.task_id.clone();
+        let validation = shared_types::validate_contract(&req.contract_fields)
+            .map_err(|e| format!("invalid contract_fields: {e}"));
+        if let Err(err) = validation {
+            self.abe_tasks
+                .register_setup_failed(task_id.clone(), err.clone())
+                .await;
+            return Err(err);
+        }
+
+        let project_root = std::env::current_dir()
+            .map_err(|e| format!("failed to resolve project_root: {e}"))?;
+        let setup = abe::worktree_setup::setup_worktree(&abe::worktree_setup::WorktreeSetupRequest {
+            project_root: project_root.clone(),
+            sha: req.sha.clone(),
+            task_id: task_id.clone(),
+            briefing_content: req.briefing_content.clone(),
+            contract_fields: req.contract_fields.clone(),
+        });
+        let setup = match setup {
+            Ok(s) => s,
+            Err(err) => {
+                self.abe_tasks
+                    .register_setup_failed(task_id.clone(), err.to_string())
+                    .await;
+                return Err(format!("SETUP_FAILED: {err}"));
+            }
+        };
+
+        let prompt = "Read .triumvirate/BRIEFING.md and implement the task contract. Commit when complete.".to_string();
+        let (cmd, mut args) = codex_command();
+        args.push("exec".to_string());
+        args.push("--message".to_string());
+        args.push(prompt);
+
+        let child = abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
+            cmd,
+            args,
+            cwd: setup.worktree_path.display().to_string(),
+            envs: HashMap::from([(
+                "CARGO_TARGET_DIR".to_string(),
+                setup.worktree_path
+                    .join(".triumvirate")
+                    .join("target")
+                    .join(task_id.clone())
+                    .display()
+                    .to_string(),
+            )]),
+        })
+        .await
+        .map_err(|e| format!("dispatch_codex_worktree failed: {e}"))?;
+
+        self.abe_tasks
+            .register(task_id.clone(), child.clone(), Some(setup.worktree_path.clone()))
+            .await;
+
+        let tracker = self.abe_tasks.clone();
+        let worktree_path = setup.worktree_path.clone();
+        let timeout_sec = req.contract_fields.task_timeout_sec;
+        let keep_failed = req.keep_failed_worktree.unwrap_or(false);
+        let project_root_for_cleanup = project_root.clone();
+        let task_id_for_monitor = task_id.clone();
+        tokio::spawn(async move {
+            let timed_out =
+                abe::codex_spawn::enforce_timeout(child.clone(), timeout_sec, &worktree_path)
+                    .await
+                    .unwrap_or(false);
+            if timed_out {
+                tracker.mark_timeout(&task_id_for_monitor).await;
+                return;
+            }
+
+            let exit = {
+                let mut locked = child.lock().await;
+                match locked.wait().await {
+                    Ok(status) => status,
+                    Err(err) => {
+                        tracker.mark_failed(&task_id_for_monitor, None, err.to_string()).await;
+                        return;
+                    }
+                }
+            };
+
+            if exit.success() {
+                let (commit_sha, files) = abe::codex_spawn::resolve_commit_outputs(&worktree_path);
+                let validation_log = fs::read_to_string(
+                    worktree_path.join(".triumvirate").join("VALIDATION_LOG.md"),
+                )
+                .ok();
+                tracker
+                    .mark_completed(
+                        &task_id_for_monitor,
+                        commit_sha,
+                        files,
+                        String::new(),
+                        validation_log,
+                        None,
+                    )
+                    .await;
+            } else {
+                tracker
+                    .mark_failed(
+                        &task_id_for_monitor,
+                        exit.code(),
+                        "codex process failed".to_string(),
+                    )
+                    .await;
+                if !keep_failed {
+                    let _ = abe::worktree_setup::rollback_worktree(
+                        &project_root_for_cleanup,
+                        &worktree_path,
+                    );
+                }
+            }
+        });
+
+        Ok(Json(DispatchCodexWorktreeResponse {
+            task_id,
+            worktree_path: setup.worktree_path.display().to_string(),
+            status: "dispatched".to_string(),
+        }))
+    }
+
+    #[tool(description = "Query Gemini synchronously and return response text.")]
+    async fn query_gemini(
+        &self,
+        Parameters(req): Parameters<QueryGeminiRequest>,
+    ) -> Result<Json<QueryGeminiResponse>, String> {
+        let query = if let Some(ctx) = req.context {
+            format!("Context:\n{ctx}\n\nQuestion:\n{}", req.query)
+        } else {
+            req.query
+        };
+        let response = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: query,
+                cwd: None,
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(|e| format!("query_gemini failed: {e}"))?;
+        Ok(Json(QueryGeminiResponse {
+            response: response.response,
+        }))
+    }
+
+    #[tool(description = "Query Gemini for code review verdicts on pass/failure contexts.")]
+    async fn query_gemini_review(
+        &self,
+        Parameters(req): Parameters<QueryGeminiReviewRequest>,
+    ) -> Result<Json<QueryGeminiReviewResponse>, String> {
+        let mut prompt = format!("Review this diff and provide verdict clean/concerns/regression.\n\n{}", req.diff);
+        if matches!(req.mode, shared_types::GeminiReviewMode::Failure) {
+            if let Some(briefing) = req.briefing {
+                prompt.push_str(&format!("\n\nBriefing:\n{briefing}"));
+            }
+            if let Some(contract) = req.contract {
+                let serialized = serde_json::to_string_pretty(&contract)
+                    .map_err(|e| format!("contract serialization failed: {e}"))?;
+                prompt.push_str(&format!("\n\nContract:\n{serialized}"));
+            }
+            if let Some(details) = req.failure_details {
+                prompt.push_str(&format!("\n\nFailure details:\n{details}"));
+            }
+        }
+
+        let response = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: prompt,
+                cwd: None,
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(|e| format!("query_gemini_review failed: {e}"))?;
+        let lower = response.response.to_lowercase();
+        let verdict = if lower.contains("regression") {
+            GeminiReviewVerdict::Regression
+        } else if lower.contains("concern") || lower.contains("issue") {
+            GeminiReviewVerdict::Concerns
+        } else {
+            GeminiReviewVerdict::Clean
+        };
+        Ok(Json(QueryGeminiReviewResponse {
+            verdict,
+            concerns: None,
+            suggestions: None,
+        }))
+    }
+
+    #[tool(description = "Get status for a dispatched ABE task.")]
+    async fn get_task_status(
+        &self,
+        Parameters(req): Parameters<GetTaskStatusRequest>,
+    ) -> Result<Json<GetTaskStatusResponse>, String> {
+        self.abe_tasks
+            .get_status(&req.task_id)
+            .await
+            .map(Json)
+            .ok_or_else(|| format!("unknown task_id: {}", req.task_id))
+    }
+
+    #[tool(description = "Get output details for a completed ABE task.")]
+    async fn get_task_output(
+        &self,
+        Parameters(req): Parameters<GetTaskOutputRequest>,
+    ) -> Result<Json<GetTaskOutputResponse>, String> {
+        self.abe_tasks
+            .get_output(&req.task_id)
+            .await
+            .map(Json)
+            .ok_or_else(|| format!("task output unavailable for task_id: {}", req.task_id))
+    }
+
+    #[tool(description = "Cancel a running ABE task.")]
+    async fn cancel_task(
+        &self,
+        Parameters(req): Parameters<AbeCancelTaskRequest>,
+    ) -> Result<Json<AbeCancelTaskResponse>, String> {
+        self.abe_tasks
+            .cancel(&req.task_id)
+            .await
+            .map(Json)
+            .ok_or_else(|| format!("unknown task_id: {}", req.task_id))
     }
 
     #[tool(description = "Spawn a multi-agent fleet (dry_run defaults to true).")]
