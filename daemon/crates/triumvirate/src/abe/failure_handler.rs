@@ -16,6 +16,15 @@ pub struct Classification {
 pub fn classify_failure(log_text: &str) -> Classification {
     let lower = log_text.to_lowercase();
 
+    if lower.contains("stub marker")
+        || lower.contains("test command failed")
+        || lower.contains("validation failed")
+    {
+        return Classification {
+            class: FailureClass::WorkerError,
+            reason: "worker produced non-compliant output".to_string(),
+        };
+    }
     if lower.contains("command not found") || lower.contains("sandbox") {
         return Classification {
             class: FailureClass::EnvironmentError,
@@ -72,7 +81,15 @@ mod tests {
         );
         assert_eq!(
             classify_failure("stub marker TODO found").class,
-            FailureClass::OrchestratorBriefingError
+            FailureClass::WorkerError
+        );
+        assert_eq!(
+            classify_failure("validation failed after retries").class,
+            FailureClass::WorkerError
+        );
+        assert_eq!(
+            classify_failure("test command failed: cargo test").class,
+            FailureClass::WorkerError
         );
     }
 

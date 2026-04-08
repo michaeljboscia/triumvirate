@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
 };
@@ -50,9 +50,31 @@ pub async fn enforce_timeout(child: Arc<Mutex<Child>>, timeout_sec: u64, cwd: &P
         let _ = child.kill().await;
     }
 
-    let _ = std::fs::remove_file(cwd.join(".git").join("index.lock"));
-    let _ = std::fs::remove_file(cwd.join(".git/index.lock"));
+    cleanup_git_locks(cwd);
     Ok(true)
+}
+
+fn cleanup_git_locks(worktree_path: &Path) {
+    let git_dir = resolve_git_dir(worktree_path);
+    let _ = std::fs::remove_file(git_dir.join("index.lock"));
+    let _ = std::fs::remove_file(worktree_path.join(".git").join("index.lock"));
+    let _ = std::fs::remove_file(worktree_path.join(".git/index.lock"));
+}
+
+fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
+    let dot_git = worktree_path.join(".git");
+    if dot_git.is_file() {
+        let content = std::fs::read_to_string(&dot_git).unwrap_or_default();
+        if let Some(gitdir) = content.lines().find_map(|line| line.strip_prefix("gitdir:")) {
+            let raw = gitdir.trim();
+            let parsed = PathBuf::from(raw);
+            if parsed.is_absolute() {
+                return parsed;
+            }
+            return worktree_path.join(parsed);
+        }
+    }
+    dot_git
 }
 
 pub fn resolve_commit_outputs(worktree_path: &Path, starting_sha: &str) -> (String, Vec<String>) {

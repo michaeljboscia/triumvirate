@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -199,9 +199,27 @@ impl TaskTracker {
     }
 }
 
-fn cleanup_git_locks(worktree_path: &std::path::Path) {
+fn cleanup_git_locks(worktree_path: &Path) {
+    let git_dir = resolve_git_dir(worktree_path);
+    let _ = fs::remove_file(git_dir.join("index.lock"));
     let _ = fs::remove_file(worktree_path.join(".git").join("index.lock"));
     let _ = fs::remove_file(worktree_path.join(".git/index.lock"));
+}
+
+fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
+    let dot_git = worktree_path.join(".git");
+    if dot_git.is_file() {
+        let content = fs::read_to_string(&dot_git).unwrap_or_default();
+        if let Some(gitdir) = content.lines().find_map(|line| line.strip_prefix("gitdir:")) {
+            let raw = gitdir.trim();
+            let parsed = PathBuf::from(raw);
+            if parsed.is_absolute() {
+                return parsed;
+            }
+            return worktree_path.join(parsed);
+        }
+    }
+    dot_git
 }
 
 #[cfg(test)]
