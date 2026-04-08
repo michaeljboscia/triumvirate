@@ -56,9 +56,11 @@ pub fn parse_plan(path: &Path) -> anyhow::Result<Vec<PlanTask>> {
 fn parse_task_block(block: &str) -> anyhow::Result<PlanTask> {
     let first_line = block.lines().next().unwrap_or_default();
     let task_id = extract_attr(first_line, "id").unwrap_or_default();
-    let wave = extract_attr(first_line, "wave")
-        .and_then(|w| w.parse::<u32>().ok())
-        .unwrap_or_default();
+    let wave_raw =
+        extract_attr(first_line, "wave").ok_or_else(|| anyhow::anyhow!("task block missing wave attribute"))?;
+    let wave = wave_raw
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid wave value '{wave_raw}'"))?;
     let req = extract_attr(first_line, "req").unwrap_or_default();
     let description = extract_between(block, "<description>", "</description>").unwrap_or_default();
     let files = extract_between(block, "<files>", "</files>").unwrap_or_default();
@@ -70,6 +72,15 @@ fn parse_task_block(block: &str) -> anyhow::Result<PlanTask> {
 
     if task_id.trim().is_empty() {
         anyhow::bail!("task block missing id attribute");
+    }
+    if req.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing req attribute");
+    }
+    if description.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing <description>");
+    }
+    if scope_out.trim().is_empty() {
+        anyhow::bail!("task {task_id} is missing <scope_out>");
     }
     if reality_test.trim().is_empty() {
         anyhow::bail!("task {task_id} is missing <reality_test>");
