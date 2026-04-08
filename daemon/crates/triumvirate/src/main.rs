@@ -898,13 +898,28 @@ start it with: triumvirate daemon"
         args.push("exec".to_string());
         args.push("--full-auto".to_string());
 
-        // Grant Codex write access to the main repo's .git/ directory.
-        // workspace-write sandbox blocks .git/ writes, but git add/commit
-        // needs access to objects/, refs/, worktrees/<name>/index.lock, etc.
-        // The object database and refs are shared across all worktrees.
+        // Grant Codex write access to git dirs for commit operations.
+        // workspace-write sandbox blocks .git/ writes. git add needs
+        // objects/ and refs/ (shared). git commit needs worktrees/<name>/
+        // index.lock (per-worktree). Both dirs required.
         let main_git_dir = project_root.join(".git");
         args.push("--add-dir".to_string());
         args.push(main_git_dir.display().to_string());
+
+        let dot_git = setup.worktree_path.join(".git");
+        if dot_git.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&dot_git) {
+                if let Some(gitdir) = content.strip_prefix("gitdir: ").map(|s| s.trim()) {
+                    let resolved = if std::path::Path::new(gitdir).is_absolute() {
+                        gitdir.to_string()
+                    } else {
+                        setup.worktree_path.join(gitdir).display().to_string()
+                    };
+                    args.push("--add-dir".to_string());
+                    args.push(resolved);
+                }
+            }
+        }
 
         args.push(prompt);
 
