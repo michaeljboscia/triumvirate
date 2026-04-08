@@ -2,7 +2,9 @@
 
 mod git_ops;
 mod ledger;
+mod abe;
 
+pub use abe::*;
 pub use git_ops::{GitOps, MergeResult};
 pub use ledger::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
