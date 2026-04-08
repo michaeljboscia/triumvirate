@@ -1,0 +1,37 @@
+TRIUMVIRATE v3.0 — AUTONOMOUS BUILD ENFORCEMENT
+=================================================
+
+Status: READY TO BUILD
+Phase: Pre-Phase 1 (canonical docs complete)
+Current Wave: N/A (build not started)
+
+Completed:
+- Spec written and goat-rodeoed (8 rounds, Phase 3 CLEAN)
+- 9 canonical docs produced (PRD, APP_FLOW, TECH_STACK, BACKEND_STRUCTURE, IMPLEMENTATION_PLAN, TEST_PLAN, CLAUDE.md, progress.txt, LESSONS.md)
+- 22 tasks across 6 waves defined
+- Execution contract embedded
+- 15 features mapped to 16 REQs
+
+Not Started:
+- Wave 0: Interfaces and contracts (T-001, T-002)
+- Wave 1: Dispatch infrastructure (T-003, T-004, T-005)
+- Wave 2: MCP tool registration (T-006 through T-010)
+- Wave 3: Enforcement scripts (T-011 through T-014)
+- Wave 4: Integration + red team (T-015, T-016)
+- Wave 5: Orchestration loop (T-017 through T-020)
+- Wave 6: E2E integration (T-021, T-022)
+
+Blocked:
+- None
+
+Next Action:
+- Phase 1 is built manually (bootstrap note). Hand Codex the IMPLEMENTATION_PLAN.md.
+- Start with Wave 0 (T-001, T-002) — types and schemas.
+
+Pre-Build Checklist:
+- [ ] validate-task.sh updated (VALIDATION_LOG.md output, classification hints, .triumvirate/ awareness)
+- [ ] Pre-commit hook script unit tested
+- [ ] Daemon codebase is clean (9 postrodeo bugs from v2.2 — verify status)
+
+Sprint After This:
+- Daemon Rust rewrite (v3.1) — subprocess management, concurrent monitoring, memory footprint
