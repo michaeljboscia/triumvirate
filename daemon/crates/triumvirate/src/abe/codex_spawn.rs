@@ -41,7 +41,10 @@ pub async fn enforce_timeout(child: Arc<Mutex<Child>>, timeout_sec: u64, cwd: &P
         return Ok(false);
     }
 
-    let _ = child.start_kill();
+    if let Some(pid) = child.id() {
+        // SIGTERM first to give the worker a chance to flush state and exit cleanly.
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     if child.try_wait()?.is_none() {
         let _ = child.kill().await;
@@ -52,7 +55,7 @@ pub async fn enforce_timeout(child: Arc<Mutex<Child>>, timeout_sec: u64, cwd: &P
     Ok(true)
 }
 
-pub fn resolve_commit_outputs(worktree_path: &Path) -> (String, Vec<String>) {
+pub fn resolve_commit_outputs(worktree_path: &Path, starting_sha: &str) -> (String, Vec<String>) {
     let head = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -70,6 +73,9 @@ pub fn resolve_commit_outputs(worktree_path: &Path) -> (String, Vec<String>) {
         })
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    if commit_sha == starting_sha {
+        return ("".to_string(), Vec::new());
+    }
 
     let files = std::process::Command::new("git")
         .arg("-C")

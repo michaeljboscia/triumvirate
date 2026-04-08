@@ -764,6 +764,15 @@ start it with: triumvirate daemon"
         args.push("exec".to_string());
         args.push("--message".to_string());
         args.push(req.prompt.clone());
+        let start_sha = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
 
         let child = abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
             cmd,
@@ -806,7 +815,18 @@ start it with: triumvirate daemon"
             };
             if exit.success() {
                 let cwd_path = PathBuf::from(&cwd);
-                let (commit_sha, files) = abe::codex_spawn::resolve_commit_outputs(&cwd_path);
+                let (commit_sha, files) =
+                    abe::codex_spawn::resolve_commit_outputs(&cwd_path, &start_sha);
+                if commit_sha.is_empty() {
+                    tracker
+                        .mark_failed(
+                            &task_id_for_monitor,
+                            exit.code(),
+                            "codex process exited without creating a commit".to_string(),
+                        )
+                        .await;
+                    return;
+                }
                 tracker
                     .mark_completed(
                         &task_id_for_monitor,
@@ -901,6 +921,7 @@ start it with: triumvirate daemon"
         let keep_failed = req.keep_failed_worktree.unwrap_or(false);
         let project_root_for_cleanup = project_root.clone();
         let task_id_for_monitor = task_id.clone();
+        let start_sha = req.sha.clone();
         tokio::spawn(async move {
             let timed_out =
                 abe::codex_spawn::enforce_timeout(child.clone(), timeout_sec, &worktree_path)
@@ -923,7 +944,18 @@ start it with: triumvirate daemon"
             };
 
             if exit.success() {
-                let (commit_sha, files) = abe::codex_spawn::resolve_commit_outputs(&worktree_path);
+                let (commit_sha, files) =
+                    abe::codex_spawn::resolve_commit_outputs(&worktree_path, &start_sha);
+                if commit_sha.is_empty() {
+                    tracker
+                        .mark_failed(
+                            &task_id_for_monitor,
+                            exit.code(),
+                            "codex process exited without creating a commit".to_string(),
+                        )
+                        .await;
+                    return;
+                }
                 let validation_log = fs::read_to_string(
                     worktree_path.join(".triumvirate").join("VALIDATION_LOG.md"),
                 )
