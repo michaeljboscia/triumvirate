@@ -3058,6 +3058,71 @@ echo '{"type":"result","stats":{"input_tokens":123,"output_tokens":45,"cached":1
         Ok(path)
     }
 
+    fn write_codex_worktree_commit_script(
+        rel_path: &str,
+        content: &str,
+        commit_message: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("codex-worktree-commit-{now}.sh"));
+        let parent = std::path::Path::new(rel_path)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let mkdir_line = if parent.is_empty() {
+            String::new()
+        } else {
+            format!("mkdir -p \"{parent}\"\n")
+        };
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+set -euo pipefail\n\
+{mkdir_line}cat > \"{rel_path}\" <<'PAYLOAD'\n\
+{content}\n\
+PAYLOAD\n\
+git add \"{rel_path}\"\n\
+git commit -m \"{commit_message}\"\n",
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
+    fn write_codex_sleep_script(seconds: u64) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("codex-sleep-{now}.sh"));
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+set -euo pipefail\n\
+sleep {seconds}\n\
+exit 0\n"
+        );
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
+    fn write_codex_custom_script(script_body: &str) -> anyhow::Result<PathBuf> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("codex-custom-{now}.sh"));
+        let script = format!("#!/usr/bin/env bash\nset -euo pipefail\n{script_body}\n");
+        fs::write(&path, script)?;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
     fn write_retry_agent_script(name: &str) -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -5716,6 +5781,379 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         assert_eq!(status.0.verdict.as_deref(), Some("approve"));
 
         std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abe_phase1_dispatch_poll_output_review_and_cancel() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let original_cwd = std::env::current_dir()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-abe-phase1-{now}"));
+        fs::create_dir_all(&project_root)?;
+
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&project_root)
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.email", "abe@test.local"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.name", "ABE Test"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "extensions.worktreeConfig", "true"])
+            .status()?;
+        fs::write(project_root.join("README.md"), "abe phase1\n")?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["add", "README.md"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["commit", "-m", "init"])
+            .status()?;
+
+        let head_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project_root)
+                .args(["rev-parse", "HEAD"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        std::env::set_current_dir(&project_root)?;
+
+        let codex_commit_script = write_codex_worktree_commit_script(
+            "src/phase1.rs",
+            "pub fn phase1_ready() -> bool { true }",
+            "T-021: complete phase1 acceptance",
+        )?;
+        let gemini_script = write_mock_gemini_script()?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex_commit_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let bridge = McpBridge::new_ephemeral();
+        let contract = shared_types::ContractFields {
+            task_id: "T-021".to_string(),
+            req_ids: vec!["REQ-A1.1".to_string(), "REQ-A1.2".to_string()],
+            wave: 6,
+            file_policy: shared_types::FilePolicy::DefaultDeny,
+            allowed_files: vec!["src/phase1.rs".to_string()],
+            forbidden_files: vec![],
+            allowed_commands: vec![vec!["true".to_string()]],
+            forbidden_commands: vec![],
+            commit_format: "^T-021:".to_string(),
+            test_command: "true".to_string(),
+            task_timeout_sec: 1,
+            done_when: "phase 1 e2e verified".to_string(),
+            reality_test: "dispatch->status->output->review->cancel".to_string(),
+        };
+
+        let dispatched = bridge
+            .dispatch_codex_worktree(Parameters(DispatchCodexWorktreeRequest {
+                sha: head_sha.clone(),
+                briefing_content: "Do the required change and commit".to_string(),
+                contract_fields: contract.clone(),
+                keep_failed_worktree: Some(true),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(dispatched.0.status, "dispatched");
+        assert!(!dispatched.0.worktree_path.is_empty());
+
+        let mut final_status = None;
+        for _ in 0..140 {
+            let status = bridge
+                .get_task_status(Parameters(GetTaskStatusRequest {
+                    task_id: dispatched.0.task_id.clone(),
+                }))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if matches!(
+                status.0.status,
+                shared_types::TaskStatus::Completed
+                    | shared_types::TaskStatus::Failed
+                    | shared_types::TaskStatus::Timeout
+                    | shared_types::TaskStatus::SetupFailed
+                    | shared_types::TaskStatus::Cancelled
+            ) {
+                final_status = Some(status.0);
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let status = final_status.expect("task should finish");
+        assert!(
+            matches!(status.status, shared_types::TaskStatus::Completed),
+            "expected completed status, got {:?}, error={:?}",
+            status.status,
+            status.error_message
+        );
+        assert!(status.commit_sha.unwrap_or_default().len() >= 7);
+
+        let out = bridge
+            .get_task_output(Parameters(GetTaskOutputRequest {
+                task_id: dispatched.0.task_id.clone(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(!out.0.commit_sha.is_empty());
+        assert!(out.0.modified_files.iter().any(|p| p == "src/phase1.rs"));
+
+        let review = bridge
+            .query_gemini_review(Parameters(QueryGeminiReviewRequest {
+                diff: "diff --git a/src/phase1.rs b/src/phase1.rs".to_string(),
+                mode: shared_types::GeminiReviewMode::Pass,
+                briefing: None,
+                contract: None,
+                failure_details: None,
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(matches!(
+            review.0.verdict,
+            GeminiReviewVerdict::Clean
+                | GeminiReviewVerdict::Concerns
+                | GeminiReviewVerdict::Regression
+        ));
+
+        let codex_sleep_script = write_codex_sleep_script(30)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex_sleep_script.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+
+        let long_task = bridge
+            .dispatch_codex(Parameters(DispatchCodexRequest {
+                prompt: "long running task".to_string(),
+                cwd: Some(project_root.display().to_string()),
+                timeout_sec: Some(120),
+                sandbox: None,
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        sleep(Duration::from_millis(150)).await;
+        let cancelled = bridge
+            .cancel_task(Parameters(AbeCancelTaskRequest {
+                task_id: long_task.0.task_id,
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(cancelled.0.status, "cancelled");
+
+        std::env::set_current_dir(&original_cwd)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        let _ = fs::remove_file(codex_commit_script);
+        let _ = fs::remove_file(codex_sleep_script);
+        let _ = fs::remove_file(gemini_script);
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abe_red_team_enforcement_blocks_non_compliant_worker() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let original_cwd = std::env::current_dir()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-abe-red-team-{now}"));
+        fs::create_dir_all(&project_root)?;
+
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&project_root)
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.email", "red-team@test.local"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.name", "Red Team Test"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["config", "extensions.worktreeConfig", "true"])
+            .status()?;
+        fs::write(project_root.join("README.md"), "abe red team\n")?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["add", "README.md"])
+            .status()?;
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["commit", "-m", "init"])
+            .status()?;
+
+        let head_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project_root)
+                .args(["rev-parse", "HEAD"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+        std::env::set_current_dir(&project_root)?;
+        let bridge = McpBridge::new_ephemeral();
+
+        let mk_contract = |task_id: &str| shared_types::ContractFields {
+            task_id: task_id.to_string(),
+            req_ids: vec!["REQ-A2.3".to_string()],
+            wave: 4,
+            file_policy: shared_types::FilePolicy::DefaultDeny,
+            allowed_files: vec!["src/allowed.rs".to_string()],
+            forbidden_files: vec!["src/forbidden.rs".to_string()],
+            allowed_commands: vec![vec!["true".to_string()]],
+            forbidden_commands: vec![vec!["rm".to_string(), "-rf".to_string()]],
+            commit_format: format!("^{task_id}:"),
+            test_command: "true".to_string(),
+            task_timeout_sec: 1,
+            done_when: "red team rejection observed".to_string(),
+            reality_test: "enforcement stack blocks violations".to_string(),
+        };
+
+        let dispatch_and_expect_failed = |script_path: PathBuf, task_id: String| {
+            let bridge = bridge.clone();
+            let head_sha = head_sha.clone();
+            async move {
+            // SAFETY: test controls env var lifecycle under lock.
+            unsafe {
+                std::env::set_var("TRIUMVIRATE_CODEX_BIN", script_path.as_os_str());
+                std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            }
+            let dispatched = bridge
+                .dispatch_codex_worktree(Parameters(DispatchCodexWorktreeRequest {
+                    sha: head_sha.clone(),
+                    briefing_content: "Non-compliant attempt for red-team validation".to_string(),
+                    contract_fields: mk_contract(&task_id),
+                    keep_failed_worktree: Some(true),
+                }))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            for _ in 0..120 {
+                let status = bridge
+                    .get_task_status(Parameters(GetTaskStatusRequest {
+                        task_id: dispatched.0.task_id.clone(),
+                    }))
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                if matches!(
+                    status.0.status,
+                    shared_types::TaskStatus::Failed
+                        | shared_types::TaskStatus::Timeout
+                        | shared_types::TaskStatus::SetupFailed
+                        | shared_types::TaskStatus::Cancelled
+                        | shared_types::TaskStatus::Completed
+                ) {
+                    return Ok::<shared_types::TaskStatus, anyhow::Error>(status.0.status);
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+                anyhow::bail!("task did not reach terminal state in time");
+            }
+        };
+
+        let forbidden_file_script = write_codex_custom_script(
+            "mkdir -p src\n\
+             echo 'pub fn bad() {}' > src/forbidden.rs\n\
+             git add src/forbidden.rs\n\
+             git commit -m 'T-016A: forbidden file write'",
+        )?;
+        let bad_commit_script = write_codex_custom_script(
+            "mkdir -p src\n\
+             echo 'pub fn ok() {}' > src/allowed.rs\n\
+             git add src/allowed.rs\n\
+             git commit -m 'wrong-format commit message'",
+        )?;
+        let stub_script = write_codex_custom_script(
+            "mkdir -p src\n\
+             echo '// TODO: stub' > src/allowed.rs\n\
+             git add src/allowed.rs\n\
+             git commit -m 'T-016C: stub marker present'",
+        )?;
+
+        let s1 = dispatch_and_expect_failed(forbidden_file_script.clone(), "T-016A".to_string()).await?;
+        assert!(!matches!(s1, shared_types::TaskStatus::Completed));
+        let s2 = dispatch_and_expect_failed(bad_commit_script.clone(), "T-016B".to_string()).await?;
+        assert!(!matches!(s2, shared_types::TaskStatus::Completed));
+        let s3 = dispatch_and_expect_failed(stub_script.clone(), "T-016C".to_string()).await?;
+        assert!(!matches!(s3, shared_types::TaskStatus::Completed));
+
+        let command_hook = PathBuf::from(
+            std::env::var("HOME")
+                .map(PathBuf::from)?
+                .join(".claude")
+                .join("hooks")
+                .join("enforce-command-scope.sh"),
+        );
+        let contract_path = project_root.join(".triumvirate").join("contract-red-team.json");
+        fs::create_dir_all(contract_path.parent().unwrap_or(&project_root))?;
+        fs::write(
+            &contract_path,
+            serde_json::to_string_pretty(&mk_contract("T-016D"))?,
+        )?;
+        let out = std::process::Command::new(command_hook)
+            .current_dir(&project_root)
+            .env("TRIUMVIRATE_CONTRACT_PATH", &contract_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    use std::io::Write as _;
+                    let payload = r#"{"tool_input":{"command":"rm -rf /tmp/evil"}}"#;
+                    stdin.write_all(payload.as_bytes())?;
+                }
+                child.wait_with_output()
+            })?;
+        assert_eq!(out.status.code(), Some(2));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("BLOCKED"));
+
+        std::env::set_current_dir(&original_cwd)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+        }
+        let _ = fs::remove_file(forbidden_file_script);
+        let _ = fs::remove_file(bad_commit_script);
+        let _ = fs::remove_file(stub_script);
         let _ = fs::remove_dir_all(project_root);
         Ok(())
     }
