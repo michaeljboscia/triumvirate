@@ -986,6 +986,29 @@ start it with: triumvirate daemon"
                         .await;
                     return;
                 }
+
+                // DAEMON-SIDE POST-EXIT VALIDATION
+                // Validates the commit against the ORIGINAL contract held by the daemon,
+                // NOT the worktree copy (which the worker may have tampered with).
+                // This closes the --no-verify bypass, hook rewrite, and contract tampering vectors.
+                let validation = abe::post_exit_validator::validate_commit(
+                    &worktree_path,
+                    &contract_for_validation,
+                    &start_sha,
+                );
+                if !validation.passed {
+                    let violation_summary = validation.violations.join("; ");
+                    tracker
+                        .mark_failed(
+                            &task_id_for_monitor,
+                            None,
+                            format!("DAEMON_VALIDATION_FAILED: {violation_summary}"),
+                        )
+                        .await;
+                    // Worktree is quarantined for forensics — NOT reverted, NOT cleaned up.
+                    return;
+                }
+
                 let validation_log = fs::read_to_string(
                     worktree_path.join(".triumvirate").join("VALIDATION_LOG.md"),
                 )
