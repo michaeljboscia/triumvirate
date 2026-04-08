@@ -897,6 +897,30 @@ start it with: triumvirate daemon"
         let (cmd, mut args) = codex_command();
         args.push("exec".to_string());
         args.push("--full-auto".to_string());
+
+        // Grant Codex write access to the worktree's git metadata dir.
+        // workspace-write sandbox blocks .git/ writes, but git commit needs
+        // to create index.lock inside the worktree's gitdir.
+        let dot_git = setup.worktree_path.join(".git");
+        let git_meta_dir = if dot_git.is_file() {
+            std::fs::read_to_string(&dot_git)
+                .ok()
+                .and_then(|c| c.strip_prefix("gitdir: ").map(|s| s.trim().to_string()))
+                .map(|p| {
+                    if std::path::Path::new(&p).is_absolute() {
+                        p
+                    } else {
+                        setup.worktree_path.join(&p).display().to_string()
+                    }
+                })
+        } else {
+            Some(dot_git.display().to_string())
+        };
+        if let Some(dir) = &git_meta_dir {
+            args.push("--add-dir".to_string());
+            args.push(dir.clone());
+        }
+
         args.push(prompt);
 
         let child = abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
