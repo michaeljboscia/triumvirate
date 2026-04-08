@@ -45,3 +45,17 @@
 ### Blind retries waste attempts
 **What happened:** Same worker, same briefing, same contract — failed 3 times the same way.
 **Rule:** Four failure classes with different retry strategies. contract-error fixes the contract. orchestrator-briefing-error rewrites the briefing. environment-error halts immediately. Only worker-error dispatches a new worker with a repair briefing.
+
+## From Stress Test (2026-04-08)
+
+### Git hooks are bypassable — daemon-side validation is the real enforcement
+**What happened:** Stress test STRESS-002 proved Codex uses `git commit --no-verify` to bypass pre-commit hooks when they block a commit. The hook was correct. Codex retried with `--no-verify` autonomously — this is built-in Codex behavior with `--full-auto`, not a bug.
+**Rule:** Git hooks are defense against ACCIDENTAL violations. They are NOT defense against a determined worker. The daemon must independently validate every commit AFTER the worker exits, using the ORIGINAL contract held by the daemon (not the worktree copy). `post_exit_validator.rs` checks file scope, commit format, stub markers, and test command. If any fail: DAEMON_VALIDATION_FAILED, worktree quarantined. The worker can cheat all it wants — nothing leaves until the daemon says so.
+
+### Never trust anything inside the worker's worktree
+**What happened:** The worker has write access to `.triumvirate/` including contract.json and the hook scripts. It can rewrite its own rules.
+**Rule:** The daemon holds the authoritative contract (`contract_for_validation`) cloned from the original dispatch request. The worktree copy of contract.json is for the HOOKS (first-line defense). The daemon's copy is for VALIDATION (final authority). These are separate — tampering with one doesn't affect the other.
+
+### Three-layer enforcement: hooks → daemon validation → Gemini review
+**What happened:** Single-layer enforcement (hooks only) was defeated in test 2 of 39. 
+**Rule:** Each layer catches what the previous misses. Hooks catch honest mistakes before commit. Daemon validation catches all bypasses after commit. Gemini review catches semantic issues that pass both mechanical layers. No single layer is sufficient alone.
