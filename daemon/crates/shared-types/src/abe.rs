@@ -51,6 +51,8 @@ pub struct ContractFields {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct DispatchCodexWorktreeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
     pub sha: String,
     pub briefing_content: String,
     pub contract_fields: ContractFields,
@@ -344,6 +346,7 @@ mod tests {
     #[test]
     fn dispatch_worktree_request_accepts_complete_contract_fields() {
         let req = DispatchCodexWorktreeRequest {
+            project_root: Some("/tmp/project".to_string()),
             sha: "abc123".to_string(),
             briefing_content: "# briefing".to_string(),
             contract_fields: valid_contract(),
