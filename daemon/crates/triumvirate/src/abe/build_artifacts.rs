@@ -32,6 +32,7 @@ pub fn read_state(path: &Path) -> anyhow::Result<BuildState> {
     Ok(serde_json::from_slice(&raw)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn append_manifest(
     path: &Path,
     task_id: &str,

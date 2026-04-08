@@ -3,6 +3,8 @@ use rusqlite::OptionalExtension;
 
 use crate::LedgerStore;
 
+type SessionRow = (String, Option<String>, String, Option<String>, i64, i64);
+
 pub(crate) fn query_summaries(
     store: &LedgerStore,
     query: &str,
@@ -95,7 +97,7 @@ pub(crate) fn get_session_detail(
             anyhow::bail!("session not found: {session_id}");
         }
 
-        let session_row: Option<(String, Option<String>, String, Option<String>, i64, i64)> = conn
+        let session_row: Option<SessionRow> = conn
             .query_row(
                 "SELECT project, branch, started_at, ended_at, event_count, summary_count
                  FROM sessions

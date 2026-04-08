@@ -66,11 +66,11 @@ pub(crate) fn health(store: &LedgerStore) -> anyhow::Result<HealthStatus> {
         let db_size_bytes = fs::metadata(&db_path).map(|m| m.len() as i64).unwrap_or(0);
         let spool_size_bytes = dir_size_bytes(&spool_dir);
 
-        let status = if spool_size_bytes > 100_000_000 {
-            "degraded".to_string()
-        } else if stale_jobs > 0 || (events_last_5min == 0 && active_sessions > 0) {
-            "degraded".to_string()
-        } else if queue_lag_seconds_conn(conn)? > 5.0 {
+        let degraded = spool_size_bytes > 100_000_000
+            || stale_jobs > 0
+            || (events_last_5min == 0 && active_sessions > 0)
+            || queue_lag_seconds_conn(conn)? > 5.0;
+        let status = if degraded {
             "degraded".to_string()
         } else {
             "healthy".to_string()

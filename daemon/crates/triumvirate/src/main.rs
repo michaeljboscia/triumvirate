@@ -3018,7 +3018,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} warm worker 
         Ok(path)
     }
 
-    fn write_codex_args_capture_script(args_path: &PathBuf, response_text: &str) -> anyhow::Result<PathBuf> {
+    fn write_codex_args_capture_script(args_path: &std::path::Path, response_text: &str) -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
