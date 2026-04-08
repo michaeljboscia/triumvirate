@@ -56,6 +56,7 @@ pub fn setup_worktree(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSetu
 
     write_validate_script(&triumvirate_dir)?;
     write_pre_commit_hook(&triumvirate_dir)?;
+    write_commit_msg_hook(&triumvirate_dir)?;
 
     ensure_exclude_entry(&worktree_path, ".triumvirate/")?;
 
@@ -98,7 +99,7 @@ where
 }
 
 fn ensure_exclude_entry(worktree_path: &Path, entry: &str) -> anyhow::Result<()> {
-    let info_dir = worktree_path.join(".git").join("info");
+    let info_dir = resolve_git_dir(worktree_path).join("info");
     fs::create_dir_all(&info_dir)?;
     let exclude_path = info_dir.join("exclude");
     let mut contents = fs::read_to_string(&exclude_path).unwrap_or_default();
@@ -111,6 +112,22 @@ fn ensure_exclude_entry(worktree_path: &Path, entry: &str) -> anyhow::Result<()>
         fs::write(exclude_path, contents.as_bytes())?;
     }
     Ok(())
+}
+
+fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
+    let dot_git = worktree_path.join(".git");
+    if dot_git.is_file() {
+        let content = fs::read_to_string(&dot_git).unwrap_or_default();
+        if let Some(gitdir) = content.lines().find_map(|line| line.strip_prefix("gitdir:")) {
+            let raw = gitdir.trim();
+            let parsed = PathBuf::from(raw);
+            if parsed.is_absolute() {
+                return parsed;
+            }
+            return worktree_path.join(parsed);
+        }
+    }
+    dot_git
 }
 
 fn write_validate_script(triumvirate_dir: &Path) -> anyhow::Result<()> {
@@ -150,14 +167,6 @@ if [[ ! -f "$contract" ]]; then
 fi
 
 msg=$(git log -1 --pretty=%B 2>/dev/null || true)
-commit_format=$(jq -r '.commit_format' "$contract")
-if [[ -n "$commit_format" && "$commit_format" != "null" ]]; then
-  if ! [[ "$msg" =~ $commit_format ]]; then
-    echo "BLOCKED: Commit message does not match contract format"
-    exit 1
-  fi
-fi
-
 mapfile -t staged < <(git diff --cached --name-only)
 for file in "${staged[@]}"; do
   if [[ "$file" == .triumvirate/* ]]; then
@@ -167,11 +176,19 @@ for file in "${staged[@]}"; do
     echo "BLOCKED: Write to $file denied by contract"
     exit 1
   fi
-  if rg -n "TODO|FIXME|unimplemented!|placeholder" "$file" >/dev/null 2>&1; then
+  if grep -rnE "TODO|FIXME|unimplemented!|placeholder" "$file" >/dev/null 2>&1; then
     echo "BLOCKED: stub marker detected in $file"
     exit 1
   fi
 done
+
+test_cmd=$(jq -r '.test_command // empty' "$contract")
+if [[ -n "$test_cmd" ]]; then
+  if ! eval "$test_cmd" >/dev/null 2>&1; then
+    echo "BLOCKED: test command failed: $test_cmd"
+    exit 1
+  fi
+fi
 "#,
     )?;
 
@@ -186,10 +203,154 @@ done
     Ok(())
 }
 
+fn write_commit_msg_hook(triumvirate_dir: &Path) -> anyhow::Result<()> {
+    let hook_path = triumvirate_dir.join("hooks").join("commit-msg");
+    let mut file = fs::File::create(&hook_path)?;
+    file.write_all(
+        br#"#!/usr/bin/env bash
+set -euo pipefail
+contract=".triumvirate/contract.json"
+if [[ ! -f "$contract" ]]; then
+  echo "BLOCKED: missing .triumvirate/contract.json"
+  exit 1
+fi
+message_file="${1:-}"
+if [[ -z "$message_file" || ! -f "$message_file" ]]; then
+  echo "BLOCKED: commit-msg hook requires message file path"
+  exit 1
+fi
+msg=$(cat "$message_file")
+commit_format=$(jq -r '.commit_format // empty' "$contract")
+if [[ -n "$commit_format" ]]; then
+  if ! [[ "$msg" =~ $commit_format ]]; then
+    echo "BLOCKED: Commit message does not match contract format"
+    exit 1
+  fi
+fi
+"#,
+    )?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms)?;
+    }
+    Ok(())
+}
+
 fn short_sha(sha: &str) -> &str {
     if sha.len() > 12 {
         &sha[..12]
     } else {
         sha
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_git_dir, setup_worktree, WorktreeSetupRequest};
+    use shared_types::{ContractFields, FilePolicy};
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    #[test]
+    fn setup_worktree_handles_dot_git_file_and_updates_exclude() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        assert!(Command::new("git").arg("init").arg(repo).status().expect("git init").success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.email", "abe@example.com"])
+            .status()
+            .expect("git config email")
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.name", "ABE"])
+            .status()
+            .expect("git config name")
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "extensions.worktreeConfig", "true"])
+            .status()
+            .expect("git config worktreeConfig")
+            .success());
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write readme");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "README.md"])
+            .status()
+            .expect("git add")
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-m", "init"])
+            .status()
+            .expect("git commit")
+            .success());
+        let sha = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+
+        let request = WorktreeSetupRequest {
+            project_root: repo.to_path_buf(),
+            sha,
+            task_id: "T-003".to_string(),
+            briefing_content: "briefing".to_string(),
+            contract_fields: ContractFields {
+                task_id: "T-003".to_string(),
+                req_ids: vec!["REQ-A1.2".to_string()],
+                wave: 1,
+                file_policy: FilePolicy::DefaultDeny,
+                allowed_files: vec!["README.md".to_string()],
+                forbidden_files: vec![],
+                allowed_commands: vec![vec!["cargo".to_string(), "check".to_string()]],
+                forbidden_commands: vec![],
+                commit_format: "^T-003:".to_string(),
+                test_command: "true".to_string(),
+                task_timeout_sec: 60,
+                done_when: "done".to_string(),
+                reality_test: "real".to_string(),
+            },
+        };
+
+        let setup = setup_worktree(&request).expect("setup worktree");
+        assert!(
+            setup.worktree_path.join(".git").is_file(),
+            ".git must be a file in worktree"
+        );
+
+        let git_dir = resolve_git_dir(&setup.worktree_path);
+        let exclude = std::fs::read_to_string(git_dir.join("info").join("exclude"))
+            .expect("read exclude");
+        assert!(exclude.lines().any(|line| line.trim() == ".triumvirate/"));
+        assert!(setup.worktree_path.join(".triumvirate/hooks/commit-msg").exists());
+    }
+
+    #[test]
+    fn resolve_git_dir_supports_relative_pointer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).expect("mkdir");
+        std::fs::write(wt.join(".git"), "gitdir: ../.git/worktrees/demo\n").expect("write");
+        let resolved = resolve_git_dir(&wt);
+        assert_eq!(resolved, PathBuf::from(&wt).join("../.git/worktrees/demo"));
     }
 }
