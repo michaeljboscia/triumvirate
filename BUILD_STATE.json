@@ -14,28 +14,28 @@
     "T-009",
     "T-010",
     "T-011",
-    "T-012"
+    "T-012",
+    "T-015",
+    "T-017",
+    "T-018",
+    "T-019",
+    "T-020"
   ],
   "tasks_remaining": [
     "T-013",
     "T-014",
-    "T-015",
     "T-016",
-    "T-017",
-    "T-018",
-    "T-019",
-    "T-020",
     "T-021",
     "T-022"
   ],
   "tasks_running": [],
   "tasks_failed": [],
   "validation_pass_rate": 1.0,
-  "collateral_fix_count": 2,
-  "last_commit_sha": "8734d04",
+  "collateral_fix_count": 3,
+  "last_commit_sha": "f352d51",
   "wave_0_sha": "2f99ffa",
   "max_parallel": 2,
   "build_timeout_sec": null,
   "build_started_at": "2026-04-07T22:15:00Z",
-  "updated_at": "2026-04-08T00:05:00Z"
+  "updated_at": "2026-04-08T00:24:00Z"
 }

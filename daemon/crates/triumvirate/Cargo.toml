@@ -27,6 +27,7 @@ mime_guess = "2"
 uuid.workspace = true
 libc.workspace = true
 async-trait = "0.1"
+futures = "0.3"
 shared-types = { path = "../shared-types" }
 daemon-core = { path = "../daemon-core" }
 mcp-bridge = { path = "../mcp-bridge" }
