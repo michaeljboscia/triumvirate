@@ -29,6 +29,7 @@ libc.workspace = true
 async-trait = "0.1"
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+regex-lite = "0.1"
 shared-types = { path = "../shared-types" }
 daemon-core = { path = "../daemon-core" }
 mcp-bridge = { path = "../mcp-bridge" }
