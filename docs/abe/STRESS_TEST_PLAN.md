@@ -769,6 +769,10 @@ Record these for every phase:
 | Disk usage (.triumvirate/) | `du -sh .triumvirate/` |
 | Open file descriptors | `lsof -p <daemon_pid> \| wc -l` |
 | Git fsck result | `git fsck --full` after each phase |
+| Gemini 429 rate-limit count | Count rejected/retried review calls |
+| .git/info/exclude integrity | `cat .git/info/exclude \| sort \| uniq -c` after concurrent dispatch |
+| Orphaned processes after kill | `ps aux \| grep codex \| grep -v grep` after daemon restart |
+| Background child processes | `pgrep -P <codex_pid>` before and after kill |
 
 ---
 
@@ -781,6 +785,8 @@ Record these for every phase:
 | Phase 3 | 4 concurrent workers complete. Wave dependency works. No resource issues. |
 | Phase 4 | 8 concurrent workers: system stays responsive, git isn't corrupted, no orphans |
 | Phase 5 | Recovery works. Edge cases produce clean errors, not panics or corruption. |
+| Phase 6 | Adversarial attacks are BLOCKED or DOCUMENTED as known limitations |
+| Phase 7 | No state corruption under race conditions. All tasks reach terminal state. |
 
 ## Fail Criteria (stop and investigate)
 
@@ -791,3 +797,22 @@ Record these for every phase:
 - Cross-task contamination (one worker sees another's files)
 - System unresponsive (can't poll get_task_status while tasks run)
 - OOM kill on any process
+- **Worker bypasses enforcement** (commits forbidden files, stubs, or wrong format via --no-verify or hook rewrite)
+- **Worker modifies its own contract** (rewrites contract.json or hooks)
+- **Race condition produces undefined state** (task is both completed AND cancelled)
+- **.git/info/exclude corrupted** by concurrent writes
+
+---
+
+## Test Summary
+
+| Phase | Tests | Workers | Focus |
+|-------|-------|---------|-------|
+| Phase 1 | 1.1–1.8 | 1 Codex + 1 Gemini | Baseline: happy path + designed failures |
+| Phase 2 | 2.1–2.5 | 2 Codex + N Gemini | Parallel isolation + mixed results |
+| Phase 3 | 3.1–3.5 | 4 Codex + N Gemini | Wave simulation + resource pressure |
+| Phase 4 | 4.1–4.5 | 8 Codex + N Gemini | Maximum concurrency + chaos |
+| Phase 5 | 5.1–5.6 | 1-2 Codex | Recovery + edge cases |
+| Phase 6 | 6.1–6.6 | 1 Codex | Adversarial: break the enforcement |
+| Phase 7 | 7.1–7.5 | 1-8 Codex | Race conditions + contention |
+| **Total** | **39 tests** | | |
