@@ -1,22 +1,29 @@
 # DEVIATION_LOG
 
-## 2026-04-08T00:00:00Z
+## 2026-04-08T03:45:00Z
 - task: T-016
 - severity: info
-- deviation: Acceptance red-team integration test not yet landed in repo test suite.
-- classification: none
-- action: add deterministic integration test using real worktree hooks and non-compliant worker scripts.
+- deviation: Completed in-repo red-team acceptance coverage with non-compliant worker paths and command-scope enforcement checks.
+- classification: resolved
+- action: merged in commit 3f43da0.
 
-## 2026-04-08T00:00:00Z
+## 2026-04-08T03:45:00Z
 - task: T-021
 - severity: info
-- deviation: Phase 1 E2E acceptance test not yet explicit as a dedicated scenario.
-- classification: none
-- action: add end-to-end dispatch/poll/output/review/cancel test using MCP bridge + temp repo.
+- deviation: Completed explicit phase-1 e2e acceptance flow (dispatch -> poll -> output -> Gemini review -> cancel).
+- classification: resolved
+- action: merged in commit 3f43da0.
 
-## 2026-04-08T00:00:00Z
+## 2026-04-08T03:45:00Z
 - task: T-022
 - severity: info
-- deviation: Full orchestration failure+recovery acceptance test not yet explicit.
-- classification: none
-- action: add multi-wave test with induced first-attempt failure and successful retry path.
+- deviation: Completed explicit orchestration failure/recovery acceptance coverage with BUILD_STATE convergence and manifest/deviation assertions.
+- classification: resolved
+- action: merged in commit 8fb7ada.
+
+## 2026-04-08T03:45:00Z
+- task: collateral
+- severity: info
+- deviation: Replaced bash-4-only `mapfile` in generated pre-commit hook with bash-3-compatible staged-file iteration.
+- classification: resolved
+- action: merged in commit 3f43da0.
