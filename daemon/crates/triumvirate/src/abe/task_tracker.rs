@@ -150,7 +150,15 @@ impl TaskTracker {
         };
         if let Some(child) = child {
             let mut child = child.lock().await;
-            let _ = child.start_kill();
+            if child.try_wait().ok().flatten().is_none() {
+                if let Some(pid) = child.id() {
+                    let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill().await;
+                }
+            }
         }
         if let Some(worktree_path) = worktree_path.as_ref() {
             cleanup_git_locks(worktree_path);
