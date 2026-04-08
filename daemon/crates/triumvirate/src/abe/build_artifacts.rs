@@ -37,6 +37,9 @@ pub fn append_manifest(
     task_id: &str,
     req_ids: &[String],
     commit_sha: &str,
+    wave: u32,
+    files_modified: &[String],
+    attempts: u32,
     validation: &str,
     gemini_review: &str,
     timestamp: &str,
@@ -44,12 +47,13 @@ pub fn append_manifest(
     if !path.exists() {
         fs::write(
             path,
-            b"## BUILD_MANIFEST\n\n| task_id | req_ids | commit_sha | validation | gemini_review | timestamp |\n|---|---|---|---|---|---|\n",
+            b"## BUILD_MANIFEST\n\n| task_id | req_ids | wave | files_modified | attempts | commit_sha | validation | gemini_review | timestamp |\n|---|---|---|---|---|---|---|---|---|\n",
         )?;
     }
     let row = format!(
-        "| {task_id} | {} | {commit_sha} | {validation} | {gemini_review} | {timestamp} |\n",
-        req_ids.join(",")
+        "| {task_id} | {} | {wave} | {} | {attempts} | {commit_sha} | {validation} | {gemini_review} | {timestamp} |\n",
+        req_ids.join(","),
+        files_modified.join(",")
     );
     let mut existing = fs::read_to_string(path)?;
     existing.push_str(&row);
@@ -115,6 +119,9 @@ mod tests {
             "T-001",
             &["REQ-A1.1".to_string()],
             "abc",
+            1,
+            &["src/lib.rs".to_string()],
+            1,
             "PASS",
             "clean",
             "2026-04-07T00:00:02Z",
