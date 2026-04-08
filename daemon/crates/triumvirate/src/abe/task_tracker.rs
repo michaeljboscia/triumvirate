@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -139,15 +140,20 @@ impl TaskTracker {
     }
 
     pub async fn cancel(&self, task_id: &str) -> Option<CancelTaskResponse> {
-        let child = {
+        let (child, worktree_path) = {
             let guard = self.inner.lock().await;
-            guard
-                .get(task_id)
-                .and_then(|task| task.child.as_ref().cloned())
+            let task = guard.get(task_id)?;
+            (
+                task.child.as_ref().cloned(),
+                task.worktree_path.clone(),
+            )
         };
         if let Some(child) = child {
             let mut child = child.lock().await;
             let _ = child.start_kill();
+        }
+        if let Some(worktree_path) = worktree_path.as_ref() {
+            cleanup_git_locks(worktree_path);
         }
 
         let mut guard = self.inner.lock().await;
@@ -190,5 +196,42 @@ impl TaskTracker {
     pub async fn elapsed_for(&self, task_id: &str) -> Option<Duration> {
         let guard = self.inner.lock().await;
         guard.get(task_id).map(|r| r.started_at.elapsed())
+    }
+}
+
+fn cleanup_git_locks(worktree_path: &std::path::Path) {
+    let _ = fs::remove_file(worktree_path.join(".git").join("index.lock"));
+    let _ = fs::remove_file(worktree_path.join(".git/index.lock"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskTracker;
+    use tokio::{process::Command, sync::Mutex};
+
+    #[tokio::test]
+    async fn cancel_cleans_git_index_lock() {
+        let tracker = TaskTracker::default();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let wt = tmp.path().join("worktree");
+        std::fs::create_dir_all(wt.join(".git")).expect("mkdir");
+        let lock = wt.join(".git").join("index.lock");
+        std::fs::write(&lock, "lock").expect("write lock");
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .expect("spawn");
+        tracker
+            .register(
+                "T-LOCK".to_string(),
+                std::sync::Arc::new(Mutex::new(child)),
+                Some(wt.clone()),
+            )
+            .await;
+
+        let _ = tracker.cancel("T-LOCK").await;
+        assert!(!lock.exists(), "expected index.lock to be removed on cancel");
     }
 }
