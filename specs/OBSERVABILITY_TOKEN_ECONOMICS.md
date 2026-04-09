@@ -10,7 +10,7 @@
 
 ## Problem Statement
 
-The Triumvirate daemon shipped ABE v3.0 with 1,932 lines of Rust and zero observability. No tracing spans, no ABE-specific metrics, no structured logging. Four Prometheus metrics are declared but never updated. The daemon captures token counts from agent responses but discards Gemini's rich stats (latency, thinking tokens, tool calls) by using `stream-json` instead of capturing the full `-o json` stats block. There is no way to know what a build costs, which agent burns the most tokens, or where time is spent.
+The Triumvirate daemon shipped ABE v3.0 with 1,932 lines of Rust and zero observability. No tracing spans, no ABE-specific metrics, no structured logging. Four Prometheus metrics are declared but never updated. The daemon captures token counts from agent responses but the GeminiStreamParser only extracts input/output/cached/total from the `stream-json` `result` event — ignoring thinking tokens, latency, tool calls, and lines changed. There is no way to know what a build costs, which agent burns the most tokens, or where time is spent.
 
 You can't optimize, debug, or trust what you can't see.
 
