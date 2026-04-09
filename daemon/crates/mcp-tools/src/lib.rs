@@ -9,6 +9,8 @@ use std::sync::{
 use tokio::time::Duration;
 
 pub mod aliases;
+pub mod gemini_query;
+pub mod review;
 
 #[derive(Clone, Debug)]
 pub struct ProgressEmitter {
