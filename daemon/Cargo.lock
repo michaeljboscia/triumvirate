@@ -1140,10 +1140,12 @@ name = "mcp-tools"
 version = "3.1.0"
 dependencies = [
  "agent-worker",
+ "anyhow",
  "daemon-core",
  "daemon-http",
  "fallback-outbox",
  "fleet",
+ "ledger",
  "mcp-bridge",
  "peer-review",
  "rmcp",
@@ -1151,6 +1153,7 @@ dependencies = [
  "shared-types",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
