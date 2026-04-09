@@ -137,7 +137,17 @@ Do NOT introduce a typed `HealthResponse` struct — keep the inline json! liter
 
 **5. Wire version into CLI --version flag**
 
-Clap automatically picks up `CARGO_PKG_VERSION` when you use `#[command(version)]` on the CLI struct. Verify the existing `Cli` struct at main.rs:127 has this attribute. If not, add it.
+Clap automatically picks up `CARGO_PKG_VERSION` when you use `#[command(version)]` on the CLI struct. Grep for `struct Cli` in `daemon/crates/triumvirate/src/main.rs` and verify the `#[command(...)]` attribute includes `version`. If not, add it.
+
+**5b. Wire version into `triumvirate doctor`**
+
+The `reality_test` requires that `triumvirate doctor` output contains the version string. `run_doctor()` lives at `daemon/crates/triumvirate/src/cli_ops.rs:59`. Insert one line as the very first stdout write — before the existing `write_line_stdout("Daemon:")` call:
+
+```rust
+write_line_stdout(&format!("Triumvirate daemon v{}", daemon_core::VERSION))?;
+```
+
+This is the minimum change to satisfy reality_test #6. `daemon_core` is already imported at the top of `cli_ops.rs`, so no new import is needed.
 
 **6. Create version-drift hook script (tracked, not in .git/)**
 
