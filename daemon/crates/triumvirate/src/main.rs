@@ -9,6 +9,7 @@ use daemon_core::{
     acquire_project_queue as core_acquire_project_queue,
     append_memory_entry as core_append_memory_entry,
     daemon_bind_addr as core_daemon_bind_addr,
+    metrics::DaemonMetrics,
     list_scratchpad as core_list_scratchpad, project_queue_key as core_project_queue_key,
     read_memory_entries as core_read_memory_entries,
     triumvirate_home_dir as core_triumvirate_home_dir,
@@ -58,7 +59,7 @@ use axum::{
     routing::{get, post},
 };
 use rust_embed::RustEmbed;
-use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, TextEncoder};
 use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -1446,120 +1447,6 @@ fn build_status_report(
 
 async fn run_daemon() -> anyhow::Result<()> {
     const LEDGER_PROJECT_LRU_CAPACITY: usize = 128;
-
-    #[derive(Debug, Clone)]
-    struct DaemonMetrics {
-        registry: Registry,
-        agent_requests_total: prometheus::IntCounter,
-        agent_duration_seconds: prometheus::Histogram,
-        agent_tokens_total: prometheus::IntCounter,
-        ledger_events_ingested_total: prometheus::IntCounter,
-        ledger_queue_lag_seconds: prometheus::Gauge,
-        ledger_spool_size_bytes: IntGauge,
-        fleet_active_total: IntGauge,
-        reviews_total: prometheus::IntCounter,
-        marker_parse_success_rate: prometheus::Gauge,
-        http_requests_total: IntCounterVec,
-        http_request_duration_seconds: HistogramVec,
-        http_in_flight_requests: IntGauge,
-    }
-
-    impl DaemonMetrics {
-        fn new() -> anyhow::Result<Self> {
-            let registry = Registry::new();
-            let agent_requests_total = prometheus::IntCounter::new(
-                "triumvirate_agent_requests_total",
-                "Total ask_agent requests handled by daemon",
-            )?;
-            let agent_duration_seconds = prometheus::Histogram::with_opts(
-                prometheus::HistogramOpts::new(
-                    "triumvirate_agent_duration_seconds",
-                    "Duration of ask_agent requests in seconds",
-                ),
-            )?;
-            let agent_tokens_total = prometheus::IntCounter::new(
-                "triumvirate_agent_tokens_total",
-                "Total tokens reported by ask_agent requests",
-            )?;
-            let ledger_events_ingested_total = prometheus::IntCounter::new(
-                "triumvirate_ledger_events_ingested_total",
-                "Total ledger events ingested",
-            )?;
-            let ledger_queue_lag_seconds = prometheus::Gauge::new(
-                "triumvirate_ledger_queue_lag_seconds",
-                "Ledger queue lag in seconds",
-            )?;
-            let ledger_spool_size_bytes = IntGauge::new(
-                "triumvirate_ledger_spool_size_bytes",
-                "Current ledger spool directory size in bytes",
-            )?;
-            let fleet_active_total = IntGauge::new(
-                "triumvirate_fleet_active_total",
-                "Active fleet count",
-            )?;
-            let reviews_total = prometheus::IntCounter::new(
-                "triumvirate_reviews_total",
-                "Total reviews completed",
-            )?;
-            let marker_parse_success_rate = prometheus::Gauge::new(
-                "triumvirate_marker_parse_success_rate",
-                "Marker parse success rate",
-            )?;
-            let http_requests_total = IntCounterVec::new(
-                prometheus::Opts::new("triumvirate_http_requests_total", "HTTP requests by route and status"),
-                &["route", "status"],
-            )?;
-            let http_request_duration_seconds = HistogramVec::new(
-                prometheus::HistogramOpts::new(
-                    "triumvirate_http_request_duration_seconds",
-                    "HTTP request durations by route",
-                ),
-                &["route"],
-            )?;
-            let http_in_flight_requests = IntGauge::new(
-                "triumvirate_http_requests_in_flight",
-                "In-flight HTTP requests",
-            )?;
-            registry.register(Box::new(agent_requests_total.clone()))?;
-            registry.register(Box::new(agent_duration_seconds.clone()))?;
-            registry.register(Box::new(agent_tokens_total.clone()))?;
-            registry.register(Box::new(ledger_events_ingested_total.clone()))?;
-            registry.register(Box::new(ledger_queue_lag_seconds.clone()))?;
-            registry.register(Box::new(ledger_spool_size_bytes.clone()))?;
-            registry.register(Box::new(fleet_active_total.clone()))?;
-            registry.register(Box::new(reviews_total.clone()))?;
-            registry.register(Box::new(marker_parse_success_rate.clone()))?;
-            registry.register(Box::new(http_requests_total.clone()))?;
-            registry.register(Box::new(http_request_duration_seconds.clone()))?;
-            registry.register(Box::new(http_in_flight_requests.clone()))?;
-            marker_parse_success_rate.set(1.0);
-            Ok(Self {
-                registry,
-                agent_requests_total,
-                agent_duration_seconds,
-                agent_tokens_total,
-                ledger_events_ingested_total,
-                ledger_queue_lag_seconds,
-                ledger_spool_size_bytes,
-                fleet_active_total,
-                reviews_total,
-                marker_parse_success_rate,
-                http_requests_total,
-                http_request_duration_seconds,
-                http_in_flight_requests,
-            })
-        }
-
-        fn snapshot_keepalive(&self) {
-            let _ = self.agent_tokens_total.get();
-            let _ = self.ledger_events_ingested_total.get();
-            let _ = self.ledger_queue_lag_seconds.get();
-            let _ = self.ledger_spool_size_bytes.get();
-            let _ = self.fleet_active_total.get();
-            let _ = self.reviews_total.get();
-            let _ = self.marker_parse_success_rate.get();
-        }
-    }
 
     #[derive(Debug, Clone)]
     struct DaemonState {
