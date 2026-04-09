@@ -668,7 +668,7 @@ This document contains 26 tasks across 7 waves. This is the COMPLETE backlog.
 - Wave 3 (Aliases + skills): 5 tasks (T-011..T-015)
 - Wave 4 (Front door swap): 3 tasks (T-016..T-018)
 - Wave 5 (Public Release): 6 tasks (T-019..T-024)
-- **Total: 26 tasks** (including the already-completed FIX-TEST-MOVED-VALUES)
+- **Total: 27 tasks** (including the already-completed FIX-TEST-MOVED-VALUES and T-004B added from T-000 postmortem)
 
 **Active remaining backlog: 25 tasks** (26 total minus FIX-TEST-MOVED-VALUES which is already DONE).
 - Do NOT accept new tasks until all tasks are complete (backlog_status: 0).
