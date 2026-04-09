@@ -526,12 +526,12 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
   <done_when>4 binaries built. Checksums generated. All --version and --help checks pass. Release artifacts in daemon/target/release-dist/ ready for upload.</done_when>
 </task>
 
-<task id="T-021" req="REQ-X3" wave="5" depends="T-018,T-019">
+<task id="T-021" req="REQ-X3" wave="5" depends="T-018,T-019" lane="orchestrator">
   <description>Draft CHANGELOG.md entry and release notes for 3.1.0</description>
   <files>CHANGELOG.md, docs/3.1.0/RELEASE_NOTES.md</files>
   <scope_out>Do not describe internal refactoring details that don't affect users. Focus on user-visible changes. Do not invent features that weren't built.</scope_out>
-  <tools>git log, cat docs/3.1.0/*.md</tools>
-  <verify>CHANGELOG.md has a 3.1.0 section at the top. RELEASE_NOTES.md exists with migration steps.</verify>
+  <tools>git log, cat docs/3.1.0/*.md — orchestrator in main session</tools>
+  <verify>test -f CHANGELOG.md && grep -q '^## 3.1.0' CHANGELOG.md && test -f docs/3.1.0/RELEASE_NOTES.md && grep -q '3.1.0' docs/3.1.0/RELEASE_NOTES.md</verify>
   <reality_test>
     CHANGELOG.md 3.1.0 section must include:
     1. Release date (today)
