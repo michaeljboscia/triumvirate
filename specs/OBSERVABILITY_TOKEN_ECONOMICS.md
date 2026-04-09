@@ -119,7 +119,7 @@ Build a Rust-native token scanner that reads Claude, Codex, and Gemini session l
 
 **REQ-T3:** Codex scanner reads `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, extracts `event_msg.payload` where `type == "token_count"`: `total_token_usage.{input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens}`, `rate_limits.{used_percent, plan_type}`, `info.model_context_window`. Incremental by mtime.
 
-**REQ-T4:** Gemini scanner captures the `-o json` stats block from Gemini CLI responses: `stats.models.{model}.tokens.{input, candidates, total, cached, thoughts, tool}`, `stats.models.{model}.api.{totalRequests, totalErrors, totalLatencyMs}`, `stats.tools.totalCalls`, `stats.files.{totalLinesAdded, totalLinesRemoved}`. Incremental by mtime.
+**REQ-T4:** Gemini scanner reads `~/.gemini/telemetry.jsonl` (single file, ~536MB, ~5.1M lines). Extracts `usageMetadata` from response entries: `promptTokenCount`, `candidatesTokenCount`, `totalTokenCount`, `thoughtsTokenCount`, `modelVersion`, per-modality breakdowns. Incremental by file offset (single file = track byte offset, not mtime). This covers ALL Gemini CLI sessions — daemon-mediated and direct. (Decision R1-D3: A confirmed — telemetry.jsonl exists on disk)
 
 **REQ-T5:** The daemon's Gemini invocation path in `agent_exec.rs` must capture the full response including the stats block. Currently `stream-json` mode streams events but does not emit the final stats summary. The daemon must either: (a) switch to `-o json` for batch mode and parse the stats block, or (b) accumulate stats from stream events if available. The stats must be written to a structured log file (`~/.triumvirate/gemini-stats/*.jsonl`) for the scanner to read.
 
