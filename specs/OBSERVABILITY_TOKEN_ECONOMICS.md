@@ -282,14 +282,13 @@ triumvirate (main binary)
 
 | File | Purpose |
 |------|---------|
-| `daemon/crates/token-scanner/Cargo.toml` | New crate manifest |
-| `daemon/crates/token-scanner/src/lib.rs` | Public API: scan_all, scanner lifecycle |
-| `daemon/crates/token-scanner/src/claude.rs` | Claude JSONL parser |
-| `daemon/crates/token-scanner/src/codex.rs` | Codex JSONL parser |
-| `daemon/crates/token-scanner/src/gemini.rs` | Gemini stats parser |
-| `daemon/crates/token-scanner/src/storage.rs` | SQLite schema, read/write, migrations |
-| `daemon/crates/token-scanner/src/attribution.rs` | BUILD_MANIFEST correlation, cost calculation |
-| `daemon/crates/token-scanner/src/price.rs` | Price table management |
+| `daemon/crates/token-economics/Cargo.toml` | New crate — depends on `tokscale-core` (git), `rusqlite`, `notify`, `shared-types` |
+| `daemon/crates/token-economics/src/lib.rs` | Public API: `TokenEconomics` struct, `record_daemon_tokens()`, scanner lifecycle |
+| `daemon/crates/token-economics/src/direct.rs` | Lane 1: daemon direct write from `agent_exec` |
+| `daemon/crates/token-economics/src/scanner.rs` | Lane 2: wraps `tokscale-core::scanner` + notify watcher + telemetry.jsonl reader |
+| `daemon/crates/token-economics/src/attribution.rs` | Session-ID correlation, BUILD_MANIFEST join, build/task/wave cost mapping |
+| `daemon/crates/token-economics/src/storage.rs` | SQLite schema (token_records, scan_state, price_table), migrations, WAL mode |
+| `daemon/crates/token-economics/src/queries.rs` | Summary, by-build, by-session query functions for HTTP + MCP |
 
 ---
 
