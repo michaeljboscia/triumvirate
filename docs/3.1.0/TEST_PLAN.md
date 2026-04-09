@@ -65,16 +65,30 @@ After EVERY wave:
 
 Capture before starting Wave 1:
 ```bash
-# Tool count
-triumvirate mcp --list-tools | wc -l
+# Tool count (via grep of #[tool] macro attributes in the current codebase —
+# triumvirate has no --list-tools CLI flag; tools are introspected via the
+# MCP tools/list protocol call at runtime, not a CLI subcommand)
+grep -c '#\[tool(' daemon/crates/triumvirate/src/main.rs
 
 # Test count
 cargo test --workspace 2>&1 | tail -1
 
-# main.rs line count
+# main.rs line count (for comparison with the <300 target at end of Wave 2)
 wc -l daemon/crates/triumvirate/src/main.rs
 
-# Running processes
-pgrep -f "inter-agent" && echo "TS server running"
-pgrep -f "triumvirate" && echo "Rust daemon running"
+# Running processes (both should exist before Wave 4; only triumvirate after)
+pgrep -f "inter-agent/start-unified" && echo "TS inter-agent server running"
+pgrep -f "target/release/triumvirate" && echo "Rust daemon running"
 ```
+
+**Post-Wave-4 verification** (tool availability through the MCP protocol, not a CLI flag):
+```bash
+# Spawn the daemon in MCP mode and list tools via the MCP protocol
+# This uses a test client that issues tools/list over stdio:
+~/.claude/scripts/mcp-tool-list.sh triumvirate mcp | wc -l
+
+# Alternative: inspect the tool_router registry directly via a test binary
+cargo test -p mcp-tools test_tool_router_lists_all_tools -- --nocapture
+```
+
+If `~/.claude/scripts/mcp-tool-list.sh` does not exist, the orchestrator creates it during Wave 4 verification — it's a 5-line wrapper around the `rmcp-client` test helper. No fake `--list-tools` flag is invented.
