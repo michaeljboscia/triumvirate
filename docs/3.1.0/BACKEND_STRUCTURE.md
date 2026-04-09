@@ -149,14 +149,16 @@ pub struct McpBridge {
 
 | Alias | Routes To | Parameter Mapping |
 |-------|-----------|-------------------|
-| `spawn_daemon` | `spawn_session` | `target` → `agent`, preserves `session_name`, `cwd` |
-| `ask_daemon` | `ask_session` | `daemon_id` → `name`, `message` passthrough |
-| `dismiss_daemon` | `dismiss_session` | `daemon_id` → `name` |
-| `list_daemons` | `list_sessions` | `target` filter → `agent` filter |
-| `send_message` | `ask_session` | `target`+`question` → `name`+`message` (synchronous) |
-| `get_response` | returns deprecation notice | "Use ask_session directly" |
-| `list_jobs` | `get_status` | shape mapping |
-| `code_review` | `review_request` | `diff`+`context` → review schema |
+| `spawn_daemon` | `spawn_session` | `target` → `agent`, preserves `session_name`, `cwd`, `timeout_ms` |
+| `ask_daemon` | `ask_session` | `daemon_id` → `name` (preserving `gd_`/`cd_` prefix), `question` → `message` |
+| `dismiss_daemon` | `dismiss_session` | `daemon_id` → `name`. `hard` param dropped (Rust doesn't support — log warning if passed) |
+| `list_daemons` | `list_sessions` | Optional `target` filter applied post-fetch |
+| `send_message` | `ask_session` | `target` → `name` (auto-spawn session if needed), `question` → `message`. Synchronous — returns response directly, not a job_id |
+| `get_response` | deprecated shim | Returns static message: "Use ask_session directly — async job queue removed in 3.1.0" |
+| `list_jobs` | `get_status` | Shape translation: each entry gets `job_id=session_id`, `state=agent_state`, `target=agent` |
+| `write_scratchpad` | `scratchpad_write` | TS `topic`/`content`/`cwd`/`owner`/`daemon_id` → Rust schema. Owner resolution: derive from `daemon_id` prefix if present, else use explicit `owner`, else default to `inter-agent`. Topic becomes filename stem, content is body. |
+| `list_scratchpad` | `scratchpad_list` | `cwd` passthrough (the only TS param) |
+| `code_review` | `review_request` | TS `cwd`/`uncommitted`/`base_branch`/`commit_sha`/`timeout_ms` → review request schema. Alias invokes `codex review` with same semantics (uncommitted=staged+unstaged, base_branch=diff against base, commit_sha=specific commit). The diff text is produced internally, not accepted as a parameter. |
 
 Each alias:
 1. Logs `tracing::info!("tool_alias", old_name, new_name)`
