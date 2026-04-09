@@ -389,7 +389,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 
 <task id="T-012" req="REQ-J2" wave="3" depends="T-011" lane="orchestrator">
   <description>Update send-to-codex skill to reference mcp__triumvirate__ask_session (orchestrator-executed, not ABE-dispatched)</description>
-  <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md directly. No &lt;files&gt; list because this task bypasses ABE contract validation.</files>
+  <files></files>
   <scope_out>Do not change skill behavior or purpose. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — all by the orchestrator in the main Claude session</tools>
   <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md && ! grep -qE "send_message|get_response" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md</verify>
