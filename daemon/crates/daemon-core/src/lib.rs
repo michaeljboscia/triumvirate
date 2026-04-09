@@ -15,6 +15,9 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 use uuid::Uuid;
 
+pub mod version;
+pub use version::{NAME, VERSION};
+
 #[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
     root.join("dead-drop")
