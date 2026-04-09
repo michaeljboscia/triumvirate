@@ -92,6 +92,7 @@ pub(crate) async fn run_doctor() -> anyhow::Result<()> {
         }
     }
 
+    write_line_stdout(&format!("Triumvirate daemon v{}", daemon_core::VERSION))?;
     write_line_stdout("Daemon:")?;
     write_line_stdout(&format!("  token_file_exists: {}", token_path.exists()))?;
     write_line_stdout(&format!("  launchd_plist_exists: {}", plist_path.exists()))?;

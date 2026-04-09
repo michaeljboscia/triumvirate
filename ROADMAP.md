@@ -1,7 +1,20 @@
 # Triumvirate Roadmap
 
-**Last updated:** 2026-04-05
-**Current version:** v0.1.0
+**Last updated:** 2026-04-09
+**Current version:** 3.1.0 (in progress — MCP Consolidation sprint)
+**Last shipped:** 3.0.0 (ABE — Autonomous Build Enforcement)
+
+---
+
+## v3.0.0 — Shipped (ABE — Autonomous Build Enforcement)
+
+The goal: enforce audited autonomous build execution so work dispatches are contract-bound, reality-tested, and merge-gated.
+
+| Item | Status | Description |
+|------|--------|-------------|
+| Autonomous build enforcement | Shipped | ABE dispatch, contract constraints, and worker validation in active use |
+| Audit-gated execution | Shipped | Phase-gated review flow before task acceptance |
+| Reality test contract integration | Shipped | Required post-build checks included in worker task contracts |
 
 ---
 

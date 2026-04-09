@@ -124,6 +124,7 @@ struct DashboardAssets;
 #[derive(Debug, Parser)]
 #[command(name = "triumvirate")]
 #[command(about = "Triumvirate v2 daemon + MCP bridge binary")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: CliCommand,
@@ -1371,7 +1372,10 @@ async fn prewarm_daemon_workers() {
 impl ServerHandler for McpBridge {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Triumvirate MCP bridge. Use `ping` to verify connectivity.")
+            .with_instructions(format!(
+                "Triumvirate MCP bridge v{}. Use `ping` to verify connectivity.",
+                daemon_core::VERSION
+            ))
     }
 }
 
@@ -1708,7 +1712,8 @@ async fn run_daemon() -> anyhow::Result<()> {
             "status": "ok",
             "service": "triumvirate-daemon-v2",
             "mode": "incremental-dev",
-            "daemon_bind_addr": state.bind_addr
+            "daemon_bind_addr": state.bind_addr,
+            "version": daemon_core::VERSION
         })))
     }
 
