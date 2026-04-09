@@ -402,7 +402,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md directly.</files>
   <scope_out>Same as T-012. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
-  <verify>grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md returns a positive integer</verify>
+  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md && ! grep -qE "send_message|get_response" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md</verify>
   <reality_test>After orchestrator runs the edit: grep "mcp__inter-agent" returns zero; grep "mcp__triumvirate__ask_session" returns positive; grep "send_message\|get_response" returns zero in the skill body. Manual test: /send-to-gemini with a small prompt returns a direct response.</reality_test>
   <done_when>Skill references mcp__triumvirate__ask_session. No inter-agent references. No async pattern.</done_when>
 </task>
