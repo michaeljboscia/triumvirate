@@ -20,6 +20,11 @@
       "deletes": null
     },
     {
+      "segment_id": "8366eb00-827d-462e-a2e3-a44d60253c84",
+      "max_doc": 434,
+      "deletes": null
+    },
+    {
       "segment_id": "0cf2a50e-4443-45f3-b713-4e6717a9cb54",
       "max_doc": 418,
       "deletes": null
@@ -45,8 +50,18 @@
       "deletes": null
     },
     {
+      "segment_id": "49d357fe-ef78-44d8-8606-f98e1be974b6",
+      "max_doc": 101,
+      "deletes": null
+    },
+    {
       "segment_id": "29287228-3400-46b1-8bff-1315723dd8e8",
       "max_doc": 71,
+      "deletes": null
+    },
+    {
+      "segment_id": "ba6db14d-8a43-415b-b25e-71cd9e141086",
+      "max_doc": 51,
       "deletes": null
     },
     {
@@ -70,6 +85,11 @@
       "deletes": null
     },
     {
+      "segment_id": "4942017e-dca3-46ac-b48a-146d69bb9875",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
       "segment_id": "47053f37-6f57-4c4b-99ab-c3c7580ae134",
       "max_doc": 1,
       "deletes": null
@@ -80,17 +100,17 @@
       "deletes": null
     },
     {
+      "segment_id": "67f68d6e-3bf3-4993-8fc6-457f0b5a2669",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "b15733e6-ea84-443f-a98f-da0c5a8cb89b",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
       "segment_id": "2fc66b6b-f0fb-4e0d-804d-53c9f0657ca5",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
-      "segment_id": "92e4ddd4-aea5-4709-b1ab-5b3709ba04f1",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
-      "segment_id": "51d9ea15-cf15-4275-83c2-fccc1f3a4640",
       "max_doc": 1,
       "deletes": null
     },
@@ -105,7 +125,17 @@
       "deletes": null
     },
     {
-      "segment_id": "67f68d6e-3bf3-4993-8fc6-457f0b5a2669",
+      "segment_id": "92e4ddd4-aea5-4709-b1ab-5b3709ba04f1",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "811c6cd8-4716-43b3-a916-16374e693231",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "51d9ea15-cf15-4275-83c2-fccc1f3a4640",
       "max_doc": 1,
       "deletes": null
     }
@@ -184,5 +214,5 @@
       }
     }
   ],
-  "opstamp": 4430
+  "opstamp": 5025
 }
