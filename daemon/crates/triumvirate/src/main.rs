@@ -6103,6 +6103,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         let dispatch_and_expect_failed = |script_path: PathBuf, task_id: String| {
             let bridge = bridge.clone();
             let head_sha = head_sha.clone();
+            let project_root = project_root.clone();
             async move {
             // SAFETY: test controls env var lifecycle under lock.
             unsafe {
