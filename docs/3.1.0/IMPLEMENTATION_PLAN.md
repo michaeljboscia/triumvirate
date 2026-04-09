@@ -635,7 +635,19 @@ The goal: **Every sprint produces a downloadable, installable, verifiable public
 ## Execution Contract
 
 ### Backlog Freeze
-This document contains 24 tasks across 6 waves (including Preflight as Wave -1 and Public Release as Wave 5). This is the COMPLETE backlog.
+This document contains 26 tasks across 7 waves. This is the COMPLETE backlog.
+
+**Task accounting (authoritative — must match Build Overview table):**
+- Wave -1 (Preflight): 2 tasks (FIX-TEST-MOVED-VALUES ✅ DONE, T-000 pending)
+- Wave 0 (Contracts): 2 tasks (T-001, T-002)
+- Wave 1 (Extract MCP handlers): 5 tasks (T-003..T-007)
+- Wave 2 (Extract HTTP routes): 3 tasks (T-008..T-010)
+- Wave 3 (Aliases + skills): 5 tasks (T-011..T-015)
+- Wave 4 (Front door swap): 3 tasks (T-016..T-018)
+- Wave 5 (Public Release): 6 tasks (T-019..T-024)
+- **Total: 26 tasks** (including the already-completed FIX-TEST-MOVED-VALUES)
+
+**Active remaining backlog: 25 tasks** (26 total minus FIX-TEST-MOVED-VALUES which is already DONE).
 - Do NOT accept new tasks until all tasks are complete (backlog_status: 0).
 - If new requirements arrive mid-execution, respond: `blocked_on: scope-change — [describe new requirement]` and STOP.
 - Only the human can add, remove, or reorder tasks in this backlog.
