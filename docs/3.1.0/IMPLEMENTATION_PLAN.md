@@ -133,9 +133,9 @@ Update `HealthResponse` struct to include `version: String`.
 
 Clap automatically picks up `CARGO_PKG_VERSION` when you use `#[command(version)]` on the CLI struct. Verify the existing `Cli` struct at main.rs:127 has this attribute. If not, add it.
 
-**6. Install pre-commit version-drift hook**
+**6. Create version-drift hook script (tracked, not in .git/)**
 
-Create `.git/hooks/pre-commit` (mode 755):
+Create `scripts/version-drift-check.sh` (mode 755, committed to repo):
 
 ```bash
 #!/bin/bash
@@ -169,7 +169,29 @@ if [ $FAILED -eq 1 ]; then
 fi
 ```
 
-Install with: `chmod +x .git/hooks/pre-commit`
+Create `scripts/install-git-hooks.sh` (also committed, also mode 755):
+
+```bash
+#!/bin/bash
+# Install repo hooks into the local .git/hooks directory.
+# Run once after cloning. Idempotent — safe to re-run.
+set -euo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HOOK_SRC="$REPO_ROOT/scripts/version-drift-check.sh"
+HOOK_DEST="$REPO_ROOT/.git/hooks/pre-commit"
+
+if [ ! -f "$HOOK_SRC" ]; then
+    echo "missing: $HOOK_SRC"; exit 1
+fi
+
+mkdir -p "$(dirname "$HOOK_DEST")"
+ln -sf "$HOOK_SRC" "$HOOK_DEST"
+chmod +x "$HOOK_SRC"
+echo "installed pre-commit hook → $HOOK_DEST"
+```
+
+**Important:** `.git/` is not tracked by git. The hook script lives under `scripts/` (tracked) and is symlinked from `.git/hooks/pre-commit` by `scripts/install-git-hooks.sh`. The ABE worker's contract can include `scripts/version-drift-check.sh` and `scripts/install-git-hooks.sh` in `allowed_files`, but NOT `.git/hooks/pre-commit` — that's local state, not repo state. The orchestrator runs `bash scripts/install-git-hooks.sh` after T-000 completes to wire the hook on the developer's local checkout.
 
 **7. Update ROADMAP.md**
 
