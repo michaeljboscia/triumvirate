@@ -68,8 +68,8 @@ Schemas verified against `mcp-server/src/unified-tools.ts` at HEAD 373256451. An
 | `list_jobs` | `{target?, cwd?}` | unified-tools.ts:116-137 | List pending/completed jobs |
 | `write_scratchpad` | `{topic, content, cwd?, owner?, daemon_id?}` | unified-tools.ts:186-222 | Write markdown artifact to shared scratchpad. **Params are `topic`/`content`/`owner`/`daemon_id`, NOT `key`/`value`/`namespace`.** Owner auto-derived from daemon_id prefix. |
 | `list_scratchpad` | `{cwd?}` | unified-tools.ts:234-241 | List scratchpad entries. **Only param is `cwd`.** |
-| `pythia_query` | `{question, intent, cwd?}` | unified-tools.ts:243-252 | Query Pythia — OUT OF SCOPE (not routed through inter-agent in practice) |
-| `pythia_corpus_health` | `{cwd?}` | unified-tools.ts:254-261 | Pythia corpus health — OUT OF SCOPE |
+| `pythia_query` | `{question, intent, cwd?}` | unified-tools.ts:243-252 | Query Pythia corpus — **IS registered in the TS inter-agent server**, but the handler is a delegation proxy that forwards to the Pythia Unix socket. OUT OF SCOPE for this migration because a separate `pythia` MCP server entry in `~/.claude.json` already provides the same functionality directly. |
+| `pythia_corpus_health` | `{cwd?}` | unified-tools.ts:254-261 | Pythia corpus health — same story as `pythia_query`: registered in unified-tools.ts as a delegation proxy, but out of scope because `pythia` MCP handles it directly. |
 | `code_review` | `{cwd?, uncommitted?, base_branch?, commit_sha?, timeout_ms?}` | unified-tools.ts:263-274 | Run `codex review` on uncommitted changes, base-branch comparison, or specific commit. **Params are `cwd`/`uncommitted`/`base_branch`/`commit_sha`, NOT `diff`/`context`/`target`.** |
 
 ### Rust Daemon MCP Tools (main.rs McpBridge — 35+ tools)
