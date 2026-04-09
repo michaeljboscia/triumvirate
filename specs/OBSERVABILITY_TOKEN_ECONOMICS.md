@@ -59,7 +59,7 @@ Build a Rust-native token scanner that reads Claude, Codex, and Gemini session l
 
 **REQ-O4:** New counter `abe_task_dispatch_total{status}` incremented on every task dispatch. Labels: `dispatched`, `completed`, `failed`, `timeout`, `cancelled`.
 
-**REQ-O5:** New histogram `abe_task_duration_seconds{task_id,wave}` recording wall-clock time from dispatch to completion/failure for each task.
+**REQ-O5:** New histogram `abe_task_duration_seconds{wave}` recording wall-clock time from dispatch to completion/failure. `task_id` is recorded in structured logs and exemplars only (not as a Prometheus label) to avoid cardinality explosion. Per-task cost data lives in the token-economics SQLite DB. (Decision R1-D1: B)
 
 **REQ-O6:** New histogram `abe_wave_duration_seconds{wave}` recording wall-clock time from first task dispatch to wave gate pass for each wave.
 
