@@ -559,7 +559,7 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
   <files>NOT APPLICABLE — creates a GitHub release via gh CLI. No repo file is modified. Tag is pushed to origin.</files>
   <scope_out>Do not push to main if not already pushed. Do not force-push. Do not close issues automatically — T-024 handles issue cleanup. Require explicit user approval before running `git push --tags` or `gh release create`.</scope_out>
   <tools>Bash (gh release create, gh release upload, git tag, git push --tags) — orchestrator in main session after user approval</tools>
-  <verify>gh release view 3.1.0 exits 0 and shows 8 assets (4 binaries + 4 .sha256)</verify>
+  <verify>gh release view 3.1.0 --json assets --jq '.assets | length' | xargs -I{} test {} -ge 8</verify>
   <reality_test>
     1. git tag 3.1.0 exists on the final Wave 4 commit
     2. git push --tags succeeded (tag visible on remote)
