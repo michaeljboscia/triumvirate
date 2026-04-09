@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-worker = { path = "../agent-worker" }
 daemon-core = { path = "../daemon-core" }
+daemon-http = { path = "../daemon-http" }
+fallback-outbox = { path = "../fallback-outbox" }
 fleet = { path = "../fleet" }
+mcp-bridge = { path = "../mcp-bridge" }
 peer-review = { path = "../peer-review" }
 rmcp.workspace = true
 serde_json.workspace = true
