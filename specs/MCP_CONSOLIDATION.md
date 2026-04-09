@@ -287,7 +287,7 @@ triumvirate (binary — startup wiring only)
 1. `cargo test --workspace` passes after all changes
 2. `cargo build --release` produces a single binary that serves both MCP (stdio) and HTTP
 3. Every TS MCP tool name works through the Rust daemon (via alias or native)
-4. `send_message` + `get_response` async job model works with both Gemini and Codex
+4. `send-to-codex`, `send-to-gemini`, and `send-to-siblings` skills work via `ask_session`
 5. `~/.claude.json` points at the Rust binary only (plus oracle + pythia)
 6. The TS `node` process for inter-agent MCP is gone
 7. `main.rs` is under 300 lines
