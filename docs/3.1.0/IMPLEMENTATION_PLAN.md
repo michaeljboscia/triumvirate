@@ -297,11 +297,21 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 <task id="T-004" req="REQ-C1" wave="1" depends="T-001">
   <description>Extract ABE tool handlers (dispatch_codex, dispatch_codex_worktree, get_task_status, get_task_output, cancel_task) from main.rs to mcp-tools/src/abe.rs</description>
   <files>daemon/crates/mcp-tools/src/abe.rs, daemon/crates/mcp-tools/src/lib.rs, daemon/crates/triumvirate/src/main.rs</files>
-  <scope_out>Do not change ABE behavior. Do not modify dispatch logic. Do not touch the abe/ module files (worktree_setup.rs, orchestrator.rs, etc.).</scope_out>
-  <tools>cargo test --workspace</tools>
-  <verify>cargo test --workspace</verify>
+  <scope_out>Do not change ABE behavior. Do not modify dispatch logic. Do not touch the abe/ module files (worktree_setup.rs, orchestrator.rs, etc.). The behavior fixes happen in T-004B, not here.</scope_out>
+  <tools>cargo test --workspace --manifest-path daemon/Cargo.toml</tools>
+  <verify>cargo test --workspace --manifest-path daemon/Cargo.toml</verify>
   <reality_test>Call dispatch_codex_worktree via MCP → worktree created, Codex spawned. Call get_task_status → returns correct state. Identical behavior to pre-extraction.</reality_test>
   <done_when>5 ABE tool handlers live in abe.rs. main.rs no longer contains these functions. All tests pass.</done_when>
+</task>
+
+<task id="T-004B" req="REQ-C1,REQ-B1" wave="1" depends="T-004">
+  <description>Add multi-channel worker completion detection to the ABE dispatch code (CRYSTALLIZED T-000 postmortem 2026-04-09)</description>
+  <files>daemon/crates/mcp-tools/src/abe.rs, daemon/crates/triumvirate/src/abe/orchestrator.rs, daemon/crates/triumvirate/src/abe/worktree_setup.rs, daemon/crates/daemon-http/src/routes.rs, daemon/crates/daemon-http/src/state.rs, daemon/crates/shared-types/src/lib.rs</files>
+  <scope_out>Do not refactor unrelated ABE logic. Do not touch the validator script. Do not change ContractFields schema. Do not modify fleet dispatch.</scope_out>
+  <tools>cargo test --workspace --manifest-path daemon/Cargo.toml, cargo build --release --manifest-path daemon/Cargo.toml</tools>
+  <verify>cargo test --workspace --manifest-path daemon/Cargo.toml</verify>
+  <reality_test>Spawn a mock ABE task via `dispatch_codex_worktree` with a script that: (1) creates a commit matching contract_format, (2) writes `.triumvirate/TASK_COMPLETE.json` with the commit SHA, (3) sleeps 60 seconds WITHOUT exiting the process. The daemon must report the task as `succeeded` within 5 seconds of the sentinel file appearing (NOT after 60s when the process finally exits). Repeat with the sentinel file removed — the daemon must still detect completion via git HEAD change within 10 seconds. Repeat with neither sentinel nor new commit — the daemon must mark STUCK after 180 seconds. Test the new `POST /abe/task-complete` route via curl with a valid bearer token: 200 OK, task state flips to succeeded. Invalid token: 401.</reality_test>
+  <done_when>ABE completion detection uses four signals, first-wins: (1) HTTP POST to /abe/task-complete route fires → task succeeded, (2) .triumvirate/TASK_COMPLETE.json exists in worktree → task succeeded, (3) worktree git HEAD differs from baseline AND commit matches contract_format → task succeeded, (4) worker process exits (existing SIGCHLD path preserved as fallback). Independently, a heartbeat watchdog marks tasks STUCK if `.triumvirate/HEARTBEAT.txt` is older than 180 seconds. `$TRIUMVIRATE_TOKEN` and `$TRIUMVIRATE_HTTP_PORT` are injected into the worker's environment at spawn time. New route `POST /abe/task-complete` exists in daemon-http, validates bearer token against state.token, matches task_id to currently-running ABE tasks, cross-checks commit_sha against worktree git state, and marks task as succeeded in the tracker. Existing ABE tests continue to pass.</done_when>
 </task>
 
 <task id="T-005" req="REQ-C1" wave="1" depends="T-001">
