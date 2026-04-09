@@ -579,7 +579,7 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
   <files>scripts/smoke-install.sh, docs/3.1.0/INSTALL_VERIFIED.md</files>
   <scope_out>Do not test in your existing environment (defeats the purpose). Use a fresh directory, Docker container, or a VM. Do not modify the release after publishing unless a critical bug is found.</scope_out>
   <tools>bash scripts/smoke-install.sh (which wraps docker run / mktemp / curl)</tools>
-  <verify>bash scripts/smoke-install.sh exits 0 and the captured log shows version 3.1.0</verify>
+  <verify>bash scripts/smoke-install.sh 2>&1 | tee /tmp/smoke-install.log && grep -q '3.1.0' /tmp/smoke-install.log</verify>
   <reality_test>
     Clean-room test (run in a fresh Docker container or mktemp directory with zero Triumvirate state):
     1. curl -fsSL https://github.com/michaeljboscia/triumvirate/releases/download/3.1.0/install.sh | bash
