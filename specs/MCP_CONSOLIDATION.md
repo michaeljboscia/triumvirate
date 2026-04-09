@@ -129,7 +129,7 @@ The Rust daemon already won. This sprint makes it official.
 | `pythia_corpus_health` | — | **OUT OF SCOPE** — stays in Pythia MCP |
 | `code_review` | `review_request` | Name + shape mapping |
 
-**Real gaps: 2** — the `send_message` + `get_response` async job model, and `list_jobs`.
+**Real gaps: 0** — `send_message`/`get_response` async model eliminated (Decision R1-D1: C). All tools map to existing Rust equivalents via aliases. Skills updated to use `ask_session` directly.
 
 ---
 
