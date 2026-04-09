@@ -1,14 +1,16 @@
-# v3.1 MCP Consolidation — Implementation Plan
+# Triumvirate 3.1.0 MCP Consolidation — Implementation Plan
 
 **Spec:** `specs/MCP_CONSOLIDATION.md`
-**PRD:** `docs/v3.1/PRD.md`
-**Backend:** `docs/v3.1/BACKEND_STRUCTURE.md`
+**PRD:** `docs/3.1.0/PRD.md`
+**Backend:** `docs/3.1.0/BACKEND_STRUCTURE.md`
+**Target version:** `3.1.0` (single source: `daemon/Cargo.toml`)
 
 ---
 
 ## Build Overview
 
-- **5 Waves, 18 Tasks**
+- **6 Waves, 19 Tasks**
+- Preflight (Wave -1): Fix test compile errors + version alignment
 - Wave 0: Contracts (types, traits, interfaces)
 - Wave 1: Extract MCP tool handlers from main.rs → mcp-tools modules
 - Wave 2: Extract HTTP routes from main.rs → daemon-http + DaemonState to daemon-core
@@ -18,6 +20,171 @@
 **Build method:** ABE fleet dispatch (`dispatch_codex_worktree`). This is the dogfood run.
 **max_parallel:** 7 (proven in stress test)
 **Test command:** `cargo test --workspace`
+
+---
+
+## Preflight: Version Alignment + Test Fixes
+
+These tasks run BEFORE Wave 0. They are not part of the fleet dispatch — they are manual prerequisites that establish the baseline commit SHA for the worktree gate.
+
+<task id="FIX-TEST-MOVED-VALUES" req="PREFLIGHT" wave="-1" depends="">
+  <description>Fix 3 E0382 moved-value errors in abe_red_team_enforcement_blocks_non_compliant_worker test</description>
+  <files>daemon/crates/triumvirate/src/main.rs</files>
+  <scope_out>Do not refactor the test. Do not fix any other test issues. One line added inside the existing closure at line ~6103.</scope_out>
+  <tools>cargo check --workspace, cargo test --workspace</tools>
+  <verify>cargo test --workspace</verify>
+  <reality_test>Before: cargo test --workspace fails with 3 E0382 errors. After: cargo test --workspace compiles and runs to completion. Full fix plan at docs/3.1.0/FIX_PLAN_test_moved_values.md.</reality_test>
+  <done_when>cargo test --workspace passes. Test suite runs. Commit includes only the one-line fix inside the closure.</done_when>
+</task>
+
+<task id="T-000" req="PREFLIGHT" wave="-1" depends="FIX-TEST-MOVED-VALUES">
+  <description>Align Cargo workspace version to 3.1.0 and wire version reporting through the codebase</description>
+  <files>daemon/Cargo.toml, daemon/crates/daemon-core/src/lib.rs, daemon/crates/triumvirate/src/main.rs, .git/hooks/pre-commit, ROADMAP.md</files>
+  <scope_out>Do not bump crate-level versions (they inherit via version.workspace = true). Do not tag git yet. Do not touch dashboard package.json or mcp-server/package.json. Do not add a changelog file.</scope_out>
+  <tools>cargo check --workspace, cargo build --release, grep</tools>
+  <verify>cargo build --release && ./daemon/target/release/triumvirate --version | grep 3.1.0</verify>
+  <reality_test>After the change: (1) daemon/Cargo.toml shows version = "3.1.0"; (2) cargo build --release succeeds; (3) triumvirate --version prints 3.1.0; (4) the MCP server info response includes 3.1.0 (verified by calling ping or inspecting get_info); (5) HTTP /health response body includes version 3.1.0; (6) pre-commit hook rejects a staged spec file that declares a different version than Cargo.toml.</reality_test>
+  <done_when>Cargo workspace at 3.1.0. Rust code imports VERSION from daemon_core::version via env!("CARGO_PKG_VERSION") — zero hardcoded version strings. MCP get_info() reports 3.1.0. HTTP /health reports 3.1.0. Pre-commit hook installed at .git/hooks/pre-commit checks spec version drift. ROADMAP.md updated: "Current version: 3.1.0 (in progress)".</done_when>
+</task>
+
+### T-000 Implementation Details
+
+**1. Bump Cargo workspace version**
+
+```toml
+# daemon/Cargo.toml — line 6
+[workspace.package]
+version = "3.1.0"   # was "0.1.0"
+```
+
+All 12 crates inherit via `version.workspace = true` — no other Cargo.toml files change.
+
+**2. Create daemon-core/src/version.rs**
+
+```rust
+// daemon/crates/daemon-core/src/version.rs (new file)
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const NAME: &str = env!("CARGO_PKG_NAME");
+```
+
+Export from `daemon-core/src/lib.rs`:
+
+```rust
+pub mod version;
+pub use version::{VERSION, NAME};
+```
+
+**3. Wire version into MCP get_info()**
+
+```rust
+// daemon/crates/triumvirate/src/main.rs — update get_info at line 1372
+impl ServerHandler for McpBridge {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(format!(
+                "Triumvirate MCP bridge v{}. Use `ping` to verify connectivity.",
+                daemon_core::VERSION
+            ))
+    }
+}
+```
+
+If `rmcp::ServerInfo` exposes a `.with_server_info(name, version)` builder method, use that too. Otherwise include version in the instructions string as shown.
+
+**4. Wire version into HTTP /health**
+
+The existing `health` route at `main.rs:1700` returns a JSON response. Add a `version` field:
+
+```rust
+async fn health(
+    State(state): State<DaemonState>,
+) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        version: daemon_core::VERSION.to_string(),
+        // ... existing fields ...
+    })
+}
+```
+
+Update `HealthResponse` struct to include `version: String`.
+
+**5. Wire version into CLI --version flag**
+
+Clap automatically picks up `CARGO_PKG_VERSION` when you use `#[command(version)]` on the CLI struct. Verify the existing `Cli` struct at main.rs:127 has this attribute. If not, add it.
+
+**6. Install pre-commit version-drift hook**
+
+Create `.git/hooks/pre-commit` (mode 755):
+
+```bash
+#!/bin/bash
+# Verify staged spec/doc files declare a version matching Cargo.toml
+set -e
+
+CARGO_VERSION=$(grep -m1 '^version = ' daemon/Cargo.toml | cut -d'"' -f2)
+
+if [ -z "$CARGO_VERSION" ]; then
+    echo "version-drift-check: could not read Cargo workspace version"
+    exit 1
+fi
+
+STAGED=$(git diff --cached --name-only --diff-filter=AM | grep -E '^(specs|docs)/.*\.md$' || true)
+
+FAILED=0
+for file in $STAGED; do
+    if [ ! -f "$file" ]; then continue; fi
+    # Look for a version declaration in the first 20 lines
+    SPEC_VERSION=$(head -n 20 "$file" | grep -oE '(Version:|Target version:|version:)\s*`?[0-9]+\.[0-9]+\.[0-9]+`?' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+    if [ -n "$SPEC_VERSION" ] && [ "$SPEC_VERSION" != "$CARGO_VERSION" ]; then
+        echo "version-drift-check: $file declares $SPEC_VERSION but Cargo.toml is at $CARGO_VERSION"
+        FAILED=1
+    fi
+done
+
+if [ $FAILED -eq 1 ]; then
+    echo ""
+    echo "Fix: bump daemon/Cargo.toml, or update the spec version header, or stage both together."
+    exit 1
+fi
+```
+
+Install with: `chmod +x .git/hooks/pre-commit`
+
+**7. Update ROADMAP.md**
+
+```markdown
+# Triumvirate Roadmap
+
+**Last updated:** 2026-04-09
+**Current version:** 3.1.0 (in progress — MCP Consolidation sprint)
+**Last shipped:** 3.0.0 (ABE — Autonomous Build Enforcement)
+```
+
+Add a shipped section for 3.0.0 if it doesn't exist.
+
+### Preflight Commit Sequence
+
+```
+1. git add daemon/crates/triumvirate/src/main.rs           # FIX-TEST-MOVED-VALUES
+   git commit -m "fix(tests): resolve moved-value errors in abe_red_team test"
+
+2. cargo test --workspace                                   # verify green
+
+3. git add daemon/Cargo.toml daemon/crates/daemon-core/src/version.rs \
+          daemon/crates/daemon-core/src/lib.rs \
+          daemon/crates/triumvirate/src/main.rs \
+          .git/hooks/pre-commit ROADMAP.md
+   git commit -m "chore(3.1.0): bump workspace version, wire version reporting, install drift hook"
+
+4. cargo build --release                                    # verify
+   ./daemon/target/release/triumvirate --version            # must print 3.1.0
+
+5. WAVE0_SHA=$(git rev-parse HEAD)                          # record baseline
+   echo "Wave 0 baseline: $WAVE0_SHA"
+```
+
+Worktrees created in Wave 0+ branch from this SHA.
 
 ---
 
