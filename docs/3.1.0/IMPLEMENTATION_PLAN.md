@@ -436,14 +436,14 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 
 ## Wave 4: Front Door Swap + Cleanup
 
-<task id="T-016" req="REQ-F1,REQ-F2,REQ-F3,REQ-F4" wave="4" depends="T-011,T-015">
-  <description>Verify all tools (canonical + aliases) work through the Rust daemon, then remove inter-agent entry from ~/.claude.json</description>
-  <files>~/.claude.json</files>
-  <scope_out>Do not modify the Rust daemon. This is a configuration change only. Keep a backup of ~/.claude.json before modification.</scope_out>
-  <tools>cp ~/.claude.json ~/.claude.json.bak.v3.0 && cargo test --workspace</tools>
-  <verify>grep -c "inter-agent" ~/.claude.json should be 0 (after removal). All MCP tools callable via mcp__triumvirate__*.</verify>
-  <reality_test>After removing inter-agent entry: call spawn_daemon (alias) → works. Call spawn_session (canonical) → works. Call dispatch_codex_worktree → works. Call every alias and canonical tool name — all respond. No "tool not found" errors. Node process for inter-agent is not running.</reality_test>
-  <done_when>~/.claude.json has no inter-agent entry. All 40+ tools accessible via triumvirate. No Node.js MCP process running.</done_when>
+<task id="T-016" req="REQ-F1,REQ-F2,REQ-F3,REQ-F4" wave="4" depends="T-011,T-015" lane="orchestrator">
+  <description>Verify all tools work through the Rust daemon, then remove inter-agent entry from ~/.claude.json (orchestrator-executed, requires explicit user approval before file change)</description>
+  <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude.json directly after user approval. This file is global Claude Code config, not repo state.</files>
+  <scope_out>Do not modify the Rust daemon. Do not delete the file — only remove the inter-agent entry. Keep a backup at /Users/mikeboscia/.claude.json.bak.3.1.0 before modification. Require explicit user approval before touching ~/.claude.json — this is a destructive config change.</scope_out>
+  <tools>Read, Bash (for cp backup and jq validation), Edit — orchestrator in main session</tools>
+  <verify>test -f /Users/mikeboscia/.claude.json.bak.3.1.0 && ! grep -q '"inter-agent"' /Users/mikeboscia/.claude.json</verify>
+  <reality_test>After orchestrator runs the edit and user approves: (1) /Users/mikeboscia/.claude.json.bak.3.1.0 exists as a complete backup; (2) jq '.mcpServers | has("inter-agent")' /Users/mikeboscia/.claude.json returns false; (3) jq '.mcpServers | has("triumvirate")' returns true; (4) calling mcp__triumvirate__spawn_daemon (alias from T-011) succeeds in a test Claude session; (5) calling mcp__triumvirate__spawn_session (canonical) succeeds; (6) calling mcp__triumvirate__dispatch_codex_worktree succeeds; (7) pgrep -f "inter-agent/start-unified" returns no PIDs (the TS node process is not running).</reality_test>
+  <done_when>~/.claude.json has no inter-agent entry. Backup exists. All 40+ tools accessible via mcp__triumvirate__*. No Node.js MCP process running. User has explicitly approved the config change.</done_when>
 </task>
 
 <task id="T-017" req="REQ-X1" wave="4" depends="T-016">
