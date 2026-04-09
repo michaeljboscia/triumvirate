@@ -208,25 +208,33 @@ Add a shipped section for 3.0.0 if it doesn't exist.
 ### Preflight Commit Sequence
 
 ```
-1. git add daemon/crates/triumvirate/src/main.rs           # FIX-TEST-MOVED-VALUES
-   git commit -m "fix(tests): resolve moved-value errors in abe_red_team test"
+1. FIX-TEST-MOVED-VALUES is ALREADY DONE (2026-04-09, commit be545585).
+   Verified: cargo test -p triumvirate abe_red_team_enforcement_blocks_non_compliant_worker
+             → test result: ok. 1 passed; 0 failed (3.41s)
+   Skip this step. Do NOT re-dispatch.
 
-2. cargo test --workspace                                   # verify green
+2. T-000 — dispatch to Codex worker via ABE (audit-gated per Phase 5.3):
+   Files added to the repo (via worker):
+     daemon/Cargo.toml
+     daemon/crates/daemon-core/src/version.rs (NEW)
+     daemon/crates/daemon-core/src/lib.rs
+     daemon/crates/triumvirate/src/main.rs
+     scripts/version-drift-check.sh (NEW)
+     scripts/install-git-hooks.sh (NEW)
+     ROADMAP.md
+   Commit message: "chore(3.1.0): bump workspace version, wire version reporting, add drift hook script"
 
-3. git add daemon/Cargo.toml daemon/crates/daemon-core/src/version.rs \
-          daemon/crates/daemon-core/src/lib.rs \
-          daemon/crates/triumvirate/src/main.rs \
-          .git/hooks/pre-commit ROADMAP.md
-   git commit -m "chore(3.1.0): bump workspace version, wire version reporting, install drift hook"
-
-4. cargo build --release                                    # verify
+3. cargo build --release                                    # verify binary
    ./daemon/target/release/triumvirate --version            # must print 3.1.0
+
+4. bash scripts/install-git-hooks.sh                        # orchestrator runs locally
+   # (the hook lives in scripts/ — .git/hooks/pre-commit is a symlink to it)
 
 5. WAVE0_SHA=$(git rev-parse HEAD)                          # record baseline
    echo "Wave 0 baseline: $WAVE0_SHA"
 ```
 
-Worktrees created in Wave 0+ branch from this SHA.
+Worktrees created in Wave 0+ branch from this SHA. The orchestrator executes step 4 (the hook install) directly — it is NOT part of any ABE task's `<files>` list because `.git/hooks/` is local state, not repo state.
 
 ---
 
