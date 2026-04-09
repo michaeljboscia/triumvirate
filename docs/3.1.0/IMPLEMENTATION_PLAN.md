@@ -113,21 +113,27 @@ If `rmcp::ServerInfo` exposes a `.with_server_info(name, version)` builder metho
 
 **4. Wire version into HTTP /health**
 
-The existing `health` route at `main.rs:1700` returns a JSON response. Add a `version` field:
+The existing `health` route around `main.rs:1700` returns `AxumJson<serde_json::Value>` built from an inline `serde_json::json!({...})` literal — there is no typed `HealthResponse` struct. Add a `"version"` field to the inline literal:
 
 ```rust
 async fn health(
     State(state): State<DaemonState>,
-) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        version: daemon_core::VERSION.to_string(),
-        // ... existing fields ...
-    })
+    headers: HeaderMap,
+) -> Result<AxumJson<serde_json::Value>, StatusCode> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(AxumJson(serde_json::json!({
+        "status": "ok",
+        "service": "triumvirate-daemon-v2",
+        "mode": "incremental-dev",
+        "daemon_bind_addr": state.bind_addr,
+        "version": daemon_core::VERSION
+    })))
 }
 ```
 
-Update `HealthResponse` struct to include `version: String`.
+Do NOT introduce a typed `HealthResponse` struct — keep the inline json! literal.
 
 **5. Wire version into CLI --version flag**
 
