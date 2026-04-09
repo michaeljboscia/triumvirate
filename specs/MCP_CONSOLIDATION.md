@@ -307,7 +307,7 @@ triumvirate (binary — startup wiring only)
 2. `cargo build --release` produces a single binary that serves both MCP (stdio) and HTTP
 3. Every TS MCP tool name works through the Rust daemon (via alias or native)
 4. `send-to-codex`, `send-to-gemini`, and `send-to-siblings` skills work via `ask_session`
-5. `~/.claude.json` points at the Rust binary only (plus oracle + pythia)
+5. `~/.claude.json` has no `inter-agent` entry. The `triumvirate` entry (Rust binary) serves all inter-agent + ABE tools. The `pythia` MCP entry is unchanged.
 6. The TS `node` process for inter-agent MCP is gone
 7. `main.rs` is under 300 lines
 8. All existing Claude skills, CLAUDE.md instructions, and goat rodeo prompts work without modification
