@@ -318,10 +318,14 @@ Keep the archived TS server. If the Rust front door breaks mid-migration:
 This sprint uses ABE's `dispatch_codex_worktree` for the build — the first real dogfood run. The irony: we're using the TS MCP server to dispatch the build that kills the TS MCP server.
 
 **Waves:**
-- Wave 0: Contracts — ObservabilityBus type, JobState type, module interfaces
-- Wave 1: Extract — move code from main.rs to mcp-tools modules (no behavior change)
-- Wave 2: Build — async job queue, tool aliases, parameter mapping
-- Wave 3: Swap — update ~/.claude.json, verify, archive TS server
-- Wave 4: Split oracle — separate oracle MCP server from inter-agent
+- Wave 0: Contracts — ObservabilityBus type, module trait interfaces, alias schema types
+- Wave 1: Extract — move tool handlers from main.rs to mcp-tools modules (no behavior change)
+- Wave 2: Extract — move HTTP routes to daemon-http, DaemonState to daemon-core (no behavior change)
+- Wave 3: Build — tool aliases, parameter mapping, skill updates (send-to-* skills)
+- Wave 4: Swap — add inter-agent tools to triumvirate MCP, verify, update ~/.claude.json, archive TS server
+
+Wave 1-2 are pure refactoring — zero behavioral change, full test suite must pass after each.
+Wave 3 adds new code (aliases) — tested against TS tool schemas.
+Wave 4 is the cutover — phased: sync aliases first, then full swap.
 
 Each wave is tested before proceeding. Wave 3 is the point of no return — but Wave 1-2 are pure refactoring with zero behavioral change.
