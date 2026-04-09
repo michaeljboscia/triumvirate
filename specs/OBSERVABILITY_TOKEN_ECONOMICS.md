@@ -117,7 +117,7 @@ Build a Rust-native token scanner that reads Claude, Codex, and Gemini session l
 
 **REQ-T2:** Claude session scanning delegated to `tokscale-core` which reads `~/.claude/projects/**/*.jsonl` with SIMD-accelerated JSON parsing and rayon parallelism. Our wrapper adds: session-ID extraction for attribution, direct SQLite write with build/task correlation, and notify-based file watching. (Delegated to tokscale-core)
 
-**REQ-T3:** Codex scanner reads `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, extracts `event_msg.payload` where `type == "token_count"`: `total_token_usage.{input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens}`, `rate_limits.{used_percent, plan_type}`, `info.model_context_window`. Incremental by mtime.
+**REQ-T3:** Codex session scanning delegated to `tokscale-core` which reads `~/.codex/sessions/` with the same infrastructure. Our wrapper adds session-ID extraction and attribution. (Delegated to tokscale-core)
 
 **REQ-T4:** Gemini scanner reads `~/.gemini/telemetry.jsonl` (single file, ~536MB, ~5.1M lines). Extracts `usageMetadata` from response entries: `promptTokenCount`, `candidatesTokenCount`, `totalTokenCount`, `thoughtsTokenCount`, `modelVersion`, per-modality breakdowns. Incremental by file offset (single file = track byte offset, not mtime). This covers ALL Gemini CLI sessions — daemon-mediated and direct. (Decision R1-D3: A confirmed — telemetry.jsonl exists on disk)
 
