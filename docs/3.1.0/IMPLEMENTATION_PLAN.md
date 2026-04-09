@@ -601,7 +601,7 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
 
 <task id="T-024" req="REQ-X3" wave="5" depends="T-022" lane="orchestrator">
   <description>Close resolved GitHub issues and update issue state for the sprint (orchestrator-executed with user approval per issue closure — external state change)</description>
-  <files>NOT APPLICABLE — modifies GitHub issues via gh CLI. No repo file is touched.</files>
+  <files></files>
   <scope_out>Do not close issues that weren't actually resolved. Do not close issues that touch on v3.2 (observability) or v3.3 (token economics) scope. Do not delete issues. Require user confirmation before each closure.</scope_out>
   <tools>Bash (gh issue list, gh issue close, gh issue comment) — orchestrator in main session</tools>
   <verify>test $(gh issue list --label "3.1.0" --state open --json number --jq 'length') -eq 0</verify>
