@@ -93,7 +93,7 @@ Build a Rust-native token scanner that reads Claude, Codex, and Gemini session l
 
 ### Error Context
 
-**REQ-O19:** Every `fs::write`, `fs::read`, `fs::create_dir_all`, `Command::new().output()`, and `serde_json::from_str`/`to_string` call in ABE modules must use `.with_context(|| format!("..."))` including the file path, operation name, and task_id where available.
+**REQ-O19:** Critical I/O paths and failure boundaries in ABE modules must use `.with_context(|| format!("..."))` including the file path, operation name, and task_id where available. Focus on: file read/write, subprocess spawn, JSON parse, and git operations. Not every single `?` — measure by grepping for bare `.unwrap()` and uncontexted `?` after sprint. (Scoped down per twin consensus)
 
 ### WebSocket Events
 
