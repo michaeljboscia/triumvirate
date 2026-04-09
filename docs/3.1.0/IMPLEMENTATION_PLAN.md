@@ -361,7 +361,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <tools>cargo test --workspace</tools>
   <verify>cargo test --workspace</verify>
   <reality_test>Call spawn_daemon via MCP → creates session (same as spawn_session). Call ask_daemon → gets response. Call send_message → synchronously calls ask_session, returns response (not job_id). Daemon log shows tracing::info with tool_alias field for each call.</reality_test>
-  <done_when>All 8 aliases registered and callable via MCP. Parameter mapping works for all schema differences. Alias usage logged. get_response returns deprecation notice.</done_when>
+  <done_when>All 10 aliases registered and callable via MCP (spawn_daemon, ask_daemon, dismiss_daemon, list_daemons, send_message, get_response, list_jobs, write_scratchpad, list_scratchpad, code_review). Parameter mapping works for all schema differences per REQ-A1. Alias usage logged via tracing::info!("tool_alias"). get_response returns deprecation notice.</done_when>
 </task>
 
 <!--
