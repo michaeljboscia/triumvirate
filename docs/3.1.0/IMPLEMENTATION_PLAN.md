@@ -457,13 +457,13 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 </task>
 
 <task id="T-018" req="REQ-X2,REQ-X3" wave="4" depends="T-016,T-017">
-  <description>Internal verification: full test suite, all tools, clean state — end of internal work, entry gate for Wave 5</description>
+  <description>Internal verification — end of internal work, entry gate for Wave 5</description>
   <files>daemon/crates/triumvirate/src/main.rs</files>
   <scope_out>No code changes. Verification only. Does NOT touch public release artifacts — that is Wave 5.</scope_out>
-  <tools>cargo test --workspace, wc -l daemon/crates/triumvirate/src/main.rs</tools>
-  <verify>cargo test --workspace passes. wc -l main.rs < 300. No Node.js MCP processes running. All skills work.</verify>
-  <reality_test>Run cargo test --workspace → all pass (including existing 156+ tests). Run wc -l main.rs → under 300. Invoke /goatrodeo → twins spawn via Rust daemon. Invoke /send-to-codex → Codex responds. curl /metrics → all metrics present. WebSocket → events flow.</reality_test>
-  <done_when>Internal work complete. All 3.1.0 functionality works locally. Ready for Wave 5 public release.</done_when>
+  <tools>cargo test --workspace, wc -l, pgrep, curl</tools>
+  <verify>cargo test --workspace && test "$(wc -l < daemon/crates/triumvirate/src/main.rs)" -lt 300 && ! pgrep -f 'inter-agent/start-unified' && curl -sf http://localhost:8080/metrics &gt; /dev/null</verify>
+  <reality_test>All verify-command assertions exit 0. Additionally: invoking `mcp__triumvirate__spawn_session` from a test Claude session returns a valid session_id with the `gd_` or `cd_` prefix. Invoking `mcp__triumvirate__dispatch_codex_worktree` with a trivial test task spawns a worker and returns a task_id. WebSocket client connected to `ws://localhost:8080/ws` receives at least one bootstrap event within 5 seconds of connection.</reality_test>
+  <done_when>Internal work complete. All 3.1.0 functionality works locally. main.rs under 300 lines. Rust daemon serves all tools. TS inter-agent process not running. Ready for Wave 5 public release.</done_when>
 </task>
 
 ---
