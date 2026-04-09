@@ -1,13 +1,14 @@
-# v3.1 MCP Consolidation — PRD
+# Triumvirate 3.1.0 MCP Consolidation — PRD
 
 **Spec:** `specs/MCP_CONSOLIDATION.md`
+**Target version:** `3.1.0` (single source: `daemon/Cargo.toml`)
 
 ---
 
 ## Features
 
 ### FEAT-001: Crate Architecture Refactor
-Extract the 6,215-line `main.rs` monolith into organized crates with functional boundaries. Production code (~2,822 lines) splits into `mcp-tools` (tool handlers), `daemon-http` (HTTP routes), and `daemon-core` (state management). `main.rs` shrinks to startup wiring (~300 lines).
+Extract the 6,216-line `main.rs` monolith into organized crates with functional boundaries. Production code (~2,824 lines) splits into `mcp-tools` (tool handlers), `daemon-http` (HTTP routes), and `daemon-core` (state management). `main.rs` shrinks to startup wiring (~300 lines). (Line counts verified 2026-04-09 at HEAD 373256451.)
 
 **Acceptance:** `wc -l main.rs` < 300. `cargo test --workspace` passes. No behavioral change.
 
