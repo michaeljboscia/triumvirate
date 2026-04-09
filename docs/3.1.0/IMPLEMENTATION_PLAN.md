@@ -31,7 +31,7 @@
 | **TOTAL** | **All tasks** | **26** |
 
 **Task execution model (two lanes):**
-- **ABE-dispatched (Codex worker)**: Tasks that modify repo-internal files. Use `dispatch_codex_worktree`. Each task is audit-gated per Phase 5.3 of goatrodeo. Tasks: T-000, T-001, T-002, T-003, T-004, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-017, T-018, T-020, T-023
+- **ABE-dispatched (Codex worker)**: Tasks that modify repo-internal files. Use `dispatch_codex_worktree`. Each task is audit-gated per Phase 5.3 of goatrodeo. Tasks: T-000, T-001, T-002, T-003, T-004, T-004B, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-017, T-018, T-020, T-023
 - **Orchestrator-executed (Claude in main session)**: Tasks that modify files OUTSIDE the repo (`~/.claude/skills/*`, `~/.claude.json`) or require user-facing GitHub operations. Claude applies these directly. Tasks: T-012, T-013, T-014, T-015, T-016, T-019, T-021, T-022, T-024
 - **FIX-TEST-MOVED-VALUES**: Already complete, no dispatch needed.
 
