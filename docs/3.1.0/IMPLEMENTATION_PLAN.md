@@ -241,13 +241,13 @@ Worktrees created in Wave 0+ branch from this SHA. The orchestrator executes ste
 ## Wave 0: Contracts and Interfaces
 
 <task id="T-001" req="REQ-B1,REQ-B2,REQ-B3" wave="0" depends="">
-  <description>Define ObservabilityBus struct and module trait interfaces in shared-types or daemon-core</description>
+  <description>Define ObservabilityBus struct and module trait interfaces in daemon-core</description>
   <files>daemon/crates/daemon-core/src/lib.rs, daemon/crates/shared-types/src/lib.rs</files>
   <scope_out>Do not implement metrics registration. Do not move DaemonMetrics yet — just define the ObservabilityBus struct shape and the trait interfaces each mcp-tools module will receive (SessionStore, AgentExecutor, TaskTrackerHandle, LedgerStoreFactory, etc.)</scope_out>
-  <tools>cargo check --workspace</tools>
+  <tools>cargo check --workspace, cargo test --workspace</tools>
   <verify>cargo check --workspace</verify>
-  <reality_test>Import ObservabilityBus from daemon-core in mcp-tools Cargo.toml — compiler accepts. Create a mock ObservabilityBus in a test — compiles. Instantiate each trait interface — compiles.</reality_test>
-  <done_when>ObservabilityBus struct defined with metrics: Arc&lt;DaemonMetrics&gt; and ws_events: broadcast::Sender&lt;String&gt;. Module trait interfaces defined. All compile.</done_when>
+  <reality_test>Write a test in daemon-core that: (1) constructs an ObservabilityBus with a real DaemonMetrics and a broadcast::channel(16); (2) clones the bus into two threads via tokio::spawn; (3) each thread publishes a test ws event via bus.publish_event("test", json!({"n": N})); (4) a separate receiver attached to the channel receives BOTH messages in the correct JSON shape with matching N values; (5) metrics.agent_requests_total.inc() from one thread is visible via metrics.agent_requests_total.get() == 1 from another. This proves the bus is Clone+Send+Sync, the channel works cross-thread, and the metrics Arc is shared. A stub that returns default values cannot pass the N-value round-trip assertion.</reality_test>
+  <done_when>ObservabilityBus struct defined with metrics: Arc&lt;DaemonMetrics&gt; and ws_events: broadcast::Sender&lt;String&gt; fields plus a publish_event() method. Module trait interfaces defined. Round-trip test passes. cargo check --workspace succeeds.</done_when>
 </task>
 
 <task id="T-002" req="REQ-A1,REQ-A2" wave="0" depends="">
