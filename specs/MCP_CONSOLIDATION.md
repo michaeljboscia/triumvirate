@@ -186,7 +186,7 @@ daemon/crates/mcp-tools/src/
 | `send_message` | alias (synchronous) | `ask_session` | Map `target` → `name`, `question` → `message`. Auto-spawn session if needed. Returns response directly (NOT a job_id — the async pattern was eliminated per Decision R1-D1) |
 | `get_response` | deprecated shim | returns static message | "Use ask_session directly — the async job queue was removed in 3.1.0. See /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md for the new synchronous pattern." |
 | `list_jobs` | alias | `get_status` (shape-mapped) | Returns a list with `job_id=session_id`, `state=agent_state`, `target=agent` to preserve the old shape |
-| `write_scratchpad` | alias | `scratchpad_write` | Name swap only — schemas are identical |
+| `write_scratchpad` | alias (schema-mapped) | `scratchpad_write` | Map TS params `topic/content/cwd/owner/daemon_id` → Rust `scratchpad_write` schema. Owner resolution: if `daemon_id` present, derive owner from its `gd_`/`cd_` prefix; else use explicit `owner`; else default to `inter-agent`. Topic becomes filename stem, content is the body. |
 | `list_scratchpad` | alias | `scratchpad_list` | Name swap only |
 | `pythia_query` | OUT OF SCOPE | — | Not in TS server anyway (server.ts:5). Stays in Pythia MCP. No alias needed. |
 | `pythia_corpus_health` | OUT OF SCOPE | — | Same — stays in Pythia MCP. |
