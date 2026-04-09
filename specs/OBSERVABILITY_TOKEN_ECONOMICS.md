@@ -212,6 +212,31 @@ Query: `WHERE model = ? AND effective_date <= ?ts AND (end_date IS NULL OR end_d
 
 ## Architecture Notes
 
+### ObservabilityBus (Round 1 — Architectural Addition)
+
+McpBridge (where ABE MCP tools live) currently has NO access to `DaemonMetrics` or `ws_events`. Both are needed for REQ-O4–O11, O20, O21, T14, T15. Solution: create an `ObservabilityBus` struct wrapping shared observability state, injected into both DaemonState (for HTTP routes) and McpBridge (for MCP tools).
+
+```rust
+pub struct ObservabilityBus {
+    pub metrics: Arc<DaemonMetrics>,
+    pub ws_events: broadcast::Sender<String>,
+    pub token_db: Arc<TokenDb>,  // SQLite connection for token-scanner
+}
+```
+
+Constructed once in `main()`, cloned into DaemonState and McpBridge. All ABE functions that need metrics/events receive a reference to the bus.
+
+### Token Ingestion Architecture (Round 1 — Dual Lane)
+
+```
+Lane 1 (Daemon-mediated):
+  agent_exec → TokenRecord (exact build_id, task_id, session_id) → SQLite direct write
+
+Lane 2 (External CLI sessions):
+  notify watcher → detect new/modified files → parse JSONL → 
+  match session_id against outbox events → attributed or "unattributed" → SQLite batch write
+```
+
 ### Crate Dependency Graph (Post-Sprint)
 
 ```
