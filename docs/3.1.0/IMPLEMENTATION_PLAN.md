@@ -505,8 +505,8 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
   <description>Build release binaries for all supported platforms with reproducible checksums</description>
   <files>scripts/build-release.sh</files>
   <scope_out>Do not publish yet — T-022 handles GitHub release. Do not sign binaries (requires manual step). Do not build Windows if it has never been tested — mark it as "next sprint" if missing. The script builds into daemon/target/release-dist/ which is gitignored (not tracked).</scope_out>
-  <tools>cargo build --release, cargo zigbuild (for cross-compilation), sha256sum, tar, zip</tools>
-  <verify>All expected binaries exist in daemon/target/release-dist/ with matching .sha256 files.</verify>
+  <tools>bash scripts/build-release.sh (wraps cargo build --release, cargo zigbuild, sha256sum, tar, zip)</tools>
+  <verify>bash scripts/build-release.sh && test -f daemon/target/release-dist/triumvirate-3.1.0-darwin-arm64.tar.gz && test -f daemon/target/release-dist/triumvirate-3.1.0-darwin-arm64.tar.gz.sha256 && test -f daemon/target/release-dist/triumvirate-3.1.0-linux-x64.tar.gz && test -f daemon/target/release-dist/triumvirate-3.1.0-linux-arm64.tar.gz</verify>
   <reality_test>
     For each target platform:
     1. Binary exists at daemon/target/release-dist/triumvirate-3.1.0-{target}.{tar.gz|zip}
