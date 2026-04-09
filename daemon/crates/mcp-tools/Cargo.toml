@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 daemon-core = { path = "../daemon-core" }
+fleet = { path = "../fleet" }
 peer-review = { path = "../peer-review" }
 rmcp.workspace = true
 serde_json.workspace = true
