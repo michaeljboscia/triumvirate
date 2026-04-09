@@ -208,7 +208,7 @@ Constructed in `main()`, injected into both `DaemonState` (for HTTP routes) and 
 
 **REQ-F2:** Update `~/.claude.json` to replace the TS MCP server entry (`inter-agent`) with the Rust daemon binary. The tool namespace changes from `mcp__inter-agent__*` to `mcp__triumvirate__*` (or keep `inter-agent` as the server name in the Rust binary for zero-change migration).
 
-**REQ-F3:** The Rust MCP server MUST declare all tool schemas via the `rmcp` tool_router macro, matching or exceeding the TS server's tool descriptions. Tool descriptions are user-facing (Claude reads them to decide which tool to call) — they must be accurate and helpful.
+**REQ-F3:** The Rust MCP server MUST declare all tool schemas via the `rmcp` tool_router macro. Every tool MUST have a description string of at least 20 characters explaining what it does and when to use it. Tool descriptions are user-facing (Claude reads them to decide which tool to call). Alias tools must include "Alias for [canonical_name]" in their description.
 
 **REQ-F4:** Verify that the Rust MCP server handles the MCP lifecycle correctly: `initialize`, `tools/list`, `tools/call`, `notifications/progress`. The TS server uses `@modelcontextprotocol/sdk` — verify protocol parity.
 
