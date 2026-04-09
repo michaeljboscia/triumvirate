@@ -399,7 +399,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 
 <task id="T-013" req="REQ-J3" wave="3" depends="T-011" lane="orchestrator">
   <description>Update send-to-gemini skill to reference mcp__triumvirate__ask_session (orchestrator-executed)</description>
-  <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md directly.</files>
+  <files></files>
   <scope_out>Same as T-012. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
   <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md && ! grep -qE "send_message|get_response" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md</verify>
