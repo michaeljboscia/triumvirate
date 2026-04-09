@@ -261,24 +261,30 @@ triumvirate (binary — startup wiring only)
 
 **After (v3.1):**
 ```
-~/.claude.json → triumvirate daemon              (Rust, ALL tools except oracle)
-~/.claude.json → oracle MCP                       (TS, pythia/oracle tools only)
+~/.claude.json → triumvirate daemon              (Rust, ALL inter-agent + ABE tools)
 ~/.claude.json → pythia MCP                       (separate, unchanged)
 ```
+
+**Oracle tools note:** The TS `mcp-server/` that this sprint archives does NOT contain oracle tools. `server.ts:5` states: "Oracle tools are NOT registered here — they live in Pythia." Oracle/Pythia functionality stays in its own existing MCP server (`mcp__pythia-gtm__`) and is untouched by this sprint. REQ-P1/P2 were dropped after this was verified by code inspection.
 
 ### File Changes
 
 | File | Change |
 |------|--------|
-| `daemon/crates/triumvirate/src/main.rs` | Shrinks from ~5,000 lines to ~300 (startup only) |
-| `daemon/crates/mcp-tools/src/*.rs` | NEW — 7 modules, ~2,500 lines extracted from main.rs |
-| `daemon/crates/mcp-tools/src/jobs.rs` | NEW — async job queue (~200 lines) |
+| `daemon/crates/triumvirate/src/main.rs` | Shrinks from 6,216 lines (current) to under 300 (startup only) |
+| `daemon/crates/mcp-tools/src/*.rs` | NEW — 8 modules (lib, inter_agent, abe, fleet, knowledge, review, gemini_query, aliases), ~2,500 lines extracted from main.rs |
 | `daemon/crates/mcp-tools/Cargo.toml` | Updated deps — all domain crates |
 | `daemon/crates/daemon-http/src/lib.rs` | Expanded — HTTP routes extracted from main.rs |
 | `daemon/crates/daemon-core/src/lib.rs` | Expanded — DaemonState, config, sessions |
-| `~/.claude.json` | Updated — triumvirate replaces inter-agent |
-| `mcp-server/` | Archived to `archive/mcp-server-ts/` |
-| `oracle-mcp-server/` | NEW — oracle tools split from inter-agent |
+| `daemon/crates/daemon-core/src/version.rs` | NEW — env!("CARGO_PKG_VERSION") constants |
+| `daemon/Cargo.toml` | Workspace version bumped from 0.1.0 → 3.1.0 |
+| `scripts/version-drift-check.sh` | NEW — pre-commit hook script (tracked in repo) |
+| `scripts/install-git-hooks.sh` | NEW — installer that symlinks the hook into .git/hooks/ |
+| `/Users/mikeboscia/.claude.json` | Updated — inter-agent entry removed. Orchestrator-executed with user approval (not in repo). |
+| `mcp-server/` | Archived to `archive/mcp-server-ts/` via git mv |
+| `/Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md` et al. | Updated — orchestrator edits (not in repo) |
+
+**`.git/hooks/pre-commit`** is NOT in this list. It is local state, not repo state. The hook logic lives in `scripts/version-drift-check.sh` (tracked) and is symlinked into `.git/hooks/` by `scripts/install-git-hooks.sh` which each developer runs once after cloning.
 
 ---
 
