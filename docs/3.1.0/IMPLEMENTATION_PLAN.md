@@ -427,7 +427,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   directly.</files>
   <scope_out>Do not change skill logic or purpose. Only update MCP tool name references from mcp__inter-agent__* to mcp__triumvirate__*. Do not touch goatrodeo.md's platform rule or audit gates added 2026-04-09.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
-  <verify>grep -r "mcp__inter-agent" /Users/mikeboscia/.claude/skills/ returns zero matches</verify>
+  <verify>! grep -rq "mcp__inter-agent" /Users/mikeboscia/.claude/skills/ && test $(grep -rc "mcp__triumvirate__" /Users/mikeboscia/.claude/skills/inter-agent-protocol/SKILL.md /Users/mikeboscia/.claude/skills/goatrodeo.md /Users/mikeboscia/.claude/skills/design-goatrodeo.md /Users/mikeboscia/.claude/skills/crystallize/factory/phase-2-diagnose.md | grep -vc ':0') -eq 4</verify>
   <reality_test>After orchestrator runs the edits: (1) grep -r "mcp__inter-agent" ~/.claude/skills/ exits with no matches; (2) each of the 4 skill files contains at least one "mcp__triumvirate__" reference; (3) the goatrodeo.md Platform Rule at line 9 is unchanged (grep "Platform Rule" returns the same line); (4) Phase 4.4 and Phase 5.3 sections still exist (grep "Canonical Doc Audit\|Dispatch Audit" returns matches).</reality_test>
   <done_when>Zero references to mcp__inter-agent across all skill files. All 4 target skills updated. Platform Rule and audit phases preserved.</done_when>
 </task>
