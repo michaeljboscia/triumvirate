@@ -738,7 +738,7 @@ After each task commit, run the validation script:
 When all tasks are complete (through Wave 5), respond with:
 ```
 backlog_status: 0 remaining
-completed_tasks: [FIX-TEST-MOVED-VALUES, T-000, T-001..T-024]
+completed_tasks: [FIX-TEST-MOVED-VALUES, T-000, T-001, T-002, T-003, T-004, T-004B, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-012, T-013, T-014, T-015, T-016, T-017, T-018, T-019, T-020, T-021, T-022, T-023, T-024]
 total_commits: {N}
 collateral_fixes: {N} ({list if any})
 validation: {N}/{N} tasks passed validate-task.sh
