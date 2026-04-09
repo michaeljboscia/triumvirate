@@ -37,7 +37,7 @@ Claude Code
   └── mcp__pythia-gtm__* → node pythia shim → Pythia MCP (unchanged)
 ```
 
-**Result:** One process. All tools. No Node.js for MCP.
+**Result:** One Rust process serves all inter-agent + ABE + fleet + ledger + lessons tools. The TS inter-agent MCP server (`mcp-server/`) is archived and no longer runs. The Pythia MCP shim (`node pythia/dist/daemon/shim.js`) is unchanged and still runs — it is a separate MCP server for Pythia/Oracle functionality and is outside this sprint's scope. Net effect: **inter-agent no longer requires Node.js; Pythia still does** (Pythia Node consolidation is a potential future sprint, not 3.1.0).
 
 ---
 
