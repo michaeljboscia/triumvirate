@@ -151,7 +151,7 @@ daemon/crates/mcp-tools/src/
 └── aliases.rs          # Backwards-compatible tool aliases + parameter mapping
 ```
 
-**REQ-C2:** Extract HTTP route handlers from `main.rs` into `daemon-http` crate. HTTP routes call the same domain logic as MCP tools — both are thin presentation layers.
+**REQ-C2:** Extract ALL `*_route` async functions from `main.rs` into `daemon-http` crate: `ask_agent_route`, `ledger_wake_route`, `ledger_health_route`, `ledger_query_route`, `ledger_session_route`, `ledger_record_route`, `ledger_gc_route`, `lesson_add_route`, `lesson_query_route`, `lesson_validate_route`, `lesson_list_route`, `memory_write_route`, `memory_read_route`, `scratchpad_write_route`, `scratchpad_list_route`, `outbox_recent_route`, `fallback_list_route`, `fallback_ack_route`, `fallback_gc_route`, and the `ws_route` WebSocket handler. HTTP routes call the same domain logic as MCP tools — both are thin presentation layers.
 
 **REQ-C3:** Extract DaemonState construction, session management, and startup logic from `main.rs` into `daemon-core`. The `main.rs` in the `triumvirate` crate becomes startup wiring only — under 300 lines.
 
