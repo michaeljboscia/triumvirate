@@ -9,6 +9,7 @@ use std::sync::{
 use tokio::time::Duration;
 
 pub mod aliases;
+pub mod fleet;
 pub mod gemini_query;
 pub mod review;
 

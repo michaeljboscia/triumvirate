@@ -1140,6 +1140,7 @@ name = "mcp-tools"
 version = "3.1.0"
 dependencies = [
  "daemon-core",
+ "fleet",
  "peer-review",
  "rmcp",
  "serde_json",

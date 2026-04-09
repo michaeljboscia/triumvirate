@@ -37,8 +37,6 @@ use fallback_outbox::{
     acknowledge_fallback_path, append_outbox_event, count_pending_fallbacks, gc_fallbacks,
     list_pending_fallback_paths, read_outbox_events, spawn_dead_drop as create_dead_drop_fallback,
 };
-use fleet::orchestrator::{FleetOrchestrator, FleetSpawnRequest as FleetSpawnRunRequest};
-use fleet::tasks::FleetTaskStore;
 use ledger::LedgerStore;
 #[cfg(test)]
 use peer_review::PeerReviewEngine;
@@ -50,8 +48,8 @@ use mcp_bridge::use_daemon_for_mcp_from_env;
 #[cfg(test)]
 use mcp_bridge::should_use_daemon_proxy;
 use mcp_tools::{
-    ProgressEmitter, display_agent_name, gemini_query as mcp_gemini_query,
-    next_heartbeat_offset, review as mcp_review,
+    ProgressEmitter, display_agent_name, fleet as mcp_fleet,
+    gemini_query as mcp_gemini_query, next_heartbeat_offset, review as mcp_review,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -1120,61 +1118,13 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<FleetSpawnRequest>,
     ) -> Result<Json<FleetSpawnResponse>, String> {
-        let project_root = req
-            .project_root
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "failed to resolve project root".to_string())?;
-        let agents = req
-            .agents
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec!["codex".to_string(), "gemini".to_string()]);
-        let dry_run = req.dry_run.unwrap_or(true);
-        let wait = req.wait.unwrap_or(false);
-        let task_description = req
-            .task_description
-            .unwrap_or_else(|| "Implement the assigned fleet task.".to_string());
-
-        let git_ops = git_ops_impl::RealGitOps::new(project_root.clone())
-            .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
-        let orchestrator = FleetOrchestrator::new(git_ops);
-        let result = orchestrator
-            .fleet_spawn(FleetSpawnRunRequest {
-                project_root: project_root.clone(),
-                agents: agents.clone(),
-                dry_run,
-                wait: Some(wait),
-                task_description,
-            })
-            .await
-            .map_err(|e| format!("fleet_spawn failed: {e}"))?;
-
-        let state = if dry_run {
-            "planned".to_string()
-        } else if wait {
-            "running".to_string()
-        } else {
-            "spawning".to_string()
-        };
-
-        let status = FleetStatusResponse {
-            fleet_id: result.fleet_id.clone(),
-            state: state.clone(),
-            worktree_paths: result
-                .worktree_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>(),
-        };
-        let mut fleet_states = self.fleet_states.lock().await;
-        fleet_states.insert(result.fleet_id.clone(), status);
-
-        Ok(Json(FleetSpawnResponse {
-            fleet_id: result.fleet_id,
-            plan: result.plan_text,
-            head_sha: result.head_sha,
-            state,
-        }))
+        let response = mcp_fleet::fleet_spawn(&self.fleet_states, req, |project_root| {
+            let git_ops = git_ops_impl::RealGitOps::new(project_root)
+                .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
+            Ok(fleet::orchestrator::FleetOrchestrator::new(git_ops))
+        })
+        .await?;
+        Ok(Json(response))
     }
 
     #[tool(description = "Return fleet status by fleet_id.")]
@@ -1182,12 +1132,7 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<FleetStatusRequest>,
     ) -> Result<Json<FleetStatusResponse>, String> {
-        let fleet_states = self.fleet_states.lock().await;
-        let status = fleet_states
-            .get(&req.fleet_id)
-            .cloned()
-            .ok_or_else(|| format!("fleet not found: {}", req.fleet_id))?;
-        Ok(Json(status))
+        Ok(Json(mcp_fleet::fleet_status(&self.fleet_states, req).await?))
     }
 
     #[tool(description = "List known fleet task IDs for a fleet.")]
@@ -1195,24 +1140,7 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<FleetTaskListRequest>,
     ) -> Result<Json<FleetTaskListResponse>, String> {
-        let fleet_states = self.fleet_states.lock().await;
-        let status = fleet_states
-            .get(&req.fleet_id)
-            .ok_or_else(|| format!("fleet not found: {}", req.fleet_id))?;
-        let task_ids = status
-            .worktree_paths
-            .iter()
-            .filter_map(|path| {
-                let task_file = PathBuf::from(path)
-                    .join(".triumvirate")
-                    .join("fleet-task.md");
-                let contents = fs::read_to_string(task_file).ok()?;
-                contents
-                    .lines()
-                    .find_map(|line| line.strip_prefix("task_id: ").map(str::to_string))
-            })
-            .collect::<Vec<_>>();
-        Ok(Json(FleetTaskListResponse { task_ids }))
+        Ok(Json(mcp_fleet::fleet_task_list(&self.fleet_states, req).await?))
     }
 
     #[tool(description = "Claim a fleet task in SQLite.")]
@@ -1220,17 +1148,7 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<FleetClaimTaskRequest>,
     ) -> Result<Json<FleetClaimTaskResponse>, String> {
-        let project_root = req
-            .project_root
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "failed to resolve project root".to_string())?;
-        let store = FleetTaskStore::new(project_root)
-            .map_err(|e| format!("fleet_claim_task store init failed: {e}"))?;
-        let claimed = store
-            .claim_task(&req.task_id, &req.assigned_agent)
-            .map_err(|e| format!("fleet_claim_task failed: {e}"))?;
-        Ok(Json(FleetClaimTaskResponse { claimed }))
+        Ok(Json(mcp_fleet::fleet_claim_task(req).await?))
     }
 
     #[tool(description = "Cancel a fleet by fleet_id.")]
@@ -1238,9 +1156,7 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<FleetCancelRequest>,
     ) -> Result<Json<FleetCancelResponse>, String> {
-        let mut fleet_states = self.fleet_states.lock().await;
-        let canceled = fleet_states.remove(&req.fleet_id).is_some();
-        Ok(Json(FleetCancelResponse { canceled }))
+        Ok(Json(mcp_fleet::fleet_cancel(&self.fleet_states, req).await?))
     }
 
     #[tool(description = "Request a peer review and receive assigned reviewer + review_id.")]
