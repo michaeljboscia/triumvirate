@@ -9,15 +9,34 @@
 
 ## Build Overview
 
-- **6 Waves, 19 Tasks**
-- Preflight (Wave -1): Fix test compile errors + version alignment
+- **7 Waves, 26 Tasks total** (broken down below)
+- Preflight (Wave -1): FIX-TEST-MOVED-VALUES ✅ **DONE** (applied 2026-04-09, verified via git blame at main.rs:6106) + T-000 version alignment (PENDING)
 - Wave 0: Contracts (types, traits, interfaces)
 - Wave 1: Extract MCP tool handlers from main.rs → mcp-tools modules
 - Wave 2: Extract HTTP routes from main.rs → daemon-http + DaemonState to daemon-core
 - Wave 3: Build aliases + update skills
 - Wave 4: Front door swap + cleanup
+- Wave 5: Public Release (mandatory standing template)
 
-**Build method:** ABE fleet dispatch (`dispatch_codex_worktree`). This is the dogfood run.
+**Task accounting (canonical):**
+| Group | Tasks | Count |
+|-------|-------|-------|
+| Preflight (Wave -1) | FIX-TEST-MOVED-VALUES ✅, T-000 | 2 |
+| Wave 0 | T-001, T-002 | 2 |
+| Wave 1 | T-003..T-007 | 5 |
+| Wave 2 | T-008..T-010 | 3 |
+| Wave 3 | T-011..T-015 | 5 |
+| Wave 4 | T-016..T-018 | 3 |
+| Wave 5 | T-019..T-024 | 6 |
+| **TOTAL** | **All tasks** | **26** |
+
+**Task execution model (two lanes):**
+- **ABE-dispatched (Codex worker)**: Tasks that modify repo-internal files. Use `dispatch_codex_worktree`. Each task is audit-gated per Phase 5.3 of goatrodeo. Tasks: T-000, T-001, T-002, T-003, T-004, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-017, T-018, T-020, T-023
+- **Orchestrator-executed (Claude in main session)**: Tasks that modify files OUTSIDE the repo (`~/.claude/skills/*`, `~/.claude.json`) or require user-facing GitHub operations. Claude applies these directly. Tasks: T-012, T-013, T-014, T-015, T-016, T-019, T-021, T-022, T-024
+- **FIX-TEST-MOVED-VALUES**: Already complete, no dispatch needed.
+
+**Build method:** ABE fleet dispatch (`dispatch_codex_worktree`) for ABE-lane tasks. This is the dogfood run.
+**Audit gate:** Every ABE dispatch requires Phase 5.3 approval from both Gemini + Codex (fresh sessions, blind) before worker spawn.
 **max_parallel:** 7 (proven in stress test)
 **Test command:** `cargo test --workspace`
 
