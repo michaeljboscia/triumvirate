@@ -438,7 +438,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 
 <task id="T-016" req="REQ-F1,REQ-F2,REQ-F3,REQ-F4" wave="4" depends="T-011,T-015" lane="orchestrator">
   <description>Verify all tools work through the Rust daemon, then remove inter-agent entry from ~/.claude.json (orchestrator-executed, requires explicit user approval before file change)</description>
-  <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude.json directly after user approval. This file is global Claude Code config, not repo state.</files>
+  <files></files>
   <scope_out>Do not modify the Rust daemon. Do not delete the file — only remove the inter-agent entry. Keep a backup at /Users/mikeboscia/.claude.json.bak.3.1.0 before modification. Require explicit user approval before touching ~/.claude.json — this is a destructive config change.</scope_out>
   <tools>Read, Bash (for cp backup and jq validation), Edit — orchestrator in main session</tools>
   <verify>test -f /Users/mikeboscia/.claude.json.bak.3.1.0 && ! grep -q '"inter-agent"' /Users/mikeboscia/.claude.json</verify>
