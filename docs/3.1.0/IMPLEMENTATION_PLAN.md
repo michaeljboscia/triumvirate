@@ -599,12 +599,12 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
   <done_when>Fresh environment install worked without modification. INSTALL_VERIFIED.md written with exact reproducible steps. If the install failed, fix it and re-run before marking done.</done_when>
 </task>
 
-<task id="T-024" req="REQ-X3" wave="5" depends="T-022">
-  <description>Close resolved GitHub issues and update issue state for the sprint</description>
-  <files>GitHub issues (external, via gh CLI)</files>
-  <scope_out>Do not close issues that weren't actually resolved. Do not close issues that touch on v3.2 (observability) or v3.3 (token economics) scope. Do not delete issues.</scope_out>
-  <tools>gh issue list, gh issue close, gh issue comment</tools>
-  <verify>Relevant issues closed with a reference to release 3.1.0.</verify>
+<task id="T-024" req="REQ-X3" wave="5" depends="T-022" lane="orchestrator">
+  <description>Close resolved GitHub issues and update issue state for the sprint (orchestrator-executed with user approval per issue closure — external state change)</description>
+  <files>NOT APPLICABLE — modifies GitHub issues via gh CLI. No repo file is touched.</files>
+  <scope_out>Do not close issues that weren't actually resolved. Do not close issues that touch on v3.2 (observability) or v3.3 (token economics) scope. Do not delete issues. Require user confirmation before each closure.</scope_out>
+  <tools>Bash (gh issue list, gh issue close, gh issue comment) — orchestrator in main session</tools>
+  <verify>gh issue list --label "3.1.0" --state open returns zero open issues (or only explicitly-deferred ones)</verify>
   <reality_test>
     For each issue labeled "v3.1" or "mcp-consolidation" in the repo:
     1. If resolved by this sprint: close with comment "Resolved in 3.1.0 — see https://github.com/michaeljboscia/triumvirate/releases/tag/3.1.0"
