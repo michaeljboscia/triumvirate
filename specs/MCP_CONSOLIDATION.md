@@ -171,15 +171,24 @@ The TS `send_message` + `get_response` async pattern was a workaround for Node.j
 
 ### Tool Aliases (Backwards Compatibility)
 
-**REQ-A1:** Register backwards-compatible aliases so existing Claude skills, prompts, and CLAUDE.md instructions that reference TS tool names continue to work:
+**REQ-A1:** Register backwards-compatible aliases for ALL 12 TS inter-agent tools so existing Claude skills, prompts, and CLAUDE.md instructions continue to work. This is the canonical alias matrix — every TS tool has an explicit status (alias-to-Rust, canonical-native, or intentionally-unsupported):
 
-| Alias (old TS name) | Routes to (Rust handler) |
-|---------------------|-------------------------|
-| `spawn_daemon` | `spawn_session` |
-| `ask_daemon` | `ask_session` |
-| `dismiss_daemon` | `dismiss_session` |
-| `list_daemons` | `list_sessions` |
-| `code_review` | `review_request` (with schema mapping) |
+| TS tool (old name) | Status | Routes to (Rust handler) | Notes |
+|---------------------|--------|--------------------------|-------|
+| `spawn_daemon` | alias | `spawn_session` | Map `target` → `agent`, preserve `session_name`, `cwd`, `timeout_ms` |
+| `ask_daemon` | alias | `ask_session` | Map `daemon_id` → `name` (preserving `gd_`/`cd_` prefix), `question` → `message` |
+| `dismiss_daemon` | alias | `dismiss_session` | Map `daemon_id` → `name`. Drop `hard` param (Rust doesn't support — log warning if passed) |
+| `list_daemons` | alias | `list_sessions` | Optional `target` filter applied post-fetch |
+| `send_message` | alias (synchronous) | `ask_session` | Map `target` → `name`, `question` → `message`. Auto-spawn session if needed. Returns response directly (NOT a job_id — the async pattern was eliminated per Decision R1-D1) |
+| `get_response` | deprecated shim | returns static message | "Use ask_session directly — the async job queue was removed in 3.1.0. See /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md for the new synchronous pattern." |
+| `list_jobs` | alias | `get_status` (shape-mapped) | Returns a list with `job_id=session_id`, `state=agent_state`, `target=agent` to preserve the old shape |
+| `write_scratchpad` | alias | `scratchpad_write` | Name swap only — schemas are identical |
+| `list_scratchpad` | alias | `scratchpad_list` | Name swap only |
+| `pythia_query` | OUT OF SCOPE | — | Not in TS server anyway (server.ts:5). Stays in Pythia MCP. No alias needed. |
+| `pythia_corpus_health` | OUT OF SCOPE | — | Same — stays in Pythia MCP. |
+| `code_review` | alias (schema-mapped) | `review_request` | Map `diff` + optional `context` to review request schema |
+
+**Count check:** 10 aliases (8 active aliases + 1 deprecated shim + 1 shape-mapped), 2 out-of-scope (never in TS server). All 12 TS tools accounted for.
 
 **REQ-A2:** Aliases accept the TS schema (e.g., `{target: "gemini"}` instead of `{agent: "gemini"}`) and map parameters internally. The Rust canonical schema is the source of truth; aliases are a compatibility shim.
 
