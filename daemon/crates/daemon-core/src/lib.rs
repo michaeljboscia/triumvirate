@@ -16,6 +16,8 @@ use tracing::instrument;
 use uuid::Uuid;
 
 pub mod version;
+pub mod metrics;
+pub mod observability;
 pub use version::{NAME, VERSION};
 
 #[instrument(skip_all)]
@@ -399,6 +401,22 @@ fn sanitize_name(value: &str) -> String {
         })
         .collect::<String>()
 }
+
+/// Narrow interface for session storage, received by mcp-tools inter_agent handlers.
+/// Implemented in Wave 1 T-003.
+pub trait SessionStore: Send + Sync {}
+
+/// Narrow interface for agent execution, received by mcp-tools inter_agent handlers.
+/// Implemented in Wave 1 T-003.
+pub trait AgentExecutor: Send + Sync {}
+
+/// Narrow interface for ABE task tracking, received by mcp-tools abe handlers.
+/// Implemented in Wave 1 T-004.
+pub trait TaskTrackerHandle: Send + Sync {}
+
+/// Narrow interface for ledger/lessons/memory access, received by mcp-tools knowledge handlers.
+/// Implemented in Wave 1 T-006.
+pub trait LedgerStoreFactory: Send + Sync {}
 
 #[instrument(skip_all)]
 pub fn project_queue_key(cwd: Option<&String>, repo: Option<&String>) -> String {
