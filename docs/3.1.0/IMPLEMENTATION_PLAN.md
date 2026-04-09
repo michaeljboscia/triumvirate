@@ -604,7 +604,7 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
   <files>NOT APPLICABLE — modifies GitHub issues via gh CLI. No repo file is touched.</files>
   <scope_out>Do not close issues that weren't actually resolved. Do not close issues that touch on v3.2 (observability) or v3.3 (token economics) scope. Do not delete issues. Require user confirmation before each closure.</scope_out>
   <tools>Bash (gh issue list, gh issue close, gh issue comment) — orchestrator in main session</tools>
-  <verify>gh issue list --label "3.1.0" --state open returns zero open issues (or only explicitly-deferred ones)</verify>
+  <verify>test $(gh issue list --label "3.1.0" --state open --json number --jq 'length') -eq 0</verify>
   <reality_test>
     For each issue labeled "v3.1" or "mcp-consolidation" in the repo:
     1. If resolved by this sprint: close with comment "Resolved in 3.1.0 — see https://github.com/michaeljboscia/triumvirate/releases/tag/3.1.0"
