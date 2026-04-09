@@ -412,7 +412,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md directly.</files>
   <scope_out>Same as T-012. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
-  <verify>grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md returns at least 2 (one per agent)</verify>
+  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md) -ge 2 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md</verify>
   <reality_test>After orchestrator runs the edit: grep "mcp__inter-agent" returns zero; grep "mcp__triumvirate__ask_session" returns at least 2. Manual test: /send-to-siblings with a small prompt returns direct responses from BOTH agents.</reality_test>
   <done_when>Skill references mcp__triumvirate__ask_session for both agents. No inter-agent references.</done_when>
 </task>
