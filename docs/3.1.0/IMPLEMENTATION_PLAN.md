@@ -554,12 +554,12 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
   <done_when>CHANGELOG.md entry + RELEASE_NOTES.md reviewed and committed. Both readable by non-contributors. Migration path explicit.</done_when>
 </task>
 
-<task id="T-022" req="REQ-X3" wave="5" depends="T-020,T-021">
-  <description>Publish GitHub release 3.1.0 with binaries, checksums, and release notes</description>
-  <files>GitHub release (external, via gh CLI)</files>
-  <scope_out>Do not push to main if not already pushed. Do not force-push. Do not close issues automatically — T-024 handles issue cleanup.</scope_out>
-  <tools>gh release create, gh release upload, git tag, git push --tags</tools>
-  <verify>gh release view 3.1.0 succeeds. All binaries visible on the GitHub release page.</verify>
+<task id="T-022" req="REQ-X3" wave="5" depends="T-020,T-021" lane="orchestrator">
+  <description>Publish GitHub release 3.1.0 with binaries, checksums, and release notes (orchestrator-executed with explicit user approval — external destructive action)</description>
+  <files>NOT APPLICABLE — creates a GitHub release via gh CLI. No repo file is modified. Tag is pushed to origin.</files>
+  <scope_out>Do not push to main if not already pushed. Do not force-push. Do not close issues automatically — T-024 handles issue cleanup. Require explicit user approval before running `git push --tags` or `gh release create`.</scope_out>
+  <tools>Bash (gh release create, gh release upload, git tag, git push --tags) — orchestrator in main session after user approval</tools>
+  <verify>gh release view 3.1.0 exits 0 and shows 8 assets (4 binaries + 4 .sha256)</verify>
   <reality_test>
     1. git tag 3.1.0 exists on the final Wave 4 commit
     2. git push --tags succeeded (tag visible on remote)
