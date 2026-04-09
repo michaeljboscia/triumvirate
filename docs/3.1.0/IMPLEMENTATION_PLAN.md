@@ -355,7 +355,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 ## Wave 3: Aliases + Skill Updates
 
 <task id="T-011" req="REQ-A1,REQ-A2,REQ-A3" wave="3" depends="T-002,T-003">
-  <description>Register all 8 alias tools in the MCP tool_router with parameter mapping and logging</description>
+  <description>Register all 10 alias tools in the MCP tool_router with parameter mapping and logging</description>
   <files>daemon/crates/mcp-tools/src/aliases.rs, daemon/crates/mcp-tools/src/lib.rs</files>
   <scope_out>Do not modify canonical tool handlers. Do not change ~/.claude.json yet. Aliases are ADDITIONAL tools, not replacements.</scope_out>
   <tools>cargo test --workspace</tools>
