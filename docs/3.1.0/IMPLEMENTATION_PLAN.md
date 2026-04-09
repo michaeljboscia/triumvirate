@@ -270,12 +270,12 @@ Worktrees created in Wave 0+ branch from this SHA. The orchestrator executes ste
 
 <task id="T-002" req="REQ-A1,REQ-A2" wave="0" depends="">
   <description>Define alias parameter mapping types and the TS→Rust schema conversion functions</description>
-  <files>daemon/crates/mcp-tools/src/aliases.rs</files>
-  <scope_out>Do not register aliases with tool_router yet. Do not modify McpBridge. Types and mapping functions only.</scope_out>
-  <tools>cargo check -p mcp-tools</tools>
-  <verify>cargo check -p mcp-tools</verify>
-  <reality_test>Call map_spawn_daemon_params with TS schema { target: "gemini", session_name: "x" } → returns Rust schema { agent: "gemini", name: "x" }. Call with { target: "codex" } → returns { agent: "codex" }. Call with { target: "claude" } → returns error (strict enum).</reality_test>
-  <done_when>All 10 alias mapping functions defined and unit-tested: spawn_daemon, ask_daemon, dismiss_daemon, list_daemons, send_message, get_response, list_jobs, write_scratchpad, list_scratchpad, code_review. Parameter conversion matches the canonical alias matrix in specs/MCP_CONSOLIDATION.md REQ-A1.</done_when>
+  <files>daemon/crates/mcp-tools/src/aliases.rs, daemon/crates/mcp-tools/src/lib.rs</files>
+  <scope_out>Do not register aliases with tool_router yet. Do not modify McpBridge. Types and mapping functions only. Do not touch main.rs or any other crate.</scope_out>
+  <tools>cargo check -p mcp-tools --manifest-path daemon/Cargo.toml, cargo test -p mcp-tools --manifest-path daemon/Cargo.toml</tools>
+  <verify>cargo check -p mcp-tools --manifest-path daemon/Cargo.toml</verify>
+  <reality_test>Unit tests in aliases.rs: (1) Call map_spawn_daemon_params with TS schema { target: "gemini", session_name: "x" } → asserts returns Rust schema { agent: "gemini", name: "x" }. (2) Call with { target: "codex" } → asserts returns { agent: "codex" }. (3) Call with { target: "claude" } → asserts returns error (strict enum — only "gemini" and "codex" allowed). (4) Call map_ask_daemon_params with { daemon_id: "gd_session_abc", question: "hi" } → asserts returns { name: "gd_session_abc", message: "hi" } (preserves prefix). (5) `cargo test -p mcp-tools --manifest-path daemon/Cargo.toml` exits 0 with all mapping tests passing. A stub returning default-empty values for all mappings cannot pass the strict-enum error case (#3).</reality_test>
+  <done_when>daemon/crates/mcp-tools/src/aliases.rs created with all 10 alias mapping functions defined and unit-tested: spawn_daemon, ask_daemon, dismiss_daemon, list_daemons, send_message, get_response, list_jobs, write_scratchpad, list_scratchpad, code_review. mcp-tools/src/lib.rs re-exports the module (`pub mod aliases;`). Parameter conversion matches the canonical alias matrix in specs/MCP_CONSOLIDATION.md REQ-A1. `cargo check -p mcp-tools --manifest-path daemon/Cargo.toml` exits 0. Unit tests exist for at least: a valid mapping, an invalid enum value (error path), and the daemon_id prefix-preservation case.</done_when>
 </task>
 
 ---
