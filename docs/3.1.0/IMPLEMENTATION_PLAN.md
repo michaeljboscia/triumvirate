@@ -348,7 +348,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 
 ## Wave 2: Extract HTTP Routes + DaemonState
 
-<task id="T-008" req="REQ-C2" wave="2" depends="T-003,T-004,T-005,T-006,T-007">
+<task id="T-008" req="REQ-C2" wave="2" depends="T-003,T-004,T-004B,T-005,T-006,T-007">
   <description>Extract all *_route HTTP handler functions from main.rs into daemon-http crate</description>
   <files>daemon/crates/daemon-http/src/lib.rs, daemon/crates/triumvirate/src/main.rs</files>
   <scope_out>Do not change HTTP route behavior. Do not modify Axum router setup (that stays in main.rs startup). Do not move WebSocket or dashboard routes in this task (T-009 handles those).</scope_out>
