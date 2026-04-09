@@ -379,21 +379,185 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 </task>
 
 <task id="T-018" req="REQ-X2,REQ-X3" wave="4" depends="T-016,T-017">
-  <description>Final verification: full test suite, all tools, clean state</description>
+  <description>Internal verification: full test suite, all tools, clean state — end of internal work, entry gate for Wave 5</description>
   <files>daemon/crates/triumvirate/src/main.rs</files>
-  <scope_out>No code changes. Verification only.</scope_out>
+  <scope_out>No code changes. Verification only. Does NOT touch public release artifacts — that is Wave 5.</scope_out>
   <tools>cargo test --workspace, wc -l daemon/crates/triumvirate/src/main.rs</tools>
   <verify>cargo test --workspace passes. wc -l main.rs < 300. No Node.js MCP processes running. All skills work.</verify>
   <reality_test>Run cargo test --workspace → all pass (including existing 156+ tests). Run wc -l main.rs → under 300. Invoke /goatrodeo → twins spawn via Rust daemon. Invoke /send-to-codex → Codex responds. curl /metrics → all metrics present. WebSocket → events flow.</reality_test>
-  <done_when>Everything works. Sprint complete. Ready for v3.2 observability sprint.</done_when>
+  <done_when>Internal work complete. All 3.1.0 functionality works locally. Ready for Wave 5 public release.</done_when>
 </task>
+
+---
+
+## Wave 5: Public Release
+
+Wave 5 makes the sprint actually available to users. Every sprint ends here — this is not optional. Skipping Wave 5 means the work shipped internally but not publicly, which is the same as not shipping.
+
+**Rule: Nothing in Wave 5 starts until Wave 4 is complete and T-018 passes.**
+
+<task id="T-019" req="REQ-X1,REQ-X2,REQ-X3" wave="5" depends="T-018">
+  <description>Repo hygiene sweep — audit the public-facing state of the repo and bring it into alignment with reality</description>
+  <files>README.md, ROADMAP.md, CONTRIBUTING.md, NOTICE.md, .gitignore, archive/</files>
+  <scope_out>Do not change code. Do not rewrite README from scratch — edit in place. Do not delete archive/ contents. Do not publish anything yet.</scope_out>
+  <tools>grep, find, git status, git ls-files</tools>
+  <verify>All audit checklist items below pass. git status clean.</verify>
+  <reality_test>
+    Audit checklist (every item must pass):
+    1. README.md mentions version 3.1.0 or has no hardcoded version
+    2. README.md describes the CURRENT architecture (Rust daemon, fleet, ABE) — no stale TS MCP server mentions as the primary
+    3. README.md has a "Status" section that is accurate (what works, what doesn't)
+    4. README.md install instructions actually work (tested in T-023)
+    5. ROADMAP.md marks 3.0.0 (ABE) as shipped, 3.1.0 as in-progress → shipped
+    6. ROADMAP.md's "Current version" matches daemon/Cargo.toml
+    7. CONTRIBUTING.md reflects the current dev workflow (cargo build, cargo test, where to file issues)
+    8. NOTICE.md is current (copyright year, license attributions)
+    9. No .env, credentials.json, or secret files in git ls-files output
+    10. .gitignore excludes .triumvirate/, target/, *.db, .env, dead-drop/
+    11. archive/ contents are explicitly acknowledged in .gitignore or README as historical reference
+    12. Old v2.x docs that reference the TS MCP server are either updated or archived
+    13. No references to "inter-agent" as the primary MCP server anywhere in top-level docs
+    14. Links in README.md resolve (no 404s to old paths)
+    15. License file (LICENSE) exists and is MIT
+  </reality_test>
+  <done_when>All 15 audit items pass. Commit: "docs(3.1.0): repo hygiene sweep — align public docs with Rust daemon reality". git status clean after commit.</done_when>
+</task>
+
+<task id="T-020" req="REQ-X3" wave="5" depends="T-019">
+  <description>Build release binaries for all supported platforms with reproducible checksums</description>
+  <files>scripts/build-release.sh (new or existing), daemon/target/release-dist/</files>
+  <scope_out>Do not publish yet — T-022 handles GitHub release. Do not sign binaries (requires manual step). Do not build Windows if it has never been tested — mark it as "next sprint" if missing.</scope_out>
+  <tools>cargo build --release, cargo zigbuild (for cross-compilation), sha256sum, tar, zip</tools>
+  <verify>All expected binaries exist in daemon/target/release-dist/ with matching .sha256 files.</verify>
+  <reality_test>
+    For each target platform:
+    1. Binary exists at daemon/target/release-dist/triumvirate-3.1.0-{target}.{tar.gz|zip}
+    2. SHA256 file exists alongside
+    3. Binary executes: `./triumvirate --version` prints "3.1.0"
+    4. Binary executes: `./triumvirate --help` prints help text with all subcommands
+    5. Binary size is within 10% of prior release (sanity check for bloat)
+    
+    Target platforms (minimum):
+    - darwin-arm64 (Apple Silicon) — native build
+    - darwin-x64 (Intel Mac) — cross-compile via rustup target
+    - linux-x64 — cross-compile or docker
+    - linux-arm64 — cross-compile or docker
+    
+    Windows is OUT OF SCOPE unless the install.sh already supports it.
+  </reality_test>
+  <done_when>4 binaries built. Checksums generated. All --version and --help checks pass. Release artifacts in daemon/target/release-dist/ ready for upload.</done_when>
+</task>
+
+<task id="T-021" req="REQ-X3" wave="5" depends="T-018,T-019">
+  <description>Draft CHANGELOG.md entry and release notes for 3.1.0</description>
+  <files>CHANGELOG.md, docs/3.1.0/RELEASE_NOTES.md</files>
+  <scope_out>Do not describe internal refactoring details that don't affect users. Focus on user-visible changes. Do not invent features that weren't built.</scope_out>
+  <tools>git log, cat docs/3.1.0/*.md</tools>
+  <verify>CHANGELOG.md has a 3.1.0 section at the top. RELEASE_NOTES.md exists with migration steps.</verify>
+  <reality_test>
+    CHANGELOG.md 3.1.0 section must include:
+    1. Release date (today)
+    2. Summary (2-3 sentences, user-facing)
+    3. What Changed (MCP consolidation, TS server removed, version alignment)
+    4. Migration Notes (required: update ~/.claude.json, old skills work via aliases)
+    5. Breaking Changes (if any — explicit list)
+    6. Under The Hood (brief mention of refactor for developers)
+    
+    RELEASE_NOTES.md must include:
+    1. Install command (curl install.sh or direct binary download)
+    2. Upgrade steps for existing users
+    3. Verification command (triumvirate --version)
+    4. Rollback instructions (restore ~/.claude.json backup)
+    5. Known issues (if any)
+    6. Link to full CHANGELOG
+    
+    Both documents must be written in plain english. No jargon without explanation. A user who has never seen this project should understand what they get.
+  </reality_test>
+  <done_when>CHANGELOG.md entry + RELEASE_NOTES.md reviewed and committed. Both readable by non-contributors. Migration path explicit.</done_when>
+</task>
+
+<task id="T-022" req="REQ-X3" wave="5" depends="T-020,T-021">
+  <description>Publish GitHub release 3.1.0 with binaries, checksums, and release notes</description>
+  <files>GitHub release (external, via gh CLI)</files>
+  <scope_out>Do not push to main if not already pushed. Do not force-push. Do not close issues automatically — T-024 handles issue cleanup.</scope_out>
+  <tools>gh release create, gh release upload, git tag, git push --tags</tools>
+  <verify>gh release view 3.1.0 succeeds. All binaries visible on the GitHub release page.</verify>
+  <reality_test>
+    1. git tag 3.1.0 exists on the final Wave 4 commit
+    2. git push --tags succeeded (tag visible on remote)
+    3. gh release view 3.1.0 shows the release with:
+       - Title: "Triumvirate 3.1.0 — MCP Consolidation"
+       - Body: contents of RELEASE_NOTES.md
+       - 4 binary assets (one per platform)
+       - 4 SHA256 assets
+    4. Downloading a binary via https://github.com/michaeljboscia/triumvirate/releases/download/3.1.0/triumvirate-3.1.0-darwin-arm64.tar.gz works
+    5. Extracted binary runs and prints 3.1.0
+  </reality_test>
+  <done_when>GitHub release 3.1.0 published. Binaries downloadable. Tag pushed. Release visible at https://github.com/michaeljboscia/triumvirate/releases/tag/3.1.0.</done_when>
+</task>
+
+<task id="T-023" req="REQ-X3" wave="5" depends="T-022">
+  <description>End-to-end install verification on a clean environment — prove other people can actually use this</description>
+  <files>scripts/smoke-install.sh (new or update install.sh), docs/3.1.0/INSTALL_VERIFIED.md</files>
+  <scope_out>Do not test in your existing environment (defeats the purpose). Use a fresh directory, Docker container, or a VM. Do not modify the release after publishing unless a critical bug is found.</scope_out>
+  <tools>docker run, mktemp -d, curl, bash install.sh</tools>
+  <verify>Fresh environment install succeeds and produces a working daemon.</verify>
+  <reality_test>
+    Clean-room test (run in a fresh Docker container or mktemp directory with zero Triumvirate state):
+    1. curl -fsSL https://github.com/michaeljboscia/triumvirate/releases/download/3.1.0/install.sh | bash
+       OR
+       Download binary tarball, extract, move to PATH
+    2. triumvirate --version prints 3.1.0
+    3. triumvirate doctor reports ready state
+    4. Configure ~/.claude.json with the triumvirate MCP entry (copy from release notes)
+    5. Start daemon: triumvirate daemon &
+    6. Daemon starts, HTTP :8080/health returns 200 with version 3.1.0
+    7. MCP tools list includes all expected tools
+    8. Kill daemon: triumvirate stop (or kill $PID)
+    9. Cleanup: rm -rf the fresh directory
+    
+    Write the steps that worked to docs/3.1.0/INSTALL_VERIFIED.md as the canonical install guide.
+  </reality_test>
+  <done_when>Fresh environment install worked without modification. INSTALL_VERIFIED.md written with exact reproducible steps. If the install failed, fix it and re-run before marking done.</done_when>
+</task>
+
+<task id="T-024" req="REQ-X3" wave="5" depends="T-022">
+  <description>Close resolved GitHub issues and update issue state for the sprint</description>
+  <files>GitHub issues (external, via gh CLI)</files>
+  <scope_out>Do not close issues that weren't actually resolved. Do not close issues that touch on v3.2 (observability) or v3.3 (token economics) scope. Do not delete issues.</scope_out>
+  <tools>gh issue list, gh issue close, gh issue comment</tools>
+  <verify>Relevant issues closed with a reference to release 3.1.0.</verify>
+  <reality_test>
+    For each issue labeled "v3.1" or "mcp-consolidation" in the repo:
+    1. If resolved by this sprint: close with comment "Resolved in 3.1.0 — see https://github.com/michaeljboscia/triumvirate/releases/tag/3.1.0"
+    2. If NOT resolved: leave open, relabel for next sprint
+    3. Issue #13 (Rust rewrite) → close if fully addressed, or relabel/narrow if only partially
+    
+    Issues #19, #20, #21, #23 stay OPEN — they are v3.2 / v3.3 scope.
+    
+    After cleanup: gh issue list --label v3.1 should show no open issues, OR only issues explicitly flagged as "moved to v3.2".
+  </reality_test>
+  <done_when>Relevant issues closed. Next-sprint issues relabeled. Issue tracker reflects the post-3.1.0 state.</done_when>
+</task>
+
+---
+
+## Standing Sprint Checklist (applies to every future sprint)
+
+Wave 5 is a **template**. Every sprint from 3.1.0 forward MUST include a "Public Release" wave with these 6 tasks (or equivalents). If a sprint ships without completing Wave 5:
+- The sprint is NOT done
+- The version is NOT tagged
+- Other people CANNOT use the work
+- The retrospective must document why Wave 5 was skipped
+
+The goal: **Every sprint produces a downloadable, installable, verifiable public artifact.** Not "it works on my machine" — "it works on a stranger's machine."
 
 ---
 
 ## Execution Contract
 
 ### Backlog Freeze
-This document contains 18 tasks across 5 waves. This is the COMPLETE backlog.
+This document contains 24 tasks across 6 waves (including Preflight as Wave -1 and Public Release as Wave 5). This is the COMPLETE backlog.
 - Do NOT accept new tasks until all tasks are complete (backlog_status: 0).
 - If new requirements arrive mid-execution, respond: `blocked_on: scope-change — [describe new requirement]` and STOP.
 - Only the human can add, remove, or reorder tasks in this backlog.
