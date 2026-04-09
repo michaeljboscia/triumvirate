@@ -1139,8 +1139,12 @@ dependencies = [
 name = "mcp-tools"
 version = "3.1.0"
 dependencies = [
+ "agent-worker",
  "daemon-core",
+ "daemon-http",
+ "fallback-outbox",
  "fleet",
+ "mcp-bridge",
  "peer-review",
  "rmcp",
  "serde_json",

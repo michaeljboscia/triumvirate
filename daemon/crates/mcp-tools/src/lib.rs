@@ -11,6 +11,7 @@ use tokio::time::Duration;
 pub mod aliases;
 pub mod fleet;
 pub mod gemini_query;
+pub mod inter_agent;
 pub mod review;
 
 #[derive(Clone, Debug)]

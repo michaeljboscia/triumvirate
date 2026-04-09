@@ -22,15 +22,15 @@ use daemon_core::{
 #[cfg(test)]
 use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 use daemon_http::{
-    fetch_daemon_ask_agent, fetch_daemon_fallback_ack,
-    fetch_daemon_fallback_gc, fetch_daemon_fallback_list, fetch_daemon_memory_read,
-    fetch_daemon_lesson_add, fetch_daemon_lesson_list, fetch_daemon_lesson_query, fetch_daemon_lesson_validate,
-    fetch_daemon_ledger_gc, fetch_daemon_ledger_query, fetch_daemon_ledger_record, fetch_daemon_ledger_session,
+    fetch_daemon_fallback_ack, fetch_daemon_fallback_gc, fetch_daemon_fallback_list,
+    fetch_daemon_lesson_add, fetch_daemon_lesson_list, fetch_daemon_lesson_query,
+    fetch_daemon_lesson_validate, fetch_daemon_ledger_gc, fetch_daemon_ledger_query,
+    fetch_daemon_ledger_record, fetch_daemon_ledger_session, fetch_daemon_memory_read,
     fetch_daemon_memory_write, fetch_daemon_outbox_recent, fetch_daemon_scratchpad_list,
-    fetch_daemon_scratchpad_write, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
-    fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
-    fetch_daemon_status_snapshot,
+    fetch_daemon_scratchpad_write,
 };
+#[cfg(test)]
+use daemon_http::{fetch_daemon_ask_agent, fetch_daemon_status};
 #[cfg(test)]
 use daemon_http::{attempt_daemon_autostart_once, reset_daemon_autostart_flag_for_tests};
 use fallback_outbox::{
@@ -49,7 +49,8 @@ use mcp_bridge::use_daemon_for_mcp_from_env;
 use mcp_bridge::should_use_daemon_proxy;
 use mcp_tools::{
     ProgressEmitter, display_agent_name, fleet as mcp_fleet,
-    gemini_query as mcp_gemini_query, next_heartbeat_offset, review as mcp_review,
+    gemini_query as mcp_gemini_query, inter_agent as mcp_inter_agent,
+    next_heartbeat_offset, review as mcp_review,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -103,8 +104,10 @@ use shared_types::GeminiReviewVerdict;
 use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     fs,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc,
     },
@@ -217,47 +220,14 @@ impl McpBridge {
         Parameters(req): Parameters<AskAgentRequest>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<AskAgentResponse>, String> {
-        let emitter = ProgressEmitter::from_context(&context);
         let local_test_execution_allowed = cfg!(test) && !mcp_daemon_proxy_enabled();
-        if !local_test_execution_allowed {
-            let display = display_agent_name(&req.agent);
-            emitter.emit(format!("→ {display}: sent ✓")).await;
-            let mut pending = Box::pin(fetch_daemon_ask_agent(&req));
-            let started = Instant::now();
-            let mut next_heartbeat = Duration::from_secs(10);
-            loop {
-                let sleep_duration = next_heartbeat.saturating_sub(started.elapsed());
-                tokio::select! {
-                    result = &mut pending => {
-                        match result {
-                            Ok(response) => {
-                                emitter.emit(format!("→ {display}: responded ✓")).await;
-                                return Ok(Json(response));
-                            }
-                            Err(err) => {
-                                emitter.emit(format!("→ {display}: FAILED ✗ ({err})")).await;
-                                return Err(format!(
-                                    "ask_agent requires triumvirate daemon; daemon request failed: {err}. \
-start it with: triumvirate daemon"
-                                ));
-                            }
-                        }
-                    }
-                    _ = sleep(sleep_duration) => {
-                        if started.elapsed() >= next_heartbeat {
-                            emitter
-                                .emit(format!("→ {display}: working... ({}s elapsed)", started.elapsed().as_secs()))
-                                .await;
-                            next_heartbeat = next_heartbeat_offset(next_heartbeat);
-                        }
-                    }
-                }
-            }
-        }
-
-        execute_ask_agent(&req, Some(emitter))
+        mcp_tools::inter_agent::ask_agent(
+            &req,
+            &context,
+            local_test_execution_allowed,
+            execute_ask_agent_boxed,
+        )
             .await
-            .map(Json)
     }
 
     #[tool(description = "Create a persistent named session for an agent.")]
@@ -265,39 +235,13 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<SpawnSessionRequest>,
     ) -> Result<String, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_session_spawn(&req)
-                .await
-                .map_err(|e| format!("spawn_session via daemon failed: {e}"));
-        }
-        let agent = req.agent.to_lowercase();
-        if !is_supported_agent_name(&agent) {
-            return Err("spawn_session supports only 'gemini' or 'codex'".to_string());
-        }
-        let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
-        let worker = acquire_worker(&agent, &cwd).await;
-
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(
-            req.name.clone(),
-            SessionState {
-                agent: agent.clone(),
-                cwd: Some(cwd),
-                history: Vec::new(),
-            },
-        );
-        core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
-            .map_err(|e| format!("failed to persist sessions: {e}"))?;
-        Ok(format!(
-            "session '{}' {} for {}",
-            req.name,
-            if worker.mode == WorkerAcquireMode::Spawned {
-                "spawned"
-            } else {
-                "reused"
-            },
-            agent
-        ))
+        mcp_tools::inter_agent::spawn_session(
+            &self.sessions,
+            self.sessions_file.as_ref(),
+            &req,
+            mcp_daemon_proxy_enabled(),
+        )
+        .await
     }
 
     #[tool(description = "Ask within a named persistent session.")]
@@ -305,43 +249,14 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<AskSessionRequest>,
     ) -> Result<String, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_session_ask(&req)
-                .await
-                .map_err(|e| format!("ask_session via daemon failed: {e}"));
-        }
-
-        let (agent, cwd) = {
-            let mut sessions = self.sessions.lock().await;
-            let state = sessions
-                .get_mut(&req.name)
-                .ok_or_else(|| format!("session '{}' not found", req.name))?;
-            (state.agent.clone(), state.cwd.clone())
-        };
-
-        let response = execute_ask_agent(
-            &AskAgentRequest {
-                agent: agent.clone(),
-                message: req.message.clone(),
-                cwd: cwd.clone(),
-                repo: None,
-                branch: None,
-            },
-            None,
+        mcp_tools::inter_agent::ask_session(
+            &self.sessions,
+            self.sessions_file.as_ref(),
+            &req,
+            mcp_daemon_proxy_enabled(),
+            execute_ask_agent_boxed,
         )
         .await
-        .map_err(|e| format!("ask_session failed: {e}"))?
-        .response;
-
-        let mut sessions = self.sessions.lock().await;
-        if let Some(state) = sessions.get_mut(&req.name) {
-            state.history.push(format!("user: {}", req.message));
-            state.history.push(format!("assistant: {response}"));
-        }
-        core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
-            .map_err(|e| format!("failed to persist sessions: {e}"))?;
-
-        Ok(response)
     }
 
     #[tool(description = "Dismiss a named session.")]
@@ -349,91 +264,28 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<DismissSessionRequest>,
     ) -> Result<String, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_session_dismiss(&req)
-                .await
-                .map_err(|e| format!("dismiss_session via daemon failed: {e}"));
-        }
-        let mut sessions = self.sessions.lock().await;
-        match sessions.remove(&req.name) {
-            Some(removed_session) => {
-                let should_drop_worker = !sessions.values().any(|s| {
-                    s.agent == removed_session.agent && s.cwd == removed_session.cwd
-                });
-                if should_drop_worker {
-                    let cwd = removed_session.cwd.unwrap_or_else(|| ".".to_string());
-                    let _ = dismiss_worker(&removed_session.agent, &cwd).await;
-                }
-                core_persist_json_file_if_enabled(self.sessions_file.as_ref(), &*sessions)
-                    .map_err(|e| format!("failed to persist sessions: {e}"))?;
-                Ok(format!("session '{}' dismissed", req.name))
-            }
-            None => Err(format!("session '{}' not found", req.name)),
-        }
+        mcp_tools::inter_agent::dismiss_session(
+            &self.sessions,
+            self.sessions_file.as_ref(),
+            &req,
+            mcp_daemon_proxy_enabled(),
+        )
+        .await
     }
 
     #[tool(description = "List active sessions.")]
     async fn list_sessions(&self) -> Json<SessionListResponse> {
-        if mcp_daemon_proxy_enabled()
-            && let Ok(response) = fetch_daemon_session_list().await
-        {
-            return Json(response);
-        }
-        let sessions = self.sessions.lock().await;
-        let mut out = sessions
-            .iter()
-            .map(|(name, s)| SessionInfo {
-                name: name.clone(),
-                agent: s.agent.clone(),
-                turns: s.history.len(),
-            })
-            .collect::<Vec<_>>();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Json(SessionListResponse { sessions: out })
+        mcp_tools::inter_agent::list_sessions(&self.sessions, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Get current system status snapshot.")]
     async fn get_status(&self) -> Json<StatusResponse> {
-        let sessions = self.sessions.lock().await;
-        let local_bind_addr =
-            core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
-        if mcp_daemon_proxy_enabled()
-            && let Ok(snapshot) = fetch_daemon_status_snapshot().await
-        {
-            return Json(StatusResponse {
-                daemon_mode: snapshot
-                    .daemon_mode
-                    .unwrap_or_else(|| "incremental-dev".to_string()),
-                active_sessions: sessions.len(),
-                supported_agents: snapshot
-                    .supported_agents
-                    .unwrap_or_else(|| vec!["gemini".to_string(), "codex".to_string()]),
-                pending_fallbacks: snapshot.pending_fallbacks.unwrap_or(0),
-                fallback_tickets: snapshot.fallback_tickets.unwrap_or_default(),
-                daemon_bind_addr: snapshot.daemon_bind_addr.unwrap_or(local_bind_addr),
-            });
-        }
-        let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
-        let fallback_tickets = list_pending_fallback_paths(10).unwrap_or_default();
-        Json(StatusResponse {
-            daemon_mode: "incremental-dev".to_string(),
-            active_sessions: sessions.len(),
-            supported_agents: vec!["gemini".to_string(), "codex".to_string()],
-            pending_fallbacks,
-            fallback_tickets: fallback_tickets
-                .into_iter()
-                .map(|p| p.display().to_string())
-                .collect(),
-            daemon_bind_addr: local_bind_addr,
-        })
+        mcp_tools::inter_agent::get_status(&self.sessions, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Query daemon HTTP status using local bearer token.")]
     async fn daemon_health(&self) -> Result<Json<DaemonHealthResponse>, String> {
-        fetch_daemon_status()
-            .await
-            .map(Json)
-            .map_err(|e| format!("daemon health query failed: {e}"))
+        mcp_tools::inter_agent::daemon_health().await
     }
 
     #[tool(description = "Write a shared memory entry.")]
@@ -1191,6 +1043,13 @@ async fn execute_ask_agent(
     progress: Option<ProgressEmitter>,
 ) -> Result<AskAgentResponse, String> {
     agent_exec::execute_ask_agent(req, progress).await
+}
+
+fn execute_ask_agent_boxed<'a>(
+    req: &'a AskAgentRequest,
+    progress: Option<ProgressEmitter>,
+) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+    Box::pin(execute_ask_agent(req, progress))
 }
 
 async fn prewarm_daemon_workers() {
