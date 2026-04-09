@@ -222,9 +222,9 @@ Constructed in `main()`, injected into both `DaemonState` (for HTTP routes) and 
 
 ### Oracle/Pythia Decision
 
-**REQ-P1:** The 15 oracle tools in `oracle-tools.ts` are NOT migrated in this sprint. They are excluded from the TS server archive — they move to a standalone `oracle-mcp-server/` directory (still TS) with their own `package.json` and `~/.claude.json` entry. This keeps Pythia/Oracle functional while the inter-agent server is deleted.
+**REQ-P1:** ~~Oracle split~~ **DROPPED.** Oracle tools are NOT registered in the TS inter-agent server (`server.ts:5` confirms: "Oracle tools are NOT registered here — they live in Pythia"). No split needed. Pythia MCP (`mcp__pythia-gtm__`) is already a separate server and is unaffected by this migration.
 
-**REQ-P2:** If oracle tools are currently registered in the same `server.ts` entry point as inter-agent tools, split them into a separate MCP server process before deleting the inter-agent server.
+**REQ-P2:** ~~Oracle entrypoint split~~ **DROPPED.** See REQ-P1.
 
 ---
 
