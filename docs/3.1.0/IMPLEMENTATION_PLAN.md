@@ -474,12 +474,12 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
 
 **Rule: Nothing in Wave 5 starts until Wave 4 is complete and T-018 passes.**
 
-<task id="T-019" req="REQ-X1,REQ-X2,REQ-X3" wave="5" depends="T-018">
+<task id="T-019" req="REQ-X1,REQ-X2,REQ-X3" wave="5" depends="T-018" lane="orchestrator">
   <description>Repo hygiene sweep — audit the public-facing state of the repo and bring it into alignment with reality</description>
-  <files>README.md, ROADMAP.md, CONTRIBUTING.md, NOTICE.md, .gitignore, archive/</files>
+  <files>README.md, ROADMAP.md, CONTRIBUTING.md, NOTICE.md, .gitignore</files>
   <scope_out>Do not change code. Do not rewrite README from scratch — edit in place. Do not delete archive/ contents. Do not publish anything yet.</scope_out>
   <tools>grep, find, git status, git ls-files</tools>
-  <verify>All audit checklist items below pass. git status clean.</verify>
+  <verify>bash scripts/repo-hygiene-check.sh</verify>
   <reality_test>
     Audit checklist (every item must pass):
     1. README.md mentions version 3.1.0 or has no hardcoded version
