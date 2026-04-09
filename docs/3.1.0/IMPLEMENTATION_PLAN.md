@@ -419,12 +419,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 
 <task id="T-015" req="REQ-A1" wave="3" depends="T-011" lane="orchestrator">
   <description>Update inter-agent-protocol, goatrodeo, design-goatrodeo, and crystallize skills to reference mcp__triumvirate__* (orchestrator-executed)</description>
-  <files>NOT APPLICABLE — orchestrator edits each of:
-    /Users/mikeboscia/.claude/skills/inter-agent-protocol/SKILL.md
-    /Users/mikeboscia/.claude/skills/goatrodeo.md
-    /Users/mikeboscia/.claude/skills/design-goatrodeo.md
-    /Users/mikeboscia/.claude/skills/crystallize/factory/phase-2-diagnose.md
-  directly.</files>
+  <files></files>
   <scope_out>Do not change skill logic or purpose. Only update MCP tool name references from mcp__inter-agent__* to mcp__triumvirate__*. Do not touch goatrodeo.md's platform rule or audit gates added 2026-04-09.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
   <verify>! grep -rq "mcp__inter-agent" /Users/mikeboscia/.claude/skills/ && test $(grep -rc "mcp__triumvirate__" /Users/mikeboscia/.claude/skills/inter-agent-protocol/SKILL.md /Users/mikeboscia/.claude/skills/goatrodeo.md /Users/mikeboscia/.claude/skills/design-goatrodeo.md /Users/mikeboscia/.claude/skills/crystallize/factory/phase-2-diagnose.md | grep -vc ':0') -eq 4</verify>
