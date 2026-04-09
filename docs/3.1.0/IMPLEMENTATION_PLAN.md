@@ -576,10 +576,10 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
 
 <task id="T-023" req="REQ-X3" wave="5" depends="T-022">
   <description>End-to-end install verification on a clean environment — prove other people can actually use this</description>
-  <files>scripts/smoke-install.sh (new or update install.sh), docs/3.1.0/INSTALL_VERIFIED.md</files>
+  <files>scripts/smoke-install.sh, docs/3.1.0/INSTALL_VERIFIED.md</files>
   <scope_out>Do not test in your existing environment (defeats the purpose). Use a fresh directory, Docker container, or a VM. Do not modify the release after publishing unless a critical bug is found.</scope_out>
-  <tools>docker run, mktemp -d, curl, bash install.sh</tools>
-  <verify>Fresh environment install succeeds and produces a working daemon.</verify>
+  <tools>bash scripts/smoke-install.sh (which wraps docker run / mktemp / curl)</tools>
+  <verify>bash scripts/smoke-install.sh exits 0 and the captured log shows version 3.1.0</verify>
   <reality_test>
     Clean-room test (run in a fresh Docker container or mktemp directory with zero Triumvirate state):
     1. curl -fsSL https://github.com/michaeljboscia/triumvirate/releases/download/3.1.0/install.sh | bash
