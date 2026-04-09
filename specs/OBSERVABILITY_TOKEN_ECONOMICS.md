@@ -113,7 +113,7 @@ Build a Rust-native token scanner that reads Claude, Codex, and Gemini session l
 
 ### Scanner
 
-**REQ-T1:** A new crate `daemon/crates/token-scanner` must exist with a public function `scan_all() -> Vec<TokenRecord>` that reads session logs from all three agents.
+**REQ-T1:** A new crate `daemon/crates/token-scanner` must exist with two ingestion lanes: (a) a direct-write API `record_daemon_tokens(record: TokenRecord)` called by `agent_exec` for daemon-mediated sessions (exact attribution, zero delay), and (b) a file scanner for external CLI sessions that processes records in streaming batches (not `Vec<TokenRecord>` — never materialize 4.2GB into memory). (Hybrid architecture per twin consensus, Decision R1)
 
 **REQ-T2:** Claude scanner reads `~/.claude/projects/**/*.jsonl`, extracts `message.usage.{input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens}` and `message.model` from assistant message events. Incremental: tracks file mtime, only re-scans changed files.
 
