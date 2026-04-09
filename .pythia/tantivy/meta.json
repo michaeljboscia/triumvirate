@@ -20,6 +20,11 @@
       "deletes": null
     },
     {
+      "segment_id": "0cf2a50e-4443-45f3-b713-4e6717a9cb54",
+      "max_doc": 418,
+      "deletes": null
+    },
+    {
       "segment_id": "ce4974bf-d8f8-4c89-8482-011d1190e181",
       "max_doc": 402,
       "deletes": null
@@ -40,6 +45,16 @@
       "deletes": null
     },
     {
+      "segment_id": "29287228-3400-46b1-8bff-1315723dd8e8",
+      "max_doc": 71,
+      "deletes": null
+    },
+    {
+      "segment_id": "b7fd3d4e-f2bb-4f74-9748-e559e0d235df",
+      "max_doc": 36,
+      "deletes": null
+    },
+    {
       "segment_id": "3c7ca17a-680b-4244-a048-215ed16136ed",
       "max_doc": 20,
       "deletes": null
@@ -55,12 +70,22 @@
       "deletes": null
     },
     {
-      "segment_id": "67f68d6e-3bf3-4993-8fc6-457f0b5a2669",
+      "segment_id": "47053f37-6f57-4c4b-99ab-c3c7580ae134",
       "max_doc": 1,
       "deletes": null
     },
     {
       "segment_id": "d8ac0277-f219-4ac2-b316-a914ed97d90d",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "2fc66b6b-f0fb-4e0d-804d-53c9f0657ca5",
+      "max_doc": 1,
+      "deletes": null
+    },
+    {
+      "segment_id": "92e4ddd4-aea5-4709-b1ab-5b3709ba04f1",
       "max_doc": 1,
       "deletes": null
     },
@@ -75,22 +100,12 @@
       "deletes": null
     },
     {
-      "segment_id": "47053f37-6f57-4c4b-99ab-c3c7580ae134",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
       "segment_id": "d95480af-7796-4c90-99c4-b27c2d0c0e64",
       "max_doc": 1,
       "deletes": null
     },
     {
-      "segment_id": "2fc66b6b-f0fb-4e0d-804d-53c9f0657ca5",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
-      "segment_id": "92e4ddd4-aea5-4709-b1ab-5b3709ba04f1",
+      "segment_id": "67f68d6e-3bf3-4993-8fc6-457f0b5a2669",
       "max_doc": 1,
       "deletes": null
     }
@@ -169,5 +184,5 @@
       }
     }
   ],
-  "opstamp": 3902
+  "opstamp": 4430
 }
