@@ -1,6 +1,22 @@
-# v3.1 MCP Consolidation — Backend Structure
+# Triumvirate 3.1.0 MCP Consolidation — Backend Structure
 
 **Spec:** `specs/MCP_CONSOLIDATION.md`
+**Target version:** `3.1.0`
+
+---
+
+## Crate Naming Clarification (IMPORTANT)
+
+Two crates with similar names exist in the daemon workspace. Both are real and have distinct responsibilities. The audit flagged this as potentially confusing — here is the canonical distinction:
+
+| Crate | Status | Responsibility |
+|-------|--------|---------------|
+| **`mcp-bridge`** | **EXISTS (low-level)** | Thin wrapper over `rmcp` protocol internals. Handles stdio transport, tool_router macro glue, ClientInfo/ServerInfo types. Contains NO business logic. Contains NO tool handlers. Depends only on `rmcp` and `shared-types`. |
+| **`mcp-tools`** | **EXISTS (empty today, will be expanded by this sprint)** | The high-level crate that contains the actual tool handler implementations (spawn_session, ask_session, dispatch_codex_worktree, etc.) organized by functional module. After this sprint completes, this crate owns `McpBridge` (the struct that the tool_router macro generates handler methods for) and all 8 handler modules. It depends on `mcp-bridge` for the protocol layer and on domain crates (fleet, ledger, peer-review, etc.) for the business logic. |
+
+**Relationship:** `mcp-tools` depends on `mcp-bridge`. Both exist. Neither is renamed. This sprint EXPANDS `mcp-tools` by extracting ~2,500 lines of tool handler code out of `daemon/crates/triumvirate/src/main.rs` into `mcp-tools/src/*.rs`. `mcp-bridge` is not modified.
+
+**Why both exist:** `mcp-bridge` predates this sprint and is already used by the current daemon. `mcp-tools` was created with an empty scaffold earlier. This sprint fills it in. After the sprint, the dependency graph is: `triumvirate` (binary) → `mcp-tools` (handlers) → `mcp-bridge` (protocol).
 
 ---
 
