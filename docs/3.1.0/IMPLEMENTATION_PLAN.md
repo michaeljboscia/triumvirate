@@ -270,8 +270,8 @@ Worktrees created in Wave 0+ branch from this SHA. The orchestrator executes ste
 
 <task id="T-002" req="REQ-A1,REQ-A2" wave="0" depends="">
   <description>Define alias parameter mapping types and the TS→Rust schema conversion functions</description>
-  <files>daemon/crates/mcp-tools/src/aliases.rs, daemon/crates/mcp-tools/src/lib.rs</files>
-  <scope_out>Do not register aliases with tool_router yet. Do not modify McpBridge. Types and mapping functions only. Do not touch main.rs or any other crate.</scope_out>
+  <files>daemon/crates/mcp-tools/src/aliases.rs, daemon/crates/mcp-tools/src/lib.rs, .triumvirate/TASK_COMPLETE.json</files>
+  <scope_out>Do not register aliases with tool_router yet. Do not modify McpBridge. Types and mapping functions only. Do not touch main.rs or any other crate. Do NOT modify mcp-tools/Cargo.toml or any Cargo.toml file — the worker MUST use plain struct literals without serde derive macros and MUST use a manual `impl std::fmt::Display` for the error enum (no `thiserror` — it is NOT in the workspace dependencies).</scope_out>
   <tools>cargo check -p mcp-tools --manifest-path daemon/Cargo.toml, cargo test -p mcp-tools --manifest-path daemon/Cargo.toml</tools>
   <verify>cargo check -p mcp-tools --manifest-path daemon/Cargo.toml</verify>
   <reality_test>Unit tests in aliases.rs: (1) Call map_spawn_daemon_params with TS schema { target: "gemini", session_name: "x" } → asserts returns Rust schema { agent: "gemini", name: "x" }. (2) Call with { target: "codex" } → asserts returns { agent: "codex" }. (3) Call with { target: "claude" } → asserts returns error (strict enum — only "gemini" and "codex" allowed). (4) Call map_ask_daemon_params with { daemon_id: "gd_session_abc", question: "hi" } → asserts returns { name: "gd_session_abc", message: "hi" } (preserves prefix). (5) `cargo test -p mcp-tools --manifest-path daemon/Cargo.toml` exits 0 with all mapping tests passing. A stub returning default-empty values for all mappings cannot pass the strict-enum error case (#3).</reality_test>
