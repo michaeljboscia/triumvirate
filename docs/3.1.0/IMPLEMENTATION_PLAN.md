@@ -257,7 +257,7 @@ Worktrees created in Wave 0+ branch from this SHA. The orchestrator executes ste
   <tools>cargo check -p mcp-tools</tools>
   <verify>cargo check -p mcp-tools</verify>
   <reality_test>Call map_spawn_daemon_params with TS schema { target: "gemini", session_name: "x" } → returns Rust schema { agent: "gemini", name: "x" }. Call with { target: "codex" } → returns { agent: "codex" }. Call with { target: "claude" } → returns error (strict enum).</reality_test>
-  <done_when>All 8 alias mapping functions defined and unit-tested. Parameter conversion for spawn_daemon, ask_daemon, dismiss_daemon, list_daemons, send_message, get_response, list_jobs, code_review.</done_when>
+  <done_when>All 10 alias mapping functions defined and unit-tested: spawn_daemon, ask_daemon, dismiss_daemon, list_daemons, send_message, get_response, list_jobs, write_scratchpad, list_scratchpad, code_review. Parameter conversion matches the canonical alias matrix in specs/MCP_CONSOLIDATION.md REQ-A1.</done_when>
 </task>
 
 ---
