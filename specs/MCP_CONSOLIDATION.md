@@ -188,8 +188,8 @@ daemon/crates/mcp-tools/src/
 | `list_jobs` | alias | `get_status` (shape-mapped) | Returns a list with `job_id=session_id`, `state=agent_state`, `target=agent` to preserve the old shape |
 | `write_scratchpad` | alias (schema-mapped) | `scratchpad_write` | Map TS params `topic/content/cwd/owner/daemon_id` → Rust `scratchpad_write` schema. Owner resolution: if `daemon_id` present, derive owner from its `gd_`/`cd_` prefix; else use explicit `owner`; else default to `inter-agent`. Topic becomes filename stem, content is the body. |
 | `list_scratchpad` | alias | `scratchpad_list` | Name swap only |
-| `pythia_query` | OUT OF SCOPE | — | Not in TS server anyway (server.ts:5). Stays in Pythia MCP. No alias needed. |
-| `pythia_corpus_health` | OUT OF SCOPE | — | Same — stays in Pythia MCP. |
+| `pythia_query` | OUT OF SCOPE | — | IS registered in unified-tools.ts:243-252 but as a delegation proxy to the Pythia socket. The separate `pythia` MCP server entry in ~/.claude.json handles the same functionality directly — migrating this to the Rust daemon would add a hop without value. No alias needed. Note: server.ts:5 refers to the distinct `oracle-tools.ts` file (never registered in unified-tools.ts) — that comment does NOT apply to pythia delegation tools. |
+| `pythia_corpus_health` | OUT OF SCOPE | — | Same rationale as `pythia_query`. |
 | `code_review` | alias (schema-mapped) | `review_request` | Map TS params `cwd/uncommitted/base_branch/commit_sha/timeout_ms` → review request schema. The alias invokes `codex review` with the same semantics: if `uncommitted` is true, review staged+unstaged changes; if `base_branch` is set, diff against that base; if `commit_sha` is set, review that specific commit. The `diff` text is produced internally by the alias from these parameters — TS tool never accepted a raw diff. |
 
 **Count check:** 10 aliases (8 active aliases + 1 deprecated shim + 1 shape-mapped), 2 out-of-scope (never in TS server). All 12 TS tools accounted for.
