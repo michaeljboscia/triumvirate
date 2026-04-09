@@ -165,7 +165,7 @@ CREATE TABLE scan_state (
 
 ### Cost Attribution
 
-**REQ-T8:** When a `BUILD_MANIFEST.md` exists, the scanner must correlate token records to ABE tasks by matching: (a) session timestamps within a task's dispatch-to-completion window, (b) agent type matching the task's executor (Codex for workers, Gemini for reviews, Claude for orchestrator).
+**REQ-T8:** Attribution uses session-ID correlation, not timestamps. The daemon records spawned session IDs in outbox events. For daemon-mediated sessions: `agent_exec` writes `TokenRecord` directly with exact `build_id`, `task_id`, and `session_id`. For external CLI sessions: scanner matches session IDs from outbox events against file session IDs. Truly external sessions (no matching outbox entry) go to an "unattributed" bucket. No timestamp-window guessing. (Decision R1-D2: C)
 
 **REQ-T9:** Cost calculation uses a configurable price table stored in the database:
 
