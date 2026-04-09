@@ -622,12 +622,20 @@ After each task commit, run the validation script:
 - If PASS (exit 0): proceed to next task.
 
 ### End-of-Execution Report
-When all tasks are complete, respond with:
+When all tasks are complete (through Wave 5), respond with:
 ```
 backlog_status: 0 remaining
-completed_tasks: [T-001, T-002, ..., T-018]
+completed_tasks: [FIX-TEST-MOVED-VALUES, T-000, T-001..T-024]
 total_commits: {N}
 collateral_fixes: {N} ({list if any})
 validation: {N}/{N} tasks passed validate-task.sh
 test_suite: cargo test --workspace → {pass/fail with counts}
+public_release:
+  tag: 3.1.0
+  github_release: https://github.com/michaeljboscia/triumvirate/releases/tag/3.1.0
+  binaries: [darwin-arm64, darwin-x64, linux-x64, linux-arm64]
+  install_verified: {true|false}
+  issues_closed: {N}
+main_rs_lines: {N}   # must be < 300
+version_reported: {string from triumvirate --version}
 ```
