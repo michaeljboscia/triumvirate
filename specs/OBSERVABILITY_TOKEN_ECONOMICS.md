@@ -204,7 +204,7 @@ Query: `WHERE model = ? AND effective_date <= ?ts AND (end_date IS NULL OR end_d
 
 ### Scanner Lifecycle
 
-**REQ-T16:** The scanner runs as a background tokio task within the daemon, triggered every 60 seconds (configurable). It does not block the main event loop.
+**REQ-T16:** The scanner runs as a background tokio task within the daemon. For Claude and Codex: uses `notify` crate filesystem watcher for real-time detection of new/modified files, with a 10-minute periodic reconciliation fallback. For Gemini: tracks byte offset in `~/.gemini/telemetry.jsonl` (single file, append-only). Does not block the main event loop. No 60-second glob polling. (Decision R1: event-driven per twin consensus)
 
 **REQ-T17:** On daemon startup, the scanner performs a full reconciliation scan (all files, not just changed ones) to catch any sessions that occurred while the daemon was down.
 
