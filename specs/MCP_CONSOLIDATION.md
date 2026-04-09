@@ -157,15 +157,17 @@ daemon/crates/mcp-tools/src/
 
 **REQ-C4:** After extraction, `main.rs` contains ONLY: CLI arg parsing, config loading, `DaemonState` construction, McpBridge construction, HTTP server spawn, MCP transport spawn, background task spawns (scanner, ledger drain), and graceful shutdown. No tool handlers. No route handlers. No business logic.
 
-### Async Job Model
+### Async Job Model — ELIMINATED (Decision R1-D1: C)
 
-**REQ-J1:** Add an async job queue to the Rust daemon that implements the `send_message` + `get_response` pattern. When `send_message` is called: spawn the agent request as a background tokio task, return a `job_id` immediately. Store job state in a `DashMap<String, JobState>` where `JobState` is `Pending | Running | Completed(String) | Failed(String)`.
+The TS `send_message` + `get_response` async pattern was a workaround for Node.js single-threaded blocking. Rust's `ask_session` is async internally (tokio) and Claude Code handles long-running MCP calls natively.
 
-**REQ-J2:** `get_response` polls the job by ID. If completed, returns the result and removes the job. If still running, returns a "still running" status with elapsed time. If not found, returns an error.
+**REQ-J1:** ~~Async job queue~~ **DROPPED.** The `send_message` alias routes to `ask_session` (synchronous from Claude's perspective). No DashMap, no TTL reaper, no job IDs.
 
-**REQ-J3:** `list_jobs` returns all jobs with their current state, agent type, elapsed time, and request summary.
+**REQ-J2:** Update `send-to-codex` skill to use `mcp__triumvirate__ask_session` instead of `mcp__inter-agent-codex__send_message`.
 
-**REQ-J4:** Jobs have a configurable TTL (default 30 minutes). Expired completed/failed jobs are reaped by a background task. This prevents unbounded memory growth.
+**REQ-J3:** Update `send-to-gemini` skill to use `mcp__triumvirate__ask_session` instead of `mcp__inter-agent-gemini__send_message`.
+
+**REQ-J4:** Update `send-to-siblings` skill to use `mcp__triumvirate__ask_session` for both agents instead of per-agent `send_message` calls.
 
 ### Tool Aliases (Backwards Compatibility)
 
