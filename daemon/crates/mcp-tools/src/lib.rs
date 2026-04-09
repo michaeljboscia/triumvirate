@@ -8,6 +8,8 @@ use std::sync::{
 };
 use tokio::time::Duration;
 
+pub mod aliases;
+
 #[derive(Clone, Debug)]
 pub struct ProgressEmitter {
     peer: rmcp::service::Peer<RoleServer>,
