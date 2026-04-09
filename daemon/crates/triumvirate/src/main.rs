@@ -22,12 +22,14 @@ use daemon_core::{
 #[cfg(test)]
 use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 use daemon_http::{
-    fetch_daemon_fallback_ack, fetch_daemon_fallback_gc, fetch_daemon_fallback_list,
-    fetch_daemon_lesson_add, fetch_daemon_lesson_list, fetch_daemon_lesson_query,
-    fetch_daemon_lesson_validate, fetch_daemon_ledger_gc, fetch_daemon_ledger_query,
-    fetch_daemon_ledger_record, fetch_daemon_ledger_session, fetch_daemon_memory_read,
-    fetch_daemon_memory_write, fetch_daemon_outbox_recent, fetch_daemon_scratchpad_list,
-    fetch_daemon_scratchpad_write,
+    fetch_daemon_ask_agent, fetch_daemon_fallback_ack, fetch_daemon_fallback_gc,
+    fetch_daemon_fallback_list, fetch_daemon_ledger_gc, fetch_daemon_ledger_query,
+    fetch_daemon_ledger_record, fetch_daemon_ledger_session, fetch_daemon_lesson_add,
+    fetch_daemon_lesson_list, fetch_daemon_lesson_query, fetch_daemon_lesson_validate,
+    fetch_daemon_memory_read, fetch_daemon_memory_write, fetch_daemon_outbox_recent,
+    fetch_daemon_scratchpad_list, fetch_daemon_scratchpad_write, fetch_daemon_session_ask,
+    fetch_daemon_session_dismiss, fetch_daemon_session_list, fetch_daemon_session_spawn,
+    fetch_daemon_status, fetch_daemon_status_snapshot,
 };
 #[cfg(test)]
 use daemon_http::{fetch_daemon_ask_agent, fetch_daemon_status};
@@ -49,7 +51,7 @@ use mcp_bridge::use_daemon_for_mcp_from_env;
 use mcp_bridge::should_use_daemon_proxy;
 use mcp_tools::{
     ProgressEmitter, display_agent_name, fleet as mcp_fleet,
-    gemini_query as mcp_gemini_query, inter_agent as mcp_inter_agent,
+    gemini_query as mcp_gemini_query, inter_agent as mcp_inter_agent, knowledge,
     next_heartbeat_offset, review as mcp_review,
 };
 use axum::{
@@ -293,25 +295,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryWriteRequest>,
     ) -> Result<Json<MemoryWriteResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_memory_write(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("memory_write via daemon failed: {e}"));
-        }
-        let id = Uuid::new_v4().to_string();
-        let entry = MemoryEntry {
-            id: id.clone(),
-            namespace: req.namespace,
-            key: req.key,
-            value: req.value,
-            ts_ms: core_unix_time_ms(),
-        };
-        append_memory_entry(&entry).map_err(|e| format!("memory_write failed: {e}"))?;
-        Ok(Json(MemoryWriteResponse {
-            id,
-            status: "ok".to_string(),
-        }))
+        knowledge::memory_write(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Read shared memory entries.")]
@@ -319,23 +303,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<MemoryReadRequest>,
     ) -> Result<Json<MemoryReadResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_memory_read(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("memory_read via daemon failed: {e}"));
-        }
-        let mut entries =
-            read_memory_entries().map_err(|e| format!("memory_read failed: {e}"))?;
-        entries.retain(|e| e.namespace == req.namespace);
-        if let Some(key) = req.key {
-            entries.retain(|e| e.key == key);
-        }
-        entries.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
-        if let Some(limit) = req.limit {
-            entries.truncate(limit);
-        }
-        Ok(Json(MemoryReadResponse { entries }))
+        knowledge::memory_read(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Write a scratchpad file in the shared workspace.")]
@@ -343,17 +311,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadWriteRequest>,
     ) -> Result<Json<ScratchpadWriteResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_scratchpad_write(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("scratchpad_write via daemon failed: {e}"));
-        }
-        let path = write_scratchpad(&req.project, &req.topic, &req.content)
-            .map_err(|e| format!("scratchpad_write failed: {e}"))?;
-        Ok(Json(ScratchpadWriteResponse {
-            path: path.display().to_string(),
-        }))
+        knowledge::scratchpad_write(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "List scratchpad files for a project.")]
@@ -361,18 +319,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ScratchpadListRequest>,
     ) -> Result<Json<ScratchpadListResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_scratchpad_list(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("scratchpad_list via daemon failed: {e}"));
-        }
-        let files = list_scratchpad(&req.project)
-            .map_err(|e| format!("scratchpad_list failed: {e}"))?
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>();
-        Ok(Json(ScratchpadListResponse { files }))
+        knowledge::scratchpad_list(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Read recent outbox lifecycle events.")]
@@ -380,16 +327,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<OutboxRecentRequest>,
     ) -> Result<Json<OutboxRecentResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_outbox_recent(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("outbox_recent via daemon failed: {e}"));
-        }
-        let mut events = read_outbox_events().map_err(|e| format!("outbox_recent failed: {e}"))?;
-        events.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
-        events.truncate(req.limit.unwrap_or(50));
-        Ok(Json(OutboxRecentResponse { events }))
+        knowledge::outbox_recent(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "List pending dead-drop fallback tickets.")]
@@ -397,29 +335,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FallbackListRequest>,
     ) -> Result<Json<FallbackListResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_fallback_list(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("fallback_list via daemon failed: {e}"));
-        }
-        let tickets = list_pending_fallback_paths(req.limit.unwrap_or(20))
-            .map_err(|e| format!("fallback_list failed: {e}"))?
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>();
-        Ok(Json(FallbackListResponse { tickets }))
+        knowledge::fallback_list(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Acknowledge a dead-drop fallback ticket by deleting it.")]
     async fn fallback_ack(&self, Parameters(req): Parameters<FallbackAckRequest>) -> Result<String, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_fallback_ack(&req)
-                .await
-                .map_err(|e| format!("fallback_ack via daemon failed: {e}"));
-        }
-        acknowledge_fallback_path(&req.path).map_err(|e| format!("fallback_ack failed: {e}"))?;
-        Ok(format!("acknowledged {}", req.path))
+        knowledge::fallback_ack(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Garbage collect stale dead-drop fallback tickets.")]
@@ -427,27 +348,12 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FallbackGcRequest>,
     ) -> Result<Json<FallbackGcResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_fallback_gc(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("fallback_gc via daemon failed: {e}"));
-        }
-        let removed = gc_fallbacks(req.max_age_days.unwrap_or(7))
-            .map_err(|e| format!("fallback_gc failed: {e}"))?;
-        Ok(Json(FallbackGcResponse { removed }))
+        knowledge::fallback_gc(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Get Ledger health status for the current project.")]
     async fn ledger_health(&self) -> Result<Json<HealthStatus>, String> {
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        let health = store
-            .health()
-            .map_err(|e| format!("failed to query ledger health: {e}"))?;
-        Ok(Json(health))
+        knowledge::ledger_health().await
     }
 
     #[tool(description = "Search ledger summaries via FTS5.")]
@@ -455,20 +361,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<LedgerQueryRequest>,
     ) -> Result<Json<LedgerQueryResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_ledger_query(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("ledger_query via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        let summaries = store
-            .query(&req.query, req.limit.unwrap_or(10))
-            .map_err(|e| format!("ledger_query failed: {e}"))?;
-        Ok(Json(LedgerQueryResponse { summaries }))
+        knowledge::ledger_query(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Fetch full ledger session reconstruction for a session_id.")]
@@ -476,71 +369,22 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<LedgerSessionRequest>,
     ) -> Result<Json<SessionDetail>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_ledger_session(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("ledger_session via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        store
-            .get_session(&req.session_id)
-            .map(Json)
-            .map_err(|e| format!("ledger_session failed: {e}"))
+        knowledge::ledger_session(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Insert a manual high-signal summary record into ledger.")]
     async fn ledger_record(&self, Parameters(req): Parameters<ManualRecord>) -> Result<String, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_ledger_record(&req)
-                .await
-                .map_err(|e| format!("ledger_record via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        store
-            .record(req)
-            .map_err(|e| format!("ledger_record failed: {e}"))?;
-        Ok("ok".to_string())
+        knowledge::ledger_record(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Run ledger garbage collection for stale events and dead-drop tickets.")]
     async fn ledger_gc(&self) -> Result<Json<GcResult>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_ledger_gc()
-                .await
-                .map(Json)
-                .map_err(|e| format!("ledger_gc via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        let result = store.gc().map_err(|e| format!("ledger_gc failed: {e}"))?;
-        Ok(Json(result))
+        knowledge::ledger_gc(mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Add a reusable lesson to the ledger knowledge base.")]
     async fn lesson_add(&self, Parameters(req): Parameters<NewLesson>) -> Result<Json<LessonAddResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_lesson_add(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("lesson_add via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        let lesson_id = store
-            .add_lesson(req)
-            .map_err(|e| format!("lesson_add failed: {e}"))?;
-        Ok(Json(LessonAddResponse { lesson_id }))
+        knowledge::lesson_add(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Query lessons using full-text search and confidence filtering.")]
@@ -548,20 +392,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<LessonQueryRequest>,
     ) -> Result<Json<LessonQueryResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_lesson_query(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("lesson_query via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        let lessons = store
-            .query_lessons(&req.query, req.min_confidence.unwrap_or(0.0))
-            .map_err(|e| format!("lesson_query failed: {e}"))?;
-        Ok(Json(LessonQueryResponse { lessons }))
+        knowledge::lesson_query(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Mark a lesson as validated and reset confidence decay anchor.")]
@@ -569,19 +400,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<LessonValidateRequest>,
     ) -> Result<String, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_lesson_validate(&req)
-                .await
-                .map_err(|e| format!("lesson_validate via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        store
-            .validate_lesson(req.lesson_id)
-            .map_err(|e| format!("lesson_validate failed: {e}"))?;
-        Ok("ok".to_string())
+        knowledge::lesson_validate(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "List lessons with optional tag and staleness filters.")]
@@ -589,21 +408,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<LessonListRequest>,
     ) -> Result<Json<LessonListResponse>, String> {
-        if mcp_daemon_proxy_enabled() {
-            return fetch_daemon_lesson_list(&req)
-                .await
-                .map(Json)
-                .map_err(|e| format!("lesson_list via daemon failed: {e}"));
-        }
-        let project_root = std::env::current_dir()
-            .map_err(|e| format!("failed to determine current directory: {e}"))?;
-        let store = LedgerStore::open(project_root)
-            .map_err(|e| format!("failed to open ledger store: {e}"))?;
-        let tags_ref = req.tags.as_deref();
-        let lessons = store
-            .list_lessons(tags_ref, req.stale_days)
-            .map_err(|e| format!("lesson_list failed: {e}"))?;
-        Ok(Json(LessonListResponse { lessons }))
+        knowledge::lesson_list(req, mcp_daemon_proxy_enabled()).await
     }
 
     #[tool(description = "Dispatch a one-off Codex task without worktree isolation.")]

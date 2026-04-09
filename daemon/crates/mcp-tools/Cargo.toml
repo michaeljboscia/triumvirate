@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 agent-worker = { path = "../agent-worker" }
+anyhow.workspace = true
 daemon-core = { path = "../daemon-core" }
 daemon-http = { path = "../daemon-http" }
 fallback-outbox = { path = "../fallback-outbox" }
 fleet = { path = "../fleet" }
+ledger = { path = "../ledger" }
 mcp-bridge = { path = "../mcp-bridge" }
 peer-review = { path = "../peer-review" }
 rmcp.workspace = true
@@ -17,3 +19,4 @@ serde_json.workspace = true
 shared-types = { path = "../shared-types" }
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
