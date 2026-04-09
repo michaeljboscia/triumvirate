@@ -364,44 +364,72 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <done_when>All 8 aliases registered and callable via MCP. Parameter mapping works for all schema differences. Alias usage logged. get_response returns deprecation notice.</done_when>
 </task>
 
-<task id="T-012" req="REQ-J2" wave="3" depends="T-011">
-  <description>Update send-to-codex skill to use mcp__triumvirate__ask_session</description>
-  <files>~/.claude/skills/send-to-codex/SKILL.md</files>
-  <scope_out>Do not change skill behavior or purpose. Only update tool references and remove send_message/get_response two-step pattern.</scope_out>
-  <tools>cat ~/.claude/skills/send-to-codex/SKILL.md</tools>
-  <verify>grep -c "mcp__triumvirate__ask_session" ~/.claude/skills/send-to-codex/SKILL.md</verify>
-  <reality_test>Invoke /send-to-codex with a question → Codex responds via ask_session. No job_id in the flow. Response is direct.</reality_test>
-  <done_when>Skill references mcp__triumvirate__ask_session. No references to mcp__inter-agent. No send_message/get_response pattern.</done_when>
+<!--
+  TASKS T-012 THROUGH T-015 ARE ORCHESTRATOR-LANE
+  
+  These tasks modify files OUTSIDE the Triumvirate repo (~/.claude/skills/*).
+  They CANNOT be dispatched to a Codex worker because:
+    1. The worker runs inside a git worktree of the Triumvirate repo
+    2. ~/.claude/ is not in the repo and is not reachable from the worktree
+    3. ABE's validate-task.sh expects repo-tracked files in the contract
+  
+  The orchestrator (Claude in the main session) executes these tasks directly:
+    - Reads the current skill file
+    - Applies the text substitutions
+    - Verifies the change via grep
+    - Commits nothing (files are outside the Triumvirate repo)
+  
+  These tasks are NOT dispatched via dispatch_codex_worktree. No audit package
+  is built. No worktree is created. The orchestrator just edits the files.
+  
+  T-011 (the alias tool registration) IS an ABE task and MUST land before
+  T-012–T-015 — the aliases have to exist in the Rust daemon before skills
+  can reference them.
+-->
+
+<task id="T-012" req="REQ-J2" wave="3" depends="T-011" lane="orchestrator">
+  <description>Update send-to-codex skill to reference mcp__triumvirate__ask_session (orchestrator-executed, not ABE-dispatched)</description>
+  <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md directly. No &lt;files&gt; list because this task bypasses ABE contract validation.</files>
+  <scope_out>Do not change skill behavior or purpose. Do not edit any Triumvirate repo files.</scope_out>
+  <tools>Read, Edit, Grep — all by the orchestrator in the main Claude session</tools>
+  <verify>grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md returns a positive integer</verify>
+  <reality_test>After orchestrator runs the edit: (1) grep "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md returns zero matches; (2) grep "mcp__triumvirate__ask_session" returns at least one match; (3) grep "send_message\|get_response" returns zero matches in the skill body (the two-step async pattern is eliminated). Additionally, a human invoking /send-to-codex with a small test prompt gets a direct response (no job_id in the flow).</reality_test>
+  <done_when>Skill file references mcp__triumvirate__ask_session. No references to mcp__inter-agent or send_message/get_response. Orchestrator reports the verification grep output.</done_when>
 </task>
 
-<task id="T-013" req="REQ-J3" wave="3" depends="T-011">
-  <description>Update send-to-gemini skill to use mcp__triumvirate__ask_session</description>
-  <files>~/.claude/skills/send-to-gemini/SKILL.md</files>
-  <scope_out>Same as T-012.</scope_out>
-  <tools>cat ~/.claude/skills/send-to-gemini/SKILL.md</tools>
-  <verify>grep -c "mcp__triumvirate__ask_session" ~/.claude/skills/send-to-gemini/SKILL.md</verify>
-  <reality_test>Invoke /send-to-gemini with a question → Gemini responds via ask_session. Direct response.</reality_test>
-  <done_when>Skill references mcp__triumvirate__ask_session. No inter-agent references.</done_when>
+<task id="T-013" req="REQ-J3" wave="3" depends="T-011" lane="orchestrator">
+  <description>Update send-to-gemini skill to reference mcp__triumvirate__ask_session (orchestrator-executed)</description>
+  <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md directly.</files>
+  <scope_out>Same as T-012. Do not edit any Triumvirate repo files.</scope_out>
+  <tools>Read, Edit, Grep — orchestrator in main session</tools>
+  <verify>grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md returns a positive integer</verify>
+  <reality_test>After orchestrator runs the edit: grep "mcp__inter-agent" returns zero; grep "mcp__triumvirate__ask_session" returns positive; grep "send_message\|get_response" returns zero in the skill body. Manual test: /send-to-gemini with a small prompt returns a direct response.</reality_test>
+  <done_when>Skill references mcp__triumvirate__ask_session. No inter-agent references. No async pattern.</done_when>
 </task>
 
-<task id="T-014" req="REQ-J4" wave="3" depends="T-011">
-  <description>Update send-to-siblings skill to use mcp__triumvirate__ask_session for both agents</description>
-  <files>~/.claude/skills/send-to-siblings/SKILL.md</files>
-  <scope_out>Same as T-012.</scope_out>
-  <tools>cat ~/.claude/skills/send-to-siblings/SKILL.md</tools>
-  <verify>grep -c "mcp__triumvirate__ask_session" ~/.claude/skills/send-to-siblings/SKILL.md</verify>
-  <reality_test>Invoke /send-to-siblings → both Gemini and Codex respond via ask_session. Both direct responses.</reality_test>
+<task id="T-014" req="REQ-J4" wave="3" depends="T-011" lane="orchestrator">
+  <description>Update send-to-siblings skill to reference mcp__triumvirate__ask_session for both Gemini and Codex (orchestrator-executed)</description>
+  <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md directly.</files>
+  <scope_out>Same as T-012. Do not edit any Triumvirate repo files.</scope_out>
+  <tools>Read, Edit, Grep — orchestrator in main session</tools>
+  <verify>grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md returns at least 2 (one per agent)</verify>
+  <reality_test>After orchestrator runs the edit: grep "mcp__inter-agent" returns zero; grep "mcp__triumvirate__ask_session" returns at least 2. Manual test: /send-to-siblings with a small prompt returns direct responses from BOTH agents.</reality_test>
   <done_when>Skill references mcp__triumvirate__ask_session for both agents. No inter-agent references.</done_when>
 </task>
 
-<task id="T-015" req="REQ-A1" wave="3" depends="T-011">
-  <description>Update inter-agent-protocol, goatrodeo, design-goatrodeo, and crystallize skills to use mcp__triumvirate__* tool names</description>
-  <files>~/.claude/skills/inter-agent-protocol/SKILL.md, ~/.claude/skills/goatrodeo.md, ~/.claude/skills/design-goatrodeo.md, ~/.claude/skills/crystallize/factory/phase-2-diagnose.md</files>
-  <scope_out>Do not change skill logic or purpose. Only update MCP tool name references from mcp__inter-agent__* to mcp__triumvirate__*.</scope_out>
-  <tools>grep -r "mcp__inter-agent" ~/.claude/skills/</tools>
-  <verify>grep -rc "mcp__inter-agent" ~/.claude/skills/ | grep -v ":0$" | wc -l should be 0</verify>
-  <reality_test>grep -r "mcp__inter-agent" ~/.claude/skills/ returns zero matches. All skills reference mcp__triumvirate__* only.</reality_test>
-  <done_when>Zero references to mcp__inter-agent in any skill file. All updated to mcp__triumvirate__.</done_when>
+<task id="T-015" req="REQ-A1" wave="3" depends="T-011" lane="orchestrator">
+  <description>Update inter-agent-protocol, goatrodeo, design-goatrodeo, and crystallize skills to reference mcp__triumvirate__* (orchestrator-executed)</description>
+  <files>NOT APPLICABLE — orchestrator edits each of:
+    /Users/mikeboscia/.claude/skills/inter-agent-protocol/SKILL.md
+    /Users/mikeboscia/.claude/skills/goatrodeo.md
+    /Users/mikeboscia/.claude/skills/design-goatrodeo.md
+    /Users/mikeboscia/.claude/skills/crystallize/factory/phase-2-diagnose.md
+  directly.</files>
+  <scope_out>Do not change skill logic or purpose. Only update MCP tool name references from mcp__inter-agent__* to mcp__triumvirate__*. Do not touch goatrodeo.md's platform rule or audit gates added 2026-04-09.</scope_out>
+  <tools>Read, Edit, Grep — orchestrator in main session</tools>
+  <verify>grep -r "mcp__inter-agent" /Users/mikeboscia/.claude/skills/ returns zero matches</verify>
+  <reality_test>After orchestrator runs the edits: (1) grep -r "mcp__inter-agent" ~/.claude/skills/ exits with no matches; (2) each of the 4 skill files contains at least one "mcp__triumvirate__" reference; (3) the goatrodeo.md Platform Rule at line 9 is unchanged (grep "Platform Rule" returns the same line); (4) Phase 4.4 and Phase 5.3 sections still exist (grep "Canonical Doc Audit\|Dispatch Audit" returns matches).</reality_test>
+  <done_when>Zero references to mcp__inter-agent across all skill files. All 4 target skills updated. Platform Rule and audit phases preserved.</done_when>
 </task>
 
 ---
