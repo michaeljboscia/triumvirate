@@ -121,7 +121,7 @@ Build a Rust-native token scanner that reads Claude, Codex, and Gemini session l
 
 **REQ-T4:** Gemini scanner reads `~/.gemini/telemetry.jsonl` (single file, ~536MB, ~5.1M lines). Extracts `usageMetadata` from response entries: `promptTokenCount`, `candidatesTokenCount`, `totalTokenCount`, `thoughtsTokenCount`, `modelVersion`, per-modality breakdowns. Incremental by file offset (single file = track byte offset, not mtime). This covers ALL Gemini CLI sessions — daemon-mediated and direct. (Decision R1-D3: A confirmed — telemetry.jsonl exists on disk)
 
-**REQ-T5:** The daemon's Gemini invocation path in `agent_exec.rs` must capture the full response including the stats block. Currently `stream-json` mode streams events but does not emit the final stats summary. The daemon must either: (a) switch to `-o json` for batch mode and parse the stats block, or (b) accumulate stats from stream events if available. The stats must be written to a structured log file (`~/.triumvirate/gemini-stats/*.jsonl`) for the scanner to read.
+**REQ-T5:** Extend `GeminiStreamParser` (agent-adapter/src/gemini.rs:138-148) to parse additional fields from the `stream-json` `result` event: `thoughtsTokenCount` (thinking tokens), `totalLatencyMs` (latency), `tools.totalCalls` (tool calls), `files.linesAdded/Removed`. No mode switch needed — `stream-json` already emits these in the final `result` event, the parser just ignores them. Extend `TokenUsage` struct (types.rs) with `thinking_tokens: Option<u64>`, `latency_ms: Option<u64>`, `tool_calls: Option<u64>`. (Research confirmed: stream-json emits final stats)
 
 ### Storage
 
