@@ -53,22 +53,24 @@ The Rust daemon already won. This sprint makes it official.
 
 ## Current State Audit
 
-### TS MCP Server Tools (unified-tools.ts — 12 tools)
+### TS MCP Server Tools (unified-tools.ts — 12 tools, schemas verified against source)
 
-| TS Tool | Schema | Semantics |
-|---------|--------|-----------|
-| `spawn_daemon` | `{target, cwd?, session_name?, timeout_ms?}` | Spawn persistent Gemini or Codex session |
-| `send_message` | `{target, request_type, question, context?, cwd?, session_log?, timeout_ms?}` | Fire-and-forget message, returns job_id |
-| `get_response` | `{job_id, timeout_ms?}` | Poll for job result by ID |
-| `ask_daemon` | `{daemon_id, message, timeout_ms?}` | Send message to existing daemon, wait for response |
-| `dismiss_daemon` | `{daemon_id}` | Kill a daemon session |
-| `list_daemons` | `{target?}` | List active sessions |
-| `list_jobs` | `{target?}` | List pending/completed jobs |
-| `write_scratchpad` | `{key, value, namespace?}` | Write to shared scratchpad |
-| `list_scratchpad` | `{namespace?}` | List scratchpad entries |
-| `pythia_query` | `{query, project?}` | Query Pythia (delegated) |
-| `pythia_corpus_health` | `{project?}` | Check Pythia index health (delegated) |
-| `code_review` | `{diff, context?, target?}` | Request code review from twin |
+Schemas verified against `mcp-server/src/unified-tools.ts` at HEAD 373256451. Any alias implementation must match these shapes exactly.
+
+| TS Tool | Schema (verified from source) | File:Line | Semantics |
+|---------|------------------------------|-----------|-----------|
+| `spawn_daemon` | `{target: "gemini"\|"codex", cwd?, session_name?, timeout_ms?}` | unified-tools.ts:50-72 | Spawn persistent Gemini or Codex session |
+| `send_message` | `{target, request_type, question, context?, cwd?, session_log?, timeout_ms?}` | unified-tools.ts:74-91 | Fire-and-forget message, returns job_id (TS workaround — eliminated in 3.1.0) |
+| `get_response` | `{job_id, timeout_ms?}` | unified-tools.ts:224-232 | Poll for job result by ID (deprecated shim in 3.1.0) |
+| `ask_daemon` | `{daemon_id, question, timeout_ms?}` | unified-tools.ts:139-159 | Send question to existing daemon, wait for response. **Param is `question`, NOT `message`.** |
+| `dismiss_daemon` | `{daemon_id, hard?}` | unified-tools.ts:161-184 | Kill a daemon session. `hard` is Gemini-only (ignored for Codex). |
+| `list_daemons` | `{target?, cwd?}` | unified-tools.ts:93-114 | List active sessions |
+| `list_jobs` | `{target?, cwd?}` | unified-tools.ts:116-137 | List pending/completed jobs |
+| `write_scratchpad` | `{topic, content, cwd?, owner?, daemon_id?}` | unified-tools.ts:186-222 | Write markdown artifact to shared scratchpad. **Params are `topic`/`content`/`owner`/`daemon_id`, NOT `key`/`value`/`namespace`.** Owner auto-derived from daemon_id prefix. |
+| `list_scratchpad` | `{cwd?}` | unified-tools.ts:234-241 | List scratchpad entries. **Only param is `cwd`.** |
+| `pythia_query` | `{question, intent, cwd?}` | unified-tools.ts:243-252 | Query Pythia — OUT OF SCOPE (not routed through inter-agent in practice) |
+| `pythia_corpus_health` | `{cwd?}` | unified-tools.ts:254-261 | Pythia corpus health — OUT OF SCOPE |
+| `code_review` | `{cwd?, uncommitted?, base_branch?, commit_sha?, timeout_ms?}` | unified-tools.ts:263-274 | Run `codex review` on uncommitted changes, base-branch comparison, or specific commit. **Params are `cwd`/`uncommitted`/`base_branch`/`commit_sha`, NOT `diff`/`context`/`target`.** |
 
 ### Rust Daemon MCP Tools (main.rs McpBridge — 35+ tools)
 
