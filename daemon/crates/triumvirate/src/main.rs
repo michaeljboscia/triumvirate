@@ -40,7 +40,8 @@ use fallback_outbox::{
 use fleet::orchestrator::{FleetOrchestrator, FleetSpawnRequest as FleetSpawnRunRequest};
 use fleet::tasks::FleetTaskStore;
 use ledger::LedgerStore;
-use peer_review::{PeerReviewEngine, ReviewRequest as PersistedReviewRequest};
+#[cfg(test)]
+use peer_review::PeerReviewEngine;
 use mcp_bridge::{
     codex_command, is_bearer_authorized, is_supported_agent_name,
 };
@@ -48,7 +49,10 @@ use mcp_bridge::{
 use mcp_bridge::use_daemon_for_mcp_from_env;
 #[cfg(test)]
 use mcp_bridge::should_use_daemon_proxy;
-use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
+use mcp_tools::{
+    ProgressEmitter, display_agent_name, gemini_query as mcp_gemini_query,
+    next_heartbeat_offset, review as mcp_review,
+};
 use axum::{
     Json as AxumJson, Router,
     body::Body,
@@ -74,7 +78,7 @@ use shared_types::{
     CancelTaskRequest as AbeCancelTaskRequest, CancelTaskResponse as AbeCancelTaskResponse,
     DispatchCodexRequest, DispatchCodexResponse,
     DispatchCodexWorktreeRequest, DispatchCodexWorktreeResponse, GetTaskOutputRequest,
-    GetTaskOutputResponse, GetTaskStatusRequest, GetTaskStatusResponse, GeminiReviewVerdict,
+    GetTaskOutputResponse, GetTaskStatusRequest, GetTaskStatusResponse,
     QueryGeminiRequest, QueryGeminiResponse, QueryGeminiReviewRequest, QueryGeminiReviewResponse,
     DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
@@ -95,6 +99,8 @@ use shared_types::{
     GcResult, HealthStatus, SessionDetail, Summary,
     SessionState,
 };
+#[cfg(test)]
+use shared_types::GeminiReviewVerdict;
 #[cfg(test)]
 use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
@@ -1054,26 +1060,11 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<QueryGeminiRequest>,
     ) -> Result<Json<QueryGeminiResponse>, String> {
-        let query = if let Some(ctx) = req.context {
-            format!("Context:\n{ctx}\n\nQuestion:\n{}", req.query)
-        } else {
-            req.query
-        };
-        let response = execute_ask_agent(
-            &AskAgentRequest {
-                agent: "gemini".to_string(),
-                message: query,
-                cwd: None,
-                repo: None,
-                branch: None,
-            },
-            None,
-        )
-        .await
-        .map_err(|e| format!("query_gemini failed: {e}"))?;
-        Ok(Json(QueryGeminiResponse {
-            response: response.response,
-        }))
+        let response = mcp_gemini_query::query_gemini(req, |ask_req| async move {
+            execute_ask_agent(&ask_req, None).await
+        })
+        .await?;
+        Ok(Json(response))
     }
 
     #[tool(description = "Query Gemini for code review verdicts on pass/failure contexts.")]
@@ -1081,46 +1072,11 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<QueryGeminiReviewRequest>,
     ) -> Result<Json<QueryGeminiReviewResponse>, String> {
-        let mut prompt = format!("Review this diff and provide verdict clean/concerns/regression.\n\n{}", req.diff);
-        if matches!(req.mode, shared_types::GeminiReviewMode::Failure) {
-            if let Some(briefing) = req.briefing {
-                prompt.push_str(&format!("\n\nBriefing:\n{briefing}"));
-            }
-            if let Some(contract) = req.contract {
-                let serialized = serde_json::to_string_pretty(&contract)
-                    .map_err(|e| format!("contract serialization failed: {e}"))?;
-                prompt.push_str(&format!("\n\nContract:\n{serialized}"));
-            }
-            if let Some(details) = req.failure_details {
-                prompt.push_str(&format!("\n\nFailure details:\n{details}"));
-            }
-        }
-
-        let response = execute_ask_agent(
-            &AskAgentRequest {
-                agent: "gemini".to_string(),
-                message: prompt,
-                cwd: None,
-                repo: None,
-                branch: None,
-            },
-            None,
-        )
-        .await
-        .map_err(|e| format!("query_gemini_review failed: {e}"))?;
-        let lower = response.response.to_lowercase();
-        let verdict = if lower.contains("regression") {
-            GeminiReviewVerdict::Regression
-        } else if lower.contains("concern") || lower.contains("issue") {
-            GeminiReviewVerdict::Concerns
-        } else {
-            GeminiReviewVerdict::Clean
-        };
-        Ok(Json(QueryGeminiReviewResponse {
-            verdict,
-            concerns: None,
-            suggestions: None,
-        }))
+        let response = mcp_gemini_query::query_gemini_review(req, |ask_req| async move {
+            execute_ask_agent(&ask_req, None).await
+        })
+        .await?;
+        Ok(Json(response))
     }
 
     #[tool(description = "Get status for a dispatched ABE task.")]
@@ -1292,26 +1248,8 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<ReviewRequestTool>,
     ) -> Result<Json<ReviewRequestResponse>, String> {
-        let project_root = req
-            .project_root
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "failed to resolve project root".to_string())?;
-        let engine = PeerReviewEngine::new(project_root)
-            .map_err(|e| format!("review_request engine init failed: {e}"))?;
-        let record = engine
-            .request_review(PersistedReviewRequest {
-                fleet_id: req.fleet_id,
-                author_agent: req.author_agent,
-                artifact: req.artifact,
-                review_type: req.review_type,
-            })
-            .map_err(|e| format!("review_request failed: {e}"))?;
-        Ok(Json(ReviewRequestResponse {
-            review_id: record.review_id,
-            reviewer_agent: record.reviewer_agent,
-            state: record.state,
-        }))
+        let response = mcp_review::review_request(req)?;
+        Ok(Json(response))
     }
 
     #[tool(description = "Submit peer review verdict and comments.")]
@@ -1319,17 +1257,7 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<ReviewSubmitRequest>,
     ) -> Result<String, String> {
-        let project_root = req
-            .project_root
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "failed to resolve project root".to_string())?;
-        let engine = PeerReviewEngine::new(project_root)
-            .map_err(|e| format!("review_submit engine init failed: {e}"))?;
-        let _ = engine
-            .submit_review(&req.review_id, &req.verdict, req.comments.as_deref())
-            .map_err(|e| format!("review_submit failed: {e}"))?;
-        Ok("ok".to_string())
+        mcp_review::review_submit(req)
     }
 
     #[tool(description = "Get current peer review status by review_id.")]
@@ -1337,24 +1265,8 @@ start it with: triumvirate daemon"
         &self,
         Parameters(req): Parameters<ReviewStatusRequest>,
     ) -> Result<Json<ReviewStatusResponse>, String> {
-        let project_root = req
-            .project_root
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "failed to resolve project root".to_string())?;
-        let engine = PeerReviewEngine::new(project_root)
-            .map_err(|e| format!("review_status engine init failed: {e}"))?;
-        let record = engine
-            .get_review(&req.review_id)
-            .map_err(|e| format!("review_status failed: {e}"))?
-            .ok_or_else(|| format!("review not found: {}", req.review_id))?;
-        Ok(Json(ReviewStatusResponse {
-            review_id: record.review_id,
-            reviewer_agent: record.reviewer_agent,
-            verdict: record.verdict,
-            comments: record.comments,
-            state: record.state,
-        }))
+        let response = mcp_review::review_status(req)?;
+        Ok(Json(response))
     }
 }
 
@@ -6049,7 +5961,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         )?;
         let stub_script = write_codex_custom_script(
             "mkdir -p src\n\
-             echo '// TODO: stub' > src/allowed.rs\n\
+            echo '// pending: stub' > src/allowed.rs\n\
              git add src/allowed.rs\n\
              git commit -m 'T-016C: stub marker present'",
         )?;
