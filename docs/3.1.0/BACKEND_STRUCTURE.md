@@ -191,7 +191,7 @@ Constructed once in `main()`. Cloned (via `Arc`) into:
 
 ### DaemonMetrics (relocated in T-001)
 
-Currently in `main.rs:1446-1530`. **Relocated to `daemon/crates/daemon-core/src/metrics.rs` as part of T-001** (decision crystallized 2026-04-09 from T-000 postmortem — the original "don't move DaemonMetrics yet" scoping rule was self-contradictory with ObservabilityBus needing to live in daemon-core). All 12 existing Prometheus metrics preserved verbatim. Only the struct definition and impl block move; the prometheus Registry init code stays in main.rs until a later task explicitly relocates it. New metrics added in v3.2.
+Currently in `main.rs:1446-1562` (nested inside `fn run_daemon()`). **Relocated to `daemon/crates/daemon-core/src/metrics.rs` as part of T-001** (decision crystallized 2026-04-09 from T-000 postmortem). The FULL struct plus the FULL `impl DaemonMetrics` block moves — including `pub fn new()` with its prometheus Registry creation and all 12 `registry.register(Box::new(...))` calls inside the constructor (they are inseparable from the struct's self-initialization) AND `pub fn snapshot_keepalive()`. The ONLY piece that stays in `main.rs` is the call site `Arc::new(DaemonMetrics::new()?)` at roughly line 2729, which updates its import path to `daemon_core::metrics::DaemonMetrics`. All 12 existing Prometheus metric names, help texts, and types are preserved verbatim. New metrics are added in v3.2.
 
 ---
 
