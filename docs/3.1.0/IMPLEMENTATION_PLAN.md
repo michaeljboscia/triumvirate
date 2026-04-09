@@ -556,7 +556,7 @@ Wave 5 makes the sprint actually available to users. Every sprint ends here — 
 
 <task id="T-022" req="REQ-X3" wave="5" depends="T-020,T-021" lane="orchestrator">
   <description>Publish GitHub release 3.1.0 with binaries, checksums, and release notes (orchestrator-executed with explicit user approval — external destructive action)</description>
-  <files>NOT APPLICABLE — creates a GitHub release via gh CLI. No repo file is modified. Tag is pushed to origin.</files>
+  <files></files>
   <scope_out>Do not push to main if not already pushed. Do not force-push. Do not close issues automatically — T-024 handles issue cleanup. Require explicit user approval before running `git push --tags` or `gh release create`.</scope_out>
   <tools>Bash (gh release create, gh release upload, git tag, git push --tags) — orchestrator in main session after user approval</tools>
   <verify>gh release view 3.1.0 --json assets --jq '.assets | length' | xargs -I{} test {} -ge 8</verify>
