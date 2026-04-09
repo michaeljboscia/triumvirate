@@ -159,15 +159,15 @@ daemon/crates/mcp-tools/src/
 
 ### Async Job Model — ELIMINATED (Decision R1-D1: C)
 
-The TS `send_message` + `get_response` async pattern was a workaround for Node.js single-threaded blocking. Rust's `ask_session` is async internally (tokio) and Claude Code handles long-running MCP calls natively.
+**Context for REQ-J naming:** The original goat rodeo reserved REQ-J1 through REQ-J4 for the async job queue (send_message + get_response + list_jobs + TTL reaper). Round 1's Decision D1 killed the async model entirely. REQ-J1 (the queue itself) became DROPPED. REQ-J2–J4 were REUSED for the downstream consequence of that decision: three skill files had to be updated to use synchronous `ask_session` instead of the eliminated async pattern. The naming is historical — if you prefer clarity, read REQ-J2–J4 as "skill updates required because REQ-J1 was dropped." The J prefix is retained because the work traces back to the original async model's removal.
 
-**REQ-J1:** ~~Async job queue~~ **DROPPED.** The `send_message` alias routes to `ask_session` (synchronous from Claude's perspective). No DashMap, no TTL reaper, no job IDs.
+**REQ-J1:** ~~Async job queue~~ **DROPPED.** The `send_message` alias routes directly to `ask_session` (synchronous from Claude's perspective). No DashMap, no TTL reaper, no job IDs. This is a permanent decision, not a deferred one.
 
-**REQ-J2:** Update `send-to-codex` skill to use `mcp__triumvirate__ask_session` instead of `mcp__inter-agent-codex__send_message`.
+**REQ-J2:** (downstream of J1's drop) Update `send-to-codex` skill to use `mcp__triumvirate__ask_session` instead of `mcp__inter-agent-codex__send_message`. Orchestrator task (T-012) — not ABE-dispatched because the skill file lives outside the repo.
 
-**REQ-J3:** Update `send-to-gemini` skill to use `mcp__triumvirate__ask_session` instead of `mcp__inter-agent-gemini__send_message`.
+**REQ-J3:** (downstream of J1's drop) Update `send-to-gemini` skill to use `mcp__triumvirate__ask_session` instead of `mcp__inter-agent-gemini__send_message`. Orchestrator task (T-013).
 
-**REQ-J4:** Update `send-to-siblings` skill to use `mcp__triumvirate__ask_session` for both agents instead of per-agent `send_message` calls.
+**REQ-J4:** (downstream of J1's drop) Update `send-to-siblings` skill to use `mcp__triumvirate__ask_session` for both agents instead of per-agent `send_message` calls. Orchestrator task (T-014).
 
 ### Tool Aliases (Backwards Compatibility)
 
