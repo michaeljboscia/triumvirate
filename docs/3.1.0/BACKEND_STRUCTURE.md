@@ -189,9 +189,9 @@ Constructed once in `main()`. Cloned (via `Arc`) into:
 - `DaemonState` (daemon-http)
 - Background tasks that need to emit events
 
-### DaemonMetrics (relocated)
+### DaemonMetrics (relocated in T-001)
 
-Currently in `main.rs:1446-1530`. Moves to a shared location (either `daemon-core` or a dedicated `metrics` module in `mcp-tools`). All 12 existing Prometheus metrics preserved. New metrics added in v3.2.
+Currently in `main.rs:1446-1530`. **Relocated to `daemon/crates/daemon-core/src/metrics.rs` as part of T-001** (decision crystallized 2026-04-09 from T-000 postmortem — the original "don't move DaemonMetrics yet" scoping rule was self-contradictory with ObservabilityBus needing to live in daemon-core). All 12 existing Prometheus metrics preserved verbatim. Only the struct definition and impl block move; the prometheus Registry init code stays in main.rs until a later task explicitly relocates it. New metrics added in v3.2.
 
 ---
 
