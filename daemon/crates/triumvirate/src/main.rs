@@ -207,6 +207,131 @@ impl McpBridge {
             abe_tasks: abe::task_tracker::TaskTracker::default(),
         }
     }
+
+    fn abe_callbacks() -> mcp_tools::abe::AbeCallbacks {
+        mcp_tools::abe::AbeCallbacks {
+            codex_command: Arc::new(codex_command),
+            setup_worktree: Arc::new(|req| {
+                abe::worktree_setup::setup_worktree(&abe::worktree_setup::WorktreeSetupRequest {
+                    project_root: req.project_root,
+                    sha: req.sha,
+                    task_id: req.task_id,
+                    briefing_content: req.briefing_content,
+                    contract_fields: req.contract_fields,
+                })
+                .map(|result| mcp_tools::abe::WorktreeSetupResult {
+                    worktree_path: result.worktree_path,
+                })
+                .map_err(|e| e.to_string())
+            }),
+            spawn_background: Arc::new(|spec| {
+                Box::pin(async move {
+                    abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
+                        cmd: spec.cmd,
+                        args: spec.args,
+                        cwd: spec.cwd,
+                        envs: spec.envs,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                })
+            }),
+            enforce_timeout: Arc::new(|child, timeout_sec, cwd| {
+                Box::pin(async move {
+                    abe::codex_spawn::enforce_timeout(child, timeout_sec, &cwd)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }),
+            resolve_commit_outputs: Arc::new(abe::codex_spawn::resolve_commit_outputs),
+            validate_commit: Arc::new(|worktree_path, contract, start_sha| {
+                let result = abe::post_exit_validator::validate_commit(worktree_path, contract, start_sha);
+                mcp_tools::abe::PostExitValidation {
+                    passed: result.passed,
+                    violations: result.violations,
+                }
+            }),
+            rollback_worktree: Arc::new(|project_root, worktree_path| {
+                abe::worktree_setup::rollback_worktree(project_root, worktree_path)
+                    .map_err(|e| e.to_string())
+            }),
+        }
+    }
+}
+
+impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
+    fn register(
+        &self,
+        task_id: String,
+        child: Arc<Mutex<tokio::process::Child>>,
+        worktree_path: Option<PathBuf>,
+    ) -> mcp_tools::abe::BoxFuture<()> {
+        let tracker = self.clone();
+        Box::pin(async move { tracker.register(task_id, child, worktree_path).await })
+    }
+
+    fn mark_completed(
+        &self,
+        task_id: String,
+        commit_sha: String,
+        modified_files: Vec<String>,
+        stdout: String,
+        validation_log: Option<String>,
+        test_output: Option<String>,
+    ) -> mcp_tools::abe::BoxFuture<()> {
+        let tracker = self.clone();
+        Box::pin(async move {
+            tracker
+                .mark_completed(
+                    &task_id,
+                    commit_sha,
+                    modified_files,
+                    stdout,
+                    validation_log,
+                    test_output,
+                )
+                .await
+        })
+    }
+
+    fn mark_failed(
+        &self,
+        task_id: String,
+        exit_code: Option<i32>,
+        error_message: String,
+    ) -> mcp_tools::abe::BoxFuture<()> {
+        let tracker = self.clone();
+        Box::pin(async move { tracker.mark_failed(&task_id, exit_code, error_message).await })
+    }
+
+    fn mark_timeout(&self, task_id: String) -> mcp_tools::abe::BoxFuture<()> {
+        let tracker = self.clone();
+        Box::pin(async move { tracker.mark_timeout(&task_id).await })
+    }
+
+    fn register_setup_failed(
+        &self,
+        task_id: String,
+        error_message: String,
+    ) -> mcp_tools::abe::BoxFuture<()> {
+        let tracker = self.clone();
+        Box::pin(async move { tracker.register_setup_failed(task_id, error_message).await })
+    }
+
+    fn get_status(&self, task_id: String) -> mcp_tools::abe::BoxFuture<Option<GetTaskStatusResponse>> {
+        let tracker = self.clone();
+        Box::pin(async move { tracker.get_status(&task_id).await })
+    }
+
+    fn get_output(&self, task_id: String) -> mcp_tools::abe::BoxFuture<Option<GetTaskOutputResponse>> {
+        let tracker = self.clone();
+        Box::pin(async move { tracker.get_output(&task_id).await })
+    }
+
+    fn cancel(&self, task_id: String) -> mcp_tools::abe::BoxFuture<Option<AbeCancelTaskResponse>> {
+        let tracker = self.clone();
+        Box::pin(async move { tracker.cancel(&task_id).await })
+    }
 }
 
 #[tool_router]
@@ -416,106 +541,9 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<DispatchCodexRequest>,
     ) -> Result<Json<DispatchCodexResponse>, String> {
-        let task_id = format!("abe-{}", Uuid::new_v4().simple());
-        let cwd = req
-            .cwd
-            .clone()
-            .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
-            .ok_or_else(|| "failed to resolve cwd".to_string())?;
-        let timeout_sec = req.timeout_sec.unwrap_or(600);
-
-        let (cmd, mut args) = codex_command();
-        args.push("exec".to_string());
-        args.push("--full-auto".to_string());
-        args.push(req.prompt.clone());
-        let start_sha = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&cwd)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_default();
-
-        let child = abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
-            cmd,
-            args,
-            cwd: cwd.clone(),
-            envs: HashMap::new(),
-        })
-        .await
-        .map_err(|e| format!("dispatch_codex failed: {e}"))?;
-
-        self.abe_tasks
-            .register(task_id.clone(), child.clone(), None)
-            .await;
-
-        let tracker = self.abe_tasks.clone();
-        let task_id_for_monitor = task_id.clone();
-        tokio::spawn(async move {
-            let timed_out = abe::codex_spawn::enforce_timeout(
-                child.clone(),
-                timeout_sec,
-                PathBuf::from(&cwd).as_path(),
-            )
+        mcp_tools::abe::dispatch_codex(self.abe_tasks.clone(), req, Self::abe_callbacks())
             .await
-            .unwrap_or(false);
-            if timed_out {
-                tracker.mark_timeout(&task_id_for_monitor).await;
-                return;
-            }
-            let exit = {
-                let mut locked = child.lock().await;
-                match locked.wait().await {
-                    Ok(status) => status,
-                    Err(err) => {
-                        tracker
-                            .mark_failed(&task_id_for_monitor, None, err.to_string())
-                            .await;
-                        return;
-                    }
-                }
-            };
-            if exit.success() {
-                let cwd_path = PathBuf::from(&cwd);
-                let (commit_sha, files) =
-                    abe::codex_spawn::resolve_commit_outputs(&cwd_path, &start_sha);
-                if commit_sha.is_empty() {
-                    tracker
-                        .mark_failed(
-                            &task_id_for_monitor,
-                            exit.code(),
-                            "codex process exited without creating a commit".to_string(),
-                        )
-                        .await;
-                    return;
-                }
-                tracker
-                    .mark_completed(
-                        &task_id_for_monitor,
-                        commit_sha,
-                        files,
-                        String::new(),
-                        None,
-                        None,
-                    )
-                    .await;
-            } else {
-                tracker
-                    .mark_failed(
-                        &task_id_for_monitor,
-                        exit.code(),
-                        "codex process failed".to_string(),
-                    )
-                    .await;
-            }
-        });
-
-        Ok(Json(DispatchCodexResponse {
-            task_id,
-            status: "dispatched".to_string(),
-        }))
+            .map(Json)
     }
 
     #[tool(description = "Dispatch a one-off Codex task in an isolated worktree with .triumvirate artifacts.")]
@@ -523,191 +551,9 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<DispatchCodexWorktreeRequest>,
     ) -> Result<Json<DispatchCodexWorktreeResponse>, String> {
-        let task_id = req.contract_fields.task_id.clone();
-        let validation = shared_types::validate_contract(&req.contract_fields)
-            .map_err(|e| format!("invalid contract_fields: {e}"));
-        if let Err(err) = validation {
-            self.abe_tasks
-                .register_setup_failed(task_id.clone(), err.clone())
-                .await;
-            return Err(err);
-        }
-
-        let project_root = req
-            .project_root
-            .clone()
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "failed to resolve project_root".to_string())?;
-        let setup = abe::worktree_setup::setup_worktree(&abe::worktree_setup::WorktreeSetupRequest {
-            project_root: project_root.clone(),
-            sha: req.sha.clone(),
-            task_id: task_id.clone(),
-            briefing_content: req.briefing_content.clone(),
-            contract_fields: req.contract_fields.clone(),
-        });
-        let setup = match setup {
-            Ok(s) => s,
-            Err(err) => {
-                self.abe_tasks
-                    .register_setup_failed(task_id.clone(), err.to_string())
-                    .await;
-                return Err(format!("SETUP_FAILED: {err}"));
-            }
-        };
-
-        let prompt = "Read .triumvirate/BRIEFING.md and implement the task contract. Commit when complete.".to_string();
-        let (cmd, mut args) = codex_command();
-        args.push("exec".to_string());
-        args.push("--full-auto".to_string());
-
-        // Grant Codex write access to git dirs for commit operations.
-        // workspace-write sandbox blocks .git/ writes. git add needs
-        // objects/ and refs/ (shared). git commit needs worktrees/<name>/
-        // index.lock (per-worktree). Both dirs required.
-        let main_git_dir = project_root.join(".git");
-        args.push("--add-dir".to_string());
-        args.push(main_git_dir.display().to_string());
-
-        let dot_git = setup.worktree_path.join(".git");
-        if dot_git.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&dot_git) {
-                if let Some(gitdir) = content.strip_prefix("gitdir: ").map(|s| s.trim()) {
-                    let resolved = if std::path::Path::new(gitdir).is_absolute() {
-                        gitdir.to_string()
-                    } else {
-                        setup.worktree_path.join(gitdir).display().to_string()
-                    };
-                    args.push("--add-dir".to_string());
-                    args.push(resolved);
-                }
-            }
-        }
-
-        args.push(prompt);
-
-        let child = abe::codex_spawn::spawn_background(abe::codex_spawn::SpawnSpec {
-            cmd,
-            args,
-            cwd: setup.worktree_path.display().to_string(),
-            envs: HashMap::from([(
-                "CARGO_TARGET_DIR".to_string(),
-                setup.worktree_path
-                    .join(".triumvirate")
-                    .join("target")
-                    .join(task_id.clone())
-                    .display()
-                    .to_string(),
-            )]),
-        })
-        .await
-        .map_err(|e| format!("dispatch_codex_worktree failed: {e}"))?;
-
-        self.abe_tasks
-            .register(task_id.clone(), child.clone(), Some(setup.worktree_path.clone()))
-            .await;
-
-        let tracker = self.abe_tasks.clone();
-        let worktree_path = setup.worktree_path.clone();
-        let timeout_sec = req.contract_fields.task_timeout_sec;
-        let keep_failed = req.keep_failed_worktree.unwrap_or(false);
-        let project_root_for_cleanup = project_root.clone();
-        let task_id_for_monitor = task_id.clone();
-        let start_sha = req.sha.clone();
-        let contract_for_validation = req.contract_fields.clone();
-        tokio::spawn(async move {
-            let timed_out =
-                abe::codex_spawn::enforce_timeout(child.clone(), timeout_sec, &worktree_path)
-                    .await
-                    .unwrap_or(false);
-            if timed_out {
-                tracker.mark_timeout(&task_id_for_monitor).await;
-                return;
-            }
-
-            let exit = {
-                let mut locked = child.lock().await;
-                match locked.wait().await {
-                    Ok(status) => status,
-                    Err(err) => {
-                        tracker.mark_failed(&task_id_for_monitor, None, err.to_string()).await;
-                        return;
-                    }
-                }
-            };
-
-            if exit.success() {
-                let (commit_sha, files) =
-                    abe::codex_spawn::resolve_commit_outputs(&worktree_path, &start_sha);
-                if commit_sha.is_empty() {
-                    tracker
-                        .mark_failed(
-                            &task_id_for_monitor,
-                            exit.code(),
-                            "codex process exited without creating a commit".to_string(),
-                        )
-                        .await;
-                    return;
-                }
-
-                // DAEMON-SIDE POST-EXIT VALIDATION
-                // Validates the commit against the ORIGINAL contract held by the daemon,
-                // NOT the worktree copy (which the worker may have tampered with).
-                // This closes the --no-verify bypass, hook rewrite, and contract tampering vectors.
-                let validation = abe::post_exit_validator::validate_commit(
-                    &worktree_path,
-                    &contract_for_validation,
-                    &start_sha,
-                );
-                if !validation.passed {
-                    let violation_summary = validation.violations.join("; ");
-                    tracker
-                        .mark_failed(
-                            &task_id_for_monitor,
-                            None,
-                            format!("DAEMON_VALIDATION_FAILED: {violation_summary}"),
-                        )
-                        .await;
-                    // Worktree is quarantined for forensics — NOT reverted, NOT cleaned up.
-                    return;
-                }
-
-                let validation_log = fs::read_to_string(
-                    worktree_path.join(".triumvirate").join("VALIDATION_LOG.md"),
-                )
-                .ok();
-                tracker
-                    .mark_completed(
-                        &task_id_for_monitor,
-                        commit_sha,
-                        files,
-                        String::new(),
-                        validation_log,
-                        None,
-                    )
-                    .await;
-            } else {
-                tracker
-                    .mark_failed(
-                        &task_id_for_monitor,
-                        exit.code(),
-                        "codex process failed".to_string(),
-                    )
-                    .await;
-                if !keep_failed {
-                    let _ = abe::worktree_setup::rollback_worktree(
-                        &project_root_for_cleanup,
-                        &worktree_path,
-                    );
-                }
-            }
-        });
-
-        Ok(Json(DispatchCodexWorktreeResponse {
-            task_id,
-            worktree_path: setup.worktree_path.display().to_string(),
-            status: "dispatched".to_string(),
-        }))
+        mcp_tools::abe::dispatch_codex_worktree(self.abe_tasks.clone(), req, Self::abe_callbacks())
+            .await
+            .map(Json)
     }
 
     #[tool(description = "Query Gemini synchronously and return response text.")]
@@ -739,11 +585,9 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<GetTaskStatusRequest>,
     ) -> Result<Json<GetTaskStatusResponse>, String> {
-        self.abe_tasks
-            .get_status(&req.task_id)
+        mcp_tools::abe::get_task_status(self.abe_tasks.clone(), req)
             .await
             .map(Json)
-            .ok_or_else(|| format!("unknown task_id: {}", req.task_id))
     }
 
     #[tool(description = "Get output details for a completed ABE task.")]
@@ -751,11 +595,9 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<GetTaskOutputRequest>,
     ) -> Result<Json<GetTaskOutputResponse>, String> {
-        self.abe_tasks
-            .get_output(&req.task_id)
+        mcp_tools::abe::get_task_output(self.abe_tasks.clone(), req)
             .await
             .map(Json)
-            .ok_or_else(|| format!("task output unavailable for task_id: {}", req.task_id))
     }
 
     #[tool(description = "Cancel a running ABE task.")]
@@ -763,11 +605,9 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<AbeCancelTaskRequest>,
     ) -> Result<Json<AbeCancelTaskResponse>, String> {
-        self.abe_tasks
-            .cancel(&req.task_id)
+        mcp_tools::abe::cancel_task(self.abe_tasks.clone(), req)
             .await
             .map(Json)
-            .ok_or_else(|| format!("unknown task_id: {}", req.task_id))
     }
 
     #[tool(description = "Spawn a multi-agent fleet (dry_run defaults to true).")]
