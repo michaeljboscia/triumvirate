@@ -190,7 +190,7 @@ daemon/crates/mcp-tools/src/
 | `list_scratchpad` | alias | `scratchpad_list` | Name swap only |
 | `pythia_query` | OUT OF SCOPE | — | Not in TS server anyway (server.ts:5). Stays in Pythia MCP. No alias needed. |
 | `pythia_corpus_health` | OUT OF SCOPE | — | Same — stays in Pythia MCP. |
-| `code_review` | alias (schema-mapped) | `review_request` | Map `diff` + optional `context` to review request schema |
+| `code_review` | alias (schema-mapped) | `review_request` | Map TS params `cwd/uncommitted/base_branch/commit_sha/timeout_ms` → review request schema. The alias invokes `codex review` with the same semantics: if `uncommitted` is true, review staged+unstaged changes; if `base_branch` is set, diff against that base; if `commit_sha` is set, review that specific commit. The `diff` text is produced internally by the alias from these parameters — TS tool never accepted a raw diff. |
 
 **Count check:** 10 aliases (8 active aliases + 1 deprecated shim + 1 shape-mapped), 2 out-of-scope (never in TS server). All 12 TS tools accounted for.
 
