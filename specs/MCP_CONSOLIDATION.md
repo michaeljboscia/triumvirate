@@ -148,7 +148,7 @@ daemon/crates/mcp-tools/src/
 ├── knowledge.rs        # ledger_*, lesson_*, memory_*, scratchpad_*, outbox_*, fallback_*
 ├── review.rs           # review_request, review_submit, review_status
 ├── gemini_query.rs     # query_gemini, query_gemini_review
-└── jobs.rs             # send_message, get_response, list_jobs (NEW — async job model)
+└── aliases.rs          # Backwards-compatible tool aliases + parameter mapping
 ```
 
 **REQ-C2:** Extract HTTP route handlers from `main.rs` into `daemon-http` crate. HTTP routes call the same domain logic as MCP tools — both are thin presentation layers.
