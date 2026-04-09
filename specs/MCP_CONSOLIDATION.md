@@ -114,24 +114,26 @@ Schemas verified against `mcp-server/src/unified-tools.ts` at HEAD 373256451. An
 | `review_submit` | 1316 | Review |
 | `review_status` | 1334 | Review |
 
-### Tool Gap Analysis
+### Tool Gap Analysis — post-Decision R1-D1
 
-| TS Tool | Rust Equivalent | Gap |
-|---------|----------------|-----|
-| `spawn_daemon` | `spawn_session` | Name alias only |
-| `send_message` | — | **GAP: async job model** |
-| `get_response` | — | **GAP: async job model** |
-| `ask_daemon` | `ask_session` | Name alias only |
-| `dismiss_daemon` | `dismiss_session` | Name alias only |
-| `list_daemons` | `list_sessions` | Name alias only |
-| `list_jobs` | `get_status` (partial) | Shape difference |
-| `write_scratchpad` | `scratchpad_write` | Name alias only |
-| `list_scratchpad` | `scratchpad_list` | Name alias only |
-| `pythia_query` | — | **OUT OF SCOPE** — stays in Pythia MCP |
-| `pythia_corpus_health` | — | **OUT OF SCOPE** — stays in Pythia MCP |
-| `code_review` | `review_request` | Name + shape mapping |
+After killing the async job model (R1-D1: C), every TS tool maps to a Rust equivalent. There are zero unresolved gaps. The table below is the post-decision state, NOT the original pre-decision state.
 
-**Real gaps: 0** — `send_message`/`get_response` async model eliminated (Decision R1-D1: C). All tools map to existing Rust equivalents via aliases. Skills updated to use `ask_session` directly.
+| TS Tool | Rust Equivalent | Resolution |
+|---------|----------------|------------|
+| `spawn_daemon` | `spawn_session` | alias (name + `target`→`agent` param rename) |
+| `send_message` | `ask_session` (synchronous) | alias — maps to sync call, returns response directly. Async pattern eliminated. |
+| `get_response` | deprecated shim | returns deprecation notice pointing at `ask_session` |
+| `ask_daemon` | `ask_session` | alias (name + `daemon_id`→`name`, `question`→`message`) |
+| `dismiss_daemon` | `dismiss_session` | alias (name + `daemon_id`→`name`; drop `hard` param) |
+| `list_daemons` | `list_sessions` | alias (name + optional `target` filter) |
+| `list_jobs` | `get_status` (shape-mapped) | alias with shape translation |
+| `write_scratchpad` | `scratchpad_write` | alias (name + params `topic/content/owner/daemon_id` mapped into Rust schema) |
+| `list_scratchpad` | `scratchpad_list` | alias (name + `cwd` passthrough) |
+| `pythia_query` | — | OUT OF SCOPE — not in TS inter-agent server in practice, stays in Pythia MCP |
+| `pythia_corpus_health` | — | OUT OF SCOPE — same |
+| `code_review` | `review_request` | alias with shape translation (`cwd/uncommitted/base_branch/commit_sha` → review request schema) |
+
+**Real unresolved gaps: 0.** Every TS tool has an explicit resolution: alias, deprecated shim, or explicit out-of-scope.
 
 ---
 
