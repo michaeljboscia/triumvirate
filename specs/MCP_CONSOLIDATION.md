@@ -137,7 +137,7 @@ The Rust daemon already won. This sprint makes it official.
 
 ### Crate Architecture Refactor
 
-**REQ-C1:** Extract McpBridge and all tool handler methods from `main.rs` into `mcp-tools` crate, organized by functional boundary:
+**REQ-C1:** Extract McpBridge and all tool handler methods from `main.rs` into `mcp-tools` crate, organized by functional boundary. Each module receives NARROWED interfaces (not full `&McpBridge`) — e.g., `inter_agent.rs` gets `SessionStore + AgentExecutor`, `abe.rs` gets `TaskTracker + ObservabilityBus`, `knowledge.rs` gets `LedgerStoreFactory + MemoryStore`. (Twin consensus: narrowed interfaces mandatory for testability)
 
 ```
 daemon/crates/mcp-tools/src/
