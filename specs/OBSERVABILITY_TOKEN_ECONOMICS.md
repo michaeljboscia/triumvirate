@@ -252,9 +252,10 @@ triumvirate (main binary)
 ├── peer-review
 ├── shared-types
 ├── fallback-outbox
-└── token-scanner (NEW)
+└── token-economics (NEW)
+    ├── tokscale-core (git: junhoyeo/tokscale, MIT) — parsing, scanning, pricing
     ├── rusqlite 0.32
-    ├── serde + serde_json
+    ├── notify (filesystem watching)
     ├── shared-types (for TokenUsage, BuildState)
     ├── anyhow
     └── tracing
