@@ -54,16 +54,17 @@ These tasks run BEFORE Wave 0. They are not part of the fleet dispatch — they 
   <verify>cargo test --workspace</verify>
   <reality_test>Before: cargo test --workspace fails with 3 E0382 errors. After: cargo test --workspace compiles and runs to completion. Full fix plan at docs/3.1.0/FIX_PLAN_test_moved_values.md.</reality_test>
   <done_when>cargo test --workspace passes. Test suite runs. Commit includes only the one-line fix inside the closure.</done_when>
+  <status>DONE — applied 2026-04-09, verified via git blame at daemon/crates/triumvirate/src/main.rs:6106. Commit be545585. Test passes: `cargo test -p triumvirate abe_red_team_enforcement_blocks_non_compliant_worker` → 1 passed, 3.41s. Do NOT re-dispatch.</status>
 </task>
 
-<task id="T-000" req="PREFLIGHT" wave="-1" depends="FIX-TEST-MOVED-VALUES">
+<task id="T-000" req="PREFLIGHT" wave="-1" depends="">
   <description>Align Cargo workspace version to 3.1.0 and wire version reporting through the codebase</description>
-  <files>daemon/Cargo.toml, daemon/crates/daemon-core/src/lib.rs, daemon/crates/triumvirate/src/main.rs, .git/hooks/pre-commit, ROADMAP.md</files>
-  <scope_out>Do not bump crate-level versions (they inherit via version.workspace = true). Do not tag git yet. Do not touch dashboard package.json or mcp-server/package.json. Do not add a changelog file.</scope_out>
+  <files>daemon/Cargo.toml, daemon/crates/daemon-core/src/lib.rs, daemon/crates/daemon-core/src/version.rs, daemon/crates/triumvirate/src/main.rs, scripts/install-git-hooks.sh, scripts/version-drift-check.sh, ROADMAP.md</files>
+  <scope_out>Do not bump individual crate-level version fields (they inherit via version.workspace = true). Do not tag git yet. Do not touch dashboard/package.json or mcp-server/package.json. Do not add a changelog file. Do NOT place hook scripts under .git/ (untrackable) — place them in scripts/ and install via scripts/install-git-hooks.sh.</scope_out>
   <tools>cargo check --workspace, cargo build --release, grep</tools>
-  <verify>cargo build --release && ./daemon/target/release/triumvirate --version | grep 3.1.0</verify>
-  <reality_test>After the change: (1) daemon/Cargo.toml shows version = "3.1.0"; (2) cargo build --release succeeds; (3) triumvirate --version prints 3.1.0; (4) the MCP server info response includes 3.1.0 (verified by calling ping or inspecting get_info); (5) HTTP /health response body includes version 3.1.0; (6) pre-commit hook rejects a staged spec file that declares a different version than Cargo.toml.</reality_test>
-  <done_when>Cargo workspace at 3.1.0. Rust code imports VERSION from daemon_core::version via env!("CARGO_PKG_VERSION") — zero hardcoded version strings. MCP get_info() reports 3.1.0. HTTP /health reports 3.1.0. Pre-commit hook installed at .git/hooks/pre-commit checks spec version drift. ROADMAP.md updated: "Current version: 3.1.0 (in progress)".</done_when>
+  <verify>cargo build --release</verify>
+  <reality_test>After the change, all of these must be true: (1) grep '^version = "3.1.0"' daemon/Cargo.toml returns a match; (2) cargo build --release exits 0; (3) ./daemon/target/release/triumvirate --version prints a string containing 3.1.0; (4) ./daemon/target/release/triumvirate doctor prints a string containing 3.1.0 (or add version to doctor output); (5) scripts/version-drift-check.sh exists and is executable; (6) scripts/install-git-hooks.sh exists and, when run, installs a pre-commit hook that rejects a test file declaring a mismatched version.</reality_test>
+  <done_when>Cargo workspace at 3.1.0. Rust code reads VERSION from daemon_core::version via env!("CARGO_PKG_VERSION") — zero hardcoded version strings. MCP get_info() instructions include 3.1.0. CLI --version prints 3.1.0. scripts/version-drift-check.sh committed to repo (trackable). scripts/install-git-hooks.sh committed and documented. ROADMAP.md updated: "Current version: 3.1.0 (in progress)".</done_when>
 </task>
 
 ### T-000 Implementation Details
