@@ -392,7 +392,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <files>NOT APPLICABLE — orchestrator edits /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md directly. No &lt;files&gt; list because this task bypasses ABE contract validation.</files>
   <scope_out>Do not change skill behavior or purpose. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — all by the orchestrator in the main Claude session</tools>
-  <verify>grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md returns a positive integer</verify>
+  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md && ! grep -qE "send_message|get_response" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md</verify>
   <reality_test>After orchestrator runs the edit: (1) grep "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md returns zero matches; (2) grep "mcp__triumvirate__ask_session" returns at least one match; (3) grep "send_message\|get_response" returns zero matches in the skill body (the two-step async pattern is eliminated). Additionally, a human invoking /send-to-codex with a small test prompt gets a direct response (no job_id in the flow).</reality_test>
   <done_when>Skill file references mcp__triumvirate__ask_session. No references to mcp__inter-agent or send_message/get_response. Orchestrator reports the verification grep output.</done_when>
 </task>
