@@ -129,7 +129,7 @@ After killing the async job model (R1-D1: C), every TS tool maps to a Rust equiv
 | `list_jobs` | `get_status` (shape-mapped) | alias with shape translation |
 | `write_scratchpad` | `scratchpad_write` | alias (name + params `topic/content/owner/daemon_id` mapped into Rust schema) |
 | `list_scratchpad` | `scratchpad_list` | alias (name + `cwd` passthrough) |
-| `pythia_query` | — | OUT OF SCOPE — not in TS inter-agent server in practice, stays in Pythia MCP |
+| `pythia_query` | — | OUT OF SCOPE — registered in unified-tools.ts as a delegation proxy but the separate `pythia` MCP server entry handles it directly; no alias needed |
 | `pythia_corpus_health` | — | OUT OF SCOPE — same |
 | `code_review` | `review_request` | alias with shape translation (`cwd/uncommitted/base_branch/commit_sha` → review request schema) |
 
