@@ -17,7 +17,7 @@ This creates:
 - **Two processes to manage** — TS server crashes independently of the daemon
 - **Two tool namespaces** — TS tools are `spawn_daemon`, Rust tools are `spawn_session` for the same operation
 - **A proxy tax on every new feature** — any MCP tool added to the Rust daemon needs a TS shim
-- **A 5,000-line main.rs** — all tool handlers, HTTP routes, metrics, and state management crammed into one file
+- **A 6,216-line main.rs** (as of 2026-04-09, HEAD `373256451`) — all tool handlers, HTTP routes, metrics, and state management crammed into one file. Production code through line ~2,824; rest is test module.
 
 The Rust daemon already won. This sprint makes it official.
 
