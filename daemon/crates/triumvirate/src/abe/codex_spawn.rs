@@ -50,7 +50,11 @@ pub async fn enforce_timeout_with_metrics(
     tokio::time::sleep(std::time::Duration::from_secs(timeout_sec)).await;
 
     let mut child = child.lock().await;
-    if child.try_wait()?.is_some() {
+    if child
+        .try_wait()
+        .context("failed to check child process status before timeout enforcement")?
+        .is_some()
+    {
         return Ok(false);
     }
 
@@ -68,8 +72,15 @@ pub async fn enforce_timeout_with_metrics(
         }
     }
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-    if child.try_wait()?.is_none() {
-        let _ = child.kill().await;
+    if child
+        .try_wait()
+        .context("failed to check child process status before SIGKILL escalation")?
+        .is_none()
+    {
+        let _ = child
+            .kill()
+            .await
+            .context("failed to send SIGKILL to timed-out child process");
         tracing::warn!(
             task_id = "unknown",
             timeout_sec,
@@ -86,26 +97,34 @@ pub async fn enforce_timeout_with_metrics(
 }
 
 fn cleanup_git_locks(worktree_path: &Path) {
-    let git_dir = resolve_git_dir(worktree_path);
+    let git_dir = resolve_git_dir(worktree_path).unwrap_or_else(|err| {
+        tracing::warn!(
+            worktree_path = %worktree_path.display(),
+            error = %err,
+            "failed_to_resolve_git_dir_for_cleanup"
+        );
+        worktree_path.join(".git")
+    });
     let _ = std::fs::remove_file(git_dir.join("index.lock"));
     let _ = std::fs::remove_file(worktree_path.join(".git").join("index.lock"));
     let _ = std::fs::remove_file(worktree_path.join(".git/index.lock"));
 }
 
-fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
+fn resolve_git_dir(worktree_path: &Path) -> anyhow::Result<PathBuf> {
     let dot_git = worktree_path.join(".git");
     if dot_git.is_file() {
-        let content = std::fs::read_to_string(&dot_git).unwrap_or_default();
+        let content = std::fs::read_to_string(&dot_git)
+            .with_context(|| format!("failed to read git pointer file {}", dot_git.display()))?;
         if let Some(gitdir) = content.lines().find_map(|line| line.strip_prefix("gitdir:")) {
             let raw = gitdir.trim();
             let parsed = PathBuf::from(raw);
             if parsed.is_absolute() {
-                return parsed;
+                return Ok(parsed);
             }
-            return worktree_path.join(parsed);
+            return Ok(worktree_path.join(parsed));
         }
     }
-    dot_git
+    Ok(dot_git)
 }
 
 #[instrument(skip_all)]

@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
+use anyhow::Context;
 use chrono::Utc;
 use daemon_core::metrics::DaemonMetrics;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -37,7 +38,8 @@ pub trait DispatchBackend: Send + Sync {
 
 #[instrument(skip_all)]
 pub fn parse_plan(path: &Path) -> anyhow::Result<Vec<PlanTask>> {
-    let content = fs::read_to_string(path)?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read implementation plan at {}", path.display()))?;
     let mut tasks = Vec::new();
 
     let mut cursor = 0usize;
@@ -164,8 +166,14 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
     max_parallel: usize,
     metrics: Option<&DaemonMetrics>,
 ) -> anyhow::Result<()> {
-    let mut state = read_state(state_path)?;
-    let tasks = parse_plan(plan_path)?;
+    let mut state = read_state(state_path).with_context(|| {
+        format!(
+            "failed to load orchestrator build state from {}",
+            state_path.display()
+        )
+    })?;
+    let tasks = parse_plan(plan_path)
+        .with_context(|| format!("failed to parse plan file at {}", plan_path.display()))?;
 
     let mut waves: BTreeMap<u32, Vec<PlanTask>> = BTreeMap::new();
     for task in tasks {
@@ -182,7 +190,13 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
             "abe_wave_started"
         );
         state.current_wave = wave;
-        update_state(state_path, &state)?;
+        update_state(state_path, &state).with_context(|| {
+            format!(
+                "failed to persist state while starting wave {} in {}",
+                wave,
+                state_path.display()
+            )
+        })?;
 
         let mut pending = wave_tasks.into_iter();
         let mut running = FuturesUnordered::new();
@@ -198,7 +212,13 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
                     "abe_dispatch_started"
                 );
                 state.tasks_running.push(task.task_id.clone());
-                update_state(state_path, &state)?;
+                update_state(state_path, &state).with_context(|| {
+                    format!(
+                        "failed to persist running state for task {} in {}",
+                        task.task_id,
+                        state_path.display()
+                    )
+                })?;
                 running.push(async move {
                     let started = std::time::Instant::now();
                     let ticket = backend.dispatch_task(&task).await?;
@@ -252,7 +272,14 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
                     "PASS",
                     "clean",
                     &timestamp,
-                )?;
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to append manifest row for task {} at {}",
+                        task.task_id,
+                        manifest_path.display()
+                    )
+                })?;
                 append_deviation(
                     deviation_path,
                     &task.task_id,
@@ -260,7 +287,14 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
                     "clean - no deviations",
                     "none",
                     &timestamp,
-                )?;
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to append deviation row for task {} at {}",
+                        task.task_id,
+                        deviation_path.display()
+                    )
+                })?;
             } else {
                 state.tasks_failed.push(task.task_id.clone());
                 let timestamp = Utc::now().to_rfc3339();
@@ -271,9 +305,22 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
                     "task failed",
                     "worker-error",
                     &timestamp,
-                )?;
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to append failure deviation row for task {} at {}",
+                        task.task_id,
+                        deviation_path.display()
+                    )
+                })?;
             }
-            update_state(state_path, &state)?;
+            update_state(state_path, &state).with_context(|| {
+                format!(
+                    "failed to persist post-task state for {} in {}",
+                    task.task_id,
+                    state_path.display()
+                )
+            })?;
         }
     }
 
