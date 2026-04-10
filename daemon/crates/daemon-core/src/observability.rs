@@ -1,16 +1,26 @@
+use std::any::Any;
 use crate::metrics::DaemonMetrics;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObservabilityBus {
     pub metrics: Arc<DaemonMetrics>,
     pub ws_events: broadcast::Sender<String>,
+    pub token_db: Arc<dyn Any + Send + Sync>,
 }
 
 impl ObservabilityBus {
-    pub fn new(metrics: Arc<DaemonMetrics>, ws_events: broadcast::Sender<String>) -> Self {
-        Self { metrics, ws_events }
+    pub fn new(
+        metrics: Arc<DaemonMetrics>,
+        ws_events: broadcast::Sender<String>,
+        token_db: Arc<dyn Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            metrics,
+            ws_events,
+            token_db,
+        }
     }
 
     pub fn publish_event(&self, event_type: &str, payload: serde_json::Value) {
@@ -32,7 +42,7 @@ mod tests {
     async fn observability_bus_clone_send_sync_round_trip() {
         let metrics = Arc::new(crate::metrics::DaemonMetrics::new().unwrap());
         let (tx, mut rx) = broadcast::channel::<String>(16);
-        let bus = ObservabilityBus::new(metrics.clone(), tx);
+        let bus = ObservabilityBus::new(metrics.clone(), tx, Arc::new(()));
 
         let bus_a = bus.clone();
         let bus_b = bus.clone();

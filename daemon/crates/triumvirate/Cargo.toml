@@ -41,6 +41,7 @@ agent-adapter = { path = "../agent-adapter" }
 ledger = { path = "../ledger" }
 fleet = { path = "../fleet" }
 peer-review = { path = "../peer-review" }
+token-economics = { path = "../token-economics" }
 
 [dev-dependencies]
 tempfile = "3"

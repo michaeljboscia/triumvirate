@@ -1,5 +1,6 @@
 mod attribution;
 mod direct;
+mod lifecycle;
 mod queries;
 mod scanner;
 mod storage;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub use attribution::{OutboxAttributionEvent, attribute_records};
 pub use direct::record_daemon_tokens;
+pub use lifecycle::run_scanner_loop;
 pub use queries::{
     AgentTokenSummary, BuildCostBreakdown, BuildTaskCost, SessionTokenBreakdown, SummaryQueryFilters,
     TimeRange, by_build_query, by_session_query, summary_query,
