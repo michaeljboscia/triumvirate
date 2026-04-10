@@ -57,6 +57,12 @@ pub async fn enforce_timeout_with_metrics(
     if let Some(pid) = child.id() {
         // SIGTERM first to give the worker a chance to flush state and exit cleanly.
         let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        tracing::warn!(
+            task_id = "unknown",
+            timeout_sec,
+            signal = "SIGTERM",
+            "abe_timeout_triggered"
+        );
         if let Some(metrics) = metrics {
             metrics.abe_timeout_total.inc();
         }
@@ -64,6 +70,12 @@ pub async fn enforce_timeout_with_metrics(
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     if child.try_wait()?.is_none() {
         let _ = child.kill().await;
+        tracing::warn!(
+            task_id = "unknown",
+            timeout_sec,
+            signal = "SIGKILL",
+            "abe_timeout_triggered"
+        );
         if let Some(metrics) = metrics {
             metrics.abe_timeout_total.inc();
         }

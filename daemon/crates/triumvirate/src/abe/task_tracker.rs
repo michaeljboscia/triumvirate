@@ -135,6 +135,12 @@ impl TaskTracker {
         });
         task.child = None;
         self.inc_dispatch_status("completed");
+        tracing::info!(
+            task_id = %task_id,
+            commit_sha = task.commit_sha.as_deref().unwrap_or_default(),
+            duration_ms = task.started_at.elapsed().as_millis() as u64,
+            "abe_task_completed"
+        );
         TransitionOutcome::Transitioned
     }
 

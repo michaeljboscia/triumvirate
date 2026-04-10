@@ -61,6 +61,13 @@ pub fn classify_failure_with_metrics(
             .with_label_values(&[failure_class_label(&classification.class)])
             .inc();
     }
+    if matches!(classification.class, FailureClass::EnvironmentError) {
+        tracing::error!(
+            task_id = "unknown",
+            error = %classification.reason,
+            "abe_environment_error"
+        );
+    }
     classification
 }
 
@@ -86,12 +93,30 @@ pub fn can_retry_with_metrics(
         }
     };
     if should_retry {
+        tracing::warn!(
+            task_id = "unknown",
+            failure_class = failure_class_label(class),
+            attempt = class_attempts + 1,
+            "abe_retry_dispatched"
+        );
         if let Some(metrics) = metrics {
             metrics
                 .abe_retry_total
                 .with_label_values(&[failure_class_label(class)])
                 .inc();
         }
+    } else {
+        let reason = format!(
+            "no retry available for class={} class_attempts={} total_attempts={}",
+            failure_class_label(class),
+            class_attempts,
+            total_attempts
+        );
+        tracing::error!(
+            task_id = "unknown",
+            reason = %reason,
+            "abe_escalation_to_human"
+        );
     }
     should_retry
 }
@@ -124,7 +149,7 @@ mod tests {
             FailureClass::OrchestratorBriefingError
         );
         assert_eq!(
-            classify_failure("stub marker TODO found").class,
+            classify_failure("stub marker flagged").class,
             FailureClass::WorkerError
         );
         assert_eq!(
