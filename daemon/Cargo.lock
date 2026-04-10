@@ -346,14 +346,20 @@ dependencies = [
 name = "daemon-http"
 version = "3.1.0"
 dependencies = [
+ "agent-adapter",
  "anyhow",
+ "axum",
  "daemon-core",
+ "fallback-outbox",
+ "ledger",
  "mcp-bridge",
  "reqwest",
  "serde",
  "serde_json",
  "shared-types",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
