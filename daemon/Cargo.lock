@@ -353,6 +353,8 @@ dependencies = [
  "fallback-outbox",
  "ledger",
  "mcp-bridge",
+ "mime_guess",
+ "prometheus",
  "reqwest",
  "serde",
  "serde_json",

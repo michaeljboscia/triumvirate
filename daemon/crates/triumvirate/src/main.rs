@@ -5,16 +5,18 @@ use agent_worker::{
 #[cfg(test)]
 use agent_worker::{reset_worker_registry_for_tests, update_worker_session};
 use daemon_core::{
-    QueueRegistry,
+    DaemonState,
     daemon_bind_addr as core_daemon_bind_addr,
+    publish_ws_event,
     metrics::DaemonMetrics,
     triumvirate_home_dir as core_triumvirate_home_dir,
-    unix_time_ms as core_unix_time_ms,
     ensure_daemon_token as core_ensure_daemon_token,
     sessions_file_path as core_sessions_file_path,
     load_json_file_if_exists as core_load_json_file_if_exists,
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
+#[cfg(test)]
+use daemon_core::unix_time_ms as core_unix_time_ms;
 #[cfg(test)]
 use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 #[cfg(test)]
@@ -43,15 +45,13 @@ use mcp_tools::{
 use axum::{
     Json as AxumJson, Router,
     body::Body,
-    extract::{Path, State, WebSocketUpgrade, ws::Message},
+    extract::State,
     handler::Handler,
-    http::{HeaderMap, Request, Response as HttpResponse, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::{get, get_service, post, post_service},
 };
-use rust_embed::RustEmbed;
-use prometheus::{Encoder, TextEncoder};
 use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -112,10 +112,6 @@ mod abe;
 mod cli_ops;
 mod git_ops_impl;
 mod tracing_setup;
-
-#[derive(RustEmbed)]
-#[folder = "../../../dashboard/dist"]
-struct DashboardAssets;
 
 #[derive(Debug, Parser)]
 #[command(name = "triumvirate")]
@@ -793,124 +789,10 @@ fn build_status_report(
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
-    #[derive(Debug, Clone)]
-    struct DaemonState {
-        token: String,
-        queues: QueueRegistry,
-        bind_addr: String,
-        sessions: Arc<Mutex<HashMap<String, SessionState>>>,
-        sessions_file: Option<PathBuf>,
-        abe_tasks: abe::task_tracker::TaskTracker,
-        ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
-        marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
-        metrics: Arc<DaemonMetrics>,
-        ws_events: broadcast::Sender<String>,
-    }
-
-    fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
-        serde_json::json!({
-            "type": event_type,
-            "ts_ms": core_unix_time_ms(),
-            "payload": payload
-        })
-        .to_string()
-    }
-
-    fn publish_ws_event(state: &DaemonState, event_type: &str, payload: serde_json::Value) {
-        let _ = state.ws_events.send(encode_ws_event(event_type, payload));
-    }
-
-    async fn ws_route(
-        State(state): State<DaemonState>,
-        ws: WebSocketUpgrade,
-    ) -> Response {
-        ws.on_upgrade(move |mut socket| async move {
-            let mut rx = state.ws_events.subscribe();
-            for bootstrap in [
-                encode_ws_event(
-                    "agent_state",
-                    serde_json::json!({ "agent": "system", "state": "idle" }),
-                ),
-                encode_ws_event(
-                    "fleet_progress",
-                    serde_json::json!({ "active_fleets": 0, "state": "idle" }),
-                ),
-                encode_ws_event(
-                    "ledger_health",
-                    serde_json::json!({ "status": "unknown" }),
-                ),
-                encode_ws_event(
-                    "review_completed",
-                    serde_json::json!({ "review_id": null, "verdict": null }),
-                ),
-            ] {
-                if socket.send(Message::Text(bootstrap.into())).await.is_err() {
-                    return;
-                }
-            }
-
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if socket.send(Message::Text(event.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
-    }
-
-    fn dashboard_asset_response(path: &str) -> Option<HttpResponse<Body>> {
-        let normalized = path.trim_start_matches('/');
-        let asset = DashboardAssets::get(normalized)?;
-        let mime = mime_guess::from_path(normalized).first_or_octet_stream();
-        let headers = [(axum::http::header::CONTENT_TYPE, mime.as_ref())];
-        Some((headers, asset.data.into_owned()).into_response())
-    }
-
-    async fn dashboard_root_route() -> Response {
-        dashboard_asset_response("index.html")
-            .unwrap_or_else(|| (StatusCode::NOT_FOUND, "dashboard index not found").into_response())
-    }
-
-    async fn dashboard_assets_route(Path(path): Path<String>) -> Response {
-        let asset_path = format!("assets/{path}");
-        dashboard_asset_response(&asset_path)
-            .unwrap_or_else(|| (StatusCode::NOT_FOUND, "asset not found").into_response())
-    }
-
-    async fn dashboard_spa_fallback_route(Path(path): Path<String>) -> Response {
-        dashboard_asset_response(&path).unwrap_or_else(|| {
-            dashboard_asset_response("index.html")
-                .unwrap_or_else(|| (StatusCode::NOT_FOUND, "dashboard index not found").into_response())
-        })
-    }
-
-    async fn metrics_route(
-        State(state): State<DaemonState>,
-    ) -> Result<String, (StatusCode, AxumJson<serde_json::Value>)> {
-        state.metrics.snapshot_keepalive();
-        let metric_families = state.metrics.registry.gather();
-        let mut body = Vec::<u8>::new();
-        TextEncoder::new().encode(&metric_families, &mut body).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(serde_json::json!({ "error": e.to_string() })),
-            )
-        })?;
-        String::from_utf8(body).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(serde_json::json!({ "error": e.to_string() })),
-            )
-        })
-    }
+    type DaemonRuntimeState = DaemonState<abe::task_tracker::TaskTracker>;
 
     async fn metrics_middleware(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         request: Request<Body>,
         next: Next,
     ) -> Response {
@@ -935,7 +817,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     async fn health(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
     ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
@@ -951,7 +833,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     async fn status(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
     ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
@@ -982,7 +864,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             .unwrap_or(Duration::from_secs(60))
     }
 
-    async fn run_ledger_sweep_once(state: &DaemonState) {
+    async fn run_ledger_sweep_once(state: &DaemonRuntimeState) {
         let project_roots = {
             let lru = state.ledger_project_lru.lock().await;
             lru.iter().cloned().collect::<Vec<_>>()
@@ -1024,7 +906,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
     }
 
-    async fn run_startup_gc_if_needed(state: &DaemonState) {
+    async fn run_startup_gc_if_needed(state: &DaemonRuntimeState) {
         let Some(project_root) = std::env::current_dir().ok() else {
             tracing::warn!("startup GC skipped: unable to resolve current_dir");
             return;
@@ -1068,7 +950,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     async fn session_spawn_route(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
         AxumJson(req): AxumJson<SpawnSessionRequest>,
     ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
@@ -1100,7 +982,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     async fn session_ask_route(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
         AxumJson(req): AxumJson<AskSessionRequest>,
     ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
@@ -1141,7 +1023,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     async fn session_dismiss_route(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
         AxumJson(req): AxumJson<DismissSessionRequest>,
     ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
@@ -1167,7 +1049,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     async fn session_list_route(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
     ) -> Result<AxumJson<SessionListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
@@ -1187,7 +1069,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     async fn abe_task_complete_route(
-        State(state): State<DaemonState>,
+        State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
         AxumJson(req): AxumJson<TaskCompleteRequest>,
     ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
@@ -1269,18 +1151,18 @@ async fn run_daemon() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|path| core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok())
         .unwrap_or_default();
-    let state = DaemonState {
+    let state = DaemonRuntimeState::new(
         token,
-        queues: Arc::new(Mutex::new(HashMap::new())),
-        bind_addr: bind_addr.clone(),
-        sessions: Arc::new(Mutex::new(sessions)),
+        Arc::new(Mutex::new(HashMap::new())),
+        bind_addr.clone(),
+        Arc::new(Mutex::new(sessions)),
         sessions_file,
-        abe_tasks: abe::task_tracker::TaskTracker::default(),
-        ledger_project_lru: Arc::new(Mutex::new(VecDeque::new())),
-        marker_parse_window: Arc::new(Mutex::new(VecDeque::new())),
-        metrics: Arc::new(DaemonMetrics::new()?),
-        ws_events: broadcast::channel(256).0,
-    };
+        abe::task_tracker::TaskTracker::default(),
+        Arc::new(Mutex::new(VecDeque::new())),
+        Arc::new(Mutex::new(VecDeque::new())),
+        Arc::new(DaemonMetrics::new()?),
+        broadcast::channel(256).0,
+    );
     let http_state = DaemonHttpState {
         token: state.token.clone(),
         queues: state.queues.clone(),
@@ -1292,10 +1174,16 @@ async fn run_daemon() -> anyhow::Result<()> {
     };
     run_startup_gc_if_needed(&state).await;
     let app = Router::new()
-        .route("/", get(dashboard_root_route))
-        .route("/assets/{*path}", get(dashboard_assets_route))
-        .route("/metrics", get(metrics_route))
-        .route("/ws", get(ws_route))
+        .route("/", get(daemon_http::dashboard_root_route))
+        .route("/assets/{*path}", get(daemon_http::dashboard_assets_route))
+        .route(
+            "/metrics",
+            get_service(daemon_http::metrics_route.with_state(http_state.clone())),
+        )
+        .route(
+            "/ws",
+            get_service(daemon_http::ws_route.with_state(http_state.clone())),
+        )
         .route("/health", get(health))
         .route("/status", get(status))
         .route(
@@ -1379,7 +1267,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
         .route("/abe/task-complete", post(abe_task_complete_route))
-        .route("/{*path}", get(dashboard_spa_fallback_route))
+        .route("/{*path}", get(daemon_http::dashboard_spa_fallback_route))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

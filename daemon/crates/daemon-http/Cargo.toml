@@ -13,9 +13,11 @@ fallback-outbox = { path = "../fallback-outbox" }
 ledger = { path = "../ledger" }
 mcp-bridge = { path = "../mcp-bridge" }
 shared-types = { path = "../shared-types" }
+prometheus.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+mime_guess = "2"

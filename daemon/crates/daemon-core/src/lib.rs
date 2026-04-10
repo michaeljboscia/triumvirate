@@ -3,15 +3,16 @@
 //! This crate is the extraction target for daemon-only orchestration logic.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use shared_types::MemoryEntry;
+use shared_types::{MemoryEntry, SessionState};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -430,6 +431,66 @@ pub fn project_queue_key(cwd: Option<&String>, repo: Option<&String>) -> String 
 }
 
 pub type QueueRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+#[derive(Debug, Clone)]
+pub struct DaemonState<TAbeTasks> {
+    pub token: String,
+    pub queues: QueueRegistry,
+    pub bind_addr: String,
+    pub sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    pub sessions_file: Option<PathBuf>,
+    pub abe_tasks: TAbeTasks,
+    pub ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
+    pub metrics: Arc<metrics::DaemonMetrics>,
+    pub ws_events: tokio::sync::broadcast::Sender<String>,
+}
+
+impl<TAbeTasks> DaemonState<TAbeTasks> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        token: String,
+        queues: QueueRegistry,
+        bind_addr: String,
+        sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+        sessions_file: Option<PathBuf>,
+        abe_tasks: TAbeTasks,
+        ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
+        marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
+        metrics: Arc<metrics::DaemonMetrics>,
+        ws_events: tokio::sync::broadcast::Sender<String>,
+    ) -> Self {
+        Self {
+            token,
+            queues,
+            bind_addr,
+            sessions,
+            sessions_file,
+            abe_tasks,
+            ledger_project_lru,
+            marker_parse_window,
+            metrics,
+            ws_events,
+        }
+    }
+}
+
+pub fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
+    serde_json::json!({
+        "type": event_type,
+        "ts_ms": unix_time_ms(),
+        "payload": payload
+    })
+    .to_string()
+}
+
+pub fn publish_ws_event<TAbeTasks>(
+    state: &DaemonState<TAbeTasks>,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    let _ = state.ws_events.send(encode_ws_event(event_type, payload));
+}
 
 #[instrument(skip_all)]
 pub async fn acquire_project_queue(registry: &QueueRegistry, key: String) -> Arc<Mutex<()>> {
