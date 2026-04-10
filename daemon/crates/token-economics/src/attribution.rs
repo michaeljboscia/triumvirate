@@ -219,4 +219,67 @@ mod tests {
         assert_eq!(record.wave, None);
         assert!(record.cost_usd.is_some());
     }
+
+    #[test]
+    fn price_table_temporal_lookup_uses_active_price_for_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open token db");
+        {
+            let conn = db.conn.lock().expect("lock db");
+            conn.execute(
+                r#"
+                INSERT INTO price_table (
+                    model,
+                    input_per_mtok,
+                    output_per_mtok,
+                    cached_per_mtok,
+                    effective_date,
+                    end_date
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    "gpt-5.3-codex",
+                    10.0_f64,
+                    20.0_f64,
+                    0.0_f64,
+                    "2026-01-01T00:00:00Z",
+                    Some("2026-06-01T00:00:00Z")
+                ],
+            )
+            .expect("insert first price point");
+            conn.execute(
+                r#"
+                INSERT INTO price_table (
+                    model,
+                    input_per_mtok,
+                    output_per_mtok,
+                    cached_per_mtok,
+                    effective_date,
+                    end_date
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    "gpt-5.3-codex",
+                    30.0_f64,
+                    40.0_f64,
+                    0.0_f64,
+                    "2026-06-01T00:00:00Z",
+                    Option::<String>::None
+                ],
+            )
+            .expect("insert second price point");
+        }
+
+        let mut record = sample_record("sess-temporal", "gpt-5.3-codex");
+        record.timestamp = "2026-06-15T10:00:00Z".to_string();
+        record.input_tokens = 1_000;
+        record.output_tokens = 500;
+        record.cached_tokens = 0;
+
+        let attributed = attribute_records(&db, vec![record], &[]).expect("attribute records");
+        let cost = attributed[0].cost_usd.expect("cost should be present");
+
+        let expected = ((1_000.0 * 30.0) + (500.0 * 40.0)) / 1_000_000.0;
+        assert!((cost - expected).abs() < 1e-12);
+    }
 }
