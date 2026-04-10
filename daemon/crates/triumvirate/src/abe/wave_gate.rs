@@ -3,7 +3,8 @@ use std::process::Command;
 use tracing::instrument;
 use std::time::Instant;
 
-use daemon_core::metrics::DaemonMetrics;
+use daemon_core::{encode_ws_event, metrics::DaemonMetrics};
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveTask {
@@ -35,7 +36,7 @@ pub fn gate_wave<F>(
 where
     F: Fn(&[WaveTask]) -> anyhow::Result<String>,
 {
-    gate_wave_with_metrics(tasks, test_command, gemini_review, 0, None)
+    gate_wave_with_metrics(tasks, test_command, gemini_review, 0, None, None)
 }
 
 pub fn gate_wave_with_metrics<F>(
@@ -44,11 +45,23 @@ pub fn gate_wave_with_metrics<F>(
     gemini_review: F,
     wave: u32,
     metrics: Option<&DaemonMetrics>,
+    ws_events: Option<&broadcast::Sender<String>>,
 ) -> anyhow::Result<String>
 where
     F: Fn(&[WaveTask]) -> anyhow::Result<String>,
 {
     let started = Instant::now();
+    if let Some(ws_events) = ws_events {
+        let _ = ws_events.send(encode_ws_event(
+            "abe_wave_state",
+            serde_json::json!({
+                "wave": wave,
+                "status": "running",
+                "task_count": tasks.len(),
+                "duration_ms": 0,
+            }),
+        ));
+    }
     validate_no_overlap(tasks)?;
     if tasks
         .iter()
@@ -90,6 +103,17 @@ where
             .abe_wave_duration_seconds
             .with_label_values(&[&wave.to_string()])
             .observe(started.elapsed().as_secs_f64());
+    }
+    if let Some(ws_events) = ws_events {
+        let _ = ws_events.send(encode_ws_event(
+            "abe_wave_state",
+            serde_json::json!({
+                "wave": wave,
+                "status": "gate_passed",
+                "task_count": tasks.len(),
+                "duration_ms": started.elapsed().as_millis(),
+            }),
+        ));
     }
     Ok(summary)
 }

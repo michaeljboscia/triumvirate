@@ -1,4 +1,4 @@
-use daemon_core::metrics::DaemonMetrics;
+use daemon_core::{encode_ws_event, metrics::DaemonMetrics};
 use fleet::orchestrator::{FleetOrchestrator, FleetSpawnRequest as FleetSpawnRunRequest};
 use fleet::tasks::FleetTaskStore;
 use shared_types::{
@@ -14,10 +14,29 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
+
+fn emit_fleet_progress(
+    ws_events: Option<&broadcast::Sender<String>>,
+    fleet_id: &str,
+    state: &str,
+    active_fleets: usize,
+) {
+    let Some(ws_events) = ws_events else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "fleet_id": fleet_id,
+        "state": state,
+        "active_fleets": active_fleets,
+    });
+    let _ = ws_events.send(encode_ws_event("fleet_progress", payload));
+}
 
 pub async fn fleet_spawn<G, F>(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     metrics: &DaemonMetrics,
+    ws_events: Option<&broadcast::Sender<String>>,
     req: FleetSpawnRequest,
     orchestrator_factory: F,
 ) -> Result<FleetSpawnResponse, String>
@@ -76,6 +95,7 @@ where
         .filter(|status| status.state == "running" || status.state == "spawning")
         .count();
     metrics.fleet_active_total.set(active as i64);
+    emit_fleet_progress(ws_events, &result.fleet_id, &state, active);
 
     Ok(FleetSpawnResponse {
         fleet_id: result.fleet_id,
@@ -140,6 +160,7 @@ pub async fn fleet_claim_task(
 pub async fn fleet_cancel(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     metrics: &DaemonMetrics,
+    ws_events: Option<&broadcast::Sender<String>>,
     req: FleetCancelRequest,
 ) -> Result<FleetCancelResponse, String> {
     let mut fleet_states = fleet_states.lock().await;
@@ -149,5 +170,8 @@ pub async fn fleet_cancel(
         .filter(|status| status.state == "running" || status.state == "spawning")
         .count();
     metrics.fleet_active_total.set(active as i64);
+    if canceled {
+        emit_fleet_progress(ws_events, &req.fleet_id, "cancelled", active);
+    }
     Ok(FleetCancelResponse { canceled })
 }

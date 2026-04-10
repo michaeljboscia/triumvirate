@@ -89,6 +89,7 @@ fn setup_worktree_inner(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSe
 
     ensure_exclude_entry(&worktree_path, ".triumvirate/")?;
 
+    run_git(&req.project_root, ["config", "extensions.worktreeConfig", "true"])?;
     run_git(
         &worktree_path,
         ["config", "--worktree", "core.hooksPath", ".triumvirate/hooks"],
