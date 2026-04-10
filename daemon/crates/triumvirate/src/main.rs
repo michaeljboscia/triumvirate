@@ -95,11 +95,12 @@ use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     process::Command,
     sync::{
         Arc,
+        OnceLock,
     },
 };
 use tokio::{
@@ -147,6 +148,17 @@ struct McpBridge {
     sessions_file: Option<PathBuf>,
     fleet_states: Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     abe_tasks: abe::task_tracker::TaskTracker,
+    metrics: Arc<DaemonMetrics>,
+}
+
+static PROCESS_METRICS: OnceLock<Arc<DaemonMetrics>> = OnceLock::new();
+
+pub(crate) fn process_metrics() -> Option<&'static Arc<DaemonMetrics>> {
+    PROCESS_METRICS.get()
+}
+
+fn set_process_metrics(metrics: Arc<DaemonMetrics>) {
+    let _ = PROCESS_METRICS.set(metrics);
 }
 
 fn mcp_daemon_proxy_enabled() -> bool {
@@ -175,6 +187,8 @@ impl McpBridge {
     }
 
     fn with_persistence(enable_persistence: bool) -> Self {
+        let metrics = Arc::new(DaemonMetrics::new().expect("failed to initialize daemon metrics"));
+        set_process_metrics(metrics.clone());
         let sessions_file = if enable_persistence {
             core_triumvirate_home_dir()
                 .ok()
@@ -193,6 +207,7 @@ impl McpBridge {
             sessions_file,
             fleet_states: Arc::new(Mutex::new(HashMap::new())),
             abe_tasks: abe::task_tracker::TaskTracker::default(),
+            metrics,
         }
     }
 
@@ -758,7 +773,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FleetSpawnRequest>,
     ) -> Result<Json<FleetSpawnResponse>, String> {
-        let response = mcp_fleet::fleet_spawn(&self.fleet_states, req, |project_root| {
+        let response = mcp_fleet::fleet_spawn(&self.fleet_states, &self.metrics, req, |project_root| {
             let git_ops = git_ops_impl::RealGitOps::new(project_root)
                 .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
             Ok(fleet::orchestrator::FleetOrchestrator::new(git_ops))
@@ -796,7 +811,9 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FleetCancelRequest>,
     ) -> Result<Json<FleetCancelResponse>, String> {
-        Ok(Json(mcp_fleet::fleet_cancel(&self.fleet_states, req).await?))
+        Ok(Json(
+            mcp_fleet::fleet_cancel(&self.fleet_states, &self.metrics, req).await?,
+        ))
     }
 
     #[tool(description = "Request a peer review and receive assigned reviewer + review_id.")]
@@ -813,7 +830,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<ReviewSubmitRequest>,
     ) -> Result<String, String> {
-        mcp_review::review_submit(req)
+        mcp_review::review_submit(&self.metrics, req)
     }
 
     #[tool(description = "Get current peer review status by review_id.")]
@@ -1048,6 +1065,29 @@ async fn run_daemon() -> anyhow::Result<()> {
             .unwrap_or(Duration::from_secs(60))
     }
 
+    fn spool_dir_size_bytes(path: &Path) -> i64 {
+        if !path.exists() {
+            return 0;
+        }
+        let mut total: u128 = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.filter_map(Result::ok) {
+                let file_type = match entry.file_type() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if file_type.is_file() {
+                    if let Ok(meta) = entry.metadata() {
+                        total = total.saturating_add(meta.len() as u128);
+                    }
+                } else if file_type.is_dir() {
+                    total = total.saturating_add(spool_dir_size_bytes(&entry.path()) as u128);
+                }
+            }
+        }
+        total.min(i64::MAX as u128) as i64
+    }
+
     async fn run_ledger_sweep_once(state: &DaemonRuntimeState) {
         let project_roots = {
             let lru = state.ledger_project_lru.lock().await;
@@ -1056,23 +1096,25 @@ async fn run_daemon() -> anyhow::Result<()> {
         for project_root in project_roots {
             let result = tokio::task::spawn_blocking({
                 let project_root = project_root.clone();
-                move || -> anyhow::Result<(shared_types::DrainResult, f64)> {
+                move || -> anyhow::Result<(shared_types::DrainResult, f64, i64)> {
                     let store = LedgerStore::open(project_root.clone())?;
                     let spool_dir = project_root.join(".triumvirate").join("spool");
                     let drained = store.drain_spool(&spool_dir)?;
                     let lag = store.queue_lag_seconds()?;
-                    Ok((drained, lag))
+                    let spool_size_bytes = spool_dir_size_bytes(&spool_dir);
+                    Ok((drained, lag, spool_size_bytes))
                 }
             })
             .await;
 
             match result {
-                Ok(Ok((drain_result, lag))) => {
+                Ok(Ok((drain_result, lag, spool_size_bytes))) => {
                     state
                         .metrics
                         .ledger_events_ingested_total
                         .inc_by(drain_result.ingested_count as u64);
                     state.metrics.ledger_queue_lag_seconds.set(lag);
+                    state.metrics.ledger_spool_size_bytes.set(spool_size_bytes);
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(
@@ -1347,6 +1389,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         Arc::new(DaemonMetrics::new()?),
         broadcast::channel(256).0,
     );
+    set_process_metrics(state.metrics.clone());
     let http_state = DaemonHttpState {
         token: state.token.clone(),
         queues: state.queues.clone(),

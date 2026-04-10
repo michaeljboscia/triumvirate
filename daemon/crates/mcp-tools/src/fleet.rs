@@ -1,3 +1,4 @@
+use daemon_core::metrics::DaemonMetrics;
 use fleet::orchestrator::{FleetOrchestrator, FleetSpawnRequest as FleetSpawnRunRequest};
 use fleet::tasks::FleetTaskStore;
 use shared_types::{
@@ -16,6 +17,7 @@ use tokio::sync::Mutex;
 
 pub async fn fleet_spawn<G, F>(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
+    metrics: &DaemonMetrics,
     req: FleetSpawnRequest,
     orchestrator_factory: F,
 ) -> Result<FleetSpawnResponse, String>
@@ -69,6 +71,11 @@ where
     };
     let mut fleet_states = fleet_states.lock().await;
     fleet_states.insert(result.fleet_id.clone(), status);
+    let active = fleet_states
+        .values()
+        .filter(|status| status.state == "running" || status.state == "spawning")
+        .count();
+    metrics.fleet_active_total.set(active as i64);
 
     Ok(FleetSpawnResponse {
         fleet_id: result.fleet_id,
@@ -132,9 +139,15 @@ pub async fn fleet_claim_task(
 
 pub async fn fleet_cancel(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
+    metrics: &DaemonMetrics,
     req: FleetCancelRequest,
 ) -> Result<FleetCancelResponse, String> {
     let mut fleet_states = fleet_states.lock().await;
     let canceled = fleet_states.remove(&req.fleet_id).is_some();
+    let active = fleet_states
+        .values()
+        .filter(|status| status.state == "running" || status.state == "spawning")
+        .count();
+    metrics.fleet_active_total.set(active as i64);
     Ok(FleetCancelResponse { canceled })
 }
