@@ -53,7 +53,13 @@ pub fn setup_worktree_with_metrics(
 
 fn setup_worktree_inner(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSetupResult> {
     let worktree_base = req.project_root.join(".triumvirate").join("abe-worktrees");
-    fs::create_dir_all(&worktree_base)?;
+    fs::create_dir_all(&worktree_base).with_context(|| {
+        format!(
+            "failed to create worktree base directory {} for task {}",
+            worktree_base.display(),
+            req.task_id
+        )
+    })?;
 
     let worktree_path = worktree_base.join(format!("{}-{}", req.task_id, short_sha(&req.sha)));
     if worktree_path.exists() {
@@ -72,28 +78,69 @@ fn setup_worktree_inner(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSe
     .with_context(|| format!("failed to create worktree for {}", req.task_id))?;
 
     let triumvirate_dir = worktree_path.join(".triumvirate");
-    fs::create_dir_all(triumvirate_dir.join("hooks"))?;
+    fs::create_dir_all(triumvirate_dir.join("hooks")).with_context(|| {
+        format!(
+            "failed to create hooks directory {} for task {}",
+            triumvirate_dir.join("hooks").display(),
+            req.task_id
+        )
+    })?;
 
     fs::write(
         triumvirate_dir.join("BRIEFING.md"),
         req.briefing_content.as_bytes(),
-    )?;
+    )
+    .with_context(|| {
+        format!(
+            "failed to write briefing file {} for task {}",
+            triumvirate_dir.join("BRIEFING.md").display(),
+            req.task_id
+        )
+    })?;
     fs::write(
         triumvirate_dir.join("contract.json"),
-        serde_json::to_vec_pretty(&req.contract_fields)?,
+        serde_json::to_vec_pretty(&req.contract_fields).with_context(|| {
+            format!("failed to serialize contract fields for task {}", req.task_id)
+        })?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write contract file {} for task {}",
+            triumvirate_dir.join("contract.json").display(),
+            req.task_id
+        )
+    })?;
+
+    write_validate_script(&triumvirate_dir)
+        .with_context(|| format!("failed to write validate script for task {}", req.task_id))?;
+    write_pre_commit_hook(&triumvirate_dir)
+        .with_context(|| format!("failed to write pre-commit hook for task {}", req.task_id))?;
+    write_commit_msg_hook(&triumvirate_dir)
+        .with_context(|| format!("failed to write commit-msg hook for task {}", req.task_id))?;
+
+    ensure_exclude_entry(&worktree_path, ".triumvirate/")
+        .with_context(|| format!("failed to update git exclude for task {}", req.task_id))?;
+
+    run_git(&req.project_root, ["config", "extensions.worktreeConfig", "true"]).with_context(
+        || {
+            format!(
+                "failed to enable worktree config in {} for task {}",
+                req.project_root.display(),
+                req.task_id
+            )
+        },
     )?;
-
-    write_validate_script(&triumvirate_dir)?;
-    write_pre_commit_hook(&triumvirate_dir)?;
-    write_commit_msg_hook(&triumvirate_dir)?;
-
-    ensure_exclude_entry(&worktree_path, ".triumvirate/")?;
-
-    run_git(&req.project_root, ["config", "extensions.worktreeConfig", "true"])?;
     run_git(
         &worktree_path,
         ["config", "--worktree", "core.hooksPath", ".triumvirate/hooks"],
-    )?;
+    )
+    .with_context(|| {
+        format!(
+            "failed to set core.hooksPath in {} for task {}",
+            worktree_path.display(),
+            req.task_id
+        )
+    })?;
 
     Ok(WorktreeSetupResult { worktree_path })
 }
@@ -121,7 +168,17 @@ where
     S: AsRef<str> + 'a,
 {
     let args_vec = args.into_iter().map(|s| s.as_ref().to_string()).collect::<Vec<_>>();
-    let out = Command::new("git").current_dir(cwd).args(&args_vec).output()?;
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(&args_vec)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to execute git {} in {}",
+                args_vec.join(" "),
+                cwd.display()
+            )
+        })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("git {} failed: {}", args_vec.join(" "), stderr.trim());
@@ -130,35 +187,55 @@ where
 }
 
 fn ensure_exclude_entry(worktree_path: &Path, entry: &str) -> anyhow::Result<()> {
-    let info_dir = resolve_git_dir(worktree_path).join("info");
-    fs::create_dir_all(&info_dir)?;
+    let info_dir = resolve_git_dir(worktree_path)
+        .with_context(|| format!("failed to resolve git dir for {}", worktree_path.display()))?
+        .join("info");
+    fs::create_dir_all(&info_dir)
+        .with_context(|| format!("failed to create git info dir {}", info_dir.display()))?;
     let exclude_path = info_dir.join("exclude");
-    let mut contents = fs::read_to_string(&exclude_path).unwrap_or_default();
+    let mut contents = match fs::read_to_string(&exclude_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to read git exclude file {}",
+                    exclude_path.display()
+                )
+            })
+        }
+    };
     if !contents.lines().any(|line| line.trim() == entry) {
         if !contents.ends_with('\n') && !contents.is_empty() {
             contents.push('\n');
         }
         contents.push_str(entry);
         contents.push('\n');
-        fs::write(exclude_path, contents.as_bytes())?;
+        fs::write(&exclude_path, contents.as_bytes()).with_context(|| {
+            format!(
+                "failed to write git exclude file {}",
+                exclude_path.display()
+            )
+        })?;
     }
     Ok(())
 }
 
-fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
+fn resolve_git_dir(worktree_path: &Path) -> anyhow::Result<PathBuf> {
     let dot_git = worktree_path.join(".git");
     if dot_git.is_file() {
-        let content = fs::read_to_string(&dot_git).unwrap_or_default();
+        let content = fs::read_to_string(&dot_git)
+            .with_context(|| format!("failed to read git pointer file {}", dot_git.display()))?;
         if let Some(gitdir) = content.lines().find_map(|line| line.strip_prefix("gitdir:")) {
             let raw = gitdir.trim();
             let parsed = PathBuf::from(raw);
             if parsed.is_absolute() {
-                return parsed;
+                return Ok(parsed);
             }
-            return worktree_path.join(parsed);
+            return Ok(worktree_path.join(parsed));
         }
     }
-    dot_git
+    Ok(dot_git)
 }
 
 fn write_validate_script(triumvirate_dir: &Path) -> anyhow::Result<()> {
@@ -168,26 +245,37 @@ fn write_validate_script(triumvirate_dir: &Path) -> anyhow::Result<()> {
         .filter(|p| p.exists());
 
     if let Some(source) = source {
-        fs::copy(source, &dst)?;
+        fs::copy(&source, &dst).with_context(|| {
+            format!(
+                "failed to copy validate-task script from {} to {}",
+                source.display(),
+                dst.display()
+            )
+        })?;
     } else {
         fs::write(
             &dst,
             b"#!/usr/bin/env bash\nset -euo pipefail\necho 'validate-task fallback: PASS'\n",
-        )?;
+        )
+        .with_context(|| format!("failed to write fallback validate-task script at {}", dst.display()))?;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&dst)?.permissions();
+        let mut perms = fs::metadata(&dst)
+            .with_context(|| format!("failed to read file metadata for {}", dst.display()))?
+            .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&dst, perms)?;
+        fs::set_permissions(&dst, perms)
+            .with_context(|| format!("failed to set executable permissions on {}", dst.display()))?;
     }
     Ok(())
 }
 
 fn write_pre_commit_hook(triumvirate_dir: &Path) -> anyhow::Result<()> {
     let hook_path = triumvirate_dir.join("hooks").join("pre-commit");
-    let mut file = fs::File::create(&hook_path)?;
+    let mut file = fs::File::create(&hook_path)
+        .with_context(|| format!("failed to create pre-commit hook at {}", hook_path.display()))?;
     file.write_all(
         br#"#!/usr/bin/env bash
 set -euo pipefail
@@ -221,14 +309,22 @@ if [[ -n "$test_cmd" ]]; then
   fi
 fi
 "#,
-    )?;
+    )
+    .with_context(|| format!("failed to write pre-commit hook at {}", hook_path.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&hook_path)?.permissions();
+        let mut perms = fs::metadata(&hook_path)
+            .with_context(|| format!("failed to read metadata for {}", hook_path.display()))?
+            .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms)?;
+        fs::set_permissions(&hook_path, perms).with_context(|| {
+            format!(
+                "failed to set executable permissions on {}",
+                hook_path.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -236,7 +332,8 @@ fi
 
 fn write_commit_msg_hook(triumvirate_dir: &Path) -> anyhow::Result<()> {
     let hook_path = triumvirate_dir.join("hooks").join("commit-msg");
-    let mut file = fs::File::create(&hook_path)?;
+    let mut file = fs::File::create(&hook_path)
+        .with_context(|| format!("failed to create commit-msg hook at {}", hook_path.display()))?;
     file.write_all(
         br#"#!/usr/bin/env bash
 set -euo pipefail
@@ -259,14 +356,22 @@ if [[ -n "$commit_format" ]]; then
   fi
 fi
 "#,
-    )?;
+    )
+    .with_context(|| format!("failed to write commit-msg hook at {}", hook_path.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&hook_path)?.permissions();
+        let mut perms = fs::metadata(&hook_path)
+            .with_context(|| format!("failed to read metadata for {}", hook_path.display()))?
+            .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms)?;
+        fs::set_permissions(&hook_path, perms).with_context(|| {
+            format!(
+                "failed to set executable permissions on {}",
+                hook_path.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -368,7 +473,7 @@ mod tests {
             ".git must be a file in worktree"
         );
 
-        let git_dir = resolve_git_dir(&setup.worktree_path);
+        let git_dir = resolve_git_dir(&setup.worktree_path).expect("resolve git dir");
         let exclude = std::fs::read_to_string(git_dir.join("info").join("exclude"))
             .expect("read exclude");
         assert!(exclude.lines().any(|line| line.trim() == ".triumvirate/"));
@@ -381,7 +486,7 @@ mod tests {
         let wt = tmp.path().join("wt");
         std::fs::create_dir_all(&wt).expect("mkdir");
         std::fs::write(wt.join(".git"), "gitdir: ../.git/worktrees/demo\n").expect("write");
-        let resolved = resolve_git_dir(&wt);
+        let resolved = resolve_git_dir(&wt).expect("resolve relative git dir");
         assert_eq!(resolved, PathBuf::from(&wt).join("../.git/worktrees/demo"));
     }
 }

@@ -1,5 +1,6 @@
 use std::{fs, path::Path};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -24,15 +25,27 @@ pub struct BuildState {
 
 #[instrument(skip_all)]
 pub fn update_state(path: &Path, state: &BuildState) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec_pretty(state)?;
-    fs::write(path, payload)?;
+    let payload = serde_json::to_vec_pretty(state).with_context(|| {
+        format!(
+            "failed to serialize BUILD_STATE payload for {}",
+            path.display()
+        )
+    })?;
+    fs::write(path, payload)
+        .with_context(|| format!("failed to write BUILD_STATE file at {}", path.display()))?;
     Ok(())
 }
 
 #[instrument(skip_all)]
 pub fn read_state(path: &Path) -> anyhow::Result<BuildState> {
-    let raw = fs::read(path)?;
-    Ok(serde_json::from_slice(&raw)?)
+    let raw = fs::read(path)
+        .with_context(|| format!("failed to read BUILD_STATE file at {}", path.display()))?;
+    serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "failed to parse BUILD_STATE JSON from {}",
+            path.display()
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,16 +66,19 @@ pub fn append_manifest(
         fs::write(
             path,
             b"## BUILD_MANIFEST\n\n| task_id | req_ids | wave | files_modified | attempts | commit_sha | validation | gemini_review | timestamp |\n|---|---|---|---|---|---|---|---|---|\n",
-        )?;
+        )
+        .with_context(|| format!("failed to initialize BUILD_MANIFEST at {}", path.display()))?;
     }
     let row = format!(
         "| {task_id} | {} | {wave} | {} | {attempts} | {commit_sha} | {validation} | {gemini_review} | {timestamp} |\n",
         req_ids.join(","),
         files_modified.join(",")
     );
-    let mut existing = fs::read_to_string(path)?;
+    let mut existing = fs::read_to_string(path)
+        .with_context(|| format!("failed to read BUILD_MANIFEST at {}", path.display()))?;
     existing.push_str(&row);
-    fs::write(path, existing)?;
+    fs::write(path, existing)
+        .with_context(|| format!("failed to append to BUILD_MANIFEST at {}", path.display()))?;
     Ok(())
 }
 
@@ -76,14 +92,17 @@ pub fn append_deviation(
     timestamp: &str,
 ) -> anyhow::Result<()> {
     if !path.exists() {
-        fs::write(path, b"## DEVIATION_LOG\n\n")?;
+        fs::write(path, b"## DEVIATION_LOG\n\n")
+            .with_context(|| format!("failed to initialize DEVIATION_LOG at {}", path.display()))?;
     }
     let entry = format!(
         "### {timestamp} - {task_id}\n- severity: {severity}\n- class: {classification}\n- summary: {summary}\n\n"
     );
-    let mut existing = fs::read_to_string(path)?;
+    let mut existing = fs::read_to_string(path)
+        .with_context(|| format!("failed to read DEVIATION_LOG at {}", path.display()))?;
     existing.push_str(&entry);
-    fs::write(path, existing)?;
+    fs::write(path, existing)
+        .with_context(|| format!("failed to append to DEVIATION_LOG at {}", path.display()))?;
     Ok(())
 }
 
