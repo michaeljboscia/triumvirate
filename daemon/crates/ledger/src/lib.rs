@@ -19,6 +19,7 @@ use shared_types::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent,
     SessionDetail, Summary,
 };
+use tracing::instrument;
 
 #[derive(Debug)]
 pub struct LedgerStore {
@@ -27,38 +28,110 @@ pub struct LedgerStore {
 }
 
 impl LedgerStore {
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "ledger_store_open",
+            spool_size = tracing::field::Empty,
+            operation = "open"
+        )
+    )]
     pub fn open(project_root: PathBuf) -> anyhow::Result<Self> {
         store::open(project_root)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = %event.event_type,
+            spool_size = tracing::field::Empty,
+            operation = "ingest_event"
+        )
+    )]
     pub fn ingest_event(&self, event: RawEvent) -> anyhow::Result<()> {
         ingest::ingest_event(self, event)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "spool_drain",
+            spool_size = tracing::field::Empty,
+            operation = "drain_spool"
+        )
+    )]
     pub fn drain_spool(&self, _spool_dir: &Path) -> anyhow::Result<DrainResult> {
         spool::drain_spool(self, _spool_dir)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "summary_query",
+            spool_size = tracing::field::Empty,
+            operation = "query"
+        )
+    )]
     pub fn query(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Summary>> {
         query::query_summaries(self, query, limit)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "session_query",
+            spool_size = tracing::field::Empty,
+            operation = "get_session"
+        )
+    )]
     pub fn get_session(&self, session_id: &str) -> anyhow::Result<SessionDetail> {
         query::get_session_detail(self, session_id)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "manual_record",
+            spool_size = tracing::field::Empty,
+            operation = "record"
+        )
+    )]
     pub fn record(&self, record: ManualRecord) -> anyhow::Result<()> {
         ingest::record_manual(self, record)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "health_check",
+            spool_size = tracing::field::Empty,
+            operation = "health"
+        )
+    )]
     pub fn health(&self) -> anyhow::Result<HealthStatus> {
         health::health(self)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "lesson_write",
+            spool_size = tracing::field::Empty,
+            operation = "add_lesson"
+        )
+    )]
     pub fn add_lesson(&self, lesson: NewLesson) -> anyhow::Result<i64> {
         lessons::add_lesson(self, lesson)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "lesson_query",
+            spool_size = tracing::field::Empty,
+            operation = "query_lessons"
+        )
+    )]
     pub fn query_lessons(
         &self,
         query: &str,
@@ -67,10 +140,26 @@ impl LedgerStore {
         lessons::query_lessons(self, query, min_confidence)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "lesson_validate",
+            spool_size = tracing::field::Empty,
+            operation = "validate_lesson"
+        )
+    )]
     pub fn validate_lesson(&self, lesson_id: i64) -> anyhow::Result<()> {
         lessons::validate_lesson(self, lesson_id)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "lesson_list",
+            spool_size = tracing::field::Empty,
+            operation = "list_lessons"
+        )
+    )]
     pub fn list_lessons(
         &self,
         tags: Option<&[String]>,
@@ -79,26 +168,74 @@ impl LedgerStore {
         lessons::list_lessons(self, tags, stale_days)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "gc",
+            spool_size = tracing::field::Empty,
+            operation = "gc"
+        )
+    )]
     pub fn gc(&self) -> anyhow::Result<GcResult> {
         gc::gc(self)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "fleet_state_check",
+            spool_size = tracing::field::Empty,
+            operation = "has_active_fleets"
+        )
+    )]
     pub fn has_active_fleets(&self) -> anyhow::Result<bool> {
         gc::has_active_fleets(self)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "gc_timestamp_query",
+            spool_size = tracing::field::Empty,
+            operation = "last_gc_timestamp"
+        )
+    )]
     pub fn last_gc_timestamp(&self) -> anyhow::Result<Option<String>> {
         gc::last_gc_timestamp(self)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "gc_gate_check",
+            spool_size = tracing::field::Empty,
+            operation = "should_run_startup_gc"
+        )
+    )]
     pub fn should_run_startup_gc(&self) -> anyhow::Result<bool> {
         gc::should_run_startup_gc(self)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "project_root",
+            spool_size = tracing::field::Empty,
+            operation = "project_root"
+        )
+    )]
     pub fn project_root(&self) -> &Path {
         &self.project_root
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "journal_mode_query",
+            spool_size = tracing::field::Empty,
+            operation = "journal_mode"
+        )
+    )]
     pub fn journal_mode(&self) -> anyhow::Result<String> {
         self.with_conn(|conn| {
             let mode: String = conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0))?;
@@ -106,10 +243,26 @@ impl LedgerStore {
         })
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "queue_lag_query",
+            spool_size = tracing::field::Empty,
+            operation = "queue_lag_seconds"
+        )
+    )]
     pub fn queue_lag_seconds(&self) -> anyhow::Result<f64> {
         self.with_conn(store::queue_lag_seconds_conn)
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "connection_access",
+            spool_size = tracing::field::Empty,
+            operation = "with_conn"
+        )
+    )]
     pub(crate) fn with_conn<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&Connection) -> anyhow::Result<T>,

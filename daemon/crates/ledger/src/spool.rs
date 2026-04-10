@@ -5,6 +5,7 @@ use std::{
 };
 
 use shared_types::{DrainResult, RawEvent};
+use tracing::instrument;
 
 use crate::LedgerStore;
 
@@ -55,6 +56,14 @@ fn parse_event_from_file(path: &Path) -> anyhow::Result<RawEvent> {
     Ok(event)
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "spool_drain",
+        spool_size = tracing::field::Empty,
+        operation = "drain_spool"
+    )
+)]
 pub(crate) fn drain_spool(store: &LedgerStore, spool_dir: &Path) -> anyhow::Result<DrainResult> {
     if !spool_dir.exists() {
         return Ok(DrainResult {

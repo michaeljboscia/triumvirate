@@ -4,6 +4,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tracing::instrument;
 
 const MAX_ACTIVE_POOLS: usize = 10;
 const IDLE_TTL_MS: u64 = 15 * 60 * 1000;
@@ -33,10 +34,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "pool_activity",
+        spool_size = tracing::field::Empty,
+        operation = "register_activity"
+    )
+)]
 pub(crate) fn register_activity(project_root: &Path) {
     register_activity_at(project_root, now_ms());
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "pool_activity",
+        spool_size = tracing::field::Empty,
+        operation = "register_activity_at"
+    )
+)]
 pub(crate) fn register_activity_at(project_root: &Path, now: u64) {
     reap_idle_at(now);
     let mut guard = match state().lock() {
@@ -57,10 +74,26 @@ pub(crate) fn register_activity_at(project_root: &Path, now: u64) {
     }
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "pool_reap",
+        spool_size = tracing::field::Empty,
+        operation = "reap_idle"
+    )
+)]
 pub(crate) fn reap_idle() {
     reap_idle_at(now_ms());
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "pool_reap",
+        spool_size = tracing::field::Empty,
+        operation = "reap_idle_at"
+    )
+)]
 pub(crate) fn reap_idle_at(now: u64) {
     let mut guard = match state().lock() {
         Ok(v) => v,
@@ -83,6 +116,14 @@ pub(crate) fn reap_idle_at(now: u64) {
 }
 
 #[cfg(test)]
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "pool_stats",
+        spool_size = tracing::field::Empty,
+        operation = "pool_stats"
+    )
+)]
 pub(crate) fn pool_stats() -> PoolStats {
     let guard = match state().lock() {
         Ok(v) => v,
@@ -100,6 +141,14 @@ pub(crate) fn pool_stats() -> PoolStats {
 }
 
 #[cfg(test)]
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "pool_reset",
+        spool_size = tracing::field::Empty,
+        operation = "reset_pool_state_for_tests"
+    )
+)]
 pub(crate) fn reset_pool_state_for_tests() {
     let mut guard = state().lock().expect("pool state mutex poisoned");
     guard.active.clear();

@@ -1,9 +1,18 @@
 use shared_types::{ManualRecord, RawEvent};
+use tracing::instrument;
 
 use crate::LedgerStore;
 use crate::pool::{reap_idle, register_activity};
 use crate::store::with_ingest_priority;
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = %event.event_type,
+        spool_size = tracing::field::Empty,
+        operation = "ingest_event"
+    )
+)]
 pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Result<()> {
     let session_id = event.session_id.clone();
     let event_timestamp = event.timestamp.clone();
@@ -42,6 +51,14 @@ pub(crate) fn ingest_event(store: &LedgerStore, event: RawEvent) -> anyhow::Resu
     Ok(())
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "manual_record",
+        spool_size = tracing::field::Empty,
+        operation = "record_manual"
+    )
+)]
 pub(crate) fn record_manual(store: &LedgerStore, record: ManualRecord) -> anyhow::Result<()> {
     with_ingest_priority(|| {
         store.with_conn(|conn| {

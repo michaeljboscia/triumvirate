@@ -1058,6 +1058,7 @@ dependencies = [
  "serde_json",
  "shared-types",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

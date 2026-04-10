@@ -1,4 +1,5 @@
 use shared_types::{Lesson, NewLesson};
+use tracing::instrument;
 
 use crate::LedgerStore;
 
@@ -8,6 +9,14 @@ struct LessonRow {
     days_since_validation: f64,
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "lesson_write",
+        spool_size = tracing::field::Empty,
+        operation = "add_lesson"
+    )
+)]
 pub(crate) fn add_lesson(store: &LedgerStore, lesson: NewLesson) -> anyhow::Result<i64> {
     store.with_conn(|conn| {
         conn.execute(
@@ -26,6 +35,14 @@ pub(crate) fn add_lesson(store: &LedgerStore, lesson: NewLesson) -> anyhow::Resu
     })
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "lesson_query",
+        spool_size = tracing::field::Empty,
+        operation = "query_lessons"
+    )
+)]
 pub(crate) fn query_lessons(
     store: &LedgerStore,
     query: &str,
@@ -52,6 +69,14 @@ pub(crate) fn query_lessons(
     Ok(apply_confidence_decay(rows, min_confidence))
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "lesson_validate",
+        spool_size = tracing::field::Empty,
+        operation = "validate_lesson"
+    )
+)]
 pub(crate) fn validate_lesson(store: &LedgerStore, lesson_id: i64) -> anyhow::Result<()> {
     store.with_conn(|conn| {
         let updated = conn.execute(
@@ -67,6 +92,14 @@ pub(crate) fn validate_lesson(store: &LedgerStore, lesson_id: i64) -> anyhow::Re
     })
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "lesson_list",
+        spool_size = tracing::field::Empty,
+        operation = "list_lessons"
+    )
+)]
 pub(crate) fn list_lessons(
     store: &LedgerStore,
     tags: Option<&[String]>,
