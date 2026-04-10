@@ -21,16 +21,6 @@ use daemon_core::{
 };
 #[cfg(test)]
 use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
-use daemon_http::{
-    fetch_daemon_ask_agent, fetch_daemon_fallback_ack, fetch_daemon_fallback_gc,
-    fetch_daemon_fallback_list, fetch_daemon_ledger_gc, fetch_daemon_ledger_query,
-    fetch_daemon_ledger_record, fetch_daemon_ledger_session, fetch_daemon_lesson_add,
-    fetch_daemon_lesson_list, fetch_daemon_lesson_query, fetch_daemon_lesson_validate,
-    fetch_daemon_memory_read, fetch_daemon_memory_write, fetch_daemon_outbox_recent,
-    fetch_daemon_scratchpad_list, fetch_daemon_scratchpad_write, fetch_daemon_session_ask,
-    fetch_daemon_session_dismiss, fetch_daemon_session_list, fetch_daemon_session_spawn,
-    fetch_daemon_status, fetch_daemon_status_snapshot,
-};
 #[cfg(test)]
 use daemon_http::{fetch_daemon_ask_agent, fetch_daemon_status};
 #[cfg(test)]
@@ -50,9 +40,8 @@ use mcp_bridge::use_daemon_for_mcp_from_env;
 #[cfg(test)]
 use mcp_bridge::should_use_daemon_proxy;
 use mcp_tools::{
-    ProgressEmitter, display_agent_name, fleet as mcp_fleet,
-    gemini_query as mcp_gemini_query, inter_agent as mcp_inter_agent, knowledge,
-    next_heartbeat_offset, review as mcp_review,
+    ProgressEmitter, fleet as mcp_fleet,
+    gemini_query as mcp_gemini_query, knowledge, review as mcp_review,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -107,7 +96,6 @@ use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
-    fs,
     path::PathBuf,
     pin::Pin,
     sync::{
