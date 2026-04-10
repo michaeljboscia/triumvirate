@@ -1,4 +1,5 @@
 use daemon_core::metrics::DaemonMetrics;
+use tracing::instrument;
 use shared_types::{
     CancelTaskRequest as AbeCancelTaskRequest, CancelTaskResponse as AbeCancelTaskResponse,
     ContractFields, DispatchCodexRequest, DispatchCodexResponse, DispatchCodexWorktreeRequest,
@@ -188,6 +189,7 @@ async fn terminate_worker(child: Arc<Mutex<Child>>) {
     }
 }
 
+#[instrument(skip_all)]
 pub async fn dispatch_codex<T: AbeTaskTracker>(
     tracker: T,
     req: DispatchCodexRequest,
@@ -308,6 +310,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     })
 }
 
+#[instrument(skip_all, fields(task_id = %req.contract_fields.task_id))]
 pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     tracker: T,
     req: DispatchCodexWorktreeRequest,
@@ -662,6 +665,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     })
 }
 
+#[instrument(skip_all, fields(task_id = %req.task_id))]
 pub async fn get_task_status<T: AbeTaskTracker>(
     tracker: T,
     req: GetTaskStatusRequest,
@@ -672,6 +676,7 @@ pub async fn get_task_status<T: AbeTaskTracker>(
         .ok_or_else(|| format!("unknown task_id: {}", req.task_id))
 }
 
+#[instrument(skip_all, fields(task_id = %req.task_id))]
 pub async fn get_task_output<T: AbeTaskTracker>(
     tracker: T,
     req: GetTaskOutputRequest,
@@ -682,6 +687,7 @@ pub async fn get_task_output<T: AbeTaskTracker>(
         .ok_or_else(|| format!("task output unavailable for task_id: {}", req.task_id))
 }
 
+#[instrument(skip_all, fields(task_id = %req.task_id))]
 pub async fn cancel_task<T: AbeTaskTracker>(
     tracker: T,
     req: AbeCancelTaskRequest,

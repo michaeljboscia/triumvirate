@@ -21,6 +21,7 @@ pub fn classify_failure(log_text: &str) -> Classification {
     classify_failure_with_metrics(log_text, None)
 }
 
+#[instrument(skip_all)]
 pub fn classify_failure_with_metrics(
     log_text: &str,
     metrics: Option<&DaemonMetrics>,
@@ -76,6 +77,7 @@ pub fn can_retry(class: &FailureClass, class_attempts: u32, total_attempts: u32)
     can_retry_with_metrics(class, class_attempts, total_attempts, None)
 }
 
+#[instrument(skip_all)]
 pub fn can_retry_with_metrics(
     class: &FailureClass,
     class_attempts: u32,

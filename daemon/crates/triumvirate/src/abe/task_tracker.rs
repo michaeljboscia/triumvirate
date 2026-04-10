@@ -117,6 +117,7 @@ impl TaskTracker {
         let _ = ws_events.send(encode_ws_event("abe_task_state", payload));
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, wave))]
     pub async fn register(
         &self,
         task_id: String,
@@ -239,6 +240,19 @@ impl TaskTracker {
         };
         if is_terminal(&task.status) {
             return TransitionOutcome::AlreadyTerminal;
+        }
+        // Guard against watchdog race: if the sentinel file exists, the worker
+        // already completed — don't mark it STUCK. The sentinel watcher will
+        // handle the Completed transition.
+        if let Some(wt) = &task.worktree_path {
+            let sentinel = wt.join(".triumvirate").join("TASK_COMPLETE.json");
+            if sentinel.exists() {
+                tracing::info!(
+                    task_id = %task_id,
+                    "watchdog tried to mark STUCK but sentinel exists — skipping"
+                );
+                return TransitionOutcome::AlreadyTerminal;
+            }
         }
         task.status = TaskStatus::Stuck;
         task.error_message = Some(error_message);

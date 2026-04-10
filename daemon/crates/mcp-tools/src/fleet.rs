@@ -1,4 +1,5 @@
 use daemon_core::{encode_ws_event, metrics::DaemonMetrics};
+use tracing::instrument;
 use fleet::orchestrator::{FleetOrchestrator, FleetSpawnRequest as FleetSpawnRunRequest};
 use fleet::tasks::FleetTaskStore;
 use shared_types::{
@@ -33,6 +34,7 @@ fn emit_fleet_progress(
     let _ = ws_events.send(encode_ws_event("fleet_progress", payload));
 }
 
+#[instrument(skip_all)]
 pub async fn fleet_spawn<G, F>(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     metrics: &DaemonMetrics,
@@ -105,6 +107,7 @@ where
     })
 }
 
+#[instrument(skip_all, fields(fleet_id = %req.fleet_id))]
 pub async fn fleet_status(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     req: FleetStatusRequest,
@@ -117,6 +120,7 @@ pub async fn fleet_status(
     Ok(status)
 }
 
+#[instrument(skip_all, fields(fleet_id = %req.fleet_id))]
 pub async fn fleet_task_list(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     req: FleetTaskListRequest,
@@ -141,6 +145,7 @@ pub async fn fleet_task_list(
     Ok(FleetTaskListResponse { task_ids })
 }
 
+#[instrument(skip_all, fields(task_id = %req.task_id))]
 pub async fn fleet_claim_task(
     req: FleetClaimTaskRequest,
 ) -> Result<FleetClaimTaskResponse, String> {
@@ -157,6 +162,7 @@ pub async fn fleet_claim_task(
     Ok(FleetClaimTaskResponse { claimed })
 }
 
+#[instrument(skip_all, fields(fleet_id = %req.fleet_id))]
 pub async fn fleet_cancel(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     metrics: &DaemonMetrics,

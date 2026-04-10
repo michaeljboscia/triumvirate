@@ -30,6 +30,7 @@ pub fn setup_worktree(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSetu
     setup_worktree_with_metrics(req, None)
 }
 
+#[instrument(skip_all, fields(task_id = %req.task_id, wave = req.contract_fields.wave))]
 pub fn setup_worktree_with_metrics(
     req: &WorktreeSetupRequest,
     metrics: Option<&DaemonMetrics>,
@@ -85,6 +86,18 @@ fn setup_worktree_inner(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSe
             req.task_id
         )
     })?;
+
+    // Remove stale sentinel from prior task — prevents daemon from prematurely
+    // marking this new task as completed based on a leftover file.
+    let stale_sentinel = triumvirate_dir.join("TASK_COMPLETE.json");
+    if stale_sentinel.exists() {
+        tracing::warn!(
+            task_id = %req.task_id,
+            path = %stale_sentinel.display(),
+            "removing stale TASK_COMPLETE.json from prior task"
+        );
+        let _ = fs::remove_file(&stale_sentinel);
+    }
 
     fs::write(
         triumvirate_dir.join("BRIEFING.md"),
