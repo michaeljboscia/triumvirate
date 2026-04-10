@@ -1,7 +1,7 @@
 use axum::{
     Json as AxumJson,
     body::Body,
-    extract::{Path, State, WebSocketUpgrade, ws::Message},
+    extract::{Path, Query, State, WebSocketUpgrade, ws::Message},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
 };
@@ -55,6 +55,7 @@ use tokio::{
     sync::{Mutex, broadcast},
     time::{Duration, Instant, sleep},
 };
+use token_economics::{BuildCostBreakdown, SessionTokenBreakdown, SummaryQueryFilters};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -327,7 +328,12 @@ pub struct DaemonHttpState {
     pub marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
     pub metrics: Arc<DaemonMetrics>,
     pub ws_events: broadcast::Sender<String>,
+    pub token_db: Arc<token_economics::TokenDb>,
     pub ask_agent_executor: AskAgentRouteExecutor,
+}
+
+pub fn open_token_db(path: &std::path::Path) -> anyhow::Result<Arc<token_economics::TokenDb>> {
+    Ok(Arc::new(token_economics::open(path)?))
 }
 
 fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
@@ -479,6 +485,147 @@ async fn record_marker_parse_result(state: &DaemonHttpState, response: &str) {
 #[derive(Debug, Deserialize)]
 pub struct LedgerWakeRequest {
     pub project_root: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenSummaryQuery {
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenByBuildQuery {
+    pub build_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenBySessionQuery {
+    pub session_id: String,
+}
+
+pub async fn token_summary_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    Query(query): Query<TokenSummaryQuery>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    if let Some(agent) = query.agent.as_deref()
+        && !matches!(agent, "claude" | "codex" | "gemini")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(serde_json::json!({ "error": "agent must be one of claude|codex|gemini" })),
+        ));
+    }
+
+    let token_db = state.token_db.clone();
+    let filters = SummaryQueryFilters {
+        since: query.since,
+        until: query.until,
+        agent: query.agent,
+    };
+
+    let response = tokio::task::spawn_blocking(move || token_economics::summary_query(&token_db, &filters))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    Ok(AxumJson(response))
+}
+
+pub async fn token_by_build_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    Query(query): Query<TokenByBuildQuery>,
+) -> Result<AxumJson<BuildCostBreakdown>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let build_id = query.build_id.trim().to_string();
+    if build_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(serde_json::json!({ "error": "build_id is required" })),
+        ));
+    }
+
+    let token_db = state.token_db.clone();
+    let response = tokio::task::spawn_blocking(move || token_economics::by_build_query(&token_db, &build_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    Ok(AxumJson(response))
+}
+
+pub async fn token_by_session_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    Query(query): Query<TokenBySessionQuery>,
+) -> Result<AxumJson<SessionTokenBreakdown>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let session_id = query.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(serde_json::json!({ "error": "session_id is required" })),
+        ));
+    }
+
+    let token_db = state.token_db.clone();
+    let response = tokio::task::spawn_blocking(move || token_economics::by_session_query(&token_db, &session_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    Ok(AxumJson(response))
 }
 
 pub async fn ask_agent_route(

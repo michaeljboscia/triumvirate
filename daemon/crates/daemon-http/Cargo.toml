@@ -13,6 +13,7 @@ fallback-outbox = { path = "../fallback-outbox" }
 ledger = { path = "../ledger" }
 mcp-bridge = { path = "../mcp-bridge" }
 shared-types = { path = "../shared-types" }
+token-economics = { path = "../token-economics" }
 prometheus.workspace = true
 reqwest.workspace = true
 serde.workspace = true
