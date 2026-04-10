@@ -1,8 +1,8 @@
 # Triumvirate Roadmap
 
-**Last updated:** 2026-04-09
-**Current version:** 3.1.0 (in progress — MCP Consolidation sprint)
-**Last shipped:** 3.0.0 (ABE — Autonomous Build Enforcement)
+**Last updated:** 2026-04-10
+**Current version:** 3.1.0 (MCP Consolidation — shipped)
+**Last shipped:** 3.1.0 (MCP Consolidation)
 
 ---
 
@@ -20,7 +20,7 @@ The goal: enforce audited autonomous build execution so work dispatches are cont
 
 ## v1.0 — Daily Driver (Now → 2 weeks)
 
-The goal: Triumvirate replaces the current inter-agent MCP server as the everyday tool for coordinating Claude, Gemini, and Codex.
+The goal: Triumvirate is the everyday tool for coordinating Claude, Gemini, and Codex. As of v3.1.0, the Rust daemon is the sole MCP endpoint — the legacy TS inter-agent server has been archived.
 
 | Item | Status | Description |
 |------|--------|-------------|
