@@ -122,3 +122,35 @@ This is a naive whole-file content scan. `daemon/crates/triumvirate/src/main.rs:
 ## Forward-looking implication for the rest of v3.1
 
 The ~1 hour of overhead on T-000 was investment, not waste. The lessons captured here should push subsequent tasks into the 15-20 minute envelope instead of the 2-hour envelope. If any Wave 0+ task drifts past ~30 minutes of wall time, STOP and check: are we hitting one of these same three defects (daemon reaper, stub-marker false-positive, Gemini connector)? Or are we in a genuinely new failure mode?
+
+## Open research — faster dispatch audit loop (2026-04-09)
+
+**The real audit bottleneck isn't the twin verdicts — it's context loading.** Every fresh `audit-T{ID}-{agent}-r{N}` session we spawn starts with zero project knowledge. Each round, Gemini and Codex have to ingest: the dispatch package (~400-500 lines), the task XML block, the referenced source files, the BACKEND_STRUCTURE sections, and sometimes the spec. That's 5-20K tokens of reading per round per auditor, and most of it is IDENTICAL across rounds. The auditor is re-reading the same codebase it just read 3 minutes ago.
+
+**Hypothesis:** If the auditor already had the project's source + docs + specs pre-indexed and resident, the audit round would be ~5 seconds instead of ~3 minutes.
+
+**Candidate tools:** Pythia (local code search) for "does this symbol exist / is this file at this path / does the cargo command work" (no LLM needed, fast). Oracle (long-lived Gemini session pre-loaded with the project's canonical docs and source tree) for "does the briefing's intent match the spec" (needs LLM judgment, but only the task delta per audit, not the whole codebase). Hybrid use of both is likely the right answer.
+
+**Priority:** High. Audit cost has been the dominant time sink in every task so far. A 5-10x speedup here turns the whole sprint into an afternoon instead of a week.
+
+## Open research — over-the-shoulder worker visibility (2026-04-09 from Wave 1 abandonment)
+
+**The problem:** When `dispatch_codex_worktree` spawns a worker headlessly, we have NO live visibility into what the worker is doing. If the worker dies mid-execution (as happened to T-004 and T-006 during Wave 1's `cargo test --workspace` invocation), the only forensics available are the rollout JSONL after the fact. Diagnosis is hard and recovery is slower than it should be.
+
+**Proposed enhancement:** Wrap each codex spawn in a detached `tmux` session named by task_id:
+
+```bash
+tmux new-session -d -s "T-XXX" "codex exec --full-auto ..."
+```
+
+Then either the human operator OR the orchestrator (Claude) can:
+- Attach live: `tmux attach -t T-XXX` → watch in real time → `Ctrl-B d` to detach
+- Capture state non-interactively: `tmux capture-pane -t T-XXX -p`
+- Run multiple worker sessions in parallel (tmux is non-blocking, switchable)
+- Diagnose dead workers before tmux session is killed
+
+**Recovery pattern crystallized from Wave 1 (saved as memory):** When a worker dies without committing, spawn a recovery codex session via `spawn_session` with `cwd` pointed at the abandoned worktree. Two flavors: conservative (read-only inspect, return JSON report) or aggressive (inspect + fix simple compile errors + commit + sentinel). Caveat: recovery sessions can't `git commit` due to macOS sandbox inheritance, so the orchestrator does the commit from the main working directory.
+
+**Integration target:** Same place as the ABE completion-detection refactor (Wave 1 T-004B). Add a `wrap_in_tmux: bool` config flag (default true) that wraps the codex invocation in a detached tmux session. Returns the tmux session name in the dispatch response so the orchestrator can attach when needed.
+
+**Priority:** Medium-high. Doesn't block progress (the inspect-session pattern recovers from worker failures), but every minute saved on diagnosing a dead worker compounds across a multi-task sprint. Two of five Wave 1 dispatches died — without the recovery pattern, that would have been a "throw away and re-dispatch" cost of ~20 min per task instead of the ~5 min recovery we actually achieved.
