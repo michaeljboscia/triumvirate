@@ -5,7 +5,12 @@ members = ["crates/agent-adapter","crates/agent-worker","crates/daemon-core","cr
 [workspace.package]
 version = "3.2.0"
 edition = "2024"
-license = "MIT"
+license = "FSL-1.1-ALv2"
+description = "Multi-agent AI coordination daemon for Claude, Gemini, and Codex"
+repository = "https://github.com/michaeljboscia/triumvirate"
+homepage = "https://github.com/michaeljboscia/triumvirate"
+keywords = ["ai", "mcp", "agents", "llm", "orchestration"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 anyhow = "1"
