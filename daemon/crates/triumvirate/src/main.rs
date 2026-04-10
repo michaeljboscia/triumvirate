@@ -1611,6 +1611,8 @@ async fn run_daemon() -> anyhow::Result<()> {
     );
     set_process_metrics(state.metrics.clone());
     init_process_token_db();
+    let token_db_path = core_triumvirate_home_dir()?.join("token-economics.db");
+    let token_db = daemon_http::open_token_db(&token_db_path)?;
     let http_state = DaemonHttpState {
         token: state.token.clone(),
         queues: state.queues.clone(),
@@ -1618,6 +1620,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         marker_parse_window: state.marker_parse_window.clone(),
         metrics: state.metrics.clone(),
         ws_events: state.ws_events.clone(),
+        token_db,
         ask_agent_executor: Arc::new(|req| execute_ask_agent_boxed(req, None)),
     };
     run_startup_gc_if_needed(&state).await;
@@ -1627,6 +1630,18 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route(
             "/metrics",
             get_service(daemon_http::metrics_route.with_state(http_state.clone())),
+        )
+        .route(
+            "/api/tokens/summary",
+            get_service(daemon_http::token_summary_route.with_state(http_state.clone())),
+        )
+        .route(
+            "/api/tokens/by-build",
+            get_service(daemon_http::token_by_build_route.with_state(http_state.clone())),
+        )
+        .route(
+            "/api/tokens/by-session",
+            get_service(daemon_http::token_by_session_route.with_state(http_state.clone())),
         )
         .route(
             "/ws",
