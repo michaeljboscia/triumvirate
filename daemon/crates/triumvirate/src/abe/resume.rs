@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::build_artifacts::{read_state, BuildState};
 use shared_types::TaskStatus;
+use tracing::instrument;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeResult {
@@ -9,6 +10,7 @@ pub struct ResumeResult {
     pub recovered_running_tasks: Vec<String>,
 }
 
+#[instrument(skip_all)]
 pub fn resume_from_state<F>(state_path: &Path, mut status_lookup: F) -> anyhow::Result<(BuildState, ResumeResult)>
 where
     F: FnMut(&str) -> Option<TaskStatus>,

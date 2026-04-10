@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::Context;
 use tokio::{process::Child, process::Command, sync::Mutex};
+use tracing::instrument;
 
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -16,6 +17,7 @@ pub struct SpawnSpec {
     pub envs: HashMap<String, String>,
 }
 
+#[instrument(skip_all)]
 pub async fn spawn_background(spec: SpawnSpec) -> anyhow::Result<Arc<Mutex<Child>>> {
     let mut command = Command::new(&spec.cmd);
     command
@@ -33,6 +35,7 @@ pub async fn spawn_background(spec: SpawnSpec) -> anyhow::Result<Arc<Mutex<Child
     Ok(Arc::new(Mutex::new(child)))
 }
 
+#[instrument(skip_all, fields(status = "timeout"))]
 pub async fn enforce_timeout(child: Arc<Mutex<Child>>, timeout_sec: u64, cwd: &Path) -> anyhow::Result<bool> {
     tokio::time::sleep(std::time::Duration::from_secs(timeout_sec)).await;
 
@@ -77,6 +80,7 @@ fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
     dot_git
 }
 
+#[instrument(skip_all)]
 pub fn resolve_commit_outputs(worktree_path: &Path, starting_sha: &str) -> (String, Vec<String>) {
     let head = std::process::Command::new("git")
         .arg("-C")

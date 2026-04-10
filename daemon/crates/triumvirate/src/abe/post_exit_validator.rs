@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use shared_types::ContractFields;
+use tracing::instrument;
 
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
@@ -13,6 +14,7 @@ pub struct ValidationResult {
 /// This runs AFTER the worker exits, outside the worker's control.
 /// The worker can --no-verify, rewrite hooks, modify contract.json — none of it matters
 /// because this function uses the contract the DAEMON holds, not the worktree copy.
+#[instrument(skip_all, fields(task_id = %contract.task_id, wave = contract.wave))]
 pub fn validate_commit(
     worktree_path: &Path,
     contract: &ContractFields,

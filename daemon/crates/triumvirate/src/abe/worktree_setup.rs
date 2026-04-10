@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::Context;
 use shared_types::ContractFields;
+use tracing::instrument;
 
 #[derive(Debug, Clone)]
 pub struct WorktreeSetupRequest {
@@ -22,6 +23,7 @@ pub struct WorktreeSetupResult {
     pub worktree_path: PathBuf,
 }
 
+#[instrument(skip_all, fields(task_id = %req.task_id, wave = req.contract_fields.wave))]
 pub fn setup_worktree(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSetupResult> {
     let worktree_base = req.project_root.join(".triumvirate").join("abe-worktrees");
     fs::create_dir_all(&worktree_base)?;
@@ -68,6 +70,7 @@ pub fn setup_worktree(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSetu
     Ok(WorktreeSetupResult { worktree_path })
 }
 
+#[instrument(skip_all)]
 pub fn rollback_worktree(project_root: &Path, worktree_path: &Path) -> anyhow::Result<()> {
     if worktree_path.exists() {
         let _ = run_git(

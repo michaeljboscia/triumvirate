@@ -1,3 +1,5 @@
+use tracing::instrument;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum FailureClass {
@@ -13,6 +15,7 @@ pub struct Classification {
     pub reason: String,
 }
 
+#[instrument(skip_all)]
 pub fn classify_failure(log_text: &str) -> Classification {
     let lower = log_text.to_lowercase();
 
@@ -49,6 +52,7 @@ pub fn classify_failure(log_text: &str) -> Classification {
     }
 }
 
+#[instrument(skip_all)]
 pub fn can_retry(class: &FailureClass, class_attempts: u32, total_attempts: u32) -> bool {
     if total_attempts >= 5 {
         return false;

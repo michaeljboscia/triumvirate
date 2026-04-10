@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 use shared_types::{ContractFields, FilePolicy};
+use tracing::instrument;
 
 use super::build_artifacts::{append_deviation, append_manifest, read_state, update_state};
 
@@ -33,6 +34,7 @@ pub trait DispatchBackend: Send + Sync {
     async fn wait_task(&self, task_id: &str) -> anyhow::Result<TaskResult>;
 }
 
+#[instrument(skip_all)]
 pub fn parse_plan(path: &Path) -> anyhow::Result<Vec<PlanTask>> {
     let content = fs::read_to_string(path)?;
     let mut tasks = Vec::new();
@@ -131,6 +133,7 @@ fn parse_task_block(block: &str) -> anyhow::Result<PlanTask> {
     })
 }
 
+#[instrument(skip_all, fields(status = "running"))]
 pub async fn run_orchestrator<B: DispatchBackend>(
     backend: &B,
     plan_path: &Path,

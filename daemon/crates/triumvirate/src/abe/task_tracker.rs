@@ -10,6 +10,7 @@ use shared_types::{
     CancelTaskResponse, GetTaskOutputResponse, GetTaskStatusResponse, TaskStatus,
 };
 use tokio::{process::Child, sync::Mutex};
+use tracing::instrument;
 
 #[derive(Debug)]
 struct TaskOutput {
@@ -57,6 +58,7 @@ fn is_terminal(status: &TaskStatus) -> bool {
 }
 
 impl TaskTracker {
+    #[instrument(skip_all, fields(task_id = %task_id, status = "working"))]
     pub async fn register(
         &self,
         task_id: String,
@@ -79,6 +81,7 @@ impl TaskTracker {
         );
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, status = "completed"))]
     pub async fn mark_completed(
         &self,
         task_id: &str,
@@ -108,6 +111,7 @@ impl TaskTracker {
         TransitionOutcome::Transitioned
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, status = "failed"))]
     pub async fn mark_failed(
         &self,
         task_id: &str,
@@ -128,6 +132,7 @@ impl TaskTracker {
         TransitionOutcome::Transitioned
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, status = "timeout"))]
     pub async fn mark_timeout(&self, task_id: &str) -> TransitionOutcome {
         let mut guard = self.inner.lock().await;
         let Some(task) = guard.get_mut(task_id) else {
@@ -142,6 +147,7 @@ impl TaskTracker {
         TransitionOutcome::Transitioned
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, status = "stuck"))]
     pub async fn mark_stuck(&self, task_id: &str, error_message: String) -> TransitionOutcome {
         let mut guard = self.inner.lock().await;
         let Some(task) = guard.get_mut(task_id) else {
@@ -156,6 +162,7 @@ impl TaskTracker {
         TransitionOutcome::Transitioned
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, status = "setup_failed"))]
     pub async fn mark_setup_failed(&self, task_id: &str, error_message: String) -> TransitionOutcome {
         let mut guard = self.inner.lock().await;
         let Some(task) = guard.get_mut(task_id) else {
@@ -170,6 +177,7 @@ impl TaskTracker {
         TransitionOutcome::Transitioned
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id))]
     pub async fn get_status(&self, task_id: &str) -> Option<GetTaskStatusResponse> {
         let guard = self.inner.lock().await;
         let task = guard.get(task_id)?;
@@ -183,6 +191,7 @@ impl TaskTracker {
         })
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id))]
     pub async fn get_output(&self, task_id: &str) -> Option<GetTaskOutputResponse> {
         let guard = self.inner.lock().await;
         let task = guard.get(task_id)?;
@@ -197,6 +206,7 @@ impl TaskTracker {
         })
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, status = "cancelled"))]
     pub async fn cancel(&self, task_id: &str) -> Option<CancelTaskResponse> {
         let (child, worktree_path, already_terminal) = {
             let guard = self.inner.lock().await;
@@ -247,16 +257,19 @@ impl TaskTracker {
         })
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id))]
     pub async fn exists(&self, task_id: &str) -> bool {
         let guard = self.inner.lock().await;
         guard.contains_key(task_id)
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id))]
     pub async fn worktree_path_for(&self, task_id: &str) -> Option<PathBuf> {
         let guard = self.inner.lock().await;
         guard.get(task_id).and_then(|task| task.worktree_path.clone())
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id, status = "setup_failed"))]
     pub async fn register_setup_failed(&self, task_id: String, error_message: String) {
         let mut guard = self.inner.lock().await;
         guard.insert(
@@ -274,11 +287,13 @@ impl TaskTracker {
         );
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id))]
     pub async fn elapsed_for(&self, task_id: &str) -> Option<Duration> {
         let guard = self.inner.lock().await;
         guard.get(task_id).map(|r| r.started_at.elapsed())
     }
 
+    #[instrument(skip_all, fields(task_id = %task_id))]
     pub async fn status_for(&self, task_id: &str) -> Option<TaskStatus> {
         let guard = self.inner.lock().await;
         guard.get(task_id).map(|r| r.status.clone())
