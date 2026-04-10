@@ -326,4 +326,92 @@ mod tests {
         assert_eq!(row.task_id, record.task_id);
         assert_eq!(row.wave, record.wave);
     }
+
+    #[test]
+    fn query_summary_filters_by_agent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("token-economics.db");
+        let db = open(&db_path).expect("open token DB");
+
+        let claude = TokenRecord {
+            agent: "claude".to_string(),
+            session_id: "session-claude".to_string(),
+            timestamp: "2026-04-10T10:00:00Z".to_string(),
+            model: Some("claude-sonnet-4".to_string()),
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 0,
+            thinking_tokens: 0,
+            total_tokens: 120,
+            cost_usd: Some(0.01),
+            latency_ms: None,
+            tool_calls: None,
+            lines_added: None,
+            lines_removed: None,
+            rate_limit_pct: None,
+            context_window: None,
+            build_id: None,
+            task_id: None,
+            wave: None,
+        };
+        let mut codex = claude.clone();
+        codex.agent = "codex".to_string();
+        codex.session_id = "session-codex".to_string();
+
+        insert_record(&db, &claude).expect("insert claude record");
+        insert_record(&db, &codex).expect("insert codex record");
+
+        let rows = query_summary(&db, None, None, Some("claude")).expect("query filtered by agent");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, "claude");
+    }
+
+    #[test]
+    fn query_summary_filters_by_time_range() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("token-economics.db");
+        let db = open(&db_path).expect("open token DB");
+
+        let before = TokenRecord {
+            agent: "gemini".to_string(),
+            session_id: "session-before".to_string(),
+            timestamp: "2026-04-10T09:59:59Z".to_string(),
+            model: Some("gemini-2.5-pro".to_string()),
+            input_tokens: 50,
+            output_tokens: 10,
+            cached_tokens: 0,
+            thinking_tokens: 0,
+            total_tokens: 60,
+            cost_usd: None,
+            latency_ms: None,
+            tool_calls: None,
+            lines_added: None,
+            lines_removed: None,
+            rate_limit_pct: None,
+            context_window: None,
+            build_id: None,
+            task_id: None,
+            wave: None,
+        };
+        let mut inside = before.clone();
+        inside.session_id = "session-inside".to_string();
+        inside.timestamp = "2026-04-10T10:30:00Z".to_string();
+        let mut after = before.clone();
+        after.session_id = "session-after".to_string();
+        after.timestamp = "2026-04-10T11:00:01Z".to_string();
+
+        insert_record(&db, &before).expect("insert before record");
+        insert_record(&db, &inside).expect("insert inside record");
+        insert_record(&db, &after).expect("insert after record");
+
+        let rows = query_summary(
+            &db,
+            Some("2026-04-10T10:00:00Z"),
+            Some("2026-04-10T11:00:00Z"),
+            None,
+        )
+        .expect("query filtered by time range");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "session-inside");
+    }
 }

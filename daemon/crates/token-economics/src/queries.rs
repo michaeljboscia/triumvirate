@@ -430,4 +430,32 @@ mod tests {
         assert_eq!(breakdown.total_tokens, 16);
         assert_eq!(breakdown.records.len(), 1);
     }
+
+    #[test]
+    fn empty_db_queries_return_empty_not_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open db");
+
+        let summary = summary_query(&db, &SummaryQueryFilters::default()).expect("summary query");
+        assert_eq!(summary["record_count"], serde_json::json!(0));
+        assert_eq!(summary["total_tokens"], serde_json::json!(0));
+        assert_eq!(summary["agents"], serde_json::json!([]));
+
+        let build = by_build_query(&db, "missing-build").expect("build query");
+        assert_eq!(build.build_id, "missing-build");
+        assert_eq!(build.record_count, 0);
+        assert_eq!(build.total_tokens, 0);
+        assert!(build.tasks.is_empty());
+        assert_eq!(build.time_range, None);
+
+        let session = by_session_query(&db, "missing-session").expect("session query");
+        assert_eq!(session.session_id, "missing-session");
+        assert_eq!(session.record_count, 0);
+        assert_eq!(session.total_tokens, 0);
+        assert!(session.records.is_empty());
+        assert!(session.agents.is_empty());
+        assert!(session.build_ids.is_empty());
+        assert!(session.task_ids.is_empty());
+        assert_eq!(session.time_range, None);
+    }
 }
