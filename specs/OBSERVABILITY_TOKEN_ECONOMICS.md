@@ -1,10 +1,10 @@
-# Triumvirate v3.0.1 + v3.0.2 — Observability & Token Economics
+# Triumvirate v3.2.0 — Observability & Token Economics
 
-**Version:** Combined Sprint Spec — Round 1 Updated
-**Date:** 2026-04-08
-**GitHub Issues:** #19, #20, #21 (v3.0.1), #23 (v3.0.2)
-**Goat Rodeo:** Round 1 complete (14 auto-resolved, 3 user decisions)
-**Codebase State:** ABE v3.0 shipped, stress test Phases 1-4 passed, daemon at commit `1ca4f58`
+**Version:** v3.2.0 (renumbered from v3.0.1 + v3.0.2 during v3.1 planning)
+**Date:** 2026-04-10 (spec refreshed post-3.1.0)
+**GitHub Issues:** #19, #20, #21, #23
+**Goat Rodeo:** Round 1 complete (14 auto-resolved, 3 user decisions). Spec refreshed for post-3.1.0 codebase.
+**Codebase State:** v3.1.0 shipped (MCP Consolidation). Daemon is pure Rust, sole MCP endpoint. `DaemonMetrics` relocated to `daemon-core/src/metrics.rs`. `ObservabilityBus` struct exists at `daemon-core/src/observability.rs`. Tool handlers extracted to `mcp-tools/src/{abe,fleet,inter_agent,knowledge,review,gemini_query}.rs`. HTTP routes in `daemon-http/src/lib.rs`. Tag: `3.1.0`.
 
 ---
 
@@ -38,9 +38,9 @@ Build a Rust-native token scanner that reads Claude, Codex, and Gemini session l
 ### What This Does NOT Cover
 
 - Dashboard UI redesign (#12)
-- Daemon Rust rewrite of non-ABE modules (#13)
-- Gemini enforcement gate (#22)
-- Notification system (#14)
+- ~~Daemon Rust rewrite of non-ABE modules (#13)~~ — **RESOLVED in v3.1.0**
+- ~~Gemini enforcement gate (#22)~~ — **RESOLVED in v3.1.0** (Phase 5.3 twin audit)
+- ~~Notification system (#14)~~ — **RESOLVED in v3.1.0** (T-004B three-ceremony closing)
 - Remaining stress test phases 5-7
 
 ---
@@ -212,19 +212,17 @@ Query: `WHERE model = ? AND effective_date <= ?ts AND (end_date IS NULL OR end_d
 
 ## Architecture Notes
 
-### ObservabilityBus (Round 1 — Architectural Addition)
+### ObservabilityBus (PARTIALLY SHIPPED in v3.1.0)
 
-McpBridge (where ABE MCP tools live) currently has NO access to `DaemonMetrics` or `ws_events`. Both are needed for REQ-O4–O11, O20, O21, T14, T15. Solution: create an `ObservabilityBus` struct wrapping shared observability state, injected into both DaemonState (for HTTP routes) and McpBridge (for MCP tools).
+`ObservabilityBus` already exists at `daemon-core/src/observability.rs` (created in v3.1.0 T-001). It currently has:
+- `pub metrics: Arc<DaemonMetrics>` — DaemonMetrics at `daemon-core/src/metrics.rs` (all 12 Prometheus metrics)
+- `pub ws_events: broadcast::Sender<String>` — WebSocket broadcast channel
+- `pub fn publish_event()` — sends JSON events to the WS channel
 
-```rust
-pub struct ObservabilityBus {
-    pub metrics: Arc<DaemonMetrics>,
-    pub ws_events: broadcast::Sender<String>,
-    pub token_db: Arc<TokenDb>,  // SQLite connection for token-scanner
-}
-```
-
-Constructed once in `main()`, cloned into DaemonState and McpBridge. All ABE functions that need metrics/events receive a reference to the bus.
+**What v3.2.0 adds to ObservabilityBus:**
+- `pub token_db: Arc<TokenDb>` — SQLite connection for token-economics
+- Wire the bus into DaemonState and McpBridge (v3.1.0 defined it but DaemonState still holds metrics + ws_events as separate fields — the bundling is a v3.2.0 task)
+- Pass bus reference to all ABE functions that need metrics/events
 
 ### Token Ingestion Architecture (Round 1 — Dual Lane)
 
@@ -263,11 +261,13 @@ triumvirate (main binary)
 
 ### File Inventory (Existing — Must Modify)
 
+**Post-3.1.0 locations** (tool handlers moved in Wave 1, HTTP routes in Wave 2):
+
 | File | Changes |
 |------|---------|
 | `daemon/crates/triumvirate/src/abe/worktree_setup.rs` | #[instrument], REQ-O23 worktreeConfig, REQ-O8 metric, REQ-O19 context |
 | `daemon/crates/triumvirate/src/abe/codex_spawn.rs` | #[instrument], REQ-O7 timeout metric, REQ-O16-O18 log events |
-| `daemon/crates/triumvirate/src/abe/task_tracker.rs` | #[instrument], REQ-O4 dispatch metric, REQ-O20 WS event |
+| `daemon/crates/triumvirate/src/abe/task_tracker.rs` | #[instrument], REQ-O4 dispatch metric, REQ-O20 WS event (NOTE: T-004B added completion detection code here in v3.1.0) |
 | `daemon/crates/triumvirate/src/abe/orchestrator.rs` | #[instrument], REQ-O5/O6 duration metrics, REQ-O16-O18 events |
 | `daemon/crates/triumvirate/src/abe/failure_handler.rs` | #[instrument], REQ-O9/O10 failure metrics |
 | `daemon/crates/triumvirate/src/abe/build_artifacts.rs` | #[instrument], REQ-O19 context |
@@ -275,9 +275,14 @@ triumvirate (main binary)
 | `daemon/crates/triumvirate/src/abe/wave_gate.rs` | #[instrument], REQ-O6 wave metric, REQ-O21 WS event |
 | `daemon/crates/triumvirate/src/abe/post_exit_validator.rs` | #[instrument], REQ-O11 validation metric |
 | `daemon/crates/triumvirate/src/agent_exec.rs` | REQ-O3 parent span, REQ-O12 token metric, REQ-T5 Gemini stats capture |
-| `daemon/crates/triumvirate/src/main.rs` | New metrics registration, new HTTP routes, WS events, scanner task spawn |
+| `daemon/crates/triumvirate/src/main.rs` | New metrics registration, scanner task spawn, ObservabilityBus wiring into DaemonState |
+| `daemon/crates/daemon-core/src/metrics.rs` | Add new ABE metrics (REQ-O4-O11) to DaemonMetrics struct + new() (moved here in v3.1.0 T-001) |
+| `daemon/crates/daemon-core/src/observability.rs` | Add token_db field to ObservabilityBus (exists since v3.1.0 T-001) |
+| `daemon/crates/daemon-http/src/lib.rs` | REQ-O22 fleet_progress wiring, REQ-T10-T12 new token API routes (HTTP routes moved here in v3.1.0 T-008) |
+| `daemon/crates/mcp-tools/src/abe.rs` | REQ-O4/O20 metrics + WS event calls inside ABE tool handlers (handlers moved here in v3.1.0 T-004) |
+| `daemon/crates/mcp-tools/src/fleet.rs` | REQ-O22 fleet_progress event inside fleet handlers (moved in v3.1.0 T-005) |
 | `daemon/crates/ledger/src/*.rs` | REQ-O2 #[instrument] on all public fns |
-| `daemon/crates/daemon-http/src/lib.rs` | REQ-O22 fleet_progress wiring |
+| `daemon/crates/shared-types/src/lib.rs` | Extended TokenUsage struct (REQ-T5) |
 
 ### File Inventory (New)
 
