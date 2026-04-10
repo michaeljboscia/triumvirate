@@ -1,14 +1,31 @@
 # Triumvirate
 
-**A multi-agent development system. Three AI models. One daemon. A methodology for building software with all of them at once.**
+[![Rust CI](https://github.com/michaeljboscia/triumvirate/actions/workflows/rust.yml/badge.svg)](https://github.com/michaeljboscia/triumvirate/actions)
+[![Version](https://img.shields.io/github/v/release/michaeljboscia/triumvirate)](https://github.com/michaeljboscia/triumvirate/releases)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/License-FSL--1.1--ALv2-blue.svg)](LICENSE)
 
-Claude, Gemini, and Codex — each with different strengths — working on the same codebase, coordinated by a single Rust daemon, visible in real-time from inside your editor. No terminal windows. No tab switching. No wondering what the other agent is doing.
+**Three AI models. One daemon. A methodology for building software with all of them at once.**
+
+Claude, Gemini, and Codex — each with different strengths — working on the same codebase, coordinated by a single Rust daemon, visible in real-time from inside your editor.
+
+## Quick Start
 
 ```bash
-cd daemon && cargo build --release && cargo run --release
+git clone https://github.com/michaeljboscia/triumvirate
+cd triumvirate/daemon
+cargo build --release && cargo run --release
 ```
 
-No Docker. No NATS. No cloud services. One binary on your machine.
+That's it. One binary. No Docker. No NATS. No cloud services. Register it in Claude Code:
+
+```bash
+# Add to ~/.claude.json under mcpServers:
+"triumvirate": { "command": "/path/to/triumvirate", "args": ["mcp"] }
+```
+
+Then from any Claude session: `spawn a Gemini session called 'research'`
+
+> **Requirements:** Rust 1.82+ and at least one agent CLI ([Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [Codex CLI](https://github.com/openai/codex)). Works with 1, 2, or all 3.
 
 ---
 
@@ -126,96 +143,66 @@ Standalone Python tool. Reads agent transcripts, feeds them to a local Ollama mo
 ## Architecture
 
 ```
-triumvirate-daemon (single Rust binary, ~7,300 lines)
+triumvirate-daemon (single Rust binary, 13 crates)
 │
-├── MCP Server (rmcp)
-│   15 tools: spawn_session, ask_session, dismiss_session,
-│   ask_agent, list_sessions, get_status, memory_write,
-│   memory_read, scratchpad_write, scratchpad_list,
-│   outbox_recent, fallback_list, fallback_ack,
-│   fallback_gc, ping
+├── MCP Server (rmcp) — 35+ tools
+│   Sessions, ABE dispatch, fleet, knowledge, review, tokens
 │
-├── HTTP API (axum)
-│   Same tools as REST endpoints for non-MCP clients.
+├── HTTP API (axum) — REST + Prometheus + WebSocket
+│   Same tools as REST endpoints, plus /metrics, /ws, /api/tokens/*
+│
+├── ABE (Autonomous Build Enforcement)
+│   ├── Fleet dispatch — N workers in isolated git worktrees
+│   ├── Task tracker — state machine with 4-signal completion detection
+│   ├── Contract enforcement — file scope, commit format, test gates
+│   └── Failure classification — auto-retry with escalation
+│
+├── Token Economics (token-economics crate)
+│   SQLite storage, session scanner (Claude/Codex/Gemini JSONL),
+│   cost attribution by build/session/task
 │
 ├── Agent Adapter (agent-adapter crate)
 │   ├── GeminiStreamParser  — parses stream-json NDJSON live
 │   ├── CodexExecParser     — parses exec --json JSONL live
 │   └── StuckDetector       — idle, loop, freeze detection
 │
-├── Agent Executor
-│   Spawns CLI subprocesses, pipes stdout line-by-line,
-│   drains stderr concurrently, kills process groups on timeout.
+├── Daemon Core — metrics, observability bus, session lifecycle
 │
-├── Daemon Core
-│   Session lifecycle, file-based state, dead-drop tickets.
-│
-└── Fallback Outbox
-    Disk-persisted retry queue. Agent failures → tickets → retry.
+└── Fallback Outbox — disk-persisted retry queue
 ```
 
-9 crates. 42 tests. Zero external services.
+13 crates. 150+ tests. Zero external services.
 
 ---
 
-## Quick Start
+## Installation Options
 
-```bash
-git clone https://github.com/michaeljboscia/triumvirate
-cd triumvirate
-./install.sh
-```
+| Option | Command | Build Required |
+|--------|---------|----------------|
+| **Daemon only** | `cd daemon && cargo build --release` | Yes (Rust) |
+| **Skills only** | `cp skills/claude/*.md ~/.claude/skills/` | No |
+| **Full stack** | `cd starter-kit && ./install.sh` | Yes (Rust) |
 
-The installer detects your environment and asks what you want:
-
-| Option | What You Get | Build Required |
-|--------|-------------|----------------|
-| **Full Stack** | Daemon + skills + hooks + configs + stenographer | Yes (Rust) |
-| **Daemon + Skills** | Daemon binary + goatrodeo/postrodeo | Yes (Rust) |
-| **Daemon Only** | Just the MCP server | Yes (Rust) |
-| **Skills Only** | Goatrodeo/postrodeo for Claude | No |
-
-Or do it manually:
-
-```bash
-# Just the daemon
-cd daemon && cargo build --release
-
-# Just the skills (no build)
-cp skills/claude/*.md ~/.claude/skills/
-
-# Full operating environment
-cd starter-kit && ./install.sh
-```
-
-### Requirements
-
-- **Rust 1.82+** (`rustup update stable`) — for daemon builds
-- **jq** — for MCP server registration
-- At least one agent CLI:
-  - `claude` — [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-  - `gemini` — [Gemini CLI](https://github.com/google-gemini/gemini-cli)
-  - `codex` — [Codex CLI](https://github.com/openai/codex)
-
-Works with 1, 2, or all 3. The daemon detects what's available at runtime.
+The full stack installer sets up: daemon + skills + hooks + configs + stenographer for all three agents.
 
 ---
 
 ## What's Next
 
-The spec review half works. The build dispatch half is next.
+v3.2.0 shipped the build dispatch half. What's left is polish and scale.
 
 | Feature | Status | What It Unlocks |
 |---------|--------|----------------|
-| **Worktree-isolated Codex swarms** | Building | Dispatch N Codex agents, each in its own git worktree. No merge conflicts during parallel builds. |
-| **Plan-aware task assignment** | Planned | Daemon reads a plan, assigns tasks to agents by wave, respects dependencies. |
-| **Merge coordination** | Planned | When parallel builders finish, daemon merges worktrees in dependency order. |
-| **Cross-model code review** | Planned | Agents review each other's code, not just specs. |
-| **Session resume** | Planned | Reconnect to previous conversations (session IDs already captured by parsers). |
-| **Cedar governance** | Planned | Policy-based approval gates for destructive operations. |
+| **Worktree-isolated Codex swarms** | **Shipped (v3.1)** | N Codex agents, each in its own git worktree. Contract enforcement, timeout, retry. |
+| **Plan-aware task assignment** | **Shipped (v3.1)** | ABE reads a plan, assigns tasks by wave, respects dependencies. |
+| **Token economics** | **Shipped (v3.2)** | Per-session, per-build, per-task cost tracking across all 3 agents. |
+| **Full observability** | **Shipped (v3.2)** | `#[instrument]` spans on all ABE functions, 20 Prometheus metrics, structured logging. |
+| **Cross-model code review** | **Shipped (v3.1)** | Agents review each other's code via peer-review queue. |
 | **Dashboard** | Planned | Web UI for watching all agent sessions in real-time. |
+| **Fleet scaling** | Planned | Multiple orchestrators, mixed worker types, concurrent builds. |
+| **Cedar governance** | Planned | Policy-based approval gates for destructive operations. |
 
-The goal: launch a Codex swarm from inside Claude, each builder in its own worktree, with live visibility into all of them, and automated merge when they're done. No terminal windows. No tab switching. No wondering.
+The daemon is the coordination layer. The methodology runs on top of it. The agents do the work.
 
 See [`ROADMAP.md`](ROADMAP.md) for the full plan.
 
