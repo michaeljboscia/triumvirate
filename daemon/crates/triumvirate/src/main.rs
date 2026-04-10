@@ -42,6 +42,7 @@ use mcp_tools::{
     aliases as mcp_aliases,
     ProgressEmitter, fleet as mcp_fleet,
     gemini_query as mcp_gemini_query, knowledge, review as mcp_review,
+    token_tools as mcp_token_tools,
 };
 use axum::{
     Json as AxumJson, Router,
@@ -150,6 +151,7 @@ struct McpBridge {
     abe_tasks: abe::task_tracker::TaskTracker,
     metrics: Arc<DaemonMetrics>,
     ws_events: broadcast::Sender<String>,
+    token_db: Arc<TokenDb>,
 }
 
 static PROCESS_METRICS: OnceLock<Arc<DaemonMetrics>> = OnceLock::new();
@@ -350,6 +352,9 @@ impl McpBridge {
         let ws_events = broadcast::channel(256).0;
         set_process_metrics(metrics.clone());
         init_process_token_db();
+        let token_db = process_token_db()
+            .expect("token DB should be initialized")
+            .clone();
         let sessions_file = if enable_persistence {
             core_triumvirate_home_dir()
                 .ok()
@@ -373,6 +378,7 @@ impl McpBridge {
             ),
             metrics,
             ws_events,
+            token_db,
         }
     }
 
@@ -729,6 +735,22 @@ impl McpBridge {
     #[tool(description = "Query daemon HTTP status using local bearer token.")]
     async fn daemon_health(&self) -> Result<Json<DaemonHealthResponse>, String> {
         mcp_tools::inter_agent::daemon_health().await
+    }
+
+    #[tool(description = "Return token summary across agents with optional since/until/agent filters.")]
+    async fn get_token_summary(
+        &self,
+        Parameters(req): Parameters<mcp_token_tools::GetTokenSummaryRequest>,
+    ) -> Result<Json<mcp_token_tools::GetTokenSummaryResponse>, String> {
+        mcp_token_tools::get_token_summary(self.token_db.db_path.as_path(), req).map(Json)
+    }
+
+    #[tool(description = "Return per-task token and cost breakdown for a build_id.")]
+    async fn get_build_cost(
+        &self,
+        Parameters(req): Parameters<mcp_token_tools::GetBuildCostRequest>,
+    ) -> Result<Json<mcp_token_tools::GetBuildCostResponse>, String> {
+        mcp_token_tools::get_build_cost(self.token_db.db_path.as_path(), req).map(Json)
     }
 
     #[tool(description = "Write a shared memory entry.")]
