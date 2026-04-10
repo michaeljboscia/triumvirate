@@ -2,7 +2,7 @@ use shared_types::{
     CancelTaskRequest as AbeCancelTaskRequest, CancelTaskResponse as AbeCancelTaskResponse,
     ContractFields, DispatchCodexRequest, DispatchCodexResponse, DispatchCodexWorktreeRequest,
     DispatchCodexWorktreeResponse, GetTaskOutputRequest, GetTaskOutputResponse,
-    GetTaskStatusRequest, GetTaskStatusResponse,
+    GetTaskStatusRequest, GetTaskStatusResponse, TaskCompleteRequest, TaskStatus,
 };
 use std::{
     collections::HashMap,
@@ -10,7 +10,9 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    process::Command,
     sync::Arc,
+    time::SystemTime,
 };
 use tokio::{process::Child, sync::Mutex};
 use uuid::Uuid;
@@ -43,6 +45,8 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
     ) -> BoxFuture<()>;
 
     fn mark_timeout(&self, task_id: String) -> BoxFuture<()>;
+
+    fn mark_stuck(&self, task_id: String, error_message: String) -> BoxFuture<()>;
 
     fn register_setup_failed(&self, task_id: String, error_message: String) -> BoxFuture<()>;
 
@@ -94,6 +98,84 @@ pub struct AbeCallbacks {
     pub validate_commit:
         Arc<dyn Fn(&Path, &ContractFields, &str) -> PostExitValidation + Send + Sync>,
     pub rollback_worktree: Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>,
+    pub completion_env: Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>,
+}
+
+fn git_output(worktree_path: &Path, args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+}
+
+fn git_head(worktree_path: &Path) -> Option<String> {
+    git_output(worktree_path, &["rev-parse", "HEAD"])
+}
+
+fn git_latest_commit_message(worktree_path: &Path) -> Option<String> {
+    git_output(worktree_path, &["log", "-1", "--pretty=%B"])
+}
+
+fn commit_message_matches_format(commit_message: &str, commit_format: &str) -> bool {
+    regex_lite::Regex::new(commit_format)
+        .map(|re| re.is_match(commit_message))
+        .unwrap_or(false)
+}
+
+fn parse_task_complete_file(path: &Path) -> Option<TaskCompleteRequest> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<TaskCompleteRequest>(&raw).ok()
+}
+
+fn latest_worktree_touch(path: &Path) -> Option<SystemTime> {
+    fn walk(path: &Path, latest: &mut Option<SystemTime>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name == ".git")
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if let Ok(modified) = meta.modified() {
+                match latest {
+                    Some(existing) if modified <= *existing => {}
+                    _ => *latest = Some(modified),
+                }
+            }
+            if meta.is_dir() {
+                walk(&entry_path, latest);
+            }
+        }
+    }
+
+    let mut latest = None;
+    walk(path, &mut latest);
+    latest
+}
+
+async fn terminate_worker(child: Arc<Mutex<Child>>) {
+    let mut locked = child.lock().await;
+    if locked.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let _ = locked.start_kill();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    if locked.try_wait().ok().flatten().is_none() {
+        let _ = locked.kill().await;
+    }
 }
 
 pub async fn dispatch_codex<T: AbeTaskTracker>(
@@ -270,19 +352,22 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
 
     args.push(prompt);
 
+    let mut worker_env = (callbacks.completion_env)();
+    worker_env.insert(
+        "CARGO_TARGET_DIR".to_string(),
+        setup.worktree_path
+            .join(".triumvirate")
+            .join("target")
+            .join(task_id.clone())
+            .display()
+            .to_string(),
+    );
+
     let child = (callbacks.spawn_background)(SpawnSpec {
         cmd,
         args,
         cwd: setup.worktree_path.display().to_string(),
-        envs: HashMap::from([(
-            "CARGO_TARGET_DIR".to_string(),
-            setup.worktree_path
-                .join(".triumvirate")
-                .join("target")
-                .join(task_id.clone())
-                .display()
-                .to_string(),
-        )]),
+        envs: worker_env,
     })
     .await
     .map_err(|e| format!("dispatch_codex_worktree failed: {e}"))?;
@@ -301,19 +386,155 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     let start_sha = req.sha.clone();
     let contract_for_validation = req.contract_fields.clone();
     tokio::spawn(async move {
-        let timed_out = (callbacks_for_monitor.enforce_timeout)(
-            child.clone(),
-            timeout_sec,
-            worktree_path.clone(),
-        )
-        .await
-        .unwrap_or(false);
-        if timed_out {
-            tracker_for_monitor
-                .mark_timeout(task_id_for_monitor.clone())
-                .await;
-            return;
-        }
+        let timeout_tracker = tracker_for_monitor.clone();
+        let timeout_callbacks = callbacks_for_monitor.clone();
+        let timeout_task_id = task_id_for_monitor.clone();
+        let timeout_worktree = worktree_path.clone();
+        let timeout_child = child.clone();
+        tokio::spawn(async move {
+            let timed_out = (timeout_callbacks.enforce_timeout)(
+                timeout_child,
+                timeout_sec,
+                timeout_worktree,
+            )
+            .await
+            .unwrap_or(false);
+            if timed_out {
+                timeout_tracker.mark_timeout(timeout_task_id).await;
+            }
+        });
+
+        let sentinel_tracker = tracker_for_monitor.clone();
+        let sentinel_task_id = task_id_for_monitor.clone();
+        let sentinel_worktree = worktree_path.clone();
+        let sentinel_start_sha = start_sha.clone();
+        let sentinel_child = child.clone();
+        let resolve_commit_outputs = callbacks_for_monitor.resolve_commit_outputs.clone();
+        tokio::spawn(async move {
+            let sentinel_path = sentinel_worktree.join(".triumvirate").join("TASK_COMPLETE.json");
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let status = sentinel_tracker
+                    .get_status(sentinel_task_id.clone())
+                    .await
+                    .map(|s| s.status);
+                if !matches!(status, Some(TaskStatus::Working)) {
+                    break;
+                }
+                if !sentinel_path.exists() {
+                    continue;
+                }
+                let Some(payload) = parse_task_complete_file(&sentinel_path) else {
+                    continue;
+                };
+                if payload.task_id != sentinel_task_id {
+                    continue;
+                }
+                let Some(head_sha) = git_head(&sentinel_worktree) else {
+                    continue;
+                };
+                if head_sha != payload.commit_sha {
+                    continue;
+                }
+                let (commit_sha, files) = (resolve_commit_outputs)(&sentinel_worktree, &sentinel_start_sha);
+                if commit_sha.is_empty() {
+                    continue;
+                }
+                sentinel_tracker
+                    .mark_completed(
+                        sentinel_task_id.clone(),
+                        commit_sha,
+                        files,
+                        String::new(),
+                        None,
+                        None,
+                    )
+                    .await;
+                terminate_worker(sentinel_child).await;
+                break;
+            }
+        });
+
+        let head_tracker = tracker_for_monitor.clone();
+        let head_task_id = task_id_for_monitor.clone();
+        let head_worktree = worktree_path.clone();
+        let head_start_sha = start_sha.clone();
+        let head_commit_format = contract_for_validation.commit_format.clone();
+        let head_child = child.clone();
+        let resolve_commit_outputs = callbacks_for_monitor.resolve_commit_outputs.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let status = head_tracker
+                    .get_status(head_task_id.clone())
+                    .await
+                    .map(|s| s.status);
+                if !matches!(status, Some(TaskStatus::Working)) {
+                    break;
+                }
+                let Some(head_sha) = git_head(&head_worktree) else {
+                    continue;
+                };
+                if head_sha == head_start_sha {
+                    continue;
+                }
+                let Some(message) = git_latest_commit_message(&head_worktree) else {
+                    continue;
+                };
+                if !commit_message_matches_format(&message, &head_commit_format) {
+                    continue;
+                }
+                let (commit_sha, files) = (resolve_commit_outputs)(&head_worktree, &head_start_sha);
+                if commit_sha.is_empty() {
+                    continue;
+                }
+                head_tracker
+                    .mark_completed(head_task_id.clone(), commit_sha, files, String::new(), None, None)
+                    .await;
+                terminate_worker(head_child).await;
+                break;
+            }
+        });
+
+        let stuck_tracker = tracker_for_monitor.clone();
+        let stuck_task_id = task_id_for_monitor.clone();
+        let stuck_worktree = worktree_path.clone();
+        let stuck_child = child.clone();
+        tokio::spawn(async move {
+            let mut last_touch = latest_worktree_touch(&stuck_worktree).or_else(|| Some(SystemTime::now()));
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let status = stuck_tracker
+                    .get_status(stuck_task_id.clone())
+                    .await
+                    .map(|s| s.status);
+                if !matches!(status, Some(TaskStatus::Working)) {
+                    break;
+                }
+                if let Some(current_touch) = latest_worktree_touch(&stuck_worktree) {
+                    if match last_touch {
+                        None => true,
+                        Some(prev) => current_touch > prev,
+                    } {
+                        last_touch = Some(current_touch);
+                    }
+                }
+                let idle_for = last_touch
+                    .and_then(|touch| SystemTime::now().duration_since(touch).ok())
+                    .unwrap_or_default();
+                if idle_for.as_secs() < 180 {
+                    continue;
+                }
+                stuck_tracker
+                    .mark_stuck(
+                        stuck_task_id.clone(),
+                        "worker marked STUCK after 180s without filesystem activity".to_string(),
+                    )
+                    .await;
+                terminate_worker(stuck_child).await;
+                break;
+            }
+        });
 
         let exit = {
             let mut locked = child.lock().await;

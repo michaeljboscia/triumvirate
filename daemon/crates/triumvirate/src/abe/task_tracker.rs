@@ -37,6 +37,25 @@ pub struct TaskTracker {
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    Transitioned,
+    AlreadyTerminal,
+    NotFound,
+}
+
+fn is_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed
+            | TaskStatus::Stuck
+            | TaskStatus::Failed
+            | TaskStatus::Timeout
+            | TaskStatus::SetupFailed
+            | TaskStatus::Cancelled
+    )
+}
+
 impl TaskTracker {
     pub async fn register(
         &self,
@@ -68,48 +87,87 @@ impl TaskTracker {
         stdout: String,
         validation_log: Option<String>,
         test_output: Option<String>,
-    ) {
+    ) -> TransitionOutcome {
         let mut guard = self.inner.lock().await;
-        if let Some(task) = guard.get_mut(task_id) {
-            task.status = TaskStatus::Completed;
-            task.commit_sha = Some(commit_sha.clone());
-            task.output = Some(TaskOutput {
-                commit_sha,
-                modified_files,
-                stdout,
-                validation_log,
-                test_output,
-            });
-            task.child = None;
+        let Some(task) = guard.get_mut(task_id) else {
+            return TransitionOutcome::NotFound;
+        };
+        if is_terminal(&task.status) {
+            return TransitionOutcome::AlreadyTerminal;
         }
+        task.status = TaskStatus::Completed;
+        task.commit_sha = Some(commit_sha.clone());
+        task.output = Some(TaskOutput {
+            commit_sha,
+            modified_files,
+            stdout,
+            validation_log,
+            test_output,
+        });
+        task.child = None;
+        TransitionOutcome::Transitioned
     }
 
-    pub async fn mark_failed(&self, task_id: &str, exit_code: Option<i32>, error_message: String) {
+    pub async fn mark_failed(
+        &self,
+        task_id: &str,
+        exit_code: Option<i32>,
+        error_message: String,
+    ) -> TransitionOutcome {
         let mut guard = self.inner.lock().await;
-        if let Some(task) = guard.get_mut(task_id) {
-            task.status = TaskStatus::Failed;
-            task.exit_code = exit_code;
-            task.error_message = Some(error_message);
-            task.child = None;
+        let Some(task) = guard.get_mut(task_id) else {
+            return TransitionOutcome::NotFound;
+        };
+        if is_terminal(&task.status) {
+            return TransitionOutcome::AlreadyTerminal;
         }
+        task.status = TaskStatus::Failed;
+        task.exit_code = exit_code;
+        task.error_message = Some(error_message);
+        task.child = None;
+        TransitionOutcome::Transitioned
     }
 
-    pub async fn mark_timeout(&self, task_id: &str) {
+    pub async fn mark_timeout(&self, task_id: &str) -> TransitionOutcome {
         let mut guard = self.inner.lock().await;
-        if let Some(task) = guard.get_mut(task_id) {
-            task.status = TaskStatus::Timeout;
-            task.error_message = Some("task timed out".to_string());
-            task.child = None;
+        let Some(task) = guard.get_mut(task_id) else {
+            return TransitionOutcome::NotFound;
+        };
+        if is_terminal(&task.status) {
+            return TransitionOutcome::AlreadyTerminal;
         }
+        task.status = TaskStatus::Timeout;
+        task.error_message = Some("task timed out".to_string());
+        task.child = None;
+        TransitionOutcome::Transitioned
     }
 
-    pub async fn mark_setup_failed(&self, task_id: &str, error_message: String) {
+    pub async fn mark_stuck(&self, task_id: &str, error_message: String) -> TransitionOutcome {
         let mut guard = self.inner.lock().await;
-        if let Some(task) = guard.get_mut(task_id) {
-            task.status = TaskStatus::SetupFailed;
-            task.error_message = Some(error_message);
-            task.child = None;
+        let Some(task) = guard.get_mut(task_id) else {
+            return TransitionOutcome::NotFound;
+        };
+        if is_terminal(&task.status) {
+            return TransitionOutcome::AlreadyTerminal;
         }
+        task.status = TaskStatus::Stuck;
+        task.error_message = Some(error_message);
+        task.child = None;
+        TransitionOutcome::Transitioned
+    }
+
+    pub async fn mark_setup_failed(&self, task_id: &str, error_message: String) -> TransitionOutcome {
+        let mut guard = self.inner.lock().await;
+        let Some(task) = guard.get_mut(task_id) else {
+            return TransitionOutcome::NotFound;
+        };
+        if is_terminal(&task.status) {
+            return TransitionOutcome::AlreadyTerminal;
+        }
+        task.status = TaskStatus::SetupFailed;
+        task.error_message = Some(error_message);
+        task.child = None;
+        TransitionOutcome::Transitioned
     }
 
     pub async fn get_status(&self, task_id: &str) -> Option<GetTaskStatusResponse> {
@@ -140,14 +198,24 @@ impl TaskTracker {
     }
 
     pub async fn cancel(&self, task_id: &str) -> Option<CancelTaskResponse> {
-        let (child, worktree_path) = {
+        let (child, worktree_path, already_terminal) = {
             let guard = self.inner.lock().await;
             let task = guard.get(task_id)?;
             (
                 task.child.as_ref().cloned(),
                 task.worktree_path.clone(),
+                is_terminal(&task.status),
             )
         };
+        if already_terminal {
+            let guard = self.inner.lock().await;
+            let task = guard.get(task_id)?;
+            return Some(CancelTaskResponse {
+                task_id: task_id.to_string(),
+                status: "already-terminal".to_string(),
+                worktree_path: task.worktree_path.as_ref().map(|p| p.display().to_string()),
+            });
+        }
         if let Some(child) = child {
             let mut child = child.lock().await;
             if child.try_wait().ok().flatten().is_none() {
@@ -184,6 +252,11 @@ impl TaskTracker {
         guard.contains_key(task_id)
     }
 
+    pub async fn worktree_path_for(&self, task_id: &str) -> Option<PathBuf> {
+        let guard = self.inner.lock().await;
+        guard.get(task_id).and_then(|task| task.worktree_path.clone())
+    }
+
     pub async fn register_setup_failed(&self, task_id: String, error_message: String) {
         let mut guard = self.inner.lock().await;
         guard.insert(
@@ -204,6 +277,11 @@ impl TaskTracker {
     pub async fn elapsed_for(&self, task_id: &str) -> Option<Duration> {
         let guard = self.inner.lock().await;
         guard.get(task_id).map(|r| r.started_at.elapsed())
+    }
+
+    pub async fn status_for(&self, task_id: &str) -> Option<TaskStatus> {
+        let guard = self.inner.lock().await;
+        guard.get(task_id).map(|r| r.status.clone())
     }
 }
 

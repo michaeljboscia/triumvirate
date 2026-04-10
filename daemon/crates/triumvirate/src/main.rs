@@ -70,6 +70,7 @@ use shared_types::{
     DispatchCodexWorktreeRequest, DispatchCodexWorktreeResponse, GetTaskOutputRequest,
     GetTaskOutputResponse, GetTaskStatusRequest, GetTaskStatusResponse,
     QueryGeminiRequest, QueryGeminiResponse, QueryGeminiReviewRequest, QueryGeminiReviewResponse,
+    TaskCompleteRequest,
     DismissSessionRequest,
     FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
     FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest,
@@ -164,6 +165,10 @@ fn mcp_daemon_proxy_enabled() -> bool {
     }
 }
 
+fn daemon_bind_port(bind_addr: &str) -> Option<u16> {
+    bind_addr.rsplit(':').next()?.parse::<u16>().ok()
+}
+
 impl McpBridge {
     fn new() -> Self {
         Self::with_persistence(true)
@@ -243,6 +248,20 @@ impl McpBridge {
                 abe::worktree_setup::rollback_worktree(project_root, worktree_path)
                     .map_err(|e| e.to_string())
             }),
+            completion_env: Arc::new(|| {
+                let mut envs = HashMap::new();
+                if let Ok(home) = core_triumvirate_home_dir() {
+                    if let Ok(token) = core_ensure_daemon_token(&home) {
+                        envs.insert("TRIUMVIRATE_TOKEN".to_string(), token);
+                    }
+                }
+                let bind_addr =
+                    core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
+                if let Some(port) = daemon_bind_port(&bind_addr) {
+                    envs.insert("TRIUMVIRATE_HTTP_PORT".to_string(), port.to_string());
+                }
+                envs
+            }),
         }
     }
 }
@@ -269,7 +288,7 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
     ) -> mcp_tools::abe::BoxFuture<()> {
         let tracker = self.clone();
         Box::pin(async move {
-            tracker
+            let _ = tracker
                 .mark_completed(
                     &task_id,
                     commit_sha,
@@ -278,7 +297,7 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
                     validation_log,
                     test_output,
                 )
-                .await
+                .await;
         })
     }
 
@@ -289,12 +308,23 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
         error_message: String,
     ) -> mcp_tools::abe::BoxFuture<()> {
         let tracker = self.clone();
-        Box::pin(async move { tracker.mark_failed(&task_id, exit_code, error_message).await })
+        Box::pin(async move {
+            let _ = tracker.mark_failed(&task_id, exit_code, error_message).await;
+        })
     }
 
     fn mark_timeout(&self, task_id: String) -> mcp_tools::abe::BoxFuture<()> {
         let tracker = self.clone();
-        Box::pin(async move { tracker.mark_timeout(&task_id).await })
+        Box::pin(async move {
+            let _ = tracker.mark_timeout(&task_id).await;
+        })
+    }
+
+    fn mark_stuck(&self, task_id: String, error_message: String) -> mcp_tools::abe::BoxFuture<()> {
+        let tracker = self.clone();
+        Box::pin(async move {
+            let _ = tracker.mark_stuck(&task_id, error_message).await;
+        })
     }
 
     fn register_setup_failed(
@@ -775,6 +805,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         bind_addr: String,
         sessions: Arc<Mutex<HashMap<String, SessionState>>>,
         sessions_file: Option<PathBuf>,
+        abe_tasks: abe::task_tracker::TaskTracker,
         ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
         marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
         metrics: Arc<DaemonMetrics>,
@@ -1915,6 +1946,79 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(SessionListResponse { sessions: out }))
     }
 
+    async fn abe_task_complete_route(
+        State(state): State<DaemonState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<TaskCompleteRequest>,
+    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
+        }
+        let Some(worktree_path) = state.abe_tasks.worktree_path_for(&req.task_id).await else {
+            return Err((StatusCode::NOT_FOUND, AxumJson(serde_json::json!({ "error": "unknown task_id" }))));
+        };
+
+        let head_sha = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if head_sha != req.commit_sha {
+            return Err((
+                StatusCode::CONFLICT,
+                AxumJson(serde_json::json!({
+                    "error": "commit sha mismatch",
+                    "expected": head_sha,
+                    "received": req.commit_sha
+                })),
+            ));
+        }
+
+        let modified_files = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree_path)
+            .args(["show", "--name-only", "--pretty=format:", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|body| {
+                body.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let outcome = state
+            .abe_tasks
+            .mark_completed(
+                &req.task_id,
+                req.commit_sha.clone(),
+                modified_files,
+                String::new(),
+                None,
+                None,
+            )
+            .await;
+        match outcome {
+            abe::task_tracker::TransitionOutcome::Transitioned
+            | abe::task_tracker::TransitionOutcome::AlreadyTerminal => {
+                Ok(AxumJson(serde_json::json!({"status":"ok"})))
+            }
+            abe::task_tracker::TransitionOutcome::NotFound => Err((
+                StatusCode::NOT_FOUND,
+                AxumJson(serde_json::json!({ "error": "unknown task_id" })),
+            )),
+        }
+    }
+
     let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
     let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     info!(%bind_addr, "starting triumvirate daemon");
@@ -1931,6 +2035,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         bind_addr: bind_addr.clone(),
         sessions: Arc::new(Mutex::new(sessions)),
         sessions_file,
+        abe_tasks: abe::task_tracker::TaskTracker::default(),
         ledger_project_lru: Arc::new(Mutex::new(VecDeque::new())),
         marker_parse_window: Arc::new(Mutex::new(VecDeque::new())),
         metrics: Arc::new(DaemonMetrics::new()?),
@@ -1967,6 +2072,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/ask", post(session_ask_route))
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
+        .route("/abe/task-complete", post(abe_task_complete_route))
         .route("/{*path}", get(dashboard_spa_fallback_route))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
