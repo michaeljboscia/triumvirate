@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::Utc;
+use daemon_core::metrics::DaemonMetrics;
 use futures::stream::{FuturesUnordered, StreamExt};
 use shared_types::{ContractFields, FilePolicy};
 use tracing::instrument;
@@ -142,6 +143,27 @@ pub async fn run_orchestrator<B: DispatchBackend>(
     deviation_path: &Path,
     max_parallel: usize,
 ) -> anyhow::Result<()> {
+    run_orchestrator_with_metrics(
+        backend,
+        plan_path,
+        state_path,
+        manifest_path,
+        deviation_path,
+        max_parallel,
+        None,
+    )
+    .await
+}
+
+pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
+    backend: &B,
+    plan_path: &Path,
+    state_path: &Path,
+    manifest_path: &Path,
+    deviation_path: &Path,
+    max_parallel: usize,
+    metrics: Option<&DaemonMetrics>,
+) -> anyhow::Result<()> {
     let mut state = read_state(state_path)?;
     let tasks = parse_plan(plan_path)?;
 
@@ -167,16 +189,23 @@ pub async fn run_orchestrator<B: DispatchBackend>(
                 state.tasks_running.push(task.task_id.clone());
                 update_state(state_path, &state)?;
                 running.push(async move {
+                    let started = std::time::Instant::now();
                     let ticket = backend.dispatch_task(&task).await?;
                     let result = backend.wait_task(&ticket).await?;
-                    Ok::<_, anyhow::Error>((task, result))
+                    Ok::<_, anyhow::Error>((task, result, started.elapsed()))
                 });
             }
 
             let Some(outcome) = running.next().await else {
                 break;
             };
-            let (task, result) = outcome?;
+            let (task, result, elapsed) = outcome?;
+            if let Some(metrics) = metrics {
+                metrics
+                    .abe_task_duration_seconds
+                    .with_label_values(&[&task.wave.to_string()])
+                    .observe(elapsed.as_secs_f64());
+            }
             state.tasks_running.retain(|t| t != &task.task_id);
             if result.status.eq_ignore_ascii_case("completed") {
                 state.tasks_completed.push(task.task_id.clone());

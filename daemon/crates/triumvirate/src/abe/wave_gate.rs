@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::process::Command;
 use tracing::instrument;
+use std::time::Instant;
+
+use daemon_core::metrics::DaemonMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveTask {
@@ -32,6 +35,20 @@ pub fn gate_wave<F>(
 where
     F: Fn(&[WaveTask]) -> anyhow::Result<String>,
 {
+    gate_wave_with_metrics(tasks, test_command, gemini_review, 0, None)
+}
+
+pub fn gate_wave_with_metrics<F>(
+    tasks: &[WaveTask],
+    test_command: &str,
+    gemini_review: F,
+    wave: u32,
+    metrics: Option<&DaemonMetrics>,
+) -> anyhow::Result<String>
+where
+    F: Fn(&[WaveTask]) -> anyhow::Result<String>,
+{
+    let started = Instant::now();
     validate_no_overlap(tasks)?;
     if tasks
         .iter()
@@ -57,6 +74,12 @@ where
         tasks.iter().map(|t| t.allowed_files.len()).sum::<usize>(),
         gemini_summary
     );
+    if let Some(metrics) = metrics {
+        metrics
+            .abe_wave_duration_seconds
+            .with_label_values(&[&wave.to_string()])
+            .observe(started.elapsed().as_secs_f64());
+    }
     Ok(summary)
 }
 

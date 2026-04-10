@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use daemon_core::metrics::DaemonMetrics;
 use shared_types::{
     CancelTaskResponse, GetTaskOutputResponse, GetTaskStatusResponse, TaskStatus,
 };
@@ -33,9 +34,19 @@ struct TaskRecord {
     worktree_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TaskTracker {
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
+    metrics: Option<Arc<DaemonMetrics>>,
+}
+
+impl Default for TaskTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            metrics: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +69,22 @@ fn is_terminal(status: &TaskStatus) -> bool {
 }
 
 impl TaskTracker {
-    #[instrument(skip_all, fields(task_id = %task_id, status = "working"))]
+    pub fn with_metrics(metrics: Arc<DaemonMetrics>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Some(metrics),
+        }
+    }
+
+    fn inc_dispatch_status(&self, status: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .abe_task_dispatch_total
+                .with_label_values(&[status])
+                .inc();
+        }
+    }
+
     pub async fn register(
         &self,
         task_id: String,
@@ -108,6 +134,7 @@ impl TaskTracker {
             test_output,
         });
         task.child = None;
+        self.inc_dispatch_status("completed");
         TransitionOutcome::Transitioned
     }
 
@@ -129,6 +156,7 @@ impl TaskTracker {
         task.exit_code = exit_code;
         task.error_message = Some(error_message);
         task.child = None;
+        self.inc_dispatch_status("failed");
         TransitionOutcome::Transitioned
     }
 
@@ -144,6 +172,7 @@ impl TaskTracker {
         task.status = TaskStatus::Timeout;
         task.error_message = Some("task timed out".to_string());
         task.child = None;
+        self.inc_dispatch_status("timeout");
         TransitionOutcome::Transitioned
     }
 
@@ -246,6 +275,7 @@ impl TaskTracker {
         let task = guard.get_mut(task_id)?;
         task.status = TaskStatus::Cancelled;
         task.child = None;
+        self.inc_dispatch_status("cancelled");
 
         Some(CancelTaskResponse {
             task_id: task_id.to_string(),

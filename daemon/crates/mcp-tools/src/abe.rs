@@ -1,3 +1,4 @@
+use daemon_core::metrics::DaemonMetrics;
 use shared_types::{
     CancelTaskRequest as AbeCancelTaskRequest, CancelTaskResponse as AbeCancelTaskResponse,
     ContractFields, DispatchCodexRequest, DispatchCodexResponse, DispatchCodexWorktreeRequest,
@@ -12,7 +13,7 @@ use std::{
     pin::Pin,
     process::Command,
     sync::Arc,
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 use tokio::{process::Child, sync::Mutex};
 use uuid::Uuid;
@@ -87,6 +88,7 @@ pub struct PostExitValidation {
 
 #[derive(Clone)]
 pub struct AbeCallbacks {
+    pub metrics: Arc<DaemonMetrics>,
     pub codex_command: Arc<dyn Fn() -> (String, Vec<String>) + Send + Sync>,
     pub setup_worktree:
         Arc<dyn Fn(WorktreeSetupRequest) -> Result<WorktreeSetupResult, String> + Send + Sync>,
@@ -99,6 +101,13 @@ pub struct AbeCallbacks {
         Arc<dyn Fn(&Path, &ContractFields, &str) -> PostExitValidation + Send + Sync>,
     pub rollback_worktree: Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>,
     pub completion_env: Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>,
+}
+
+fn observe_task_duration(metrics: &DaemonMetrics, wave: &str, started_at: Instant) {
+    metrics
+        .abe_task_duration_seconds
+        .with_label_values(&[wave])
+        .observe(started_at.elapsed().as_secs_f64());
 }
 
 fn git_output(worktree_path: &Path, args: &[&str]) -> Option<String> {
@@ -183,6 +192,11 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     req: DispatchCodexRequest,
     callbacks: AbeCallbacks,
 ) -> Result<DispatchCodexResponse, String> {
+    callbacks
+        .metrics
+        .abe_task_dispatch_total
+        .with_label_values(&["dispatched"])
+        .inc();
     let task_id = format!("abe-{}", Uuid::new_v4().simple());
     let cwd = req
         .cwd
@@ -220,8 +234,10 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
 
     let tracker_for_monitor = tracker.clone();
     let callbacks_for_monitor = callbacks.clone();
+    let task_started_at = Instant::now();
     let task_id_for_monitor = task_id.clone();
     tokio::spawn(async move {
+        let wave_label = "mcp";
         let timed_out = (callbacks_for_monitor.enforce_timeout)(
             child.clone(),
             timeout_sec,
@@ -230,6 +246,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         .await
         .unwrap_or(false);
         if timed_out {
+            observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
             tracker_for_monitor
                 .mark_timeout(task_id_for_monitor.clone())
                 .await;
@@ -251,6 +268,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
             let cwd_path = PathBuf::from(&cwd);
             let (commit_sha, files) = (callbacks_for_monitor.resolve_commit_outputs)(&cwd_path, &start_sha);
             if commit_sha.is_empty() {
+                observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
                 tracker_for_monitor
                     .mark_failed(
                         task_id_for_monitor.clone(),
@@ -260,6 +278,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                     .await;
                 return;
             }
+            observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
             tracker_for_monitor
                 .mark_completed(
                     task_id_for_monitor.clone(),
@@ -271,6 +290,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 )
                 .await;
         } else {
+            observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
             tracker_for_monitor
                 .mark_failed(
                     task_id_for_monitor.clone(),
@@ -292,6 +312,11 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     req: DispatchCodexWorktreeRequest,
     callbacks: AbeCallbacks,
 ) -> Result<DispatchCodexWorktreeResponse, String> {
+    callbacks
+        .metrics
+        .abe_task_dispatch_total
+        .with_label_values(&["dispatched"])
+        .inc();
     let task_id = req.contract_fields.task_id.clone();
     let validation =
         shared_types::validate_contract(&req.contract_fields).map_err(|e| format!("invalid contract_fields: {e}"));
@@ -380,17 +405,21 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     let callbacks_for_monitor = callbacks.clone();
     let worktree_path = setup.worktree_path.clone();
     let timeout_sec = req.contract_fields.task_timeout_sec;
+    let wave_label = req.contract_fields.wave.to_string();
     let keep_failed = req.keep_failed_worktree.unwrap_or(false);
     let project_root_for_cleanup = project_root.clone();
     let task_id_for_monitor = task_id.clone();
     let start_sha = req.sha.clone();
     let contract_for_validation = req.contract_fields.clone();
+    let task_started_at = Instant::now();
     tokio::spawn(async move {
         let timeout_tracker = tracker_for_monitor.clone();
         let timeout_callbacks = callbacks_for_monitor.clone();
         let timeout_task_id = task_id_for_monitor.clone();
         let timeout_worktree = worktree_path.clone();
         let timeout_child = child.clone();
+        let timeout_wave_label = wave_label.clone();
+        let timeout_metrics = callbacks_for_monitor.metrics.clone();
         tokio::spawn(async move {
             let timed_out = (timeout_callbacks.enforce_timeout)(
                 timeout_child,
@@ -400,6 +429,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             .await
             .unwrap_or(false);
             if timed_out {
+                observe_task_duration(&timeout_metrics, &timeout_wave_label, task_started_at);
                 timeout_tracker.mark_timeout(timeout_task_id).await;
             }
         });
@@ -410,6 +440,8 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let sentinel_start_sha = start_sha.clone();
         let sentinel_child = child.clone();
         let resolve_commit_outputs = callbacks_for_monitor.resolve_commit_outputs.clone();
+        let sentinel_wave_label = wave_label.clone();
+        let sentinel_metrics = callbacks_for_monitor.metrics.clone();
         tokio::spawn(async move {
             let sentinel_path = sentinel_worktree.join(".triumvirate").join("TASK_COMPLETE.json");
             loop {
@@ -450,6 +482,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                         None,
                     )
                     .await;
+                observe_task_duration(&sentinel_metrics, &sentinel_wave_label, task_started_at);
                 terminate_worker(sentinel_child).await;
                 break;
             }
@@ -462,6 +495,8 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let head_commit_format = contract_for_validation.commit_format.clone();
         let head_child = child.clone();
         let resolve_commit_outputs = callbacks_for_monitor.resolve_commit_outputs.clone();
+        let head_wave_label = wave_label.clone();
+        let head_metrics = callbacks_for_monitor.metrics.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -491,6 +526,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 head_tracker
                     .mark_completed(head_task_id.clone(), commit_sha, files, String::new(), None, None)
                     .await;
+                observe_task_duration(&head_metrics, &head_wave_label, task_started_at);
                 terminate_worker(head_child).await;
                 break;
             }
@@ -500,6 +536,8 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let stuck_task_id = task_id_for_monitor.clone();
         let stuck_worktree = worktree_path.clone();
         let stuck_child = child.clone();
+        let stuck_wave_label = wave_label.clone();
+        let stuck_metrics = callbacks_for_monitor.metrics.clone();
         tokio::spawn(async move {
             let mut last_touch = latest_worktree_touch(&stuck_worktree).or_else(|| Some(SystemTime::now()));
             loop {
@@ -531,6 +569,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                         "worker marked STUCK after 180s without filesystem activity".to_string(),
                     )
                     .await;
+                observe_task_duration(&stuck_metrics, &stuck_wave_label, task_started_at);
                 terminate_worker(stuck_child).await;
                 break;
             }
@@ -553,6 +592,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             let (commit_sha, files) =
                 (callbacks_for_monitor.resolve_commit_outputs)(&worktree_path, &start_sha);
             if commit_sha.is_empty() {
+                observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
                 tracker_for_monitor
                     .mark_failed(
                         task_id_for_monitor.clone(),
@@ -567,6 +607,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 (callbacks_for_monitor.validate_commit)(&worktree_path, &contract_for_validation, &start_sha);
             if !validation.passed {
                 let violation_summary = validation.violations.join("; ");
+                observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
                 tracker_for_monitor
                     .mark_failed(
                         task_id_for_monitor.clone(),
@@ -589,7 +630,9 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                     None,
                 )
                 .await;
+            observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
         } else {
+            observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
             tracker_for_monitor
                 .mark_failed(
                     task_id_for_monitor.clone(),
