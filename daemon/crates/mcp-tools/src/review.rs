@@ -1,3 +1,4 @@
+use daemon_core::metrics::DaemonMetrics;
 use peer_review::{PeerReviewEngine, ReviewRequest as PersistedReviewRequest};
 use shared_types::{
     ReviewRequestResponse, ReviewRequestTool, ReviewStatusRequest, ReviewStatusResponse,
@@ -28,7 +29,7 @@ pub fn review_request(req: ReviewRequestTool) -> Result<ReviewRequestResponse, S
     })
 }
 
-pub fn review_submit(req: ReviewSubmitRequest) -> Result<String, String> {
+pub fn review_submit(metrics: &DaemonMetrics, req: ReviewSubmitRequest) -> Result<String, String> {
     let project_root = req
         .project_root
         .map(PathBuf::from)
@@ -39,6 +40,7 @@ pub fn review_submit(req: ReviewSubmitRequest) -> Result<String, String> {
     let _ = engine
         .submit_review(&req.review_id, &req.verdict, req.comments.as_deref())
         .map_err(|e| format!("review_submit failed: {e}"))?;
+    metrics.reviews_total.inc();
     Ok("ok".to_string())
 }
 

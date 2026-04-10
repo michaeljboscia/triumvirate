@@ -1,4 +1,5 @@
 use crate::{append_outbox_event, spawn_dead_drop};
+use crate::process_metrics;
 use agent_adapter::{
     ApprovalChannelMode, CodexAppServerEvent, CodexAppServerParser, CodexExecParser,
     GeminiStreamParser, ParsedAgentResult, StuckDetector, WorkingState, WorkingStateEvent,
@@ -355,6 +356,9 @@ pub(crate) async fn execute_ask_agent(
         match attempt_result {
             Ok(parsed) => {
                 let tokens = token_total(&parsed);
+                if let Some(metrics) = process_metrics() {
+                    metrics.agent_tokens_total.inc_by(tokens);
+                }
                 span.record("agent.outcome", "success");
                 span.record("agent.tokens", tokens);
                 span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
