@@ -314,7 +314,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spawn_daemon_gemini_maps_to_agent_gemini() {
+    fn u_al_01_spawn_daemon_gemini_maps_to_agent_gemini() {
         let p = SpawnDaemonParams {
             target: "gemini".into(),
             session_name: Some("x".into()),
@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_daemon_codex_maps_to_agent_codex() {
+    fn u_al_02_spawn_daemon_codex_maps_to_agent_codex() {
         let p = SpawnDaemonParams {
             target: "codex".into(),
             session_name: None,
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_daemon_claude_rejected() {
+    fn u_al_03_spawn_daemon_claude_rejected() {
         let p = SpawnDaemonParams {
             target: "claude".into(),
             session_name: None,
@@ -351,7 +351,19 @@ mod tests {
     }
 
     #[test]
-    fn ask_daemon_preserves_prefix() {
+    fn u_al_04_spawn_daemon_empty_target_errors() {
+        let p = SpawnDaemonParams {
+            target: "".into(),
+            session_name: None,
+            cwd: None,
+            timeout_ms: None,
+        };
+        let err = map_spawn_daemon_params(p).unwrap_err();
+        assert!(matches!(err, AliasMappingError::InvalidTarget(t) if t.is_empty()));
+    }
+
+    #[test]
+    fn u_al_05_ask_daemon_preserves_gd_prefix() {
         let p = AskDaemonParams {
             daemon_id: "gd_session_abc".into(),
             question: "hi".into(),
@@ -363,7 +375,90 @@ mod tests {
     }
 
     #[test]
-    fn write_scratchpad_owner_derived_from_gd_prefix() {
+    fn u_al_06_ask_daemon_preserves_cd_prefix() {
+        let p = AskDaemonParams {
+            daemon_id: "cd_session_xyz".into(),
+            question: "hello".into(),
+            timeout_ms: Some(50),
+        };
+        let out = map_ask_daemon_params(p).unwrap();
+        assert_eq!(out.name, "cd_session_xyz");
+        assert_eq!(out.message, "hello");
+        assert_eq!(out.timeout_ms, Some(50));
+    }
+
+    #[test]
+    fn u_al_07_ask_daemon_invalid_prefix_errors() {
+        let p = AskDaemonParams {
+            daemon_id: "xx_bad".into(),
+            question: "hello".into(),
+            timeout_ms: None,
+        };
+        let err = map_ask_daemon_params(p).unwrap_err();
+        assert!(matches!(err, AliasMappingError::InvalidDaemonId(id) if id == "xx_bad"));
+    }
+
+    #[test]
+    fn u_al_08_dismiss_daemon_drops_hard_param() {
+        let p = DismissDaemonParams {
+            daemon_id: "gd_session_42".into(),
+            hard: Some(true),
+        };
+        let out = map_dismiss_daemon_params(p).unwrap();
+        assert_eq!(out.name, "gd_session_42");
+    }
+
+    #[test]
+    fn u_al_09_send_message_is_synchronous_mapping() {
+        let p = SendMessageParams {
+            target: "codex".into(),
+            request_type: "question".into(),
+            question: "echo test".into(),
+            context: Some("ctx".into()),
+            cwd: Some("/tmp/repo".into()),
+            session_log: Some("session.log".into()),
+            timeout_ms: Some(1234),
+        };
+        let out = map_send_message_params(p).unwrap();
+        assert_eq!(out.name, "codex");
+        assert_eq!(out.message, "echo test");
+        assert_eq!(out.timeout_ms, Some(1234));
+    }
+
+    #[test]
+    fn u_al_10_get_response_returns_deprecation_shim() {
+        let p = GetResponseParams {
+            job_id: "job_123".into(),
+            timeout_ms: Some(1),
+        };
+        let out = map_get_response_params(p).unwrap();
+        assert!(
+            out.message.starts_with("get_response is deprecated in 3.1.0"),
+            "unexpected deprecation message: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn u_al_11_list_jobs_target_filter_validation() {
+        let valid = ListJobsParams {
+            target: Some("gemini".into()),
+            cwd: Some("/tmp".into()),
+        };
+        let out = map_list_jobs_params(valid).unwrap();
+        assert_eq!(out.target, Some("gemini".into()));
+        assert_eq!(out.cwd, Some("/tmp".into()));
+
+        let invalid = ListJobsParams {
+            target: Some("invalid".into()),
+            cwd: None,
+        };
+        let err = map_list_jobs_params(invalid).unwrap_err();
+        assert!(matches!(err, AliasMappingError::InvalidTarget(t) if t == "invalid"));
+    }
+
+    #[test]
+    fn u_al_12_write_scratchpad_owner_from_gd_prefix() {
         let p = WriteScratchpadParams {
             topic: "notes".into(),
             content: "hello".into(),
@@ -372,6 +467,174 @@ mod tests {
             daemon_id: Some("gd_session_xyz".into()),
         };
         let out = map_write_scratchpad_params(p).unwrap();
-        assert!(out.owner.starts_with("gemini-"));
+        assert_eq!(out.owner, "gemini-session_xyz");
+    }
+
+    #[test]
+    fn u_al_13_write_scratchpad_owner_from_cd_prefix() {
+        let p = WriteScratchpadParams {
+            topic: "notes".into(),
+            content: "hello".into(),
+            cwd: None,
+            owner: None,
+            daemon_id: Some("cd_session_abc".into()),
+        };
+        let out = map_write_scratchpad_params(p).unwrap();
+        assert_eq!(out.owner, "codex-session_abc");
+    }
+
+    #[test]
+    fn u_al_14_write_scratchpad_explicit_owner() {
+        let p = WriteScratchpadParams {
+            topic: "notes".into(),
+            content: "hello".into(),
+            cwd: Some("/tmp/repo".into()),
+            owner: Some("custom".into()),
+            daemon_id: None,
+        };
+        let out = map_write_scratchpad_params(p).unwrap();
+        assert_eq!(out.owner, "custom");
+        assert_eq!(out.cwd, Some("/tmp/repo".into()));
+    }
+
+    #[test]
+    fn u_al_15_write_scratchpad_default_owner() {
+        let p = WriteScratchpadParams {
+            topic: "notes".into(),
+            content: "hello".into(),
+            cwd: None,
+            owner: None,
+            daemon_id: None,
+        };
+        let out = map_write_scratchpad_params(p).unwrap();
+        assert_eq!(out.owner, "inter-agent");
+    }
+
+    #[test]
+    fn u_al_16_write_scratchpad_cwd_optional() {
+        let p = WriteScratchpadParams {
+            topic: "notes".into(),
+            content: "hello".into(),
+            cwd: None,
+            owner: Some("custom".into()),
+            daemon_id: None,
+        };
+        let out = map_write_scratchpad_params(p).unwrap();
+        assert_eq!(out.cwd, None);
+    }
+
+    #[test]
+    fn u_al_17_code_review_all_fields_passthrough() {
+        let p = CodeReviewParams {
+            cwd: Some("/tmp/repo".into()),
+            uncommitted: Some(true),
+            base_branch: Some("main".into()),
+            commit_sha: Some("abc123".into()),
+            timeout_ms: Some(5000),
+        };
+        let out = map_code_review_params(p).unwrap();
+        assert_eq!(out.cwd, Some("/tmp/repo".into()));
+        assert_eq!(out.uncommitted, Some(true));
+        assert_eq!(out.base_branch, Some("main".into()));
+        assert_eq!(out.commit_sha, Some("abc123".into()));
+        assert_eq!(out.timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn u_al_18_code_review_has_no_diff_or_context_fields() {
+        let p = CodeReviewParams {
+            cwd: None,
+            uncommitted: None,
+            base_branch: None,
+            commit_sha: None,
+            timeout_ms: None,
+        };
+        let out = map_code_review_params(p).unwrap();
+        let ReviewRequestLike {
+            cwd,
+            uncommitted,
+            base_branch,
+            commit_sha,
+            timeout_ms,
+        } = out;
+        assert_eq!(cwd, None);
+        assert_eq!(uncommitted, None);
+        assert_eq!(base_branch, None);
+        assert_eq!(commit_sha, None);
+        assert_eq!(timeout_ms, None);
+    }
+
+    #[test]
+    fn u_al_19_list_scratchpad_cwd_passthrough() {
+        let p = ListScratchpadParams {
+            cwd: Some("/tmp/work".into()),
+        };
+        let out = map_list_scratchpad_params(p).unwrap();
+        assert_eq!(out.cwd, Some("/tmp/work".into()));
+    }
+
+    #[test]
+    fn u_al_20_all_alias_functions_return_expected_types() {
+        fn assert_spawn_type(_: Result<SpawnSessionRequestLike, AliasMappingError>) {}
+        fn assert_ask_type(_: Result<AskSessionRequestLike, AliasMappingError>) {}
+        fn assert_dismiss_type(_: Result<DismissSessionRequestLike, AliasMappingError>) {}
+        fn assert_list_sessions_type(_: Result<ListSessionsRequestLike, AliasMappingError>) {}
+        fn assert_get_response_type(_: Result<GetResponseDeprecationShim, AliasMappingError>) {}
+        fn assert_get_status_type(_: Result<GetStatusRequestLike, AliasMappingError>) {}
+        fn assert_scratchpad_write_type(_: Result<ScratchpadWriteRequestLike, AliasMappingError>) {}
+        fn assert_scratchpad_list_type(_: Result<ScratchpadListRequestLike, AliasMappingError>) {}
+        fn assert_review_type(_: Result<ReviewRequestLike, AliasMappingError>) {}
+
+        assert_spawn_type(map_spawn_daemon_params(SpawnDaemonParams {
+            target: "gemini".into(),
+            session_name: None,
+            cwd: None,
+            timeout_ms: None,
+        }));
+        assert_ask_type(map_ask_daemon_params(AskDaemonParams {
+            daemon_id: "gd_ok".into(),
+            question: "q".into(),
+            timeout_ms: None,
+        }));
+        assert_dismiss_type(map_dismiss_daemon_params(DismissDaemonParams {
+            daemon_id: "cd_ok".into(),
+            hard: Some(false),
+        }));
+        assert_list_sessions_type(map_list_daemons_params(ListDaemonsParams {
+            target: Some("codex".into()),
+            cwd: None,
+        }));
+        assert_ask_type(map_send_message_params(SendMessageParams {
+            target: "gemini".into(),
+            request_type: "question".into(),
+            question: "q".into(),
+            context: None,
+            cwd: None,
+            session_log: None,
+            timeout_ms: None,
+        }));
+        assert_get_response_type(map_get_response_params(GetResponseParams {
+            job_id: "job".into(),
+            timeout_ms: None,
+        }));
+        assert_get_status_type(map_list_jobs_params(ListJobsParams {
+            target: None,
+            cwd: None,
+        }));
+        assert_scratchpad_write_type(map_write_scratchpad_params(WriteScratchpadParams {
+            topic: "topic".into(),
+            content: "content".into(),
+            cwd: None,
+            owner: None,
+            daemon_id: None,
+        }));
+        assert_scratchpad_list_type(map_list_scratchpad_params(ListScratchpadParams { cwd: None }));
+        assert_review_type(map_code_review_params(CodeReviewParams {
+            cwd: None,
+            uncommitted: None,
+            base_branch: None,
+            commit_sha: None,
+            timeout_ms: None,
+        }));
     }
 }
