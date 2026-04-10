@@ -436,4 +436,68 @@ mod tests {
         assert_eq!(decoded.query, "wal");
         assert_eq!(decoded.limit, Some(5));
     }
+
+    #[test]
+    fn token_usage_has_thinking_tokens_field() {
+        let usage = super::TokenUsage {
+            input: None,
+            output: None,
+            cached: None,
+            thinking_tokens: Some(42),
+            latency_ms: None,
+            tool_calls: None,
+            total: None,
+        };
+        assert_eq!(usage.thinking_tokens, Some(42));
+    }
+
+    #[test]
+    fn token_usage_has_latency_ms_field() {
+        let usage = super::TokenUsage {
+            input: None,
+            output: None,
+            cached: None,
+            thinking_tokens: None,
+            latency_ms: Some(1200),
+            tool_calls: None,
+            total: None,
+        };
+        assert_eq!(usage.latency_ms, Some(1200));
+    }
+
+    #[test]
+    fn token_usage_has_tool_calls_field() {
+        let usage = super::TokenUsage {
+            input: None,
+            output: None,
+            cached: None,
+            thinking_tokens: None,
+            latency_ms: None,
+            tool_calls: Some(3),
+            total: None,
+        };
+        assert_eq!(usage.tool_calls, Some(3));
+    }
+
+    #[test]
+    fn token_usage_roundtrips_with_optional_fields() {
+        let usage = super::TokenUsage {
+            input: Some(100),
+            output: Some(40),
+            cached: Some(5),
+            thinking_tokens: Some(8),
+            latency_ms: Some(900),
+            tool_calls: Some(2),
+            total: Some(145),
+        };
+        let json = serde_json::to_string(&usage).expect("serialize");
+        let decoded: super::TokenUsage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.input, Some(100));
+        assert_eq!(decoded.output, Some(40));
+        assert_eq!(decoded.cached, Some(5));
+        assert_eq!(decoded.thinking_tokens, Some(8));
+        assert_eq!(decoded.latency_ms, Some(900));
+        assert_eq!(decoded.tool_calls, Some(2));
+        assert_eq!(decoded.total, Some(145));
+    }
 }

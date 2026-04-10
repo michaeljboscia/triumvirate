@@ -333,6 +333,125 @@ mod tests {
     }
 
     #[test]
+    fn ledger_open_creates_db_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+
+        let store = LedgerStore::open(project_root.clone()).expect("open ledger store");
+        let db_path = store.project_root().join(".triumvirate").join("ledger.db");
+        assert!(db_path.exists(), "ledger.db should be created by open()");
+    }
+
+    #[test]
+    fn health_is_ok_on_empty_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+        let status = store.health().expect("health");
+        assert_eq!(status.status, "healthy");
+        assert_eq!(status.events_last_5min, 0);
+    }
+
+    #[test]
+    fn ingest_and_get_session_roundtrip() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+        store
+            .ingest_event(RawEvent {
+                session_id: "u-le-session".to_string(),
+                event_type: "PostToolUse".to_string(),
+                sequence: 1,
+                timestamp: "2026-04-07T00:00:00Z".to_string(),
+                payload_json: "{\"tool\":\"Edit\"}".to_string(),
+            })
+            .expect("ingest event");
+
+        let detail = store
+            .get_session("u-le-session")
+            .expect("session should exist after ingest");
+        assert_eq!(detail.events.len(), 1);
+        assert_eq!(detail.events[0].event_type, "PostToolUse");
+    }
+
+    #[test]
+    fn gc_removes_old_unsummarized_events() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO events (session_id, event_type, sequence, timestamp, payload_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', '-40 days'))",
+                    rusqlite::params![
+                        "gc-old-session",
+                        "PostToolUse",
+                        1_i64,
+                        "2026-01-01T00:00:00Z",
+                        "{}"
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("insert old event");
+
+        let gc = store.gc().expect("gc");
+        assert!(gc.events_deleted >= 1);
+
+        let remaining = store
+            .with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = 'gc-old-session'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .expect("count remaining events");
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn lessons_crud_cycle_add_query_validate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))
+            .expect("create spool dir");
+        let store = LedgerStore::open(project_root).expect("open ledger store");
+
+        let lesson_id = store
+            .add_lesson(shared_types::NewLesson {
+                title: "U-LE lesson".to_string(),
+                body: "Always test the state transitions.".to_string(),
+                source_session_id: Some("sess-u-le".to_string()),
+                initial_confidence: 0.7,
+                tags_json: Some("[\"testing\"]".to_string()),
+                req_ids_json: Some("[\"U-LE-05\"]".to_string()),
+            })
+            .expect("add lesson");
+
+        let queried = store
+            .query_lessons("state", 0.0)
+            .expect("query lessons");
+        assert!(queried.iter().any(|lesson| lesson.lesson_id == lesson_id));
+
+        store.validate_lesson(lesson_id).expect("validate lesson");
+        let listed = store.list_lessons(None, None).expect("list lessons");
+        assert!(listed.iter().any(|lesson| lesson.lesson_id == lesson_id));
+    }
+
+    #[test]
     fn fleet_tables_have_expected_columns() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root = temp.path().join("project");

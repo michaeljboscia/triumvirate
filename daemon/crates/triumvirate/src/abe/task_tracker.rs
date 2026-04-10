@@ -414,8 +414,157 @@ fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::TaskTracker;
+    use std::sync::Arc;
+
+    use shared_types::TaskStatus;
+
+    use super::{TaskTracker, TransitionOutcome};
     use tokio::{process::Command, sync::Mutex};
+
+    async fn register_working_task(tracker: &TaskTracker, task_id: &str) {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn child");
+        tracker
+            .register(
+                task_id.to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn register_creates_working_task() {
+        let tracker = TaskTracker::default();
+        register_working_task(&tracker, "U-TT-01").await;
+
+        let status = tracker.get_status("U-TT-01").await.expect("task status");
+        assert_eq!(status.status, TaskStatus::Working);
+    }
+
+    #[tokio::test]
+    async fn mark_completed_transitions_to_completed() {
+        let tracker = TaskTracker::default();
+        register_working_task(&tracker, "U-TT-02").await;
+
+        let outcome = tracker
+            .mark_completed(
+                "U-TT-02",
+                "abc123".to_string(),
+                vec!["src/lib.rs".to_string()],
+                "done".to_string(),
+                Some("validation ok".to_string()),
+                Some("tests ok".to_string()),
+            )
+            .await;
+        assert_eq!(outcome, TransitionOutcome::Transitioned);
+
+        let status = tracker.get_status("U-TT-02").await.expect("task status");
+        assert_eq!(status.status, TaskStatus::Completed);
+        assert_eq!(status.commit_sha.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn mark_failed_transitions_to_failed() {
+        let tracker = TaskTracker::default();
+        register_working_task(&tracker, "U-TT-03").await;
+
+        let outcome = tracker
+            .mark_failed("U-TT-03", Some(1), "boom".to_string())
+            .await;
+        assert_eq!(outcome, TransitionOutcome::Transitioned);
+
+        let status = tracker.get_status("U-TT-03").await.expect("task status");
+        assert_eq!(status.status, TaskStatus::Failed);
+        assert_eq!(status.exit_code, Some(1));
+        assert_eq!(status.error_message.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn mark_timeout_transitions_to_timeout() {
+        let tracker = TaskTracker::default();
+        register_working_task(&tracker, "U-TT-04").await;
+
+        let outcome = tracker.mark_timeout("U-TT-04").await;
+        assert_eq!(outcome, TransitionOutcome::Transitioned);
+
+        let status = tracker.get_status("U-TT-04").await.expect("task status");
+        assert_eq!(status.status, TaskStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_transitions_to_stuck() {
+        let tracker = TaskTracker::default();
+        register_working_task(&tracker, "U-TT-05").await;
+
+        let outcome = tracker
+            .mark_stuck("U-TT-05", "stuck waiting for signal".to_string())
+            .await;
+        assert_eq!(outcome, TransitionOutcome::Transitioned);
+
+        let status = tracker.get_status("U-TT-05").await.expect("task status");
+        assert_eq!(status.status, TaskStatus::Stuck);
+        assert_eq!(
+            status.error_message.as_deref(),
+            Some("stuck waiting for signal")
+        );
+    }
+
+    #[tokio::test]
+    async fn double_transition_returns_already_terminal() {
+        let tracker = TaskTracker::default();
+        register_working_task(&tracker, "U-TT-06").await;
+
+        let first = tracker
+            .mark_completed(
+                "U-TT-06",
+                "def456".to_string(),
+                Vec::new(),
+                String::new(),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(first, TransitionOutcome::Transitioned);
+
+        let second = tracker
+            .mark_failed("U-TT-06", Some(2), "should fail transition".to_string())
+            .await;
+        assert_eq!(second, TransitionOutcome::AlreadyTerminal);
+    }
+
+    #[tokio::test]
+    async fn unknown_task_returns_not_found() {
+        let tracker = TaskTracker::default();
+
+        let outcome = tracker
+            .mark_completed(
+                "U-TT-07-missing",
+                "nope".to_string(),
+                Vec::new(),
+                String::new(),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(outcome, TransitionOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_transitions_task_to_cancelled() {
+        let tracker = TaskTracker::default();
+        register_working_task(&tracker, "U-TT-08").await;
+
+        let response = tracker.cancel("U-TT-08").await.expect("cancel response");
+        assert_eq!(response.status, "cancelled");
+
+        let status = tracker.get_status("U-TT-08").await.expect("task status");
+        assert_eq!(status.status, TaskStatus::Cancelled);
+    }
 
     #[tokio::test]
     async fn cancel_cleans_git_index_lock() {
@@ -435,7 +584,7 @@ mod tests {
             .register(
                 "T-LOCK".to_string(),
                 0,
-                std::sync::Arc::new(Mutex::new(child)),
+                Arc::new(Mutex::new(child)),
                 Some(wt.clone()),
             )
             .await;
