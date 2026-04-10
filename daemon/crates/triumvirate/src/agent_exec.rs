@@ -1,5 +1,7 @@
-use crate::{append_outbox_event, spawn_dead_drop};
-use crate::process_metrics;
+use crate::{
+    TokenRecord, append_outbox_event, process_metrics, process_token_db, record_daemon_tokens,
+    spawn_dead_drop,
+};
 use agent_adapter::{
     ApprovalChannelMode, CodexAppServerEvent, CodexAppServerParser, CodexExecParser,
     GeminiStreamParser, ParsedAgentResult, StuckDetector, WorkingState, WorkingStateEvent,
@@ -17,11 +19,16 @@ use mcp_bridge::{
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
+use serde::Deserialize;
 use shared_types::{
     AskAgentRequest, AskAgentResponse, LifecycleEvent, ManualRecord, OutboxEvent,
     TokenUsage as SharedTokenUsage,
 };
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -72,6 +79,99 @@ fn kill_process_group(_child: &mut tokio::process::Child) {}
 fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: WorkingStateEvent) {
     if let Some(sender) = tx {
         let _ = sender.try_send(event);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildStateContext {
+    build_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContractContext {
+    task_id: String,
+    wave: u32,
+}
+
+fn cast_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn cast_usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn read_build_id(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd?;
+    let path = Path::new(cwd).join("BUILD_STATE.json");
+    let raw = fs::read_to_string(path).ok()?;
+    let parsed: BuildStateContext = serde_json::from_str(&raw).ok()?;
+    Some(parsed.build_id)
+}
+
+fn read_contract_context(cwd: Option<&str>) -> (Option<String>, Option<i64>) {
+    let Some(cwd) = cwd else {
+        return (None, None);
+    };
+    let path = Path::new(cwd).join(".triumvirate").join("contract.json");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let Ok(parsed) = serde_json::from_str::<ContractContext>(&raw) else {
+        return (None, None);
+    };
+    (Some(parsed.task_id), Some(i64::from(parsed.wave)))
+}
+
+fn persist_daemon_token_record(
+    agent: &str,
+    request_id: &str,
+    parsed: &ParsedAgentResult,
+    resolved_cwd: &Option<String>,
+    resolved_repo: &Option<String>,
+) {
+    let Some(token_db) = process_token_db() else {
+        return;
+    };
+
+    let usage = parsed.token_usage.as_ref();
+    let input = usage.and_then(|u| u.input).unwrap_or(0);
+    let output = usage.and_then(|u| u.output).unwrap_or(0);
+    let cached = usage.and_then(|u| u.cached).unwrap_or(0);
+    let total = usage
+        .and_then(|u| u.total)
+        .unwrap_or_else(|| input.saturating_add(output).saturating_add(cached));
+    let session_id = parsed
+        .session_id
+        .clone()
+        .unwrap_or_else(|| request_id.to_string());
+    let (task_id, wave) = read_contract_context(resolved_cwd.as_deref());
+    let build_id = read_build_id(resolved_cwd.as_deref()).or_else(|| resolved_repo.clone());
+
+    let record = TokenRecord {
+        agent: agent.to_string(),
+        session_id,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        model: parsed.cli_version.clone(),
+        input_tokens: cast_u64_to_i64(input),
+        output_tokens: cast_u64_to_i64(output),
+        cached_tokens: cast_u64_to_i64(cached),
+        thinking_tokens: 0,
+        total_tokens: cast_u64_to_i64(total),
+        cost_usd: None,
+        latency_ms: None,
+        tool_calls: Some(cast_usize_to_i64(parsed.tool_calls.len())),
+        lines_added: None,
+        lines_removed: None,
+        rate_limit_pct: None,
+        context_window: None,
+        build_id,
+        task_id,
+        wave,
+    };
+
+    if let Err(err) = record_daemon_tokens(token_db.as_ref(), &record) {
+        tracing::warn!("failed to record daemon token usage: {err}");
     }
 }
 
@@ -362,6 +462,13 @@ pub(crate) async fn execute_ask_agent(
                 if let Some(metrics) = process_metrics() {
                     metrics.agent_tokens_total.inc_by(tokens);
                 }
+                persist_daemon_token_record(
+                    &agent,
+                    &request_id,
+                    &parsed,
+                    &resolved_cwd,
+                    &resolved_repo,
+                );
                 span.record("agent.outcome", "success");
                 span.record("agent.tokens", tokens);
                 span.record("agent.duration_ms", started.elapsed().as_millis() as u64);

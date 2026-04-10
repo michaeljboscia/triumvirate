@@ -107,7 +107,7 @@ use tokio::{
     sync::{Mutex, broadcast},
     time::{Duration, Instant, sleep},
 };
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_exec;
@@ -153,13 +153,171 @@ struct McpBridge {
 }
 
 static PROCESS_METRICS: OnceLock<Arc<DaemonMetrics>> = OnceLock::new();
+static PROCESS_TOKEN_DB: OnceLock<Arc<TokenDb>> = OnceLock::new();
+
+#[derive(Debug)]
+pub(crate) struct TokenDb {
+    db_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TokenRecord {
+    pub agent: String,
+    pub session_id: String,
+    pub timestamp: String,
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub thinking_tokens: i64,
+    pub total_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub latency_ms: Option<i64>,
+    pub tool_calls: Option<i64>,
+    pub lines_added: Option<i64>,
+    pub lines_removed: Option<i64>,
+    pub rate_limit_pct: Option<f64>,
+    pub context_window: Option<i64>,
+    pub build_id: Option<String>,
+    pub task_id: Option<String>,
+    pub wave: Option<i64>,
+}
 
 pub(crate) fn process_metrics() -> Option<&'static Arc<DaemonMetrics>> {
     PROCESS_METRICS.get()
 }
 
+pub(crate) fn process_token_db() -> Option<&'static Arc<TokenDb>> {
+    PROCESS_TOKEN_DB.get()
+}
+
 fn set_process_metrics(metrics: Arc<DaemonMetrics>) {
     let _ = PROCESS_METRICS.set(metrics);
+}
+
+fn init_process_token_db() {
+    if PROCESS_TOKEN_DB.get().is_some() {
+        return;
+    }
+
+    let home = match core_triumvirate_home_dir() {
+        Ok(home) => home,
+        Err(err) => {
+            warn!("failed to resolve triumvirate home for token DB: {err}");
+            return;
+        }
+    };
+    let db_path = home.join("token-economics.db");
+    if let Some(parent) = db_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        warn!(
+            "failed to initialize token economics DB directory at {}: {err}",
+            parent.display()
+        );
+        return;
+    }
+    let _ = PROCESS_TOKEN_DB.set(Arc::new(TokenDb { db_path }));
+}
+
+fn sql_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_opt_text(value: Option<&str>) -> String {
+    value.map(sql_quote).unwrap_or_else(|| "NULL".to_string())
+}
+
+fn sql_opt_i64(value: Option<i64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
+fn sql_opt_f64(value: Option<f64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
+pub(crate) fn record_daemon_tokens(db: &TokenDb, record: &TokenRecord) -> Result<(), String> {
+    if record.agent.trim().is_empty() {
+        return Err("token record agent must be non-empty".to_string());
+    }
+    if record.session_id.trim().is_empty() {
+        return Err("token record session_id must be non-empty".to_string());
+    }
+
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS token_records (
+            id INTEGER PRIMARY KEY,
+            agent TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cached_tokens INTEGER DEFAULT 0,
+            thinking_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER NOT NULL,
+            cost_usd REAL,
+            latency_ms INTEGER,
+            tool_calls INTEGER,
+            lines_added INTEGER,
+            lines_removed INTEGER,
+            rate_limit_pct REAL,
+            context_window INTEGER,
+            build_id TEXT,
+            task_id TEXT,
+            wave INTEGER
+        );
+        INSERT INTO token_records (
+            agent, session_id, timestamp, model, input_tokens, output_tokens, cached_tokens,
+            thinking_tokens, total_tokens, cost_usd, latency_ms, tool_calls, lines_added,
+            lines_removed, rate_limit_pct, context_window, build_id, task_id, wave
+        ) VALUES (
+            {agent}, {session_id}, {timestamp}, {model}, {input_tokens}, {output_tokens},
+            {cached_tokens}, {thinking_tokens}, {total_tokens}, {cost_usd}, {latency_ms},
+            {tool_calls}, {lines_added}, {lines_removed}, {rate_limit_pct}, {context_window},
+            {build_id}, {task_id}, {wave}
+        );",
+        agent = sql_quote(&record.agent),
+        session_id = sql_quote(&record.session_id),
+        timestamp = sql_quote(&record.timestamp),
+        model = sql_opt_text(record.model.as_deref()),
+        input_tokens = record.input_tokens,
+        output_tokens = record.output_tokens,
+        cached_tokens = record.cached_tokens,
+        thinking_tokens = record.thinking_tokens,
+        total_tokens = record.total_tokens,
+        cost_usd = sql_opt_f64(record.cost_usd),
+        latency_ms = sql_opt_i64(record.latency_ms),
+        tool_calls = sql_opt_i64(record.tool_calls),
+        lines_added = sql_opt_i64(record.lines_added),
+        lines_removed = sql_opt_i64(record.lines_removed),
+        rate_limit_pct = sql_opt_f64(record.rate_limit_pct),
+        context_window = sql_opt_i64(record.context_window),
+        build_id = sql_opt_text(record.build_id.as_deref()),
+        task_id = sql_opt_text(record.task_id.as_deref()),
+        wave = sql_opt_i64(record.wave),
+    );
+
+    let output = Command::new("sqlite3")
+        .arg(&db.db_path)
+        .arg(sql)
+        .output()
+        .map_err(|err| format!("failed to execute sqlite3 for token record insert: {err}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        "sqlite3 token record insert failed".to_string()
+    } else {
+        format!("sqlite3 token record insert failed: {stderr}")
+    })
 }
 
 fn mcp_daemon_proxy_enabled() -> bool {
@@ -191,6 +349,7 @@ impl McpBridge {
         let metrics = Arc::new(DaemonMetrics::new().expect("failed to initialize daemon metrics"));
         let ws_events = broadcast::channel(256).0;
         set_process_metrics(metrics.clone());
+        init_process_token_db();
         let sessions_file = if enable_persistence {
             core_triumvirate_home_dir()
                 .ok()
@@ -898,6 +1057,7 @@ async fn execute_ask_agent(
     req: &AskAgentRequest,
     progress: Option<ProgressEmitter>,
 ) -> Result<AskAgentResponse, String> {
+    init_process_token_db();
     agent_exec::execute_ask_agent(req, progress).await
 }
 
@@ -1428,6 +1588,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         ws_events,
     );
     set_process_metrics(state.metrics.clone());
+    init_process_token_db();
     let http_state = DaemonHttpState {
         token: state.token.clone(),
         queues: state.queues.clone(),
@@ -3964,6 +4125,22 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
+        fs::write(
+            test_home.join("BUILD_STATE.json"),
+            serde_json::json!({
+                "build_id": "abe-v3-main"
+            })
+            .to_string(),
+        )?;
+        fs::create_dir_all(test_home.join(".triumvirate"))?;
+        fs::write(
+            test_home.join(".triumvirate").join("contract.json"),
+            serde_json::json!({
+                "task_id": "T-114",
+                "wave": 3
+            })
+            .to_string(),
+        )?;
 
         let response = execute_ask_agent(&AskAgentRequest {
             agent: "gemini".to_string(),
@@ -3984,6 +4161,25 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         assert!(outbox.contains(&response.request_id));
         assert!(outbox.contains("\"tool_name\":\"read_file\""));
         assert!(outbox.contains("\"token_usage\":{\"input\":123,\"output\":45,\"cached\":10,\"total\":178}"));
+
+        let token_db = process_token_db().ok_or_else(|| anyhow::anyhow!("token db not initialized"))?;
+        let query = "SELECT COUNT(*) FROM token_records \
+            WHERE agent='gemini' \
+              AND session_id='session-usage-1' \
+              AND total_tokens=178 \
+              AND build_id='abe-v3-main' \
+              AND task_id='T-114' \
+              AND wave=3;";
+        let sqlite_output = std::process::Command::new("sqlite3")
+            .arg(&token_db.db_path)
+            .arg(query)
+            .output()?;
+        assert!(sqlite_output.status.success());
+        let count = String::from_utf8_lossy(&sqlite_output.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
+        assert!(count >= 1);
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
