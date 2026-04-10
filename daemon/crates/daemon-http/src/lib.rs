@@ -1,4 +1,19 @@
-use daemon_core::{ensure_daemon_token as core_ensure_daemon_token, triumvirate_home_dir as core_triumvirate_home_dir};
+use axum::{
+    Json as AxumJson,
+    extract::State,
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+};
+use daemon_core::{
+    QueueRegistry, acquire_project_queue as core_acquire_project_queue,
+    append_memory_entry as core_append_memory_entry, ensure_daemon_token as core_ensure_daemon_token,
+    list_scratchpad as core_list_scratchpad, metrics::DaemonMetrics, project_queue_key as core_project_queue_key,
+    read_memory_entries as core_read_memory_entries, triumvirate_home_dir as core_triumvirate_home_dir,
+    unix_time_ms as core_unix_time_ms, write_scratchpad as core_write_scratchpad,
+};
+use fallback_outbox::{
+    acknowledge_fallback_path, gc_fallbacks, list_pending_fallback_paths, read_outbox_events,
+};
+use ledger::LedgerStore;
 use mcp_bridge::{
     daemon_ask_agent_url, daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
     daemon_autostart_enabled, daemon_health_url, daemon_memory_read_url, daemon_memory_write_url,
@@ -7,18 +22,36 @@ use mcp_bridge::{
     daemon_outbox_recent_url, daemon_scratchpad_list_url, daemon_scratchpad_write_url,
     daemon_session_ask_url, daemon_session_dismiss_url, daemon_session_list_url, daemon_session_spawn_url,
     daemon_status_url, should_use_daemon_proxy,
+    is_bearer_authorized,
 };
+use serde::Deserialize;
 use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest, DaemonHealthResponse, DaemonStatusSnapshot,
     DismissSessionRequest, FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
-    FallbackListResponse, GcResult, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest, LessonAddResponse,
+    FallbackListResponse, GcResult, HealthStatus, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest,
+    Lesson, LessonAddResponse,
     LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse, LessonValidateRequest, ManualRecord,
-    MemoryReadRequest, MemoryReadResponse, MemoryWriteRequest, MemoryWriteResponse, NewLesson, SessionDetail,
+    MemoryEntry, MemoryReadRequest, MemoryReadResponse, MemoryWriteRequest, MemoryWriteResponse, NewLesson,
+    SessionDetail, Summary,
     OutboxRecentRequest, OutboxRecentResponse, ScratchpadListRequest, ScratchpadListResponse,
     ScratchpadWriteRequest, ScratchpadWriteResponse, SessionListResponse, SpawnSessionRequest,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{Duration, sleep};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::{
+    sync::{Mutex, broadcast},
+    time::{Duration, Instant, sleep},
+};
+use tracing::warn;
+use uuid::Uuid;
 
 static DAEMON_AUTOSTART_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
@@ -273,4 +306,814 @@ pub async fn fetch_daemon_lesson_validate(req: &LessonValidateRequest) -> anyhow
 
 pub async fn fetch_daemon_lesson_list(req: &LessonListRequest) -> anyhow::Result<LessonListResponse> {
     daemon_post_json::<LessonListRequest, LessonListResponse>(daemon_lesson_list_url(), req).await
+}
+
+const LEDGER_PROJECT_LRU_CAPACITY: usize = 128;
+
+pub type AskAgentRouteFuture<'a> = Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>>;
+pub type AskAgentRouteExecutor =
+    Arc<dyn for<'a> Fn(&'a AskAgentRequest) -> AskAgentRouteFuture<'a> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct DaemonHttpState {
+    pub token: String,
+    pub queues: QueueRegistry,
+    pub ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
+    pub metrics: Arc<DaemonMetrics>,
+    pub ws_events: broadcast::Sender<String>,
+    pub ask_agent_executor: AskAgentRouteExecutor,
+}
+
+fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
+    serde_json::json!({
+        "type": event_type,
+        "ts_ms": core_unix_time_ms(),
+        "payload": payload
+    })
+    .to_string()
+}
+
+fn publish_ws_event(state: &DaemonHttpState, event_type: &str, payload: serde_json::Value) {
+    let _ = state.ws_events.send(encode_ws_event(event_type, payload));
+}
+
+async fn record_marker_parse_result(state: &DaemonHttpState, response: &str) {
+    let parse_ok = match agent_adapter::parse_tool_call_marker(response) {
+        Ok(_) => true,
+        Err(err) => {
+            warn!("tool marker parse failed: {err}");
+            false
+        }
+    };
+
+    let mut window = state.marker_parse_window.lock().await;
+    let now = Instant::now();
+    window.push_back((now, parse_ok));
+    while let Some((ts, _)) = window.front() {
+        if now.duration_since(*ts) > Duration::from_secs(3600) {
+            let _ = window.pop_front();
+        } else {
+            break;
+        }
+    }
+    let total = window.len();
+    if total == 0 {
+        return;
+    }
+    let successes = window.iter().filter(|(_, ok)| *ok).count();
+    let rate = successes as f64 / total as f64;
+    state.metrics.marker_parse_success_rate.set(rate);
+    if total >= 10 && rate < 0.5 {
+        warn!(
+            marker_parse_success_rate = rate,
+            sample_count = total,
+            "marker parse success rate degraded below 50% over rolling 1h window"
+        );
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LedgerWakeRequest {
+    pub project_root: String,
+}
+
+pub async fn ask_agent_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AskAgentRequest>,
+) -> Result<AxumJson<AskAgentResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    // Serialize agent execution per project to keep ordering predictable for concurrent bridges.
+    let queue =
+        core_acquire_project_queue(&state.queues, core_project_queue_key(req.cwd.as_ref(), req.repo.as_ref()))
+            .await;
+    let _guard = queue.lock().await;
+    let started = Instant::now();
+    let result = (state.ask_agent_executor)(&req).await;
+    state.metrics.agent_requests_total.inc();
+    state.metrics.agent_duration_seconds.observe(started.elapsed().as_secs_f64());
+    match result {
+        Ok(response) => {
+            record_marker_parse_result(&state, &response.response).await;
+            publish_ws_event(
+                &state,
+                "agent_state",
+                serde_json::json!({
+                    "agent": response.agent,
+                    "request_id": response.request_id,
+                    "state": "done"
+                }),
+            );
+            Ok(AxumJson(response))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            AxumJson(serde_json::json!({ "error": e })),
+        )),
+    }
+}
+
+pub async fn ledger_wake_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<LedgerWakeRequest>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let project_root = PathBuf::from(&req.project_root);
+    if !project_root.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(serde_json::json!({ "error": "project_root must be absolute" })),
+        ));
+    }
+
+    {
+        let mut lru = state.ledger_project_lru.lock().await;
+        if let Some(existing_index) = lru.iter().position(|p| p == &project_root) {
+            lru.remove(existing_index);
+        }
+        lru.push_back(project_root.clone());
+        while lru.len() > LEDGER_PROJECT_LRU_CAPACITY {
+            lru.pop_front();
+        }
+    }
+
+    let (drain_result, queue_lag_seconds) = tokio::task::spawn_blocking({
+        let project_root = project_root.clone();
+        move || -> anyhow::Result<(shared_types::DrainResult, f64)> {
+            let store = LedgerStore::open(project_root.clone())?;
+            let spool_dir = project_root.join(".triumvirate").join("spool");
+            let drained = store.drain_spool(&spool_dir)?;
+            let lag = store.queue_lag_seconds()?;
+            Ok((drained, lag))
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    state
+        .metrics
+        .ledger_events_ingested_total
+        .inc_by(drain_result.ingested_count as u64);
+    state.metrics.ledger_queue_lag_seconds.set(queue_lag_seconds);
+
+    Ok(AxumJson(serde_json::json!({
+        "status": "ok",
+        "project_root": req.project_root,
+        "drain_result": drain_result
+    })))
+}
+
+pub async fn ledger_health_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<HealthStatus>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    let (health, queue_lag_seconds) = tokio::task::spawn_blocking(move || -> anyhow::Result<(HealthStatus, f64)> {
+        let store = LedgerStore::open(project_root)?;
+        let health = store.health()?;
+        let lag = store.queue_lag_seconds()?;
+        Ok((health, lag))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    state.metrics.ledger_queue_lag_seconds.set(queue_lag_seconds);
+    if let Ok(payload) = serde_json::to_value(&health) {
+        publish_ws_event(&state, "ledger_health", payload);
+    }
+
+    Ok(AxumJson(health))
+}
+
+pub async fn ledger_query_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<LedgerQueryRequest>,
+) -> Result<AxumJson<LedgerQueryResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    let summaries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Summary>> {
+        let store = LedgerStore::open(project_root)?;
+        store.query(&req.query, req.limit.unwrap_or(10))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(LedgerQueryResponse { summaries }))
+}
+
+pub async fn ledger_session_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<LedgerSessionRequest>,
+) -> Result<AxumJson<SessionDetail>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    let session = tokio::task::spawn_blocking(move || -> anyhow::Result<SessionDetail> {
+        let store = LedgerStore::open(project_root)?;
+        store.get_session(&req.session_id)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(session))
+}
+
+pub async fn ledger_record_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ManualRecord>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let store = LedgerStore::open(project_root)?;
+        store.record(req)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(serde_json::json!({ "status": "ok" })))
+}
+
+pub async fn ledger_gc_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<GcResult>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<GcResult> {
+        let store = LedgerStore::open(project_root)?;
+        store.gc()
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(result))
+}
+
+pub async fn lesson_add_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<NewLesson>,
+) -> Result<AxumJson<LessonAddResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    let lesson_id = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        let store = LedgerStore::open(project_root)?;
+        store.add_lesson(req)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(LessonAddResponse { lesson_id }))
+}
+
+pub async fn lesson_query_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<LessonQueryRequest>,
+) -> Result<AxumJson<LessonQueryResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    let lessons = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Lesson>> {
+        let store = LedgerStore::open(project_root)?;
+        store.query_lessons(&req.query, req.min_confidence.unwrap_or(0.0))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(LessonQueryResponse { lessons }))
+}
+
+pub async fn lesson_validate_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<LessonValidateRequest>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let store = LedgerStore::open(project_root)?;
+        store.validate_lesson(req.lesson_id)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(serde_json::json!({ "status": "ok" })))
+}
+
+pub async fn lesson_list_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<LessonListRequest>,
+) -> Result<AxumJson<LessonListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let project_root = {
+        let lru = state.ledger_project_lru.lock().await;
+        lru.back().cloned()
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "unable to resolve project root" })),
+        )
+    })?;
+
+    let lessons = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Lesson>> {
+        let store = LedgerStore::open(project_root)?;
+        store.list_lessons(req.tags.as_deref(), req.stale_days)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(LessonListResponse { lessons }))
+}
+
+pub async fn memory_write_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<MemoryWriteRequest>,
+) -> Result<AxumJson<MemoryWriteResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let home = core_triumvirate_home_dir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    let id = Uuid::new_v4().to_string();
+    let entry = MemoryEntry {
+        id: id.clone(),
+        namespace: req.namespace,
+        key: req.key,
+        value: req.value,
+        ts_ms: core_unix_time_ms(),
+    };
+    core_append_memory_entry(&home, &entry).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    Ok(AxumJson(MemoryWriteResponse {
+        id,
+        status: "ok".to_string(),
+    }))
+}
+
+pub async fn memory_read_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<MemoryReadRequest>,
+) -> Result<AxumJson<MemoryReadResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let home = core_triumvirate_home_dir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    let mut entries = core_read_memory_entries(&home).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    entries.retain(|e| e.namespace == req.namespace);
+    if let Some(key) = req.key {
+        entries.retain(|e| e.key == key);
+    }
+    entries.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    if let Some(limit) = req.limit {
+        entries.truncate(limit);
+    }
+    Ok(AxumJson(MemoryReadResponse { entries }))
+}
+
+pub async fn scratchpad_write_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ScratchpadWriteRequest>,
+) -> Result<AxumJson<ScratchpadWriteResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let home = core_triumvirate_home_dir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    let path = core_write_scratchpad(
+        &home,
+        &req.project,
+        &req.topic,
+        &req.content,
+        core_unix_time_ms(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    Ok(AxumJson(ScratchpadWriteResponse {
+        path: path.display().to_string(),
+    }))
+}
+
+pub async fn scratchpad_list_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ScratchpadListRequest>,
+) -> Result<AxumJson<ScratchpadListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let home = core_triumvirate_home_dir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    let files = core_list_scratchpad(&home, &req.project)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    Ok(AxumJson(ScratchpadListResponse { files }))
+}
+
+pub async fn outbox_recent_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<OutboxRecentRequest>,
+) -> Result<AxumJson<OutboxRecentResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let mut events = read_outbox_events().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    events.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    events.truncate(req.limit.unwrap_or(50));
+    Ok(AxumJson(OutboxRecentResponse { events }))
+}
+
+pub async fn fallback_list_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<FallbackListRequest>,
+) -> Result<AxumJson<FallbackListResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let tickets = list_pending_fallback_paths(req.limit.unwrap_or(20))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    Ok(AxumJson(FallbackListResponse { tickets }))
+}
+
+pub async fn fallback_ack_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<FallbackAckRequest>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    acknowledge_fallback_path(&req.path).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    Ok(AxumJson(serde_json::json!({
+        "status": "ok",
+        "message": format!("acknowledged {}", req.path)
+    })))
+}
+
+pub async fn fallback_gc_route(
+    State(state): State<DaemonHttpState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<FallbackGcRequest>,
+) -> Result<AxumJson<FallbackGcResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let removed = gc_fallbacks(req.max_age_days.unwrap_or(7)).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    Ok(AxumJson(FallbackGcResponse { removed }))
 }
