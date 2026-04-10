@@ -1,7 +1,9 @@
 use axum::{
     Json as AxumJson,
-    extract::State,
+    body::Body,
+    extract::{Path, State, WebSocketUpgrade, ws::Message},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response::{IntoResponse, Response},
 };
 use daemon_core::{
     QueueRegistry, acquire_project_queue as core_acquire_project_queue,
@@ -10,6 +12,7 @@ use daemon_core::{
     read_memory_entries as core_read_memory_entries, triumvirate_home_dir as core_triumvirate_home_dir,
     unix_time_ms as core_unix_time_ms, write_scratchpad as core_write_scratchpad,
 };
+use prometheus::{Encoder, TextEncoder};
 use fallback_outbox::{
     acknowledge_fallback_path, gc_fallbacks, list_pending_fallback_paths, read_outbox_events,
 };
@@ -38,7 +41,9 @@ use shared_types::{
 };
 use std::{
     collections::VecDeque,
+    fs,
     future::Future,
+    path::Component,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -336,6 +341,104 @@ fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
 
 fn publish_ws_event(state: &DaemonHttpState, event_type: &str, payload: serde_json::Value) {
     let _ = state.ws_events.send(encode_ws_event(event_type, payload));
+}
+
+pub async fn ws_route(
+    State(state): State<DaemonHttpState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |mut socket| async move {
+        let mut rx = state.ws_events.subscribe();
+        for bootstrap in [
+            encode_ws_event(
+                "agent_state",
+                serde_json::json!({ "agent": "system", "state": "idle" }),
+            ),
+            encode_ws_event(
+                "fleet_progress",
+                serde_json::json!({ "active_fleets": 0, "state": "idle" }),
+            ),
+            encode_ws_event(
+                "ledger_health",
+                serde_json::json!({ "status": "unknown" }),
+            ),
+            encode_ws_event(
+                "review_completed",
+                serde_json::json!({ "review_id": null, "verdict": null }),
+            ),
+        ] {
+            if socket.send(Message::Text(bootstrap.into())).await.is_err() {
+                return;
+            }
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if socket.send(Message::Text(event.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+fn dashboard_asset_response(path: &str) -> Option<Response<Body>> {
+    let normalized = path.trim_start_matches('/');
+    let mut full_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../dashboard/dist");
+    for component in std::path::Path::new(normalized).components() {
+        match component {
+            Component::Normal(part) => full_path.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    let asset = fs::read(full_path).ok()?;
+    let mime = mime_guess::from_path(normalized).first_or_octet_stream();
+    let headers = [(axum::http::header::CONTENT_TYPE, mime.as_ref())];
+    Some((headers, asset).into_response())
+}
+
+pub async fn dashboard_root_route() -> Response {
+    dashboard_asset_response("index.html")
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "dashboard index not found").into_response())
+}
+
+pub async fn dashboard_assets_route(Path(path): Path<String>) -> Response {
+    let asset_path = format!("assets/{path}");
+    dashboard_asset_response(&asset_path)
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "asset not found").into_response())
+}
+
+pub async fn dashboard_spa_fallback_route(Path(path): Path<String>) -> Response {
+    dashboard_asset_response(&path).unwrap_or_else(|| {
+        dashboard_asset_response("index.html")
+            .unwrap_or_else(|| (StatusCode::NOT_FOUND, "dashboard index not found").into_response())
+    })
+}
+
+pub async fn metrics_route(
+    State(state): State<DaemonHttpState>,
+) -> Result<String, (StatusCode, AxumJson<serde_json::Value>)> {
+    state.metrics.snapshot_keepalive();
+    let metric_families = state.metrics.registry.gather();
+    let mut body = Vec::<u8>::new();
+    TextEncoder::new().encode(&metric_families, &mut body).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    String::from_utf8(body).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })
 }
 
 async fn record_marker_parse_result(state: &DaemonHttpState, response: &str) {
