@@ -1,8 +1,8 @@
 # Triumvirate Roadmap
 
 **Last updated:** 2026-04-10
-**Current version:** 3.2.0 (Observability & Token Economics — in progress)
-**Last shipped:** 3.1.0 (MCP Consolidation)
+**Current version:** 3.2.0 (Observability & Token Economics — shipped)
+**Last shipped:** 3.2.0 (Observability & Token Economics)
 
 ---
 

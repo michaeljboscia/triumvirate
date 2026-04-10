@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.2.0 — Observability & Token Economics (2026-04-10)
+
+Full observability instrumentation + a token economics engine for tracking costs across all three AI agents.
+
+### What Changed
+
+- **Tracing spans on every ABE function.** All public functions in the ABE modules (10 files, ~45 functions) and ledger crate (10 files) now have `#[instrument]` spans with structured fields (task_id, wave, status). Parent trace span links MCP requests through daemon dispatch to agent execution.
+
+- **8 new ABE Prometheus metrics.** `abe_task_dispatch_total`, `abe_task_duration_seconds`, `abe_wave_duration_seconds`, `abe_timeout_total`, `abe_worktree_setup_duration_seconds`, `abe_failure_class_total`, `abe_retry_total`, `abe_validation_total`. All wired to recording sites.
+
+- **4 dead metrics now live.** `agent_tokens_total`, `fleet_active_total`, `reviews_total`, `ledger_spool_size_bytes` — all were declared but never recorded. Now wired to their correct code paths.
+
+- **Structured logging for ABE lifecycle.** `tracing::info/warn/error` events at every lifecycle point: dispatch start, task complete, wave start, wave gate pass, timeout, retry, collateral fix, worktree failure, escalation.
+
+- **Error context on ABE I/O paths.** Critical file operations, subprocess spawns, JSON parsing, and git operations now carry `.context()` annotations with file paths and task IDs.
+
+- **3 new WebSocket events.** `abe_task_state` (every task state transition), `abe_wave_state` (wave start/completion), `fleet_progress` (fleet state transitions). Plus `worktreeConfig` auto-enabled during worktree setup (#19 hotfix).
+
+- **Token economics crate.** New `daemon/crates/token-economics/` with SQLite storage (WAL mode), session file scanner (Claude JSONL, Codex JSONL, Gemini JSON + telemetry.jsonl), cost attribution engine (session-ID correlation, price table), and direct-write API for daemon-mediated sessions.
+
+- **3 new HTTP routes.** `GET /api/tokens/summary`, `/api/tokens/by-build`, `/api/tokens/by-session` — query token usage and costs by agent, build, or session.
+
+- **2 new MCP tools.** `get_token_summary` and `get_build_cost` — accessible from Claude sessions.
+
+- **Scanner lifecycle.** Background tokio task with notify-based file watching, startup reconciliation for sessions that occurred while daemon was down, periodic reconciliation fallback, `token_update` WebSocket events after each scan cycle.
+
+- **TokenUsage extended.** `thinking_tokens`, `latency_ms`, `tool_calls` fields added (all `Option<u64>`). GeminiStreamParser extracts them from stream-json result events.
+
+### Known Issues
+
+- Token scanner tests are compile-verification only (no behavioral tests with mock data yet)
+- Scanner lifecycle needs real-world validation with actual agent sessions
+- `notify` crate file watching may miss events on some filesystems (periodic reconciliation compensates)
+
+---
+
 ## 3.1.0 — MCP Consolidation (2026-04-10)
 
 The Rust daemon becomes the sole MCP endpoint. The legacy TypeScript inter-agent server is retired.
