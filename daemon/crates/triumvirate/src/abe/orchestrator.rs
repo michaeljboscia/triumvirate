@@ -176,6 +176,11 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
     }
 
     for (wave, wave_tasks) in waves {
+        tracing::info!(
+            wave,
+            task_count = wave_tasks.len(),
+            "abe_wave_started"
+        );
         state.current_wave = wave;
         update_state(state_path, &state)?;
 
@@ -186,6 +191,12 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
                 let Some(task) = pending.next() else {
                     break;
                 };
+                tracing::info!(
+                    task_id = %task.task_id,
+                    wave = task.wave,
+                    allowed_files_count = task.contract_fields.allowed_files.len(),
+                    "abe_dispatch_started"
+                );
                 state.tasks_running.push(task.task_id.clone());
                 update_state(state_path, &state)?;
                 running.push(async move {
@@ -208,6 +219,25 @@ pub async fn run_orchestrator_with_metrics<B: DispatchBackend>(
             }
             state.tasks_running.retain(|t| t != &task.task_id);
             if result.status.eq_ignore_ascii_case("completed") {
+                let extra_files = result
+                    .modified_files
+                    .iter()
+                    .filter(|file| !task.contract_fields.allowed_files.contains(*file))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !extra_files.is_empty() {
+                    tracing::warn!(
+                        task_id = %task.task_id,
+                        extra_files = ?extra_files,
+                        "abe_collateral_fix_detected"
+                    );
+                }
+                tracing::info!(
+                    task_id = %task.task_id,
+                    commit_sha = %result.commit_sha,
+                    duration_ms = elapsed.as_millis() as u64,
+                    "abe_task_completed"
+                );
                 state.tasks_completed.push(task.task_id.clone());
                 state.tasks_remaining.retain(|t| t != &task.task_id);
                 let timestamp = Utc::now().to_rfc3339();

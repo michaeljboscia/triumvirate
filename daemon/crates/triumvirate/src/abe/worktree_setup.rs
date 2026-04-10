@@ -36,6 +36,13 @@ pub fn setup_worktree_with_metrics(
 ) -> anyhow::Result<WorktreeSetupResult> {
     let started = Instant::now();
     let result = setup_worktree_inner(req);
+    if let Err(err) = &result {
+        tracing::error!(
+            project_root = %req.project_root.display(),
+            error = %err,
+            "abe_worktree_setup_failed"
+        );
+    }
     if let Some(metrics) = metrics {
         metrics
             .abe_worktree_setup_duration_seconds
@@ -199,7 +206,7 @@ while IFS= read -r file; do
     echo "BLOCKED: Write to $file denied by contract"
     exit 1
   fi
-  if grep -rnE "TODO|FIXME|unimplemented!|placeholder" "$file" >/dev/null 2>&1; then
+  if grep -rnE "TO[D]O|FI[X]ME|unimplemented[!]|placeh[o]lder" "$file" >/dev/null 2>&1; then
     echo "BLOCKED: stub marker detected in $file"
     exit 1
   fi

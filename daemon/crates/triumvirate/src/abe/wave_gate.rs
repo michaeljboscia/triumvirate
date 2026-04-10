@@ -67,6 +67,17 @@ where
         }
     }
     let gemini_summary = gemini_review(tasks)?;
+    let test_result = if test_command.trim().is_empty() {
+        "skipped"
+    } else {
+        "pass"
+    };
+    tracing::info!(
+        wave,
+        test_result,
+        review_verdict = %gemini_summary,
+        "abe_wave_gate_passed"
+    );
 
     let summary = format!(
         "wave_gate=PASS tasks={} files={} review={}",
