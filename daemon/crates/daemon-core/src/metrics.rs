@@ -9,6 +9,14 @@ pub struct DaemonMetrics {
     pub agent_requests_total: IntCounter,
     pub agent_duration_seconds: Histogram,
     pub agent_tokens_total: IntCounter,
+    pub abe_task_dispatch_total: IntCounterVec,
+    pub abe_task_duration_seconds: HistogramVec,
+    pub abe_wave_duration_seconds: HistogramVec,
+    pub abe_timeout_total: IntCounter,
+    pub abe_worktree_setup_duration_seconds: Histogram,
+    pub abe_failure_class_total: IntCounterVec,
+    pub abe_retry_total: IntCounterVec,
+    pub abe_validation_total: IntCounterVec,
     pub ledger_events_ingested_total: IntCounter,
     pub ledger_queue_lag_seconds: Gauge,
     pub ledger_spool_size_bytes: IntGauge,
@@ -34,6 +42,53 @@ impl DaemonMetrics {
         let agent_tokens_total = IntCounter::new(
             "triumvirate_agent_tokens_total",
             "Total tokens reported by ask_agent requests",
+        )?;
+        let abe_task_dispatch_total = IntCounterVec::new(
+            Opts::new(
+                "triumvirate_abe_task_dispatch_total",
+                "ABE task dispatches by status",
+            ),
+            &["status"],
+        )?;
+        let abe_task_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "triumvirate_abe_task_duration_seconds",
+                "ABE task duration in seconds by wave",
+            ),
+            &["wave"],
+        )?;
+        let abe_wave_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "triumvirate_abe_wave_duration_seconds",
+                "ABE wave duration in seconds by wave",
+            ),
+            &["wave"],
+        )?;
+        let abe_timeout_total = IntCounter::new(
+            "triumvirate_abe_timeout_total",
+            "Total ABE timeout events",
+        )?;
+        let abe_worktree_setup_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "triumvirate_abe_worktree_setup_duration_seconds",
+            "Time spent setting up ABE worktrees in seconds",
+        ))?;
+        let abe_failure_class_total = IntCounterVec::new(
+            Opts::new(
+                "triumvirate_abe_failure_class_total",
+                "ABE failures by classification",
+            ),
+            &["class"],
+        )?;
+        let abe_retry_total = IntCounterVec::new(
+            Opts::new("triumvirate_abe_retry_total", "ABE retries by failure class"),
+            &["class"],
+        )?;
+        let abe_validation_total = IntCounterVec::new(
+            Opts::new(
+                "triumvirate_abe_validation_total",
+                "ABE post-exit validations by result",
+            ),
+            &["result"],
         )?;
         let ledger_events_ingested_total = IntCounter::new(
             "triumvirate_ledger_events_ingested_total",
@@ -72,6 +127,14 @@ impl DaemonMetrics {
         registry.register(Box::new(agent_requests_total.clone()))?;
         registry.register(Box::new(agent_duration_seconds.clone()))?;
         registry.register(Box::new(agent_tokens_total.clone()))?;
+        registry.register(Box::new(abe_task_dispatch_total.clone()))?;
+        registry.register(Box::new(abe_task_duration_seconds.clone()))?;
+        registry.register(Box::new(abe_wave_duration_seconds.clone()))?;
+        registry.register(Box::new(abe_timeout_total.clone()))?;
+        registry.register(Box::new(abe_worktree_setup_duration_seconds.clone()))?;
+        registry.register(Box::new(abe_failure_class_total.clone()))?;
+        registry.register(Box::new(abe_retry_total.clone()))?;
+        registry.register(Box::new(abe_validation_total.clone()))?;
         registry.register(Box::new(ledger_events_ingested_total.clone()))?;
         registry.register(Box::new(ledger_queue_lag_seconds.clone()))?;
         registry.register(Box::new(ledger_spool_size_bytes.clone()))?;
@@ -87,6 +150,14 @@ impl DaemonMetrics {
             agent_requests_total,
             agent_duration_seconds,
             agent_tokens_total,
+            abe_task_dispatch_total,
+            abe_task_duration_seconds,
+            abe_wave_duration_seconds,
+            abe_timeout_total,
+            abe_worktree_setup_duration_seconds,
+            abe_failure_class_total,
+            abe_retry_total,
+            abe_validation_total,
             ledger_events_ingested_total,
             ledger_queue_lag_seconds,
             ledger_spool_size_bytes,
