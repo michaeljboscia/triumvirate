@@ -157,6 +157,12 @@ pub struct TokenUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
 }
 

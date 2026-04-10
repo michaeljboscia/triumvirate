@@ -39,6 +39,9 @@ pub struct TokenUsage {
     pub input: Option<u64>,
     pub output: Option<u64>,
     pub cached: Option<u64>,
+    pub thinking_tokens: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub tool_calls: Option<u64>,
     pub total: Option<u64>,
 }
 

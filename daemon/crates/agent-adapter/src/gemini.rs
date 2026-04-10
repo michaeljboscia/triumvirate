@@ -143,6 +143,18 @@ impl GeminiStreamParser {
                         .and_then(|v| v.as_u64()),
                     output: stats.get("output_tokens").and_then(|v| v.as_u64()),
                     cached: stats.get("cached").and_then(|v| v.as_u64()),
+                    thinking_tokens: stats
+                        .get("thoughtsTokenCount")
+                        .and_then(|v| v.as_u64()),
+                    latency_ms: stats
+                        .get("totalLatencyMs")
+                        .or_else(|| stats.get("duration_ms"))
+                        .and_then(|v| v.as_u64()),
+                    tool_calls: stats
+                        .get("tools")
+                        .and_then(|v| v.get("totalCalls"))
+                        .or_else(|| stats.get("tool_calls"))
+                        .and_then(|v| v.as_u64()),
                     total: stats.get("total_tokens").and_then(|v| v.as_u64()),
                 };
                 self.token_usage = Some(usage.clone());
@@ -210,5 +222,8 @@ mod tests {
         assert_eq!(result.session_id.as_deref(), Some("9396020a-f4d8-43e9-82e0-386da5df7cb1"));
         assert!(result.response_text.contains("8 crates"));
         assert_eq!(result.token_usage.as_ref().and_then(|t| t.total), Some(43893));
+        assert_eq!(result.token_usage.as_ref().and_then(|t| t.thinking_tokens), Some(121));
+        assert_eq!(result.token_usage.as_ref().and_then(|t| t.latency_ms), Some(19516));
+        assert_eq!(result.token_usage.as_ref().and_then(|t| t.tool_calls), Some(1));
     }
 }
