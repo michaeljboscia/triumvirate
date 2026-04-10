@@ -19,6 +19,7 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shared-types = { path = "../shared-types" }
+token-economics = { path = "../token-economics" }
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

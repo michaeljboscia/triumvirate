@@ -15,6 +15,7 @@ pub mod gemini_query;
 pub mod inter_agent;
 pub mod knowledge;
 pub mod review;
+pub mod token_tools;
 
 #[derive(Clone, Debug)]
 pub struct ProgressEmitter {
