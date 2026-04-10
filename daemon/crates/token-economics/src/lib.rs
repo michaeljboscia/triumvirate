@@ -1,3 +1,4 @@
+mod scanner;
 mod storage;
 
 use std::sync::Mutex;
@@ -6,6 +7,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 pub use storage::{insert_record, open, query_summary};
+pub use scanner::{
+    scan_claude_file, scan_codex_file, scan_gemini_chat_file, scan_gemini_telemetry_file,
+};
 
 #[derive(Debug)]
 pub struct TokenDb {
