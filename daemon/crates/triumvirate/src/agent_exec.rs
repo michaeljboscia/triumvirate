@@ -107,6 +107,9 @@ pub(crate) async fn execute_ask_agent(
             input: usage.input,
             output: usage.output,
             cached: usage.cached,
+            thinking_tokens: usage.thinking_tokens,
+            latency_ms: usage.latency_ms,
+            tool_calls: usage.tool_calls,
             total: usage.total,
         })
     }

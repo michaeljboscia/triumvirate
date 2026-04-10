@@ -55,6 +55,9 @@ impl CodexExecParser {
                     input: usage.get("input_tokens").and_then(|v| v.as_u64()),
                     output: usage.get("output_tokens").and_then(|v| v.as_u64()),
                     cached: usage.get("cached_input_tokens").and_then(|v| v.as_u64()),
+                    thinking_tokens: None,
+                    latency_ms: None,
+                    tool_calls: None,
                     total: None,
                 };
                 self.token_usage = Some(token_usage.clone());

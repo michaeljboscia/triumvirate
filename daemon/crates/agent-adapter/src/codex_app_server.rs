@@ -161,6 +161,9 @@ impl CodexAppServerParser {
                         .get("cached_input_tokens")
                         .or_else(|| usage.get("cached"))
                         .and_then(|v| v.as_u64()),
+                    thinking_tokens: None,
+                    latency_ms: None,
+                    tool_calls: None,
                     total: usage
                         .get("total_tokens")
                         .or_else(|| usage.get("total"))
