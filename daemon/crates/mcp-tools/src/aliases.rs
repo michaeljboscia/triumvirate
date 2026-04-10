@@ -4,6 +4,9 @@
 //! request-like structs for Wave 0 contract work. Tool router registration and invocation
 //! wiring are handled later in Wave 3 (T-011).
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AliasMappingError {
     InvalidTarget(String),
@@ -28,7 +31,7 @@ impl std::fmt::Display for AliasMappingError {
 
 impl std::error::Error for AliasMappingError {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SpawnDaemonParams {
     pub target: String,
     pub session_name: Option<String>,
@@ -36,26 +39,26 @@ pub struct SpawnDaemonParams {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AskDaemonParams {
     pub daemon_id: String,
     pub question: String,
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DismissDaemonParams {
     pub daemon_id: String,
     pub hard: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ListDaemonsParams {
     pub target: Option<String>,
     pub cwd: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SendMessageParams {
     pub target: String,
     pub request_type: String,
@@ -66,19 +69,19 @@ pub struct SendMessageParams {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetResponseParams {
     pub job_id: String,
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ListJobsParams {
     pub target: Option<String>,
     pub cwd: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WriteScratchpadParams {
     pub topic: String,
     pub content: String,
@@ -87,12 +90,12 @@ pub struct WriteScratchpadParams {
     pub daemon_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ListScratchpadParams {
     pub cwd: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodeReviewParams {
     pub cwd: Option<String>,
     pub uncommitted: Option<bool>,

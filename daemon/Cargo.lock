@@ -1158,6 +1158,8 @@ dependencies = [
  "peer-review",
  "regex-lite",
  "rmcp",
+ "schemars",
+ "serde",
  "serde_json",
  "shared-types",
  "tokio",

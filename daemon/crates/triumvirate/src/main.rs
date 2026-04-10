@@ -39,6 +39,7 @@ use mcp_bridge::use_daemon_for_mcp_from_env;
 #[cfg(test)]
 use mcp_bridge::should_use_daemon_proxy;
 use mcp_tools::{
+    aliases as mcp_aliases,
     ProgressEmitter, fleet as mcp_fleet,
     gemini_query as mcp_gemini_query, knowledge, review as mcp_review,
 };
@@ -96,6 +97,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
+    process::Command,
     sync::{
         Arc,
     },
@@ -421,6 +423,109 @@ impl McpBridge {
         mcp_tools::inter_agent::get_status(&self.sessions, mcp_daemon_proxy_enabled()).await
     }
 
+    #[tool(description = "Alias for spawn_session using legacy spawn_daemon schema.")]
+    async fn spawn_daemon(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::SpawnDaemonParams>,
+    ) -> Result<String, String> {
+        info!(old_name = "spawn_daemon", new_name = "spawn_session", "tool_alias");
+        let mapped = mcp_aliases::map_spawn_daemon_params(req).map_err(|e| e.to_string())?;
+        let name = mapped
+            .name
+            .ok_or_else(|| mcp_aliases::AliasMappingError::MissingRequired("session_name").to_string())?;
+        self.spawn_session(Parameters(SpawnSessionRequest {
+            agent: mapped.agent,
+            name,
+            cwd: mapped.cwd,
+        }))
+        .await
+    }
+
+    #[tool(description = "Alias for ask_session using legacy ask_daemon schema.")]
+    async fn ask_daemon(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::AskDaemonParams>,
+    ) -> Result<String, String> {
+        info!(old_name = "ask_daemon", new_name = "ask_session", "tool_alias");
+        let mapped = mcp_aliases::map_ask_daemon_params(req).map_err(|e| e.to_string())?;
+        self.ask_session(Parameters(AskSessionRequest {
+            name: mapped.name,
+            message: mapped.message,
+        }))
+        .await
+    }
+
+    #[tool(description = "Alias for dismiss_session using legacy dismiss_daemon schema.")]
+    async fn dismiss_daemon(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::DismissDaemonParams>,
+    ) -> Result<String, String> {
+        info!(old_name = "dismiss_daemon", new_name = "dismiss_session", "tool_alias");
+        let mapped = mcp_aliases::map_dismiss_daemon_params(req).map_err(|e| e.to_string())?;
+        self.dismiss_session(Parameters(DismissSessionRequest { name: mapped.name }))
+            .await
+    }
+
+    #[tool(description = "Alias for list_sessions using legacy list_daemons schema.")]
+    async fn list_daemons(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::ListDaemonsParams>,
+    ) -> Result<Json<SessionListResponse>, String> {
+        info!(old_name = "list_daemons", new_name = "list_sessions", "tool_alias");
+        let mapped = mcp_aliases::map_list_daemons_params(req).map_err(|e| e.to_string())?;
+        let mut response = self.list_sessions().await.0;
+        if let Some(target) = mapped.target {
+            response.sessions.retain(|session| session.agent == target);
+        }
+        Ok(Json(response))
+    }
+
+    #[tool(description = "Alias for ask_session using legacy send_message schema.")]
+    async fn send_message(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::SendMessageParams>,
+    ) -> Result<String, String> {
+        info!(old_name = "send_message", new_name = "ask_session", "tool_alias");
+        let mapped = mcp_aliases::map_send_message_params(req).map_err(|e| e.to_string())?;
+        let ask_req = AskSessionRequest {
+            name: mapped.name.clone(),
+            message: mapped.message,
+        };
+        match self.ask_session(Parameters(ask_req.clone())).await {
+            Ok(response) => Ok(response),
+            Err(err) if err.contains("not found") => {
+                self.spawn_session(Parameters(SpawnSessionRequest {
+                    agent: mapped.name.clone(),
+                    name: mapped.name,
+                    cwd: None,
+                }))
+                .await?;
+                self.ask_session(Parameters(ask_req)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[tool(description = "Alias shim for get_response; use ask_session directly.")]
+    async fn get_response(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::GetResponseParams>,
+    ) -> Result<String, String> {
+        info!(old_name = "get_response", new_name = "ask_session", "tool_alias");
+        let mapped = mcp_aliases::map_get_response_params(req).map_err(|e| e.to_string())?;
+        Ok(mapped.message)
+    }
+
+    #[tool(description = "Alias for get_status using legacy list_jobs schema.")]
+    async fn list_jobs(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::ListJobsParams>,
+    ) -> Result<Json<StatusResponse>, String> {
+        info!(old_name = "list_jobs", new_name = "get_status", "tool_alias");
+        let _mapped = mcp_aliases::map_list_jobs_params(req).map_err(|e| e.to_string())?;
+        Ok(self.get_status().await)
+    }
+
     #[tool(description = "Query daemon HTTP status using local bearer token.")]
     async fn daemon_health(&self) -> Result<Json<DaemonHealthResponse>, String> {
         mcp_tools::inter_agent::daemon_health().await
@@ -450,12 +555,39 @@ impl McpBridge {
         knowledge::scratchpad_write(req, mcp_daemon_proxy_enabled()).await
     }
 
+    #[tool(description = "Alias for scratchpad_write using legacy write_scratchpad schema.")]
+    async fn write_scratchpad(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::WriteScratchpadParams>,
+    ) -> Result<Json<ScratchpadWriteResponse>, String> {
+        info!(old_name = "write_scratchpad", new_name = "scratchpad_write", "tool_alias");
+        let mapped = mcp_aliases::map_write_scratchpad_params(req).map_err(|e| e.to_string())?;
+        self.scratchpad_write(Parameters(ScratchpadWriteRequest {
+            project: mapped.owner,
+            topic: mapped.filename_stem,
+            content: mapped.content,
+        }))
+        .await
+    }
+
     #[tool(description = "List scratchpad files for a project.")]
     async fn scratchpad_list(
         &self,
         Parameters(req): Parameters<ScratchpadListRequest>,
     ) -> Result<Json<ScratchpadListResponse>, String> {
         knowledge::scratchpad_list(req, mcp_daemon_proxy_enabled()).await
+    }
+
+    #[tool(description = "Alias for scratchpad_list using legacy list_scratchpad schema.")]
+    async fn list_scratchpad(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::ListScratchpadParams>,
+    ) -> Result<Json<ScratchpadListResponse>, String> {
+        info!(old_name = "list_scratchpad", new_name = "scratchpad_list", "tool_alias");
+        let mapped = mcp_aliases::map_list_scratchpad_params(req).map_err(|e| e.to_string())?;
+        let project = mapped.cwd.unwrap_or_else(|| "inter-agent".to_string());
+        self.scratchpad_list(Parameters(ScratchpadListRequest { project }))
+            .await
     }
 
     #[tool(description = "Read recent outbox lifecycle events.")]
@@ -692,6 +824,24 @@ impl McpBridge {
         let response = mcp_review::review_status(req)?;
         Ok(Json(response))
     }
+
+    #[tool(description = "Alias for review_request using legacy code_review schema.")]
+    async fn code_review(
+        &self,
+        Parameters(req): Parameters<mcp_aliases::CodeReviewParams>,
+    ) -> Result<Json<ReviewRequestResponse>, String> {
+        info!(old_name = "code_review", new_name = "review_request", "tool_alias");
+        let mapped = mcp_aliases::map_code_review_params(req).map_err(|e| e.to_string())?;
+        let artifact = build_code_review_artifact(&mapped)?;
+        self.review_request(Parameters(ReviewRequestTool {
+            project_root: mapped.cwd.clone(),
+            fleet_id: None,
+            author_agent: "codex".to_string(),
+            artifact,
+            review_type: "code".to_string(),
+        }))
+        .await
+    }
 }
 
 async fn execute_ask_agent(
@@ -706,6 +856,40 @@ fn execute_ask_agent_boxed<'a>(
     progress: Option<ProgressEmitter>,
 ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
     Box::pin(execute_ask_agent(req, progress))
+}
+
+fn build_code_review_artifact(req: &mcp_aliases::ReviewRequestLike) -> Result<String, String> {
+    let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&cwd).arg("--no-pager");
+    if let Some(commit_sha) = req.commit_sha.as_deref() {
+        command.args(["show", "--no-color", commit_sha]);
+    } else if let Some(base_branch) = req.base_branch.as_deref() {
+        command.args(["diff", "--no-color", &format!("{base_branch}...HEAD")]);
+    } else if req.uncommitted.unwrap_or(false) {
+        command.args(["diff", "--no-color", "HEAD"]);
+    } else {
+        command.args(["diff", "--no-color"]);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("code_review failed to run git diff/show: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "code_review git command failed".to_string()
+        } else {
+            format!("code_review git command failed: {stderr}")
+        });
+    }
+
+    let artifact = String::from_utf8_lossy(&output.stdout).to_string();
+    if artifact.trim().is_empty() {
+        Ok("No diff content found for the selected review scope.".to_string())
+    } else {
+        Ok(artifact)
+    }
 }
 
 async fn prewarm_daemon_workers() {
