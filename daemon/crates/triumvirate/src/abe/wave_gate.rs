@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::process::Command;
+use tracing::instrument;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveTask {
@@ -8,6 +9,7 @@ pub struct WaveTask {
     pub validation_status: String,
 }
 
+#[instrument(skip_all)]
 pub fn validate_no_overlap(tasks: &[WaveTask]) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     for task in tasks {
@@ -21,6 +23,7 @@ pub fn validate_no_overlap(tasks: &[WaveTask]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[instrument(skip_all)]
 pub fn gate_wave<F>(
     tasks: &[WaveTask],
     test_command: &str,

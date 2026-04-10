@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BuildState {
@@ -21,18 +22,21 @@ pub struct BuildState {
     pub updated_at: String,
 }
 
+#[instrument(skip_all)]
 pub fn update_state(path: &Path, state: &BuildState) -> anyhow::Result<()> {
     let payload = serde_json::to_vec_pretty(state)?;
     fs::write(path, payload)?;
     Ok(())
 }
 
+#[instrument(skip_all)]
 pub fn read_state(path: &Path) -> anyhow::Result<BuildState> {
     let raw = fs::read(path)?;
     Ok(serde_json::from_slice(&raw)?)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[instrument(skip_all, fields(task_id = %task_id, wave = wave, status = %validation))]
 pub fn append_manifest(
     path: &Path,
     task_id: &str,
@@ -62,6 +66,7 @@ pub fn append_manifest(
     Ok(())
 }
 
+#[instrument(skip_all, fields(task_id = %task_id, status = %severity))]
 pub fn append_deviation(
     path: &Path,
     task_id: &str,
