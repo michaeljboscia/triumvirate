@@ -206,22 +206,30 @@ impl McpBridge {
             sessions: Arc::new(Mutex::new(sessions)),
             sessions_file,
             fleet_states: Arc::new(Mutex::new(HashMap::new())),
-            abe_tasks: abe::task_tracker::TaskTracker::default(),
+            abe_tasks: abe::task_tracker::TaskTracker::with_metrics(metrics.clone()),
             metrics,
         }
     }
 
-    fn abe_callbacks() -> mcp_tools::abe::AbeCallbacks {
+    fn abe_callbacks(&self) -> mcp_tools::abe::AbeCallbacks {
+        let metrics = self.metrics.clone();
+        let setup_metrics = metrics.clone();
+        let timeout_metrics = metrics.clone();
+        let validate_metrics = metrics.clone();
         mcp_tools::abe::AbeCallbacks {
+            metrics: metrics.clone(),
             codex_command: Arc::new(codex_command),
-            setup_worktree: Arc::new(|req| {
-                abe::worktree_setup::setup_worktree(&abe::worktree_setup::WorktreeSetupRequest {
+            setup_worktree: Arc::new(move |req| {
+                abe::worktree_setup::setup_worktree_with_metrics(
+                    &abe::worktree_setup::WorktreeSetupRequest {
                     project_root: req.project_root,
                     sha: req.sha,
                     task_id: req.task_id,
                     briefing_content: req.briefing_content,
                     contract_fields: req.contract_fields,
-                })
+                    },
+                    Some(setup_metrics.as_ref()),
+                )
                 .map(|result| mcp_tools::abe::WorktreeSetupResult {
                     worktree_path: result.worktree_path,
                 })
@@ -239,16 +247,27 @@ impl McpBridge {
                     .map_err(|e| e.to_string())
                 })
             }),
-            enforce_timeout: Arc::new(|child, timeout_sec, cwd| {
+            enforce_timeout: Arc::new(move |child, timeout_sec, cwd| {
+                let metrics = timeout_metrics.clone();
                 Box::pin(async move {
-                    abe::codex_spawn::enforce_timeout(child, timeout_sec, &cwd)
+                    abe::codex_spawn::enforce_timeout_with_metrics(
+                        child,
+                        timeout_sec,
+                        &cwd,
+                        Some(metrics.as_ref()),
+                    )
                         .await
                         .map_err(|e| e.to_string())
                 })
             }),
             resolve_commit_outputs: Arc::new(abe::codex_spawn::resolve_commit_outputs),
-            validate_commit: Arc::new(|worktree_path, contract, start_sha| {
-                let result = abe::post_exit_validator::validate_commit(worktree_path, contract, start_sha);
+            validate_commit: Arc::new(move |worktree_path, contract, start_sha| {
+                let result = abe::post_exit_validator::validate_commit_with_metrics(
+                    worktree_path,
+                    contract,
+                    start_sha,
+                    Some(validate_metrics.as_ref()),
+                );
                 mcp_tools::abe::PostExitValidation {
                     passed: result.passed,
                     violations: result.violations,
@@ -699,7 +718,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<DispatchCodexRequest>,
     ) -> Result<Json<DispatchCodexResponse>, String> {
-        mcp_tools::abe::dispatch_codex(self.abe_tasks.clone(), req, Self::abe_callbacks())
+        mcp_tools::abe::dispatch_codex(self.abe_tasks.clone(), req, self.abe_callbacks())
             .await
             .map(Json)
     }
@@ -709,7 +728,7 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<DispatchCodexWorktreeRequest>,
     ) -> Result<Json<DispatchCodexWorktreeResponse>, String> {
-        mcp_tools::abe::dispatch_codex_worktree(self.abe_tasks.clone(), req, Self::abe_callbacks())
+        mcp_tools::abe::dispatch_codex_worktree(self.abe_tasks.clone(), req, self.abe_callbacks())
             .await
             .map(Json)
     }
@@ -1377,16 +1396,17 @@ async fn run_daemon() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|path| core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok())
         .unwrap_or_default();
+    let metrics = Arc::new(DaemonMetrics::new()?);
     let state = DaemonRuntimeState::new(
         token,
         Arc::new(Mutex::new(HashMap::new())),
         bind_addr.clone(),
         Arc::new(Mutex::new(sessions)),
         sessions_file,
-        abe::task_tracker::TaskTracker::default(),
+        abe::task_tracker::TaskTracker::with_metrics(metrics.clone()),
         Arc::new(Mutex::new(VecDeque::new())),
         Arc::new(Mutex::new(VecDeque::new())),
-        Arc::new(DaemonMetrics::new()?),
+        metrics.clone(),
         broadcast::channel(256).0,
     );
     set_process_metrics(state.metrics.clone());

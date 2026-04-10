@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
+use daemon_core::metrics::DaemonMetrics;
 use tokio::{process::Child, process::Command, sync::Mutex};
 use tracing::instrument;
 
@@ -37,6 +38,15 @@ pub async fn spawn_background(spec: SpawnSpec) -> anyhow::Result<Arc<Mutex<Child
 
 #[instrument(skip_all, fields(status = "timeout"))]
 pub async fn enforce_timeout(child: Arc<Mutex<Child>>, timeout_sec: u64, cwd: &Path) -> anyhow::Result<bool> {
+    enforce_timeout_with_metrics(child, timeout_sec, cwd, None).await
+}
+
+pub async fn enforce_timeout_with_metrics(
+    child: Arc<Mutex<Child>>,
+    timeout_sec: u64,
+    cwd: &Path,
+    metrics: Option<&DaemonMetrics>,
+) -> anyhow::Result<bool> {
     tokio::time::sleep(std::time::Duration::from_secs(timeout_sec)).await;
 
     let mut child = child.lock().await;
@@ -47,10 +57,16 @@ pub async fn enforce_timeout(child: Arc<Mutex<Child>>, timeout_sec: u64, cwd: &P
     if let Some(pid) = child.id() {
         // SIGTERM first to give the worker a chance to flush state and exit cleanly.
         let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if let Some(metrics) = metrics {
+            metrics.abe_timeout_total.inc();
+        }
     }
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     if child.try_wait()?.is_none() {
         let _ = child.kill().await;
+        if let Some(metrics) = metrics {
+            metrics.abe_timeout_total.inc();
+        }
     }
 
     cleanup_git_locks(cwd);

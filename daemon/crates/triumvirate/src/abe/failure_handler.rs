@@ -1,4 +1,5 @@
 use tracing::instrument;
+use daemon_core::metrics::DaemonMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
@@ -17,51 +18,90 @@ pub struct Classification {
 
 #[instrument(skip_all)]
 pub fn classify_failure(log_text: &str) -> Classification {
-    let lower = log_text.to_lowercase();
+    classify_failure_with_metrics(log_text, None)
+}
 
-    if lower.contains("stub marker")
+pub fn classify_failure_with_metrics(
+    log_text: &str,
+    metrics: Option<&DaemonMetrics>,
+) -> Classification {
+    let lower = log_text.to_lowercase();
+    let classification = if lower.contains("stub marker")
         || lower.contains("test command failed")
         || lower.contains("validation failed")
     {
-        return Classification {
+        Classification {
             class: FailureClass::WorkerError,
             reason: "worker produced non-compliant output".to_string(),
-        };
-    }
-    if lower.contains("command not found") || lower.contains("sandbox") {
-        return Classification {
+        }
+    } else if lower.contains("command not found") || lower.contains("sandbox") {
+        Classification {
             class: FailureClass::EnvironmentError,
             reason: "environment dependency or sandbox error".to_string(),
-        };
-    }
-    if lower.contains("blocked: write to") || lower.contains("denied by contract") {
-        return Classification {
+        }
+    } else if lower.contains("blocked: write to") || lower.contains("denied by contract") {
+        Classification {
             class: FailureClass::ContractError,
             reason: "contract blocked required change".to_string(),
-        };
-    }
-    if lower.contains("orchestrator") || lower.contains("briefing") {
-        return Classification {
+        }
+    } else if lower.contains("orchestrator") || lower.contains("briefing") {
+        Classification {
             class: FailureClass::OrchestratorBriefingError,
             reason: "briefing quality issue".to_string(),
-        };
+        }
+    } else {
+        Classification {
+            class: FailureClass::OrchestratorBriefingError,
+            reason: "unclassified failure — conservative default, send to Gemini".to_string(),
+        }
+    };
+    if let Some(metrics) = metrics {
+        metrics
+            .abe_failure_class_total
+            .with_label_values(&[failure_class_label(&classification.class)])
+            .inc();
     }
-    Classification {
-        class: FailureClass::OrchestratorBriefingError,
-        reason: "unclassified failure — conservative default, send to Gemini".to_string(),
-    }
+    classification
 }
 
 #[instrument(skip_all)]
 pub fn can_retry(class: &FailureClass, class_attempts: u32, total_attempts: u32) -> bool {
-    if total_attempts >= 5 {
-        return false;
-    }
-    match class {
+    can_retry_with_metrics(class, class_attempts, total_attempts, None)
+}
+
+pub fn can_retry_with_metrics(
+    class: &FailureClass,
+    class_attempts: u32,
+    total_attempts: u32,
+    metrics: Option<&DaemonMetrics>,
+) -> bool {
+    let should_retry = if total_attempts >= 5 {
+        false
+    } else {
+        match class {
         FailureClass::WorkerError => class_attempts < 3,
         FailureClass::ContractError => class_attempts < 2,
         FailureClass::OrchestratorBriefingError => class_attempts < 2,
         FailureClass::EnvironmentError => false,
+        }
+    };
+    if should_retry {
+        if let Some(metrics) = metrics {
+            metrics
+                .abe_retry_total
+                .with_label_values(&[failure_class_label(class)])
+                .inc();
+        }
+    }
+    should_retry
+}
+
+fn failure_class_label(class: &FailureClass) -> &'static str {
+    match class {
+        FailureClass::WorkerError => "worker-error",
+        FailureClass::ContractError => "contract-error",
+        FailureClass::OrchestratorBriefingError => "orchestrator-briefing-error",
+        FailureClass::EnvironmentError => "environment-error",
     }
 }
 

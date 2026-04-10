@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use daemon_core::metrics::DaemonMetrics;
 use shared_types::ContractFields;
 use tracing::instrument;
 
@@ -19,6 +20,15 @@ pub fn validate_commit(
     worktree_path: &Path,
     contract: &ContractFields,
     start_sha: &str,
+) -> ValidationResult {
+    validate_commit_with_metrics(worktree_path, contract, start_sha, None)
+}
+
+pub fn validate_commit_with_metrics(
+    worktree_path: &Path,
+    contract: &ContractFields,
+    start_sha: &str,
+    metrics: Option<&DaemonMetrics>,
 ) -> ValidationResult {
     let mut violations = Vec::new();
 
@@ -107,10 +117,52 @@ pub fn validate_commit(
         }
     }
 
-    ValidationResult {
+    let result = ValidationResult {
         passed: violations.is_empty(),
         violations,
+    };
+    if let Some(metrics) = metrics {
+        metrics
+            .abe_validation_total
+            .with_label_values(&[validation_result_label(&result)])
+            .inc();
     }
+    result
+}
+
+fn validation_result_label(result: &ValidationResult) -> &'static str {
+    if result.passed {
+        return "pass";
+    }
+    if result
+        .violations
+        .iter()
+        .any(|v| v.starts_with("FILE_SCOPE:"))
+    {
+        return "fail_scope";
+    }
+    if result
+        .violations
+        .iter()
+        .any(|v| v.starts_with("COMMIT_FORMAT:"))
+    {
+        return "fail_format";
+    }
+    if result
+        .violations
+        .iter()
+        .any(|v| v.starts_with("STUB_MARKER:"))
+    {
+        return "fail_stub";
+    }
+    if result
+        .violations
+        .iter()
+        .any(|v| v.starts_with("TEST_FAILED:") || v.starts_with("TEST_ERROR:"))
+    {
+        return "fail_test";
+    }
+    "fail_scope"
 }
 
 fn get_modified_files(worktree_path: &Path, start_sha: &str) -> Vec<String> {

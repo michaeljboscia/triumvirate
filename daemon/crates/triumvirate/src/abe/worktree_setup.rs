@@ -3,9 +3,11 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    time::Instant,
 };
 
 use anyhow::Context;
+use daemon_core::metrics::DaemonMetrics;
 use shared_types::ContractFields;
 use tracing::instrument;
 
@@ -25,6 +27,24 @@ pub struct WorktreeSetupResult {
 
 #[instrument(skip_all, fields(task_id = %req.task_id, wave = req.contract_fields.wave))]
 pub fn setup_worktree(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSetupResult> {
+    setup_worktree_with_metrics(req, None)
+}
+
+pub fn setup_worktree_with_metrics(
+    req: &WorktreeSetupRequest,
+    metrics: Option<&DaemonMetrics>,
+) -> anyhow::Result<WorktreeSetupResult> {
+    let started = Instant::now();
+    let result = setup_worktree_inner(req);
+    if let Some(metrics) = metrics {
+        metrics
+            .abe_worktree_setup_duration_seconds
+            .observe(started.elapsed().as_secs_f64());
+    }
+    result
+}
+
+fn setup_worktree_inner(req: &WorktreeSetupRequest) -> anyhow::Result<WorktreeSetupResult> {
     let worktree_base = req.project_root.join(".triumvirate").join("abe-worktrees");
     fs::create_dir_all(&worktree_base)?;
 
