@@ -41,6 +41,7 @@ pub async fn enforce_timeout(child: Arc<Mutex<Child>>, timeout_sec: u64, cwd: &P
     enforce_timeout_with_metrics(child, timeout_sec, cwd, None).await
 }
 
+#[instrument(skip_all, fields(timeout_sec))]
 pub async fn enforce_timeout_with_metrics(
     child: Arc<Mutex<Child>>,
     timeout_sec: u64,

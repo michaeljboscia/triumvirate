@@ -26,4 +26,5 @@ docs/superpowers/plans/
 
 # Rust build artifacts
 daemon/target/
+daemon/dist/
 .triumvirate/

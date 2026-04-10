@@ -24,6 +24,7 @@ pub fn validate_commit(
     validate_commit_with_metrics(worktree_path, contract, start_sha, None)
 }
 
+#[instrument(skip_all, fields(task_id = %contract.task_id, wave = contract.wave))]
 pub fn validate_commit_with_metrics(
     worktree_path: &Path,
     contract: &ContractFields,
