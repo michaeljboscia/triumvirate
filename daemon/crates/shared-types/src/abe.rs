@@ -68,6 +68,15 @@ pub struct DispatchCodexWorktreeResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TaskCompleteRequest {
+    pub task_id: String,
+    pub commit_sha: String,
+    pub result: String,
+    pub timestamp: String,
+    pub commit_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DispatchErrorCode {
     DaemonUnavailable,
@@ -141,6 +150,7 @@ pub struct GetTaskStatusRequest {
 pub enum TaskStatus {
     Working,
     Completed,
+    Stuck,
     Failed,
     Timeout,
     SetupFailed,

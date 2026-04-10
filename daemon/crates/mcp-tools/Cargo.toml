@@ -20,3 +20,4 @@ shared-types = { path = "../shared-types" }
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+regex-lite = "0.1"
