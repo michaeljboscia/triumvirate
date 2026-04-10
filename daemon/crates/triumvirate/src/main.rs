@@ -7,6 +7,7 @@ use agent_worker::{reset_worker_registry_for_tests, update_worker_session};
 use daemon_core::{
     DaemonState,
     daemon_bind_addr as core_daemon_bind_addr,
+    observability::ObservabilityBus,
     publish_ws_event,
     metrics::DaemonMetrics,
     triumvirate_home_dir as core_triumvirate_home_dir,
@@ -89,6 +90,7 @@ use shared_types::{
     GcResult, HealthStatus, SessionDetail,
     SessionState,
 };
+use token_economics::{TokenDb, TokenRecord};
 #[cfg(test)]
 use shared_types::GeminiReviewVerdict;
 #[cfg(test)]
@@ -151,39 +153,11 @@ struct McpBridge {
     abe_tasks: abe::task_tracker::TaskTracker,
     metrics: Arc<DaemonMetrics>,
     ws_events: broadcast::Sender<String>,
-    token_db: Arc<TokenDb>,
+    token_db: Option<Arc<TokenDb>>,
 }
 
 static PROCESS_METRICS: OnceLock<Arc<DaemonMetrics>> = OnceLock::new();
 static PROCESS_TOKEN_DB: OnceLock<Arc<TokenDb>> = OnceLock::new();
-
-#[derive(Debug)]
-pub(crate) struct TokenDb {
-    db_path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct TokenRecord {
-    pub agent: String,
-    pub session_id: String,
-    pub timestamp: String,
-    pub model: Option<String>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cached_tokens: i64,
-    pub thinking_tokens: i64,
-    pub total_tokens: i64,
-    pub cost_usd: Option<f64>,
-    pub latency_ms: Option<i64>,
-    pub tool_calls: Option<i64>,
-    pub lines_added: Option<i64>,
-    pub lines_removed: Option<i64>,
-    pub rate_limit_pct: Option<f64>,
-    pub context_window: Option<i64>,
-    pub build_id: Option<String>,
-    pub task_id: Option<String>,
-    pub wave: Option<i64>,
-}
 
 pub(crate) fn process_metrics() -> Option<&'static Arc<DaemonMetrics>> {
     PROCESS_METRICS.get()
@@ -197,49 +171,17 @@ fn set_process_metrics(metrics: Arc<DaemonMetrics>) {
     let _ = PROCESS_METRICS.set(metrics);
 }
 
-fn init_process_token_db() {
-    if PROCESS_TOKEN_DB.get().is_some() {
-        return;
+fn init_process_token_db() -> anyhow::Result<Arc<TokenDb>> {
+    if let Some(existing) = PROCESS_TOKEN_DB.get() {
+        return Ok(existing.clone());
     }
 
-    let home = match core_triumvirate_home_dir() {
-        Ok(home) => home,
-        Err(err) => {
-            warn!("failed to resolve triumvirate home for token DB: {err}");
-            return;
-        }
-    };
+    let home = core_triumvirate_home_dir()?;
     let db_path = home.join("token-economics.db");
-    if let Some(parent) = db_path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        warn!(
-            "failed to initialize token economics DB directory at {}: {err}",
-            parent.display()
-        );
-        return;
-    }
-    let _ = PROCESS_TOKEN_DB.set(Arc::new(TokenDb { db_path }));
-}
-
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn sql_opt_text(value: Option<&str>) -> String {
-    value.map(sql_quote).unwrap_or_else(|| "NULL".to_string())
-}
-
-fn sql_opt_i64(value: Option<i64>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "NULL".to_string())
-}
-
-fn sql_opt_f64(value: Option<f64>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "NULL".to_string())
+    let db = token_economics::open(&db_path)?;
+    let db = Arc::new(db);
+    let _ = PROCESS_TOKEN_DB.set(db.clone());
+    Ok(db)
 }
 
 pub(crate) fn record_daemon_tokens(db: &TokenDb, record: &TokenRecord) -> Result<(), String> {
@@ -249,77 +191,7 @@ pub(crate) fn record_daemon_tokens(db: &TokenDb, record: &TokenRecord) -> Result
     if record.session_id.trim().is_empty() {
         return Err("token record session_id must be non-empty".to_string());
     }
-
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS token_records (
-            id INTEGER PRIMARY KEY,
-            agent TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            model TEXT,
-            input_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            cached_tokens INTEGER DEFAULT 0,
-            thinking_tokens INTEGER DEFAULT 0,
-            total_tokens INTEGER NOT NULL,
-            cost_usd REAL,
-            latency_ms INTEGER,
-            tool_calls INTEGER,
-            lines_added INTEGER,
-            lines_removed INTEGER,
-            rate_limit_pct REAL,
-            context_window INTEGER,
-            build_id TEXT,
-            task_id TEXT,
-            wave INTEGER
-        );
-        INSERT INTO token_records (
-            agent, session_id, timestamp, model, input_tokens, output_tokens, cached_tokens,
-            thinking_tokens, total_tokens, cost_usd, latency_ms, tool_calls, lines_added,
-            lines_removed, rate_limit_pct, context_window, build_id, task_id, wave
-        ) VALUES (
-            {agent}, {session_id}, {timestamp}, {model}, {input_tokens}, {output_tokens},
-            {cached_tokens}, {thinking_tokens}, {total_tokens}, {cost_usd}, {latency_ms},
-            {tool_calls}, {lines_added}, {lines_removed}, {rate_limit_pct}, {context_window},
-            {build_id}, {task_id}, {wave}
-        );",
-        agent = sql_quote(&record.agent),
-        session_id = sql_quote(&record.session_id),
-        timestamp = sql_quote(&record.timestamp),
-        model = sql_opt_text(record.model.as_deref()),
-        input_tokens = record.input_tokens,
-        output_tokens = record.output_tokens,
-        cached_tokens = record.cached_tokens,
-        thinking_tokens = record.thinking_tokens,
-        total_tokens = record.total_tokens,
-        cost_usd = sql_opt_f64(record.cost_usd),
-        latency_ms = sql_opt_i64(record.latency_ms),
-        tool_calls = sql_opt_i64(record.tool_calls),
-        lines_added = sql_opt_i64(record.lines_added),
-        lines_removed = sql_opt_i64(record.lines_removed),
-        rate_limit_pct = sql_opt_f64(record.rate_limit_pct),
-        context_window = sql_opt_i64(record.context_window),
-        build_id = sql_opt_text(record.build_id.as_deref()),
-        task_id = sql_opt_text(record.task_id.as_deref()),
-        wave = sql_opt_i64(record.wave),
-    );
-
-    let output = Command::new("sqlite3")
-        .arg(&db.db_path)
-        .arg(sql)
-        .output()
-        .map_err(|err| format!("failed to execute sqlite3 for token record insert: {err}"))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(if stderr.is_empty() {
-        "sqlite3 token record insert failed".to_string()
-    } else {
-        format!("sqlite3 token record insert failed: {stderr}")
-    })
+    token_economics::record_daemon_tokens(db, record.clone()).map_err(|err| err.to_string())
 }
 
 fn mcp_daemon_proxy_enabled() -> bool {
@@ -351,10 +223,10 @@ impl McpBridge {
         let metrics = Arc::new(DaemonMetrics::new().expect("failed to initialize daemon metrics"));
         let ws_events = broadcast::channel(256).0;
         set_process_metrics(metrics.clone());
-        init_process_token_db();
-        let token_db = process_token_db()
-            .expect("token DB should be initialized")
-            .clone();
+        if let Err(err) = init_process_token_db() {
+            warn!("failed to initialize token DB for MCP bridge: {err}");
+        }
+        let token_db = process_token_db().cloned();
         let sessions_file = if enable_persistence {
             core_triumvirate_home_dir()
                 .ok()
@@ -742,7 +614,10 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<mcp_token_tools::GetTokenSummaryRequest>,
     ) -> Result<Json<mcp_token_tools::GetTokenSummaryResponse>, String> {
-        mcp_token_tools::get_token_summary(self.token_db.db_path.as_path(), req).map(Json)
+        let db_path = daemon_core::triumvirate_home_dir()
+            .map(|p| p.join("token-economics.db"))
+            .map_err(|e| format!("token db path: {e}"))?;
+        mcp_token_tools::get_token_summary(&db_path, req).map(Json)
     }
 
     #[tool(description = "Return per-task token and cost breakdown for a build_id.")]
@@ -750,7 +625,10 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<mcp_token_tools::GetBuildCostRequest>,
     ) -> Result<Json<mcp_token_tools::GetBuildCostResponse>, String> {
-        mcp_token_tools::get_build_cost(self.token_db.db_path.as_path(), req).map(Json)
+        let db_path = daemon_core::triumvirate_home_dir()
+            .map(|p| p.join("token-economics.db"))
+            .map_err(|e| format!("token db path: {e}"))?;
+        mcp_token_tools::get_build_cost(&db_path, req).map(Json)
     }
 
     #[tool(description = "Write a shared memory entry.")]
@@ -1079,7 +957,9 @@ async fn execute_ask_agent(
     req: &AskAgentRequest,
     progress: Option<ProgressEmitter>,
 ) -> Result<AskAgentResponse, String> {
-    init_process_token_db();
+    if let Err(err) = init_process_token_db() {
+        warn!("failed to initialize token DB for ask_agent: {err}");
+    }
     agent_exec::execute_ask_agent(req, progress).await
 }
 
@@ -1594,6 +1474,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         .unwrap_or_default();
     let metrics = Arc::new(DaemonMetrics::new()?);
     let ws_events = broadcast::channel(256).0;
+    let token_db = init_process_token_db()?;
+    let observability_bus =
+        ObservabilityBus::new(metrics.clone(), ws_events.clone(), token_db.clone());
     let state = DaemonRuntimeState::new(
         token,
         Arc::new(Mutex::new(HashMap::new())),
@@ -1610,9 +1493,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         ws_events,
     );
     set_process_metrics(state.metrics.clone());
-    init_process_token_db();
     let token_db_path = core_triumvirate_home_dir()?.join("token-economics.db");
     let token_db = daemon_http::open_token_db(&token_db_path)?;
+    let scanner_token_db = token_db.clone();
     let http_state = DaemonHttpState {
         token: state.token.clone(),
         queues: state.queues.clone(),
@@ -1737,6 +1620,12 @@ async fn run_daemon() -> anyhow::Result<()> {
     info!(%bind_addr, "daemon listener bound");
     tokio::spawn(async {
         prewarm_daemon_workers().await;
+    });
+    tokio::spawn({
+        let scanner_bus = observability_bus.clone();
+        async move {
+            token_economics::run_scanner_loop(scanner_token_db, scanner_bus).await;
+        }
     });
     tokio::spawn({
         let sweep_state = state.clone();
