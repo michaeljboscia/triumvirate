@@ -149,6 +149,7 @@ struct McpBridge {
     fleet_states: Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     abe_tasks: abe::task_tracker::TaskTracker,
     metrics: Arc<DaemonMetrics>,
+    ws_events: broadcast::Sender<String>,
 }
 
 static PROCESS_METRICS: OnceLock<Arc<DaemonMetrics>> = OnceLock::new();
@@ -188,6 +189,7 @@ impl McpBridge {
 
     fn with_persistence(enable_persistence: bool) -> Self {
         let metrics = Arc::new(DaemonMetrics::new().expect("failed to initialize daemon metrics"));
+        let ws_events = broadcast::channel(256).0;
         set_process_metrics(metrics.clone());
         let sessions_file = if enable_persistence {
             core_triumvirate_home_dir()
@@ -206,8 +208,12 @@ impl McpBridge {
             sessions: Arc::new(Mutex::new(sessions)),
             sessions_file,
             fleet_states: Arc::new(Mutex::new(HashMap::new())),
-            abe_tasks: abe::task_tracker::TaskTracker::with_metrics(metrics.clone()),
+            abe_tasks: abe::task_tracker::TaskTracker::with_observability(
+                metrics.clone(),
+                Some(ws_events.clone()),
+            ),
             metrics,
+            ws_events,
         }
     }
 
@@ -299,11 +305,12 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
     fn register(
         &self,
         task_id: String,
+        wave: u32,
         child: Arc<Mutex<tokio::process::Child>>,
         worktree_path: Option<PathBuf>,
     ) -> mcp_tools::abe::BoxFuture<()> {
         let tracker = self.clone();
-        Box::pin(async move { tracker.register(task_id, child, worktree_path).await })
+        Box::pin(async move { tracker.register(task_id, wave, child, worktree_path).await })
     }
 
     fn mark_completed(
@@ -792,11 +799,17 @@ impl McpBridge {
         &self,
         Parameters(req): Parameters<FleetSpawnRequest>,
     ) -> Result<Json<FleetSpawnResponse>, String> {
-        let response = mcp_fleet::fleet_spawn(&self.fleet_states, &self.metrics, req, |project_root| {
-            let git_ops = git_ops_impl::RealGitOps::new(project_root)
-                .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
-            Ok(fleet::orchestrator::FleetOrchestrator::new(git_ops))
-        })
+        let response = mcp_fleet::fleet_spawn(
+            &self.fleet_states,
+            &self.metrics,
+            Some(&self.ws_events),
+            req,
+            |project_root| {
+                let git_ops = git_ops_impl::RealGitOps::new(project_root)
+                    .map_err(|e| format!("fleet_spawn gitops init failed: {e}"))?;
+                Ok(fleet::orchestrator::FleetOrchestrator::new(git_ops))
+            },
+        )
         .await?;
         Ok(Json(response))
     }
@@ -831,7 +844,8 @@ impl McpBridge {
         Parameters(req): Parameters<FleetCancelRequest>,
     ) -> Result<Json<FleetCancelResponse>, String> {
         Ok(Json(
-            mcp_fleet::fleet_cancel(&self.fleet_states, &self.metrics, req).await?,
+            mcp_fleet::fleet_cancel(&self.fleet_states, &self.metrics, Some(&self.ws_events), req)
+                .await?,
         ))
     }
 
@@ -1397,17 +1411,21 @@ async fn run_daemon() -> anyhow::Result<()> {
         .and_then(|path| core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok())
         .unwrap_or_default();
     let metrics = Arc::new(DaemonMetrics::new()?);
+    let ws_events = broadcast::channel(256).0;
     let state = DaemonRuntimeState::new(
         token,
         Arc::new(Mutex::new(HashMap::new())),
         bind_addr.clone(),
         Arc::new(Mutex::new(sessions)),
         sessions_file,
-        abe::task_tracker::TaskTracker::with_metrics(metrics.clone()),
+        abe::task_tracker::TaskTracker::with_observability(
+            metrics.clone(),
+            Some(ws_events.clone()),
+        ),
         Arc::new(Mutex::new(VecDeque::new())),
         Arc::new(Mutex::new(VecDeque::new())),
         metrics.clone(),
-        broadcast::channel(256).0,
+        ws_events,
     );
     set_process_metrics(state.metrics.clone());
     let http_state = DaemonHttpState {

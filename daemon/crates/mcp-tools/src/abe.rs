@@ -24,6 +24,7 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
     fn register(
         &self,
         task_id: String,
+        wave: u32,
         child: Arc<Mutex<Child>>,
         worktree_path: Option<PathBuf>,
     ) -> BoxFuture<()>;
@@ -229,7 +230,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     .map_err(|e| format!("dispatch_codex failed: {e}"))?;
 
     tracker
-        .register(task_id.clone(), child.clone(), None)
+        .register(task_id.clone(), 0, child.clone(), None)
         .await;
 
     let tracker_for_monitor = tracker.clone();
@@ -398,7 +399,12 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     .map_err(|e| format!("dispatch_codex_worktree failed: {e}"))?;
 
     tracker
-        .register(task_id.clone(), child.clone(), Some(setup.worktree_path.clone()))
+        .register(
+            task_id.clone(),
+            req.contract_fields.wave,
+            child.clone(),
+            Some(setup.worktree_path.clone()),
+        )
         .await;
 
     let tracker_for_monitor = tracker.clone();

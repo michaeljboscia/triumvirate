@@ -6,11 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use daemon_core::metrics::DaemonMetrics;
+use daemon_core::{encode_ws_event, metrics::DaemonMetrics};
 use shared_types::{
     CancelTaskResponse, GetTaskOutputResponse, GetTaskStatusResponse, TaskStatus,
 };
-use tokio::{process::Child, sync::Mutex};
+use tokio::{process::Child, sync::{Mutex, broadcast}};
 use tracing::instrument;
 
 #[derive(Debug)]
@@ -24,6 +24,7 @@ struct TaskOutput {
 
 #[derive(Debug)]
 struct TaskRecord {
+    wave: u32,
     status: TaskStatus,
     started_at: Instant,
     commit_sha: Option<String>,
@@ -38,6 +39,7 @@ struct TaskRecord {
 pub struct TaskTracker {
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
     metrics: Option<Arc<DaemonMetrics>>,
+    ws_events: Option<broadcast::Sender<String>>,
 }
 
 impl Default for TaskTracker {
@@ -45,6 +47,7 @@ impl Default for TaskTracker {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
+            ws_events: None,
         }
     }
 }
@@ -70,9 +73,17 @@ fn is_terminal(status: &TaskStatus) -> bool {
 
 impl TaskTracker {
     pub fn with_metrics(metrics: Arc<DaemonMetrics>) -> Self {
+        Self::with_observability(metrics, None)
+    }
+
+    pub fn with_observability(
+        metrics: Arc<DaemonMetrics>,
+        ws_events: Option<broadcast::Sender<String>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             metrics: Some(metrics),
+            ws_events,
         }
     }
 
@@ -85,18 +96,42 @@ impl TaskTracker {
         }
     }
 
+    fn emit_task_state(
+        &self,
+        task_id: &str,
+        wave: u32,
+        status: &'static str,
+        duration_ms: u128,
+        commit_sha: Option<&str>,
+    ) {
+        let Some(ws_events) = &self.ws_events else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "wave": wave,
+            "status": status,
+            "duration_ms": duration_ms,
+            "commit_sha": commit_sha,
+        });
+        let _ = ws_events.send(encode_ws_event("abe_task_state", payload));
+    }
+
     pub async fn register(
         &self,
         task_id: String,
+        wave: u32,
         child: Arc<Mutex<Child>>,
         worktree_path: Option<PathBuf>,
     ) {
         let mut guard = self.inner.lock().await;
+        let started_at = Instant::now();
         guard.insert(
-            task_id,
+            task_id.clone(),
             TaskRecord {
+                wave,
                 status: TaskStatus::Working,
-                started_at: Instant::now(),
+                started_at,
                 commit_sha: None,
                 exit_code: None,
                 error_message: None,
@@ -105,6 +140,8 @@ impl TaskTracker {
                 worktree_path,
             },
         );
+        self.emit_task_state(&task_id, wave, "dispatched", 0, None);
+        self.emit_task_state(&task_id, wave, "running", 0, None);
     }
 
     #[instrument(skip_all, fields(task_id = %task_id, status = "completed"))]
@@ -126,6 +163,7 @@ impl TaskTracker {
         }
         task.status = TaskStatus::Completed;
         task.commit_sha = Some(commit_sha.clone());
+        let duration_ms = task.started_at.elapsed().as_millis();
         task.output = Some(TaskOutput {
             commit_sha,
             modified_files,
@@ -140,6 +178,13 @@ impl TaskTracker {
             commit_sha = task.commit_sha.as_deref().unwrap_or_default(),
             duration_ms = task.started_at.elapsed().as_millis() as u64,
             "abe_task_completed"
+        );
+        self.emit_task_state(
+            task_id,
+            task.wave,
+            "completed",
+            duration_ms,
+            task.commit_sha.as_deref(),
         );
         TransitionOutcome::Transitioned
     }
@@ -159,10 +204,12 @@ impl TaskTracker {
             return TransitionOutcome::AlreadyTerminal;
         }
         task.status = TaskStatus::Failed;
+        let duration_ms = task.started_at.elapsed().as_millis();
         task.exit_code = exit_code;
         task.error_message = Some(error_message);
         task.child = None;
         self.inc_dispatch_status("failed");
+        self.emit_task_state(task_id, task.wave, "failed", duration_ms, task.commit_sha.as_deref());
         TransitionOutcome::Transitioned
     }
 
@@ -176,9 +223,11 @@ impl TaskTracker {
             return TransitionOutcome::AlreadyTerminal;
         }
         task.status = TaskStatus::Timeout;
+        let duration_ms = task.started_at.elapsed().as_millis();
         task.error_message = Some("task timed out".to_string());
         task.child = None;
         self.inc_dispatch_status("timeout");
+        self.emit_task_state(task_id, task.wave, "timeout", duration_ms, task.commit_sha.as_deref());
         TransitionOutcome::Transitioned
     }
 
@@ -280,8 +329,10 @@ impl TaskTracker {
         let mut guard = self.inner.lock().await;
         let task = guard.get_mut(task_id)?;
         task.status = TaskStatus::Cancelled;
+        let duration_ms = task.started_at.elapsed().as_millis();
         task.child = None;
         self.inc_dispatch_status("cancelled");
+        self.emit_task_state(task_id, task.wave, "cancelled", duration_ms, task.commit_sha.as_deref());
 
         Some(CancelTaskResponse {
             task_id: task_id.to_string(),
@@ -309,8 +360,9 @@ impl TaskTracker {
     pub async fn register_setup_failed(&self, task_id: String, error_message: String) {
         let mut guard = self.inner.lock().await;
         guard.insert(
-            task_id,
+            task_id.clone(),
             TaskRecord {
+                wave: 0,
                 status: TaskStatus::SetupFailed,
                 started_at: Instant::now(),
                 commit_sha: None,
@@ -321,6 +373,7 @@ impl TaskTracker {
                 worktree_path: None,
             },
         );
+        self.emit_task_state(&task_id, 0, "failed", 0, None);
     }
 
     #[instrument(skip_all, fields(task_id = %task_id))]
@@ -381,6 +434,7 @@ mod tests {
         tracker
             .register(
                 "T-LOCK".to_string(),
+                0,
                 std::sync::Arc::new(Mutex::new(child)),
                 Some(wt.clone()),
             )
