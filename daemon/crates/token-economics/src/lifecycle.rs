@@ -23,8 +23,21 @@ use crate::{
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 pub async fn run_scanner_loop(db: Arc<TokenDb>, bus: ObservabilityBus) {
-    if let Err(err) = run_full_reconciliation(db.clone(), &bus).await {
-        warn!("token scanner startup reconciliation failed: {err}");
+    // Skip startup reconciliation if env var is set, or if this is the first boot
+    // (first boot would scan ALL historical files including 500MB+ Gemini telemetry,
+    // blocking the daemon for minutes). Instead, just start watching for new changes.
+    // Historical backfill can be triggered manually via MCP tool later.
+    if std::env::var("TRIUMVIRATE_SKIP_SCANNER_RECONCILIATION").is_ok() {
+        tracing::info!("token scanner: skipping startup reconciliation (TRIUMVIRATE_SKIP_SCANNER_RECONCILIATION set)");
+    } else {
+        // Run reconciliation in a spawned task so it doesn't block the event loop
+        let recon_db = db.clone();
+        let recon_bus = bus.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_full_reconciliation(recon_db, &recon_bus).await {
+                warn!("token scanner startup reconciliation failed: {err}");
+            }
+        });
     }
 
     let (file_tx, mut file_rx) = mpsc::unbounded_channel::<PathBuf>();
