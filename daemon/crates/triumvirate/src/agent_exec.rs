@@ -78,7 +78,9 @@ fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: Worki
     name = "ask_agent",
     skip(req, progress),
     fields(
-        agent.type = %req.agent,
+        agent = %req.agent,
+        session_id = tracing::field::Empty,
+        request_type = "ask_agent",
         agent.tokens = tracing::field::Empty,
         agent.outcome = tracing::field::Empty,
         agent.duration_ms = tracing::field::Empty
@@ -127,6 +129,10 @@ pub(crate) async fn execute_ask_agent(
     let execution_prompt = inject_tool_marker_prompt(&req.message);
     let worker = acquire_worker(&agent, &exec_cwd).await;
     let mut worker_session_id = worker.session_id.clone();
+    span.record(
+        "session_id",
+        tracing::field::display(worker_session_id.as_deref().unwrap_or("none")),
+    );
     let worker_mode = worker.mode.clone();
     let worker_mode_state = "SPAWNED";
 
@@ -354,6 +360,10 @@ pub(crate) async fn execute_ask_agent(
                 span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                 let next_session_id = parsed.session_id.clone();
                 update_worker_session(&agent, &exec_cwd, next_session_id).await;
+                span.record(
+                    "session_id",
+                    tracing::field::display(parsed.session_id.as_deref().unwrap_or("none")),
+                );
                 lifecycle.push(LifecycleEvent {
                     state: "DONE".to_string(),
                     detail: format!("{agent} responded on attempt {}", idx + 1),
