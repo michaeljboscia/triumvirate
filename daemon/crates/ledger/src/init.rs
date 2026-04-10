@@ -1,4 +1,5 @@
 use std::{fs, path::Path};
+use tracing::instrument;
 
 const GITIGNORE_ENTRY: &str = ".triumvirate/";
 
@@ -6,6 +7,14 @@ fn is_git_repo(project_root: &Path) -> bool {
     project_root.join(".git").exists()
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "gitignore_setup",
+        spool_size = tracing::field::Empty,
+        operation = "ensure_triumvirate_gitignore"
+    )
+)]
 pub(crate) fn ensure_triumvirate_gitignore(project_root: &Path) -> anyhow::Result<()> {
     if !is_git_repo(project_root) {
         return Ok(());

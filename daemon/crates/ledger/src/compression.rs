@@ -1,4 +1,5 @@
 use serde_json::Value;
+use tracing::instrument;
 
 use crate::LedgerStore;
 use crate::store::with_task_state_priority;
@@ -55,11 +56,27 @@ fn reclaim_stale_running_conn(conn: &rusqlite::Connection) -> anyhow::Result<usi
 }
 
 #[allow(dead_code)]
+#[instrument(
+    skip_all,
+    fields(
+        event_type = tracing::field::Empty,
+        spool_size = tracing::field::Empty,
+        operation = "reclaim_stale_running"
+    )
+)]
 pub(crate) fn reclaim_stale_running(store: &LedgerStore) -> anyhow::Result<usize> {
     store.with_conn(reclaim_stale_running_conn)
 }
 
 #[allow(dead_code)]
+#[instrument(
+    skip_all,
+    fields(
+        event_type = tracing::field::Empty,
+        spool_size = tracing::field::Empty,
+        operation = "process_pending_events"
+    )
+)]
 pub(crate) fn process_pending_events(store: &LedgerStore) -> anyhow::Result<usize> {
     store.with_conn(|conn| {
         let _ = reclaim_stale_running_conn(conn)?;

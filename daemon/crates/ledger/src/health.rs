@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use shared_types::HealthStatus;
+use tracing::instrument;
 
 use crate::LedgerStore;
 use crate::store::queue_lag_seconds_conn;
@@ -28,6 +29,14 @@ fn dir_size_bytes(path: &Path) -> i64 {
     total.min(i64::MAX as u128) as i64
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "health_check",
+        spool_size = tracing::field::Empty,
+        operation = "health"
+    )
+)]
 pub(crate) fn health(store: &LedgerStore) -> anyhow::Result<HealthStatus> {
     let spool_dir = store.project_root().join(".triumvirate").join("spool");
     let db_path = store.project_root().join(".triumvirate").join("ledger.db");

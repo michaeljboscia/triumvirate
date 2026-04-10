@@ -6,16 +6,33 @@ use std::{
 
 use rusqlite::{OptionalExtension, params};
 use shared_types::GcResult;
+use tracing::instrument;
 
 use crate::LedgerStore;
 
 const EVENT_RETENTION_DAYS: i64 = 30;
 const DEAD_DROP_RETENTION_DAYS: u64 = 7;
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "gc",
+        spool_size = tracing::field::Empty,
+        operation = "gc"
+    )
+)]
 pub(crate) fn gc(store: &LedgerStore) -> anyhow::Result<GcResult> {
     gc_at(store, SystemTime::now())
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "fleet_state_check",
+        spool_size = tracing::field::Empty,
+        operation = "has_active_fleets"
+    )
+)]
 pub(crate) fn has_active_fleets(store: &LedgerStore) -> anyhow::Result<bool> {
     store.with_conn(|conn| {
         let has_active: i64 = conn.query_row(
@@ -31,6 +48,14 @@ pub(crate) fn has_active_fleets(store: &LedgerStore) -> anyhow::Result<bool> {
     })
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "gc_gate_check",
+        spool_size = tracing::field::Empty,
+        operation = "should_run_startup_gc"
+    )
+)]
 pub(crate) fn should_run_startup_gc(store: &LedgerStore) -> anyhow::Result<bool> {
     if has_active_fleets(store)? {
         return Ok(false);
@@ -52,6 +77,14 @@ pub(crate) fn should_run_startup_gc(store: &LedgerStore) -> anyhow::Result<bool>
     })
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "gc_timestamp_query",
+        spool_size = tracing::field::Empty,
+        operation = "last_gc_timestamp"
+    )
+)]
 pub(crate) fn last_gc_timestamp(store: &LedgerStore) -> anyhow::Result<Option<String>> {
     store.with_conn(|conn| {
         let value: Option<String> = conn

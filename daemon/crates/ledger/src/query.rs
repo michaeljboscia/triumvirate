@@ -1,10 +1,19 @@
 use shared_types::{RawEvent, SessionDetail, Summary};
 use rusqlite::OptionalExtension;
+use tracing::instrument;
 
 use crate::LedgerStore;
 
 type SessionRow = (String, Option<String>, String, Option<String>, i64, i64);
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "summary_query",
+        spool_size = tracing::field::Empty,
+        operation = "query_summaries"
+    )
+)]
 pub(crate) fn query_summaries(
     store: &LedgerStore,
     query: &str,
@@ -42,6 +51,14 @@ pub(crate) fn query_summaries(
     })
 }
 
+#[instrument(
+    skip_all,
+    fields(
+        event_type = "session_query",
+        spool_size = tracing::field::Empty,
+        operation = "get_session_detail"
+    )
+)]
 pub(crate) fn get_session_detail(
     store: &LedgerStore,
     session_id: &str,
