@@ -114,6 +114,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_exec;
+mod streaming;
 mod abe;
 mod cli_ops;
 mod git_ops_impl;
