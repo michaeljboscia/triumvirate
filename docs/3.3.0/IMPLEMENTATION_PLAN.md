@@ -154,9 +154,9 @@
 | 1 | T-302, T-303, T-304 | Parallel | Wave 0 |
 | 2 | T-305, T-306, T-307 | Sequential | Wave 1 |
 | 3 | T-308, T-309 | Parallel | Wave 2 (proxy needs T-305), Wave 1 (watch needs T-304) |
-| 4 | T-310, T-311 | Parallel | Wave 2+ |
+| 4 | T-310, T-312, T-311 | T-310 parallel with T-312; T-311 after T-312 | Wave 2+ |
 
-**Total: 12 tasks across 5 waves.**
+**Total: 13 tasks across 5 waves.**
 
 ## Execution Contract
 
