@@ -102,13 +102,14 @@ async fn stream_loop(
     let (_write, mut read) = stream.split();
     let mut seq_seen: Option<u64> = None;
     let mut session_by_agent: HashMap<String, String> = HashMap::new();
-    let mut active_turn: Option<ActiveTurn> = None;
+    let mut active_turns: HashMap<String, ActiveTurn> = HashMap::new();
     let mut timer = time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
             _ = timer.tick() => {
-                if let Some(turn) = &active_turn {
+                // Show timer for the most recently started turn across all agents.
+                if let Some(turn) = most_recent_turn(&active_turns) {
                     redraw_timer(turn)?;
                 }
             }
@@ -121,7 +122,7 @@ async fn stream_loop(
                                 args,
                                 &mut session_by_agent,
                                 &mut seq_seen,
-                                &mut active_turn,
+                                &mut active_turns,
                             )?;
                         }
                     }
@@ -153,13 +154,13 @@ fn handle_ws_text(
     args: &WatchArgs,
     session_by_agent: &mut HashMap<String, String>,
     seq_seen: &mut Option<u64>,
-    active_turn: &mut Option<ActiveTurn>,
+    active_turns: &mut HashMap<String, ActiveTurn>,
 ) -> Result<()> {
     let value: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => {
             if args.all {
-                print_line_with_timer(active_turn, "[invalid_json] failed to parse websocket message")?;
+                print_line_with_timer(active_turns, "[invalid_json] failed to parse websocket message")?;
             }
             return Ok(());
         }
@@ -175,7 +176,7 @@ fn handle_ws_text(
             let payload = value.get("payload").cloned().unwrap_or(Value::Null);
             let payload_json = serde_json::to_string(&payload)
                 .unwrap_or_else(|_| "<unserializable payload>".to_string());
-            print_line_with_timer(active_turn, &format!("[{event_type}] {payload_json}"))?;
+            print_line_with_timer(active_turns, &format!("[{event_type}] {payload_json}"))?;
         }
         return Ok(());
     }
@@ -188,6 +189,21 @@ fn handle_ws_text(
     let event: AgentStreamEvent = serde_json::from_value(payload)
         .context("failed to deserialize AgentStreamEvent payload")?;
 
+    // BUG-1 FIX: Track sequence number for ALL events BEFORE session filtering.
+    // Without this, filtered events leave gaps in seq_seen causing false
+    // "[events skipped]" spam when the next matching event arrives.
+    let seq = event.seq();
+    if let Some(prev) = *seq_seen {
+        if seq != prev.saturating_add(1) {
+            print_line_with_timer(active_turns, &format!("[events skipped, resynced at seq {seq}]"))?;
+        }
+    }
+    *seq_seen = Some(seq);
+
+    // BUG-3 NOTE: session_by_agent uses agent name as key, so concurrent
+    // sessions from the same agent (e.g. two gemini sessions) overwrite each
+    // other. The real fix requires session_name on all event variants, which
+    // is a spec change deferred past v3.3.0.
     let event_session = match &event {
         AgentStreamEvent::TurnStarted { agent, session_name, .. } => {
             session_by_agent.insert(agent.clone(), session_name.clone());
@@ -200,40 +216,46 @@ fn handle_ws_text(
         | AgentStreamEvent::Error { agent, .. } => session_by_agent.get(agent).cloned(),
     };
 
+    // BUG-2 FIX: Only filter when we positively know the session doesn't match.
+    // If session_by_agent hasn't been populated yet (watch connected after
+    // TurnStarted), event_session is None — show the event rather than
+    // silently dropping it.
     if let Some(expected) = args.session.as_deref() {
-        if event_session.as_deref() != Some(expected) {
-            return Ok(());
+        match event_session.as_deref() {
+            Some(actual) if actual != expected => return Ok(()),
+            _ => {} // None (unknown) or matching — show it
         }
     }
-
-    let seq = event.seq();
-    if let Some(prev) = *seq_seen {
-        if seq != prev.saturating_add(1) {
-            print_line_with_timer(active_turn, &format!("[events skipped, resynced at seq {seq}]"))?;
-        }
-    }
-    *seq_seen = Some(seq);
 
     match &event {
         AgentStreamEvent::TurnStarted { agent, .. } => {
-            *active_turn = Some(ActiveTurn {
-                agent: agent.clone(),
-                started: Instant::now(),
-            });
-            print_line_with_timer(active_turn, &event.display_text())?;
-            if let Some(turn) = active_turn.as_ref() {
+            // BUG-4 FIX: Track per-agent active turns instead of a single global.
+            active_turns.insert(
+                agent.clone(),
+                ActiveTurn {
+                    agent: agent.clone(),
+                    started: Instant::now(),
+                },
+            );
+            print_line_with_timer(active_turns, &event.display_text())?;
+            if let Some(turn) = active_turns.get(agent) {
                 redraw_timer(turn)?;
             }
         }
         AgentStreamEvent::TurnCompleted { agent, .. } => {
-            print_line_with_timer(active_turn, &event.display_text())?;
-            if active_turn.as_ref().map(|t| t.agent.as_str()) == Some(agent.as_str()) {
-                *active_turn = None;
+            print_line_with_timer(active_turns, &event.display_text())?;
+            // BUG-4 FIX: Remove only this agent's turn.
+            active_turns.remove(agent.as_str());
+            // BUG-5 FIX: Clean up session_by_agent on turn completion to
+            // prevent unbounded memory growth. The map reflects only the
+            // current active session per agent.
+            session_by_agent.remove(agent.as_str());
+            if active_turns.is_empty() {
                 clear_timer_line()?;
             }
         }
         _ => {
-            print_line_with_timer(active_turn, &event.display_text())?;
+            print_line_with_timer(active_turns, &event.display_text())?;
         }
     }
 
@@ -260,12 +282,18 @@ fn clear_timer_line() -> Result<()> {
     Ok(())
 }
 
-fn print_line_with_timer(active_turn: &Option<ActiveTurn>, line: &str) -> Result<()> {
-    if active_turn.is_some() {
+/// Return the most recently started turn across all agents (for timer display).
+fn most_recent_turn(active_turns: &HashMap<String, ActiveTurn>) -> Option<&ActiveTurn> {
+    // "Most recently started" = smallest elapsed = largest `started` Instant.
+    active_turns.values().max_by_key(|t| t.started)
+}
+
+fn print_line_with_timer(active_turns: &HashMap<String, ActiveTurn>, line: &str) -> Result<()> {
+    if !active_turns.is_empty() {
         clear_timer_line()?;
     }
     println!("{line}");
-    if let Some(turn) = active_turn {
+    if let Some(turn) = most_recent_turn(active_turns) {
         redraw_timer(turn)?;
     }
     Ok(())

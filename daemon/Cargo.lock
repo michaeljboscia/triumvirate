@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-adapter"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "agent-worker"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "daemon-core",
  "serde",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-core"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-http"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "agent-adapter",
  "anyhow",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "fallback-outbox"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "daemon-core",
@@ -588,7 +588,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fleet"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "agent-worker",
  "anyhow",
@@ -1179,7 +1179,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "ledger"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "agent-adapter",
  "anyhow",
@@ -1275,7 +1275,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-bridge"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "agent-adapter",
  "shared-types",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-tools"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "agent-worker",
  "anyhow",
@@ -1517,7 +1517,7 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
 name = "peer-review"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "ledger",
@@ -1906,12 +1906,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -2258,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "shared-types"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2478,7 +2480,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token-economics"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "anyhow",
  "daemon-core",
@@ -2727,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "triumvirate"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "agent-adapter",
  "agent-worker",
@@ -3003,6 +3005,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
