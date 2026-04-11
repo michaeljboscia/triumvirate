@@ -268,6 +268,76 @@ mod tests {
     }
 
     #[test]
+    fn worker_lifecycle_round_trip_and_display() {
+        let spawned = AgentStreamEvent::WorkerLifecycle {
+            lifecycle: WorkerLifecycleType::Spawned,
+            agent: "codex".into(),
+            session_name: "worker-1".into(),
+            task_id: Some("T-001".into()),
+            parent_session_id: Some("sess-parent".into()),
+            root_session_id: Some("sess-root".into()),
+            commit_sha: None,
+            error_message: None,
+            elapsed_ms: None,
+            seq: 100,
+        };
+        assert_eq!(spawned.seq(), 100);
+        let text = spawned.display_text();
+        assert!(text.contains("codex"));
+        assert!(text.contains("worker spawned"));
+        assert!(text.contains("T-001"));
+
+        // Verify JSON round-trip preserves lifecycle sub-type
+        let json = serde_json::to_string(&spawned).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["event_type"], "WorkerLifecycle");
+        assert_eq!(value["lifecycle"], "spawned");
+        assert_eq!(value["parent_session_id"], "sess-parent");
+        assert_eq!(value["root_session_id"], "sess-root");
+        // commit_sha is None, should be absent (skip_serializing_if)
+        assert!(value.get("commit_sha").is_none());
+
+        let completed = AgentStreamEvent::WorkerLifecycle {
+            lifecycle: WorkerLifecycleType::Completed,
+            agent: "codex".into(),
+            session_name: "worker-1".into(),
+            task_id: Some("T-001".into()),
+            parent_session_id: Some("sess-parent".into()),
+            root_session_id: Some("sess-root".into()),
+            commit_sha: Some("abc123".into()),
+            error_message: None,
+            elapsed_ms: Some(42000),
+            seq: 101,
+        };
+        let text = completed.display_text();
+        assert!(text.contains("worker completed"));
+        assert!(text.contains("42.0s"));
+        let json = serde_json::to_string(&completed).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["lifecycle"], "completed");
+        assert_eq!(value["commit_sha"], "abc123");
+
+        let failed = AgentStreamEvent::WorkerLifecycle {
+            lifecycle: WorkerLifecycleType::Failed,
+            agent: "codex".into(),
+            session_name: "worker-2".into(),
+            task_id: Some("T-002".into()),
+            parent_session_id: None,
+            root_session_id: None,
+            commit_sha: None,
+            error_message: Some("test suite failed".into()),
+            elapsed_ms: Some(15000),
+            seq: 102,
+        };
+        let text = failed.display_text();
+        assert!(text.contains("worker failed"));
+        assert!(text.contains("test suite failed"));
+        let json = serde_json::to_string(&failed).unwrap();
+        let parsed: AgentStreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(failed, parsed);
+    }
+
+    #[test]
     fn display_text_formats_correctly() {
         let event = AgentStreamEvent::TurnCompleted {
             agent: "Gemini".into(),
