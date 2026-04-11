@@ -208,6 +208,15 @@ impl CodexExecParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                if started {
+                    let seq = self.next_seq();
+                    self.emit_stream_event(AgentStreamEvent::ToolCall {
+                        agent: "codex".into(),
+                        tool_name: "bash".into(),
+                        args_summary: command.to_string(),
+                        seq,
+                    });
+                }
                 Some(event)
             }
             _ => {
