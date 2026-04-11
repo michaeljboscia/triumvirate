@@ -8,5 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shared-types = { path = "../shared-types" }
 tokio.workspace = true
 tracing.workspace = true
