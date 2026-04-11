@@ -55,6 +55,39 @@ pub enum AgentStreamEvent {
         message: String,
         seq: u64,
     },
+    /// Worker lifecycle event — spawned, completed, or failed.
+    /// Carries lineage fields for hierarchical sidebar display.
+    /// FEAT-014 (REQ-010)
+    WorkerLifecycle {
+        lifecycle: WorkerLifecycleType,
+        agent: String,
+        session_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root_session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit_sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        seq: u64,
+    },
+}
+
+/// Sub-type for WorkerLifecycle events.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLifecycleType {
+    /// Worker has been dispatched and is starting.
+    Spawned,
+    /// Worker completed successfully.
+    Completed,
+    /// Worker encountered a fatal error.
+    Failed,
 }
 
 impl AgentStreamEvent {
