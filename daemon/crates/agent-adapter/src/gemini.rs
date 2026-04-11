@@ -180,13 +180,19 @@ impl GeminiStreamParser {
                     } else {
                         WorkingState::Error
                     },
-                    detail: msg,
+                    detail: msg.clone(),
                     tool_name: None,
                     tool_args_json: None,
                     token_usage: None,
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::Error {
+                    agent: "gemini".into(),
+                    message: msg,
+                    seq,
+                });
                 Some(event)
             }
             "result" => {
