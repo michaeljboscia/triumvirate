@@ -19,7 +19,9 @@ use uuid::Uuid;
 pub mod version;
 pub mod metrics;
 pub mod observability;
+pub mod sequencer;
 pub use version::{NAME, VERSION};
+pub use sequencer::EventSequencer;
 
 #[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
