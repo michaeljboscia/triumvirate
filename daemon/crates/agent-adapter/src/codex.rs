@@ -1,6 +1,8 @@
 use crate::types::{
     ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState, WorkingStateEvent,
 };
+use shared_types::AgentStreamEvent;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Default)]
 pub struct CodexExecParser {
@@ -9,6 +11,8 @@ pub struct CodexExecParser {
     events: Vec<WorkingStateEvent>,
     tool_calls: Vec<ToolCallRecord>,
     token_usage: Option<TokenUsage>,
+    stream_tx: Option<mpsc::Sender<AgentStreamEvent>>,
+    stream_seq: u64,
 }
 
 impl CodexExecParser {
