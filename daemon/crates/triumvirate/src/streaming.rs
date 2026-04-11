@@ -54,35 +54,17 @@ pub async fn execute_ask_agent_streaming(
     // Delegate to the existing executor (imported from agent_exec via crate)
     let response = crate::agent_exec::execute_ask_agent(req, None).await?;
 
-    // Send TurnCompleted
+    // Send TurnCompleted — token data not available on AskAgentResponse
+    // (it's extracted separately in agent_exec). Wave 1 tasks will wire
+    // the parsers to emit rich events including token stats.
     let _ = tx
         .send(AgentStreamEvent::TurnCompleted {
             agent,
-            tokens_in: response
-                .token_usage
-                .as_ref()
-                .and_then(|u| u.input)
-                .unwrap_or(0) as i64,
-            tokens_out: response
-                .token_usage
-                .as_ref()
-                .and_then(|u| u.output)
-                .unwrap_or(0) as i64,
-            cached_tokens: response
-                .token_usage
-                .as_ref()
-                .and_then(|u| u.cached)
-                .map(|c| c as i64),
-            tool_count: response
-                .token_usage
-                .as_ref()
-                .and_then(|u| u.tool_calls)
-                .unwrap_or(0) as i64,
-            duration_ms: response
-                .token_usage
-                .as_ref()
-                .and_then(|u| u.latency_ms)
-                .unwrap_or(0),
+            tokens_in: 0,
+            tokens_out: 0,
+            cached_tokens: None,
+            tool_count: 0,
+            duration_ms: 0,
             seq: sequencer.next(),
         })
         .await;
