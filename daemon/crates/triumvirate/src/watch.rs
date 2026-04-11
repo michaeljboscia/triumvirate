@@ -1,3 +1,12 @@
+//! `triumvirate watch` — live streaming of agent events via WebSocket.
+//!
+//! Connects to the daemon's `/ws` endpoint, deserializes `AgentStreamEvent`
+//! payloads, and pretty-prints them to stdout. Uses `tokio::select!` with a
+//! 1-second interval timer for smooth heartbeat updates during long generation.
+//!
+//! FEAT-004 (REQ-W01 through REQ-W06)
+//! Origin: Codex worker T-309, instrument spans from Claude bake-off.
+
 use anyhow::{Context, Result};
 use clap::Args;
 use crossterm::{
@@ -15,6 +24,7 @@ use std::{
 };
 use tokio::time::{self, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::instrument;
 
 #[derive(Debug, Clone, Args)]
 pub struct WatchArgs {
