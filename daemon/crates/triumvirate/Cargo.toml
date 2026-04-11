@@ -29,6 +29,8 @@ libc.workspace = true
 tokio-util.workspace = true
 async-trait = "0.1"
 futures = "0.3"
+tokio-tungstenite = "0.28"
+crossterm = "0.28"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex-lite = "0.1"
 shared-types = { path = "../shared-types" }
