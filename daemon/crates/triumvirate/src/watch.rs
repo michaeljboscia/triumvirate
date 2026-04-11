@@ -42,6 +42,7 @@ struct ActiveTurn {
     started: Instant,
 }
 
+#[instrument(skip_all, fields(all = args.all, session = ?args.session))]
 pub async fn run_watch(args: WatchArgs) -> Result<()> {
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(10);
