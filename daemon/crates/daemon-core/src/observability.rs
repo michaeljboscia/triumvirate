@@ -1,5 +1,6 @@
 use std::any::Any;
 use crate::metrics::DaemonMetrics;
+use shared_types::AgentStreamEvent;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -31,6 +32,20 @@ impl ObservabilityBus {
         })
         .to_string();
         let _ = self.ws_events.send(msg);
+    }
+
+    /// Publish an AgentStreamEvent to the WebSocket broadcast.
+    /// Emitted as type "agent_stream" alongside existing event types.
+    /// REQ-E04
+    pub fn publish_agent_stream_event(&self, event: &AgentStreamEvent) {
+        let payload = match serde_json::to_value(event) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("failed to serialize AgentStreamEvent: {e}");
+                return;
+            }
+        };
+        self.publish_event("agent_stream", payload);
     }
 }
 
