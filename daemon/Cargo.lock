@@ -2676,6 +2676,7 @@ dependencies = [
  "fallback-outbox",
  "fleet",
  "futures",
+ "futures-util",
  "ledger",
  "libc",
  "mcp-bridge",

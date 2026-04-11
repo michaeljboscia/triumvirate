@@ -46,3 +46,4 @@ token-economics = { path = "../token-economics" }
 
 [dev-dependencies]
 tempfile = "3"
+futures-util = "0.3"
