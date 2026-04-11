@@ -225,10 +225,20 @@ impl GeminiStreamParser {
                     detail: "turn completed".to_string(),
                     tool_name: None,
                     tool_args_json: None,
-                    token_usage: Some(usage),
+                    token_usage: Some(usage.clone()),
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnCompleted {
+                    agent: "gemini".into(),
+                    tokens_in: usage.input.unwrap_or(0) as i64,
+                    tokens_out: usage.output.unwrap_or(0) as i64,
+                    cached_tokens: usage.cached.map(|c| c as i64),
+                    tool_count: usage.tool_calls.unwrap_or(0) as i64,
+                    duration_ms: usage.latency_ms.unwrap_or(0),
+                    seq,
+                });
                 Some(event)
             }
             _ => {
