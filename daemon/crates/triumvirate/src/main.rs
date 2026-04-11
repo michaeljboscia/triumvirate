@@ -1615,7 +1615,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
         .route("/abe/task-complete", post(abe_task_complete_route))
-        .nest("/mcp", {
+        .nest_service("/mcp", {
             let mcp_bridge = McpBridge::new();
             let cancel = tokio_util::sync::CancellationToken::new();
             http_mcp::build_mcp_router(mcp_bridge, state.token.clone(), cancel)
