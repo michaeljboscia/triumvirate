@@ -118,11 +118,31 @@ impl GeminiStreamParser {
                     state: WorkingState::ToolCallStarted,
                     detail: format!("calling {tool_name}"),
                     tool_name: Some(tool_name.to_string()),
-                    tool_args_json: args_json,
+                    tool_args_json: args_json.clone(),
                     token_usage: None,
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                if tool_name == "read_file" {
+                    let path = args_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    self.emit_stream_event(AgentStreamEvent::FileRead {
+                        agent: "gemini".into(),
+                        file_path: path,
+                        seq,
+                    });
+                } else {
+                    self.emit_stream_event(AgentStreamEvent::ToolCall {
+                        agent: "gemini".into(),
+                        tool_name: tool_name.to_string(),
+                        args_summary: args_json.clone().unwrap_or_default(),
+                        seq,
+                    });
+                }
                 Some(event)
             }
             "tool_result" => {
