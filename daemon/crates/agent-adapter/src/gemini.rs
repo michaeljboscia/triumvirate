@@ -1,6 +1,8 @@
 use crate::types::{
     ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState, WorkingStateEvent,
 };
+use shared_types::AgentStreamEvent;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Default)]
 pub struct GeminiStreamParser {
@@ -10,11 +12,38 @@ pub struct GeminiStreamParser {
     tool_calls: Vec<ToolCallRecord>,
     token_usage: Option<TokenUsage>,
     cli_version: Option<String>,
+    /// Optional channel for emitting AgentStreamEvent during parsing.
+    /// When set, each meaningful parse event is forwarded to this sender.
+    /// REQ-E03
+    stream_tx: Option<mpsc::Sender<AgentStreamEvent>>,
+    stream_seq: u64,
 }
 
 impl GeminiStreamParser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a parser that also emits AgentStreamEvent to the given channel.
+    pub fn with_stream_channel(tx: mpsc::Sender<AgentStreamEvent>) -> Self {
+        Self {
+            stream_tx: Some(tx),
+            ..Self::default()
+        }
+    }
+
+    /// Try to send an AgentStreamEvent to the stream channel (if configured).
+    /// Non-blocking best-effort — if the receiver is dropped, events are silently lost.
+    fn emit_stream_event(&mut self, event: AgentStreamEvent) {
+        if let Some(tx) = &self.stream_tx {
+            // try_send to avoid blocking the parser — drop events on backpressure
+            let _ = tx.try_send(event);
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.stream_seq += 1;
+        self.stream_seq
     }
 
     pub fn parse_line(&mut self, line: &str) -> Option<WorkingStateEvent> {
