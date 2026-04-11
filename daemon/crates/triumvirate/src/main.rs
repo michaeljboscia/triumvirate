@@ -148,6 +148,15 @@ enum CliCommand {
     Doctor,
     /// Bridge stdio MCP to daemon HTTP endpoint.
     Proxy,
+    /// Watch live agent streaming events.
+    Watch {
+        /// Show all WebSocket message types, not just agent_stream.
+        #[arg(long)]
+        all: bool,
+        /// Filter events to a specific session name.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
