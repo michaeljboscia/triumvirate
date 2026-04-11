@@ -68,8 +68,8 @@
   <scope_out>Do not modify existing HTTP routes. Do not modify the stdio MCP path. Do not modify McpBridge tool implementations. Only add the new transport endpoint and wire it to the shared McpBridge.</scope_out>
   <tools>cargo check -p triumvirate, cargo test -p triumvirate --lib, file read/write within files list</tools>
   <verify>cargo check -p triumvirate</verify>
-  <reality_test>Start the daemon. POST a JSON-RPC initialize request to http://127.0.0.1:8080/mcp. Assert response contains Mcp-Session-Id header and server capabilities listing all 35+ tools. POST a tools/call for ping tool. Assert valid JSON-RPC response.</reality_test>
-  <done_when>Daemon serves MCP over Streamable HTTP at /mcp. Tools callable via HTTP POST. Session ID management working. All existing tools available on both transports.</done_when>
+  <reality_test>Start the daemon. POST a JSON-RPC initialize request to http://127.0.0.1:8080/mcp. Assert response contains Mcp-Session-Id header and server capabilities listing all 35+ tools. POST a tools/call for ping tool. Assert valid JSON-RPC response. GET /mcp with Accept: text/event-stream — assert connection opens with Content-Type text/event-stream and stays alive for at least 2s.</reality_test>
+  <done_when>Daemon serves MCP over Streamable HTTP at /mcp. Tools callable via HTTP POST. GET /mcp opens SSE stream for server notifications. Session ID management working. All existing tools available on both transports.</done_when>
 </task>
 
 <task id="T-306" req="REQ-H05,REQ-H06,REQ-H09" wave="2" depends="T-305">
