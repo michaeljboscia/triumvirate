@@ -20,8 +20,10 @@ pub mod version;
 pub mod metrics;
 pub mod observability;
 pub mod sequencer;
+pub mod pid;
 pub use version::{NAME, VERSION};
 pub use sequencer::EventSequencer;
+pub use pid::PidFile;
 
 #[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
