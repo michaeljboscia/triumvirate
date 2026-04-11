@@ -101,10 +101,20 @@ impl CodexExecParser {
                     detail: "turn completed".to_string(),
                     tool_name: None,
                     tool_args_json: None,
-                    token_usage: Some(token_usage),
+                    token_usage: Some(token_usage.clone()),
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnCompleted {
+                    agent: "codex".into(),
+                    tokens_in: token_usage.input.unwrap_or(0) as i64,
+                    tokens_out: token_usage.output.unwrap_or(0) as i64,
+                    cached_tokens: token_usage.cached.map(|c| c as i64),
+                    tool_count: self.tool_calls.len() as i64,
+                    duration_ms: token_usage.latency_ms.unwrap_or(0),
+                    seq,
+                });
                 Some(event)
             }
             "error" => {
