@@ -7,6 +7,7 @@ mod streaming;
 
 pub use abe::*;
 pub use git_ops::{GitOps, MergeResult};
+pub use streaming::AgentStreamEvent;
 pub use ledger::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
     Summary,
