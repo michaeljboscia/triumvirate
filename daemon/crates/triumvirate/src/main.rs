@@ -145,6 +145,8 @@ enum CliCommand {
     Status,
     /// Run local diagnostics for daemon readiness.
     Doctor,
+    /// Bridge stdio MCP to daemon HTTP endpoint.
+    Proxy,
 }
 
 #[derive(Debug, Clone)]
