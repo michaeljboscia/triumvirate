@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/agent-adapter","crates/agent-worker","crates/daemon-core","crates/daemon-http","crates/fallback-outbox","crates/fleet","crates/ledger","crates/mcp-bridge","crates/mcp-tools","crates/peer-review","crates/shared-types","crates/token-economics","crates/triumvirate"]
 
 [workspace.package]
-version = "3.2.0"
+version = "3.3.0"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 description = "Multi-agent AI coordination daemon for Claude, Gemini, and Codex"
@@ -17,12 +17,13 @@ anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rmcp = { version = "1.3.0", features = ["server", "macros", "transport-io", "transport-async-rw", "client"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "1.3.0", features = ["server", "macros", "transport-io", "transport-async-rw", "client", "transport-streamable-http-server"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "time", "sync"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.29"

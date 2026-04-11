@@ -1,6 +1,8 @@
 use crate::types::{
     ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState, WorkingStateEvent,
 };
+use shared_types::AgentStreamEvent;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Default)]
 pub struct GeminiStreamParser {
@@ -10,11 +12,38 @@ pub struct GeminiStreamParser {
     tool_calls: Vec<ToolCallRecord>,
     token_usage: Option<TokenUsage>,
     cli_version: Option<String>,
+    /// Optional channel for emitting AgentStreamEvent during parsing.
+    /// When set, each meaningful parse event is forwarded to this sender.
+    /// REQ-E03
+    stream_tx: Option<mpsc::Sender<AgentStreamEvent>>,
+    stream_seq: u64,
 }
 
 impl GeminiStreamParser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a parser that also emits AgentStreamEvent to the given channel.
+    pub fn with_stream_channel(tx: mpsc::Sender<AgentStreamEvent>) -> Self {
+        Self {
+            stream_tx: Some(tx),
+            ..Self::default()
+        }
+    }
+
+    /// Try to send an AgentStreamEvent to the stream channel (if configured).
+    /// Non-blocking best-effort — if the receiver is dropped, events are silently lost.
+    fn emit_stream_event(&mut self, event: AgentStreamEvent) {
+        if let Some(tx) = &self.stream_tx {
+            // try_send to avoid blocking the parser — drop events on backpressure
+            let _ = tx.try_send(event);
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.stream_seq += 1;
+        self.stream_seq
     }
 
     pub fn parse_line(&mut self, line: &str) -> Option<WorkingStateEvent> {
@@ -37,6 +66,12 @@ impl GeminiStreamParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnStarted {
+                    agent: "gemini".into(),
+                    session_name: self.session_id.clone().unwrap_or_default(),
+                    seq,
+                });
                 Some(event)
             }
             "message" => {
@@ -83,11 +118,31 @@ impl GeminiStreamParser {
                     state: WorkingState::ToolCallStarted,
                     detail: format!("calling {tool_name}"),
                     tool_name: Some(tool_name.to_string()),
-                    tool_args_json: args_json,
+                    tool_args_json: args_json.clone(),
                     token_usage: None,
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                if tool_name == "read_file" {
+                    let path = args_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    self.emit_stream_event(AgentStreamEvent::FileRead {
+                        agent: "gemini".into(),
+                        file_path: path,
+                        seq,
+                    });
+                } else {
+                    self.emit_stream_event(AgentStreamEvent::ToolCall {
+                        agent: "gemini".into(),
+                        tool_name: tool_name.to_string(),
+                        args_summary: args_json.clone().unwrap_or_default(),
+                        seq,
+                    });
+                }
                 Some(event)
             }
             "tool_result" => {
@@ -125,13 +180,19 @@ impl GeminiStreamParser {
                     } else {
                         WorkingState::Error
                     },
-                    detail: msg,
+                    detail: msg.clone(),
                     tool_name: None,
                     tool_args_json: None,
                     token_usage: None,
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::Error {
+                    agent: "gemini".into(),
+                    message: msg,
+                    seq,
+                });
                 Some(event)
             }
             "result" => {
@@ -164,10 +225,20 @@ impl GeminiStreamParser {
                     detail: "turn completed".to_string(),
                     tool_name: None,
                     tool_args_json: None,
-                    token_usage: Some(usage),
+                    token_usage: Some(usage.clone()),
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnCompleted {
+                    agent: "gemini".into(),
+                    tokens_in: usage.input.unwrap_or(0) as i64,
+                    tokens_out: usage.output.unwrap_or(0) as i64,
+                    cached_tokens: usage.cached.map(|c| c as i64),
+                    tool_count: usage.tool_calls.unwrap_or(0) as i64,
+                    duration_ms: usage.latency_ms.unwrap_or(0),
+                    seq,
+                });
                 Some(event)
             }
             _ => {

@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.3.0 — Live Agent Streaming (2026-04-11)
+
+Real-time visibility into agent execution. See tool calls, file reads, and responses as they happen.
+
+### What Changed
+
+- **AgentStreamEvent pipeline.** New `AgentStreamEvent` enum in shared-types with 6 variants (TurnStarted, ToolCall, FileRead, ResponseChunk, TurnCompleted, Error). Monotonic sequence numbers for gap detection. GeminiStreamParser and CodexExecParser emit events via tokio mpsc channels during parsing.
+
+- **Streamable HTTP MCP endpoint.** Daemon serves MCP over Streamable HTTP at `POST/GET /mcp` using rmcp's `transport-streamable-http-server` feature. SSE streaming with session management via `Mcp-Session-Id` header. Bearer token auth. Coexists with existing stdio transport.
+
+- **`triumvirate proxy` command.** Bridges Claude Code's stdio JSON-RPC to the daemon's HTTP /mcp endpoint. Auto-reconnect with bounded exponential backoff (100ms→5s). Clear error if daemon unreachable at startup. Golden path for Claude Code users.
+
+- **`triumvirate watch` command.** Connects to daemon WebSocket, pretty-prints agent streaming events in real-time. `--session` filter, `--all` flag, sequence gap detection, in-place heartbeat timer using crossterm. The README experience — in a side pane.
+
+- **WebSocket `agent_stream` events.** ObservabilityBus emits AgentStreamEvent alongside existing event types (token_update, abe_task_state, fleet_progress). No breaking changes to existing consumers.
+
+- **SSE spike test server.** Standalone minimal MCP server at `daemon/spike/sse-test-server/` for empirically testing Claude Code SSE frame rendering. Result: UNTESTED (requires manual verification).
+
+### Process Innovations
+
+- **Multi-model bake-off.** Claude subagent + Codex worker build the same task in parallel. Gemini judges which is better (~$0.001/review). Best-of-breed merge. Baked into `/goatrodeo` Phase 5.4 and `/postrodeo` Phases 4.2/5.3.
+
+- **Incremental BUILD_MANIFEST.** Created at build start, appended after each wave. Never missed again.
+
+### Known Issues
+
+- Claude Code does not render MCP server progress notifications (GitHub #4157). Streaming visibility requires the `watch` side pane until Anthropic ships SSE support.
+- Spike test untested — requires manual `claude mcp add --transport http` verification.
+
+---
+
 ## 3.2.0 — Observability & Token Economics (2026-04-10)
 
 Full observability instrumentation + a token economics engine for tracking costs across all three AI agents.

@@ -1,6 +1,8 @@
 use crate::types::{
     ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState, WorkingStateEvent,
 };
+use shared_types::AgentStreamEvent;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Default)]
 pub struct CodexExecParser {
@@ -9,11 +11,31 @@ pub struct CodexExecParser {
     events: Vec<WorkingStateEvent>,
     tool_calls: Vec<ToolCallRecord>,
     token_usage: Option<TokenUsage>,
+    stream_tx: Option<mpsc::Sender<AgentStreamEvent>>,
+    stream_seq: u64,
 }
 
 impl CodexExecParser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_stream_channel(tx: mpsc::Sender<AgentStreamEvent>) -> Self {
+        Self {
+            stream_tx: Some(tx),
+            ..Self::default()
+        }
+    }
+
+    fn emit_stream_event(&mut self, event: AgentStreamEvent) {
+        if let Some(tx) = &self.stream_tx {
+            let _ = tx.try_send(event);
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.stream_seq += 1;
+        self.stream_seq
     }
 
     pub fn parse_line(&mut self, line: &str) -> Option<WorkingStateEvent> {
@@ -32,6 +54,12 @@ impl CodexExecParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnStarted {
+                    agent: "codex".into(),
+                    session_name: self.thread_id.clone().unwrap_or_default(),
+                    seq,
+                });
                 Some(event)
             }
             "turn.started" => {
@@ -45,6 +73,12 @@ impl CodexExecParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnStarted {
+                    agent: "codex".into(),
+                    session_name: self.thread_id.clone().unwrap_or_default(),
+                    seq,
+                });
                 Some(event)
             }
             "item.started" => self.parse_item_event(&json, true),
@@ -67,10 +101,20 @@ impl CodexExecParser {
                     detail: "turn completed".to_string(),
                     tool_name: None,
                     tool_args_json: None,
-                    token_usage: Some(token_usage),
+                    token_usage: Some(token_usage.clone()),
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnCompleted {
+                    agent: "codex".into(),
+                    tokens_in: token_usage.input.unwrap_or(0) as i64,
+                    tokens_out: token_usage.output.unwrap_or(0) as i64,
+                    cached_tokens: token_usage.cached.map(|c| c as i64),
+                    tool_count: self.tool_calls.len() as i64,
+                    duration_ms: token_usage.latency_ms.unwrap_or(0),
+                    seq,
+                });
                 Some(event)
             }
             "error" => {
@@ -83,13 +127,19 @@ impl CodexExecParser {
                 let event = WorkingStateEvent {
                     agent: "codex".to_string(),
                     state: WorkingState::Error,
-                    detail,
+                    detail: detail.clone(),
                     tool_name: None,
                     tool_args_json: None,
                     token_usage: None,
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::Error {
+                    agent: "codex".into(),
+                    message: detail,
+                    seq,
+                });
                 Some(event)
             }
             _ => {
@@ -158,6 +208,15 @@ impl CodexExecParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                if started {
+                    let seq = self.next_seq();
+                    self.emit_stream_event(AgentStreamEvent::ToolCall {
+                        agent: "codex".into(),
+                        tool_name: "bash".into(),
+                        args_summary: command.to_string(),
+                        seq,
+                    });
+                }
                 Some(event)
             }
             _ => {
