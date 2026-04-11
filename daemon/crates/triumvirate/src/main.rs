@@ -1481,7 +1481,17 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
     }
 
-    let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
+    // FEAT-015 (REQ-019): Acquire PID file FIRST, before any other setup.
+    // This is the single-instance guarantee — if another daemon is running,
+    // we fail loudly here instead of binding to the port (which would fail
+    // later anyway with a less-helpful error).
+    // The PidFile is held for the lifetime of run_daemon() — dropping it
+    // releases the flock and removes the file.
+    let triumvirate_home = core_triumvirate_home_dir()?;
+    let _pid_file = daemon_core::PidFile::acquire(&triumvirate_home)
+        .context("failed to acquire daemon pid file (another daemon may be running)")?;
+
+    let token = core_ensure_daemon_token(&triumvirate_home)?;
     let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     info!(%bind_addr, "starting triumvirate daemon");
     let sessions_file = core_triumvirate_home_dir()
