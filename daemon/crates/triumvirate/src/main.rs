@@ -1064,6 +1064,9 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Proxy => {
             proxy::run_proxy().await?;
         }
+        CliCommand::Watch { all, session } => {
+            watch::run_watch(all, session).await?;
+        }
     }
 
     Ok(())
