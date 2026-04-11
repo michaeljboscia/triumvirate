@@ -126,7 +126,17 @@
   <done_when>SPIKE_RESULTS.md exists with a definitive YES or NO answer about Claude Code SSE frame rendering, with evidence.</done_when>
 </task>
 
-<task id="T-311" req="REQ-E01,REQ-H08" wave="4" depends="T-305,T-308,T-309">
+<task id="T-312" req="" wave="4" depends="T-302,T-303,T-304,T-305,T-306,T-307,T-308,T-309">
+  <description>Produce BUILD_MANIFEST.md documenting every task, commit SHA, files changed, test results, and deviations. This is a MANDATORY goatrodeo gate (P6.2) that has been missed 5 sprints in a row.</description>
+  <files>docs/3.3.0/BUILD_MANIFEST.md</files>
+  <scope_out>Do not modify any code. Only produce the manifest document.</scope_out>
+  <tools>git log, git diff --stat, file read/write within files list</tools>
+  <verify>test -f docs/3.3.0/BUILD_MANIFEST.md</verify>
+  <reality_test>BUILD_MANIFEST.md exists and contains: task ID, commit SHA, files changed, test pass/fail for EVERY task T-300 through T-311. No placeholder rows. No "TBD" entries.</reality_test>
+  <done_when>BUILD_MANIFEST.md has a complete row for every task with real commit SHAs and test results.</done_when>
+</task>
+
+<task id="T-311" req="REQ-E01,REQ-H08" wave="4" depends="T-305,T-308,T-309,T-312">
   <description>End-to-end verification. Full flow: daemon + proxy + watch + Claude Code. Update docs. Version bump.</description>
   <files>daemon/Cargo.toml, CHANGELOG.md, README.md, docs/3.3.0/RELEASE_NOTES.md</files>
   <scope_out>Do not modify daemon code except version bump. Do not add features. Only verify, document, and version.</scope_out>
