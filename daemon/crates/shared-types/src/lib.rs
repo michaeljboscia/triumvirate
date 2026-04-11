@@ -385,6 +385,24 @@ pub struct SessionState {
     #[serde(default)]
     pub cwd: Option<String>,
     pub history: Vec<String>,
+    /// The immediate session that triggered this session's dispatch.
+    /// For Pantheon-spawned Claude Code sessions, this is the panel_id.
+    /// For Codex/Gemini workers dispatched via MCP, this is the caller's session_id.
+    /// FEAT-011 (REQ-010)
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    /// The top-level user session in a dispatch chain. For Pantheon terminal
+    /// panels, root == parent == own session_id. For workers spawned by
+    /// sub-agents, this chains back to the original Pantheon panel.
+    /// FEAT-011 (REQ-010)
+    #[serde(default)]
+    pub root_session_id: Option<String>,
+    /// The PANTHEON_SESSION_ID env var value captured from the MCP handshake
+    /// (via _meta.pantheon.session_id for stdio or X-Pantheon-Session-Id
+    /// header for HTTP/SSE). NULL for non-Pantheon sessions.
+    /// FEAT-011 (REQ-033)
+    #[serde(default)]
+    pub pantheon_session_id: Option<String>,
 }
 
 #[cfg(test)]
