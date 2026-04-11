@@ -54,6 +54,12 @@ impl CodexExecParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnStarted {
+                    agent: "codex".into(),
+                    session_name: self.thread_id.clone().unwrap_or_default(),
+                    seq,
+                });
                 Some(event)
             }
             "turn.started" => {
@@ -67,6 +73,12 @@ impl CodexExecParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnStarted {
+                    agent: "codex".into(),
+                    session_name: self.thread_id.clone().unwrap_or_default(),
+                    seq,
+                });
                 Some(event)
             }
             "item.started" => self.parse_item_event(&json, true),
