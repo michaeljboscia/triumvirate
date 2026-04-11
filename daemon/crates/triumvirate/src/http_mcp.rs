@@ -27,13 +27,12 @@ pub fn build_streamable_http_mcp_service(
     bridge_template: McpBridge,
     cancellation_token: CancellationToken,
 ) -> StreamableHttpService<McpBridge, LocalSessionManager> {
-    let config = StreamableHttpServerConfig {
-        sse_keep_alive: Some(std::time::Duration::from_secs(15)),
-        sse_retry: Some(std::time::Duration::from_secs(3)),
-        stateful_mode: true,
-        json_response: false,
-        cancellation_token,
-    };
+    let config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(Some(std::time::Duration::from_secs(15)))
+        .with_sse_retry(Some(std::time::Duration::from_secs(3)))
+        .with_stateful_mode(true)
+        .with_json_response(false)
+        .with_cancellation_token(cancellation_token);
 
     let session_manager = Arc::new(LocalSessionManager::default());
 
