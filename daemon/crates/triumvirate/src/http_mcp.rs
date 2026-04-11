@@ -37,7 +37,7 @@ pub fn build_mcp_router(
     let mcp_service = build_streamable_http_service(bridge_template, cancellation_token);
 
     Router::new()
-        .nest_service("/", mcp_service)
+        .fallback_service(mcp_service)
         .layer(middleware::from_fn(move |req, next| {
             let token = bearer_token.clone();
             bearer_auth_middleware(token, req, next)
