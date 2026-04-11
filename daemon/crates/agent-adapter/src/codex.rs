@@ -20,6 +20,24 @@ impl CodexExecParser {
         Self::default()
     }
 
+    pub fn with_stream_channel(tx: mpsc::Sender<AgentStreamEvent>) -> Self {
+        Self {
+            stream_tx: Some(tx),
+            ..Self::default()
+        }
+    }
+
+    fn emit_stream_event(&mut self, event: AgentStreamEvent) {
+        if let Some(tx) = &self.stream_tx {
+            let _ = tx.try_send(event);
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.stream_seq += 1;
+        self.stream_seq
+    }
+
     pub fn parse_line(&mut self, line: &str) -> Option<WorkingStateEvent> {
         let json: serde_json::Value = serde_json::from_str(line).ok()?;
         let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or_default();
