@@ -121,6 +121,7 @@ mod cli_ops;
 mod git_ops_impl;
 mod proxy;
 mod tracing_setup;
+mod watch;
 
 #[derive(Debug, Parser)]
 #[command(name = "triumvirate")]
