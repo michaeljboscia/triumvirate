@@ -28,8 +28,8 @@
 | Task | Commit | Files Changed | Tests | Status |
 |------|--------|--------------|-------|--------|
 | T-305 | 2618151 | http_mcp.rs (new), main.rs, Cargo.toml x2 | 67/67 (4 crates) | DONE |
-| T-306 | — | — | — | PENDING |
-| T-307 | — | — | — | PENDING |
+| T-306 | dd951ff | http_mcp.rs (auth middleware + router), main.rs | 67/67 (no regressions) | DONE |
+| T-307 | b9425ca | tests/integration_streaming.rs (new, 5 tests) | compile OK; 0/5 pass (v3.2.0 daemon) | DONE |
 
 ## Wave 3: Proxy + Watch CLI
 
