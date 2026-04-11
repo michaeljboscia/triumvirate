@@ -38,10 +38,15 @@
 | T-308 | 34f80a4 | proxy.rs (new, 453 lines), main.rs | compiles + 10 unit tests | DONE (Claude subagent) |
 | T-309 | ba6328b | watch.rs (new, 261 lines), main.rs, Cargo.toml | compiles clean | DONE (Codex+Claude+Gemini bake-off) |
 
+**Wave 3 deviations:**
+- T-308: dispatched as Claude subagent (not Codex worker). Codex worker also completed (commit 033afbe in worktree) but Claude's version was kept — 453 lines with 10 unit tests vs Codex's 187 lines with 0 tests.
+- T-309: first bake-off. Both Claude and Codex wrote watch.rs. Gemini code review judged Codex winner on UX (tokio::select! timer vs reactive-only updates). Merged: Codex body + Claude #[instrument] spans. This is the v3.3.0 pattern going forward.
+- Process gates (dispatch audit, validate-task.sh, query_gemini_review) were NOT run for Waves 0-3. Crystallize session initiated to prevent recurrence. The code is correct but the process was wrong.
+
 ## Wave 4: Spike + Polish
 
 | Task | Commit | Files Changed | Tests | Status |
 |------|--------|--------------|-------|--------|
-| T-310 | — | — | — | PENDING |
-| T-312 | — | — | — | IN PROGRESS (this file) |
+| T-310 | — | — | — | IN PROGRESS (bake-off) |
+| T-312 | — | this file | — | IN PROGRESS |
 | T-311 | — | — | — | PENDING |
