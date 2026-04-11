@@ -47,6 +47,24 @@
 
 | Task | Commit | Files Changed | Tests | Status |
 |------|--------|--------------|-------|--------|
-| T-310 | — | — | — | IN PROGRESS (bake-off) |
-| T-312 | — | this file | — | IN PROGRESS |
-| T-311 | — | — | — | PENDING |
+| T-310 | 535bcf7 | spike/sse-test-server/ (new), docs/3.3.0/SPIKE_RESULTS.md (new) | compiles clean | DONE (Claude only — Codex stuck) |
+| T-312 | this commit | docs/3.3.0/BUILD_MANIFEST.md | — | DONE |
+| T-311 | this commit | Cargo.toml (version bump), CHANGELOG.md | full workspace check | DONE |
+
+**Wave 4 deviations:**
+- T-310: Codex worker stuck after 180s. Claude subagent completed. No bake-off — only one contestant.
+- T-310 spike server uses rmcp 1.4.0 (resolved from ^1.3.0 in spike Cargo.toml) — ProgressNotificationParam API changed (no `extensions` field).
+- T-312: BUILD_MANIFEST written incrementally throughout build (first time ever). Goatrodeo skill updated to enforce this.
+
+## Build Summary
+
+| Metric | Value |
+|--------|-------|
+| Total tasks | 13 (T-300 through T-312) |
+| Real commits | 14 (excluding auto-snapshot noise) |
+| Unit tests passing | 67+ across 4 crates |
+| Integration tests | 5/5 streaming + 44/46 existing |
+| New files | 7 (streaming.rs, sequencer.rs, http_mcp.rs, proxy.rs, watch.rs, spike server, BUILD_MANIFEST) |
+| Modified files | ~10 (main.rs, Cargo.toml, gemini.rs, codex.rs, observability.rs, etc.) |
+| Bake-offs | 2 (T-308: Claude won, T-309: Codex won — Gemini judged) |
+| Process deviations | Waves 0-2 executed without dispatch audit or validate-task.sh |
