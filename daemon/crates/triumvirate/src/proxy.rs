@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use futures::StreamExt;
 use reqwest::Client;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info, warn};
@@ -51,8 +52,15 @@ pub async fn run_proxy() -> anyhow::Result<()> {
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
-    let mut stdout = tokio::io::stdout();
+
+    // Bug 6: Wrap stdout in BufWriter for backpressure control.
+    let raw_stdout = tokio::io::stdout();
+    let mut stdout = tokio::io::BufWriter::new(raw_stdout);
+
     let mut line_buf = String::new();
+
+    // Bug 2: Store the MCP session ID from the first response.
+    let mut session_id: Option<String> = None;
 
     // Backoff state for mid-session reconnect (REQ-P02).
     let mut backoff = INITIAL_BACKOFF;
@@ -77,30 +85,36 @@ pub async fn run_proxy() -> anyhow::Result<()> {
             continue;
         }
 
-        match forward_request(&client, &base_url, &token, trimmed).await {
-            Ok(response_lines) => {
+        // Bug 4: Check if the request is a notification (no "id" field).
+        let request_id = extract_request_id(trimmed);
+        let is_notification = request_id.is_null();
+
+        match forward_request(&client, &base_url, &token, trimmed, &mut session_id, &mut stdout).await {
+            Ok(()) => {
                 // Reset backoff on success.
                 backoff = INITIAL_BACKOFF;
-                for response_line in &response_lines {
-                    stdout.write_all(response_line.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                }
-                stdout.flush().await?;
             }
             Err(err) => {
                 // REQ-P02: Write JSON-RPC error for the failed in-flight call,
                 // then attempt reconnect with bounded backoff for next call.
                 error!(%err, "request to daemon failed");
 
-                // Try to extract the request id so the error response correlates.
-                let id = extract_request_id(trimmed);
-                let error_response = make_jsonrpc_error(id, -32000, &format!("daemon unreachable: {err}"));
-                stdout.write_all(error_response.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+                // Bug 4: Only emit error response if the request had an id.
+                if !is_notification {
+                    let error_response = make_jsonrpc_error(
+                        request_id,
+                        -32000,
+                        &format!("daemon unreachable: {err}"),
+                    );
+                    stdout.write_all(error_response.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
 
                 // Attempt reconnect with exponential backoff.
-                if let Err(reconnect_err) = reconnect_with_backoff(&client, &base_url, &token, &mut backoff).await {
+                if let Err(reconnect_err) =
+                    reconnect_with_backoff(&client, &base_url, &token, &mut backoff).await
+                {
                     error!(%reconnect_err, "reconnect failed, exiting proxy");
                     bail!("daemon lost and reconnect failed: {reconnect_err}");
                 }
@@ -138,20 +152,28 @@ fn read_token_file(path: &PathBuf) -> anyhow::Result<String> {
 // HTTP forwarding
 // ---------------------------------------------------------------------------
 
-/// Forward a single JSON-RPC line to the daemon. Returns one or more response
-/// lines depending on whether the daemon replies with `application/json` or
-/// `text/event-stream` (SSE).
+/// Forward a single JSON-RPC line to the daemon. Streams SSE responses
+/// incrementally, writing only final JSON-RPC result/error frames to stdout.
 async fn forward_request(
     client: &Client,
     url: &str,
     token: &str,
     body: &str,
-) -> anyhow::Result<Vec<String>> {
-    let resp = client
+    session_id: &mut Option<String>,
+    stdout: &mut tokio::io::BufWriter<tokio::io::Stdout>,
+) -> anyhow::Result<()> {
+    let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
-        .bearer_auth(token)
+        .bearer_auth(token);
+
+    // Bug 2: Forward the session ID on subsequent requests.
+    if let Some(sid) = session_id.as_deref() {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+
+    let resp = req
         .body(body.to_string())
         .send()
         .await
@@ -163,6 +185,17 @@ async fn forward_request(
         bail!("daemon returned HTTP {status}: {err_body}");
     }
 
+    // Bug 2: Extract session ID from response headers.
+    if let Some(sid_val) = resp.headers().get("mcp-session-id") {
+        if let Ok(sid_str) = sid_val.to_str() {
+            let new_sid = sid_str.to_string();
+            if session_id.as_deref() != Some(&new_sid) {
+                debug!(session_id = %new_sid, "captured mcp-session-id");
+                *session_id = Some(new_sid);
+            }
+        }
+    }
+
     let content_type = resp
         .headers()
         .get("content-type")
@@ -171,33 +204,117 @@ async fn forward_request(
         .to_string();
 
     if content_type.contains("text/event-stream") {
-        parse_sse_response(resp).await
+        // Bug 1: Stream SSE incrementally instead of buffering the entire body.
+        stream_sse_response(resp, stdout).await
     } else {
         // application/json or anything else: treat as single JSON body.
         let text = resp.text().await.context("failed to read response body")?;
-        Ok(vec![text])
+        // Bug 3: Only write if it's a JSON-RPC result or error (has "id" + "result"/"error").
+        if is_jsonrpc_result_or_error(&text) {
+            stdout.write_all(text.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
+        Ok(())
     }
 }
 
-/// Parse an SSE response stream, extracting JSON-RPC messages from `data:` lines.
-async fn parse_sse_response(resp: reqwest::Response) -> anyhow::Result<Vec<String>> {
-    let full_body = resp.text().await.context("failed to read SSE body")?;
-    let mut messages = Vec::new();
+/// Bug 1 + Bug 3 + Bug 5: Stream SSE response incrementally. Accumulates
+/// multi-line `data:` frames, parses on blank-line boundaries, and only
+/// forwards JSON-RPC result/error messages to stdout.
+async fn stream_sse_response(
+    resp: reqwest::Response,
+    stdout: &mut tokio::io::BufWriter<tokio::io::Stdout>,
+) -> anyhow::Result<()> {
+    let mut byte_stream = resp.bytes_stream();
+    // Leftover bytes from the previous chunk that didn't end on a newline.
+    let mut carry = String::new();
+    // Bug 5: Accumulated data: lines for the current SSE event.
+    let mut data_accum: Vec<String> = Vec::new();
 
-    for line in full_body.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            let data = data.trim();
-            if data.is_empty() {
-                continue;
+    while let Some(chunk_result) = byte_stream.next().await {
+        let chunk = chunk_result.context("error reading SSE stream chunk")?;
+        let chunk_str = String::from_utf8_lossy(&chunk);
+
+        // Prepend any leftover from the previous chunk.
+        let combined = if carry.is_empty() {
+            chunk_str.to_string()
+        } else {
+            let mut c = std::mem::take(&mut carry);
+            c.push_str(&chunk_str);
+            c
+        };
+
+        let mut lines = combined.split('\n').peekable();
+        while let Some(line) = lines.next() {
+            // If this is the last segment and there's no trailing newline,
+            // it's an incomplete line — carry it forward.
+            if lines.peek().is_none() && !combined.ends_with('\n') {
+                carry = line.to_string();
+                break;
             }
-            // Only forward lines that look like JSON objects.
-            if data.starts_with('{') {
-                messages.push(data.to_string());
+
+            let line = line.trim_end_matches('\r');
+
+            if line.is_empty() {
+                // Bug 5: Blank line = SSE event boundary. Process accumulated data.
+                if !data_accum.is_empty() {
+                    let payload = data_accum.join("");
+                    data_accum.clear();
+
+                    // Bug 3: Only forward JSON-RPC result/error frames.
+                    if payload.starts_with('{') && is_jsonrpc_result_or_error(&payload) {
+                        stdout.write_all(payload.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        // Bug 6: Flush after each complete response.
+                        stdout.flush().await?;
+                    }
+                }
+            } else if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim_start();
+                // Bug 5: Accumulate data lines (multi-line SSE data frames).
+                data_accum.push(data.to_string());
+            }
+            // Ignore event:, id:, retry:, and comment lines.
+        }
+    }
+
+    // Process any remaining accumulated data after stream ends.
+    if !data_accum.is_empty() {
+        let payload = data_accum.join("");
+        if payload.starts_with('{') && is_jsonrpc_result_or_error(&payload) {
+            stdout.write_all(payload.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
+    }
+
+    // Process any trailing carry (incomplete line at end of stream).
+    if !carry.is_empty() {
+        if let Some(data) = carry.strip_prefix("data:") {
+            let data = data.trim_start();
+            if data.starts_with('{') && is_jsonrpc_result_or_error(data) {
+                stdout.write_all(data.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
             }
         }
     }
 
-    Ok(messages)
+    Ok(())
+}
+
+/// Bug 3: Check if a JSON string is a JSON-RPC result or error response.
+/// Returns true only if the object has both an "id" field (non-null) AND
+/// either a "result" or "error" field.
+fn is_jsonrpc_result_or_error(json_str: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return false;
+    };
+    let has_id = val.get("id").is_some_and(|id| !id.is_null());
+    let has_result = val.get("result").is_some();
+    let has_error = val.get("error").is_some();
+    has_id && (has_result || has_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,42 +529,114 @@ mod tests {
         assert!(err.to_string().contains("cannot read"), "expected read error, got: {err}");
     }
 
-    #[tokio::test]
-    async fn parse_sse_extracts_data_lines() {
-        // Simulate an SSE body with multiple data lines.
+    #[test]
+    fn is_jsonrpc_result_or_error_accepts_result() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        assert!(is_jsonrpc_result_or_error(json));
+    }
+
+    #[test]
+    fn is_jsonrpc_result_or_error_accepts_error() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"bad"}}"#;
+        assert!(is_jsonrpc_result_or_error(json));
+    }
+
+    #[test]
+    fn is_jsonrpc_result_or_error_rejects_notification() {
+        // Notification: has method but no id.
+        let json = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
+        assert!(!is_jsonrpc_result_or_error(json));
+    }
+
+    #[test]
+    fn is_jsonrpc_result_or_error_rejects_null_id() {
+        let json = r#"{"jsonrpc":"2.0","id":null,"result":{}}"#;
+        assert!(!is_jsonrpc_result_or_error(json));
+    }
+
+    #[test]
+    fn is_jsonrpc_result_or_error_rejects_invalid_json() {
+        assert!(!is_jsonrpc_result_or_error("not json"));
+    }
+
+    #[test]
+    fn parse_sse_body_extracts_result_frames_only() {
         let body = [
             "event: message",
             r#"data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#,
             "",
             "event: message",
-            r#"data: {"jsonrpc":"2.0","id":2,"result":{}}"#,
+            r#"data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":50}}"#,
             "",
-            "data: not-json-ignored",
-            "data: ",
+            "event: message",
+            r#"data: {"jsonrpc":"2.0","id":2,"result":{}}"#,
             "",
         ]
         .join("\n");
 
-        let messages = parse_sse_body(&body);
+        let messages = parse_sse_body_filtered(&body);
+        // Should only get the two result frames, not the notification.
         assert_eq!(messages.len(), 2);
         assert!(messages[0].contains(r#""id":1"#));
         assert!(messages[1].contains(r#""id":2"#));
     }
 
-    /// Helper to test SSE parsing without needing a real reqwest::Response.
-    fn parse_sse_body(body: &str) -> Vec<String> {
+    #[test]
+    fn parse_sse_body_handles_multiline_data() {
+        // Bug 5: Multi-line data frames should be concatenated.
+        let body = [
+            "event: message",
+            r#"data: {"jsonrpc":"2.0","id":1,"#,
+            r#"data: "result":{"tools":[]}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let messages = parse_sse_body_filtered(&body);
+        assert_eq!(messages.len(), 1);
+        // The concatenated result should be valid JSON.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&messages[0]).expect("should be valid JSON");
+        assert_eq!(parsed["id"], 1);
+    }
+
+    #[test]
+    fn notification_request_has_null_id() {
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let id = extract_request_id(line);
+        assert!(id.is_null(), "notification should have null id");
+    }
+
+    /// Helper to test SSE parsing with the new filtering logic, without
+    /// needing a real reqwest::Response.
+    fn parse_sse_body_filtered(body: &str) -> Vec<String> {
         let mut messages = Vec::new();
+        let mut data_accum: Vec<String> = Vec::new();
+
         for line in body.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if data.is_empty() {
-                    continue;
+            if line.is_empty() {
+                // Event boundary.
+                if !data_accum.is_empty() {
+                    let payload = data_accum.join("");
+                    data_accum.clear();
+                    if payload.starts_with('{') && is_jsonrpc_result_or_error(&payload) {
+                        messages.push(payload);
+                    }
                 }
-                if data.starts_with('{') {
-                    messages.push(data.to_string());
-                }
+            } else if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim_start();
+                data_accum.push(data.to_string());
             }
         }
+
+        // Handle trailing data without final blank line.
+        if !data_accum.is_empty() {
+            let payload = data_accum.join("");
+            if payload.starts_with('{') && is_jsonrpc_result_or_error(&payload) {
+                messages.push(payload);
+            }
+        }
+
         messages
     }
 }
