@@ -113,14 +113,18 @@ pub async fn execute_ask_agent(
 **Request:** JSON-RPC 2.0 (Content-Type: application/json)
 **Response:** `text/event-stream` (SSE) OR `application/json`
 
-SSE stream for tool calls:
+SSE stream for tool calls (formatted text chunks as partial tool_result content):
 ```
-data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"...","progress":1,"message":"→ Gemini: turn started"}}
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"→ Gemini: turn started\n"}],"isError":false},"_partial":true}
 
-data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"...","progress":2,"message":"→ Gemini: calling read_file (src/auth.rs)"}}
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"→ Gemini: calling read_file (src/auth.rs)\n"}],"isError":false},"_partial":true}
 
-data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"The auth middleware has three issues..."}]}}
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"→ Gemini: generating response (5s elapsed)\n"}],"isError":false},"_partial":true}
+
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"The auth middleware has three issues..."}],"isError":false}}
 ```
+
+Note: Intermediate frames use `_partial: true` to indicate more data follows. The final frame omits `_partial`. If the MCP client does not support partial frames, it buffers until the final frame — same as current blob behavior.
 
 **Auth:** Bearer token (same as existing HTTP API)
 **Session:** Mcp-Session-Id header returned on initialize
