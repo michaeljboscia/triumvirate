@@ -4464,6 +4464,9 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
                     agent: "gemini".to_string(),
                     cwd: None,
                     history: vec!["hello".to_string()],
+                    parent_session_id: None,
+                    root_session_id: None,
+                    pantheon_session_id: None,
                 },
             );
             core_persist_json_file_if_enabled(first.sessions_file.as_ref(), &*sessions)?;
