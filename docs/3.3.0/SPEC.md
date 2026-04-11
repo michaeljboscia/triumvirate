@@ -3,6 +3,7 @@
 **Version:** 3.3.0
 **Working Directory:** /Users/mikeboscia/projects/triumvirate
 **Git Branch:** main (will branch to v3.3.0 for build)
+**Goatrodeo:** 7 rounds, 8 decisions, 38 auto-resolves, Phase 3 PASS
 
 ## Problem
 
@@ -10,91 +11,129 @@ The daemon captures real-time streaming data from agents (tool calls, file reads
 
 ## Goal
 
-When the user asks an agent a question through the daemon, they see each step as it happens:
+When the user asks an agent a question through the daemon, they see each step as it happens in a watch pane:
 
 ```
 → Gemini: turn started
 → Gemini: calling read_file (src/middleware/auth.rs)
 → Gemini: calling read_file (src/middleware/jwt.rs)
-→ Gemini: generating response
+→ Gemini: generating response (5s elapsed)
 → Gemini: responded (12,847 in / 1,203 out / 8,400 cached, 2 tools, 4.1s)
-"The auth middleware has three issues..."
 ```
 
-Not after. During.
+Delivered today via `triumvirate watch` side pane. Delivered inline when Claude Code supports MCP SSE rendering (future).
 
-## Requirements
+## Architecture (Post-Goatrodeo)
 
-### Phase 1: MCP Progress Notifications (stdio transport)
+Three new single-purpose commands:
+- `triumvirate mcp` — stdio MCP server (unchanged from v3.2.0)
+- `triumvirate proxy` — stdio↔HTTP bridge with auto-reconnect (golden path)
+- `triumvirate watch` — connects to /ws, pretty-prints AgentStreamEvent
 
-**REQ-S01:** During `ask_session` tool execution, the daemon MUST emit MCP `notifications/progress` messages for each streaming event parsed from the agent subprocess. Events include: turn started, tool call, file read, response generation, response complete.
+The daemon (`triumvirate daemon`) gains a Streamable HTTP MCP endpoint at `/mcp` using rmcp's `transport-streamable-http-server` feature. The proxy bridges Claude Code's stdio to this endpoint. Agent execution flows through the daemon, so metrics, token ledger, and WebSocket all see every event.
 
-**REQ-S02:** Each progress notification MUST include a human-readable `message` field describing the current agent activity. Format: `"{agent}: {action} ({detail})"`. Example: `"Gemini: calling read_file (src/auth.rs)"`.
+```
+┌──────────────┐     stdio      ┌──────────────┐     HTTP/SSE     ┌──────────────┐
+│  Claude Code  │ ──────────── │  proxy        │ ──────────────── │  daemon      │
+│  (user)       │              │  (bridge)     │                  │  (:8080)     │
+└──────────────┘              └──────────────┘                  │              │
+                                                                  │  ┌─────────┐│
+┌──────────────┐     WS        │  │ McpBridge ││
+│  watch CLI    │ ◄──────────── │  │ (35+tools)││
+│  (streaming)  │              │  │           ││
+└──────────────┘              │  │ Axum HTTP ││
+                                                                  │  │ WS /ws   ││
+                                                                  │  │ SSE /mcp ││
+                                                                  │  └─────────┘│
+                                                                  └──────────────┘
+```
 
-**REQ-S03:** Each progress notification MUST include numeric `progress` and `total` fields representing elapsed events vs estimated total events for the turn. If total is unknown, `total` MUST be omitted (not set to 0).
-
-**REQ-S04:** During `ask_agent` tool execution, the daemon MUST emit the same progress notifications as `ask_session`.
-
-**REQ-S05:** Progress notifications MUST use the `progressToken` from the client's original tool call request `_meta` field. If the client does not send a `progressToken`, the daemon MUST NOT emit progress notifications for that call.
-
-**REQ-S06:** Progress notifications MUST be sent via `context.peer.notify_progress()` (rmcp API). No custom JSON-RPC messages. No stderr hacks.
-
-**REQ-S07:** The `GeminiStreamParser` MUST emit structured events that the progress notification layer can consume. Events: `TurnStarted`, `ToolCall { name, args_summary }`, `FileRead { path }`, `ResponseChunk { preview }`, `TurnCompleted { tokens_in, tokens_out, cached, tool_count, duration_ms }`.
-
-**REQ-S08:** The `CodexExecParser` MUST emit the same structured event types as GeminiStreamParser, adapted for Codex's exec JSON format.
-
-**REQ-S09:** If Claude Code does not render progress notifications in the current version, the feature MUST degrade gracefully — the tool call completes normally with the final response. No errors. No behavior change for clients that don't support progress.
-
-**REQ-S10:** Unit tests MUST verify that the progress notification layer emits the correct events for a mocked agent stream. At least 5 test cases: turn started, tool call, file read, response chunk, turn completed.
-
-### Phase 2: Streamable HTTP Transport
-
-**REQ-H01:** The daemon MUST expose an MCP-compliant Streamable HTTP endpoint at `POST /mcp` that accepts JSON-RPC tool call requests and can return responses as SSE streams.
-
-**REQ-H02:** The daemon MUST expose a `GET /mcp` endpoint for clients to establish an SSE connection for server-initiated notifications (progress updates, resource changes).
-
-**REQ-H03:** The Streamable HTTP endpoint MUST support session management via `Mcp-Session-Id` header. The daemon generates a session ID on first `initialize` request and returns it in the response header.
-
-**REQ-H04:** The Streamable HTTP transport MUST coexist with the existing stdio transport. Both transports MUST be active simultaneously. Claude Code config determines which transport a given client uses.
-
-**REQ-H05:** During tool execution over Streamable HTTP, the daemon MUST stream progress events as SSE `data:` frames containing JSON-RPC `notifications/progress` messages. One frame per agent streaming event.
-
-**REQ-H06:** The final tool result MUST be sent as the last SSE frame, then the SSE stream for that request MUST close.
-
-**REQ-H07:** The daemon MUST use rmcp's `transport-streamable-http-server` feature for the Streamable HTTP implementation. No custom SSE framing.
-
-**REQ-H08:** Claude Code configuration for Streamable HTTP MUST work with: `claude mcp add --transport http triumvirate http://127.0.0.1:8080/mcp`. The daemon MUST handle this configuration correctly.
-
-**REQ-H09:** The Streamable HTTP endpoint MUST enforce bearer token authentication identical to the existing HTTP API. Unauthenticated requests receive 401.
-
-**REQ-H10:** Integration tests MUST verify SSE streaming behavior: connect to `/mcp` via GET, call a tool via POST, receive at least 2 SSE progress frames before the final result frame.
+## Requirements (Final — Post Round 7)
 
 ### Streaming Event Schema
 
-**REQ-E01:** All streaming events MUST conform to a shared `AgentStreamEvent` enum with these variants: `TurnStarted { agent, session_name }`, `ToolCall { agent, tool_name, args_summary }`, `FileRead { agent, file_path }`, `ResponseChunk { agent, text_preview }`, `TurnCompleted { agent, tokens_in, tokens_out, cached_tokens, tool_count, duration_ms }`, `Error { agent, message }`.
+**REQ-E01:** AgentStreamEvent enum defined in shared-types crate with variants: `TurnStarted { agent, session_name }`, `ToolCall { agent, tool_name, args_summary }`, `FileRead { agent, file_path }`, `ResponseChunk { agent, text_preview }`, `TurnCompleted { agent, tokens_in, tokens_out, cached_tokens, tool_count, duration_ms }`, `Error { agent, message }`. Each event carries a monotonic sequence number.
 
-**REQ-E02:** The `AgentStreamEvent` enum MUST be defined in the `shared-types` crate so both the MCP progress layer and the HTTP SSE layer consume the same type.
+**REQ-E02:** AgentStreamEvent MUST be defined in the `shared-types` crate so all consumers (MCP, HTTP, WS) use the same type.
 
-**REQ-E03:** The existing `GeminiStreamParser` and `CodexExecParser` in the `agent-adapter` crate MUST be modified to produce `AgentStreamEvent` values via a `tokio::sync::mpsc` channel during stream parsing.
+**REQ-E03:** GeminiStreamParser and CodexExecParser MUST be modified to produce AgentStreamEvent values via a `tokio::sync::mpsc` channel during stream parsing. New `execute_ask_agent_streaming()` function returns the channel. Old `execute_ask_agent()` wraps it and collects into a String blob (adapter pattern). Existing callers unchanged.
 
-**REQ-E04:** The existing WebSocket broadcast (`/ws`) MUST also emit `AgentStreamEvent` values, maintaining backwards compatibility with any WebSocket consumers.
+**REQ-E04:** The WebSocket broadcast (`/ws`) MUST emit AgentStreamEvent as a new event type (`agent_stream`) alongside existing v3.2.0 events (`token_update`, `abe_task_state`, `fleet_progress`). No existing events removed or modified.
+
+### Streamable HTTP Transport
+
+**REQ-H01:** The daemon MUST expose an MCP-compliant Streamable HTTP endpoint at `/mcp` (POST for JSON-RPC requests, GET for SSE notifications). All 35+ tools available on both stdio and HTTP transports via shared `Arc<McpBridge>`.
+
+**REQ-H02:** The daemon MUST expose a `GET /mcp` endpoint for clients to establish an SSE connection for server-initiated notifications.
+
+**REQ-H03:** Session management via `Mcp-Session-Id` header. Daemon generates ID on `initialize`, returns in response header.
+
+**REQ-H04:** Streamable HTTP MUST coexist with existing stdio transport. Both active simultaneously. Two transport adapters sharing one `Arc<McpBridge>`.
+
+**REQ-H05:** During tool execution over Streamable HTTP, the daemon MUST stream formatted text chunks as partial tool_result content. Format: `"→ {agent}: {action} ({detail})\n"`. The daemon formats, the client displays.
+
+**REQ-H06:** Final tool result sent as last SSE frame, then stream closes.
+
+**REQ-H07:** Use rmcp `transport-streamable-http-server` feature (available in 1.3.0, already in deps).
+
+**REQ-H08:** Streamable HTTP endpoint works with direct HTTP MCP clients: `claude mcp add --transport http triumvirate http://127.0.0.1:8080/mcp`. This is for non-proxy clients; the golden path uses the proxy command.
+
+**REQ-H09:** Bearer token auth on `/mcp` matching existing HTTP API.
+
+**REQ-H10:** Integration tests verify SSE streaming: connect, call tool, receive at least 2 SSE progress frames before final result.
+
+### Proxy Command
+
+**REQ-P01:** `triumvirate proxy` bridges stdio (Claude Code) to HTTP (daemon :8080/mcp). One job: translate stdio JSON-RPC ↔ HTTP JSON-RPC.
+
+**REQ-P02:** Auto-reconnect with bounded exponential backoff when daemon restarts. Fail in-flight calls loudly, recover channel for subsequent calls.
+
+**REQ-P03:** If daemon is unreachable at startup, retry for 5 seconds then exit with clear error: "daemon not reachable at 127.0.0.1:8080 — run 'triumvirate daemon' first". No silent fallback.
+
+**REQ-P04:** Unit tests verify: proxy forwards tool calls, proxy reconnects after disconnect, proxy exits cleanly when daemon is down.
+
+### Watch CLI
+
+**REQ-W01:** `triumvirate watch` connects to daemon WebSocket at /ws and pretty-prints AgentStreamEvent values. Format: `"→ {agent}: {action} ({detail})"`.
+
+**REQ-W02:** Default shows `agent_stream` events only. `--all` flag shows all WS event types.
+
+**REQ-W03:** `--session <name>` filter for specific agent session.
+
+**REQ-W04:** Heartbeat display during long generation: `"→ Gemini: generating response (15s elapsed)"` with running timer updated in-place.
+
+**REQ-W05:** Handles daemon-not-running gracefully: retry with clear message, not crash.
+
+**REQ-W06:** Detects sequence number gaps, prints `"[events skipped, resynced at seq N]"`.
+
+### Spike Test
+
+**REQ-K01:** Build a 50-line test MCP server using rmcp progress_demo.rs that sends 5 SSE notification frames over Streamable HTTP. Register in Claude Code. Call a tool. Observe whether Claude Code renders intermediate frames. Document results. Runs in parallel with main build.
 
 ## Non-Goals
 
-- Dashboard UI (tracked in GitHub #12)
-- Streaming for ABE fleet dispatch (separate feature — ABE workers are headless)
-- Token-by-token LLM output streaming (agent CLIs don't expose this granularity)
-- Breaking change to existing stdio MCP interface
+- Dashboard UI (tracked in GitHub #12, becomes Pantheon v4.0)
+- Streaming for ABE fleet dispatch (headless workers)
+- Token-by-token LLM output streaming (agents don't expose this)
+- Breaking changes to stdio MCP interface
+- Replacing existing WS event schemas
 
 ## Dependencies
 
-- `rmcp` crate v1.3+ (already in deps — need to add `transport-streamable-http-server` feature)
-- Claude Code must support either progress notifications (Path 1) or HTTP MCP transport (Path 2)
-- Existing `GeminiStreamParser` and `CodexExecParser` in `agent-adapter` crate
+- `rmcp` 1.3.0 with `transport-streamable-http-server` feature
+- Existing `GeminiStreamParser` and `CodexExecParser` in agent-adapter
+- Existing WebSocket broadcast on `/ws`
+- Existing Axum HTTP server on :8080
 
-## Prior Art
+## Goatrodeo Decision Log
 
-- `danny-avila/Example-MCP-Server` — working progress notifications over Streamable HTTP
-- FastMCP (Python) — `ctx.report_progress()` pattern
-- rmcp `examples/servers/src/common/progress_demo.rs` — Rust example
-- `rust-mcp-sdk` HyperServer — Axum-based SSE streaming
+| Round | Decision | Choice |
+|-------|----------|--------|
+| R1 | SSE content format | Formatted text chunks (not JSON-RPC progress) |
+| R1 | Executor refactor | Adapter pattern (new streaming fn wraps old) |
+| R1 | WS backward compat | Alongside existing events (not replace) |
+| R2 | Build strategy | Full stack now, side-pane today, inline when CC supports SSE |
+| R2 | Spike test | Parallel with build, doesn't block |
+| R5 | Migration safety | Smart proxy (later split into three commands) |
+| R6 | Smart proxy confirmed | Build despite no CC streaming benefit — unified execution |
+| R7 | Proxy architecture | Three commands (mcp, proxy, watch), proxy reconnects, no fallback |
