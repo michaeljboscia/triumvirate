@@ -1051,6 +1051,9 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Doctor => {
             run_doctor().await?;
         }
+        CliCommand::Proxy => {
+            proxy::run_proxy().await?;
+        }
     }
 
     Ok(())
