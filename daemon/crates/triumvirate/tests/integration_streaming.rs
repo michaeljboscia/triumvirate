@@ -215,30 +215,14 @@ async fn i_stream_05_mcp_tools_list_returns_tools() -> anyhow::Result<()> {
 
     assert!(response.status().is_success());
 
-    // The response is an SSE stream. We need to read chunks until we get
-    // a data frame containing the tools/list result.
-    let mut stream = response.bytes_stream();
-    let mut collected = String::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-
-    use futures_util::StreamExt;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
-            Ok(Some(Ok(chunk))) => {
-                let text = String::from_utf8_lossy(&chunk);
-                collected.push_str(&text);
-                // Check if we've received the tools response
-                if collected.contains("tools") || collected.contains("spawn_session") || collected.contains("ping") {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-
+    // The response is an SSE stream. response.text() reads until the
+    // stream closes (which happens after the JSON-RPC result is sent).
+    let body = response.text().await?;
+    // SSE data frames contain the JSON-RPC response
+    let has_tools = body.contains("tools") || body.contains("spawn_session") || body.contains("ping");
     assert!(
-        collected.contains("tools") || collected.contains("spawn_session") || collected.contains("ping"),
-        "expected tools in SSE stream, got: {collected}"
+        has_tools,
+        "expected tools in SSE stream body, got: {body}"
     );
     Ok(())
 }
