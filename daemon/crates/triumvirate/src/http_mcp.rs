@@ -4,10 +4,15 @@
 //! as a tower::Service that handles POST (JSON-RPC tool calls) and GET (SSE stream)
 //! with session management via Mcp-Session-Id header.
 //!
-//! FEAT-002 (REQ-H01, REQ-H02, REQ-H03, REQ-H04, REQ-H07)
+//! Bearer token auth is enforced via a tower middleware layer on the /mcp route,
+//! matching the existing HTTP API auth pattern.
+//!
+//! FEAT-002 (REQ-H01, REQ-H02, REQ-H03, REQ-H04, REQ-H07, REQ-H09)
 
 use std::sync::Arc;
 
+use axum::{Router, middleware};
+use http::{Request, StatusCode, header::AUTHORIZATION};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig,
     StreamableHttpService,
@@ -17,13 +22,53 @@ use tokio_util::sync::CancellationToken;
 
 use crate::McpBridge;
 
-/// Build the StreamableHttpService that serves MCP over HTTP/SSE.
+/// Build an Axum Router for the /mcp endpoint with auth + StreamableHttpService.
 ///
-/// The service_factory creates a new McpBridge instance per MCP session.
-/// McpBridge implements rmcp::ServerHandler, which auto-implements
-/// rmcp::Service<RoleServer>. All instances share the same underlying
-/// Arc-wrapped state (sessions, fleet, ABE tasks, metrics, WS events).
-pub fn build_streamable_http_mcp_service(
+/// The returned router includes bearer token auth middleware and the rmcp
+/// StreamableHttpService as a nested service. Mount via:
+/// ```rust,ignore
+/// .nest("/mcp", http_mcp::build_mcp_router(bridge, token, cancel))
+/// ```
+pub fn build_mcp_router(
+    bridge_template: McpBridge,
+    bearer_token: String,
+    cancellation_token: CancellationToken,
+) -> Router {
+    let mcp_service = build_streamable_http_service(bridge_template, cancellation_token);
+
+    Router::new()
+        .nest_service("/", mcp_service)
+        .layer(middleware::from_fn(move |req, next| {
+            let token = bearer_token.clone();
+            bearer_auth_middleware(token, req, next)
+        }))
+}
+
+/// Bearer token auth middleware for the /mcp endpoint.
+/// Returns 401 Unauthorized if the token is missing or wrong.
+/// REQ-H09
+async fn bearer_auth_middleware(
+    expected_token: String,
+    req: Request<axum::body::Body>,
+    next: middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let auth_header = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let is_authorized = auth_header
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected_token);
+
+    if !is_authorized {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(req).await)
+}
+
+fn build_streamable_http_service(
     bridge_template: McpBridge,
     cancellation_token: CancellationToken,
 ) -> StreamableHttpService<McpBridge, LocalSessionManager> {
