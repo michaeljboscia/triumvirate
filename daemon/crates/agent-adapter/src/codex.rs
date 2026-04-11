@@ -127,13 +127,19 @@ impl CodexExecParser {
                 let event = WorkingStateEvent {
                     agent: "codex".to_string(),
                     state: WorkingState::Error,
-                    detail,
+                    detail: detail.clone(),
                     tool_name: None,
                     tool_args_json: None,
                     token_usage: None,
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::Error {
+                    agent: "codex".into(),
+                    message: detail,
+                    seq,
+                });
                 Some(event)
             }
             _ => {
