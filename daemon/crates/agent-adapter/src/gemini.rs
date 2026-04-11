@@ -66,6 +66,12 @@ impl GeminiStreamParser {
                     ts_ms: None,
                 };
                 self.events.push(event.clone());
+                let seq = self.next_seq();
+                self.emit_stream_event(AgentStreamEvent::TurnStarted {
+                    agent: "gemini".into(),
+                    session_name: self.session_id.clone().unwrap_or_default(),
+                    seq,
+                });
                 Some(event)
             }
             "message" => {
