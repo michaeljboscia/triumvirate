@@ -28,3 +28,6 @@ docs/superpowers/plans/
 daemon/target/
 daemon/dist/
 .triumvirate/
+
+# Pythia local search index (75MB+ SQLite + tantivy)
+.pythia/
