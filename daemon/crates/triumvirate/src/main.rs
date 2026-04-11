@@ -1489,7 +1489,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     // releases the flock and removes the file.
     let triumvirate_home = core_triumvirate_home_dir()?;
     let _pid_file = daemon_core::PidFile::acquire(&triumvirate_home)
-        .context("failed to acquire daemon pid file (another daemon may be running)")?;
+        .map_err(|e| anyhow::anyhow!("failed to acquire daemon pid file (another daemon may be running): {e:#}"))?;
 
     let token = core_ensure_daemon_token(&triumvirate_home)?;
     let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
