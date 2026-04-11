@@ -109,6 +109,12 @@ pub async fn spawn_session(
             agent: agent.clone(),
             cwd: Some(cwd),
             history: Vec::new(),
+            // FEAT-011 (REQ-010, REQ-033): lineage fields for Pantheon v4.0
+            // sidebar hierarchy. Captured later during MCP dispatch (T-004)
+            // from _meta.pantheon.session_id or X-Pantheon-Session-Id header.
+            parent_session_id: None,
+            root_session_id: None,
+            pantheon_session_id: None,
         },
     );
     core_persist_json_file_if_enabled(sessions_file, &*sessions)
