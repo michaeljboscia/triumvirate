@@ -9,6 +9,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "shared-types",
  "tokio",
  "tracing",
 ]
