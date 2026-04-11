@@ -20,20 +20,13 @@ use crate::McpBridge;
 /// Build the StreamableHttpService that serves MCP over HTTP/SSE.
 ///
 /// The service_factory creates a new McpBridge instance per MCP session.
-/// All instances share the same underlying Arc-wrapped state (sessions,
-/// fleet, ABE tasks, metrics, WS events, token DB).
-///
-/// Mount the returned service on the Axum router via:
-/// ```rust,ignore
-/// .nest_service("/mcp", build_streamable_http_mcp_service(bridge_template))
-/// ```
+/// McpBridge implements rmcp::ServerHandler, which auto-implements
+/// rmcp::Service<RoleServer>. All instances share the same underlying
+/// Arc-wrapped state (sessions, fleet, ABE tasks, metrics, WS events).
 pub fn build_streamable_http_mcp_service(
     bridge_template: McpBridge,
     cancellation_token: CancellationToken,
-) -> StreamableHttpService<
-    impl rmcp::Service<rmcp::RoleServer> + Send + 'static,
-    LocalSessionManager,
-> {
+) -> StreamableHttpService<McpBridge, LocalSessionManager> {
     let config = StreamableHttpServerConfig {
         sse_keep_alive: Some(std::time::Duration::from_secs(15)),
         sse_retry: Some(std::time::Duration::from_secs(3)),
@@ -45,10 +38,7 @@ pub fn build_streamable_http_mcp_service(
     let session_manager = Arc::new(LocalSessionManager::default());
 
     StreamableHttpService::new(
-        move || {
-            let bridge = bridge_template.clone();
-            Ok(rmcp::service::serve_directly(bridge))
-        },
+        move || Ok(bridge_template.clone()),
         session_manager,
         config,
     )
