@@ -27,7 +27,7 @@
 
 | Task | Commit | Files Changed | Tests | Status |
 |------|--------|--------------|-------|--------|
-| T-305 | — | — | — | PENDING |
+| T-305 | 2618151 | http_mcp.rs (new), main.rs, Cargo.toml x2 | 67/67 (4 crates) | DONE |
 | T-306 | — | — | — | PENDING |
 | T-307 | — | — | — | PENDING |
 
