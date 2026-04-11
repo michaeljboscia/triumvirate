@@ -1,13 +1,18 @@
 //! Shared DTOs for MCP bridge <-> daemon communication.
 
+mod api;
 mod git_ops;
 mod ledger;
 mod abe;
 mod streaming;
 
 pub use abe::*;
+pub use api::{
+    WorkersResponse, WorkerInfo, FleetResponse, FleetBuild, FleetTask,
+    StateResponse, ReplayRequest, ReplayResponse,
+};
 pub use git_ops::{GitOps, MergeResult};
-pub use streaming::AgentStreamEvent;
+pub use streaming::{AgentStreamEvent, WorkerLifecycleType};
 pub use ledger::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
     Summary,
