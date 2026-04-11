@@ -55,10 +55,12 @@ async fn bearer_auth_middleware(
     let auth_header = req
         .headers()
         .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     let is_authorized = auth_header
-        .and_then(|h| h.strip_prefix("Bearer "))
+        .as_deref()
+        .and_then(|h: &str| h.strip_prefix("Bearer "))
         .is_some_and(|token| token == expected_token);
 
     if !is_authorized {
