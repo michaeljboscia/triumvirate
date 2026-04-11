@@ -231,7 +231,7 @@ After each task commit, run the validation script:
 When all tasks are complete, respond with:
 ```
 backlog_status: 0 remaining
-completed_tasks: [T-300, T-301, T-302, T-303, T-304, T-305, T-306, T-307, T-308, T-309, T-310, T-311]
+completed_tasks: [T-300, T-301, T-302, T-303, T-304, T-305, T-306, T-307, T-308, T-309, T-310, T-311, T-312]
 total_commits: {N}
 collateral_fixes: {N} ({list if any})
 validation: {N}/{N} tasks passed validate-task.sh
