@@ -215,10 +215,16 @@ async fn i_stream_05_mcp_tools_list_returns_tools() -> anyhow::Result<()> {
 
     assert!(response.status().is_success());
     let body = response.text().await?;
-    // Should contain tool definitions
+    // Response is SSE format — parse the data lines for JSON-RPC content
+    let has_tools = body.lines()
+        .filter(|line| line.starts_with("data: "))
+        .any(|line| {
+            let data = line.strip_prefix("data: ").unwrap_or("");
+            data.contains("tools") || data.contains("spawn_session") || data.contains("ping")
+        });
     assert!(
-        body.contains("tools") || body.contains("spawn_session") || body.contains("ping"),
-        "expected tools in response, got: {body}"
+        has_tools,
+        "expected tools in SSE data frames, got: {body}"
     );
     Ok(())
 }
