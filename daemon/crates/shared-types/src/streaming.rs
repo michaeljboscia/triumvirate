@@ -127,6 +127,24 @@ impl AgentStreamEvent {
             Self::Error { agent, message, .. } => {
                 format!("→ {agent}: error ({message})")
             }
+            Self::WorkerLifecycle { lifecycle, agent, session_name, task_id, elapsed_ms, error_message, .. } => {
+                let task = task_id.as_deref().unwrap_or("unknown");
+                match lifecycle {
+                    WorkerLifecycleType::Spawned => {
+                        format!("→ {agent}: worker spawned [{session_name}] task {task}")
+                    }
+                    WorkerLifecycleType::Completed => {
+                        let dur = elapsed_ms
+                            .map(|ms| format!(" ({:.1}s)", ms as f64 / 1000.0))
+                            .unwrap_or_default();
+                        format!("→ {agent}: worker completed [{session_name}] task {task}{dur}")
+                    }
+                    WorkerLifecycleType::Failed => {
+                        let err = error_message.as_deref().unwrap_or("unknown error");
+                        format!("→ {agent}: worker failed [{session_name}] task {task} — {err}")
+                    }
+                }
+            }
         }
     }
 
@@ -138,7 +156,8 @@ impl AgentStreamEvent {
             | Self::FileRead { seq, .. }
             | Self::ResponseChunk { seq, .. }
             | Self::TurnCompleted { seq, .. }
-            | Self::Error { seq, .. } => *seq,
+            | Self::Error { seq, .. }
+            | Self::WorkerLifecycle { seq, .. } => *seq,
         }
     }
 }
