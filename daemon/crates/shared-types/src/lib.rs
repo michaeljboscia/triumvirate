@@ -3,6 +3,7 @@
 mod git_ops;
 mod ledger;
 mod abe;
+mod streaming;
 
 pub use abe::*;
 pub use git_ops::{GitOps, MergeResult};
