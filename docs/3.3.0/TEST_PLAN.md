@@ -1,7 +1,7 @@
 # TEST_PLAN — v3.3.0 Live Agent Streaming
 
 **Version:** 3.3.0
-**Spec:** docs/3.3.0/SPEC.md (25 REQs, 10 dropped in goatrodeo = 25 active)
+**Spec:** docs/3.3.0/SPEC.md (25 active REQs after goatrodeo; REQ-S01–S10 were dropped during rounds)
 
 ## Acceptance Test Matrix
 

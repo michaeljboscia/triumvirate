@@ -114,10 +114,14 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_exec;
+mod streaming;
+mod http_mcp;
 mod abe;
 mod cli_ops;
 mod git_ops_impl;
+mod proxy;
 mod tracing_setup;
+mod watch;
 
 #[derive(Debug, Parser)]
 #[command(name = "triumvirate")]
@@ -142,6 +146,10 @@ enum CliCommand {
     Status,
     /// Run local diagnostics for daemon readiness.
     Doctor,
+    /// Bridge stdio MCP to daemon HTTP endpoint.
+    Proxy,
+    /// Watch live agent streaming events.
+    Watch(watch::WatchArgs),
 }
 
 #[derive(Debug, Clone)]
@@ -1046,6 +1054,12 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Doctor => {
             run_doctor().await?;
         }
+        CliCommand::Proxy => {
+            proxy::run_proxy().await?;
+        }
+        CliCommand::Watch(args) => {
+            watch::run_watch(args).await?;
+        }
     }
 
     Ok(())
@@ -1613,6 +1627,11 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
         .route("/abe/task-complete", post(abe_task_complete_route))
+        .nest_service("/mcp", {
+            let mcp_bridge = McpBridge::new();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            http_mcp::build_mcp_router(mcp_bridge, state.token.clone(), cancel)
+        })
         .route("/{*path}", get(daemon_http::dashboard_spa_fallback_route))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
