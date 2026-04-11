@@ -35,8 +35,8 @@
 
 | Task | Commit | Files Changed | Tests | Status |
 |------|--------|--------------|-------|--------|
-| T-308 | — | — | — | PENDING |
-| T-309 | — | — | — | PENDING |
+| T-308 | 34f80a4 | proxy.rs (new, 453 lines), main.rs | compiles + 10 unit tests | DONE (Claude subagent) |
+| T-309 | ba6328b | watch.rs (new, 261 lines), main.rs, Cargo.toml | compiles clean | DONE (Codex+Claude+Gemini bake-off) |
 
 ## Wave 4: Spike + Polish
 
