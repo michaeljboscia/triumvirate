@@ -1305,6 +1305,11 @@ async fn run_daemon() -> anyhow::Result<()> {
                 agent: agent.clone(),
                 cwd: Some(cwd),
                 history: Vec::new(),
+                // FEAT-011 (REQ-010, REQ-033): Pantheon lineage fields,
+                // populated later during MCP dispatch in T-004.
+                parent_session_id: None,
+                root_session_id: None,
+                pantheon_session_id: None,
             },
         );
         core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
