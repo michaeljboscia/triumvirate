@@ -100,22 +100,56 @@ Register them in the `app = Router::new()...` chain alongside the existing `/api
 
 ## Worker aggregation contract
 
-`/api/workers` returns the **union** of:
+`/api/workers` returns `WorkersResponse { workers: state.abe_tasks.snapshot_workers().await }`. That's it. One line of aggregation logic.
 
-1. **Persistent named sessions** — every entry in `state.sessions` map. Build a `WorkerInfo` from each `SessionState` using:
-   - `session_id` = the HashMap key
-   - `agent` = `session_state.agent_target` (e.g. "gemini", "codex")
-   - `name` = the HashMap key (Pantheon's UI uses this)
-   - `status` = string derived from session state — use `"idle"` as the default since SessionState doesn't track running/idle natively (or pull from a field if one exists; check the struct)
-   - `task_id` = `None` for named sessions
-   - `parent_session_id`, `root_session_id`, `pantheon_session_id` = pass through directly
-   - `cwd` = `session_state.cwd.clone()`
-   - `started_at` = format `started_at_unix_ms` as RFC 3339 (use the `chrono` crate which is already a workspace dep — see `format_rfc3339` in task_tracker.rs for the pattern)
-   - `elapsed_ms` = `now_unix_ms - started_at_unix_ms` (clamp to u64)
+`TaskTracker::snapshot_workers()` (added by T-007.5) returns `Vec<shared_types::WorkerInfo>` with every lineage field already populated from T-007's `TaskRecord`. You do NOT need to build `WorkerInfo` values from scratch — the task_tracker module does it for you. If the returned shape is wrong, the fix belongs in `task_tracker.rs::snapshot_workers` (which is frozen for this task) not in your handler.
 
-2. **ABE-dispatched workers** — call `state.abe_tasks.snapshot_workers().await` and append all entries to the same `Vec<WorkerInfo>`.
+If `state.abe_tasks` is empty, `snapshot_workers()` returns an empty `Vec`, and `WorkersResponse { workers: vec![] }` serializes as `{"workers":[]}` — the empty-array case is tested in reality test (6).
 
-The output `WorkersResponse.workers` is the concatenation. Order is unspecified.
+## Fleet state population in tests
+
+`state.fleet_v2_states` is `Arc<tokio::sync::Mutex<HashMap<String, FleetBuild>>>`. It's a `pub` field on `DaemonState` (added by T-007.5). To pre-populate it in a test, acquire the lock and insert directly:
+
+```rust
+{
+    let mut guard = state.fleet_v2_states.lock().await;
+    guard.insert("build-001".to_string(), FleetBuild {
+        build_id: "build-001".to_string(),
+        task_count: 2,
+        completed: 1,
+        failed: 0,
+        in_progress: 1,
+        queued: 0,
+        tasks: vec![
+            FleetTask { task_id: "T-001".into(), status: "committed".into(), files: vec![], worker_session_id: None, elapsed_ms: 0, commit_sha: None },
+            FleetTask { task_id: "T-002".into(), status: "working".into(), files: vec![], worker_session_id: None, elapsed_ms: 0, commit_sha: None },
+        ],
+    });
+}
+// guard drops here, lock released
+```
+
+Same pattern for every test that needs a populated fleet. In production, `dispatch_codex_worktree` will populate `fleet_v2_states` in a future task — that's out of scope for T-008. Until then, `/api/fleet` returns `{"builds":[]}` in production.
+
+## DaemonState constructor for tests
+
+Use the standard 10-argument `DaemonState::new(...)` constructor from daemon-core. The new T-007.5 fields (`replay_buffer`, `fleet_v2_states`, `last_event_seq`, `started_at`) are initialized automatically with defaults — you do NOT pass them to `new()`. After construction, mutate them directly via the `pub` fields:
+
+```rust
+let state = DaemonState::new(
+    "test-token".to_string(),
+    Arc::new(tokio::sync::Mutex::new(HashMap::new())),          // queues
+    "127.0.0.1:0".to_string(),                                   // bind_addr (unused in tower-test)
+    Arc::new(tokio::sync::Mutex::new(HashMap::new())),           // sessions
+    None,                                                         // sessions_file
+    TaskTracker::with_observability(metrics.clone(), Some(ws_events.clone())),
+    Arc::new(tokio::sync::Mutex::new(VecDeque::new())),          // ledger_project_lru
+    Arc::new(tokio::sync::Mutex::new(VecDeque::new())),          // marker_parse_window
+    metrics.clone(),
+    ws_events,
+);
+// Now pre-populate fleet_v2_states via the lock pattern shown above.
+```
 
 ## Auth pattern (per-handler, not middleware)
 
