@@ -1,4 +1,4 @@
-use daemon_core::metrics::DaemonMetrics;
+use daemon_core::{current_pantheon_session, metrics::DaemonMetrics};
 use tracing::instrument;
 use shared_types::{
     CancelTaskRequest as AbeCancelTaskRequest, CancelTaskResponse as AbeCancelTaskResponse,
