@@ -83,15 +83,15 @@ is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &
 
 ## `/api/state` contract
 
-Returns `StateResponse` populated as follows:
+Returns `StateResponse` populated as follows. The type is frozen by T-002 and has NO `sessions` field — named MCP sessions stay on the existing `/session/list` route.
 
 | Field | Source |
 |---|---|
-| `version` | `daemon_core::VERSION` (already a `&'static str`) |
-| `uptime_ms` | `state.started_at.elapsed().as_millis() as u64` |
-| `workers` | Same union as T-008's `/api/workers` (sessions ∪ abe_tasks.snapshot_workers). **Cross-task coordination note:** if T-008 ships first and exposes a helper like `aggregate_workers(&state) -> Vec<WorkerInfo>`, you MAY call it. If not, duplicate the logic — don't add a public helper, just call `state.abe_tasks.snapshot_workers().await` and iterate `state.sessions`. |
-| `fleet` | `state.fleet_v2_states.lock().await.values().cloned().collect()` |
-| `last_event_seq` | `state.last_event_seq.load(std::sync::atomic::Ordering::Relaxed)` |
+| `version: String` | `daemon_core::VERSION.to_string()` (VERSION is `&'static str`, so `.to_string()` is required to coerce into `String`) |
+| `uptime_ms: u64` | `state.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64` (saturate, don't panic) |
+| `workers: Vec<WorkerInfo>` | `state.abe_tasks.snapshot_workers().await` — ABE workers only, same source as T-008's `/api/workers`. Do NOT aggregate SessionState entries. |
+| `fleet: Vec<FleetBuild>` | `state.fleet_v2_states.lock().await.values().cloned().collect()` |
+| `last_event_seq: u64` | `state.last_event_seq.load(std::sync::atomic::Ordering::Relaxed)` |
 
 ## `/ws/v2` handshake protocol (the meat of T-009)
 
