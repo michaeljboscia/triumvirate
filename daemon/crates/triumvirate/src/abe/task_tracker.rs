@@ -277,12 +277,14 @@ impl TaskTracker {
             duration_ms,
             task.commit_sha.as_deref(),
         );
-        // FEAT-014 (REQ-010): WorkerLifecycle::Completed for Pantheon sidebar.
+        // FEAT-014 (REQ-010) T-004: WorkerLifecycle::Completed with lineage
+        // re-read from TaskRecord (task-local from register is gone — this
+        // executes in the spawned monitor task).
         self.emit_worker_lifecycle(
             WorkerLifecycleType::Completed,
             task_id,
-            None,
-            None,
+            task.parent_session_id.clone(),
+            task.root_session_id.clone(),
             task.commit_sha.clone(),
             None,
             Some(duration_ms as u64),
