@@ -718,6 +718,8 @@ mod tests {
                 0,
                 Arc::new(Mutex::new(child)),
                 Some(wt.clone()),
+                None,
+                None,
             )
             .await;
 
