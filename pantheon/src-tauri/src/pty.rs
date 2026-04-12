@@ -159,7 +159,7 @@ pub fn pty_spawn(
         let home_str = home.to_string_lossy();
         let existing = std::env::var("PATH").unwrap_or_default();
         let augmented = format!(
-            "{home_str}/.claude/local:{home_str}/.volta/bin:{extra_path}:{existing}"
+            "{home_str}/.local/bin:{home_str}/.claude/local:{home_str}/.volta/bin:{extra_path}:{existing}"
         );
         builder.env("PATH", augmented);
     } else {
