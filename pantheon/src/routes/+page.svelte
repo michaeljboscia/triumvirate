@@ -169,7 +169,11 @@
     flex: 1 1 auto;
     min-width: 0;
     background-color: #1a1a1a;
-    padding: 12px;
+    /* T-016: no padding — the TerminalPanel component owns its own
+     * internal padding (inside .xterm-viewport) so xterm.js's canvas
+     * can measure the exact container width/height without phantom
+     * scroll areas. */
+    padding: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
