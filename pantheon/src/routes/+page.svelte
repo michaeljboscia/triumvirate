@@ -12,7 +12,7 @@
   // you can see data flowing from the daemon today — T-021/T-022 replace
   // these <p> tags with the real sidebar tree and status panels.
 
-  import { daemon } from "$lib/stores/daemon";
+  import { daemon } from "$lib/stores/daemon.svelte";
 
   let sidebarOpen = $state(true);
   let statusOpen = $state(true);
