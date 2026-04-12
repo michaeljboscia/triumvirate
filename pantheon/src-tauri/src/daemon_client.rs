@@ -191,7 +191,7 @@ fn load_token() -> Result<String> {
 /// open a WebSocket, run the live session until it fails, then backs off
 /// before retrying. REST polling is driven from inside the session so it
 /// inherits the same connection's health lifetime.
-async fn run_forever<R: Runtime>(app: AppHandle<R>, state: Arc<ClientState>) {
+async fn run_forever(app: AppHandle, state: Arc<ClientState>) {
     let mut backoff = Duration::from_secs(1);
     loop {
         match run_session(&app, &state).await {
