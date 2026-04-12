@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use axum::{Router, middleware, response::Response};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::{Router, middleware};
+use axum::http::{HeaderName, Request, StatusCode, header::AUTHORIZATION};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig,
     StreamableHttpService,
