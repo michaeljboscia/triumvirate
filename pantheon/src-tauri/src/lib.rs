@@ -47,6 +47,18 @@ pub fn run() {
             // the on_window_event handler below) and the tray is what
             // brings it back via left-click.
             tray::init_tray(app)?;
+
+            // T-020: spawn the daemon client background task. Connects
+            // to the v3.9.0 daemon over REST + /ws/v2, maintains the
+            // 4-state health machine, and drives the tray icon via
+            // `tray::update_daemon_state`. Failure to load the token
+            // file (daemon not running) is non-fatal — we log it and
+            // let the UI show Disconnected until the user starts the
+            // daemon, at which point the user can manually restart
+            // Pantheon. Wave 7 adds an in-app "Start daemon" button.
+            if let Err(err) = daemon_client::spawn(app.handle().clone()) {
+                tracing::warn!(error = %err, "daemon_client failed to spawn");
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
