@@ -313,12 +313,12 @@ impl TaskTracker {
         task.child = None;
         self.inc_dispatch_status("failed");
         self.emit_task_state(task_id, task.wave, "failed", duration_ms, task.commit_sha.as_deref());
-        // FEAT-014 (REQ-010): WorkerLifecycle::Failed for Pantheon sidebar.
+        // FEAT-014 (REQ-010) T-004: WorkerLifecycle::Failed with lineage from TaskRecord.
         self.emit_worker_lifecycle(
             WorkerLifecycleType::Failed,
             task_id,
-            None,
-            None,
+            task.parent_session_id.clone(),
+            task.root_session_id.clone(),
             None,
             Some(error_message),
             Some(duration_ms as u64),
