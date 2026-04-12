@@ -295,10 +295,20 @@ impl TaskTracker {
         task.status = TaskStatus::Failed;
         let duration_ms = task.started_at.elapsed().as_millis();
         task.exit_code = exit_code;
-        task.error_message = Some(error_message);
+        task.error_message = Some(error_message.clone());
         task.child = None;
         self.inc_dispatch_status("failed");
         self.emit_task_state(task_id, task.wave, "failed", duration_ms, task.commit_sha.as_deref());
+        // FEAT-014 (REQ-010): WorkerLifecycle::Failed for Pantheon sidebar.
+        self.emit_worker_lifecycle(
+            WorkerLifecycleType::Failed,
+            task_id,
+            None,
+            None,
+            None,
+            Some(error_message),
+            Some(duration_ms as u64),
+        );
         TransitionOutcome::Transitioned
     }
 
