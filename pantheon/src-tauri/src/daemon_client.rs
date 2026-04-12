@@ -169,6 +169,7 @@ pub fn spawn(app: AppHandle) -> Result<()> {
         token,
         last_seq: std::sync::atomic::AtomicU64::new(0),
         health: Mutex::new(HealthState::Starting),
+        last_emit: Mutex::new(Instant::now() - MIN_TRANSITION_DWELL * 2),
     });
 
     tauri::async_runtime::spawn(async move {
