@@ -214,7 +214,7 @@ async fn run_forever(app: AppHandle, state: Arc<ClientState>) {
 /// replay handshake, then race the inbound stream against a REST poll
 /// ticker until either one fails. Returns Ok on clean close, Err on any
 /// fault that should trigger a reconnect.
-async fn run_session<R: Runtime>(app: &AppHandle<R>, state: &Arc<ClientState>) -> Result<()> {
+async fn run_session(app: &AppHandle, state: &Arc<ClientState>) -> Result<()> {
     // Step 1 — initial REST pull so the sidebar has data BEFORE the WS
     // handshake finishes. If /api/state fails here, the daemon is likely
     // unreachable entirely and we should fail fast into the backoff.
