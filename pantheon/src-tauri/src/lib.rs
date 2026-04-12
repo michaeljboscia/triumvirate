@@ -4,6 +4,7 @@
 
 mod daemon_client;
 mod menu;
+mod pty;
 mod tray;
 
 use tauri::{RunEvent, WindowEvent};
