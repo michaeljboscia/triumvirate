@@ -41,6 +41,9 @@ pub struct TaskTracker {
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
     metrics: Option<Arc<DaemonMetrics>>,
     ws_events: Option<broadcast::Sender<String>>,
+    /// FEAT-014 (REQ-010): shared sequencer for WorkerLifecycle events.
+    /// None means WorkerLifecycle emission is disabled (legacy constructor).
+    sequencer: Option<Arc<EventSequencer>>,
 }
 
 impl Default for TaskTracker {
@@ -49,6 +52,7 @@ impl Default for TaskTracker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
             ws_events: None,
+            sequencer: None,
         }
     }
 }
