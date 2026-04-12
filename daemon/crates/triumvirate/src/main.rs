@@ -1746,6 +1746,212 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(SessionListResponse { sessions: out }))
     }
 
+    // FEAT-013 (REQ-020) T-009: GET /api/state — full daemon state snapshot.
+    // Bearer-auth-gated per-handler, identical pattern to the existing
+    // health/status handlers. Returns shared_types::StateResponse, which is
+    // the frozen T-002 contract (NO `sessions` field — named MCP sessions
+    // stay on /session/list).
+    async fn api_state(
+        State(state): State<DaemonRuntimeState>,
+        headers: HeaderMap,
+    ) -> Result<AxumJson<shared_types::StateResponse>, StatusCode> {
+        if !is_bearer_authorized(
+            headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            &state.token,
+        ) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        // Saturate on astronomically-long uptimes rather than panic.
+        let uptime_ms: u64 = state
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let workers = state.abe_tasks.snapshot_workers().await;
+        let fleet: Vec<shared_types::FleetBuild> = state
+            .fleet_v2_states
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        let last_event_seq = state
+            .last_event_seq
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Ok(AxumJson(shared_types::StateResponse {
+            version: daemon_core::VERSION.to_string(),
+            uptime_ms,
+            workers,
+            fleet,
+            last_event_seq,
+        }))
+    }
+
+    // FEAT-013 (REQ-020) T-009: GET /ws/v2 — replay-aware WebSocket upgrade.
+    // Auth is checked on the upgrade request BEFORE `on_upgrade` returns,
+    // so unauthenticated clients get a plain 401 and never switch protocols.
+    // Inside the upgraded socket we follow the canonical subscribe-before-read
+    // pattern: subscribe to `state.ws_events` FIRST, then parse the client's
+    // subscribe handshake, then read the replay buffer, then replay, then
+    // switch to live tail. All event frames (historical AND live) use the
+    // same `daemon_core::encode_ws_event("agent_stream", ...)` envelope —
+    // the only bare-JSON frames are the handshake ReplayResponse ack/close.
+    async fn ws_v2(
+        State(state): State<DaemonRuntimeState>,
+        headers: HeaderMap,
+        ws: axum::extract::WebSocketUpgrade,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if !is_bearer_authorized(
+            headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            &state.token,
+        ) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        ws.on_upgrade(move |mut socket| async move {
+            use axum::extract::ws::Message;
+            use shared_types::{AgentStreamEvent, ReplayRequest, ReplayResponse};
+            use tokio::sync::broadcast::error::RecvError;
+
+            // STEP 1 (critical): subscribe to the live broadcast BEFORE we
+            // read the replay buffer. This closes the race where an event
+            // lands between our replay read and our subscribe, which would
+            // then be dropped on the floor.
+            let mut live_rx = state.ws_events.subscribe();
+
+            // STEP 2: read the client's first message — must be a subscribe
+            // ReplayRequest. Anything else closes the socket.
+            let first_text = match socket.recv().await {
+                Some(Ok(Message::Text(text))) => text,
+                _ => {
+                    let _ = socket.close().await;
+                    return;
+                }
+            };
+            let req: ReplayRequest = match serde_json::from_str(&first_text) {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = socket.close().await;
+                    return;
+                }
+            };
+            if req.action != "subscribe" {
+                let _ = socket.close().await;
+                return;
+            }
+
+            // STEP 3: read the replay snapshot against the client's last_seq.
+            let replay = state.replay_buffer.replay_since(req.last_seq);
+
+            match replay {
+                daemon_core::ReplayResult::OutOfRange { oldest_seq } => {
+                    // Send a BARE JSON ReplayResponse (no envelope). The
+                    // top-level `replay` field is how clients distinguish
+                    // handshake frames from event frames.
+                    let resp = ReplayResponse {
+                        replay: "out_of_range".to_string(),
+                        oldest_seq: Some(oldest_seq),
+                    };
+                    if let Ok(body) = serde_json::to_string(&resp) {
+                        let _ = socket.send(Message::Text(body.into())).await;
+                    }
+                    let _ = socket.close().await;
+                }
+                daemon_core::ReplayResult::Events(events) => {
+                    // Send the "ok" handshake ack (bare ReplayResponse).
+                    let ack = ReplayResponse {
+                        replay: "ok".to_string(),
+                        oldest_seq: None,
+                    };
+                    let ack_body = match serde_json::to_string(&ack) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            let _ = socket.close().await;
+                            return;
+                        }
+                    };
+                    if socket.send(Message::Text(ack_body.into())).await.is_err() {
+                        return;
+                    }
+
+                    // Track max seq sent so we can dedupe the inevitable
+                    // overlap between historical replay and live tail.
+                    let mut max_sent = req.last_seq;
+
+                    // Historical replay: every event goes through the SAME
+                    // envelope shape as the live tail. This is the Round 1
+                    // audit's critical finding — bare-event replay would
+                    // break clients at the replay→live transition.
+                    for event in &events {
+                        let payload = match serde_json::to_value(event) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let envelope =
+                            daemon_core::encode_ws_event("agent_stream", payload);
+                        if socket.send(Message::Text(envelope.into())).await.is_err() {
+                            return;
+                        }
+                        max_sent = max_sent.max(event.seq());
+                    }
+
+                    // Live tail: the publisher has already encoded the
+                    // envelope, so we forward the raw string after a dedup
+                    // check. Parse it only to extract `seq` — do NOT
+                    // re-serialize, that would change `ts_ms`.
+                    loop {
+                        match live_rx.recv().await {
+                            Ok(envelope) => {
+                                let mut skip = false;
+                                if let Ok(value) =
+                                    serde_json::from_str::<serde_json::Value>(&envelope)
+                                {
+                                    if value.get("type").and_then(|v| v.as_str())
+                                        == Some("agent_stream")
+                                    {
+                                        if let Some(payload) = value.get("payload") {
+                                            if let Ok(event) = serde_json::from_value::<
+                                                AgentStreamEvent,
+                                            >(
+                                                payload.clone()
+                                            ) {
+                                                let seq = event.seq();
+                                                if seq <= max_sent {
+                                                    skip = true;
+                                                } else {
+                                                    max_sent = seq;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if skip {
+                                    continue;
+                                }
+                                if socket
+                                    .send(Message::Text(envelope.into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(RecvError::Lagged(_)) => {
+                                // Canonical close-and-reconnect. The client
+                                // will reopen /ws/v2 with its updated
+                                // last_seq; trying to recover in place is
+                                // how gaps sneak in.
+                                let _ = socket.close().await;
+                                break;
+                            }
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     async fn abe_task_complete_route(
         State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
