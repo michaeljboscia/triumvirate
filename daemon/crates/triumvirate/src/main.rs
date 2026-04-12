@@ -5757,15 +5757,12 @@ mod pantheon_rest_tests {
 
     #[tokio::test]
     async fn api_fleet_empty_returns_empty_builds_array() {
-        let state = make_state("tok-f-2");
+        let state = make_state(TEST_TOKEN);
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/fleet")
-            .header(AUTHORIZATION, "Bearer tok-f-2")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_with_bearer("/api/fleet", TEST_TOKEN))
+            .await
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp.into_body()).await;
         assert!(
