@@ -2394,6 +2394,13 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/api/workers", get(api_workers))
         .route("/api/fleet", get(api_fleet))
         .route("/api/fleet/{build_id}", get(api_fleet_by_id))
+        // T-009 (REQ-020, FEAT-013): Pantheon v3.9.0 state snapshot +
+        // replay-aware WebSocket. /api/state takes DaemonRuntimeState like
+        // the T-008 routes, and /ws/v2 uses axum's WebSocketUpgrade
+        // extractor. Both are bearer-auth-gated per-handler. The legacy
+        // /ws route below is untouched so `triumvirate watch` still works.
+        .route("/api/state", get(api_state))
+        .route("/ws/v2", get(ws_v2))
         .route(
             "/ws",
             get_service(daemon_http::ws_route.with_state(http_state.clone())),
