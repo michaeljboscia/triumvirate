@@ -6067,3 +6067,606 @@ mod pantheon_rest_tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
+
+// ---------------------------------------------------------------------------
+// T-009 (REQ-020, FEAT-013) reality tests — Pantheon v3.9.0 state snapshot
+// + replay-aware WebSocket handshake.
+//
+// Every test in this module stands up a real Axum server bound to a random
+// port (`TcpListener::bind("127.0.0.1:0")`) and talks to it with a real
+// tokio_tungstenite WebSocket client + reqwest HTTP client. No in-process
+// fakes, no mocked handlers — these exercise the exact same code path
+// production `run_daemon` uses, wired with the real module-scope `api_state`
+// / `ws_v2` handlers and the real `daemon_http::ws_route` for the legacy
+// regression check.
+//
+// Bake-off credit: Apollo wrote the architecture (module-scope handlers
+// imported directly into the test module via `super::api_state` /
+// `super::ws_v2`). Athena's `read_text` + `ws_request_with_bearer` helpers
+// are cherry-picked in from her submission per Gemini's judge verdict —
+// they handle WebSocket ping/pong/close frames gracefully in tests where
+// Apollo's raw `stream.next().await.expect(...).expect(...)` pattern would
+// be brittle under heartbeats.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod pantheon_ws_replay_tests {
+    use super::*;
+    use axum::Router;
+    use axum::routing::get;
+    use daemon_core::{DaemonState, encode_ws_event};
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use shared_types::{
+        AgentStreamEvent, FleetBuild, ReplayResponse, SessionState, StateResponse,
+    };
+    use std::collections::{HashMap, VecDeque};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::{Mutex, broadcast};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    /// Helper: build a real DaemonRuntimeState wired to a fresh broadcast
+    /// channel + a temp TokenDb for the legacy /ws route's DaemonHttpState.
+    /// Returns the state plus a tempdir guard (keep it alive for the
+    /// lifetime of the test — dropping it removes the sqlite file).
+    async fn make_test_state(
+        token: &str,
+    ) -> (
+        DaemonState<abe::task_tracker::TaskTracker>,
+        daemon_http::DaemonHttpState,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let ws_events = broadcast::channel::<String>(256).0;
+        let abe_tasks = abe::task_tracker::TaskTracker::with_observability(
+            metrics.clone(),
+            Some(ws_events.clone()),
+        );
+        let sessions: HashMap<String, SessionState> = HashMap::new();
+        let state = DaemonState::new(
+            token.to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "127.0.0.1:0".to_string(),
+            Arc::new(Mutex::new(sessions)),
+            None,
+            abe_tasks,
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            metrics.clone(),
+            ws_events.clone(),
+        );
+        let token_db_path = tmp.path().join("tokens.db");
+        let token_db = daemon_http::open_token_db(&token_db_path).expect("token db");
+        let http_state = daemon_http::DaemonHttpState {
+            token: state.token.clone(),
+            queues: state.queues.clone(),
+            ledger_project_lru: state.ledger_project_lru.clone(),
+            marker_parse_window: state.marker_parse_window.clone(),
+            metrics: state.metrics.clone(),
+            ws_events: state.ws_events.clone(),
+            token_db,
+            ask_agent_executor: Arc::new(|_req| {
+                Box::pin(async {
+                    Err::<shared_types::AskAgentResponse, String>(
+                        "ask_agent not used in ws replay tests".to_string(),
+                    )
+                })
+            }),
+        };
+        (state, http_state, tmp)
+    }
+
+    /// Helper: construct the subset of the production Router that matters
+    /// for T-009 testing. Mirrors how `run_daemon` wires the T-009 handlers
+    /// plus the legacy `/ws` route for the backwards-compat test. The key
+    /// architectural property: both /api/state and /ws/v2 bind to the REAL
+    /// module-scope production handlers via `super::api_state` /
+    /// `super::ws_v2` — no test copies, no shadow definitions.
+    fn make_test_router(
+        state: DaemonState<abe::task_tracker::TaskTracker>,
+        http_state: daemon_http::DaemonHttpState,
+    ) -> Router {
+        Router::new()
+            .route("/api/state", get(super::api_state))
+            .route("/ws/v2", get(super::ws_v2))
+            .route(
+                "/ws",
+                axum::routing::get_service(
+                    daemon_http::ws_route.with_state(http_state),
+                ),
+            )
+            .with_state(state)
+    }
+
+    /// Helper: start an ephemeral Axum server on a random 127.0.0.1 port
+    /// and return the bound SocketAddr plus the tempdir guard and the
+    /// server task handle. The caller must call `handle.abort()` at the
+    /// end of the test so the runtime can shut down cleanly.
+    async fn start_ephemeral_server(
+        token: &str,
+    ) -> (
+        SocketAddr,
+        DaemonState<abe::task_tracker::TaskTracker>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (state, http_state, tmp) = make_test_state(token).await;
+        let state_for_router = state.clone();
+        let app = make_test_router(state_for_router, http_state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, state, tmp, handle)
+    }
+
+    /// Helper: build a ToolCall event at the given seq.
+    fn make_event(seq: u64) -> AgentStreamEvent {
+        AgentStreamEvent::ToolCall {
+            agent: "codex".to_string(),
+            tool_name: "bash".to_string(),
+            args_summary: format!("echo {seq}"),
+            seq,
+        }
+    }
+
+    /// Cherry-picked from T-009 Athena per Gemini judge: build a
+    /// tungstenite client request carrying an Authorization header.
+    /// Cleaner than inline `.into_client_request()?` + `.headers_mut()`
+    /// chains at every call site.
+    fn ws_request_with_bearer(url: &str, token: &str) -> WsRequest {
+        let mut req = url.into_client_request().expect("ws request");
+        req.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header value"),
+        );
+        req
+    }
+
+    /// Cherry-picked from T-009 Athena per Gemini judge: build a
+    /// tungstenite client request with NO Authorization header. For the
+    /// missing-bearer rejection test.
+    fn ws_request_plain(url: &str) -> WsRequest {
+        url.into_client_request().expect("ws request")
+    }
+
+    /// Cherry-picked from T-009 Athena per Gemini judge: read the next
+    /// TEXT frame from the WebSocket, transparently swallowing any
+    /// Ping/Pong/Binary/Frame control frames in between. Returns None on
+    /// Close or error. Apollo's raw `stream.next().await.expect(...)` would
+    /// be brittle if tungstenite ever interleaves a heartbeat; this helper
+    /// is the correct way to read text payloads from a live socket.
+    async fn read_text(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Option<String> {
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(WsMessage::Text(text)) => return Some(text.to_string()),
+                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => continue,
+                Ok(WsMessage::Close(_)) => return None,
+                Ok(WsMessage::Binary(_)) => continue,
+                Ok(WsMessage::Frame(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Helper: open a /ws/v2 WebSocket with the given bearer header (or
+    /// no header, for the 401 rejection test).
+    async fn connect_ws_v2(
+        addr: SocketAddr,
+        bearer: Option<&str>,
+    ) -> tokio_tungstenite::tungstenite::Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        let url = format!("ws://{addr}/ws/v2");
+        let req = match bearer {
+            Some(b) => ws_request_with_bearer(&url, b),
+            None => ws_request_plain(&url),
+        };
+        let (stream, _resp) = tokio_tungstenite::connect_async(req).await?;
+        Ok(stream)
+    }
+
+    // Test 1 — GET /api/state returns a full StateResponse.
+    #[tokio::test]
+    async fn api_state_returns_full_snapshot_with_version_and_uptime() {
+        let token = "test-token-t009-1";
+        let (addr, state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        let child_a = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn a");
+        state
+            .abe_tasks
+            .register(
+                "T-STATE-A".to_string(),
+                1,
+                Arc::new(Mutex::new(child_a)),
+                None,
+                Some("pantheon-parent".to_string()),
+                Some("pantheon-root".to_string()),
+            )
+            .await;
+        let child_b = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn b");
+        state
+            .abe_tasks
+            .register(
+                "T-STATE-B".to_string(),
+                1,
+                Arc::new(Mutex::new(child_b)),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        {
+            let mut guard = state.fleet_v2_states.lock().await;
+            guard.insert(
+                "build-t009-1".to_string(),
+                FleetBuild {
+                    build_id: "build-t009-1".to_string(),
+                    task_count: 3,
+                    completed: 1,
+                    failed: 0,
+                    in_progress: 1,
+                    queued: 1,
+                    tasks: vec![],
+                },
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("send /api/state");
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: StateResponse = resp.json().await.expect("parse StateResponse");
+
+        assert_eq!(body.version, daemon_core::VERSION.to_string());
+        assert!(body.uptime_ms > 0);
+        assert_eq!(body.workers.len(), 2);
+        assert_eq!(body.fleet.len(), 1);
+        assert_eq!(body.fleet[0].build_id, "build-t009-1");
+        let _seq: u64 = body.last_event_seq;
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 2 — GET /api/state with no Authorization header returns 401.
+    #[tokio::test]
+    async fn api_state_rejects_missing_bearer() {
+        let token = "test-token-t009-2";
+        let (addr, _state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/state"))
+            .send()
+            .await
+            .expect("send /api/state");
+        assert_eq!(resp.status().as_u16(), 401);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 3 — /ws/v2 replays events within range wrapped in the envelope.
+    #[tokio::test]
+    async fn ws_v2_replays_events_within_range_wrapped_in_envelope() {
+        let token = "test-token-t009-3";
+        let (addr, state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        for i in 1..=5u64 {
+            state.replay_buffer.push(make_event(i));
+        }
+
+        let mut stream = connect_ws_v2(addr, Some(token)).await.expect("connect");
+        stream
+            .send(WsMessage::Text(
+                serde_json::to_string(&shared_types::ReplayRequest {
+                    action: "subscribe".to_string(),
+                    last_seq: 0,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .expect("send subscribe");
+
+        let ack_text = read_text(&mut stream).await.expect("ack frame");
+        let ack: ReplayResponse = serde_json::from_str(&ack_text).expect("parse ack");
+        assert_eq!(ack.replay, "ok");
+        assert!(ack.oldest_seq.is_none());
+
+        for expected_seq in 1..=5u64 {
+            let text = read_text(&mut stream)
+                .await
+                .unwrap_or_else(|| panic!("expected frame for seq {expected_seq}"));
+            let value: serde_json::Value =
+                serde_json::from_str(&text).expect("parse envelope");
+            assert_eq!(
+                value.get("type").and_then(|v| v.as_str()),
+                Some("agent_stream")
+            );
+            let payload = value.get("payload").expect("payload").clone();
+            let event: AgentStreamEvent =
+                serde_json::from_value(payload).expect("parse payload");
+            assert_eq!(event.seq(), expected_seq);
+        }
+
+        let _ = stream.close(None).await;
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 4 — /ws/v2 returns out_of_range when client is too far behind.
+    #[tokio::test]
+    async fn ws_v2_returns_out_of_range_when_client_too_far_behind() {
+        let token = "test-token-t009-4";
+        let (addr, state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        // 1500 events into a 1000-capacity buffer → oldest evicts to 501.
+        for i in 1..=1500u64 {
+            state.replay_buffer.push(make_event(i));
+        }
+
+        let mut stream = connect_ws_v2(addr, Some(token)).await.expect("connect");
+        stream
+            .send(WsMessage::Text(
+                serde_json::to_string(&shared_types::ReplayRequest {
+                    action: "subscribe".to_string(),
+                    last_seq: 200,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .expect("send subscribe");
+
+        let text = read_text(&mut stream).await.expect("out_of_range frame");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("parse out_of_range");
+        assert!(value.get("type").is_none(), "must not be envelope-wrapped");
+        assert!(value.get("payload").is_none());
+        assert_eq!(
+            value.get("replay").and_then(|v| v.as_str()),
+            Some("out_of_range")
+        );
+        let resp: ReplayResponse =
+            serde_json::from_str(&text).expect("ReplayResponse");
+        assert_eq!(resp.replay, "out_of_range");
+        assert_eq!(resp.oldest_seq, Some(501));
+
+        // Socket should close after the out_of_range frame.
+        assert!(read_text(&mut stream).await.is_none());
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 5 — boundary replay.
+    #[tokio::test]
+    async fn ws_v2_at_boundary_replays_correctly_with_envelope() {
+        let token = "test-token-t009-5";
+        let (addr, state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        for i in 50..=60u64 {
+            state.replay_buffer.push(make_event(i));
+        }
+
+        let mut stream = connect_ws_v2(addr, Some(token)).await.expect("connect");
+        stream
+            .send(WsMessage::Text(
+                serde_json::to_string(&shared_types::ReplayRequest {
+                    action: "subscribe".to_string(),
+                    last_seq: 50,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .expect("send subscribe");
+
+        let ack_text = read_text(&mut stream).await.expect("ack");
+        let ack: ReplayResponse = serde_json::from_str(&ack_text).expect("parse ack");
+        assert_eq!(ack.replay, "ok");
+
+        for expected_seq in 51..=60u64 {
+            let text = read_text(&mut stream).await.expect("frame");
+            let value: serde_json::Value =
+                serde_json::from_str(&text).expect("parse envelope");
+            assert_eq!(
+                value.get("type").and_then(|v| v.as_str()),
+                Some("agent_stream")
+            );
+            let event: AgentStreamEvent =
+                serde_json::from_value(value.get("payload").expect("payload").clone())
+                    .expect("parse payload");
+            assert_eq!(event.seq(), expected_seq);
+            assert_ne!(event.seq(), 50);
+        }
+
+        let _ = stream.close(None).await;
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 6 — live tail after historical replay preserves the envelope.
+    #[tokio::test]
+    async fn ws_v2_live_tail_after_historical_replay_preserves_envelope() {
+        let token = "test-token-t009-6";
+        let (addr, state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        for i in 1..=3u64 {
+            state.replay_buffer.push(make_event(i));
+        }
+
+        let mut stream = connect_ws_v2(addr, Some(token)).await.expect("connect");
+        stream
+            .send(WsMessage::Text(
+                serde_json::to_string(&shared_types::ReplayRequest {
+                    action: "subscribe".to_string(),
+                    last_seq: 0,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .expect("send subscribe");
+
+        let _ = read_text(&mut stream).await.expect("ack");
+        for _ in 0..3 {
+            let text = read_text(&mut stream).await.expect("historical frame");
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(
+                value.get("type").and_then(|v| v.as_str()),
+                Some("agent_stream")
+            );
+        }
+
+        let new_event = make_event(4);
+        let new_envelope = encode_ws_event(
+            "agent_stream",
+            serde_json::to_value(&new_event).unwrap(),
+        );
+        let _ = state.ws_events.send(new_envelope);
+
+        let text = tokio::time::timeout(Duration::from_millis(500), read_text(&mut stream))
+            .await
+            .expect("timeout waiting for live tail")
+            .expect("live frame");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("parse live");
+        assert_eq!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some("agent_stream"),
+            "live frame must use the SAME envelope as replay"
+        );
+        let event: AgentStreamEvent =
+            serde_json::from_value(value.get("payload").expect("payload").clone())
+                .expect("parse payload");
+        assert_eq!(event.seq(), 4);
+
+        let _ = stream.close(None).await;
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 7 — dedup between historical replay and live tail.
+    #[tokio::test]
+    async fn ws_v2_dedups_overlap_between_historical_and_live() {
+        let token = "test-token-t009-7";
+        let (addr, state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        for i in 1..=5u64 {
+            state.replay_buffer.push(make_event(i));
+        }
+
+        let mut stream = connect_ws_v2(addr, Some(token)).await.expect("connect");
+        stream
+            .send(WsMessage::Text(
+                serde_json::to_string(&shared_types::ReplayRequest {
+                    action: "subscribe".to_string(),
+                    last_seq: 0,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .expect("send subscribe");
+
+        let _ = read_text(&mut stream).await.expect("ack");
+        for _ in 0..5 {
+            let _ = read_text(&mut stream).await.expect("historical frame");
+        }
+
+        let duplicate = encode_ws_event(
+            "agent_stream",
+            serde_json::to_value(&make_event(3)).unwrap(),
+        );
+        let _ = state.ws_events.send(duplicate);
+
+        let timed = tokio::time::timeout(Duration::from_millis(200), read_text(&mut stream)).await;
+        match timed {
+            Err(_) => {} // timeout — dedup suppressed the frame
+            Ok(Some(frame)) => panic!("expected no frame (dedup), got {frame:?}"),
+            Ok(None) => panic!("stream ended unexpectedly during dedup test"),
+        }
+
+        let _ = stream.close(None).await;
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 8 — /ws/v2 rejects missing bearer BEFORE the protocol switch.
+    #[tokio::test]
+    async fn ws_v2_rejects_missing_bearer_on_upgrade() {
+        let token = "test-token-t009-8";
+        let (addr, _state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        let result = connect_ws_v2(addr, None).await;
+        assert!(
+            result.is_err(),
+            "expected connect_ws_v2 without bearer to fail with 401"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Test 9 — legacy /ws route unchanged (backwards-compat for `triumvirate watch`).
+    #[tokio::test]
+    async fn legacy_ws_route_unchanged() {
+        let token = "test-token-t009-9";
+        let (addr, _state, _tmp, handle) = start_ephemeral_server(token).await;
+
+        let url = format!("ws://{addr}/ws");
+        let (mut stream, _resp) =
+            tokio_tungstenite::connect_async(url).await.expect("connect legacy ws");
+
+        let expected = [
+            "agent_state",
+            "fleet_progress",
+            "ledger_health",
+            "review_completed",
+        ];
+        for expected_type in expected {
+            let text = read_text(&mut stream).await.expect("bootstrap frame");
+            let value: serde_json::Value =
+                serde_json::from_str(&text).expect("parse bootstrap");
+            assert_eq!(
+                value.get("type").and_then(|v| v.as_str()),
+                Some(expected_type),
+                "legacy /ws bootstrap out of order"
+            );
+        }
+
+        let _ = stream.close(None).await;
+        handle.abort();
+        let _ = handle.await;
+    }
+}
