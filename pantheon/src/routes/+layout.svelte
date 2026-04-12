@@ -24,7 +24,7 @@
   // alongside the tauri-plugin-prevent-default restoration once the
   // WebProcess crash loop is confirmed fixed.
   // import { onMount } from "svelte";
-  // import { daemon } from "$lib/stores/daemon";
+  // import { daemon } from "$lib/stores/daemon.svelte";
 
   let { children } = $props();
 
