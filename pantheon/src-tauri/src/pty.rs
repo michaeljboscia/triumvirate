@@ -134,8 +134,39 @@ pub fn pty_spawn(
         builder.arg(arg);
     }
     builder.cwd(&cwd);
-    // T-019 (separate task) adds PANTHEON_SESSION_ID here. For now we
-    // inherit whatever the parent Pantheon process has in its env.
+
+    // T-016 env inheritance: portable-pty gives the child a near-empty
+    // environment by default — notably PATH is just "/usr/bin:/bin:
+    // /usr/sbin:/sbin" which doesn't include Homebrew, Volta, or the
+    // user's ~/.claude/local install. Iterate the parent process env
+    // and apply each var so the spawned `claude` can be found.
+    // This also propagates HOME, LANG, TERM-related vars that Claude
+    // needs for correct rendering. The caveat: when Pantheon is
+    // double-clicked from Finder (launchd), the parent env is itself
+    // stripped; the user may need a PATH that includes the install
+    // location baked into the launchd environment. For the dev path
+    // this is sufficient.
+    for (k, v) in std::env::vars() {
+        builder.env(k, v);
+    }
+
+    // Belt-and-suspenders PATH: prepend the common install locations
+    // for Claude CLI so a launchd-stripped environment still finds it.
+    // This runs AFTER the inherit loop above, so if PATH was already
+    // set by inheritance we prepend to it; otherwise we set from scratch.
+    let extra_path = "/opt/homebrew/bin:/usr/local/bin";
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_str = home.to_string_lossy();
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let augmented = format!(
+            "{home_str}/.claude/local:{home_str}/.volta/bin:{extra_path}:{existing}"
+        );
+        builder.env("PATH", augmented);
+    } else {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        builder.env("PATH", format!("{extra_path}:{existing}"));
+    }
+    // T-019 (separate task) adds PANTHEON_SESSION_ID here.
 
     // 3. Spawn the child into the PTY's slave side.
     let child = pair
