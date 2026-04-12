@@ -854,7 +854,14 @@ mod tests {
             .spawn()
             .expect("spawn");
         tracker
-            .register("T-LEGACY-01".to_string(), 1, Arc::new(Mutex::new(child)), None)
+            .register(
+                "T-LEGACY-01".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+            )
             .await;
 
         // Should still emit abe_task_state events, but no WorkerLifecycle
