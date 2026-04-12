@@ -20,15 +20,18 @@
   // future sprint — the spec is dark-only for v4.0.
 
   import "../app.css";
-  import { onMount } from "svelte";
-  import { daemon } from "$lib/stores/daemon";
+  // T-020 crash-loop diagnostic: daemon store silenced. Re-enable
+  // alongside the tauri-plugin-prevent-default restoration once the
+  // WebProcess crash loop is confirmed fixed.
+  // import { onMount } from "svelte";
+  // import { daemon } from "$lib/stores/daemon";
 
   let { children } = $props();
 
-  onMount(() => {
-    daemon.init();
-    return () => daemon.destroy();
-  });
+  // onMount(() => {
+  //   daemon.init();
+  //   return () => daemon.destroy();
+  // });
 </script>
 
 {@render children()}
