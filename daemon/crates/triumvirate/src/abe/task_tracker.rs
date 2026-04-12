@@ -89,6 +89,24 @@ impl TaskTracker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             metrics: Some(metrics),
             ws_events,
+            sequencer: None,
+        }
+    }
+
+    /// FEAT-014 (REQ-010): Full observability with WorkerLifecycle event
+    /// emission enabled. Shares a sequencer with the streaming executor so
+    /// WorkerLifecycle events have monotonic seq numbers aligned with the
+    /// rest of the event stream.
+    pub fn with_pantheon_observability(
+        metrics: Arc<DaemonMetrics>,
+        ws_events: broadcast::Sender<String>,
+        sequencer: Arc<EventSequencer>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Some(metrics),
+            ws_events: Some(ws_events),
+            sequencer: Some(sequencer),
         }
     }
 
