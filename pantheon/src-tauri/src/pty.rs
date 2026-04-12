@@ -176,7 +176,17 @@ pub fn pty_spawn(
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
 
-    // T-019 (separate task) adds PANTHEON_SESSION_ID here.
+    // T-019 (REQ-033): stamp the child with a unique PANTHEON_SESSION_ID
+    // so any agent (Claude, Codex, Gemini) spawned inside this PTY can
+    // be traced back to this specific Pantheon panel. The UUID also
+    // propagates to every child of the Claude process — including the
+    // MCP stdio proxy — so daemon-side worker lineage (handled by the
+    // v3.9.0 DaemonState session-map) can associate dispatched workers
+    // with their originating shell. The UUID is returned from this
+    // command so the frontend can stash it in the sessions store for
+    // later cross-reference against /api/workers data.
+    let pantheon_session_id = uuid::Uuid::new_v4().to_string();
+    builder.env("PANTHEON_SESSION_ID", &pantheon_session_id);
 
     // 3. Spawn the child into the PTY's slave side.
     let child = pair
