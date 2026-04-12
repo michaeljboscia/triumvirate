@@ -455,6 +455,31 @@ pub struct DaemonState<TAbeTasks> {
     pub marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
     pub metrics: Arc<metrics::DaemonMetrics>,
     pub ws_events: tokio::sync::broadcast::Sender<String>,
+    /// FEAT-013 (REQ-020) T-007.5: shared event replay ring buffer.
+    /// Filled by a single startup task in `run_daemon` that subscribes to
+    /// `ws_events` BEFORE any other consumer (subscribe-before-read pattern)
+    /// and pushes parsed `AgentStreamEvent` items into the buffer. Read by
+    /// the WebSocket /ws/v2 handshake handler when a client reconnects with
+    /// `last_seq`. Defaults to a 1000-event capacity.
+    pub replay_buffer: Arc<replay::EventReplayBuffer>,
+    /// FEAT-012 (REQ-017) T-007.5: v3.9.0-shape fleet-of-builds store, keyed
+    /// by `build_id`. Distinct from `McpBridge.fleet_states`, which uses the
+    /// legacy `FleetStatusResponse` shape for the existing MCP fleet tools.
+    /// Read by GET /api/fleet and /api/fleet/{build_id}. Starts empty until
+    /// a future task wires `dispatch_codex_worktree` to publish FleetBuild
+    /// entries here. The empty state satisfies T-008's `done_when` clause
+    /// "Empty responses when no workers/fleet active."
+    pub fleet_v2_states: Arc<Mutex<HashMap<String, FleetBuild>>>,
+    /// FEAT-013 (REQ-020) T-007.5: monotonic counter behind WS events.
+    /// Bridged into AgentStreamEvent::seq via the existing EventSequencer in
+    /// triumvirate; this field is the daemon-state-level mirror that
+    /// /api/state surfaces to clients as `last_event_seq`. Updated by the
+    /// same buffer-fill task that pushes to `replay_buffer`.
+    pub last_event_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// FEAT-013 (REQ-020) T-007.5: daemon process start instant.
+    /// Captured in `run_daemon` and used by /api/state to compute `uptime_ms`
+    /// without requiring a wall-clock subtraction.
+    pub started_at: std::time::Instant,
 }
 
 impl<TAbeTasks> DaemonState<TAbeTasks> {
@@ -482,6 +507,10 @@ impl<TAbeTasks> DaemonState<TAbeTasks> {
             marker_parse_window,
             metrics,
             ws_events,
+            replay_buffer: Arc::new(replay::EventReplayBuffer::default_capacity()),
+            fleet_v2_states: Arc::new(Mutex::new(HashMap::new())),
+            last_event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            started_at: std::time::Instant::now(),
         }
     }
 }
