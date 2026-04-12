@@ -133,6 +133,11 @@ struct ClientState {
 /// every window and so the tray icon can be swapped via the already-
 /// registered `update_daemon_state` command path.
 pub fn spawn(app: AppHandle) -> Result<()> {
+    // Concrete AppHandle (Wry runtime) — Pantheon is desktop-only per
+    // REQ-028, so there's no payoff to generic `AppHandle<R>` and keeping
+    // it concrete lets us call `#[tauri::command]` functions like
+    // `tray::update_daemon_state` directly. Those commands are baked to
+    // the concrete runtime type by the macro and can't accept a generic.
     let token = load_token().context("failed to load ~/.triumvirate/daemon.token")?;
     let base = std::env::var("PANTHEON_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_HTTP.into());
     let base_http = base.trim_end_matches('/').to_string();
