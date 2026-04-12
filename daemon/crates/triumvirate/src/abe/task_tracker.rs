@@ -1092,6 +1092,106 @@ mod tests {
         }
     }
 
+    /// FEAT-012 (REQ-017) T-007.5 reality test:
+    /// snapshot_workers must enumerate every registered task and surface
+    /// the lineage fields. A stub that returns Vec::new() fails the count;
+    /// a stub that hardcodes Vec::with_capacity(2).push(default) fails the
+    /// per-task assertions.
+    #[tokio::test]
+    async fn snapshot_workers_enumerates_all_tracked_tasks_with_lineage() {
+        let tracker = TaskTracker::default();
+
+        // Register two tasks with distinct lineage.
+        let child_a = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-SNAP-A".to_string(),
+                1,
+                Arc::new(Mutex::new(child_a)),
+                None,
+                Some("pantheon-parent-A".to_string()),
+                Some("pantheon-root-A".to_string()),
+            )
+            .await;
+
+        let child_b = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-SNAP-B".to_string(),
+                2,
+                Arc::new(Mutex::new(child_b)),
+                None,
+                None, // legacy non-Pantheon caller
+                None,
+            )
+            .await;
+
+        let snapshot = tracker.snapshot_workers().await;
+        assert_eq!(snapshot.len(), 2, "expected 2 worker entries");
+
+        // Build a lookup so we can assert per-task without depending on order.
+        let by_id: std::collections::HashMap<&str, &shared_types::WorkerInfo> = snapshot
+            .iter()
+            .map(|w| (w.task_id.as_deref().unwrap_or(""), w))
+            .collect();
+
+        let a = by_id.get("T-SNAP-A").expect("T-SNAP-A in snapshot");
+        assert_eq!(a.session_id, "T-SNAP-A");
+        assert_eq!(a.task_id.as_deref(), Some("T-SNAP-A"));
+        assert_eq!(a.agent, "codex");
+        assert_eq!(a.name, "codex-worker-T-SNAP-A");
+        assert_eq!(a.status, "working");
+        assert_eq!(a.parent_session_id.as_deref(), Some("pantheon-parent-A"));
+        assert_eq!(a.root_session_id.as_deref(), Some("pantheon-root-A"));
+        assert!(a.started_at.starts_with("20"), "RFC 3339 timestamp expected");
+
+        let b = by_id.get("T-SNAP-B").expect("T-SNAP-B in snapshot");
+        assert_eq!(b.session_id, "T-SNAP-B");
+        assert_eq!(b.parent_session_id, None);
+        assert_eq!(b.root_session_id, None);
+    }
+
+    /// FEAT-012 (REQ-017) T-007.5 reality test:
+    /// snapshot_workers reflects the post-completion status correctly,
+    /// not just the initial Working state. A stub that always returns
+    /// status="working" fails this.
+    #[tokio::test]
+    async fn snapshot_workers_reflects_post_completion_status() {
+        let tracker = TaskTracker::default();
+        let child = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-SNAP-DONE".to_string(),
+                0,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+            )
+            .await;
+        let _ = tracker
+            .mark_completed(
+                "T-SNAP-DONE",
+                "abc123".to_string(),
+                vec![],
+                String::new(),
+                None,
+                None,
+            )
+            .await;
+        let snap = tracker.snapshot_workers().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].status, "completed");
+    }
+
+    /// FEAT-012 (REQ-017) T-007.5 reality test: empty tracker returns empty snapshot.
+    #[tokio::test]
+    async fn snapshot_workers_empty_tracker_returns_empty_vec() {
+        let tracker = TaskTracker::default();
+        let snap = tracker.snapshot_workers().await;
+        assert!(snap.is_empty());
+    }
+
     /// Verify that the legacy constructor (without sequencer) does NOT emit
     /// WorkerLifecycle events. This is the backwards-compat guarantee.
     #[tokio::test]
