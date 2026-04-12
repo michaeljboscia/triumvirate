@@ -112,7 +112,7 @@ pub fn pty_spawn(
     cwd: String,
     cmd: String,
     args: Vec<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     // 1. Open the PTY pair. The default size must be non-zero; anything
     // less than 1 row or 1 col makes the child think the terminal is
     // invisible and many apps (including Claude Code) refuse to draw.
