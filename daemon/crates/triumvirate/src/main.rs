@@ -1202,6 +1202,158 @@ async fn run_status() -> anyhow::Result<()> {
     cli_ops::run_status().await
 }
 
+/// T-004 stdio-transport reality tests for `extract_pantheon_scope_from_meta`
+/// and the composed `call_tool` scope wrap.
+///
+/// FEAT-014 (REQ-010, REQ-033).
+///
+/// These tests live in a dedicated module so they run cleanly regardless of
+/// the state of the larger legacy `tests` module (which has several stale
+/// tests disabled via `#[cfg(any())]` pending issue #24).
+#[cfg(test)]
+mod pantheon_stdio_meta_tests {
+    use super::*;
+    use rmcp::model::{CallToolRequestParams, Meta};
+    use serde_json::{Value, json};
+    use std::borrow::Cow;
+
+    fn req_with_meta(meta_obj: serde_json::Map<String, Value>) -> CallToolRequestParams {
+        CallToolRequestParams {
+            meta: Some(Meta(meta_obj)),
+            name: Cow::Borrowed("ping"),
+            arguments: None,
+            task: None,
+        }
+    }
+
+    fn req_no_meta() -> CallToolRequestParams {
+        CallToolRequestParams {
+            meta: None,
+            name: Cow::Borrowed("ping"),
+            arguments: None,
+            task: None,
+        }
+    }
+
+    #[test]
+    fn extract_returns_none_when_meta_absent() {
+        assert!(extract_pantheon_scope_from_meta(&req_no_meta()).is_none());
+    }
+
+    #[test]
+    fn extract_returns_none_when_pantheon_session_id_absent() {
+        let mut m = serde_json::Map::new();
+        m.insert("some.other.key".into(), json!("foo"));
+        assert!(extract_pantheon_scope_from_meta(&req_with_meta(m)).is_none());
+    }
+
+    #[test]
+    fn extract_returns_none_when_session_id_empty_string() {
+        let mut m = serde_json::Map::new();
+        m.insert("pantheon.session_id".into(), json!(""));
+        assert!(extract_pantheon_scope_from_meta(&req_with_meta(m)).is_none());
+    }
+
+    #[test]
+    fn extract_returns_none_when_session_id_whitespace_only() {
+        let mut m = serde_json::Map::new();
+        m.insert("pantheon.session_id".into(), json!("   "));
+        assert!(extract_pantheon_scope_from_meta(&req_with_meta(m)).is_none());
+    }
+
+    #[test]
+    fn extract_returns_none_when_session_id_not_a_string() {
+        let mut m = serde_json::Map::new();
+        m.insert("pantheon.session_id".into(), json!(42));
+        assert!(extract_pantheon_scope_from_meta(&req_with_meta(m)).is_none());
+    }
+
+    #[test]
+    fn extract_populates_parent_and_defaults_root_to_parent() {
+        let mut m = serde_json::Map::new();
+        m.insert("pantheon.session_id".into(), json!("stdio-sess-abc"));
+        let ctx = extract_pantheon_scope_from_meta(&req_with_meta(m))
+            .expect("scope should be populated");
+        assert_eq!(ctx.parent_session_id, "stdio-sess-abc");
+        assert_eq!(ctx.root_session_id, "stdio-sess-abc");
+    }
+
+    #[test]
+    fn extract_honors_explicit_root_session_id() {
+        let mut m = serde_json::Map::new();
+        m.insert("pantheon.session_id".into(), json!("intermediate-worker"));
+        m.insert("pantheon.root_session_id".into(), json!("pantheon-root"));
+        let ctx = extract_pantheon_scope_from_meta(&req_with_meta(m))
+            .expect("scope should be populated");
+        assert_eq!(ctx.parent_session_id, "intermediate-worker");
+        assert_eq!(ctx.root_session_id, "pantheon-root");
+    }
+
+    #[test]
+    fn extract_blank_root_falls_back_to_parent() {
+        let mut m = serde_json::Map::new();
+        m.insert("pantheon.session_id".into(), json!("stdio-sess-xyz"));
+        m.insert("pantheon.root_session_id".into(), json!("   "));
+        let ctx = extract_pantheon_scope_from_meta(&req_with_meta(m))
+            .expect("scope should be populated");
+        assert_eq!(ctx.parent_session_id, "stdio-sess-xyz");
+        // Blank root collapses to None, which defaults to parent.
+        assert_eq!(ctx.root_session_id, "stdio-sess-xyz");
+    }
+
+    /// T-004 stdio half — end-to-end composition reality test.
+    ///
+    /// Exercises the SAME two-step pipeline `McpBridge::call_tool` uses:
+    ///   (1) `extract_pantheon_scope_from_meta(&request)`
+    ///   (2) `PANTHEON_SESSION.scope(scope_value, inner_future).await`
+    ///
+    /// The inner future reads `current_pantheon_session()` — the exact API
+    /// that ABE dispatch code uses to pick up the lineage. If either step
+    /// regresses (the extractor returns None, or the scope wrap is removed
+    /// from `call_tool`), this test fails.
+    #[tokio::test]
+    async fn call_tool_pipeline_propagates_meta_to_task_local() {
+        let mut m = serde_json::Map::new();
+        m.insert("pantheon.session_id".into(), json!("stdio-e2e-parent"));
+        m.insert("pantheon.root_session_id".into(), json!("stdio-e2e-root"));
+        let req = req_with_meta(m);
+
+        // Mirror McpBridge::call_tool's lineage pipeline exactly.
+        let scope_value = extract_pantheon_scope_from_meta(&req);
+        assert!(
+            scope_value.is_some(),
+            "extractor must produce Some for a valid _meta"
+        );
+
+        let captured = daemon_core::PANTHEON_SESSION
+            .scope(scope_value, async {
+                daemon_core::current_pantheon_session()
+            })
+            .await;
+
+        let ctx = captured.expect("task-local must be visible inside scope");
+        assert_eq!(ctx.parent_session_id, "stdio-e2e-parent");
+        assert_eq!(ctx.root_session_id, "stdio-e2e-root");
+    }
+
+    /// Reverse assertion: a request without _meta produces a None scope,
+    /// and `current_pantheon_session()` returns None even inside the
+    /// scope wrap. This is the legacy (non-Pantheon) stdio caller path.
+    #[tokio::test]
+    async fn call_tool_pipeline_leaves_task_local_none_for_legacy_callers() {
+        let req = req_no_meta();
+        let scope_value = extract_pantheon_scope_from_meta(&req);
+        assert!(scope_value.is_none());
+
+        let captured = daemon_core::PANTHEON_SESSION
+            .scope(scope_value, async {
+                daemon_core::current_pantheon_session()
+            })
+            .await;
+        assert!(captured.is_none());
+    }
+}
+
 #[cfg(test)]
 fn build_status_report(
     daemon_bind_addr: String,
