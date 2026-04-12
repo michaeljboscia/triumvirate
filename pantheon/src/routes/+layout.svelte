@@ -11,6 +11,7 @@
   // automatically when the layout unmounts — Svelte 5 pattern.
 
   import "../app.css";
+  import { daemon } from "$lib/stores/daemon";
 
   let { children } = $props();
 
@@ -26,6 +27,15 @@
     const onChange = (e: MediaQueryListEvent) => apply(e.matches);
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
+  });
+
+  // T-020: boot the daemon store exactly once at app mount. init() is
+  // idempotent internally, but we still gate the $effect so it doesn't
+  // re-run on HMR. destroy() releases the Tauri event listeners cleanly
+  // so dev-mode reloads don't accumulate subscriptions.
+  $effect(() => {
+    daemon.init();
+    return () => daemon.destroy();
   });
 </script>
 
