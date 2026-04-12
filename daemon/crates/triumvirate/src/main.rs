@@ -56,11 +56,18 @@ use axum::{
     routing::{get, get_service, post, post_service},
 };
 use rmcp::{
-    Json, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    ErrorData as McpError, Json, ServerHandler, ServiceExt,
+    handler::server::{
+        router::tool::ToolRouter,
+        tool::ToolCallContext,
+        wrapper::Parameters,
+    },
+    model::{
+        CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo, Tool,
+    },
     service::{RequestContext, RoleServer},
-    tool, tool_handler, tool_router,
+    tool, tool_router,
     transport::stdio,
 };
 use shared_types::{
