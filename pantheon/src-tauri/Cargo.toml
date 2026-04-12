@@ -25,7 +25,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # T-014: tray-icon enables the system tray API; image-png lets us load
 # template PNGs at runtime for the 4-state daemon-status icon swap.
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 tauri-plugin-opener = "2"
 # T-015: suppress WKWebView's native Cmd+F find bar. Removing Find from the
 # Edit menu isn't enough — WebKit intercepts the chord on its own unless we
