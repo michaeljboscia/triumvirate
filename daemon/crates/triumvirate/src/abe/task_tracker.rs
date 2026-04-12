@@ -200,6 +200,8 @@ impl TaskTracker {
         wave: u32,
         child: Arc<Mutex<Child>>,
         worktree_path: Option<PathBuf>,
+        parent_session_id: Option<String>,
+        root_session_id: Option<String>,
     ) {
         let mut guard = self.inner.lock().await;
         let started_at = Instant::now();
@@ -215,19 +217,18 @@ impl TaskTracker {
                 output: None,
                 child: Some(child),
                 worktree_path,
+                parent_session_id: parent_session_id.clone(),
+                root_session_id: root_session_id.clone(),
             },
         );
         self.emit_task_state(&task_id, wave, "dispatched", 0, None);
         self.emit_task_state(&task_id, wave, "running", 0, None);
-        // FEAT-014 (REQ-010): Also emit WorkerLifecycle::Spawned for Pantheon.
-        // parent_session_id / root_session_id are NULL here; T-004 wires the
-        // dispatch path to pass them through when a PANTHEON_SESSION_ID is
-        // captured from the MCP handshake.
+        // FEAT-014 (REQ-010) T-004: WorkerLifecycle::Spawned with Pantheon lineage.
         self.emit_worker_lifecycle(
             WorkerLifecycleType::Spawned,
             &task_id,
-            None,
-            None,
+            parent_session_id,
+            root_session_id,
             None,
             None,
             None,
