@@ -706,4 +706,148 @@ mod tests {
         let _ = tracker.cancel("T-LOCK").await;
         assert!(!lock.exists(), "expected index.lock to be removed on cancel");
     }
+
+    /// FEAT-014 (REQ-010) reality test for T-007:
+    /// Verify that register/mark_completed/mark_failed emit WorkerLifecycle
+    /// events via the broadcast channel when Pantheon observability is enabled.
+    /// A stub implementation that only emits abe_task_state would fail this test.
+    #[tokio::test]
+    async fn pantheon_observability_emits_worker_lifecycle_events() {
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let (ws_tx, mut ws_rx) = broadcast::channel(64);
+        let sequencer = Arc::new(EventSequencer::new());
+        let tracker = TaskTracker::with_pantheon_observability(
+            metrics,
+            ws_tx,
+            sequencer,
+        );
+
+        // Register a task → should emit Spawned
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn");
+        tracker
+            .register(
+                "T-LIFECYCLE-01".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+            )
+            .await;
+
+        // Drain events and find the WorkerLifecycle ones
+        let mut lifecycle_events: Vec<AgentStreamEvent> = Vec::new();
+        while let Ok(msg) = ws_rx.try_recv() {
+            // msg is an encoded ws_event wrapper. We parse the outer envelope
+            // and look for "agent_stream" type events, then extract the payload.
+            let outer: serde_json::Value =
+                serde_json::from_str(&msg).expect("valid json");
+            if outer.get("type").and_then(|v| v.as_str()) == Some("agent_stream") {
+                let payload = outer.get("payload").expect("payload field");
+                if let Ok(event) = serde_json::from_value::<AgentStreamEvent>(payload.clone()) {
+                    if matches!(event, AgentStreamEvent::WorkerLifecycle { .. }) {
+                        lifecycle_events.push(event);
+                    }
+                }
+            }
+        }
+
+        // Register emits exactly one WorkerLifecycle::Spawned
+        assert_eq!(lifecycle_events.len(), 1, "expected 1 Spawned event");
+        match &lifecycle_events[0] {
+            AgentStreamEvent::WorkerLifecycle {
+                lifecycle,
+                task_id,
+                session_name,
+                agent,
+                seq,
+                ..
+            } => {
+                assert!(matches!(lifecycle, WorkerLifecycleType::Spawned));
+                assert_eq!(task_id.as_deref(), Some("T-LIFECYCLE-01"));
+                assert_eq!(session_name, "codex-worker-T-LIFECYCLE-01");
+                assert_eq!(agent, "codex");
+                assert!(*seq > 0, "seq should be monotonic");
+            }
+            other => panic!("expected WorkerLifecycle, got {other:?}"),
+        }
+
+        // Mark completed → should emit Completed
+        let _outcome = tracker
+            .mark_completed(
+                "T-LIFECYCLE-01",
+                "abc123".to_string(),
+                vec!["src/auth.rs".to_string()],
+                "done".to_string(),
+                None,
+                None,
+            )
+            .await;
+
+        // Drain again
+        let mut completed_events: Vec<AgentStreamEvent> = Vec::new();
+        while let Ok(msg) = ws_rx.try_recv() {
+            let outer: serde_json::Value = serde_json::from_str(&msg).expect("valid json");
+            if outer.get("type").and_then(|v| v.as_str()) == Some("agent_stream") {
+                let payload = outer.get("payload").expect("payload field");
+                if let Ok(event) = serde_json::from_value::<AgentStreamEvent>(payload.clone()) {
+                    if matches!(event, AgentStreamEvent::WorkerLifecycle { .. }) {
+                        completed_events.push(event);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(completed_events.len(), 1, "expected 1 Completed event");
+        match &completed_events[0] {
+            AgentStreamEvent::WorkerLifecycle {
+                lifecycle,
+                task_id,
+                commit_sha,
+                elapsed_ms,
+                ..
+            } => {
+                assert!(matches!(lifecycle, WorkerLifecycleType::Completed));
+                assert_eq!(task_id.as_deref(), Some("T-LIFECYCLE-01"));
+                assert_eq!(commit_sha.as_deref(), Some("abc123"));
+                assert!(elapsed_ms.is_some(), "elapsed_ms should be populated");
+            }
+            other => panic!("expected WorkerLifecycle::Completed, got {other:?}"),
+        }
+    }
+
+    /// Verify that the legacy constructor (without sequencer) does NOT emit
+    /// WorkerLifecycle events. This is the backwards-compat guarantee.
+    #[tokio::test]
+    async fn legacy_observability_does_not_emit_worker_lifecycle() {
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let (ws_tx, mut ws_rx) = broadcast::channel(64);
+        let tracker = TaskTracker::with_observability(metrics, Some(ws_tx));
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn");
+        tracker
+            .register("T-LEGACY-01".to_string(), 1, Arc::new(Mutex::new(child)), None)
+            .await;
+
+        // Should still emit abe_task_state events, but no WorkerLifecycle
+        let mut lifecycle_count = 0;
+        while let Ok(msg) = ws_rx.try_recv() {
+            let outer: serde_json::Value = serde_json::from_str(&msg).expect("valid json");
+            if outer.get("type").and_then(|v| v.as_str()) == Some("agent_stream") {
+                let payload = outer.get("payload").expect("payload field");
+                if let Ok(AgentStreamEvent::WorkerLifecycle { .. }) =
+                    serde_json::from_value::<AgentStreamEvent>(payload.clone())
+                {
+                    lifecycle_count += 1;
+                }
+            }
+        }
+        assert_eq!(lifecycle_count, 0, "legacy constructor should not emit WorkerLifecycle");
+    }
 }
