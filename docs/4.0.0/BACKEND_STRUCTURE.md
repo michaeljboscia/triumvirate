@@ -46,7 +46,7 @@ When the daemon receives an MCP request that dispatches a worker:
 ### REST Endpoints
 
 #### GET /api/workers
-Returns all active sessions and workers with lineage.
+Returns all ABE-dispatched workers (sourced exclusively from `TaskTracker::snapshot_workers()`) with their lineage fields. Named MCP sessions remain on the existing `/session/list` route and are NOT aggregated into this endpoint — the scope split prevents fabricating `started_at`/`elapsed_ms` timestamps that don't exist on `SessionState`.
 
 ```json
 {
