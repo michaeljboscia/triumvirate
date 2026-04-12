@@ -208,6 +208,19 @@ impl TaskTracker {
         );
         self.emit_task_state(&task_id, wave, "dispatched", 0, None);
         self.emit_task_state(&task_id, wave, "running", 0, None);
+        // FEAT-014 (REQ-010): Also emit WorkerLifecycle::Spawned for Pantheon.
+        // parent_session_id / root_session_id are NULL here; T-004 wires the
+        // dispatch path to pass them through when a PANTHEON_SESSION_ID is
+        // captured from the MCP handshake.
+        self.emit_worker_lifecycle(
+            WorkerLifecycleType::Spawned,
+            &task_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
     }
 
     #[instrument(skip_all, fields(task_id = %task_id, status = "completed"))]
