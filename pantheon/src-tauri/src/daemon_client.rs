@@ -341,7 +341,7 @@ async fn run_session(app: &AppHandle, state: &Arc<ClientState>) -> Result<()> {
 /// daemon-core::encode_ws_event. We update `last_seq` if the payload
 /// carries a sequence number — that keeps our reconnect handshake
 /// pointed at the correct replay position.
-fn handle_ws_frame<R: Runtime>(app: &AppHandle<R>, state: &Arc<ClientState>, txt: &str) {
+fn handle_ws_frame(app: &AppHandle, state: &Arc<ClientState>, txt: &str) {
     let parsed: serde_json::Value = match serde_json::from_str(txt) {
         Ok(v) => v,
         Err(err) => {
