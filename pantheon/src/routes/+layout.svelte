@@ -1,14 +1,23 @@
 <script lang="ts">
-  // T-015 (REQ-029) — Root layout. Mounts the app.css (Tailwind v4 + theme
-  // tokens) and wires dark-mode auto-detection via prefers-color-scheme.
+  // T-015 / T-020 — Root layout.
   //
-  // Strategy: default to dark because Pantheon is a dev tool and that's
-  // the expected resting state, but respect the OS preference on mount +
-  // react live to appearance changes. Toggles the `.dark` class on
-  // <html>, which app.css wires to the Tailwind `dark:` variant.
+  // Mounts app.css (Tailwind v4 + dark tokens) and boots the daemon
+  // store. That's it.
   //
-  // Using $effect (not onMount) so the subscription cleanup runs
-  // automatically when the layout unmounts — Svelte 5 pattern.
+  // T-020 flicker fix (final): Pantheon is dark-only per REQ-029. The
+  // previous versions of this file toggled a `.dark` class on <html>
+  // via prefers-color-scheme matchMedia. That combined with Tauri v2's
+  // default-white WKWebView paint gap to produce a rapid black/white
+  // flicker on launch. Fix is three-part:
+  //   1. tauri.conf.json sets backgroundColor=#1a1a1a + theme=Dark so
+  //      the NATIVE window paints dark before the webview exists
+  //   2. app.html has an inline <style> hard-pinning html/body dark,
+  //      applied before any JS/CSS bundle loads
+  //   3. app.css has `color-scheme: dark` on :root so browser-native
+  //      controls (scrollbars, form elements) use dark from first paint
+  // There is no runtime class toggling. There is no matchMedia. If the
+  // user wants a light-mode Pantheon, that's a feature request for a
+  // future sprint — the spec is dark-only for v4.0.
 
   import "../app.css";
   import { onMount } from "svelte";
@@ -16,31 +25,9 @@
 
   let { children } = $props();
 
-  // T-020 fix: use onMount instead of $effect for dark-mode detection
-  // and daemon.init(). $effect runs on reactive-graph updates and can
-  // loop if anything it touches mutates reactive state (even
-  // transitively). onMount runs exactly once on component mount and
-  // its cleanup runs exactly once on unmount — no reactivity involvement.
-  // This eliminates any chance of an $effect re-fire causing the
-  // dark-class toggle or the listener re-registration to thrash.
   onMount(() => {
-    const mql = window.matchMedia("(prefers-color-scheme: dark)");
-    const apply = (isDark: boolean) => {
-      document.documentElement.classList.toggle("dark", isDark);
-    };
-    apply(mql.matches);
-    const onChange = (e: MediaQueryListEvent) => apply(e.matches);
-    mql.addEventListener("change", onChange);
-
-    // Boot the daemon store. init() is internally idempotent (early
-    // return if already initialized) so repeated HMR reloads in dev
-    // mode are safe.
     daemon.init();
-
-    return () => {
-      mql.removeEventListener("change", onChange);
-      daemon.destroy();
-    };
+    return () => daemon.destroy();
   });
 </script>
 
