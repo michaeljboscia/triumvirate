@@ -299,6 +299,11 @@ async fn run_session(app: &AppHandle, state: &Arc<ClientState>) -> Result<()> {
     // point spamming /api/workers 0ms later.
     poll_ticker.tick().await;
     let mut last_rest_ok = Instant::now();
+    // T-020 fix: count consecutive REST failures before flipping to
+    // Degraded. A single failure is often transient (daemon restart,
+    // brief network blip) and flipping the UI state on it causes
+    // visible flicker.
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         tokio::select! {
