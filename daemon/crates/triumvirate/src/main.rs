@@ -353,9 +353,22 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
         wave: u32,
         child: Arc<Mutex<tokio::process::Child>>,
         worktree_path: Option<PathBuf>,
+        parent_session_id: Option<String>,
+        root_session_id: Option<String>,
     ) -> mcp_tools::abe::BoxFuture<()> {
         let tracker = self.clone();
-        Box::pin(async move { tracker.register(task_id, wave, child, worktree_path).await })
+        Box::pin(async move {
+            tracker
+                .register(
+                    task_id,
+                    wave,
+                    child,
+                    worktree_path,
+                    parent_session_id,
+                    root_session_id,
+                )
+                .await
+        })
     }
 
     fn mark_completed(
