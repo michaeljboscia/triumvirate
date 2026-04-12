@@ -83,12 +83,31 @@ class DaemonStore {
 	state = $state<HealthState>("starting");
 	workers = $state<WorkerInfo[]>([]);
 	fleet = $state<FleetBuild[]>([]);
+
 	/**
-	 * Rolling buffer of the most recent stream events. Capped at 500 so
-	 * long-running sessions don't leak memory — components that want the
-	 * full history should subscribe to the Tauri event directly.
+	 * T-020 fix: rolling buffer of stream events is DELIBERATELY NOT a
+	 * $state rune. Every incoming ws event was reassigning a new array
+	 * reference, triggering a full reactive re-render across the UI and
+	 * producing visible flashing at even modest event rates. Components
+	 * that want a snapshot of recent events should call
+	 * `daemon.recentEventsSnapshot()` on demand (e.g. from an activity
+	 * panel's own scheduled refresh), which returns a copy without
+	 * entangling Svelte reactivity. Wave 6 activity panels can adopt
+	 * their own local $state mirror with a throttle if they need live
+	 * updates.
 	 */
-	recentEvents = $state<StreamEvent[]>([]);
+	private streamBuffer: StreamEvent[] = [];
+	private static readonly STREAM_BUFFER_CAP = 500;
+
+	/**
+	 * Return a point-in-time copy of the stream buffer. Safe to read
+	 * without triggering reactivity. Consumers that want live updates
+	 * should poll this on their own cadence (setInterval) or use a
+	 * manual $state mirror gated by a throttle.
+	 */
+	recentEventsSnapshot(): StreamEvent[] {
+		return this.streamBuffer.slice();
+	}
 
 	private unlistens: UnlistenFn[] = [];
 	private initialized = false;
