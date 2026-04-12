@@ -1,9 +1,14 @@
 [package]
 name = "pantheon"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "3.9.0"
+description = "Pantheon — native macOS app for multi-agent orchestration"
+authors = ["Mike Boscia"]
 edition = "2021"
+# T-013: pantheon/src-tauri is a member of the sibling daemon/ Cargo
+# workspace so it shares Cargo.lock + target/ with the daemon crates and
+# can take a path dependency on shared-types via the workspace. Cargo
+# requires the back-pointer because the workspace root is not a parent.
+workspace = "../../daemon"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
