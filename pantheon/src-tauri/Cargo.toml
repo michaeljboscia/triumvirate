@@ -50,3 +50,11 @@ shared-types = { path = "../../daemon/crates/shared-types" }
 anyhow = "1"
 tracing = "0.1"
 
+# T-016: PTY host for embedding Claude Code terminals inside Pantheon.
+# portable-pty abstracts the OS-specific PTY system calls behind a
+# cross-platform API. The reads are BLOCKING (per mx-rust-systems skill),
+# so we dispatch them on a dedicated std::thread and ferry bytes back to
+# tokio via a Tauri Channel the frontend owns.
+portable-pty = "0.9"
+base64 = "0.22"
+
