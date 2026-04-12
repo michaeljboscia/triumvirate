@@ -27,6 +27,10 @@ tauri-build = { version = "2", features = [] }
 # template PNGs at runtime for the 4-state daemon-status icon swap.
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
+# T-015: suppress WKWebView's native Cmd+F find bar. Removing Find from the
+# Edit menu isn't enough — WebKit intercepts the chord on its own unless we
+# tell the runtime to drop it before it reaches the webview.
+tauri-plugin-prevent-default = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
