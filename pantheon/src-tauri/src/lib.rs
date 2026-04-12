@@ -2,6 +2,7 @@
 // in lib.rs (not main.rs) so the same code can compile for mobile targets.
 // main.rs is just `pantheon_lib::run()`.
 
+mod daemon_client;
 mod menu;
 mod tray;
 
