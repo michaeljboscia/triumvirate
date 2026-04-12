@@ -14,7 +14,6 @@
     "core:tray:default",
     "core:image:default",
     "core:event:default",
-    "opener:default",
-    "prevent-default:default"
+    "opener:default"
   ]
 }
