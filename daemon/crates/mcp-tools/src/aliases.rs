@@ -23,7 +23,7 @@ impl std::fmt::Display for AliasMappingError {
             Self::MissingRequired(field) => write!(f, "missing required field '{field}'"),
             Self::InvalidDaemonId(id) => write!(
                 f,
-                "invalid daemon_id '{id}' — expected 'gd_*' or 'cd_*' prefix"
+                "invalid daemon_id '{id}' — must be a non-empty session name"
             ),
         }
     }
