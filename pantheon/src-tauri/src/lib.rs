@@ -34,15 +34,16 @@ pub fn run() {
         // it in.
         .manage(pty::PtyState::default())
         .plugin(tauri_plugin_opener::init())
-        // T-020 crash-loop diagnostic: plugin disabled. See note at the
-        // top of the file. Restore by re-enabling the import and the
-        // `.plugin(tauri_plugin_prevent_default::Builder...)` call below.
-        //
-        // .plugin(
-        //     tauri_plugin_prevent_default::Builder::new()
-        //         .with_flags(Flags::FIND)
-        //         .build(),
-        // )
+        // T-015: intercept WKWebView's built-in Cmd+F find bar before
+        // the webview sees it. `Flags::FIND` is the single-purpose
+        // flag; we deliberately do NOT use `Flags::all()` because that
+        // would also suppress right-click / devtools / reload, which
+        // we want during development.
+        .plugin(
+            tauri_plugin_prevent_default::Builder::new()
+                .with_flags(Flags::FIND)
+                .build(),
+        )
         // T-015: install the custom native menu (no Find/Replace).
         .menu(|handle| menu::build_menu(handle))
         .setup(|app| {
