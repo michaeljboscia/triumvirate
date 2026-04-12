@@ -106,34 +106,44 @@ Two releases, strict order: v3.9.0 daemon backend FIRST, v4.0.0 Tauri app SECOND
 
 ## Wave 2 — Daemon HTTP (v3.9.0)
 
-<task id="T-008" req="REQ-017" wave="2" depends="T-002,T-003,T-004">
-  <description>Implement GET /api/workers, GET /api/fleet, and GET /api/fleet/:build_id endpoints</description>
-  <files>daemon/crates/daemon-http/src/routes.rs (or equivalent Axum router file), daemon/crates/triumvirate/src/main.rs</files>
-  <scope_out>Do not modify existing HTTP routes. Add new routes only. Do not change auth middleware.</scope_out>
-  <tools>cargo check, cargo test, curl</tools>
-  <verify>cargo check</verify>
-  <reality_test>Start daemon. Dispatch a worker. curl GET /api/workers with bearer token — verify JSON response contains the worker with parent_session_id. curl GET /api/fleet — verify task status. curl without token — verify 401.</reality_test>
-  <done_when>Both endpoints return correct JSON matching BACKEND_STRUCTURE.md contracts. Auth enforced. Empty responses when no workers/fleet active.</done_when>
+<task id="T-007.5" req="REQ-017,REQ-020" wave="2" depends="T-006,T-007">
+  <description>Wave 2 plumbing prep — wire EventReplayBuffer into ws_events, add TaskTracker.snapshot_workers, add fleet_v2_states to DaemonState. This task was added on 2026-04-11 by Phase 5.3 empirical verification after T-008 and T-009 attempted to read fields that didn't exist. (Phase 4.4 doc audit miss.)</description>
+  <files>daemon/crates/daemon-core/src/lib.rs, daemon/crates/triumvirate/src/abe/task_tracker.rs, daemon/crates/triumvirate/src/main.rs, daemon/crates/shared-types/src/api.rs (WorkerSnapshot type)</files>
+  <scope_out>Do not modify EventReplayBuffer's public API (T-006 contract). Do not change shared_types::api response shapes. Do not add new HTTP routes — that's T-008/T-009. Do not change McpBridge.fleet_states (legacy MCP fleet path stays untouched).</scope_out>
+  <tools>cargo check -p daemon-core -p triumvirate -p shared-types, cargo test -p daemon-core -p triumvirate, file read/write within files list only</tools>
+  <verify>cargo check -p daemon-core -p triumvirate -p shared-types</verify>
+  <reality_test>(1) Start daemon harness in test. Spawn a TaskTracker with the new constructor. Register two tasks. Call snapshot_workers() — assert it returns 2 entries with correct task_ids and lineage. (2) Construct DaemonState with the new replay_buffer field. Send 5 AgentStreamEvent::ToolCall events through ws_events. Assert daemon_state.replay_buffer.len() == 5 within 100ms (the fill task pushed them). (3) Call DaemonState::new and verify fleet_v2_states starts empty.</reality_test>
+  <done_when>DaemonState carries Arc&lt;EventReplayBuffer&gt; and Arc&lt;Mutex&lt;HashMap&lt;String, FleetBuild&gt;&gt;&gt;. A startup hook in run_daemon subscribes to ws_events BEFORE any other subscriber and pushes parsed events into the buffer (subscribe-before-read). TaskTracker::snapshot_workers() returns Vec&lt;WorkerSnapshot&gt; suitable for T-008's WorkerInfo aggregation. Build manifests for T-008 and T-009 reference these new fields by name.</done_when>
 </task>
 
-<task id="T-009" req="REQ-020" wave="2" depends="T-002,T-006">
-  <description>Implement GET /api/state endpoint and WebSocket replay handshake</description>
-  <files>daemon/crates/daemon-http/src/routes.rs, daemon/crates/triumvirate/src/main.rs</files>
-  <scope_out>Do not modify existing WebSocket broadcast logic. Extend the WebSocket handler to support the subscribe-with-lastSeq handshake. Do not break existing `triumvirate watch` behavior.</scope_out>
-  <tools>cargo check, cargo test, curl, websocat</tools>
-  <verify>cargo check</verify>
-  <reality_test>GET /api/state — verify full snapshot with sessions, workers, fleet, last_event_seq. Connect WebSocket with {"action": "subscribe", "last_seq": N}. Verify replay of events since N. Connect with last_seq older than buffer — verify {"replay": "out_of_range"} response. Verify existing `triumvirate watch` still works (backwards compatible).</reality_test>
-  <done_when>/api/state returns complete snapshot. WebSocket accepts subscribe-with-lastSeq. Replay works. Out-of-range handled. Backwards compatible with existing clients that don't send subscribe message.</done_when>
+<task id="T-008" req="REQ-017" wave="2" depends="T-002,T-003,T-004,T-007.5">
+  <description>Implement GET /api/workers, GET /api/fleet, and GET /api/fleet/{build_id} endpoints (axum 0.8 path syntax — was /:build_id in original spec, fixed to /{build_id} after empirical verification revealed axum 0.8 panics on colon-prefix syntax)</description>
+  <files>daemon/crates/triumvirate/src/main.rs (3 new route handlers + 3 new in-file unit/reality tests), daemon/crates/shared-types/src/api.rs (no shape changes — types from T-002 reused)</files>
+  <scope_out>Do not modify existing HTTP routes. Add new routes only. Do not change auth middleware. Do not modify shared_types::api shapes (already finalized in T-002). Do not touch McpBridge or the legacy /api/tokens routes. Do not introduce new crate dependencies.</scope_out>
+  <tools>cargo check -p triumvirate, cargo test -p triumvirate --bin triumvirate, file read/write within files list only</tools>
+  <verify>cargo check -p triumvirate</verify>
+  <reality_test>(1) Build the Axum router via the same `app = Router::new()...` chain. Tower-test it with a Request to GET /api/workers + bearer token + a TaskTracker that has 2 workers registered with distinct parent_session_ids. Assert response.status() == 200 AND parsed WorkersResponse.workers.len() == 2 AND each entry's parent_session_id matches what was registered. (2) Same shape for /api/fleet — populate fleet_v2_states with 1 FleetBuild containing 3 tasks; assert /api/fleet returns it. (3) GET /api/fleet/{build_id} for an existing build returns 200 + that single build; for a missing build returns 404. (4) GET /api/workers without Authorization header returns 401. (5) GET /api/workers with WRONG bearer returns 401. None of these can pass on a stub that returns hardcoded JSON — they require live state aggregation.</reality_test>
+  <done_when>Three GET endpoints return correct JSON matching BACKEND_STRUCTURE.md contracts. Auth enforced. Empty responses when no workers/fleet active. No regressions in existing routes (cargo test --bin triumvirate green).</done_when>
+</task>
+
+<task id="T-009" req="REQ-020" wave="2" depends="T-002,T-006,T-007.5">
+  <description>Implement GET /api/state endpoint AND a NEW WebSocket route /ws/v2 with the subscribe-with-lastSeq replay handshake (the existing /ws stays untouched for legacy `triumvirate watch` compatibility)</description>
+  <files>daemon/crates/triumvirate/src/main.rs (1 new GET /api/state handler, 1 new WS /ws/v2 route + handshake handler, in-file reality tests)</files>
+  <scope_out>Do NOT modify the existing /ws route or daemon-http::ws_route — that's the legacy WebSocket the `triumvirate watch` CLI consumes. Add /ws/v2 alongside it. Do not change EventReplayBuffer's public API. Do not change DaemonState struct fields (T-007.5 owns those). Do not introduce new crate dependencies. Do not modify shared_types::api shapes.</scope_out>
+  <tools>cargo check -p triumvirate, cargo test -p triumvirate --bin triumvirate, file read/write within files list only</tools>
+  <verify>cargo check -p triumvirate</verify>
+  <reality_test>(1) GET /api/state with bearer → assert StateResponse parses, with version, uptime_ms, sessions (Vec), workers (Vec), fleet (Vec), last_event_seq (u64). (2) /ws/v2 handshake test using axum::extract::ws helper or a tokio_tungstenite client over a real ephemeral server: connect, send {"action":"subscribe","last_seq":0}. Buffer pre-loaded with 5 events, seq 1..5 → assert client receives all 5 in order. (3) Pre-load buffer with seq 1001..1100 (capacity 100), send subscribe with last_seq=200 → assert client receives a single ReplayResponse JSON object with `{"replay":"out_of_range","oldest_seq":1001}` (or equivalent shape). (4) Send subscribe with last_seq=1050 → assert client receives events 1051..1100 in order. (5) Subscribe-before-read race: spawn a task that pushes event seq=1101 to the buffer 5ms after the client sends subscribe; assert client receives it after the historical replay (no gap). (6) NEGATIVE: connect to legacy /ws (not /ws/v2) → assert it still emits the 4 hardcoded bootstrap events (backwards compat).</reality_test>
+  <done_when>GET /api/state returns StateResponse. /ws/v2 implements the subscribe-with-lastSeq handshake using subscribe-before-read with seq dedup. Out-of-range surfaced as a structured response. Existing /ws unchanged. cargo test --bin triumvirate green.</done_when>
 </task>
 
 <task id="T-010" req="REQ-033" wave="2" depends="T-004">
-  <description>Capture PANTHEON_SESSION_ID from HTTP header and MCP _meta in both transport modes</description>
-  <files>daemon/crates/triumvirate/src/http_mcp.rs, daemon/crates/mcp-bridge/src/lib.rs</files>
-  <scope_out>Do not change MCP protocol compliance. Only read custom fields. Do not reject connections without PANTHEON_SESSION_ID — they're valid non-Pantheon clients.</scope_out>
-  <tools>cargo check, cargo test</tools>
-  <verify>cargo check</verify>
-  <reality_test>Send MCP initialize with _meta: {"pantheon.session_id": "test-123"} via stdio transport. Verify daemon stores pantheon_session_id = "test-123" on the session record. Send HTTP request with X-Pantheon-Session-Id: "test-456" via proxy transport. Verify same. Send request without either — verify session created with NULL pantheon_session_id.</reality_test>
-  <done_when>Both MCP transports (stdio and HTTP/SSE) capture PANTHEON_SESSION_ID. Stored in sessions table. NULL for non-Pantheon clients. No breaking changes to existing MCP behavior.</done_when>
+  <description>ABSORBED INTO T-004 (2026-04-11). Both transport halves (HTTP X-Pantheon-Session-Id middleware + stdio _meta.pantheon.session_id extraction) shipped under T-004 in this session. T-010 is closed without code; the original done_when has been satisfied. See BUILD_MANIFEST.md Wave 1 row.</description>
+  <files>(none — see T-004)</files>
+  <scope_out>n/a (closed)</scope_out>
+  <tools>n/a</tools>
+  <verify>cargo test -p triumvirate --bin triumvirate -- pantheon_stdio_meta_tests http_mcp::tests (16/16)</verify>
+  <reality_test>16/16 tests pass across pantheon_stdio_meta_tests + http_mcp::tests; both transports proven end-to-end.</reality_test>
+  <done_when>ABSORBED INTO T-004 — done.</done_when>
 </task>
 
 ---

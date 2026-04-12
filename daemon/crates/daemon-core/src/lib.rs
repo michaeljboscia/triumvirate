@@ -10,7 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use shared_types::{MemoryEntry, SessionState};
+use shared_types::{MemoryEntry, SessionState, api::FleetBuild};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::instrument;
