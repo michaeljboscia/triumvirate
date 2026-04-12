@@ -1,4 +1,4 @@
-/* T-015 (REQ-029) — Pantheon design tokens + Tailwind v4 entry.
+/* T-015 / T-020 — Pantheon design tokens + Tailwind v4 entry.
  *
  * Tailwind v4 is CSS-first: no tailwind.config.js, no postcss.config.js. The
  * `@import "tailwindcss"` pulls in the preflight + utility layer, and
@@ -6,16 +6,19 @@
  * variables (e.g. --color-bg-primary is usable as both class="bg-bg-primary"
  * and as var(--color-bg-primary) inside raw CSS).
  *
- * Dark mode strategy: `@custom-variant dark` wires the `dark:` utility
- * prefix to `.dark` on any ancestor, so toggling `<html class="dark">` in
- * +layout.svelte switches the whole tree. We default to dark (Pantheon is
- * a developer tool — dark is the expected resting state) and honor
- * prefers-color-scheme via a $effect in the layout.
+ * T-020 flicker fix: Pantheon is dark-only (REQ-029). We no longer toggle
+ * a `.dark` class on <html> at runtime — that was causing paint thrashing
+ * against Tailwind Preflight's prefers-color-scheme defaults. `color-scheme`
+ * is hard-pinned to `dark` at :root so browser-native controls (scrollbars,
+ * form elements) use the dark palette from first paint. The inline style
+ * block in app.html handles the pre-JS gap.
  */
 
-@import "tailwindcss";
+:root {
+	color-scheme: dark;
+}
 
-@custom-variant dark (&:where(.dark, .dark *));
+@import "tailwindcss";
 
 @theme {
   /* Surface scale — used for sidebar / terminal area / status area. */
