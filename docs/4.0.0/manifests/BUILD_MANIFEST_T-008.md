@@ -11,9 +11,14 @@
 
 ---
 
+## Audit log
+
+- **Round 1 (2026-04-11)**: REJECTED by Gemini + Codex. Findings: SessionState field-name hallucination (`agent_target`/`started_at_unix_ms` don't exist), scope drift between XML `<files>` and manifest, `/api/fleet/{build_id}` missing from BACKEND_STRUCTURE, done_when misalignment, missing fleet_v2_states population guidance.
+- **Round 2 fixes (this revision)**: Dropped SessionState aggregation entirely — T-008 surfaces ABE workers only via `TaskTracker::snapshot_workers()`. Session listing stays on the existing `/session/list` route. BACKEND_STRUCTURE.md updated to document `/api/fleet/{build_id}` and align `/api/state`. XML `<files>` + done_when trimmed to match manifest.
+
 ## Mission (one sentence)
 
-Add three new GET endpoints to the daemon's Axum router — `/api/workers`, `/api/fleet`, `/api/fleet/{build_id}` — that return JSON shapes already defined in `shared_types::api`, gated by the existing `is_bearer_authorized` per-handler bearer-token check, sourced from `state.sessions` + `state.abe_tasks.snapshot_workers()` + `state.fleet_v2_states`.
+Add three new GET endpoints to the daemon's Axum router — `/api/workers`, `/api/fleet`, `/api/fleet/{build_id}` — that return JSON shapes already defined in `shared_types::api`, gated by the existing `is_bearer_authorized` per-handler bearer-token check, sourced exclusively from `state.abe_tasks.snapshot_workers()` and `state.fleet_v2_states`. **SessionState entries are NOT aggregated into /api/workers** — they remain on the existing `/session/list` route, because SessionState has no `started_at`/`elapsed_ms` fields and fabricating them would be dishonest.
 
 ## Files you may create or modify
 
