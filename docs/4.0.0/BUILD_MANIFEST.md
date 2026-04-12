@@ -79,12 +79,15 @@ This manifest is **append-only** per the goatrodeo skill Phase 5.4 step 14. Ever
 
 ---
 
-## Wave 3 — Daemon Release (v3.9.0) — IN PROGRESS
+## Wave 3 — Daemon Release (v3.9.0) — CLOSED
 
 | Task | Commit | Files | Status |
 |---|---|---|---|
-| T-011 | _pending_ | daemon/crates/triumvirate/tests/integration_pantheon.rs (new end-to-end integration test composing Wave 1 + Wave 2) | ⏳ next |
-| T-012 | _pending_ | daemon/Cargo.toml (version 3.3.0 → 3.9.0), CHANGELOG.md entry, BUILD_MANIFEST.md closure, git tag v3.9.0 | ⏸ blocked on T-011 |
+| T-011 | _(this wave)_ | daemon/crates/triumvirate/tests/integration_pantheon.rs — 10 `#[ignore]`-gated integration tests covering /api/state, /api/workers, /api/fleet, /api/fleet/{build_id}, /ws/v2 handshake + out_of_range + auth rejection, legacy /ws regression, and /api/state↔/api/workers cross-endpoint consistency. Matches the pattern of existing `integration_http/abe/mcp/streaming.rs`. | ✅ |
+| T-012 | _(this wave)_ | daemon/Cargo.toml version 3.3.0 → 3.9.0, daemon/CHANGELOG.md created with full v3.9.0 entry, BUILD_MANIFEST.md closure (this row), local git tag `v3.9.0` at the final commit. Push deferred until user authorizes. | ✅ |
+
+**Wave 3 closure SHA:** _(populated on commit)_
+**v3.9.0 release:** backend feature-complete; daemon exposes every REST + WebSocket surface Pantheon's Tauri app (v4.0.0, Waves 4+) needs to consume.
 
 ## Wave 4+ — not yet started
 
