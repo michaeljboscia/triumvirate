@@ -524,6 +524,72 @@ pub fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
     .to_string()
 }
 
+/// FEAT-013 (REQ-020) T-007.5: Run the replay-buffer fill loop.
+///
+/// Consumes events from `buffer_rx` (a `tokio::sync::broadcast::Receiver`
+/// that has ALREADY been subscribed to the daemon's `ws_events` channel
+/// BEFORE this function is called — the subscribe-before-read invariant
+/// is the caller's responsibility), filters for "agent_stream" envelopes,
+/// parses payloads as `AgentStreamEvent`, and pushes them into the supplied
+/// replay buffer while updating the monotonic `last_event_seq` mirror.
+///
+/// This is the body of the long-lived task spawned by `run_daemon`.
+/// Extracted into daemon-core so it can be unit-tested without standing
+/// up the full daemon binary.
+///
+/// The loop exits cleanly when the broadcast channel closes. Lagged errors
+/// (slow consumer) are logged and skipped — the alternative is to die,
+/// which would leave the buffer empty for the rest of daemon uptime and
+/// break every WebSocket replay client.
+pub async fn run_replay_buffer_fill(
+    mut buffer_rx: tokio::sync::broadcast::Receiver<String>,
+    buffer: Arc<replay::EventReplayBuffer>,
+    last_event_seq: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use shared_types::AgentStreamEvent;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::broadcast::error::RecvError;
+
+    loop {
+        match buffer_rx.recv().await {
+            Ok(envelope) => {
+                let parsed: serde_json::Value = match serde_json::from_str(&envelope) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "replay buffer fill: invalid envelope");
+                        continue;
+                    }
+                };
+                if parsed.get("type").and_then(|v| v.as_str()) != Some("agent_stream") {
+                    continue;
+                }
+                let payload = match parsed.get("payload") {
+                    Some(p) => p.clone(),
+                    None => continue,
+                };
+                let event: AgentStreamEvent = match serde_json::from_value(payload) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "replay buffer fill: payload not AgentStreamEvent");
+                        continue;
+                    }
+                };
+                let seq = event.seq();
+                buffer.push(event);
+                last_event_seq.fetch_max(seq, Ordering::Relaxed);
+            }
+            Err(RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, "replay buffer fill: lagged, skipping events");
+                continue;
+            }
+            Err(RecvError::Closed) => {
+                tracing::info!("replay buffer fill: channel closed, exiting");
+                break;
+            }
+        }
+    }
+}
+
 pub fn publish_ws_event<TAbeTasks>(
     state: &DaemonState<TAbeTasks>,
     event_type: &str,
