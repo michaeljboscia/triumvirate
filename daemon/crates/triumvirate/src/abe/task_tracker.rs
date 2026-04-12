@@ -754,6 +754,8 @@ mod tests {
                 1,
                 Arc::new(Mutex::new(child)),
                 None,
+                None,
+                None,
             )
             .await;
 
