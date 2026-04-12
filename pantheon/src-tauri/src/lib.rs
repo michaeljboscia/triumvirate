@@ -80,7 +80,15 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![greet, tray::update_daemon_state])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            tray::update_daemon_state,
+            // T-016: PTY host commands for the xterm.js terminal panel.
+            pty::pty_spawn,
+            pty::pty_write,
+            pty::pty_resize,
+            pty::pty_kill,
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
