@@ -388,14 +388,26 @@ mod tests {
     }
 
     #[test]
-    fn u_al_07_ask_daemon_invalid_prefix_errors() {
+    fn u_al_07_ask_daemon_empty_id_errors() {
         let p = AskDaemonParams {
-            daemon_id: "xx_bad".into(),
+            daemon_id: "".into(),
             question: "hello".into(),
             timeout_ms: None,
         };
         let err = map_ask_daemon_params(p).unwrap_err();
-        assert!(matches!(err, AliasMappingError::InvalidDaemonId(id) if id == "xx_bad"));
+        assert!(matches!(err, AliasMappingError::InvalidDaemonId(id) if id.is_empty()));
+    }
+
+    #[test]
+    fn u_al_07b_ask_daemon_accepts_any_session_name() {
+        let p = AskDaemonParams {
+            daemon_id: "daemon-peritia".into(),
+            question: "hello".into(),
+            timeout_ms: None,
+        };
+        let out = map_ask_daemon_params(p).unwrap();
+        assert_eq!(out.name, "daemon-peritia");
+        assert_eq!(out.message, "hello");
     }
 
     #[test]
