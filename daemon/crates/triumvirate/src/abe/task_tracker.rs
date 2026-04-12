@@ -140,6 +140,48 @@ impl TaskTracker {
         let _ = ws_events.send(encode_ws_event("abe_task_state", payload));
     }
 
+    /// FEAT-014 (REQ-010): Emit a WorkerLifecycle event on the shared WebSocket
+    /// channel. Used by Pantheon's sidebar to populate the worker hierarchy
+    /// in real-time. Lineage fields (parent_session_id, root_session_id) are
+    /// populated by T-004's dispatch path when available; NULL for legacy
+    /// callers without Pantheon context.
+    ///
+    /// No-op if either ws_events or sequencer is absent (legacy constructor).
+    fn emit_worker_lifecycle(
+        &self,
+        lifecycle: WorkerLifecycleType,
+        task_id: &str,
+        parent_session_id: Option<String>,
+        root_session_id: Option<String>,
+        commit_sha: Option<String>,
+        error_message: Option<String>,
+        elapsed_ms: Option<u64>,
+    ) {
+        let (Some(ws_events), Some(sequencer)) = (&self.ws_events, &self.sequencer) else {
+            return;
+        };
+        let event = AgentStreamEvent::WorkerLifecycle {
+            lifecycle,
+            agent: "codex".to_string(), // ABE currently only dispatches Codex workers
+            session_name: format!("codex-worker-{task_id}"),
+            task_id: Some(task_id.to_string()),
+            parent_session_id,
+            root_session_id,
+            commit_sha,
+            error_message,
+            elapsed_ms,
+            seq: sequencer.next(),
+        };
+        let payload = match serde_json::to_value(&event) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to serialize WorkerLifecycle event");
+                return;
+            }
+        };
+        let _ = ws_events.send(encode_ws_event("agent_stream", payload));
+    }
+
     #[instrument(skip_all, fields(task_id = %task_id, wave))]
     pub async fn register(
         &self,
