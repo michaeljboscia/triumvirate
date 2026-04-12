@@ -1364,8 +1364,74 @@ fn build_status_report(
     )
 }
 
+/// FEAT-012 (REQ-017) T-008: Runtime state alias used by the Pantheon v3.9.0
+/// REST surface. Kept at module scope so both `run_daemon` and the
+/// `pantheon_rest_tests` module can type the handlers identically.
+type DaemonRuntimeState = DaemonState<abe::task_tracker::TaskTracker>;
+
+/// FEAT-012 (REQ-017) T-008: GET /api/workers — return every ABE worker
+/// currently tracked by `state.abe_tasks.snapshot_workers()`. SessionState
+/// entries live on the existing `/session/list` route; they are NOT
+/// aggregated here (they carry no `started_at`/`elapsed_ms`, so mixing them
+/// in would require fabricating values — flagged and rejected in Phase 5.3
+/// round 1 audit).
+async fn api_workers(
+    State(state): State<DaemonRuntimeState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<shared_types::WorkersResponse>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let workers = state.abe_tasks.snapshot_workers().await;
+    Ok(AxumJson(shared_types::WorkersResponse { workers }))
+}
+
+/// FEAT-012 (REQ-017) T-008: GET /api/fleet — return every FleetBuild
+/// currently registered in `state.fleet_v2_states`. Returns an empty
+/// `{"builds":[]}` array (never null) when no builds are active.
+async fn api_fleet(
+    State(state): State<DaemonRuntimeState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<shared_types::FleetResponse>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let builds: Vec<shared_types::FleetBuild> = {
+        let guard = state.fleet_v2_states.lock().await;
+        guard.values().cloned().collect()
+    };
+    Ok(AxumJson(shared_types::FleetResponse { builds }))
+}
+
+/// FEAT-012 (REQ-017) T-008: GET /api/fleet/{build_id} — return a single
+/// FleetBuild by id, or 404 if the build does not exist. Uses axum 0.8
+/// path-segment syntax `{build_id}` (NOT `:build_id`, which panics at
+/// router construction time in axum 0.8).
+async fn api_fleet_by_id(
+    State(state): State<DaemonRuntimeState>,
+    axum::extract::Path(build_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Result<AxumJson<shared_types::FleetBuild>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let guard = state.fleet_v2_states.lock().await;
+    match guard.get(&build_id).cloned() {
+        Some(build) => Ok(AxumJson(build)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
-    type DaemonRuntimeState = DaemonState<abe::task_tracker::TaskTracker>;
 
     async fn metrics_middleware(
         State(state): State<DaemonRuntimeState>,
@@ -1835,6 +1901,12 @@ async fn run_daemon() -> anyhow::Result<()> {
             "/api/tokens/by-session",
             get_service(daemon_http::token_by_session_route.with_state(http_state.clone())),
         )
+        // FEAT-012 (REQ-017) T-008: Pantheon v3.9.0 REST endpoints.
+        // These take the runtime `state` (DaemonRuntimeState), not http_state,
+        // because they read `abe_tasks` and `fleet_v2_states` directly.
+        .route("/api/workers", get(api_workers))
+        .route("/api/fleet", get(api_fleet))
+        .route("/api/fleet/{build_id}", get(api_fleet_by_id))
         .route(
             "/ws",
             get_service(daemon_http::ws_route.with_state(http_state.clone())),
@@ -5417,5 +5489,328 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         let _ = fs::remove_file(stub_script);
         let _ = fs::remove_dir_all(project_root);
         Ok(())
+    }
+}
+
+/// FEAT-012 (REQ-017) T-008 reality tests for the Pantheon v3.9.0 REST
+/// surface (`/api/workers`, `/api/fleet`, `/api/fleet/{build_id}`).
+///
+/// These tests drive the real Axum router via `tower::ServiceExt::oneshot`
+/// — no mocks, no hardcoded JSON stubs. They assert:
+///   - auth gating on every route (missing/wrong bearer → 401)
+///   - end-to-end aggregation from `state.abe_tasks` and
+///     `state.fleet_v2_states` into the frozen `shared_types::api` shapes
+///   - empty-array-not-null serialization for the Tauri client
+///   - path-parameter routing via axum 0.8 `{build_id}` syntax
+#[cfg(test)]
+mod pantheon_rest_tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode, header::AUTHORIZATION},
+        routing::get,
+    };
+    use daemon_core::metrics::DaemonMetrics;
+    use shared_types::{FleetBuild, FleetResponse, FleetTask, WorkersResponse};
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::Arc,
+    };
+    use tokio::{process::Command, sync::Mutex};
+    use tower::ServiceExt;
+
+    // Re-use the production handlers directly — no stubs, no duplicates.
+    // If these symbols ever move or rename, this test module refuses to
+    // compile, which is the whole point of binding the tests to the real
+    // entry points rather than shadowing them.
+    use super::{api_fleet, api_fleet_by_id, api_workers, DaemonRuntimeState};
+
+    fn make_state(token: &str) -> DaemonRuntimeState {
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let (ws_events, _rx) = broadcast::channel::<String>(64);
+        let abe_tasks = abe::task_tracker::TaskTracker::with_observability(
+            metrics.clone(),
+            Some(ws_events.clone()),
+        );
+        DaemonState::new(
+            token.to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "127.0.0.1:0".to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            abe_tasks,
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(VecDeque::new())),
+            metrics,
+            ws_events,
+        )
+    }
+
+    fn make_router(state: DaemonRuntimeState) -> Router {
+        Router::new()
+            .route("/api/workers", get(api_workers))
+            .route("/api/fleet", get(api_fleet))
+            .route("/api/fleet/{build_id}", get(api_fleet_by_id))
+            .with_state(state)
+    }
+
+    async fn register_worker(
+        state: &DaemonRuntimeState,
+        task_id: &str,
+        parent: Option<&str>,
+        root: Option<&str>,
+    ) {
+        // A real subprocess is required because TaskTracker::register
+        // takes Arc<Mutex<Child>>. `sh -c true` exits immediately but the
+        // record persists in the tracker until explicitly transitioned.
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn child");
+        state
+            .abe_tasks
+            .register(
+                task_id.to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                parent.map(ToString::to_string),
+                root.map(ToString::to_string),
+            )
+            .await;
+    }
+
+    async fn body_to_string(body: Body) -> String {
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read body bytes");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    fn sample_build(build_id: &str) -> FleetBuild {
+        FleetBuild {
+            build_id: build_id.to_string(),
+            task_count: 2,
+            completed: 1,
+            failed: 0,
+            in_progress: 1,
+            queued: 0,
+            tasks: vec![
+                FleetTask {
+                    task_id: "T-001".into(),
+                    status: "committed".into(),
+                    files: vec![],
+                    worker_session_id: None,
+                    elapsed_ms: 0,
+                    commit_sha: None,
+                },
+                FleetTask {
+                    task_id: "T-002".into(),
+                    status: "working".into(),
+                    files: vec![],
+                    worker_session_id: None,
+                    elapsed_ms: 0,
+                    commit_sha: None,
+                },
+            ],
+        }
+    }
+
+    // ----- /api/workers ------------------------------------------------
+
+    #[tokio::test]
+    async fn api_workers_returns_abe_workers_with_lineage() {
+        let state = make_state("tok-w-1");
+        register_worker(&state, "T-APOLLO-A", Some("pantheon-A"), Some("root-A")).await;
+        register_worker(&state, "T-APOLLO-B", Some("pantheon-B"), Some("root-B")).await;
+
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/workers")
+            .header(AUTHORIZATION, "Bearer tok-w-1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp.into_body()).await;
+        let parsed: WorkersResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.workers.len(), 2);
+
+        let parents: std::collections::HashSet<String> = parsed
+            .workers
+            .iter()
+            .filter_map(|w| w.parent_session_id.clone())
+            .collect();
+        let expected: std::collections::HashSet<String> =
+            ["pantheon-A".to_string(), "pantheon-B".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(parents, expected, "lineage must flow through snapshot");
+
+        let task_ids: std::collections::HashSet<String> = parsed
+            .workers
+            .iter()
+            .filter_map(|w| w.task_id.clone())
+            .collect();
+        assert!(task_ids.contains("T-APOLLO-A"));
+        assert!(task_ids.contains("T-APOLLO-B"));
+    }
+
+    #[tokio::test]
+    async fn api_workers_empty_tracker_returns_empty_array_not_null() {
+        let state = make_state("tok-w-2");
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/workers")
+            .header(AUTHORIZATION, "Bearer tok-w-2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp.into_body()).await;
+
+        // Tauri client reads `workers` as Vec<WorkerInfo> — `null` would
+        // deserialize as an error on the client, so this assertion is
+        // load-bearing for the Pantheon reconnect flow.
+        assert!(
+            body.contains("\"workers\":[]"),
+            "expected empty array, got body: {body}"
+        );
+        assert!(
+            !body.contains("\"workers\":null"),
+            "workers must never serialize as null"
+        );
+
+        let parsed: WorkersResponse = serde_json::from_str(&body).unwrap();
+        assert!(parsed.workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_workers_rejects_missing_bearer() {
+        let state = make_state("tok-w-3");
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/workers")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_workers_rejects_wrong_bearer() {
+        let state = make_state("tok-w-4");
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/workers")
+            .header(AUTHORIZATION, "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ----- /api/fleet --------------------------------------------------
+
+    #[tokio::test]
+    async fn api_fleet_returns_v2_builds_from_state() {
+        let state = make_state("tok-f-1");
+        {
+            let mut guard = state.fleet_v2_states.lock().await;
+            guard.insert("build-001".to_string(), sample_build("build-001"));
+        }
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/fleet")
+            .header(AUTHORIZATION, "Bearer tok-f-1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp.into_body()).await;
+        let parsed: FleetResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.builds.len(), 1);
+        assert_eq!(parsed.builds[0].build_id, "build-001");
+        assert_eq!(parsed.builds[0].tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn api_fleet_empty_returns_empty_builds_array() {
+        let state = make_state("tok-f-2");
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/fleet")
+            .header(AUTHORIZATION, "Bearer tok-f-2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp.into_body()).await;
+        assert!(
+            body.contains("\"builds\":[]"),
+            "expected empty builds array, got: {body}"
+        );
+        assert!(!body.contains("\"builds\":null"));
+        let parsed: FleetResponse = serde_json::from_str(&body).unwrap();
+        assert!(parsed.builds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_fleet_by_id_returns_existing_build() {
+        let state = make_state("tok-f-3");
+        {
+            let mut guard = state.fleet_v2_states.lock().await;
+            guard.insert("build-002".to_string(), sample_build("build-002"));
+        }
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/fleet/build-002")
+            .header(AUTHORIZATION, "Bearer tok-f-3")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_string(resp.into_body()).await;
+        let parsed: FleetBuild = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.build_id, "build-002");
+        assert_eq!(parsed.tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn api_fleet_by_id_returns_404_for_missing_build() {
+        let state = make_state("tok-f-4");
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/fleet/nonexistent")
+            .header(AUTHORIZATION, "Bearer tok-f-4")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_fleet_rejects_missing_bearer() {
+        let state = make_state("tok-f-5");
+        let router = make_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/fleet")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
