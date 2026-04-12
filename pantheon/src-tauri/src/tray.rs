@@ -110,36 +110,30 @@ pub fn init_tray<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
 /// Tauri command — frontend calls this when the daemon health state
 /// changes (initially in T-020 when DaemonClient lands; today it's
 /// callable for testing). Looks up the tray by id and swaps the icon.
+///
+/// Until real PNG assets land, every state uses the same default window
+/// icon. The `update_daemon_state` command IS wired and reaches the right
+/// tray handle, so swapping in real PNGs is a localized change here:
+/// branch on `_tray_state` and call `Image::from_bytes(include_bytes!(
+/// "../icons/StateXTemplate.png"))?` per arm.
 #[tauri::command]
 pub fn update_daemon_state(app: AppHandle, state: String) -> Result<(), String> {
-    let tray_state = DaemonTrayState::from_str(&state);
+    let _tray_state = DaemonTrayState::from_str(&state);
     let tray = app
         .tray_by_id(TRAY_ID)
         .ok_or_else(|| format!("tray '{TRAY_ID}' not found"))?;
 
-    // Until real PNG assets land, every state uses the same default
-    // icon. Replace these `image_for_state` arms with `Image::from_bytes(
-    // include_bytes!("../icons/StateXTemplate.png"))?` when the polish
-    // pass adds the template images.
-    let icon = image_for_state(&app, tray_state)?;
-    tray.set_icon(Some(icon))
-        .map_err(|e| format!("set_icon failed: {e}"))?;
-    Ok(())
-}
-
-/// Pick the icon image for a given state. Currently a placeholder that
-/// returns the default window icon for all four states — the
-/// `update_daemon_state` command IS wired and reaches the right tray
-/// handle, so swapping in real PNGs is a one-line change per arm.
-fn image_for_state<R: Runtime>(
-    app: &AppHandle<R>,
-    _state: DaemonTrayState,
-) -> Result<Image<'static>, String> {
-    // TODO(polish): when 4 template PNGs land at icons/Icon*Template.png,
-    // branch on `_state` and Image::from_bytes(include_bytes!(...)) each.
+    // Inline the icon clone — extracting this into a helper function
+    // returning Image<'static> tripped a lifetime error because
+    // default_window_icon() returns Option<&Image<'_>> with a borrowed
+    // lifetime tied to the AppHandle. Cloning + handing directly to
+    // set_icon avoids the function-boundary lifetime constraint entirely.
     let icon = app
         .default_window_icon()
         .ok_or_else(|| "no default window icon".to_string())?
         .clone();
-    Ok(icon)
+
+    tray.set_icon(Some(icon))
+        .map_err(|e| format!("set_icon failed: {e}"))?;
+    Ok(())
 }
