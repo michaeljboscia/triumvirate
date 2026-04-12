@@ -151,3 +151,187 @@ fn build_streamable_http_service(
         config,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    //! Reality tests for T-004 (REQ-010, REQ-033).
+    //!
+    //! These drive the `bearer_auth_middleware` directly with synthetic
+    //! `Request<Body>` objects and inspect what `current_pantheon_session()`
+    //! returns from inside the downstream handler. No real HTTP server,
+    //! no real MCP — the middleware is the entire unit under test.
+
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use daemon_core::current_pantheon_session;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use tower::ServiceExt;
+
+    /// Guards single-threaded use of the shared captured-state cell.
+    /// Axum's `middleware::from_fn` test harness will run closures in
+    /// parallel otherwise, and we want deterministic reads.
+    fn capture_cell() -> &'static StdMutex<Option<Option<Arc<PantheonSessionContext>>>> {
+        static CELL: OnceLock<StdMutex<Option<Option<Arc<PantheonSessionContext>>>>> =
+            OnceLock::new();
+        CELL.get_or_init(|| StdMutex::new(None))
+    }
+
+    /// Build a tiny Axum router with `bearer_auth_middleware` layered on top
+    /// of a handler that captures the current PANTHEON_SESSION into the test
+    /// cell and returns 200 OK.
+    fn make_test_router(token: &str) -> axum::Router {
+        let capture_handler = |_req: Request<Body>| async move {
+            let got = current_pantheon_session();
+            *capture_cell().lock().unwrap() = Some(got);
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        axum::Router::new()
+            .fallback(capture_handler)
+            .layer(axum::middleware::from_fn({
+                let token = token.to_string();
+                move |req, next| {
+                    let token = token.clone();
+                    bearer_auth_middleware(token, req, next)
+                }
+            }))
+    }
+
+    fn reset_capture() {
+        *capture_cell().lock().unwrap() = None;
+    }
+
+    fn taken_capture() -> Option<Arc<PantheonSessionContext>> {
+        capture_cell()
+            .lock()
+            .unwrap()
+            .take()
+            .expect("handler should have captured")
+    }
+
+    #[tokio::test]
+    async fn middleware_propagates_pantheon_session_header_to_task_local() {
+        reset_capture();
+        let router = make_test_router("secret");
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .header(PANTHEON_SESSION_HEADER, "pantheon-sess-123")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let captured = taken_capture().expect("scope should have been populated");
+        assert_eq!(captured.parent_session_id, "pantheon-sess-123");
+        // No root header supplied → root defaults to parent.
+        assert_eq!(captured.root_session_id, "pantheon-sess-123");
+    }
+
+    #[tokio::test]
+    async fn middleware_honors_explicit_root_session_header() {
+        reset_capture();
+        let router = make_test_router("secret");
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .header(PANTHEON_SESSION_HEADER, "intermediate-worker")
+            .header(PANTHEON_ROOT_SESSION_HEADER, "pantheon-root")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let captured = taken_capture().expect("scope should have been populated");
+        assert_eq!(captured.parent_session_id, "intermediate-worker");
+        assert_eq!(captured.root_session_id, "pantheon-root");
+    }
+
+    #[tokio::test]
+    async fn middleware_missing_pantheon_header_leaves_scope_none() {
+        reset_capture();
+        let router = make_test_router("secret");
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Handler ran inside PANTHEON_SESSION.scope(None, ...) → None.
+        assert!(taken_capture().is_none());
+    }
+
+    #[tokio::test]
+    async fn middleware_rejects_missing_bearer_before_scope_runs() {
+        reset_capture();
+        let router = make_test_router("secret");
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header(PANTHEON_SESSION_HEADER, "should-never-be-read")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Handler should never have run, so the cell is still None.
+        assert!(capture_cell().lock().unwrap().is_none());
+        // Drain the body to keep tower happy.
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
+
+    #[tokio::test]
+    async fn middleware_rejects_wrong_bearer() {
+        reset_capture();
+        let router = make_test_router("secret");
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer wrong")
+            .header(PANTHEON_SESSION_HEADER, "x")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(capture_cell().lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn middleware_treats_empty_header_as_none() {
+        reset_capture();
+        let router = make_test_router("secret");
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .header(PANTHEON_SESSION_HEADER, "   ")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(taken_capture().is_none());
+    }
+}
