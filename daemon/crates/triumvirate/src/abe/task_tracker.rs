@@ -34,6 +34,17 @@ struct TaskRecord {
     output: Option<TaskOutput>,
     child: Option<Arc<Mutex<Child>>>,
     worktree_path: Option<PathBuf>,
+    /// FEAT-014 (REQ-010) T-004: Pantheon lineage captured at register time
+    /// from `daemon_core::current_pantheon_session()`. Stored here (rather
+    /// than read on-demand) because `mark_completed`/`mark_failed` execute
+    /// inside a `tokio::spawn`ed monitor task where the task-local is not
+    /// visible. `None` for legacy (non-Pantheon) callers.
+    parent_session_id: Option<String>,
+    /// FEAT-014 (REQ-010) T-004: Root of the dispatch chain. For direct
+    /// Pantheon dispatches this equals `parent_session_id`. For chained
+    /// dispatches (v4.0+) it identifies the original Pantheon session at
+    /// the top of the chain.
+    root_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
