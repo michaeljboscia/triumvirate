@@ -5713,28 +5713,23 @@ mod pantheon_rest_tests {
 
     #[tokio::test]
     async fn api_workers_rejects_missing_bearer() {
-        let state = make_state("tok-w-3");
+        let state = make_state(TEST_TOKEN);
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/workers")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_no_bearer("/api/workers"))
+            .await
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn api_workers_rejects_wrong_bearer() {
-        let state = make_state("tok-w-4");
+        let state = make_state(TEST_TOKEN);
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/workers")
-            .header(AUTHORIZATION, "Bearer wrong-token")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_with_bearer("/api/workers", "wrong-token"))
+            .await
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
