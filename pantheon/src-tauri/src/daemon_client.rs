@@ -46,10 +46,10 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use shared_types::api::{
+use shared_types::{
     FleetResponse, ReplayRequest, ReplayResponse, StateResponse, WorkersResponse,
 };
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
