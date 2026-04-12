@@ -166,6 +166,16 @@ pub fn pty_spawn(
         let existing = std::env::var("PATH").unwrap_or_default();
         builder.env("PATH", format!("{extra_path}:{existing}"));
     }
+    // T-016 color fix: advertise full 256-color + truecolor capability
+    // to the child. launchd doesn't set TERM when Pantheon launches
+    // from Finder, so Claude Code (and any other color-aware CLI)
+    // downgrades to monochrome by default. xterm.js supports both
+    // 256-color palette and 24-bit truecolor, so set both vars. These
+    // are applied AFTER the std::env::vars() inherit loop so they
+    // overwrite whatever the parent had (e.g. TERM=dumb from launchd).
+    builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+
     // T-019 (separate task) adds PANTHEON_SESSION_ID here.
 
     // 3. Spawn the child into the PTY's slave side.
