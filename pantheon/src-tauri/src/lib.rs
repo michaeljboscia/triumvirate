@@ -32,6 +32,11 @@ pub fn run() {
     // last visible window vanishes — the tray would be left holding a
     // dead app handle. Per mx-tauri-window Level 2 hide-on-close pattern.
     let app = tauri::Builder::default()
+        // T-016: register the PtyState singleton so the pty_* commands
+        // can atomically manage the shared PTY handle. Default constructs
+        // an empty `Option<PtyHandle>` — the first pty_spawn invoke fills
+        // it in.
+        .manage(pty::PtyState::default())
         .plugin(tauri_plugin_opener::init())
         // T-020 crash-loop diagnostic: plugin disabled. See note at the
         // top of the file. Restore by re-enabling the import and the
