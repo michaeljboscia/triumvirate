@@ -6,6 +6,13 @@
   // auto-collapses below 1200px window width and re-expands above it (unless
   // the user has manually toggled it). Wave 5+ replaces the placeholder
   // <div>s with real terminal panels, sidebar tree, and status panels.
+  //
+  // T-020 wire-in: reads daemon.state + daemon.workers + daemon.fleet from
+  // the store for the status-area preview. This is a placeholder view so
+  // you can see data flowing from the daemon today — T-021/T-022 replace
+  // these <p> tags with the real sidebar tree and status panels.
+
+  import { daemon } from "$lib/stores/daemon";
 
   let sidebarOpen = $state(true);
   let statusOpen = $state(true);
