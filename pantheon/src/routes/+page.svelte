@@ -68,9 +68,21 @@
 <div class="shell">
   {#if sidebarOpen}
     <aside class="sidebar" aria-label="Workers and sessions sidebar">
-      <header class="region-header">Sidebar</header>
-      <p class="placeholder">Worker hierarchy lands in T-021.</p>
-      <p class="hint">⌘B to toggle</p>
+      <header class="region-header">Workers · {daemon.workers.length}</header>
+      {#if daemon.workers.length === 0}
+        <p class="placeholder">No workers yet. Dispatch one via Claude or Codex.</p>
+      {:else}
+        <ul class="worker-list">
+          {#each daemon.workers as w (w.session_id)}
+            <li class="worker-row">
+              <span class="worker-name">{w.name}</span>
+              <span class="worker-status worker-status-{w.status}">{w.status}</span>
+              <span class="worker-meta">{w.agent} · {Math.round(w.elapsed_ms / 1000)}s</span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <p class="hint">⌘B to toggle · T-021 replaces with real tree</p>
     </aside>
   {/if}
 
@@ -82,9 +94,28 @@
 
   {#if statusOpen}
     <section class="status-area" aria-label="Status panels">
-      <header class="region-header">Status</header>
-      <p class="placeholder">Status panels land in T-022 and T-023.</p>
-      <p class="hint">⌘⇧B to toggle · auto-collapses &lt;1200px</p>
+      <header class="region-header">Daemon</header>
+      <div class="state-row">
+        <span class="state-dot state-dot-{daemon.state}"></span>
+        <span class="state-label">{daemon.state}</span>
+      </div>
+      <header class="region-header region-header-sub">Fleet · {daemon.fleet.length}</header>
+      {#if daemon.fleet.length === 0}
+        <p class="placeholder">No active fleet builds.</p>
+      {:else}
+        <ul class="fleet-list">
+          {#each daemon.fleet as build (build.build_id)}
+            <li class="fleet-row">
+              <span class="fleet-id">{build.build_id}</span>
+              <span class="fleet-counts">
+                {build.completed}/{build.task_count}
+                {#if build.failed > 0}<span class="fleet-fail">· {build.failed} fail</span>{/if}
+              </span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <p class="hint">⌘⇧B to toggle · T-022/T-023 replace with real panels</p>
     </section>
   {/if}
 </div>
