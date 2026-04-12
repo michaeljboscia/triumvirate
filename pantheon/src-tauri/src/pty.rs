@@ -233,7 +233,9 @@ pub fn pty_spawn(
         *guard = Some(handle);
     }
 
-    Ok(())
+    // T-019: return the stamped UUID so the frontend can record the
+    // linkage and display it on hover in the sidebar (future T-021).
+    Ok(pantheon_session_id)
 }
 
 /// Blocking read loop running on a dedicated OS thread. Reads bytes
