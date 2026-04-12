@@ -162,19 +162,29 @@
     // the handle and spawned the reader thread — the reader thread
     // is already pumping data into the channel by the time the
     // promise resolves.
-    invoke("pty_spawn", {
+    invoke<string>("pty_spawn", {
       onOutput: channel,
       cols: term.cols,
       rows: term.rows,
       cwd,
       cmd,
       args,
-    }).catch((err) => {
-      console.error("pty_spawn failed", err);
-      term.write(
-        `\r\n\x1b[31m[pantheon] pty_spawn failed: ${err}\x1b[0m\r\n`,
-      );
-    });
+    })
+      .then((sessionId) => {
+        // T-019: the Rust side returns the PANTHEON_SESSION_ID it
+        // stamped on the child environment. Stash it on the component
+        // instance so later features (sidebar hover, worker-lineage
+        // cross-reference against /api/workers) can display it.
+        // Console log is intentional for now — Wave 6's T-021 will
+        // consume this via a sessions store.
+        console.info("[pantheon] pty spawned", { sessionId, cwd, cmd });
+      })
+      .catch((err) => {
+        console.error("pty_spawn failed", err);
+        term.write(
+          `\r\n\x1b[31m[pantheon] pty_spawn failed: ${err}\x1b[0m\r\n`,
+        );
+      });
 
     // 7. Wire keystrokes → pty_write. xterm.js fires `onData` with
     // the raw bytes the user typed, already including ANSI sequences
