@@ -528,7 +528,9 @@ fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
 mod tests {
     use std::sync::Arc;
 
-    use shared_types::TaskStatus;
+    use daemon_core::{EventSequencer, metrics::DaemonMetrics};
+    use shared_types::{AgentStreamEvent, TaskStatus, WorkerLifecycleType};
+    use tokio::sync::broadcast;
 
     use super::{TaskTracker, TransitionOutcome};
     use tokio::{process::Command, sync::Mutex};
