@@ -47,9 +47,9 @@ This manifest is **append-only** per the goatrodeo skill Phase 5.4 step 14. Ever
 
 | Task | Commit | Files | Bake-off | Tests | Status |
 |---|---|---|---|---|---|
-| T-007.5 | _pending_ | daemon-core/src/lib.rs (DaemonState + new fields), triumvirate/src/abe/task_tracker.rs (snapshot_workers), triumvirate/src/main.rs (replay-buffer fill task) | ❌ skip — pure plumbing | _pending_ | 🟡 in progress |
-| T-008 | _pending_ | triumvirate/src/main.rs (3 new GET routes + 3 handlers + 3 reality tests) | ✅ 2x Claude subagents | _pending_ | ⏸ blocked on T-007.5 |
-| T-009 | _pending_ | triumvirate/src/main.rs (1 new GET route, 1 new WS route, replay-aware handshake) | ✅ 2x Claude subagents | _pending_ | ⏸ blocked on T-007.5 |
+| T-007.5 | c14e057 | daemon-core/src/lib.rs (DaemonState + 4 new fields + run_replay_buffer_fill), triumvirate/src/abe/task_tracker.rs (snapshot_workers + status_label + format_rfc3339), triumvirate/src/main.rs (replay-buffer fill task wired in run_daemon) | ❌ skip — pure plumbing | 7/7 reality tests (4 fill + 3 snapshot) PASS | ✅ |
+| T-008 | _pending_ | triumvirate/src/main.rs (3 new GET routes + 3 handlers + ≥5 reality tests) | ✅ 2x Claude subagents | _pending_ | ⏳ ready for bake-off |
+| T-009 | _pending_ | triumvirate/src/main.rs (1 new GET route, 1 new WS route, replay-aware handshake) | ✅ 2x Claude subagents | _pending_ | ⏳ ready for bake-off |
 
 ---
 
