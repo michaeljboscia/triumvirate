@@ -1364,6 +1364,78 @@ fn build_status_report(
     )
 }
 
+// ---------------------------------------------------------------------------
+// T-008 — Pantheon v3.9.0 REST endpoints (REQ-017, FEAT-012)
+//
+// GET /api/workers        — ABE workers only (via TaskTracker::snapshot_workers)
+// GET /api/fleet          — v3.9.0 fleet builds from DaemonState::fleet_v2_states
+// GET /api/fleet/{build_id} — single fleet build lookup (404 when absent)
+//
+// Auth is enforced per-handler via `is_bearer_authorized`, matching the
+// existing `health`/`status` pattern — NOT middleware. SessionState is
+// intentionally NOT aggregated into /api/workers; the existing /session/list
+// route remains the canonical path for named MCP sessions (see Phase 5.3 R1
+// audit findings in the T-008 manifest).
+// ---------------------------------------------------------------------------
+
+/// Type alias mirroring `run_daemon`'s local `DaemonRuntimeState` so the new
+/// handlers can live at module scope (keeps the `#[cfg(test)] mod
+/// pantheon_rest_tests` module below able to call them directly without
+/// re-plumbing).
+type PantheonDaemonState = DaemonState<abe::task_tracker::TaskTracker>;
+
+async fn api_workers(
+    State(state): State<PantheonDaemonState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<shared_types::WorkersResponse>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let workers = state.abe_tasks.snapshot_workers().await;
+    Ok(AxumJson(shared_types::WorkersResponse { workers }))
+}
+
+async fn api_fleet(
+    State(state): State<PantheonDaemonState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<shared_types::FleetResponse>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let builds = {
+        let guard = state.fleet_v2_states.lock().await;
+        guard.values().cloned().collect::<Vec<_>>()
+    };
+    Ok(AxumJson(shared_types::FleetResponse { builds }))
+}
+
+async fn api_fleet_by_id(
+    State(state): State<PantheonDaemonState>,
+    axum::extract::Path(build_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Result<AxumJson<shared_types::FleetBuild>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let maybe_build = {
+        let guard = state.fleet_v2_states.lock().await;
+        guard.get(&build_id).cloned()
+    };
+    match maybe_build {
+        Some(build) => Ok(AxumJson(build)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
     type DaemonRuntimeState = DaemonState<abe::task_tracker::TaskTracker>;
 
