@@ -4,7 +4,7 @@
 
 mod tray;
 
-use tauri::{Manager, RunEvent, WindowEvent};
+use tauri::{RunEvent, WindowEvent};
 
 // Smoke-test command from the scaffold; kept so the frontend can verify the
 // IPC bridge works during early development. Removed in T-020 once real
