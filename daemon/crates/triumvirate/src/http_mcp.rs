@@ -63,8 +63,17 @@ pub fn build_mcp_router(
 }
 
 /// Bearer token auth middleware for the /mcp endpoint.
-/// Returns 401 Unauthorized if the token is missing or wrong.
-/// REQ-H09
+///
+/// - REQ-H09: Returns 401 Unauthorized if the token is missing or wrong.
+/// - REQ-010 / REQ-033 (T-004): On authorized requests, extracts the
+///   `X-Pantheon-Session-Id` (and optional `X-Pantheon-Root-Session-Id`)
+///   headers and scopes the downstream handler chain in a
+///   `PANTHEON_SESSION.scope(...)` so that ABE dispatch code can read the
+///   lineage via `daemon_core::current_pantheon_session()`.
+///
+/// Non-Pantheon callers (the legacy CLI, `curl`, tests) simply omit the
+/// header and the scope holds `None`, which propagates as "no lineage" into
+/// WorkerLifecycle events.
 async fn bearer_auth_middleware(
     expected_token: String,
     req: Request<axum::body::Body>,
@@ -85,7 +94,42 @@ async fn bearer_auth_middleware(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    Ok(next.run(req).await)
+    // FEAT-014 (REQ-010) T-004: extract Pantheon lineage headers (if any).
+    // Missing / empty / non-ASCII values all collapse to `None`.
+    let pantheon_parent = req
+        .headers()
+        .get(PANTHEON_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let pantheon_root = req
+        .headers()
+        .get(PANTHEON_ROOT_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let scope_value: Option<Arc<PantheonSessionContext>> = pantheon_parent.map(|parent| {
+        let ctx = match pantheon_root {
+            Some(root) => PantheonSessionContext::with_root(parent, root),
+            None => PantheonSessionContext::new(parent),
+        };
+        Arc::new(ctx)
+    });
+
+    // Wrap the downstream handler in PANTHEON_SESSION.scope so that every
+    // `.await` inside the MCP tool call chain (including `tracker.register()`)
+    // can observe the lineage via task-local reads. tokio::spawn boundaries
+    // inside dispatch code are handled by explicit capture there — see
+    // mcp_tools::abe::dispatch_codex.
+    let response = PANTHEON_SESSION
+        .scope(scope_value, async move { next.run(req).await })
+        .await;
+
+    Ok(response)
 }
 
 fn build_streamable_http_service(
