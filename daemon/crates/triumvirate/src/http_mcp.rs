@@ -8,6 +8,7 @@
 //! matching the existing HTTP API auth pattern.
 //!
 //! FEAT-002 (REQ-H01, REQ-H02, REQ-H03, REQ-H04, REQ-H07, REQ-H09)
+//! FEAT-011 (REQ-010, REQ-033) — Pantheon session linking via X-Pantheon-Session-Id
 
 use std::sync::Arc;
 
@@ -21,6 +22,29 @@ use rmcp::transport::streamable_http_server::{
 use tokio_util::sync::CancellationToken;
 
 use crate::McpBridge;
+
+/// Canonical header name for Pantheon session identification.
+/// FEAT-011 (REQ-033): Set by Pantheon's MCP proxy when a Claude Code PTY
+/// child dispatches via HTTP. Captured by bearer_auth_middleware into the
+/// PANTHEON_SESSION_ID tokio task-local, consumed by ABE TaskTracker to
+/// populate parent_session_id on dispatched workers.
+pub const PANTHEON_SESSION_HEADER: &str = "x-pantheon-session-id";
+
+tokio::task_local! {
+    /// The current Pantheon session ID for this MCP request, if any.
+    ///
+    /// Set by bearer_auth_middleware after extracting the X-Pantheon-Session-Id
+    /// header. Read by ABE dispatch to stamp parent_session_id on workers.
+    /// None for non-Pantheon clients (legacy CLI, tests, manual MCP callers).
+    pub static PANTHEON_SESSION_ID: Option<String>;
+}
+
+/// Helper for code that needs to read the current Pantheon session ID
+/// from task-local state. Returns None if not in a Pantheon-originated
+/// request scope.
+pub fn current_pantheon_session_id() -> Option<String> {
+    PANTHEON_SESSION_ID.try_with(|v| v.clone()).ok().flatten()
+}
 
 /// Build an Axum Router for the /mcp endpoint with auth + StreamableHttpService.
 ///
