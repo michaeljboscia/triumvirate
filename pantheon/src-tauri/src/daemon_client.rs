@@ -122,7 +122,18 @@ struct ClientState {
     /// Last observed health state. Protected by a Mutex (not atomic)
     /// because the transition logic reads + writes non-atomically.
     health: Mutex<HealthState>,
+    /// Wall-clock instant of the last state emit. Used to enforce a
+    /// minimum dwell time between transitions so rapid churn during
+    /// reconnect can't fan out to the UI as visible flicker.
+    last_emit: Mutex<Instant>,
 }
+
+/// Minimum dwell time between health state transitions. If `transition`
+/// is called faster than this, the new state is still stored in memory
+/// but we do NOT emit a `daemon://state` event and do NOT swap the tray
+/// icon. Prevents UI flicker during fast Ready → Degraded → Ready churn
+/// on transient REST poll failures.
+const MIN_TRANSITION_DWELL: Duration = Duration::from_millis(300);
 
 /// Spawn the daemon client background task. Called from `lib.rs::run()`'s
 /// setup hook so the connection loop starts as soon as the Tauri runtime
