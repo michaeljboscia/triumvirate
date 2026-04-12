@@ -22,12 +22,26 @@ use uuid::Uuid;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
+    /// Register a newly-dispatched worker task.
+    ///
+    /// `parent_session_id` / `root_session_id` carry Pantheon lineage
+    /// captured from the inbound MCP request (X-Pantheon-Session-Id header
+    /// or stdio `_meta.pantheon.session_id`). Callers MUST read these from
+    /// `daemon_core::current_pantheon_session()` BEFORE any `tokio::spawn`
+    /// — task-locals do not propagate across spawn boundaries.
+    ///
+    /// Both fields may be `None` for legacy callers that didn't identify
+    /// themselves as a Pantheon session; in that case the WorkerLifecycle
+    /// events will have `parent_session_id = None` and Pantheon's sidebar
+    /// will render the worker as a top-level root.
     fn register(
         &self,
         task_id: String,
         wave: u32,
         child: Arc<Mutex<Child>>,
         worktree_path: Option<PathBuf>,
+        parent_session_id: Option<String>,
+        root_session_id: Option<String>,
     ) -> BoxFuture<()>;
 
     fn mark_completed(
