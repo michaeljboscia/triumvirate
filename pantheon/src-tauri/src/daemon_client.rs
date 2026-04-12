@@ -132,7 +132,7 @@ struct ClientState {
 /// The app handle is cloned into the task so events can be emitted to
 /// every window and so the tray icon can be swapped via the already-
 /// registered `update_daemon_state` command path.
-pub fn spawn<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+pub fn spawn(app: AppHandle) -> Result<()> {
     let token = load_token().context("failed to load ~/.triumvirate/daemon.token")?;
     let base = std::env::var("PANTHEON_DAEMON_URL").unwrap_or_else(|_| DEFAULT_DAEMON_HTTP.into());
     let base_http = base.trim_end_matches('/').to_string();
