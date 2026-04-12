@@ -5686,16 +5686,12 @@ mod pantheon_rest_tests {
 
     #[tokio::test]
     async fn api_workers_empty_tracker_returns_empty_array_not_null() {
-        let state = make_state("tok-w-2");
+        let state = make_state(TEST_TOKEN);
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/workers")
-            .header(AUTHORIZATION, "Bearer tok-w-2")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_with_bearer("/api/workers", TEST_TOKEN))
+            .await
             .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp.into_body()).await;
 
