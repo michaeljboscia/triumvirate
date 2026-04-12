@@ -149,7 +149,7 @@ match replay {
         return;
     }
     ReplayResult::Events(events) => {
-        // Send "ok" ack, then the historical events, then switch to live.
+        // Send "ok" ack (bare ReplayResponse, no envelope — handshake frame).
         let ack = shared_types::ReplayResponse { replay: "ok".into(), oldest_seq: None };
         if socket.send(axum::extract::ws::Message::Text(
             serde_json::to_string(&ack).unwrap().into()
@@ -157,41 +157,54 @@ match replay {
 
         // Track max seq sent so we can dedupe overlap with the live stream.
         let mut max_sent = req.last_seq;
+
+        // CRITICAL: wrap EVERY historical event in the SAME envelope shape
+        // the live tail uses. The client parses envelopes uniformly; sending
+        // bare AgentStreamEvent JSON here would break the replay→live
+        // transition and was the Round 1 audit's critical finding.
         for event in &events {
-            let payload = match serde_json::to_string(event) {
-                Ok(p) => p,
+            let payload_value = match serde_json::to_value(event) {
+                Ok(v) => v,
                 Err(_) => continue,
             };
-            if socket.send(axum::extract::ws::Message::Text(payload.into())).await.is_err() {
+            let envelope = daemon_core::encode_ws_event("agent_stream", payload_value);
+            if socket.send(axum::extract::ws::Message::Text(envelope.into())).await.is_err() {
                 return;
             }
             max_sent = max_sent.max(event.seq());
         }
 
-        // Switch to live tail (with seq dedup).
+        // Switch to live tail. Live envelopes are already encoded by the
+        // publisher (TaskTracker etc.) so we forward them unchanged after
+        // dedup. Parse to extract seq for the dedup check, but ALWAYS send
+        // the raw envelope string — do NOT re-serialize.
         loop {
             match live_rx.recv().await {
                 Ok(envelope) => {
-                    // The envelope is the daemon-core encode_ws_event wrapper.
-                    // Parse it to extract seq for dedup.
+                    let mut skip = false;
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&envelope) {
                         if value.get("type").and_then(|v| v.as_str()) == Some("agent_stream") {
                             if let Some(payload) = value.get("payload") {
                                 if let Ok(event) = serde_json::from_value::<shared_types::AgentStreamEvent>(payload.clone()) {
                                     let seq = event.seq();
-                                    if seq <= max_sent { continue; } // dedup the overlap
-                                    max_sent = seq;
+                                    if seq <= max_sent {
+                                        skip = true; // dedup the overlap
+                                    } else {
+                                        max_sent = seq;
+                                    }
                                 }
                             }
                         }
                     }
+                    if skip { continue; }
                     if socket.send(axum::extract::ws::Message::Text(envelope.into())).await.is_err() {
                         break;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Per Gemini research: close the connection on lag.
-                    // Client must reconnect with current last_seq.
+                    // Canonical pattern: close on lag. Client reconnects with
+                    // its current last_seq and the handshake starts over.
+                    // Do NOT try to recover in place.
                     let _ = socket.close().await;
                     break;
                 }
