@@ -1,156 +1,158 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  // T-013 (REQ-001, REQ-002, REQ-027, REQ-029, REQ-034) — Pantheon shell layout.
+  //
+  // Three-region flexbox: sidebar (250px) | terminal area (flex:1) | status (280px).
+  // Cmd+B toggles sidebar. Cmd+Shift+B toggles status area. Status area
+  // auto-collapses below 1200px window width and re-expands above it (unless
+  // the user has manually toggled it). Wave 5+ replaces the placeholder
+  // <div>s with real terminal panels, sidebar tree, and status panels.
 
-  let name = $state("");
-  let greetMsg = $state("");
+  let sidebarOpen = $state(true);
+  let statusOpen = $state(true);
+  // Tracks whether the user has manually toggled status. If true, the
+  // auto-collapse breakpoint stops fighting them.
+  let statusManuallyToggled = $state(false);
+  let windowWidth = $state(typeof window !== "undefined" ? window.innerWidth : 1400);
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
-  }
+  // Window-width tracking for the 1200px auto-collapse breakpoint.
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => {
+      windowWidth = window.innerWidth;
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  });
+
+  // Auto-collapse status area below 1200px UNLESS the user has overridden.
+  $effect(() => {
+    if (statusManuallyToggled) return;
+    statusOpen = windowWidth >= 1200;
+  });
+
+  // Keyboard shortcuts. Cmd+B → sidebar, Cmd+Shift+B → status. Both fire
+  // on macOS Command and Linux/Windows Ctrl so the same shell works for
+  // dev runs on Linux during integration testing — though Pantheon ships
+  // macOS-only per REQ-028.
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod) return;
+      if (e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          statusOpen = !statusOpen;
+          statusManuallyToggled = true;
+        } else {
+          sidebarOpen = !sidebarOpen;
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<svelte:head>
+  <title>Pantheon</title>
+</svelte:head>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+<div class="shell">
+  {#if sidebarOpen}
+    <aside class="sidebar" aria-label="Workers and sessions sidebar">
+      <header class="region-header">Sidebar</header>
+      <p class="placeholder">Worker hierarchy lands in T-021.</p>
+      <p class="hint">⌘B to toggle</p>
+    </aside>
+  {/if}
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
-</main>
+  <main class="terminal-area" aria-label="Terminal panels">
+    <header class="region-header">Terminal Area</header>
+    <p class="placeholder">Terminal panels land in T-016 and T-017.</p>
+    <p class="hint">Window: {windowWidth}px wide</p>
+  </main>
+
+  {#if statusOpen}
+    <section class="status-area" aria-label="Status panels">
+      <header class="region-header">Status</header>
+      <p class="placeholder">Status panels land in T-022 and T-023.</p>
+      <p class="hint">⌘⇧B to toggle · auto-collapses &lt;1200px</p>
+    </section>
+  {/if}
+</div>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
+  :global(html), :global(body) {
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     color: #f6f6f6;
-    background-color: #2f2f2f;
+    background-color: #1a1a1a;
   }
 
-  a:hover {
-    color: #24c8db;
+  .shell {
+    display: flex;
+    height: 100vh;
+    width: 100vw;
   }
 
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
+  .sidebar {
+    flex: 0 0 250px;
+    width: 250px;
+    border-right: 1px solid #333;
+    background-color: #181818;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
   }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
 
+  .terminal-area {
+    flex: 1 1 auto;
+    min-width: 0;
+    background-color: #1a1a1a;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .status-area {
+    flex: 0 0 280px;
+    width: 280px;
+    border-left: 1px solid #333;
+    background-color: #181818;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .region-header {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #888;
+    border-bottom: 1px solid #333;
+    padding-bottom: 6px;
+    margin-bottom: 12px;
+  }
+
+  .placeholder {
+    margin: 0 0 8px 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #aaa;
+  }
+
+  .hint {
+    margin: 0;
+    font-size: 11px;
+    color: #666;
+    margin-top: auto;
+  }
 </style>
