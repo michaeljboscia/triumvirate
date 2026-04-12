@@ -5650,19 +5650,15 @@ mod pantheon_rest_tests {
 
     #[tokio::test]
     async fn api_workers_returns_abe_workers_with_lineage() {
-        let state = make_state("tok-w-1");
+        let state = make_state(TEST_TOKEN);
         register_worker(&state, "T-APOLLO-A", Some("pantheon-A"), Some("root-A")).await;
         register_worker(&state, "T-APOLLO-B", Some("pantheon-B"), Some("root-B")).await;
 
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/workers")
-            .header(AUTHORIZATION, "Bearer tok-w-1")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_with_bearer("/api/workers", TEST_TOKEN))
+            .await
             .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp.into_body()).await;
         let parsed: WorkersResponse = serde_json::from_str(&body).unwrap();
