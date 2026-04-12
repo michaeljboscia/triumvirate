@@ -1036,7 +1036,37 @@ async fn prewarm_daemon_workers() {
     agent_exec::prewarm_daemon_workers().await;
 }
 
-#[tool_handler]
+/// Hand-rolled `ServerHandler` impl. Replaces `#[tool_handler]` so we can
+/// intercept `call_tool` and extract Pantheon session lineage from the
+/// JSON-RPC `_meta` field before delegating to the generated tool router.
+///
+/// FEAT-014 (REQ-010, REQ-033) T-004 — stdio transport half.
+///
+/// The HTTP transport extracts lineage from the `X-Pantheon-Session-Id` /
+/// `X-Pantheon-Root-Session-Id` headers in `http_mcp::bearer_auth_middleware`
+/// and scopes the downstream handler chain in `PANTHEON_SESSION.scope(...)`.
+/// The stdio transport has no headers, so Pantheon's MCP proxy passes the
+/// same identifiers through the MCP protocol's `_meta` object instead:
+///
+/// ```json
+/// {
+///   "method": "tools/call",
+///   "params": {
+///     "name": "dispatch_codex",
+///     "_meta": {
+///       "pantheon.session_id": "sess-xyz",
+///       "pantheon.root_session_id": "sess-root"
+///     },
+///     "arguments": { ... }
+///   }
+/// }
+/// ```
+///
+/// `call_tool` reads those fields, constructs a `PantheonSessionContext`,
+/// and wraps the inner `tool_router.call(...)` in `PANTHEON_SESSION.scope`
+/// so that `dispatch_codex`/`dispatch_codex_worktree` see the same task-local
+/// state they would on the HTTP path. `list_tools` and `get_tool` are copied
+/// verbatim from the `#[tool_handler]` expansion.
 impl ServerHandler for McpBridge {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1045,6 +1075,77 @@ impl ServerHandler for McpBridge {
                 daemon_core::VERSION
             ))
     }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // FEAT-014 (REQ-010, REQ-033) T-004 stdio half: pull Pantheon
+        // lineage out of the _meta envelope. Missing/blank values collapse
+        // to None, which means "not a Pantheon caller" and propagates
+        // through as absent lineage on the emitted WorkerLifecycle events.
+        let scope_value = extract_pantheon_scope_from_meta(&request);
+
+        let tcc = ToolCallContext::new(self, request, context);
+        let fut = self.tool_router.call(tcc);
+        daemon_core::PANTHEON_SESSION.scope(scope_value, fut).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+}
+
+/// FEAT-014 (REQ-010, REQ-033) T-004 stdio half.
+///
+/// Pull `_meta.pantheon.session_id` and optional `_meta.pantheon.root_session_id`
+/// out of a tool-call request and produce the `PANTHEON_SESSION` scope value.
+///
+/// Returns:
+/// - `Some(Arc<ctx>)` if a non-empty session ID is present.
+/// - `None` if `_meta` is absent, the fields are missing, non-string, or blank.
+///
+/// Broken out so it can be unit-tested without standing up a full MCP server.
+fn extract_pantheon_scope_from_meta(
+    request: &CallToolRequestParams,
+) -> Option<Arc<daemon_core::PantheonSessionContext>> {
+    // Canonical keys, namespaced per MCP `_meta` convention.
+    const PARENT_KEY: &str = "pantheon.session_id";
+    const ROOT_KEY: &str = "pantheon.root_session_id";
+
+    let meta = request.meta.as_ref()?;
+    let obj = &meta.0;
+
+    let parent = obj
+        .get(PARENT_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    let root = obj
+        .get(ROOT_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let ctx = match root {
+        Some(r) => daemon_core::PantheonSessionContext::with_root(parent, r),
+        None => daemon_core::PantheonSessionContext::new(parent),
+    };
+    Some(Arc::new(ctx))
 }
 
 fn init_tracing() -> anyhow::Result<()> {
