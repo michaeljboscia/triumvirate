@@ -193,4 +193,108 @@
     color: #666;
     margin-top: auto;
   }
+
+  /* T-020: placeholder preview styles for daemon data. Get replaced by
+   * real Sidebar.svelte / StatusArea.svelte components in Wave 6. */
+  .region-header-sub {
+    margin-top: 16px;
+  }
+
+  .worker-list,
+  .fleet-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .worker-row,
+  .fleet-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 10px;
+    background-color: #212121;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+
+  .worker-name,
+  .fleet-id {
+    color: #e6e6e6;
+    font-weight: 500;
+  }
+
+  .worker-status {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #888;
+  }
+
+  .worker-status-working,
+  .worker-status-in_progress {
+    color: #4a9eff;
+  }
+  .worker-status-committed,
+  .worker-status-completed {
+    color: #4ade80;
+  }
+  .worker-status-failed {
+    color: #f87171;
+  }
+
+  .worker-meta,
+  .fleet-counts {
+    font-size: 10px;
+    color: #888;
+  }
+
+  .fleet-fail {
+    color: #f87171;
+  }
+
+  .state-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0 12px 0;
+  }
+
+  .state-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .state-dot-starting {
+    background-color: #fbbf24;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  .state-dot-ready {
+    background-color: #4ade80;
+  }
+  .state-dot-degraded {
+    background-color: #fbbf24;
+  }
+  .state-dot-disconnected {
+    background-color: #f87171;
+  }
+
+  .state-label {
+    font-size: 12px;
+    color: #e6e6e6;
+    text-transform: capitalize;
+  }
+
+  @keyframes pulse {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
+  }
 </style>
