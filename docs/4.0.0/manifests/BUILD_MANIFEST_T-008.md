@@ -202,14 +202,14 @@ cargo test -p triumvirate --bin triumvirate -- http_mcp::tests pantheon_stdio_me
 
 All three must pass. The second is your new test module. The third is the regression check — Wave 1 tests must still be green.
 
-## Done when
+## Done when (mirrors the IMPLEMENTATION_PLAN.md T-008 done_when)
 
-- Three new GET routes registered in `run_daemon`'s `Router::new()` chain.
-- Three handlers implemented per the contract above.
-- 8+ reality tests in `mod pantheon_rest_tests` PASS.
-- `cargo check --workspace --tests` clean.
-- No existing route or test broken.
-- The commit message starts with `T-008:` and references REQ-017.
+- Three new GET routes registered in `run_daemon`'s `Router::new()` chain and return JSON matching the BACKEND_STRUCTURE.md contract.
+- Auth enforced via the existing per-handler `is_bearer_authorized` pattern.
+- Empty responses when no workers/fleet active (empty array, never null).
+- No regression in existing routes — `cargo test -p triumvirate --bin triumvirate` green.
+- The 9 reality tests above PASS (≥6 required; 9 listed).
+- Commit message starts with `T-008:` and references REQ-017 + FEAT-012.
 
 ## Forbidden actions
 
