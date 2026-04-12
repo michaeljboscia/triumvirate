@@ -20,18 +20,19 @@
   // future sprint — the spec is dark-only for v4.0.
 
   import "../app.css";
-  // T-020 crash-loop diagnostic: daemon store silenced. Re-enable
-  // alongside the tauri-plugin-prevent-default restoration once the
-  // WebProcess crash loop is confirmed fixed.
-  // import { onMount } from "svelte";
-  // import { daemon } from "$lib/stores/daemon.svelte";
+  import { onMount } from "svelte";
+  import { daemon } from "$lib/stores/daemon.svelte";
 
   let { children } = $props();
 
-  // onMount(() => {
-  //   daemon.init();
-  //   return () => daemon.destroy();
-  // });
+  // T-020 re-enabled post-diagnostic. The actual cause of the blank
+  // window was the daemon store needing a `.svelte.ts` extension,
+  // not this init call. Wiring it up so the status rail's dot
+  // actually reflects daemon state instead of stuck-on "Starting".
+  onMount(() => {
+    daemon.init();
+    return () => daemon.destroy();
+  });
 </script>
 
 {@render children()}
