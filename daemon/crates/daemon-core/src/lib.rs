@@ -22,10 +22,15 @@ pub mod observability;
 pub mod sequencer;
 pub mod pid;
 pub mod replay;
+pub mod pantheon_session;
 pub use version::{NAME, VERSION};
 pub use sequencer::EventSequencer;
 pub use pid::PidFile;
 pub use replay::{EventReplayBuffer, ReplayResult, DEFAULT_CAPACITY as REPLAY_BUFFER_DEFAULT_CAPACITY};
+pub use pantheon_session::{
+    PANTHEON_SESSION, PantheonSessionContext, current_parent_session_id,
+    current_pantheon_session, current_root_session_id,
+};
 
 #[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
