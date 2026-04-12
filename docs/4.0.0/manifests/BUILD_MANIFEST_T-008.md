@@ -168,29 +168,29 @@ async fn api_workers(
 }
 ```
 
-## Reality tests (≥5, all in `mod pantheon_rest_tests` at the bottom of main.rs)
+## Reality tests (≥6, all in `mod pantheon_rest_tests` at the bottom of main.rs)
 
 Each test must use a real `axum::Router` built via `Router::new().route(...).with_state(state.clone())` — not a mock. Use `tower::ServiceExt::oneshot` to drive requests; the dev-dependency `tower = { version = "0.5", features = ["util"] }` is already present in `daemon/crates/triumvirate/Cargo.toml` (added during T-004).
 
-You will need a helper to build a test `DaemonRuntimeState` with empty sessions, an empty TaskTracker, and an empty `fleet_v2_states`. The constructor signature is `DaemonState::new(token, queues, bind_addr, sessions, sessions_file, abe_tasks, ledger_project_lru, marker_parse_window, metrics, ws_events)` — see how the production code in `run_daemon` builds it.
+Required tests (add more if useful, but all listed must PASS):
 
-Required tests (you may add more):
+1. **`api_workers_returns_abe_workers_with_lineage`** — register 2 ABE tasks via `state.abe_tasks.register(task_id, wave, child, worktree_path, parent_session_id, root_session_id)` with distinct `parent_session_id`s (e.g. "pantheon-A" and "pantheon-B"). Hit GET `/api/workers` with bearer. Assert response.status == 200 AND parsed `WorkersResponse.workers.len() == 2` AND the set of `parent_session_id`s equals `{"pantheon-A", "pantheon-B"}`. A stub returning `[]` fails the count; a stub with hardcoded lineage fails the content check.
 
-1. **`api_workers_returns_session_with_lineage`** — populate `state.sessions` with one named SessionState that has `pantheon_session_id = Some("pantheon-XYZ")`. Hit GET `/api/workers` with bearer. Assert response.status == 200 AND parsed `WorkersResponse.workers.len() == 1` AND `workers[0].pantheon_session_id == Some("pantheon-XYZ")`. A stub returning `[]` fails this.
-
-2. **`api_workers_aggregates_sessions_and_abe_workers`** — populate `state.sessions` with 1 entry AND register 2 ABE tasks via `state.abe_tasks.register(...)`. Hit GET `/api/workers`. Assert workers.len() == 3 AND the union is correct (no dedup issues). A stub that only reads sessions OR only reads abe_tasks fails this.
+2. **`api_workers_empty_tracker_returns_empty_array_not_null`** — empty TaskTracker. Hit GET `/api/workers`. Assert the body deserializes as `WorkersResponse { workers: vec![] }` AND the raw JSON contains `"workers":[]` (NOT `"workers":null` — critical for Pantheon's Tauri client).
 
 3. **`api_workers_rejects_missing_bearer`** — GET `/api/workers` with no Authorization header → 401.
 
 4. **`api_workers_rejects_wrong_bearer`** — GET `/api/workers` with `Bearer wrong-token` → 401.
 
-5. **`api_fleet_returns_v2_builds_from_state`** — populate `state.fleet_v2_states` with one `FleetBuild { build_id: "build-001", task_count: 2, completed: 1, ... tasks: vec![FleetTask{...}, FleetTask{...}] }`. Hit GET `/api/fleet` with bearer. Assert parsed `FleetResponse.builds.len() == 1` AND `builds[0].build_id == "build-001"` AND `builds[0].tasks.len() == 2`.
+5. **`api_fleet_returns_v2_builds_from_state`** — pre-populate `state.fleet_v2_states` via the lock pattern with one `FleetBuild { build_id: "build-001", task_count: 2, ... tasks: vec![FleetTask{...}, FleetTask{...}] }`. Hit GET `/api/fleet` with bearer. Assert `FleetResponse.builds.len() == 1` AND `builds[0].build_id == "build-001"` AND `builds[0].tasks.len() == 2`.
 
-6. **`api_fleet_by_id_returns_404_for_missing_build`** — empty `fleet_v2_states`. Hit GET `/api/fleet/nonexistent`. Assert response.status == 404. (For an existing build it returns 200 + the FleetBuild.)
+6. **`api_fleet_empty_returns_empty_builds_array`** — empty `fleet_v2_states`. GET `/api/fleet` → parsed `FleetResponse.builds.is_empty()` AND raw JSON has `"builds":[]`.
 
-7. **`api_fleet_by_id_returns_existing_build`** — populate `fleet_v2_states` with `build-002`. Hit GET `/api/fleet/build-002`. Assert 200 + `FleetBuild.build_id == "build-002"`.
+7. **`api_fleet_by_id_returns_existing_build`** — populate `fleet_v2_states` with `build-002`. GET `/api/fleet/build-002` → 200 + `FleetBuild.build_id == "build-002"`.
 
-8. **`api_workers_empty_state_returns_empty_array_not_null`** — empty sessions + empty abe_tasks. Hit GET `/api/workers`. Assert `WorkersResponse.workers` deserializes as an empty Vec, NOT null. (Critical for Pantheon's Tauri client which would crash on null.)
+8. **`api_fleet_by_id_returns_404_for_missing_build`** — empty `fleet_v2_states`. GET `/api/fleet/nonexistent` → response.status == 404.
+
+9. **`api_fleet_rejects_missing_bearer`** — GET `/api/fleet` with no Authorization header → 401. (Parity with the /api/workers auth tests.)
 
 ## Verify commands
 
