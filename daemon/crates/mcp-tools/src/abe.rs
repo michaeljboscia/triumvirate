@@ -431,12 +431,20 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     .await
     .map_err(|e| format!("dispatch_codex_worktree failed: {e}"))?;
 
+    // FEAT-014 (REQ-010) T-004: capture Pantheon lineage once in the request
+    // task before the monitor task is spawned; see dispatch_codex for rationale.
+    let pantheon_ctx = current_pantheon_session();
+    let parent_session_id = pantheon_ctx.as_ref().map(|c| c.parent_session_id.clone());
+    let root_session_id = pantheon_ctx.as_ref().map(|c| c.root_session_id.clone());
+
     tracker
         .register(
             task_id.clone(),
             req.contract_fields.wave,
             child.clone(),
             Some(setup.worktree_path.clone()),
+            parent_session_id,
+            root_session_id,
         )
         .await;
 
