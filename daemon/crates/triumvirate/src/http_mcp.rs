@@ -156,40 +156,47 @@ fn build_streamable_http_service(
 mod tests {
     //! Reality tests for T-004 (REQ-010, REQ-033).
     //!
-    //! These drive the `bearer_auth_middleware` directly with synthetic
+    //! These drive `bearer_auth_middleware` directly with synthetic
     //! `Request<Body>` objects and inspect what `current_pantheon_session()`
     //! returns from inside the downstream handler. No real HTTP server,
     //! no real MCP — the middleware is the entire unit under test.
+    //!
+    //! Each test owns its own `Arc<StdMutex<Option<Outcome>>>` capture cell
+    //! so tests can run in parallel without stomping on each other.
 
     use super::*;
     use axum::{
-        body::{Body, to_bytes},
+        body::Body,
         http::{Request, StatusCode},
     };
     use daemon_core::current_pantheon_session;
-    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::sync::Mutex as StdMutex;
     use tower::ServiceExt;
 
-    /// Guards single-threaded use of the shared captured-state cell.
-    /// Axum's `middleware::from_fn` test harness will run closures in
-    /// parallel otherwise, and we want deterministic reads.
-    fn capture_cell() -> &'static StdMutex<Option<Option<Arc<PantheonSessionContext>>>> {
-        static CELL: OnceLock<StdMutex<Option<Option<Arc<PantheonSessionContext>>>>> =
-            OnceLock::new();
-        CELL.get_or_init(|| StdMutex::new(None))
+    /// Outcome captured by the downstream handler: the value of
+    /// `current_pantheon_session()` at the moment the handler ran.
+    /// `None` inside the outer `Option` means the handler never ran
+    /// (e.g. the middleware rejected the request).
+    type CaptureCell = Arc<StdMutex<Option<Option<Arc<PantheonSessionContext>>>>>;
+
+    fn fresh_cell() -> CaptureCell {
+        Arc::new(StdMutex::new(None))
     }
 
-    /// Build a tiny Axum router with `bearer_auth_middleware` layered on top
-    /// of a handler that captures the current PANTHEON_SESSION into the test
-    /// cell and returns 200 OK.
-    fn make_test_router(token: &str) -> axum::Router {
-        let capture_handler = |_req: Request<Body>| async move {
-            let got = current_pantheon_session();
-            *capture_cell().lock().unwrap() = Some(got);
-            axum::response::Response::builder()
-                .status(StatusCode::OK)
-                .body(Body::empty())
-                .unwrap()
+    /// Build a tiny Axum router whose only handler captures the current
+    /// PANTHEON_SESSION into the supplied per-test cell and returns 200.
+    fn make_test_router(token: &str, cell: CaptureCell) -> axum::Router {
+        let cell_for_handler = cell.clone();
+        let capture_handler = move |_req: Request<Body>| {
+            let cell = cell_for_handler.clone();
+            async move {
+                let got = current_pantheon_session();
+                *cell.lock().unwrap() = Some(got);
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::empty())
+                    .unwrap()
+            }
         };
 
         axum::Router::new()
@@ -203,22 +210,24 @@ mod tests {
             }))
     }
 
-    fn reset_capture() {
-        *capture_cell().lock().unwrap() = None;
+    fn assert_handler_did_not_run(cell: &CaptureCell) {
+        assert!(
+            cell.lock().unwrap().is_none(),
+            "downstream handler should not have executed"
+        );
     }
 
-    fn taken_capture() -> Option<Arc<PantheonSessionContext>> {
-        capture_cell()
-            .lock()
+    fn take_captured(cell: &CaptureCell) -> Option<Arc<PantheonSessionContext>> {
+        cell.lock()
             .unwrap()
             .take()
-            .expect("handler should have captured")
+            .expect("downstream handler should have executed and captured a value")
     }
 
     #[tokio::test]
     async fn middleware_propagates_pantheon_session_header_to_task_local() {
-        reset_capture();
-        let router = make_test_router("secret");
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
 
         let req = Request::builder()
             .uri("/mcp")
@@ -231,7 +240,7 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let captured = taken_capture().expect("scope should have been populated");
+        let captured = take_captured(&cell).expect("scope should have been populated");
         assert_eq!(captured.parent_session_id, "pantheon-sess-123");
         // No root header supplied → root defaults to parent.
         assert_eq!(captured.root_session_id, "pantheon-sess-123");
@@ -239,8 +248,8 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_honors_explicit_root_session_header() {
-        reset_capture();
-        let router = make_test_router("secret");
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
 
         let req = Request::builder()
             .uri("/mcp")
@@ -254,15 +263,15 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let captured = taken_capture().expect("scope should have been populated");
+        let captured = take_captured(&cell).expect("scope should have been populated");
         assert_eq!(captured.parent_session_id, "intermediate-worker");
         assert_eq!(captured.root_session_id, "pantheon-root");
     }
 
     #[tokio::test]
     async fn middleware_missing_pantheon_header_leaves_scope_none() {
-        reset_capture();
-        let router = make_test_router("secret");
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
 
         let req = Request::builder()
             .uri("/mcp")
@@ -275,13 +284,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Handler ran inside PANTHEON_SESSION.scope(None, ...) → None.
-        assert!(taken_capture().is_none());
+        assert!(take_captured(&cell).is_none());
     }
 
     #[tokio::test]
     async fn middleware_rejects_missing_bearer_before_scope_runs() {
-        reset_capture();
-        let router = make_test_router("secret");
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
 
         let req = Request::builder()
             .uri("/mcp")
@@ -292,17 +301,13 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // Handler should never have run, so the cell is still None.
-        assert!(capture_cell().lock().unwrap().is_none());
-        // Drain the body to keep tower happy.
-        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+        assert_handler_did_not_run(&cell);
     }
 
     #[tokio::test]
     async fn middleware_rejects_wrong_bearer() {
-        reset_capture();
-        let router = make_test_router("secret");
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
 
         let req = Request::builder()
             .uri("/mcp")
@@ -314,13 +319,13 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(capture_cell().lock().unwrap().is_none());
+        assert_handler_did_not_run(&cell);
     }
 
     #[tokio::test]
     async fn middleware_treats_empty_header_as_none() {
-        reset_capture();
-        let router = make_test_router("secret");
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
 
         let req = Request::builder()
             .uri("/mcp")
@@ -332,6 +337,6 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(taken_capture().is_none());
+        assert!(take_captured(&cell).is_none());
     }
 }
