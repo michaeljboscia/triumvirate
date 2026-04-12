@@ -34,3 +34,19 @@ tauri-plugin-prevent-default = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# T-020: DaemonClient deps. reqwest for REST polling, tokio-tungstenite for
+# the /ws/v2 replay-aware WebSocket, futures-util for the Stream/Sink traits
+# used while reading/writing WS frames, tokio with time + sync so we can
+# spawn the reconnect loop, dirs to find ~/.triumvirate/daemon.token, and
+# shared-types (path dep via the daemon workspace) for the REST response
+# contracts. rustls-tls matches the daemon workspace's reqwest features so
+# we don't pull native-tls transitively.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+dirs = "6"
+shared-types = { path = "../../daemon/crates/shared-types" }
+anyhow = "1"
+tracing = "0.1"
+
