@@ -13,6 +13,13 @@
   // these <p> tags with the real sidebar tree and status panels.
 
   import { daemon } from "$lib/stores/daemon.svelte";
+  import TerminalPanel from "$lib/components/TerminalPanel.svelte";
+
+  // T-016: hardcoded cwd for the initial terminal. T-017 replaces this
+  // with a directory picker + recent projects list. The path must be
+  // absolute and must exist; portable-pty's cwd is passed straight to
+  // execve-like spawn.
+  const INITIAL_CWD = "/Users/mikeboscia/projects/triumvirate";
 
   let sidebarOpen = $state(true);
   let statusOpen = $state(true);
