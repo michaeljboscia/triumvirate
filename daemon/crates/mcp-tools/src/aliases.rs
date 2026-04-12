@@ -179,10 +179,10 @@ fn validate_optional_target(target: Option<String>) -> Result<Option<String>, Al
 }
 
 fn validate_daemon_id(daemon_id: String) -> Result<String, AliasMappingError> {
-    if daemon_id.starts_with("gd_") || daemon_id.starts_with("cd_") {
-        Ok(daemon_id)
-    } else {
+    if daemon_id.trim().is_empty() {
         Err(AliasMappingError::InvalidDaemonId(daemon_id))
+    } else {
+        Ok(daemon_id)
     }
 }
 
