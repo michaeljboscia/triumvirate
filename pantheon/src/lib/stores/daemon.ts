@@ -131,13 +131,14 @@ class DaemonStore {
 					this.fleet = event.payload.builds;
 				}),
 				listen<StreamEvent>("daemon://stream", (event) => {
-					// Push newest to the front, cap at 500. Front-loading means
-					// components that show a feed (sidebar activity, worker
-					// drawer) can read the first N without reversing.
-					this.recentEvents = [
-						event.payload,
-						...this.recentEvents.slice(0, 499),
-					];
+					// T-020 fix: mutate the plain buffer in place — no
+					// reactivity. Push newest to the front, trim from the
+					// back. Components that care about stream events should
+					// call `recentEventsSnapshot()` on their own cadence.
+					this.streamBuffer.unshift(event.payload);
+					if (this.streamBuffer.length > DaemonStore.STREAM_BUFFER_CAP) {
+						this.streamBuffer.length = DaemonStore.STREAM_BUFFER_CAP;
+					}
 				}),
 			]);
 
