@@ -98,58 +98,98 @@ Returns all active ABE builds.
 }
 ```
 
+#### GET /api/fleet/{build_id}
+
+Returns a single `FleetBuild` by its `build_id`. Used by Pantheon's sidebar
+drill-down when the user clicks a build in the overview list.
+
+- **200 OK** + `FleetBuild` JSON on hit
+- **404 Not Found** when `build_id` is absent from `fleet_v2_states`
+- **401 Unauthorized** when the bearer header is missing or wrong
+
+Response body on hit is the same `FleetBuild` shape shown inside `/api/fleet`'s
+`builds[]` array. (NOT wrapped in a `FleetResponse`.) Auth: bearer token from
+`~/.triumvirate/daemon.token`. Axum 0.8 path syntax mandates `{build_id}` —
+the old colon-prefix `/:build_id` panics at router construction and must
+never appear in source.
+
 #### GET /api/state
-Full state snapshot for reconnect. Combines workers + fleet + daemon metadata.
+
+Full state snapshot for reconnect. Matches the frozen `shared_types::api::StateResponse`
+type from T-002 and does **not** carry a separate `sessions` array — named MCP
+sessions are exposed via the existing `/session/list` route, while ABE-dispatched
+workers (the only entries that appear in `/api/state.workers`) come from
+`TaskTracker::snapshot_workers()` on the v3.9.0 DaemonState.
 
 ```json
 {
   "version": "3.9.0",
   "uptime_ms": 3600000,
-  "sessions": [...],
-  "workers": [...],
-  "fleet": [...],
+  "workers": [],
+  "fleet": [],
   "last_event_seq": 1542
 }
 ```
 
+Fields:
+
+- `version` — daemon semver as a `String` (source: `daemon_core::VERSION.to_string()`)
+- `uptime_ms` — milliseconds since `DaemonState.started_at` (an `Instant` captured in `run_daemon`)
+- `workers` — `Vec<WorkerInfo>` aggregated from `state.abe_tasks.snapshot_workers().await` (ABE workers only; MCP sessions are out-of-scope for this endpoint, reachable via `/session/list`)
+- `fleet` — `Vec<FleetBuild>` from `state.fleet_v2_states.lock().await.values().cloned().collect()`
+- `last_event_seq` — `u64` from `state.last_event_seq.load(Ordering::Relaxed)`; used by clients on reconnect to send `{"action":"subscribe","last_seq":N}` to `/ws/v2`
+
 ### Event Replay Ring Buffer
+
+The actual production type lives in `daemon/crates/daemon-core/src/replay.rs`
+(added by T-006). Public API:
 
 ```rust
 pub struct EventReplayBuffer {
-    buffer: VecDeque<AgentStreamEvent>,
-    capacity: usize, // 1000
+    // Arc<RwLock<VecDeque<AgentStreamEvent>>> internally — Clone-safe.
+    // DEFAULT_CAPACITY = 1000 events (~200 KB at ~200 bytes/event).
 }
 
 impl EventReplayBuffer {
-    pub fn push(&mut self, event: AgentStreamEvent) {
-        if self.buffer.len() >= self.capacity {
-            self.buffer.pop_front();
-        }
-        self.buffer.push_back(event);
-    }
-
-    pub fn replay_since(&self, last_seq: u64) -> ReplayResult {
-        let oldest = self.buffer.front().map(|e| e.seq());
-        match oldest {
-            Some(oldest_seq) if last_seq >= oldest_seq => {
-                let events: Vec<_> = self.buffer.iter()
-                    .filter(|e| e.seq() > last_seq)
-                    .cloned()
-                    .collect();
-                ReplayResult::Events(events)
-            }
-            _ => ReplayResult::OutOfRange,
-        }
-    }
+    pub fn new(capacity: usize) -> Self;
+    pub fn default_capacity() -> Self;       // DEFAULT_CAPACITY
+    pub fn push(&self, event: AgentStreamEvent);
+    pub fn replay_since(&self, last_seq: u64) -> ReplayResult;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn seq_range(&self) -> Option<(u64, u64)>;
 }
 
 pub enum ReplayResult {
+    /// Client's lastSeq is within buffer range. Events to replay.
+    /// Empty vec means "you're caught up" (last_seq >= newest).
     Events(Vec<AgentStreamEvent>),
-    OutOfRange, // Client must do full /api/state refresh
+    /// Client's lastSeq is older than the buffer's oldest event.
+    /// Client must do a full /api/state refresh.
+    OutOfRange {
+        /// The oldest seq currently in the buffer. Client's last_seq < this.
+        oldest_seq: u64,
+    },
 }
 ```
 
-WebSocket handshake: client sends `{"action": "subscribe", "last_seq": 1234}`. Server acquires broadcast subscriber BEFORE reading buffer (prevents gap), replays, then switches to live.
+**WebSocket handshake for /ws/v2** (added by T-009 — legacy /ws is unchanged):
+the client sends `{"action": "subscribe", "last_seq": N}` as its first message.
+The server subscribes to the broadcast channel FIRST (subscribe-before-read
+race fix), THEN reads the replay buffer snapshot, THEN branches on
+`ReplayResult`, THEN dedupes the live tail by comparing each incoming event's
+`seq()` against `max_sent`.
+
+**Wire format consistency**: Both historical replay frames AND live tail frames
+use the same `daemon_core::encode_ws_event("agent_stream", payload)` envelope
+shape — `{"type":"agent_stream","ts_ms":N,"payload":<AgentStreamEvent>}`. The
+`ReplayResponse` ack (`{"replay":"ok"}` or `{"replay":"out_of_range","oldest_seq":N}`)
+is sent as a bare JSON object without the envelope — clients distinguish by
+the presence of the top-level `"replay"` field.
+
+**RecvError::Lagged** (broadcast buffer overflow): close the connection. Client
+reconnects with its current `last_seq` and the handshake starts over. Do NOT
+try to recover in place — the canonical pattern is close-and-retry.
 
 ### WorkerLifecycle Event
 
