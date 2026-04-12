@@ -11,31 +11,36 @@
   // automatically when the layout unmounts — Svelte 5 pattern.
 
   import "../app.css";
+  import { onMount } from "svelte";
   import { daemon } from "$lib/stores/daemon";
 
   let { children } = $props();
 
-  $effect(() => {
-    if (typeof window === "undefined") return;
-
+  // T-020 fix: use onMount instead of $effect for dark-mode detection
+  // and daemon.init(). $effect runs on reactive-graph updates and can
+  // loop if anything it touches mutates reactive state (even
+  // transitively). onMount runs exactly once on component mount and
+  // its cleanup runs exactly once on unmount — no reactivity involvement.
+  // This eliminates any chance of an $effect re-fire causing the
+  // dark-class toggle or the listener re-registration to thrash.
+  onMount(() => {
     const mql = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = (isDark: boolean) => {
       document.documentElement.classList.toggle("dark", isDark);
     };
-
     apply(mql.matches);
     const onChange = (e: MediaQueryListEvent) => apply(e.matches);
     mql.addEventListener("change", onChange);
-    return () => mql.removeEventListener("change", onChange);
-  });
 
-  // T-020: boot the daemon store exactly once at app mount. init() is
-  // idempotent internally, but we still gate the $effect so it doesn't
-  // re-run on HMR. destroy() releases the Tauri event listeners cleanly
-  // so dev-mode reloads don't accumulate subscriptions.
-  $effect(() => {
+    // Boot the daemon store. init() is internally idempotent (early
+    // return if already initialized) so repeated HMR reloads in dev
+    // mode are safe.
     daemon.init();
-    return () => daemon.destroy();
+
+    return () => {
+      mql.removeEventListener("change", onChange);
+      daemon.destroy();
+    };
   });
 </script>
 
