@@ -269,15 +269,17 @@
     border-radius: 50%;
     display: inline-block;
   }
+  /* T-020 fix: no animation on state-dot-starting. Pulsing + rapid
+   * state transitions during reconnect was a flashing risk — static
+   * colors only until the state machine is proven stable in Wave 6. */
   .state-dot-starting {
     background-color: #fbbf24;
-    animation: pulse 1.5s ease-in-out infinite;
   }
   .state-dot-ready {
     background-color: #4ade80;
   }
   .state-dot-degraded {
-    background-color: #fbbf24;
+    background-color: #fb923c;
   }
   .state-dot-disconnected {
     background-color: #f87171;
@@ -287,14 +289,5 @@
     font-size: 12px;
     color: #e6e6e6;
     text-transform: capitalize;
-  }
-
-  @keyframes pulse {
-    0%, 100% {
-      opacity: 1;
-    }
-    50% {
-      opacity: 0.4;
-    }
   }
 </style>
