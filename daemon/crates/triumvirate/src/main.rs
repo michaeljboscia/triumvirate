@@ -5737,19 +5737,16 @@ mod pantheon_rest_tests {
 
     #[tokio::test]
     async fn api_fleet_returns_v2_builds_from_state() {
-        let state = make_state("tok-f-1");
+        let state = make_state(TEST_TOKEN);
         {
             let mut guard = state.fleet_v2_states.lock().await;
             guard.insert("build-001".to_string(), sample_build("build-001"));
         }
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/fleet")
-            .header(AUTHORIZATION, "Bearer tok-f-1")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_with_bearer("/api/fleet", TEST_TOKEN))
+            .await
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_to_string(resp.into_body()).await;
         let parsed: FleetResponse = serde_json::from_str(&body).unwrap();
