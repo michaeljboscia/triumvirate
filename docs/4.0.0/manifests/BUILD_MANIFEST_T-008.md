@@ -63,14 +63,30 @@ state.abe_tasks.snapshot_workers().await -> Vec<shared_types::WorkerInfo>
 is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) -> bool
 ```
 
-## SessionState lineage fields (T-003)
+## SessionState is OUT OF SCOPE for T-008
 
-`shared_types::SessionState` has these fields you must surface for sessions whose `is_session()` is true:
-- `parent_session_id: Option<String>`
-- `root_session_id: Option<String>`
-- `pantheon_session_id: Option<String>`
+**Do NOT read, touch, or aggregate `state.sessions` in any handler.** The only
+reason T-008 initially tried to include SessionState was to satisfy a vague
+"all active sessions and workers" phrase from BACKEND_STRUCTURE — the Phase
+5.3 round 1 audit correctly flagged that (a) SessionState has no `started_at`
+or `elapsed_ms` fields, so any aggregation would have to fabricate values,
+and (b) the existing `/session/list` route already exposes named sessions
+to clients. T-008 is now a clean ABE-workers-only endpoint.
 
-Other SessionState fields the route may need: the session's name (key in the HashMap), `agent_target` (e.g., "gemini"/"codex"), `cwd: Option<String>`, `started_at_unix_ms: i64`, `last_active_unix_ms: i64`. **Read the SessionState struct at `daemon/crates/shared-types/src/lib.rs` to confirm field names BEFORE coding** — do not guess.
+For reference, `shared_types::SessionState` actually contains:
+```rust
+pub struct SessionState {
+    pub agent: String,                        // NOT "agent_target"
+    #[serde(default)] pub cwd: Option<String>,
+    pub history: Vec<String>,
+    #[serde(default)] pub parent_session_id: Option<String>,
+    #[serde(default)] pub root_session_id: Option<String>,
+    #[serde(default)] pub pantheon_session_id: Option<String>,
+}
+```
+
+There are no timestamps. Do not attempt to fabricate them. Do not add fields
+to SessionState in this task — that would be scope creep.
 
 ## Routes to add (axum 0.8 syntax — `{name}`, NOT `:name`)
 
