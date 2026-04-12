@@ -5526,6 +5526,34 @@ mod pantheon_rest_tests {
     // entry points rather than shadowing them.
     use super::{api_fleet, api_fleet_by_id, api_workers, DaemonRuntimeState};
 
+    /// Shared bearer token for the pantheon REST test module. Every test
+    /// builds a fresh `DaemonState` with this value, so collisions are
+    /// impossible even under parallel test execution — state is not shared
+    /// across tests. Cherry-picked from T-008 Athena per Gemini judge.
+    const TEST_TOKEN: &str = "pantheon-rest-test-token";
+
+    /// Build an authenticated GET request. Cherry-picked from T-008 Athena
+    /// per Gemini judge to eliminate the repeated `Request::builder()...`
+    /// chain across all nine tests.
+    fn get_with_bearer(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("request build")
+    }
+
+    /// Build a GET request with NO Authorization header, for the two
+    /// missing-bearer auth-rejection tests.
+    fn get_no_bearer(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request build")
+    }
+
     fn make_state(token: &str) -> DaemonRuntimeState {
         let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
         let (ws_events, _rx) = broadcast::channel::<String>(64);
