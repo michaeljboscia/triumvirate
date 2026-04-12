@@ -6,9 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use daemon_core::{encode_ws_event, metrics::DaemonMetrics};
+use daemon_core::{EventSequencer, encode_ws_event, metrics::DaemonMetrics};
 use shared_types::{
-    CancelTaskResponse, GetTaskOutputResponse, GetTaskStatusResponse, TaskStatus,
+    AgentStreamEvent, CancelTaskResponse, GetTaskOutputResponse, GetTaskStatusResponse,
+    TaskStatus, WorkerLifecycleType,
 };
 use tokio::{process::Child, sync::{Mutex, broadcast}};
 use tracing::instrument;
