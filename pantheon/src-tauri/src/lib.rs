@@ -8,11 +8,7 @@ mod pty;
 mod tray;
 
 use tauri::{RunEvent, WindowEvent};
-// T-020 crash-loop diagnostic: tauri_plugin_prevent_default disabled.
-// Gemini's diagnosis (9/10 confidence) identifies this plugin's script
-// injection as the likely cause of a WKWebView WebProcess crash loop.
-// We prove or disprove by ripping it out in one step.
-// use tauri_plugin_prevent_default::Flags;
+use tauri_plugin_prevent_default::Flags;
 
 // Smoke-test command from the scaffold; kept so the frontend can verify the
 // IPC bridge works during early development. Removed in T-020 once real
