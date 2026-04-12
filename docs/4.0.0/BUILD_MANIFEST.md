@@ -79,11 +79,17 @@ This manifest is **append-only** per the goatrodeo skill Phase 5.4 step 14. Ever
 
 ---
 
-## Wave 3+ — not yet started
+## Wave 3 — Daemon Release (v3.9.0) — IN PROGRESS
+
+| Task | Commit | Files | Status |
+|---|---|---|---|
+| T-011 | _pending_ | daemon/crates/triumvirate/tests/integration_pantheon.rs (new end-to-end integration test composing Wave 1 + Wave 2) | ⏳ next |
+| T-012 | _pending_ | daemon/Cargo.toml (version 3.3.0 → 3.9.0), CHANGELOG.md entry, BUILD_MANIFEST.md closure, git tag v3.9.0 | ⏸ blocked on T-011 |
+
+## Wave 4+ — not yet started
 
 | Wave | Tasks | Status |
 |---|---|---|
-| Wave 3 | T-011 (integration test), T-012 (v3.9.0 release) | not started |
 | Wave 4 | T-013 (Tauri scaffold) | not started |
 | Wave 5 | T-014–T-018 (Tauri features) | not started |
 | Wave 6 | T-019–T-023 | not started |
