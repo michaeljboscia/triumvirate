@@ -265,6 +265,16 @@ impl TaskTracker {
             duration_ms,
             task.commit_sha.as_deref(),
         );
+        // FEAT-014 (REQ-010): WorkerLifecycle::Completed for Pantheon sidebar.
+        self.emit_worker_lifecycle(
+            WorkerLifecycleType::Completed,
+            task_id,
+            None,
+            None,
+            task.commit_sha.clone(),
+            None,
+            Some(duration_ms as u64),
+        );
         TransitionOutcome::Transitioned
     }
 
