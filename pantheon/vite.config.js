@@ -1,11 +1,16 @@
 import { sveltekit } from "@sveltejs/kit/vite";
+import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
 
 const host = /** @type {string | undefined} */ (process.env.TAURI_DEV_HOST);
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-	plugins: [sveltekit()],
+	// T-015: Tailwind v4 runs via its own Vite plugin (no postcss.config, no
+	// tailwind.config.js — v4 is CSS-first and configured via @theme in
+	// src/app.css). @tailwindcss/vite MUST come before sveltekit() so Svelte
+	// style blocks can pick up the generated utility layer.
+	plugins: [tailwindcss(), sveltekit()],
 
 	// Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
 	//
