@@ -234,8 +234,12 @@ pub fn map_send_message_params(
     // Dropped in Wave 0 mapping: request_type, context, cwd, session_log.
     let _ = (&p.request_type, &p.context, &p.cwd, &p.session_log);
 
+    if p.target.trim().is_empty() {
+        return Err(AliasMappingError::MissingRequired("target"));
+    }
+
     Ok(AskSessionRequestLike {
-        name: map_target_to_agent(p.target)?,
+        name: p.target,
         message: p.question,
         timeout_ms: p.timeout_ms,
     })
