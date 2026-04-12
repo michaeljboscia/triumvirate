@@ -49,7 +49,7 @@ use serde::Serialize;
 use shared_types::{
     FleetResponse, ReplayRequest, ReplayResponse, StateResponse, WorkersResponse,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
