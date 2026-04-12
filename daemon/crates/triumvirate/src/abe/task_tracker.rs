@@ -515,6 +515,80 @@ impl TaskTracker {
         let guard = self.inner.lock().await;
         guard.get(task_id).map(|r| r.status.clone())
     }
+
+    /// FEAT-012 (REQ-017) T-007.5: Snapshot every tracked worker as a
+    /// `WorkerInfo` row suitable for `/api/workers` aggregation.
+    ///
+    /// Returns one entry per task currently in the inner map. Each entry
+    /// uses the task_id as both `session_id` and `task_id` (ABE workers do
+    /// not have a separate session identifier — each dispatch is its own
+    /// session). The `agent` is hardcoded to `"codex"` because the daemon
+    /// only spawns Codex workers via ABE today; if Claude/Gemini ABE workers
+    /// land in a future task, this should branch on `TaskRecord` metadata.
+    ///
+    /// `started_at` is rendered as RFC 3339 by reconstructing a SystemTime
+    /// from the elapsed Instant — this is approximate (within milliseconds)
+    /// because Instant has no anchor to wall-clock time, but it's accurate
+    /// enough for client-side hierarchical display and matches what the
+    /// existing watch CLI expects.
+    ///
+    /// Status mapping: TaskStatus → string follows the BACKEND_STRUCTURE.md
+    /// contract: working/completed/failed/timeout/stuck/setup_failed/cancelled.
+    ///
+    /// This method is the authoritative read path for the `/api/workers`
+    /// endpoint added in T-008. It is intentionally allocation-heavy
+    /// (clones every record) — the caller is a once-per-HTTP-request reader,
+    /// not a hot loop.
+    pub async fn snapshot_workers(&self) -> Vec<shared_types::WorkerInfo> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let guard = self.inner.lock().await;
+        let now_sys = SystemTime::now();
+        let now_inst = Instant::now();
+        guard
+            .iter()
+            .map(|(task_id, rec)| {
+                let elapsed = now_inst.saturating_duration_since(rec.started_at);
+                let started_sys = now_sys.checked_sub(elapsed).unwrap_or(now_sys);
+                let started_at = format_rfc3339(started_sys.duration_since(UNIX_EPOCH).ok());
+                shared_types::WorkerInfo {
+                    session_id: task_id.clone(),
+                    agent: "codex".to_string(),
+                    name: format!("codex-worker-{task_id}"),
+                    status: status_label(&rec.status).to_string(),
+                    task_id: Some(task_id.clone()),
+                    parent_session_id: rec.parent_session_id.clone(),
+                    root_session_id: rec.root_session_id.clone(),
+                    pantheon_session_id: None, // ABE workers inherit pantheon lineage via parent
+                    cwd: rec.worktree_path.as_ref().map(|p| p.display().to_string()),
+                    started_at,
+                    elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Map TaskStatus to the canonical lowercase string used by /api/workers.
+fn status_label(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Working => "working",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Timeout => "timeout",
+        TaskStatus::Stuck => "stuck",
+        TaskStatus::SetupFailed => "setup_failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Render an optional UNIX duration as an RFC 3339 timestamp string.
+/// On overflow or None, returns the epoch (1970-01-01T00:00:00Z) — this
+/// only happens for clocks set before 1970 and is harmless for the UI.
+fn format_rfc3339(unix: Option<std::time::Duration>) -> String {
+    let secs = unix.map(|d| d.as_secs() as i64).unwrap_or(0);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
 fn cleanup_git_locks(worktree_path: &Path) {
