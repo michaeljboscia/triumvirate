@@ -5795,28 +5795,23 @@ mod pantheon_rest_tests {
 
     #[tokio::test]
     async fn api_fleet_by_id_returns_404_for_missing_build() {
-        let state = make_state("tok-f-4");
+        let state = make_state(TEST_TOKEN);
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/fleet/nonexistent")
-            .header(AUTHORIZATION, "Bearer tok-f-4")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_with_bearer("/api/fleet/nonexistent", TEST_TOKEN))
+            .await
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn api_fleet_rejects_missing_bearer() {
-        let state = make_state("tok-f-5");
+        let state = make_state(TEST_TOKEN);
         let router = make_router(state);
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/fleet")
-            .body(Body::empty())
+        let resp = router
+            .oneshot(get_no_bearer("/api/fleet"))
+            .await
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
