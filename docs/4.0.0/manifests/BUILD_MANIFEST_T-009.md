@@ -11,9 +11,27 @@
 
 ---
 
+## Audit log
+
+- **Round 1 (2026-04-11)**: REJECTED by Gemini (CRITICAL) + Codex (HIGH). Both twins flagged a wire-format inconsistency in the reference implementation: historical replay events were to be sent as bare `AgentStreamEvent` JSON while live tail events flow through the `encode_ws_event("agent_stream", ...)` envelope. Client parsers would break on the protocol switch. Codex also flagged that the IMPLEMENTATION_PLAN T-009 reality_test referenced a `sessions (Vec)` field on `StateResponse` that the frozen T-002 api.rs type does not have.
+- **Round 2 fixes (this revision)**: Replay frames now use the SAME `daemon_core::encode_ws_event` envelope as the live tail. `StateResponse` no longer mentions a `sessions` field (the frozen type has none). BACKEND_STRUCTURE.md updated to reflect the actual `ReplayResult::OutOfRange { oldest_seq }` shape. `daemon_core::VERSION.to_string()` used explicitly. RecvError::Lagged close-and-reconnect behavior made explicit.
+
 ## Mission (one sentence)
 
 Add `GET /api/state` (full daemon state snapshot) and a NEW WebSocket route `/ws/v2` (replay-aware handshake using `state.replay_buffer`) to the daemon's Axum router. **Do not touch the existing `/ws` route — `triumvirate watch` and other legacy clients depend on its current behavior.**
+
+## Wire format (READ BEFORE WRITING A SINGLE LINE OF CODE)
+
+All `/ws/v2` frames sent from server to client fall into one of two categories:
+
+1. **Handshake-response frames** (bare JSON, no envelope): the first frame after the client's subscribe handshake is always a `ReplayResponse`:
+   - `{"replay":"ok"}` on success
+   - `{"replay":"out_of_range","oldest_seq":<u64>}` when the client's `last_seq` is older than the buffer's oldest event
+   Clients distinguish handshake frames from event frames by the presence of the top-level `"replay"` field.
+
+2. **Event frames** (wrapped in envelope, identical shape for historical replay AND live tail): every `AgentStreamEvent` goes through `daemon_core::encode_ws_event("agent_stream", serde_json::to_value(event).unwrap())`. The resulting envelope is `{"type":"agent_stream","ts_ms":<unix_ms>,"payload":<event json>}`. Clients parse the envelope, match `type=="agent_stream"`, and deserialize `payload` back into `AgentStreamEvent`.
+
+**One wire format. One envelope. No exceptions.** The Phase 5.3 Round 1 audit explicitly flagged that the earlier reference implementation sent bare replay events followed by envelope-wrapped live events — this would break clients at the replay→live transition. Do not introduce that bug again.
 
 ## Files you may create or modify
 
