@@ -314,13 +314,21 @@ async fn run_session(app: &AppHandle, state: &Arc<ClientState>) -> Result<()> {
                 match fetch_workers_and_fleet(state).await {
                     Ok((workers, fleet)) => {
                         last_rest_ok = Instant::now();
+                        consecutive_failures = 0;
                         let _ = app.emit(EVENT_WORKERS, &workers);
                         let _ = app.emit(EVENT_FLEET, &fleet);
                         transition(app, state, HealthState::Ready).await;
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, "REST poll failed");
-                        transition(app, state, HealthState::Degraded).await;
+                        consecutive_failures += 1;
+                        tracing::warn!(error = %err, failures = consecutive_failures, "REST poll failed");
+                        // Only flip the UI to Degraded after 3 consecutive
+                        // failures (≈6 seconds at the 2s poll interval).
+                        // Single-poll failures stay silent — the daemon
+                        // might just be mid-restart.
+                        if consecutive_failures >= 3 {
+                            transition(app, state, HealthState::Degraded).await;
+                        }
                         if last_rest_ok.elapsed() > DEGRADED_GRACE * 3 {
                             return Err(anyhow!("REST poll failed past grace window"));
                         }
