@@ -24,6 +24,7 @@ use tracing::{info, warn};
 /// The lock is released automatically when this struct is dropped (i.e. when
 /// the daemon exits cleanly OR crashes — the kernel releases file locks on
 /// process termination).
+#[derive(Debug)]
 pub struct PidFile {
     /// The open file handle — holding it keeps the lock alive.
     _file: File,
