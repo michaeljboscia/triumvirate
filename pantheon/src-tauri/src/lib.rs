@@ -2,9 +2,11 @@
 // in lib.rs (not main.rs) so the same code can compile for mobile targets.
 // main.rs is just `pantheon_lib::run()`.
 
+mod menu;
 mod tray;
 
 use tauri::{RunEvent, WindowEvent};
+use tauri_plugin_prevent_default::Flags;
 
 // Smoke-test command from the scaffold; kept so the frontend can verify the
 // IPC bridge works during early development. Removed in T-020 once real
