@@ -1436,6 +1436,280 @@ async fn api_fleet_by_id(
     }
 }
 
+// ---------------------------------------------------------------------------
+// T-009 — Pantheon v3.9.0 state snapshot + replay-aware WebSocket (REQ-020,
+// FEAT-013)
+//
+// GET /api/state  — full daemon snapshot (version, uptime, workers, fleet,
+//                   last_event_seq). Used by Pantheon v4.0 on first connect
+//                   and whenever a WebSocket reconnect comes back with an
+//                   out-of-range `last_seq`.
+//
+// GET /ws/v2      — replay-aware WebSocket. The legacy /ws route (which
+//                   emits 4 hardcoded bootstrap events and tails ws_events)
+//                   stays exactly as-is so `triumvirate watch` keeps working.
+//                   /ws/v2 implements the subscribe-before-read handshake:
+//                     1. subscribe to ws_events BEFORE reading the buffer
+//                        (race-condition fix)
+//                     2. read the client's first Text frame as a
+//                        ReplayRequest {"action":"subscribe","last_seq":N}
+//                     3. snapshot state.replay_buffer.replay_since(N)
+//                     4. if OutOfRange → send a bare ReplayResponse
+//                        {"replay":"out_of_range","oldest_seq":X} and close
+//                     5. if Events(v) → send a bare ReplayResponse
+//                        {"replay":"ok"}, then forward every historical
+//                        event wrapped in the SAME encode_ws_event envelope
+//                        the live tail uses, tracking max_sent for dedup,
+//                        then tail ws_events forever (skipping envelopes
+//                        whose payload.seq <= max_sent).
+//                     6. RecvError::Lagged closes the socket — the client
+//                        reconnects with its current last_seq and the
+//                        handshake restarts. We do NOT try to recover in
+//                        place.
+//
+// Wire-format rule (Phase 5.3 R1 audit finding): historical replay frames
+// and live tail frames use the SAME daemon_core::encode_ws_event envelope.
+// Only the two ReplayResponse handshake frames are bare JSON — clients
+// distinguish them by the top-level `"replay"` field. Do NOT send bare
+// AgentStreamEvent JSON anywhere on this route.
+// ---------------------------------------------------------------------------
+
+async fn api_state(
+    State(state): State<PantheonDaemonState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<shared_types::StateResponse>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // `daemon_core::VERSION` is a `&'static str`; `.to_string()` is needed to
+    // satisfy `StateResponse.version: String`. The manifest explicitly
+    // requires using the constant (not a hardcoded literal) so the test can
+    // pin the field to the exact compile-time crate version.
+    let version = daemon_core::VERSION.to_string();
+
+    // Saturating elapsed-ms: `Instant::elapsed()` returns `Duration`, whose
+    // `as_millis()` is `u128`. Cap at u64::MAX so a pathologically long
+    // uptime can never panic the cast.
+    let uptime_ms = state
+        .started_at
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+
+    // ABE workers only. Named MCP sessions stay on /session/list — the
+    // frozen T-002 StateResponse type has no `sessions` field (the earlier
+    // spec draft did, and Round 1 audit caught it).
+    let workers = state.abe_tasks.snapshot_workers().await;
+
+    let fleet = {
+        let guard = state.fleet_v2_states.lock().await;
+        guard
+            .values()
+            .cloned()
+            .collect::<Vec<shared_types::FleetBuild>>()
+    };
+
+    let last_event_seq = state
+        .last_event_seq
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    Ok(AxumJson(shared_types::StateResponse {
+        version,
+        uptime_ms,
+        workers,
+        fleet,
+        last_event_seq,
+    }))
+}
+
+async fn ws_v2(
+    State(state): State<PantheonDaemonState>,
+    headers: HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // CRITICAL: auth must happen BEFORE the protocol switch. If we let the
+    // upgrade complete and then close inside `on_upgrade`, the client sees a
+    // successful WebSocket handshake followed by an immediate close — which
+    // is functionally indistinguishable from "server accepted and
+    // disconnected" and test #8 explicitly asserts a 401 response instead.
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let replay_buffer = state.replay_buffer.clone();
+    let ws_events = state.ws_events.clone();
+
+    ws.on_upgrade(move |socket| async move {
+        ws_v2_handshake(socket, replay_buffer, ws_events).await;
+    })
+}
+
+/// Body of the /ws/v2 upgraded-socket handler. Extracted into a free async
+/// function so the handshake logic can be exercised directly if needed and
+/// so the handler closure stays tidy.
+async fn ws_v2_handshake(
+    mut socket: axum::extract::ws::WebSocket,
+    replay_buffer: std::sync::Arc<daemon_core::replay::EventReplayBuffer>,
+    ws_events: tokio::sync::broadcast::Sender<String>,
+) {
+    use axum::extract::ws::Message;
+    use daemon_core::replay::ReplayResult;
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Step 1: subscribe BEFORE reading the replay buffer. Any event that
+    // lands on ws_events after this subscribe but before we drain the
+    // buffer is captured by the live receiver; the max_sent dedup below
+    // catches the overlap.
+    let mut live_rx = ws_events.subscribe();
+
+    // Step 2: read the client's subscribe handshake frame. Anything other
+    // than a well-formed ReplayRequest closes the socket.
+    let first = match socket.recv().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    let req: shared_types::ReplayRequest = match serde_json::from_str(first.as_str()) {
+        Ok(req) => req,
+        Err(_) => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    if req.action != "subscribe" {
+        let _ = socket.close().await;
+        return;
+    }
+
+    // Step 3: snapshot the replay buffer.
+    let replay = replay_buffer.replay_since(req.last_seq);
+
+    // Step 4: branch on ReplayResult.
+    match replay {
+        ReplayResult::OutOfRange { oldest_seq } => {
+            // Bare ReplayResponse — NOT wrapped in the encode_ws_event
+            // envelope. Clients distinguish it by the top-level "replay"
+            // field. After sending, close the socket; the client will
+            // fetch /api/state and reconnect.
+            let resp = shared_types::ReplayResponse {
+                replay: "out_of_range".to_string(),
+                oldest_seq: Some(oldest_seq),
+            };
+            if let Ok(json) = serde_json::to_string(&resp) {
+                let _ = socket.send(Message::Text(json.into())).await;
+            }
+            let _ = socket.close().await;
+        }
+        ReplayResult::Events(events) => {
+            // Send the "ok" handshake ack (bare JSON, no envelope).
+            let ack = shared_types::ReplayResponse {
+                replay: "ok".to_string(),
+                oldest_seq: None,
+            };
+            match serde_json::to_string(&ack) {
+                Ok(json) => {
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = socket.close().await;
+                    return;
+                }
+            }
+
+            // Track the max seq we've sent so we can dedup overlap between
+            // the historical replay and the live tail. A live event whose
+            // seq is <= max_sent is one the client already has and must
+            // not be re-emitted.
+            let mut max_sent = req.last_seq;
+
+            // Wrap every historical event in the SAME envelope the live
+            // tail uses. Sending bare AgentStreamEvent JSON here was the
+            // Round 1 audit's critical finding — it would force clients
+            // to switch parsers at the replay→live boundary.
+            for event in &events {
+                let payload = match serde_json::to_value(event) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let envelope = daemon_core::encode_ws_event("agent_stream", payload);
+                if socket.send(Message::Text(envelope.into())).await.is_err() {
+                    return;
+                }
+                let seq = event.seq();
+                if seq > max_sent {
+                    max_sent = seq;
+                }
+            }
+
+            // Step 5: live tail. Envelopes are already encoded by the
+            // publisher (TaskTracker etc.), so we forward the raw string
+            // unchanged after the dedup check. We parse a serde_json::Value
+            // out of each envelope ONLY to extract the seq — we do NOT
+            // re-serialize, which would risk drifting the ts_ms field or
+            // the exact payload byte layout.
+            loop {
+                match live_rx.recv().await {
+                    Ok(envelope) => {
+                        let mut skip = false;
+                        if let Ok(value) =
+                            serde_json::from_str::<serde_json::Value>(envelope.as_str())
+                        {
+                            if value.get("type").and_then(|v| v.as_str())
+                                == Some("agent_stream")
+                            {
+                                if let Some(payload) = value.get("payload") {
+                                    if let Ok(event) = serde_json::from_value::<
+                                        shared_types::AgentStreamEvent,
+                                    >(
+                                        payload.clone()
+                                    ) {
+                                        let seq = event.seq();
+                                        if seq <= max_sent {
+                                            skip = true;
+                                        } else {
+                                            max_sent = seq;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if skip {
+                            continue;
+                        }
+                        if socket.send(Message::Text(envelope.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        // Canonical close-on-lag pattern. The client
+                        // reconnects with its current last_seq and the
+                        // handshake starts over. We do NOT try to recover
+                        // in place — partial-order recovery is impossible
+                        // without re-reading the buffer, and the caller's
+                        // reconnect path already handles it.
+                        let _ = socket.close().await;
+                        break;
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
     type DaemonRuntimeState = DaemonState<abe::task_tracker::TaskTracker>;
 
