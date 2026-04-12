@@ -245,8 +245,24 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     .await
     .map_err(|e| format!("dispatch_codex failed: {e}"))?;
 
+    // FEAT-014 (REQ-010) T-004: Capture Pantheon lineage from the inbound
+    // MCP request's task-local BEFORE we spawn the monitor task. task-locals
+    // do not cross tokio::spawn, so reading it inside the spawned closure
+    // below would silently return None. Owned Option<String>s are moved
+    // into the spawn and attached to register() immediately.
+    let pantheon_ctx = current_pantheon_session();
+    let parent_session_id = pantheon_ctx.as_ref().map(|c| c.parent_session_id.clone());
+    let root_session_id = pantheon_ctx.as_ref().map(|c| c.root_session_id.clone());
+
     tracker
-        .register(task_id.clone(), 0, child.clone(), None)
+        .register(
+            task_id.clone(),
+            0,
+            child.clone(),
+            None,
+            parent_session_id,
+            root_session_id,
+        )
         .await;
 
     let tracker_for_monitor = tracker.clone();
