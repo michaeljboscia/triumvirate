@@ -1788,6 +1788,76 @@ async fn run_daemon() -> anyhow::Result<()> {
         ws_events,
     );
     set_process_metrics(state.metrics.clone());
+
+    // FEAT-013 (REQ-020) T-007.5: Subscribe-before-read.
+    // Spawn the long-lived event replay buffer fill task NOW, before the HTTP
+    // server starts listening and before any ABE dispatch can publish events.
+    // The subscribe call must come before the first event is sent on the
+    // broadcast channel — broadcast::Receiver only buffers events that arrive
+    // AFTER subscription. Since this runs during run_daemon init, no producer
+    // is active yet, so we are guaranteed to capture every subsequent event.
+    {
+        let mut buffer_rx = state.ws_events.subscribe();
+        let buffer = state.replay_buffer.clone();
+        let last_seq = state.last_event_seq.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            use shared_types::AgentStreamEvent;
+            loop {
+                match buffer_rx.recv().await {
+                    Ok(envelope) => {
+                        // Envelope shape: {"type": "...", "ts_ms": N, "payload": {...}}
+                        // Per daemon_core::encode_ws_event. Only "agent_stream"
+                        // wrapped events carry an AgentStreamEvent payload.
+                        let parsed: serde_json::Value = match serde_json::from_str(&envelope) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                tracing::debug!(error = %err, "replay buffer fill: invalid envelope");
+                                continue;
+                            }
+                        };
+                        if parsed.get("type").and_then(|v| v.as_str()) != Some("agent_stream") {
+                            // Non-stream events (abe_task_state, fleet_progress, etc.)
+                            // are not part of the AgentStreamEvent replay contract.
+                            continue;
+                        }
+                        let payload = match parsed.get("payload") {
+                            Some(p) => p.clone(),
+                            None => continue,
+                        };
+                        let event: AgentStreamEvent = match serde_json::from_value(payload) {
+                            Ok(e) => e,
+                            Err(err) => {
+                                tracing::debug!(error = %err, "replay buffer fill: payload not AgentStreamEvent");
+                                continue;
+                            }
+                        };
+                        let seq = event.seq();
+                        buffer.push(event);
+                        // last_event_seq is monotonic — fetch_max ensures we
+                        // never go backwards even if events arrive out of order
+                        // due to broadcast lag.
+                        last_seq.fetch_max(seq, Ordering::Relaxed);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Buffer-fill task fell behind. broadcast::Receiver will
+                        // skip ahead. We log and continue — the alternative is
+                        // to die, which would leave the replay buffer empty for
+                        // the rest of daemon uptime.
+                        tracing::warn!(
+                            skipped,
+                            "replay buffer fill: lagged, skipping events"
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("replay buffer fill: channel closed, exiting");
+                        break;
+                    }
+                }
+            }
+        });
+    }
     let token_db_path = core_triumvirate_home_dir()?.join("token-economics.db");
     let token_db = daemon_http::open_token_db(&token_db_path)?;
     let scanner_token_db = token_db.clone();
