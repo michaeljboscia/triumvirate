@@ -397,10 +397,10 @@ async fn emit_state(app: &AppHandle, new: HealthState) {
     // Sync the tray icon. `tray::update_daemon_state` is a Tauri command
     // but it's also just a Rust function — we call it directly here so
     // the state machine drives the icon without a round-trip through IPC.
-    if let Some(_tray) = app.tray_by_id(crate::tray::TRAY_ID) {
+    if app.tray_by_id(crate::tray::TRAY_ID).is_some() {
         // Command takes AppHandle + String; ignore result (best-effort
         // icon swap, failure is logged by the command itself).
-        let _ = crate::tray::update_daemon_state(app.app_handle().clone(), new.as_tray_str().into());
+        let _ = crate::tray::update_daemon_state(app.clone(), new.as_tray_str().into());
     }
 }
 
