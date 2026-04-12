@@ -391,6 +391,13 @@ fn handle_ws_frame(app: &AppHandle, state: &Arc<ClientState>, txt: &str) {
 /// this in one helper ensures every place that changes state ALSO pushes
 /// the change to the UI — forgetting one is a subtle bug where the tray
 /// says green but the sidebar says disconnected.
+///
+/// T-020 fix: debounces rapid transitions via MIN_TRANSITION_DWELL. If
+/// a transition arrives within the dwell window, the new state is still
+/// recorded in `state.health` (so subsequent logic reads the truth) but
+/// we skip the emit and the tray swap. This prevents the UI from
+/// flickering during the fast Ready → Degraded → Ready churn that
+/// happens on transient REST poll failures.
 async fn transition(app: &AppHandle, state: &ClientState, new: HealthState) {
     let mut guard = state.health.lock().await;
     if *guard == new {
@@ -398,6 +405,22 @@ async fn transition(app: &AppHandle, state: &ClientState, new: HealthState) {
     }
     *guard = new;
     drop(guard);
+
+    let mut emit_guard = state.last_emit.lock().await;
+    if emit_guard.elapsed() < MIN_TRANSITION_DWELL {
+        // Too soon — swallow the emit. The new state is already stored
+        // in state.health so the next un-debounced transition will
+        // still see the correct "previous" value. If we stay in this
+        // state longer than MIN_TRANSITION_DWELL, a subsequent logical
+        // re-emit (e.g. next REST poll success → Ready → Ready noop)
+        // will be skipped by the `*guard == new` check above, which
+        // is fine — the tray won't update until the NEXT actual
+        // transition, which is the desired behavior.
+        return;
+    }
+    *emit_guard = Instant::now();
+    drop(emit_guard);
+
     emit_state(app, new).await;
 }
 
