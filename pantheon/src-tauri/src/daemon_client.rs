@@ -379,7 +379,7 @@ fn handle_ws_frame(app: &AppHandle, state: &Arc<ClientState>, txt: &str) {
 /// this in one helper ensures every place that changes state ALSO pushes
 /// the change to the UI — forgetting one is a subtle bug where the tray
 /// says green but the sidebar says disconnected.
-async fn transition<R: Runtime>(app: &AppHandle<R>, state: &ClientState, new: HealthState) {
+async fn transition(app: &AppHandle, state: &ClientState, new: HealthState) {
     let mut guard = state.health.lock().await;
     if *guard == new {
         return;
