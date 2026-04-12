@@ -497,6 +497,8 @@ impl TaskTracker {
                 output: None,
                 child: None,
                 worktree_path: None,
+                parent_session_id: None,
+                root_session_id: None,
             },
         );
         self.emit_task_state(&task_id, 0, "failed", 0, None);
