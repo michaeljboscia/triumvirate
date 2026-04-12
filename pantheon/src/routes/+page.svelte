@@ -103,9 +103,10 @@
   {/if}
 
   <main class="terminal-area" aria-label="Terminal panels">
-    <header class="region-header">Terminal Area</header>
-    <p class="placeholder">Terminal panels land in T-016 and T-017.</p>
-    <p class="hint">Window: {windowWidth}px wide</p>
+    <!-- T-016: single hardcoded terminal running Claude Code in the
+         triumvirate directory. T-017 replaces this with a TabBar +
+         multiple panels managed by sessions.ts store. -->
+    <TerminalPanel cwd={INITIAL_CWD} cmd="claude" args={[]} />
   </main>
 
   {#if statusOpen}
