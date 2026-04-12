@@ -1907,6 +1907,13 @@ async fn run_daemon() -> anyhow::Result<()> {
             "/api/tokens/by-session",
             get_service(daemon_http::token_by_session_route.with_state(http_state.clone())),
         )
+        // T-008 (REQ-017, FEAT-012): Pantheon v3.9.0 REST endpoints.
+        // These handlers take State<DaemonRuntimeState> (not DaemonHttpState),
+        // so they register with plain `get(...)` rather than `get_service(...)`.
+        // Auth is per-handler via is_bearer_authorized — NOT middleware.
+        .route("/api/workers", get(api_workers))
+        .route("/api/fleet", get(api_fleet))
+        .route("/api/fleet/{build_id}", get(api_fleet_by_id))
         .route(
             "/ws",
             get_service(daemon_http::ws_route.with_state(http_state.clone())),
