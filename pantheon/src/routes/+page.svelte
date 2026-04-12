@@ -65,6 +65,15 @@
   <title>Pantheon</title>
 </svelte:head>
 
+<!-- T-020 diagnostic: impossible-to-miss marker proving the Svelte app
+     mounted. Inline styles so no class-scoping can hide it. Remove
+     once we confirm the layout is working end to end. -->
+<div
+  style="position:fixed;top:0;left:0;right:0;background:#dc2626;color:#fff;padding:12px 20px;font-size:14px;font-weight:600;z-index:99999;text-align:center;font-family:-apple-system,sans-serif"
+>
+  PANTHEON MOUNTED · daemon state: {daemon.state} · workers: {daemon.workers.length} · fleet: {daemon.fleet.length}
+</div>
+
 <div class="shell">
   {#if sidebarOpen}
     <aside class="sidebar" aria-label="Workers and sessions sidebar">
