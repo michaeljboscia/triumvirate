@@ -1218,21 +1218,14 @@ mod pantheon_stdio_meta_tests {
     use std::borrow::Cow;
 
     fn req_with_meta(meta_obj: serde_json::Map<String, Value>) -> CallToolRequestParams {
-        CallToolRequestParams {
-            meta: Some(Meta(meta_obj)),
-            name: Cow::Borrowed("ping"),
-            arguments: None,
-            task: None,
-        }
+        // CallToolRequestParams is #[non_exhaustive]; use the builder path.
+        let mut p = CallToolRequestParams::new(Cow::Borrowed("ping"));
+        p.meta = Some(Meta(meta_obj));
+        p
     }
 
     fn req_no_meta() -> CallToolRequestParams {
-        CallToolRequestParams {
-            meta: None,
-            name: Cow::Borrowed("ping"),
-            arguments: None,
-            task: None,
-        }
+        CallToolRequestParams::new(Cow::Borrowed("ping"))
     }
 
     #[test]
