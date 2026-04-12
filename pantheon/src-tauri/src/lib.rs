@@ -27,6 +27,19 @@ pub fn run() {
     // dead app handle. Per mx-tauri-window Level 2 hide-on-close pattern.
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // T-015: intercept WKWebView's built-in Cmd+F find bar before the
+        // webview sees it. `Flags::FIND` is the single-purpose flag; we
+        // deliberately do NOT use `Flags::all()` because that would also
+        // suppress right-click / devtools / reload, which we want during
+        // development. This pairs with menu::build_menu dropping the Edit
+        // menu's Find items so the chord has nothing to trigger.
+        .plugin(
+            tauri_plugin_prevent_default::Builder::new()
+                .with_flags(Flags::FIND)
+                .build(),
+        )
+        // T-015: install the custom native menu (no Find/Replace).
+        .menu(|handle| menu::build_menu(handle))
         .setup(|app| {
             // T-014: install the menubar tray icon at startup. The tray
             // outlives every window — closing the window hides it (see
