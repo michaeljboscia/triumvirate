@@ -392,7 +392,7 @@ async fn transition(app: &AppHandle, state: &ClientState, new: HealthState) {
 /// Emit the current state to the frontend AND drive the tray icon.
 /// Separating this from `transition` lets the spawn seed emit the
 /// initial Starting state without taking the mutex.
-async fn emit_state<R: Runtime>(app: &AppHandle<R>, new: HealthState) {
+async fn emit_state(app: &AppHandle, new: HealthState) {
     let _ = app.emit(EVENT_STATE, new);
     // Sync the tray icon. `tray::update_daemon_state` is a Tauri command
     // but it's also just a Rust function — we call it directly here so
