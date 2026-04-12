@@ -48,8 +48,30 @@ This manifest is **append-only** per the goatrodeo skill Phase 5.4 step 14. Ever
 | Task | Commit | Files | Bake-off | Tests | Status |
 |---|---|---|---|---|---|
 | T-007.5 | c14e057 | daemon-core/src/lib.rs (DaemonState + 4 new fields + run_replay_buffer_fill), triumvirate/src/abe/task_tracker.rs (snapshot_workers + status_label + format_rfc3339), triumvirate/src/main.rs (replay-buffer fill task wired in run_daemon) | ❌ skip — pure plumbing | 7/7 reality tests (4 fill + 3 snapshot) PASS | ✅ |
-| T-008 | _pending_ | triumvirate/src/main.rs (3 new GET routes + 3 handlers + ≥5 reality tests) | ✅ 2x Claude subagents | _pending_ | ⏳ ready for bake-off |
-| T-009 | _pending_ | triumvirate/src/main.rs (1 new GET route, 1 new WS route, replay-aware handshake) | ✅ 2x Claude subagents | _pending_ | ⏳ ready for bake-off |
+| T-008 | _in-flight_ | triumvirate/src/main.rs (3 new GET routes + 3 handlers + 9 reality tests) | ✅ 2x Claude subagents (Apollo + Athena, worktree isolation) | _pending bake-off_ | 🔄 dispatched |
+| T-009 | _in-flight_ | triumvirate/src/main.rs (1 new GET route, 1 new WS route, replay-aware handshake + 9 reality tests) | ✅ 2x Claude subagents (Apollo + Athena, worktree isolation) | _pending bake-off_ | 🔄 dispatched |
+
+### Phase 5.3 audit record
+
+- **R1 (4 auditors)**: REJECTED × 4. 10 findings total (1 CRITICAL — T-009 wire format split between replay and live; 5 HIGH — SessionState field hallucinations, scope drift, BACKEND_STRUCTURE staleness; 3 MEDIUM; 1 LOW). Fix commit: `707c677`.
+- **R2 (4 fresh auditors)**: APPROVED × 4 with 1 residual LOW finding (stale /api/workers intro sentence in BACKEND_STRUCTURE — 3 of 4 auditors flagged it). Fix commit: `b9ce1e5`.
+- **Gate pass**: P5.3 — Dispatch Audit PASSED at SHA `b9ce1e5`.
+
+### A3 → A1 deviation log (2026-04-11)
+
+**User selected A3** (2 Claude + 1 Codex per task, 6 implementers total). **Executing A1** (2 Claude per task, 4 implementers total).
+
+**Reason:** Empirical probe of the Codex path (`dispatch_codex` + `dispatch_codex_worktree`) ran into the `ContractFields`-setup complexity barrier. The 4-channel daemon reaper fix is **verified working** (two probes both transitioned cleanly from `working` → terminal state via `child.wait()` in 82s and 106s respectively — no hang observed), so the infrastructure is sound. The barrier is that `dispatch_codex_worktree` requires hand-crafted per-task `allowed_files` / `forbidden_files` / `allowed_commands` / `file_policy:default-deny` contracts, and getting them wrong produces worker failures that look like reaper issues but are actually contract mismatches. Hand-crafting correct Contracts for two brand-new tasks mid-bake-off adds substantial probability of false-negative results that would contaminate the Gemini judge's signal.
+
+**What's preserved from A3:**
+- Cross-implementation diversity (different Claude instances, independent token paths, separate worktrees, no shared state between the two implementers per task)
+- Cross-model evaluation (Gemini code-review judges via `mcp__gemini__gemini-analyze-code`)
+- The 4-task parallelism (not serial)
+
+**What's NOT preserved:**
+- Cross-model generation (no Codex-authored alternative for comparison)
+
+**Upgrade path if the user wants true A3 after this bake-off:** Run a R2 pass where the winners from A1 get a single Codex worker submission added to each task's bake-off, re-judged by Gemini. This delays merge by ~15 min per task but delivers the 3-implementer signal the user asked for. Logged as a potential follow-up.
 
 ---
 
