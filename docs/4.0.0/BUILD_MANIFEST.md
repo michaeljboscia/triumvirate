@@ -48,8 +48,12 @@ This manifest is **append-only** per the goatrodeo skill Phase 5.4 step 14. Ever
 | Task | Commit | Files | Bake-off | Tests | Status |
 |---|---|---|---|---|---|
 | T-007.5 | c14e057 | daemon-core/src/lib.rs (DaemonState + 4 new fields + run_replay_buffer_fill), triumvirate/src/abe/task_tracker.rs (snapshot_workers + status_label + format_rfc3339), triumvirate/src/main.rs (replay-buffer fill task wired in run_daemon) | ❌ skip — pure plumbing | 7/7 reality tests (4 fill + 3 snapshot) PASS | ✅ |
-| T-008 | _in-flight_ | triumvirate/src/main.rs (3 new GET routes + 3 handlers + 9 reality tests) | ✅ 2x Claude subagents (Apollo + Athena, worktree isolation) | _pending bake-off_ | 🔄 dispatched |
-| T-009 | _in-flight_ | triumvirate/src/main.rs (1 new GET route, 1 new WS route, replay-aware handshake + 9 reality tests) | ✅ 2x Claude subagents (Apollo + Athena, worktree isolation) | _pending bake-off_ | 🔄 dispatched |
+| T-008 | `5f6a3cb` + harmonize `55df8f7` | triumvirate/src/main.rs (3 module-scope handlers: api_workers/api_fleet/api_fleet_by_id + DaemonRuntimeState alias hoisted + pantheon_rest_tests with TEST_TOKEN/get_with_bearer/get_no_bearer helpers + 9 reality tests) | ✅ **2× Claude subagents — Apollo won (narrow).** Winner: Apollo for type-alias hoisting + per-handler doc comments. Cherry-picked: Athena's `TEST_TOKEN` constant + `get_with_bearer`/`get_no_bearer` helpers. Gemini judge: agree-with-prior, 0 bugs. | 9/9 pantheon_rest_tests + 32/32 Wave 1 regression PASS | ✅ |
+| T-009 | `bda929a` | triumvirate/src/main.rs (3 module-scope handlers: api_state/ws_v2/ws_v2_handshake + route registrations + pantheon_ws_replay_tests with subscribe-before-read + envelope wire format + max_sent dedup + 9 reality tests driving real ephemeral Axum server + tokio_tungstenite client) | ✅ **2× Claude subagents — Apollo won (CLEAR).** Winner: Apollo because Athena nested handlers inside run_daemon and duplicated ~160 lines of handler logic into her test module (test fidelity break — tests exercised copies, not production). Cherry-picked: Athena's `read_text()` (graceful Ping/Pong/Close handling) + `ws_request_with_bearer`/`ws_request_plain` helpers. Gemini judge: agree-with-prior, HIGH-severity duplication defect verified, 0 bugs in winner. | 9/9 pantheon_ws_replay_tests + 41/41 T-008 & Wave 1 regression = **50/50 total** PASS | ✅ |
+
+**Wave 2 closure SHA:** `bda929a` (2026-04-11 22:2x EDT)
+**Wave 2 test total:** 50/50 green (18 new in Wave 2 + 32 Wave 1 regression)
+**Wave 2 wall time:** ~2h from kickoff to closure (32 min manifests + 6 min R1 audit + 4 min R2 audit + 7 min reaper probe + 12 min bake-off wall + 10 min judge + 10 min cherry-pick/harmonize/test/commit per task × 2 tasks + 5 min contamination restore). Biggest time-sink was the manifest drafting and the absolute-path contamination recovery.
 
 ### Phase 5.3 audit record
 
