@@ -23,7 +23,7 @@ impl std::fmt::Display for AliasMappingError {
             Self::MissingRequired(field) => write!(f, "missing required field '{field}'"),
             Self::InvalidDaemonId(id) => write!(
                 f,
-                "invalid daemon_id '{id}' — expected 'gd_*' or 'cd_*' prefix"
+                "invalid daemon_id '{id}' — must be a non-empty session name"
             ),
         }
     }
@@ -179,10 +179,10 @@ fn validate_optional_target(target: Option<String>) -> Result<Option<String>, Al
 }
 
 fn validate_daemon_id(daemon_id: String) -> Result<String, AliasMappingError> {
-    if daemon_id.starts_with("gd_") || daemon_id.starts_with("cd_") {
-        Ok(daemon_id)
-    } else {
+    if daemon_id.trim().is_empty() {
         Err(AliasMappingError::InvalidDaemonId(daemon_id))
+    } else {
+        Ok(daemon_id)
     }
 }
 
@@ -234,8 +234,12 @@ pub fn map_send_message_params(
     // Dropped in Wave 0 mapping: request_type, context, cwd, session_log.
     let _ = (&p.request_type, &p.context, &p.cwd, &p.session_log);
 
+    if p.target.trim().is_empty() {
+        return Err(AliasMappingError::MissingRequired("target"));
+    }
+
     Ok(AskSessionRequestLike {
-        name: map_target_to_agent(p.target)?,
+        name: p.target,
         message: p.question,
         timeout_ms: p.timeout_ms,
     })
@@ -388,14 +392,26 @@ mod tests {
     }
 
     #[test]
-    fn u_al_07_ask_daemon_invalid_prefix_errors() {
+    fn u_al_07_ask_daemon_empty_id_errors() {
         let p = AskDaemonParams {
-            daemon_id: "xx_bad".into(),
+            daemon_id: "".into(),
             question: "hello".into(),
             timeout_ms: None,
         };
         let err = map_ask_daemon_params(p).unwrap_err();
-        assert!(matches!(err, AliasMappingError::InvalidDaemonId(id) if id == "xx_bad"));
+        assert!(matches!(err, AliasMappingError::InvalidDaemonId(id) if id.is_empty()));
+    }
+
+    #[test]
+    fn u_al_07b_ask_daemon_accepts_any_session_name() {
+        let p = AskDaemonParams {
+            daemon_id: "daemon-peritia".into(),
+            question: "hello".into(),
+            timeout_ms: None,
+        };
+        let out = map_ask_daemon_params(p).unwrap();
+        assert_eq!(out.name, "daemon-peritia");
+        assert_eq!(out.message, "hello");
     }
 
     #[test]

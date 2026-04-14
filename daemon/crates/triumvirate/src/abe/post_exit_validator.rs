@@ -216,6 +216,7 @@ mod tests {
             task_timeout_sec: 60,
             done_when: "test".to_string(),
             reality_test: "test".to_string(),
+            sandbox_permissions: None,
         }
     }
 

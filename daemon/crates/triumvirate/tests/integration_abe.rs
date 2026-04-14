@@ -171,6 +171,7 @@ fn build_contract(task_id: &str, timeout_sec: u64, commit_format: &str) -> Contr
         task_timeout_sec: timeout_sec,
         done_when: "integration lifecycle complete".to_string(),
         reality_test: "dispatch -> status -> output -> cancel".to_string(),
+        sandbox_permissions: None,
     }
 }
 
