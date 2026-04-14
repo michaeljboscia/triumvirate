@@ -1,0 +1,58 @@
+/* T-015 / T-020 — Pantheon design tokens + Tailwind v4 entry.
+ *
+ * Tailwind v4 is CSS-first: no tailwind.config.js, no postcss.config.js. The
+ * `@import "tailwindcss"` pulls in the preflight + utility layer, and
+ * `@theme` declares the custom tokens that become utility classes AND CSS
+ * variables (e.g. --color-bg-primary is usable as both class="bg-bg-primary"
+ * and as var(--color-bg-primary) inside raw CSS).
+ *
+ * T-020 flicker fix: Pantheon is dark-only (REQ-029). We no longer toggle
+ * a `.dark` class on <html> at runtime — that was causing paint thrashing
+ * against Tailwind Preflight's prefers-color-scheme defaults. `color-scheme`
+ * is hard-pinned to `dark` at :root so browser-native controls (scrollbars,
+ * form elements) use the dark palette from first paint. The inline style
+ * block in app.html handles the pre-JS gap.
+ */
+
+:root {
+	color-scheme: dark;
+}
+
+@import "tailwindcss";
+
+@theme {
+  /* Surface scale — used for sidebar / terminal area / status area. */
+  --color-bg-primary: #1a1a1a;
+  --color-bg-secondary: #181818;
+  --color-bg-tertiary: #212121;
+
+  /* Text scale. */
+  --color-fg-primary: #f6f6f6;
+  --color-fg-secondary: #aaaaaa;
+  --color-fg-muted: #666666;
+
+  /* Borders + separators. */
+  --color-border-default: #333333;
+
+  /* Accent — reserved for Wave 5+ status pills + active tab highlights. */
+  --color-accent: #4a9eff;
+}
+
+/* Baseline reset so the Tauri webview fills the chrome without scroll
+ * bars flashing on load. Tailwind preflight handles the rest.
+ */
+html,
+body {
+	height: 100vh;
+	overflow: hidden;
+	font-family:
+		-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* Default-dark until the layout effect decides otherwise. Prevents a
+ * flash-of-light-theme on cold start before $effect runs.
+ */
+html {
+	background-color: var(--color-bg-primary);
+	color: var(--color-fg-primary);
+}

@@ -122,6 +122,7 @@ fn parse_task_block(block: &str) -> anyhow::Result<PlanTask> {
         task_timeout_sec: 1_800,
         done_when,
         reality_test,
+        sandbox_permissions: None,
     };
 
     Ok(PlanTask {

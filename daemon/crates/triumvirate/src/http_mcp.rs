@@ -8,11 +8,14 @@
 //! matching the existing HTTP API auth pattern.
 //!
 //! FEAT-002 (REQ-H01, REQ-H02, REQ-H03, REQ-H04, REQ-H07, REQ-H09)
+//! FEAT-011 / FEAT-014 (REQ-010, REQ-033) — Pantheon session linking via
+//! X-Pantheon-Session-Id / X-Pantheon-Root-Session-Id headers.
 
 use std::sync::Arc;
 
-use axum::{Router, middleware, response::Response};
+use axum::{Router, middleware};
 use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use daemon_core::{PANTHEON_SESSION, PantheonSessionContext};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig,
     StreamableHttpService,
@@ -21,6 +24,21 @@ use rmcp::transport::streamable_http_server::{
 use tokio_util::sync::CancellationToken;
 
 use crate::McpBridge;
+
+/// Canonical header name for Pantheon session identification.
+///
+/// FEAT-014 (REQ-010, REQ-033): Set by Pantheon's MCP proxy when a Claude
+/// Code PTY child dispatches via HTTP. Extracted by `bearer_auth_middleware`
+/// and stored in the `PANTHEON_SESSION` tokio task-local in `daemon-core`.
+/// ABE dispatch reads it via `daemon_core::current_pantheon_session()` BEFORE
+/// spawning any monitor tasks, then passes the lineage explicitly into
+/// `TaskTracker::register()`.
+pub const PANTHEON_SESSION_HEADER: &str = "x-pantheon-session-id";
+
+/// Optional second header for explicit root-session propagation in chained
+/// dispatches. If absent, the middleware treats `X-Pantheon-Session-Id` as
+/// both parent and root.
+pub const PANTHEON_ROOT_SESSION_HEADER: &str = "x-pantheon-root-session-id";
 
 /// Build an Axum Router for the /mcp endpoint with auth + StreamableHttpService.
 ///
@@ -45,8 +63,17 @@ pub fn build_mcp_router(
 }
 
 /// Bearer token auth middleware for the /mcp endpoint.
-/// Returns 401 Unauthorized if the token is missing or wrong.
-/// REQ-H09
+///
+/// - REQ-H09: Returns 401 Unauthorized if the token is missing or wrong.
+/// - REQ-010 / REQ-033 (T-004): On authorized requests, extracts the
+///   `X-Pantheon-Session-Id` (and optional `X-Pantheon-Root-Session-Id`)
+///   headers and scopes the downstream handler chain in a
+///   `PANTHEON_SESSION.scope(...)` so that ABE dispatch code can read the
+///   lineage via `daemon_core::current_pantheon_session()`.
+///
+/// Non-Pantheon callers (the legacy CLI, `curl`, tests) simply omit the
+/// header and the scope holds `None`, which propagates as "no lineage" into
+/// WorkerLifecycle events.
 async fn bearer_auth_middleware(
     expected_token: String,
     req: Request<axum::body::Body>,
@@ -67,7 +94,42 @@ async fn bearer_auth_middleware(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    Ok(next.run(req).await)
+    // FEAT-014 (REQ-010) T-004: extract Pantheon lineage headers (if any).
+    // Missing / empty / non-ASCII values all collapse to `None`.
+    let pantheon_parent = req
+        .headers()
+        .get(PANTHEON_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let pantheon_root = req
+        .headers()
+        .get(PANTHEON_ROOT_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let scope_value: Option<Arc<PantheonSessionContext>> = pantheon_parent.map(|parent| {
+        let ctx = match pantheon_root {
+            Some(root) => PantheonSessionContext::with_root(parent, root),
+            None => PantheonSessionContext::new(parent),
+        };
+        Arc::new(ctx)
+    });
+
+    // Wrap the downstream handler in PANTHEON_SESSION.scope so that every
+    // `.await` inside the MCP tool call chain (including `tracker.register()`)
+    // can observe the lineage via task-local reads. tokio::spawn boundaries
+    // inside dispatch code are handled by explicit capture there — see
+    // mcp_tools::abe::dispatch_codex.
+    let response = PANTHEON_SESSION
+        .scope(scope_value, async move { next.run(req).await })
+        .await;
+
+    Ok(response)
 }
 
 fn build_streamable_http_service(
@@ -88,4 +150,193 @@ fn build_streamable_http_service(
         session_manager,
         config,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Reality tests for T-004 (REQ-010, REQ-033).
+    //!
+    //! These drive `bearer_auth_middleware` directly with synthetic
+    //! `Request<Body>` objects and inspect what `current_pantheon_session()`
+    //! returns from inside the downstream handler. No real HTTP server,
+    //! no real MCP — the middleware is the entire unit under test.
+    //!
+    //! Each test owns its own `Arc<StdMutex<Option<Outcome>>>` capture cell
+    //! so tests can run in parallel without stomping on each other.
+
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use daemon_core::current_pantheon_session;
+    use std::sync::Mutex as StdMutex;
+    use tower::ServiceExt;
+
+    /// Outcome captured by the downstream handler: the value of
+    /// `current_pantheon_session()` at the moment the handler ran.
+    /// `None` inside the outer `Option` means the handler never ran
+    /// (e.g. the middleware rejected the request).
+    type CaptureCell = Arc<StdMutex<Option<Option<Arc<PantheonSessionContext>>>>>;
+
+    fn fresh_cell() -> CaptureCell {
+        Arc::new(StdMutex::new(None))
+    }
+
+    /// Build a tiny Axum router whose only handler captures the current
+    /// PANTHEON_SESSION into the supplied per-test cell and returns 200.
+    fn make_test_router(token: &str, cell: CaptureCell) -> axum::Router {
+        let cell_for_handler = cell.clone();
+        let capture_handler = move |_req: Request<Body>| {
+            let cell = cell_for_handler.clone();
+            async move {
+                let got = current_pantheon_session();
+                *cell.lock().unwrap() = Some(got);
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        };
+
+        axum::Router::new()
+            .fallback(capture_handler)
+            .layer(axum::middleware::from_fn({
+                let token = token.to_string();
+                move |req, next| {
+                    let token = token.clone();
+                    bearer_auth_middleware(token, req, next)
+                }
+            }))
+    }
+
+    fn assert_handler_did_not_run(cell: &CaptureCell) {
+        assert!(
+            cell.lock().unwrap().is_none(),
+            "downstream handler should not have executed"
+        );
+    }
+
+    fn take_captured(cell: &CaptureCell) -> Option<Arc<PantheonSessionContext>> {
+        cell.lock()
+            .unwrap()
+            .take()
+            .expect("downstream handler should have executed and captured a value")
+    }
+
+    #[tokio::test]
+    async fn middleware_propagates_pantheon_session_header_to_task_local() {
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .header(PANTHEON_SESSION_HEADER, "pantheon-sess-123")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let captured = take_captured(&cell).expect("scope should have been populated");
+        assert_eq!(captured.parent_session_id, "pantheon-sess-123");
+        // No root header supplied → root defaults to parent.
+        assert_eq!(captured.root_session_id, "pantheon-sess-123");
+    }
+
+    #[tokio::test]
+    async fn middleware_honors_explicit_root_session_header() {
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .header(PANTHEON_SESSION_HEADER, "intermediate-worker")
+            .header(PANTHEON_ROOT_SESSION_HEADER, "pantheon-root")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let captured = take_captured(&cell).expect("scope should have been populated");
+        assert_eq!(captured.parent_session_id, "intermediate-worker");
+        assert_eq!(captured.root_session_id, "pantheon-root");
+    }
+
+    #[tokio::test]
+    async fn middleware_missing_pantheon_header_leaves_scope_none() {
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Handler ran inside PANTHEON_SESSION.scope(None, ...) → None.
+        assert!(take_captured(&cell).is_none());
+    }
+
+    #[tokio::test]
+    async fn middleware_rejects_missing_bearer_before_scope_runs() {
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header(PANTHEON_SESSION_HEADER, "should-never-be-read")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_handler_did_not_run(&cell);
+    }
+
+    #[tokio::test]
+    async fn middleware_rejects_wrong_bearer() {
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer wrong")
+            .header(PANTHEON_SESSION_HEADER, "x")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_handler_did_not_run(&cell);
+    }
+
+    #[tokio::test]
+    async fn middleware_treats_empty_header_as_none() {
+        let cell = fresh_cell();
+        let router = make_test_router("secret", cell.clone());
+
+        let req = Request::builder()
+            .uri("/mcp")
+            .method("POST")
+            .header("Authorization", "Bearer secret")
+            .header(PANTHEON_SESSION_HEADER, "   ")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(take_captured(&cell).is_none());
+    }
 }

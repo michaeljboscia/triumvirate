@@ -10,6 +10,18 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
             "triumvirate=info,daemon_core=info,daemon_http=info,agent_worker=info,agent_adapter=info,mcp_bridge=info,mcp_tools=info,fallback_outbox=info,shared_types=info,warn".into()
         });
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    let use_stderr = should_write_logs_to_stderr();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_target(false)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_writer(move || {
+            if use_stderr {
+                Box::new(std::io::stderr()) as Box<dyn std::io::Write + Send>
+            } else {
+                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send>
+            }
+        });
     match otel_endpoint {
         Some(endpoint) => {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -24,26 +36,24 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
             opentelemetry::global::set_tracer_provider(provider);
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_target(false)
-                        .with_span_events(FmtSpan::CLOSE),
-                )
+                .with(fmt_layer)
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
         }
         None => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_target(false)
-                        .with_span_events(FmtSpan::CLOSE),
-                )
+                .with(fmt_layer)
                 .init();
         }
     }
     Ok(())
+}
+
+fn should_write_logs_to_stderr() -> bool {
+    // Keep MCP/proxy stdout reserved for JSON-RPC frames only.
+    matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("mcp") | Some("proxy")
+    )
 }

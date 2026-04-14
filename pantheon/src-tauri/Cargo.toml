@@ -1,0 +1,64 @@
+[package]
+name = "pantheon"
+version = "3.9.0"
+description = "Pantheon — native macOS app for multi-agent orchestration"
+authors = ["Mike Boscia"]
+edition = "2021"
+# T-013: pantheon/src-tauri is a member of the sibling daemon/ Cargo
+# workspace so it shares Cargo.lock + target/ with the daemon crates and
+# can take a path dependency on shared-types via the workspace. Cargo
+# requires the back-pointer because the workspace root is not a parent.
+workspace = "../../daemon"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "pantheon_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# T-014: tray-icon enables the system tray API; image-png lets us load
+# template PNGs at runtime for the 4-state daemon-status icon swap.
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+tauri-plugin-opener = "2"
+# T-015: suppress WKWebView's native Cmd+F find bar. Removing Find from the
+# Edit menu isn't enough — WebKit intercepts the chord on its own unless we
+# tell the runtime to drop it before it reaches the webview.
+tauri-plugin-prevent-default = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# T-020: DaemonClient deps. reqwest for REST polling, tokio-tungstenite for
+# the /ws/v2 replay-aware WebSocket, futures-util for the Stream/Sink traits
+# used while reading/writing WS frames, tokio with time + sync so we can
+# spawn the reconnect loop, dirs to find ~/.triumvirate/daemon.token, and
+# shared-types (path dep via the daemon workspace) for the REST response
+# contracts. rustls-tls matches the daemon workspace's reqwest features so
+# we don't pull native-tls transitively.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+dirs = "6"
+shared-types = { path = "../../daemon/crates/shared-types" }
+anyhow = "1"
+tracing = "0.1"
+
+# T-016: PTY host for embedding Claude Code terminals inside Pantheon.
+# portable-pty abstracts the OS-specific PTY system calls behind a
+# cross-platform API. The reads are BLOCKING (per mx-rust-systems skill),
+# so we dispatch them on a dedicated std::thread and ferry bytes back to
+# tokio via a Tauri Channel the frontend owns.
+portable-pty = "0.9"
+base64 = "0.22"
+# T-019: per-PTY UUID for the PANTHEON_SESSION_ID env var that links
+# each Claude Code session back to its dispatching shell for daemon-
+# side worker lineage.
+uuid = { version = "1", features = ["v4"] }
+

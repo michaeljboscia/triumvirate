@@ -5,6 +5,7 @@ use rmcp::{
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
+    OnceLock,
 };
 use tokio::time::Duration;
 
@@ -34,6 +35,9 @@ impl ProgressEmitter {
     }
 
     pub async fn emit(&self, message: impl Into<String>) {
+        if !should_emit_progress_notifications() {
+            return;
+        }
         let message = message.into();
         if let Err(err) = self
             .peer
@@ -61,6 +65,20 @@ impl ProgressEmitter {
             }
         }
     }
+}
+
+fn should_emit_progress_notifications() -> bool {
+    static SHOULD_EMIT: OnceLock<bool> = OnceLock::new();
+    *SHOULD_EMIT.get_or_init(|| {
+        if let Ok(raw) = std::env::var("TRIUMVIRATE_MCP_EMIT_PROGRESS") {
+            let normalized = raw.trim().to_ascii_lowercase();
+            return matches!(normalized.as_str(), "1" | "true" | "yes" | "on");
+        }
+        !matches!(
+            std::env::args().nth(1).as_deref(),
+            Some("mcp") | Some("proxy")
+        )
+    })
 }
 
 pub fn display_agent_name(agent: &str) -> String {

@@ -1,13 +1,18 @@
 //! Shared DTOs for MCP bridge <-> daemon communication.
 
+mod api;
 mod git_ops;
 mod ledger;
 mod abe;
 mod streaming;
 
 pub use abe::*;
+pub use api::{
+    WorkersResponse, WorkerInfo, FleetResponse, FleetBuild, FleetTask,
+    StateResponse, ReplayRequest, ReplayResponse,
+};
 pub use git_ops::{GitOps, MergeResult};
-pub use streaming::AgentStreamEvent;
+pub use streaming::{AgentStreamEvent, WorkerLifecycleType};
 pub use ledger::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
     Summary,
@@ -380,10 +385,72 @@ pub struct SessionState {
     #[serde(default)]
     pub cwd: Option<String>,
     pub history: Vec<String>,
+    /// The immediate session that triggered this session's dispatch.
+    /// For Pantheon-spawned Claude Code sessions, this is the panel_id.
+    /// For Codex/Gemini workers dispatched via MCP, this is the caller's session_id.
+    /// FEAT-011 (REQ-010)
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    /// The top-level user session in a dispatch chain. For Pantheon terminal
+    /// panels, root == parent == own session_id. For workers spawned by
+    /// sub-agents, this chains back to the original Pantheon panel.
+    /// FEAT-011 (REQ-010)
+    #[serde(default)]
+    pub root_session_id: Option<String>,
+    /// The PANTHEON_SESSION_ID env var value captured from the MCP handshake
+    /// (via _meta.pantheon.session_id for stdio or X-Pantheon-Session-Id
+    /// header for HTTP/SSE). NULL for non-Pantheon sessions.
+    /// FEAT-011 (REQ-033)
+    #[serde(default)]
+    pub pantheon_session_id: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_state_persists_pantheon_lineage_fields() {
+        // Reality test: verify lineage fields round-trip through JSON
+        // (SessionState is persisted as JSON at ~/.triumvirate/sessions.json,
+        // not SQLite — the JSON file IS the database).
+        // A stub struct missing these fields would fail deserialization
+        // because we assert exact values after round-trip.
+        use super::SessionState;
+
+        let state = SessionState {
+            agent: "claude".to_string(),
+            cwd: Some("/Users/mikeboscia/projects/triumvirate".to_string()),
+            history: vec!["initialize".to_string()],
+            parent_session_id: Some("sess-pantheon-panel-1".to_string()),
+            root_session_id: Some("sess-pantheon-panel-1".to_string()),
+            pantheon_session_id: Some("pantheon-uuid-abc-123".to_string()),
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["parent_session_id"], "sess-pantheon-panel-1");
+        assert_eq!(value["root_session_id"], "sess-pantheon-panel-1");
+        assert_eq!(value["pantheon_session_id"], "pantheon-uuid-abc-123");
+
+        let parsed: SessionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.parent_session_id, Some("sess-pantheon-panel-1".to_string()));
+        assert_eq!(parsed.root_session_id, Some("sess-pantheon-panel-1".to_string()));
+        assert_eq!(parsed.pantheon_session_id, Some("pantheon-uuid-abc-123".to_string()));
+    }
+
+    #[test]
+    fn session_state_backwards_compatible_missing_lineage() {
+        // Verify existing sessions.json files (without lineage fields) still
+        // deserialize — #[serde(default)] means missing fields become None.
+        use super::SessionState;
+
+        let legacy_json = r#"{"agent":"gemini","cwd":"/tmp","history":["start"]}"#;
+        let parsed: SessionState = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.agent, "gemini");
+        assert_eq!(parsed.parent_session_id, None);
+        assert_eq!(parsed.root_session_id, None);
+        assert_eq!(parsed.pantheon_session_id, None);
+    }
+
     #[test]
     fn lifecycle_event_holds_values() {
         let s = super::LifecycleEvent {

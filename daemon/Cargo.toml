@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/agent-adapter","crates/agent-worker","crates/daemon-core","crates/daemon-http","crates/fallback-outbox","crates/fleet","crates/ledger","crates/mcp-bridge","crates/mcp-tools","crates/peer-review","crates/shared-types","crates/token-economics","crates/triumvirate"]
+members = ["crates/agent-adapter","crates/agent-worker","crates/daemon-core","crates/daemon-http","crates/fallback-outbox","crates/fleet","crates/ledger","crates/mcp-bridge","crates/mcp-tools","crates/peer-review","crates/shared-types","crates/token-economics","crates/triumvirate","../pantheon/src-tauri"]
 
 [workspace.package]
-version = "3.3.0"
+version = "3.9.0"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 description = "Multi-agent AI coordination daemon for Claude, Gemini, and Codex"

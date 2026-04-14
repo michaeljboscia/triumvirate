@@ -47,6 +47,11 @@ pub struct ContractFields {
     pub task_timeout_sec: u64,
     pub done_when: String,
     pub reality_test: String,
+    /// Optional codex-exec `-c sandbox_permissions=[...]` extensions.
+    /// Known values: "network-full-access", "disk-full-read-access", "disk-write-cwd".
+    /// Omitted/empty = default sandbox (no extensions) — preserves prior behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_permissions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -329,6 +334,7 @@ mod tests {
             task_timeout_sec: 600,
             done_when: "Behavior implemented".to_string(),
             reality_test: "End-to-end test passes".to_string(),
+            sandbox_permissions: None,
         }
     }
 
@@ -351,6 +357,52 @@ mod tests {
     fn parse_and_validate_contract_reports_json_error() {
         let err = parse_and_validate_contract("{not-json}").expect_err("expected json error");
         assert!(err.issues.iter().any(|i| i.field == "contract"));
+    }
+
+    #[test]
+    fn contract_without_sandbox_permissions_deserializes() {
+        let json = r#"{
+            "task_id": "T-003",
+            "req_ids": ["REQ-002"],
+            "wave": 1,
+            "file_policy": "default-deny",
+            "allowed_files": ["src/engine.rs"],
+            "forbidden_files": [],
+            "allowed_commands": [["cargo","test"]],
+            "forbidden_commands": [],
+            "commit_format": "^T-003:",
+            "test_command": "cargo test",
+            "task_timeout_sec": 600,
+            "done_when": "ok",
+            "reality_test": "ok"
+        }"#;
+        let parsed: ContractFields = serde_json::from_str(json).expect("backward-compat parse");
+        assert!(parsed.sandbox_permissions.is_none());
+    }
+
+    #[test]
+    fn contract_with_sandbox_permissions_deserializes() {
+        let json = r#"{
+            "task_id": "T-003",
+            "req_ids": ["REQ-002"],
+            "wave": 1,
+            "file_policy": "default-deny",
+            "allowed_files": ["src/engine.rs"],
+            "forbidden_files": [],
+            "allowed_commands": [["cargo","test"]],
+            "forbidden_commands": [],
+            "commit_format": "^T-003:",
+            "test_command": "cargo test",
+            "task_timeout_sec": 600,
+            "done_when": "ok",
+            "reality_test": "ok",
+            "sandbox_permissions": ["network-full-access"]
+        }"#;
+        let parsed: ContractFields = serde_json::from_str(json).expect("sandbox perms parse");
+        assert_eq!(
+            parsed.sandbox_permissions.as_deref(),
+            Some(&["network-full-access".to_string()][..])
+        );
     }
 
     #[test]

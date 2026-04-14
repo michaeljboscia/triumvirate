@@ -214,6 +214,10 @@ fn handle_ws_text(
         | AgentStreamEvent::ResponseChunk { agent, .. }
         | AgentStreamEvent::TurnCompleted { agent, .. }
         | AgentStreamEvent::Error { agent, .. } => session_by_agent.get(agent).cloned(),
+        // FEAT-014 (REQ-010): WorkerLifecycle events use session_name directly,
+        // not session_by_agent lookup. These events are emitted by the daemon
+        // with full lineage context, so session_name is authoritative.
+        AgentStreamEvent::WorkerLifecycle { session_name, .. } => Some(session_name.clone()),
     };
 
     // BUG-2 FIX: Only filter when we positively know the session doesn't match.

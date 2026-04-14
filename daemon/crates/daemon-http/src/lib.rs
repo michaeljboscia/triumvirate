@@ -49,6 +49,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        LazyLock,
     },
 };
 use tokio::{
@@ -60,6 +61,15 @@ use tracing::warn;
 use uuid::Uuid;
 
 static DAEMON_AUTOSTART_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static DAEMON_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(8)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build shared daemon HTTP client")
+});
+const DEFAULT_DAEMON_HTTP_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_DAEMON_ASK_TIMEOUT_SECS: u64 = 180;
 
 pub fn reset_daemon_autostart_flag_for_tests() {
     DAEMON_AUTOSTART_ATTEMPTED.store(false, Ordering::SeqCst);
@@ -89,9 +99,10 @@ pub fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
 
 async fn daemon_get_json<T: serde::de::DeserializeOwned>(url: String) -> anyhow::Result<T> {
     let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
-    let client = reqwest::Client::new();
+    let client = &*DAEMON_HTTP_CLIENT;
+    let timeout = daemon_http_timeout();
 
-    let first = client.get(&url).bearer_auth(&token).send().await;
+    let first = client.get(&url).bearer_auth(&token).timeout(timeout).send().await;
     match first {
         Ok(response) => {
             if !response.status().is_success() {
@@ -102,7 +113,7 @@ async fn daemon_get_json<T: serde::de::DeserializeOwned>(url: String) -> anyhow:
         Err(_) => {
             if attempt_daemon_autostart_once().unwrap_or(false) {
                 sleep(Duration::from_millis(300)).await;
-                let retry = client.get(&url).bearer_auth(token).send().await?;
+                let retry = client.get(&url).bearer_auth(token).timeout(timeout).send().await?;
                 if !retry.status().is_success() {
                     anyhow::bail!("daemon responded with HTTP {}", retry.status());
                 }
@@ -117,10 +128,24 @@ async fn daemon_post_json<TReq: serde::Serialize, TResp: serde::de::DeserializeO
     url: String,
     payload: &TReq,
 ) -> anyhow::Result<TResp> {
-    let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
-    let client = reqwest::Client::new();
+    daemon_post_json_with_timeout(url, payload, daemon_http_timeout()).await
+}
 
-    let first = client.post(&url).bearer_auth(&token).json(payload).send().await;
+async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de::DeserializeOwned>(
+    url: String,
+    payload: &TReq,
+    timeout: Duration,
+) -> anyhow::Result<TResp> {
+    let token = core_ensure_daemon_token(&core_triumvirate_home_dir()?)?;
+    let client = &*DAEMON_HTTP_CLIENT;
+
+    let first = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(payload)
+        .timeout(timeout)
+        .send()
+        .await;
     match first {
         Ok(response) => {
             if !response.status().is_success() {
@@ -135,6 +160,7 @@ async fn daemon_post_json<TReq: serde::Serialize, TResp: serde::de::DeserializeO
                     .post(&url)
                     .bearer_auth(token)
                     .json(payload)
+                    .timeout(timeout)
                     .send()
                     .await?;
                 if !retry.status().is_success() {
@@ -145,6 +171,24 @@ async fn daemon_post_json<TReq: serde::Serialize, TResp: serde::de::DeserializeO
             anyhow::bail!("daemon request failed")
         }
     }
+}
+
+fn daemon_http_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("TRIUMVIRATE_DAEMON_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DAEMON_HTTP_TIMEOUT_SECS),
+    )
+}
+
+fn daemon_ask_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DAEMON_ASK_TIMEOUT_SECS),
+    )
 }
 
 pub async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
@@ -202,7 +246,12 @@ pub async fn fetch_daemon_session_spawn(req: &SpawnSessionRequest) -> anyhow::Re
 }
 
 pub async fn fetch_daemon_session_ask(req: &AskSessionRequest) -> anyhow::Result<String> {
-    let json = daemon_post_json::<AskSessionRequest, serde_json::Value>(daemon_session_ask_url(), req).await?;
+    let json = daemon_post_json_with_timeout::<AskSessionRequest, serde_json::Value>(
+        daemon_session_ask_url(),
+        req,
+        daemon_ask_timeout(),
+    )
+    .await?;
     Ok(json
         .get("response")
         .and_then(|v| v.as_str())

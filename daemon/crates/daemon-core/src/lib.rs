@@ -10,7 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use shared_types::{MemoryEntry, SessionState};
+use shared_types::{FleetBuild, MemoryEntry, SessionState};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::instrument;
@@ -20,8 +20,17 @@ pub mod version;
 pub mod metrics;
 pub mod observability;
 pub mod sequencer;
+pub mod pid;
+pub mod replay;
+pub mod pantheon_session;
 pub use version::{NAME, VERSION};
 pub use sequencer::EventSequencer;
+pub use pid::PidFile;
+pub use replay::{EventReplayBuffer, ReplayResult, DEFAULT_CAPACITY as REPLAY_BUFFER_DEFAULT_CAPACITY};
+pub use pantheon_session::{
+    PANTHEON_SESSION, PantheonSessionContext, current_parent_session_id,
+    current_pantheon_session, current_root_session_id,
+};
 
 #[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
@@ -446,6 +455,31 @@ pub struct DaemonState<TAbeTasks> {
     pub marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
     pub metrics: Arc<metrics::DaemonMetrics>,
     pub ws_events: tokio::sync::broadcast::Sender<String>,
+    /// FEAT-013 (REQ-020) T-007.5: shared event replay ring buffer.
+    /// Filled by a single startup task in `run_daemon` that subscribes to
+    /// `ws_events` BEFORE any other consumer (subscribe-before-read pattern)
+    /// and pushes parsed `AgentStreamEvent` items into the buffer. Read by
+    /// the WebSocket /ws/v2 handshake handler when a client reconnects with
+    /// `last_seq`. Defaults to a 1000-event capacity.
+    pub replay_buffer: Arc<replay::EventReplayBuffer>,
+    /// FEAT-012 (REQ-017) T-007.5: v3.9.0-shape fleet-of-builds store, keyed
+    /// by `build_id`. Distinct from `McpBridge.fleet_states`, which uses the
+    /// legacy `FleetStatusResponse` shape for the existing MCP fleet tools.
+    /// Read by GET /api/fleet and /api/fleet/{build_id}. Starts empty until
+    /// a future task wires `dispatch_codex_worktree` to publish FleetBuild
+    /// entries here. The empty state satisfies T-008's `done_when` clause
+    /// "Empty responses when no workers/fleet active."
+    pub fleet_v2_states: Arc<Mutex<HashMap<String, FleetBuild>>>,
+    /// FEAT-013 (REQ-020) T-007.5: monotonic counter behind WS events.
+    /// Bridged into AgentStreamEvent::seq via the existing EventSequencer in
+    /// triumvirate; this field is the daemon-state-level mirror that
+    /// /api/state surfaces to clients as `last_event_seq`. Updated by the
+    /// same buffer-fill task that pushes to `replay_buffer`.
+    pub last_event_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// FEAT-013 (REQ-020) T-007.5: daemon process start instant.
+    /// Captured in `run_daemon` and used by /api/state to compute `uptime_ms`
+    /// without requiring a wall-clock subtraction.
+    pub started_at: std::time::Instant,
 }
 
 impl<TAbeTasks> DaemonState<TAbeTasks> {
@@ -473,6 +507,10 @@ impl<TAbeTasks> DaemonState<TAbeTasks> {
             marker_parse_window,
             metrics,
             ws_events,
+            replay_buffer: Arc::new(replay::EventReplayBuffer::default_capacity()),
+            fleet_v2_states: Arc::new(Mutex::new(HashMap::new())),
+            last_event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            started_at: std::time::Instant::now(),
         }
     }
 }
@@ -484,6 +522,72 @@ pub fn encode_ws_event(event_type: &str, payload: serde_json::Value) -> String {
         "payload": payload
     })
     .to_string()
+}
+
+/// FEAT-013 (REQ-020) T-007.5: Run the replay-buffer fill loop.
+///
+/// Consumes events from `buffer_rx` (a `tokio::sync::broadcast::Receiver`
+/// that has ALREADY been subscribed to the daemon's `ws_events` channel
+/// BEFORE this function is called — the subscribe-before-read invariant
+/// is the caller's responsibility), filters for "agent_stream" envelopes,
+/// parses payloads as `AgentStreamEvent`, and pushes them into the supplied
+/// replay buffer while updating the monotonic `last_event_seq` mirror.
+///
+/// This is the body of the long-lived task spawned by `run_daemon`.
+/// Extracted into daemon-core so it can be unit-tested without standing
+/// up the full daemon binary.
+///
+/// The loop exits cleanly when the broadcast channel closes. Lagged errors
+/// (slow consumer) are logged and skipped — the alternative is to die,
+/// which would leave the buffer empty for the rest of daemon uptime and
+/// break every WebSocket replay client.
+pub async fn run_replay_buffer_fill(
+    mut buffer_rx: tokio::sync::broadcast::Receiver<String>,
+    buffer: Arc<replay::EventReplayBuffer>,
+    last_event_seq: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use shared_types::AgentStreamEvent;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::broadcast::error::RecvError;
+
+    loop {
+        match buffer_rx.recv().await {
+            Ok(envelope) => {
+                let parsed: serde_json::Value = match serde_json::from_str(&envelope) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "replay buffer fill: invalid envelope");
+                        continue;
+                    }
+                };
+                if parsed.get("type").and_then(|v| v.as_str()) != Some("agent_stream") {
+                    continue;
+                }
+                let payload = match parsed.get("payload") {
+                    Some(p) => p.clone(),
+                    None => continue,
+                };
+                let event: AgentStreamEvent = match serde_json::from_value(payload) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "replay buffer fill: payload not AgentStreamEvent");
+                        continue;
+                    }
+                };
+                let seq = event.seq();
+                buffer.push(event);
+                last_event_seq.fetch_max(seq, Ordering::Relaxed);
+            }
+            Err(RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, "replay buffer fill: lagged, skipping events");
+                continue;
+            }
+            Err(RecvError::Closed) => {
+                tracing::info!("replay buffer fill: channel closed, exiting");
+                break;
+            }
+        }
+    }
 }
 
 pub fn publish_ws_event<TAbeTasks>(
@@ -501,6 +605,163 @@ pub async fn acquire_project_queue(registry: &QueueRegistry, key: String) -> Arc
         .entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+#[cfg(test)]
+mod replay_fill_tests {
+    //! FEAT-013 (REQ-020) T-007.5 reality tests for `run_replay_buffer_fill`.
+    //!
+    //! Drives the EXACT same function `run_daemon` calls in production with
+    //! a real broadcast channel, real replay buffer, and real
+    //! AgentStreamEvent payloads. Stub implementations would fail the
+    //! seq-monotonicity assertion, the buffer-population assertion, or the
+    //! envelope-filter assertion.
+
+    use super::*;
+    use shared_types::AgentStreamEvent;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    fn make_envelope(event: &AgentStreamEvent) -> String {
+        encode_ws_event("agent_stream", serde_json::to_value(event).unwrap())
+    }
+
+    fn make_event(seq: u64) -> AgentStreamEvent {
+        AgentStreamEvent::ToolCall {
+            agent: "test-agent".into(),
+            tool_name: "test_tool".into(),
+            args_summary: format!("call-{seq}"),
+            seq,
+        }
+    }
+
+    /// End-to-end: subscribe → receive → push to buffer → update last_seq.
+    #[tokio::test]
+    async fn fill_pushes_agent_stream_events_into_buffer_and_advances_last_seq() {
+        let (tx, rx) = broadcast::channel::<String>(64);
+        let buffer = Arc::new(replay::EventReplayBuffer::default_capacity());
+        let last_seq = Arc::new(AtomicU64::new(0));
+
+        let buf = buffer.clone();
+        let seq = last_seq.clone();
+        let task = tokio::spawn(async move {
+            run_replay_buffer_fill(rx, buf, seq).await;
+        });
+
+        // Send 5 envelopes with seq 1..=5
+        for i in 1..=5u64 {
+            tx.send(make_envelope(&make_event(i))).unwrap();
+        }
+
+        // Give the fill task a tick to drain the channel.
+        for _ in 0..50 {
+            if buffer.len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(buffer.len(), 5, "expected all 5 events buffered");
+        assert_eq!(last_seq.load(Ordering::Relaxed), 5);
+
+        // Closing the channel makes the task exit cleanly.
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    /// Non-agent_stream envelopes (abe_task_state, ledger_health, etc.)
+    /// must NOT be pushed into the AgentStreamEvent replay buffer.
+    #[tokio::test]
+    async fn fill_filters_out_non_agent_stream_envelopes() {
+        let (tx, rx) = broadcast::channel::<String>(64);
+        let buffer = Arc::new(replay::EventReplayBuffer::default_capacity());
+        let last_seq = Arc::new(AtomicU64::new(0));
+
+        let buf = buffer.clone();
+        let seq = last_seq.clone();
+        let task = tokio::spawn(async move {
+            run_replay_buffer_fill(rx, buf, seq).await;
+        });
+
+        // Send 3 noise envelopes + 1 real one
+        tx.send(encode_ws_event("abe_task_state", serde_json::json!({"x":1}))).unwrap();
+        tx.send(encode_ws_event("ledger_health", serde_json::json!({"status":"ok"}))).unwrap();
+        tx.send(encode_ws_event("fleet_progress", serde_json::json!({"active":0}))).unwrap();
+        tx.send(make_envelope(&make_event(42))).unwrap();
+
+        for _ in 0..50 {
+            if buffer.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(buffer.len(), 1, "only the agent_stream event should land");
+        assert_eq!(last_seq.load(Ordering::Relaxed), 42);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    /// Malformed envelopes are logged and skipped, not crashed on.
+    #[tokio::test]
+    async fn fill_tolerates_malformed_envelopes() {
+        let (tx, rx) = broadcast::channel::<String>(64);
+        let buffer = Arc::new(replay::EventReplayBuffer::default_capacity());
+        let last_seq = Arc::new(AtomicU64::new(0));
+
+        let buf = buffer.clone();
+        let seq = last_seq.clone();
+        let task = tokio::spawn(async move {
+            run_replay_buffer_fill(rx, buf, seq).await;
+        });
+
+        tx.send("not valid json {".into()).unwrap();
+        tx.send(r#"{"type":"agent_stream","payload":{"garbage":"!"}}"#.into()).unwrap();
+        tx.send(make_envelope(&make_event(7))).unwrap();
+
+        for _ in 0..50 {
+            if buffer.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(buffer.len(), 1, "only the well-formed event should land");
+        assert_eq!(last_seq.load(Ordering::Relaxed), 7);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    /// last_event_seq uses fetch_max — out-of-order arrivals never decrease it.
+    #[tokio::test]
+    async fn fill_last_seq_is_monotonic_under_out_of_order_arrivals() {
+        let (tx, rx) = broadcast::channel::<String>(64);
+        let buffer = Arc::new(replay::EventReplayBuffer::default_capacity());
+        let last_seq = Arc::new(AtomicU64::new(0));
+
+        let buf = buffer.clone();
+        let seq = last_seq.clone();
+        let task = tokio::spawn(async move {
+            run_replay_buffer_fill(rx, buf, seq).await;
+        });
+
+        tx.send(make_envelope(&make_event(100))).unwrap();
+        tx.send(make_envelope(&make_event(50))).unwrap(); // earlier seq
+        tx.send(make_envelope(&make_event(200))).unwrap();
+
+        for _ in 0..50 {
+            if buffer.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(buffer.len(), 3);
+        // Even though we pushed 50 after 100, last_seq stayed at 100, then jumped to 200.
+        assert_eq!(last_seq.load(Ordering::Relaxed), 200);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,37 @@
+Pantheon v4.0 Progress
+======================
+
+Current Phase: Phase 4 (Canonical Docs) — COMPLETE
+Next Phase: Phase 4.2 (Trait-to-Task Traceability)
+
+v3.9.0 Daemon Backend: NOT STARTED
+  Wave 0: Contracts — NOT STARTED
+  Wave 1: Daemon Core — NOT STARTED
+  Wave 2: Daemon HTTP — NOT STARTED
+  Wave 3: Daemon Release — NOT STARTED
+
+v4.0.0 Tauri App: NOT STARTED
+  Wave 4: Tauri Scaffold — NOT STARTED
+  Wave 5: Terminal Panels — NOT STARTED
+  Wave 6: Sidebar + Status — NOT STARTED
+  Wave 7: Polish — NOT STARTED
+  Wave 8: Build + Release — NOT STARTED
+
+Completed:
+  - Spec (specs/PANTHEON_V4.md) — 35 REQs, goatrodeo Phase 3 passed
+  - PRD (docs/4.0.0/PRD.md) — 15 FEATs with acceptance criteria
+  - APP_FLOW (docs/4.0.0/APP_FLOW.md) — all user journeys
+  - TECH_STACK (docs/4.0.0/TECH_STACK.md) — version-locked deps
+  - DESIGN_SYSTEM (docs/4.0.0/DESIGN_SYSTEM.md) — colors, typography, spacing
+  - FRONTEND_GUIDELINES (docs/4.0.0/FRONTEND_GUIDELINES.md) — Svelte 5 patterns
+  - BACKEND_STRUCTURE (docs/4.0.0/BACKEND_STRUCTURE.md) — API contracts, schema
+  - IMPLEMENTATION_PLAN (docs/4.0.0/IMPLEMENTATION_PLAN.md) — 29 tasks, 9 waves
+  - TEST_PLAN (docs/4.0.0/TEST_PLAN.md) — every REQ mapped to test
+  - CLAUDE.md (docs/4.0.0/CLAUDE.md) — AI agent instructions
+
+Blocked: Nothing
+
+Notes:
+  - Tauri v2 skill may be needed before Wave 4 build agents dispatch
+  - Market research at research/pantheon-v4-market-research.md
+  - aoe (Agent of Empires) tried and rejected — lessons in memory

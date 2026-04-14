@@ -6,9 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use daemon_core::{encode_ws_event, metrics::DaemonMetrics};
+use daemon_core::{EventSequencer, encode_ws_event, metrics::DaemonMetrics};
 use shared_types::{
-    CancelTaskResponse, GetTaskOutputResponse, GetTaskStatusResponse, TaskStatus,
+    AgentStreamEvent, CancelTaskResponse, GetTaskOutputResponse, GetTaskStatusResponse,
+    TaskStatus, WorkerLifecycleType,
 };
 use tokio::{process::Child, sync::{Mutex, broadcast}};
 use tracing::instrument;
@@ -33,6 +34,17 @@ struct TaskRecord {
     output: Option<TaskOutput>,
     child: Option<Arc<Mutex<Child>>>,
     worktree_path: Option<PathBuf>,
+    /// FEAT-014 (REQ-010) T-004: Pantheon lineage captured at register time
+    /// from `daemon_core::current_pantheon_session()`. Stored here (rather
+    /// than read on-demand) because `mark_completed`/`mark_failed` execute
+    /// inside a `tokio::spawn`ed monitor task where the task-local is not
+    /// visible. `None` for legacy (non-Pantheon) callers.
+    parent_session_id: Option<String>,
+    /// FEAT-014 (REQ-010) T-004: Root of the dispatch chain. For direct
+    /// Pantheon dispatches this equals `parent_session_id`. For chained
+    /// dispatches (v4.0+) it identifies the original Pantheon session at
+    /// the top of the chain.
+    root_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +52,9 @@ pub struct TaskTracker {
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
     metrics: Option<Arc<DaemonMetrics>>,
     ws_events: Option<broadcast::Sender<String>>,
+    /// FEAT-014 (REQ-010): shared sequencer for WorkerLifecycle events.
+    /// None means WorkerLifecycle emission is disabled (legacy constructor).
+    sequencer: Option<Arc<EventSequencer>>,
 }
 
 impl Default for TaskTracker {
@@ -48,6 +63,7 @@ impl Default for TaskTracker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
             ws_events: None,
+            sequencer: None,
         }
     }
 }
@@ -84,6 +100,24 @@ impl TaskTracker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             metrics: Some(metrics),
             ws_events,
+            sequencer: None,
+        }
+    }
+
+    /// FEAT-014 (REQ-010): Full observability with WorkerLifecycle event
+    /// emission enabled. Shares a sequencer with the streaming executor so
+    /// WorkerLifecycle events have monotonic seq numbers aligned with the
+    /// rest of the event stream.
+    pub fn with_pantheon_observability(
+        metrics: Arc<DaemonMetrics>,
+        ws_events: broadcast::Sender<String>,
+        sequencer: Arc<EventSequencer>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Some(metrics),
+            ws_events: Some(ws_events),
+            sequencer: Some(sequencer),
         }
     }
 
@@ -117,6 +151,48 @@ impl TaskTracker {
         let _ = ws_events.send(encode_ws_event("abe_task_state", payload));
     }
 
+    /// FEAT-014 (REQ-010): Emit a WorkerLifecycle event on the shared WebSocket
+    /// channel. Used by Pantheon's sidebar to populate the worker hierarchy
+    /// in real-time. Lineage fields (parent_session_id, root_session_id) are
+    /// populated by T-004's dispatch path when available; NULL for legacy
+    /// callers without Pantheon context.
+    ///
+    /// No-op if either ws_events or sequencer is absent (legacy constructor).
+    fn emit_worker_lifecycle(
+        &self,
+        lifecycle: WorkerLifecycleType,
+        task_id: &str,
+        parent_session_id: Option<String>,
+        root_session_id: Option<String>,
+        commit_sha: Option<String>,
+        error_message: Option<String>,
+        elapsed_ms: Option<u64>,
+    ) {
+        let (Some(ws_events), Some(sequencer)) = (&self.ws_events, &self.sequencer) else {
+            return;
+        };
+        let event = AgentStreamEvent::WorkerLifecycle {
+            lifecycle,
+            agent: "codex".to_string(), // ABE currently only dispatches Codex workers
+            session_name: format!("codex-worker-{task_id}"),
+            task_id: Some(task_id.to_string()),
+            parent_session_id,
+            root_session_id,
+            commit_sha,
+            error_message,
+            elapsed_ms,
+            seq: sequencer.next(),
+        };
+        let payload = match serde_json::to_value(&event) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to serialize WorkerLifecycle event");
+                return;
+            }
+        };
+        let _ = ws_events.send(encode_ws_event("agent_stream", payload));
+    }
+
     #[instrument(skip_all, fields(task_id = %task_id, wave))]
     pub async fn register(
         &self,
@@ -124,6 +200,8 @@ impl TaskTracker {
         wave: u32,
         child: Arc<Mutex<Child>>,
         worktree_path: Option<PathBuf>,
+        parent_session_id: Option<String>,
+        root_session_id: Option<String>,
     ) {
         let mut guard = self.inner.lock().await;
         let started_at = Instant::now();
@@ -139,10 +217,22 @@ impl TaskTracker {
                 output: None,
                 child: Some(child),
                 worktree_path,
+                parent_session_id: parent_session_id.clone(),
+                root_session_id: root_session_id.clone(),
             },
         );
         self.emit_task_state(&task_id, wave, "dispatched", 0, None);
         self.emit_task_state(&task_id, wave, "running", 0, None);
+        // FEAT-014 (REQ-010) T-004: WorkerLifecycle::Spawned with Pantheon lineage.
+        self.emit_worker_lifecycle(
+            WorkerLifecycleType::Spawned,
+            &task_id,
+            parent_session_id,
+            root_session_id,
+            None,
+            None,
+            None,
+        );
     }
 
     #[instrument(skip_all, fields(task_id = %task_id, status = "completed"))]
@@ -187,6 +277,18 @@ impl TaskTracker {
             duration_ms,
             task.commit_sha.as_deref(),
         );
+        // FEAT-014 (REQ-010) T-004: WorkerLifecycle::Completed with lineage
+        // re-read from TaskRecord (task-local from register is gone — this
+        // executes in the spawned monitor task).
+        self.emit_worker_lifecycle(
+            WorkerLifecycleType::Completed,
+            task_id,
+            task.parent_session_id.clone(),
+            task.root_session_id.clone(),
+            task.commit_sha.clone(),
+            None,
+            Some(duration_ms as u64),
+        );
         TransitionOutcome::Transitioned
     }
 
@@ -207,10 +309,20 @@ impl TaskTracker {
         task.status = TaskStatus::Failed;
         let duration_ms = task.started_at.elapsed().as_millis();
         task.exit_code = exit_code;
-        task.error_message = Some(error_message);
+        task.error_message = Some(error_message.clone());
         task.child = None;
         self.inc_dispatch_status("failed");
         self.emit_task_state(task_id, task.wave, "failed", duration_ms, task.commit_sha.as_deref());
+        // FEAT-014 (REQ-010) T-004: WorkerLifecycle::Failed with lineage from TaskRecord.
+        self.emit_worker_lifecycle(
+            WorkerLifecycleType::Failed,
+            task_id,
+            task.parent_session_id.clone(),
+            task.root_session_id.clone(),
+            None,
+            Some(error_message),
+            Some(duration_ms as u64),
+        );
         TransitionOutcome::Transitioned
     }
 
@@ -385,6 +497,8 @@ impl TaskTracker {
                 output: None,
                 child: None,
                 worktree_path: None,
+                parent_session_id: None,
+                root_session_id: None,
             },
         );
         self.emit_task_state(&task_id, 0, "failed", 0, None);
@@ -401,6 +515,80 @@ impl TaskTracker {
         let guard = self.inner.lock().await;
         guard.get(task_id).map(|r| r.status.clone())
     }
+
+    /// FEAT-012 (REQ-017) T-007.5: Snapshot every tracked worker as a
+    /// `WorkerInfo` row suitable for `/api/workers` aggregation.
+    ///
+    /// Returns one entry per task currently in the inner map. Each entry
+    /// uses the task_id as both `session_id` and `task_id` (ABE workers do
+    /// not have a separate session identifier — each dispatch is its own
+    /// session). The `agent` is hardcoded to `"codex"` because the daemon
+    /// only spawns Codex workers via ABE today; if Claude/Gemini ABE workers
+    /// land in a future task, this should branch on `TaskRecord` metadata.
+    ///
+    /// `started_at` is rendered as RFC 3339 by reconstructing a SystemTime
+    /// from the elapsed Instant — this is approximate (within milliseconds)
+    /// because Instant has no anchor to wall-clock time, but it's accurate
+    /// enough for client-side hierarchical display and matches what the
+    /// existing watch CLI expects.
+    ///
+    /// Status mapping: TaskStatus → string follows the BACKEND_STRUCTURE.md
+    /// contract: working/completed/failed/timeout/stuck/setup_failed/cancelled.
+    ///
+    /// This method is the authoritative read path for the `/api/workers`
+    /// endpoint added in T-008. It is intentionally allocation-heavy
+    /// (clones every record) — the caller is a once-per-HTTP-request reader,
+    /// not a hot loop.
+    pub async fn snapshot_workers(&self) -> Vec<shared_types::WorkerInfo> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let guard = self.inner.lock().await;
+        let now_sys = SystemTime::now();
+        let now_inst = Instant::now();
+        guard
+            .iter()
+            .map(|(task_id, rec)| {
+                let elapsed = now_inst.saturating_duration_since(rec.started_at);
+                let started_sys = now_sys.checked_sub(elapsed).unwrap_or(now_sys);
+                let started_at = format_rfc3339(started_sys.duration_since(UNIX_EPOCH).ok());
+                shared_types::WorkerInfo {
+                    session_id: task_id.clone(),
+                    agent: "codex".to_string(),
+                    name: format!("codex-worker-{task_id}"),
+                    status: status_label(&rec.status).to_string(),
+                    task_id: Some(task_id.clone()),
+                    parent_session_id: rec.parent_session_id.clone(),
+                    root_session_id: rec.root_session_id.clone(),
+                    pantheon_session_id: None, // ABE workers inherit pantheon lineage via parent
+                    cwd: rec.worktree_path.as_ref().map(|p| p.display().to_string()),
+                    started_at,
+                    elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Map TaskStatus to the canonical lowercase string used by /api/workers.
+fn status_label(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Working => "working",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Timeout => "timeout",
+        TaskStatus::Stuck => "stuck",
+        TaskStatus::SetupFailed => "setup_failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Render an optional UNIX duration as an RFC 3339 timestamp string.
+/// On overflow or None, returns the epoch (1970-01-01T00:00:00Z) — this
+/// only happens for clocks set before 1970 and is harmless for the UI.
+fn format_rfc3339(unix: Option<std::time::Duration>) -> String {
+    let secs = unix.map(|d| d.as_secs() as i64).unwrap_or(0);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
 fn cleanup_git_locks(worktree_path: &Path) {
@@ -430,7 +618,9 @@ fn resolve_git_dir(worktree_path: &Path) -> PathBuf {
 mod tests {
     use std::sync::Arc;
 
-    use shared_types::TaskStatus;
+    use daemon_core::{EventSequencer, metrics::DaemonMetrics};
+    use shared_types::{AgentStreamEvent, TaskStatus, WorkerLifecycleType};
+    use tokio::sync::broadcast;
 
     use super::{TaskTracker, TransitionOutcome};
     use tokio::{process::Command, sync::Mutex};
@@ -446,6 +636,8 @@ mod tests {
                 task_id.to_string(),
                 1,
                 Arc::new(Mutex::new(child)),
+                None,
+                None,
                 None,
             )
             .await;
@@ -600,10 +792,443 @@ mod tests {
                 0,
                 Arc::new(Mutex::new(child)),
                 Some(wt.clone()),
+                None,
+                None,
             )
             .await;
 
         let _ = tracker.cancel("T-LOCK").await;
         assert!(!lock.exists(), "expected index.lock to be removed on cancel");
+    }
+
+    /// FEAT-014 (REQ-010) reality test for T-007:
+    /// Verify that register/mark_completed/mark_failed emit WorkerLifecycle
+    /// events via the broadcast channel when Pantheon observability is enabled.
+    /// A stub implementation that only emits abe_task_state would fail this test.
+    #[tokio::test]
+    async fn pantheon_observability_emits_worker_lifecycle_events() {
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let (ws_tx, mut ws_rx) = broadcast::channel(64);
+        let sequencer = Arc::new(EventSequencer::new());
+        let tracker = TaskTracker::with_pantheon_observability(
+            metrics,
+            ws_tx,
+            sequencer,
+        );
+
+        // Register a task → should emit Spawned
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn");
+        tracker
+            .register(
+                "T-LIFECYCLE-01".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // Drain events and find the WorkerLifecycle ones
+        let mut lifecycle_events: Vec<AgentStreamEvent> = Vec::new();
+        while let Ok(msg) = ws_rx.try_recv() {
+            // msg is an encoded ws_event wrapper. We parse the outer envelope
+            // and look for "agent_stream" type events, then extract the payload.
+            let outer: serde_json::Value =
+                serde_json::from_str(&msg).expect("valid json");
+            if outer.get("type").and_then(|v| v.as_str()) == Some("agent_stream") {
+                let payload = outer.get("payload").expect("payload field");
+                if let Ok(event) = serde_json::from_value::<AgentStreamEvent>(payload.clone()) {
+                    if matches!(event, AgentStreamEvent::WorkerLifecycle { .. }) {
+                        lifecycle_events.push(event);
+                    }
+                }
+            }
+        }
+
+        // Register emits exactly one WorkerLifecycle::Spawned
+        assert_eq!(lifecycle_events.len(), 1, "expected 1 Spawned event");
+        match &lifecycle_events[0] {
+            AgentStreamEvent::WorkerLifecycle {
+                lifecycle,
+                task_id,
+                session_name,
+                agent,
+                seq,
+                ..
+            } => {
+                assert!(matches!(lifecycle, WorkerLifecycleType::Spawned));
+                assert_eq!(task_id.as_deref(), Some("T-LIFECYCLE-01"));
+                assert_eq!(session_name, "codex-worker-T-LIFECYCLE-01");
+                assert_eq!(agent, "codex");
+                assert!(*seq > 0, "seq should be monotonic");
+            }
+            other => panic!("expected WorkerLifecycle, got {other:?}"),
+        }
+
+        // Mark completed → should emit Completed
+        let _outcome = tracker
+            .mark_completed(
+                "T-LIFECYCLE-01",
+                "abc123".to_string(),
+                vec!["src/auth.rs".to_string()],
+                "done".to_string(),
+                None,
+                None,
+            )
+            .await;
+
+        // Drain again
+        let mut completed_events: Vec<AgentStreamEvent> = Vec::new();
+        while let Ok(msg) = ws_rx.try_recv() {
+            let outer: serde_json::Value = serde_json::from_str(&msg).expect("valid json");
+            if outer.get("type").and_then(|v| v.as_str()) == Some("agent_stream") {
+                let payload = outer.get("payload").expect("payload field");
+                if let Ok(event) = serde_json::from_value::<AgentStreamEvent>(payload.clone()) {
+                    if matches!(event, AgentStreamEvent::WorkerLifecycle { .. }) {
+                        completed_events.push(event);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(completed_events.len(), 1, "expected 1 Completed event");
+        match &completed_events[0] {
+            AgentStreamEvent::WorkerLifecycle {
+                lifecycle,
+                task_id,
+                commit_sha,
+                elapsed_ms,
+                ..
+            } => {
+                assert!(matches!(lifecycle, WorkerLifecycleType::Completed));
+                assert_eq!(task_id.as_deref(), Some("T-LIFECYCLE-01"));
+                assert_eq!(commit_sha.as_deref(), Some("abc123"));
+                assert!(elapsed_ms.is_some(), "elapsed_ms should be populated");
+            }
+            other => panic!("expected WorkerLifecycle::Completed, got {other:?}"),
+        }
+    }
+
+    /// FEAT-014 (REQ-010) T-004 reality test:
+    /// Verify that Pantheon lineage (parent_session_id / root_session_id)
+    /// supplied to register() is stamped onto ALL three WorkerLifecycle
+    /// events — Spawned at register time, Completed/Failed from the spawned
+    /// monitor task (which cannot read task-locals). A stub that only
+    /// stamped lineage on Spawned would pass the Spawned assertion but fail
+    /// on Completed/Failed.
+    #[tokio::test]
+    async fn pantheon_lineage_propagates_through_all_worker_lifecycle_events() {
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let (ws_tx, mut ws_rx) = broadcast::channel(64);
+        let sequencer = Arc::new(EventSequencer::new());
+        let tracker = TaskTracker::with_pantheon_observability(metrics, ws_tx, sequencer);
+
+        let parent_id = "pantheon-session-xyz".to_string();
+        let root_id = "pantheon-root-xyz".to_string();
+
+        // --- Path 1: register → mark_completed → expect Spawned + Completed ---
+        let child = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-LIN-OK".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                Some(parent_id.clone()),
+                Some(root_id.clone()),
+            )
+            .await;
+        let _ = tracker
+            .mark_completed(
+                "T-LIN-OK",
+                "deadbeef".to_string(),
+                vec!["x.rs".to_string()],
+                String::new(),
+                None,
+                None,
+            )
+            .await;
+
+        // --- Path 2: register → mark_failed → expect Spawned + Failed ---
+        let child2 = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-LIN-ERR".to_string(),
+                1,
+                Arc::new(Mutex::new(child2)),
+                None,
+                Some(parent_id.clone()),
+                Some(root_id.clone()),
+            )
+            .await;
+        let _ = tracker
+            .mark_failed("T-LIN-ERR", Some(1), "boom".to_string())
+            .await;
+
+        // Drain and collect WorkerLifecycle events by task_id → lifecycle
+        let mut collected: Vec<AgentStreamEvent> = Vec::new();
+        while let Ok(msg) = ws_rx.try_recv() {
+            let outer: serde_json::Value = serde_json::from_str(&msg).expect("json");
+            if outer.get("type").and_then(|v| v.as_str()) != Some("agent_stream") {
+                continue;
+            }
+            let payload = outer.get("payload").expect("payload");
+            if let Ok(ev) = serde_json::from_value::<AgentStreamEvent>(payload.clone()) {
+                if matches!(ev, AgentStreamEvent::WorkerLifecycle { .. }) {
+                    collected.push(ev);
+                }
+            }
+        }
+
+        // Must see 4 events total: Spawned+Completed for OK, Spawned+Failed for ERR.
+        assert_eq!(
+            collected.len(),
+            4,
+            "expected 4 WorkerLifecycle events, got {}: {collected:?}",
+            collected.len()
+        );
+
+        // Every single one MUST carry the Pantheon lineage we provided.
+        for ev in &collected {
+            match ev {
+                AgentStreamEvent::WorkerLifecycle {
+                    parent_session_id,
+                    root_session_id,
+                    task_id,
+                    ..
+                } => {
+                    assert_eq!(
+                        parent_session_id.as_deref(),
+                        Some(parent_id.as_str()),
+                        "parent_session_id missing on {task_id:?}"
+                    );
+                    assert_eq!(
+                        root_session_id.as_deref(),
+                        Some(root_id.as_str()),
+                        "root_session_id missing on {task_id:?}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // And the distribution must be one Spawned + one terminal per task_id.
+        let mut ok_spawned = 0;
+        let mut ok_completed = 0;
+        let mut err_spawned = 0;
+        let mut err_failed = 0;
+        for ev in &collected {
+            if let AgentStreamEvent::WorkerLifecycle {
+                lifecycle, task_id, ..
+            } = ev
+            {
+                match (task_id.as_deref(), lifecycle) {
+                    (Some("T-LIN-OK"), WorkerLifecycleType::Spawned) => ok_spawned += 1,
+                    (Some("T-LIN-OK"), WorkerLifecycleType::Completed) => ok_completed += 1,
+                    (Some("T-LIN-ERR"), WorkerLifecycleType::Spawned) => err_spawned += 1,
+                    (Some("T-LIN-ERR"), WorkerLifecycleType::Failed) => err_failed += 1,
+                    other => panic!("unexpected event combo: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(ok_spawned, 1);
+        assert_eq!(ok_completed, 1);
+        assert_eq!(err_spawned, 1);
+        assert_eq!(err_failed, 1);
+    }
+
+    /// T-004 regression: register() with both lineage fields set to None
+    /// emits events with `parent_session_id = None` / `root_session_id = None`.
+    /// This is the legacy-caller path (non-Pantheon MCP clients).
+    #[tokio::test]
+    async fn pantheon_lineage_none_when_caller_did_not_supply_it() {
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let (ws_tx, mut ws_rx) = broadcast::channel(64);
+        let sequencer = Arc::new(EventSequencer::new());
+        let tracker = TaskTracker::with_pantheon_observability(metrics, ws_tx, sequencer);
+
+        let child = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-LIN-NONE".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+            )
+            .await;
+        let _ = tracker
+            .mark_completed(
+                "T-LIN-NONE",
+                "abc".to_string(),
+                vec![],
+                String::new(),
+                None,
+                None,
+            )
+            .await;
+
+        while let Ok(msg) = ws_rx.try_recv() {
+            let outer: serde_json::Value = serde_json::from_str(&msg).expect("json");
+            if outer.get("type").and_then(|v| v.as_str()) != Some("agent_stream") {
+                continue;
+            }
+            let payload = outer.get("payload").expect("payload");
+            if let Ok(AgentStreamEvent::WorkerLifecycle {
+                parent_session_id,
+                root_session_id,
+                ..
+            }) = serde_json::from_value::<AgentStreamEvent>(payload.clone())
+            {
+                assert!(parent_session_id.is_none(), "expected no parent");
+                assert!(root_session_id.is_none(), "expected no root");
+            }
+        }
+    }
+
+    /// FEAT-012 (REQ-017) T-007.5 reality test:
+    /// snapshot_workers must enumerate every registered task and surface
+    /// the lineage fields. A stub that returns Vec::new() fails the count;
+    /// a stub that hardcodes Vec::with_capacity(2).push(default) fails the
+    /// per-task assertions.
+    #[tokio::test]
+    async fn snapshot_workers_enumerates_all_tracked_tasks_with_lineage() {
+        let tracker = TaskTracker::default();
+
+        // Register two tasks with distinct lineage.
+        let child_a = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-SNAP-A".to_string(),
+                1,
+                Arc::new(Mutex::new(child_a)),
+                None,
+                Some("pantheon-parent-A".to_string()),
+                Some("pantheon-root-A".to_string()),
+            )
+            .await;
+
+        let child_b = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-SNAP-B".to_string(),
+                2,
+                Arc::new(Mutex::new(child_b)),
+                None,
+                None, // legacy non-Pantheon caller
+                None,
+            )
+            .await;
+
+        let snapshot = tracker.snapshot_workers().await;
+        assert_eq!(snapshot.len(), 2, "expected 2 worker entries");
+
+        // Build a lookup so we can assert per-task without depending on order.
+        let by_id: std::collections::HashMap<&str, &shared_types::WorkerInfo> = snapshot
+            .iter()
+            .map(|w| (w.task_id.as_deref().unwrap_or(""), w))
+            .collect();
+
+        let a = by_id.get("T-SNAP-A").expect("T-SNAP-A in snapshot");
+        assert_eq!(a.session_id, "T-SNAP-A");
+        assert_eq!(a.task_id.as_deref(), Some("T-SNAP-A"));
+        assert_eq!(a.agent, "codex");
+        assert_eq!(a.name, "codex-worker-T-SNAP-A");
+        assert_eq!(a.status, "working");
+        assert_eq!(a.parent_session_id.as_deref(), Some("pantheon-parent-A"));
+        assert_eq!(a.root_session_id.as_deref(), Some("pantheon-root-A"));
+        assert!(a.started_at.starts_with("20"), "RFC 3339 timestamp expected");
+
+        let b = by_id.get("T-SNAP-B").expect("T-SNAP-B in snapshot");
+        assert_eq!(b.session_id, "T-SNAP-B");
+        assert_eq!(b.parent_session_id, None);
+        assert_eq!(b.root_session_id, None);
+    }
+
+    /// FEAT-012 (REQ-017) T-007.5 reality test:
+    /// snapshot_workers reflects the post-completion status correctly,
+    /// not just the initial Working state. A stub that always returns
+    /// status="working" fails this.
+    #[tokio::test]
+    async fn snapshot_workers_reflects_post_completion_status() {
+        let tracker = TaskTracker::default();
+        let child = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "T-SNAP-DONE".to_string(),
+                0,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+            )
+            .await;
+        let _ = tracker
+            .mark_completed(
+                "T-SNAP-DONE",
+                "abc123".to_string(),
+                vec![],
+                String::new(),
+                None,
+                None,
+            )
+            .await;
+        let snap = tracker.snapshot_workers().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].status, "completed");
+    }
+
+    /// FEAT-012 (REQ-017) T-007.5 reality test: empty tracker returns empty snapshot.
+    #[tokio::test]
+    async fn snapshot_workers_empty_tracker_returns_empty_vec() {
+        let tracker = TaskTracker::default();
+        let snap = tracker.snapshot_workers().await;
+        assert!(snap.is_empty());
+    }
+
+    /// Verify that the legacy constructor (without sequencer) does NOT emit
+    /// WorkerLifecycle events. This is the backwards-compat guarantee.
+    #[tokio::test]
+    async fn legacy_observability_does_not_emit_worker_lifecycle() {
+        let metrics = Arc::new(DaemonMetrics::new().expect("metrics"));
+        let (ws_tx, mut ws_rx) = broadcast::channel(64);
+        let tracker = TaskTracker::with_observability(metrics, Some(ws_tx));
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .spawn()
+            .expect("spawn");
+        tracker
+            .register(
+                "T-LEGACY-01".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // Should still emit abe_task_state events, but no WorkerLifecycle
+        let mut lifecycle_count = 0;
+        while let Ok(msg) = ws_rx.try_recv() {
+            let outer: serde_json::Value = serde_json::from_str(&msg).expect("valid json");
+            if outer.get("type").and_then(|v| v.as_str()) == Some("agent_stream") {
+                let payload = outer.get("payload").expect("payload field");
+                if let Ok(AgentStreamEvent::WorkerLifecycle { .. }) =
+                    serde_json::from_value::<AgentStreamEvent>(payload.clone())
+                {
+                    lifecycle_count += 1;
+                }
+            }
+        }
+        assert_eq!(lifecycle_count, 0, "legacy constructor should not emit WorkerLifecycle");
     }
 }
