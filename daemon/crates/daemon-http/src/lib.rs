@@ -203,6 +203,10 @@ pub async fn fetch_daemon_status() -> anyhow::Result<DaemonHealthResponse> {
             .and_then(|v| v.as_str())
             .unwrap_or("ok")
             .to_string(),
+        version: status_json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
         service: status_json
             .get("service")
             .and_then(|v| v.as_str())
@@ -232,7 +236,7 @@ pub async fn fetch_daemon_status_snapshot() -> anyhow::Result<DaemonStatusSnapsh
 }
 
 pub async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
-    daemon_post_json::<AskAgentRequest, AskAgentResponse>(daemon_ask_agent_url(), req).await
+    daemon_post_json_with_timeout::<AskAgentRequest, AskAgentResponse>(daemon_ask_agent_url(), req, daemon_ask_timeout()).await
 }
 
 pub async fn fetch_daemon_session_spawn(req: &SpawnSessionRequest) -> anyhow::Result<String> {

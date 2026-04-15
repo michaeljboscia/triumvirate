@@ -353,6 +353,7 @@ pub struct ReviewStatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonHealthResponse {
     pub status: String,
+    pub version: Option<String>,
     pub service: Option<String>,
     pub mode: Option<String>,
     pub daemon: Option<String>,
