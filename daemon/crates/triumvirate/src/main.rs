@@ -3846,6 +3846,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             "127.0.0.1:8080".to_string(),
             Some(DaemonHealthResponse {
                 status: "ok".to_string(),
+                version: Some("3.9.0".to_string()),
                 service: Some("svc".to_string()),
                 mode: Some("dev".to_string()),
                 daemon: None,

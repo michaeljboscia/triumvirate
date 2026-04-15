@@ -38,6 +38,22 @@ use tokio::{
 use tracing::{Span, instrument};
 use uuid::Uuid;
 
+/// Gemini model faildown chain — ordered by empirical reliability (2026-04-15).
+/// First model is the CLI default (settings.json). Subsequent models are tried
+/// on 429/capacity errors. stderr is monitored for fast-kill on 429 detection.
+///
+/// Reliability from 10-run probe:
+///   gemini-2.5-flash        90%  5.9s avg  (default)
+///   gemini-3-flash-preview  80%  6.6s avg
+///   gemini-2.5-pro          10%  (capacity-exhausted)
+///   gemini-3.1-pro-preview   0%  (capacity-exhausted)
+const GEMINI_MODEL_FAILDOWN: &[&str] = &[
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
+];
+
 const TOOL_MARKER_INSTRUCTIONS: &str = "\
 When you need to call a Triumvirate tool, emit exactly one XML block with this shape:
 <triumvirate_tool name=\"ledger_record\">{\"title\":\"...\",\"narrative\":\"...\"}</triumvirate_tool>
@@ -316,20 +332,54 @@ pub(crate) async fn execute_ask_agent(
         emitter.emit(format!("→ {agent_display}: working...")).await;
     }
 
-    let backoffs = [Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
+    // Build the attempt schedule: for gemini, use model faildown chain; for others, 3 retries.
+    let attempt_schedule: Vec<(Duration, Option<&str>)> = if agent == "gemini" {
+        GEMINI_MODEL_FAILDOWN
+            .iter()
+            .enumerate()
+            .map(|(i, model)| {
+                let backoff = if i == 0 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(500)
+                };
+                (backoff, Some(*model))
+            })
+            .collect()
+    } else {
+        vec![
+            (Duration::from_millis(250), None),
+            (Duration::from_secs(1), None),
+            (Duration::from_secs(2), None),
+        ]
+    };
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
 
-    for (idx, backoff) in backoffs.iter().enumerate() {
-        let session_for_attempt = worker_session_id.clone();
+    for (idx, (backoff, model_override)) in attempt_schedule.iter().enumerate() {
+        if let Some(model) = model_override {
+            tracing::info!("faildown attempt {}/{}: trying model {model}", idx + 1, attempt_schedule.len());
+            if let Some(emitter) = progress.as_ref() {
+                emitter
+                    .emit(format!("→ {agent_display}: trying model {model} ({}/{})...", idx + 1, attempt_schedule.len()))
+                    .await;
+            }
+        }
+        let session_for_attempt = if model_override.is_some() && idx > 0 {
+            // Don't reuse cached sessions across model faildown — different models can't resume each other's sessions
+            None
+        } else {
+            worker_session_id.clone()
+        };
         let (events_tx, mut events_rx) = mpsc::channel::<WorkingStateEvent>(1024);
         let mut stuck_detector = StuckDetector::default();
-        let mut attempt = Box::pin(run_named_agent_with_session(
+        let mut attempt = Box::pin(run_named_agent_with_session_and_model(
             &agent,
             &execution_prompt,
             &exec_cwd,
             session_for_attempt.as_deref(),
             Some(events_tx),
+            *model_override,
         ));
         let started = Instant::now();
         let mut next_heartbeat = Duration::from_secs(30);
@@ -574,13 +624,15 @@ pub(crate) async fn execute_ask_agent(
                             .await;
                     }
                 }
+                let model_label = model_override.unwrap_or("default");
                 lifecycle.push(LifecycleEvent {
                     state: "RETRY".to_string(),
                     detail: format!(
-                        "Retrying {} ({}/{}) after {}",
+                        "Retrying {} ({}/{}, model={}) after {}",
                         agent,
                         idx + 1,
-                        backoffs.len(),
+                        attempt_schedule.len(),
+                        model_label,
                         msg
                     ),
                 });
@@ -605,7 +657,7 @@ pub(crate) async fn execute_ask_agent(
                 }
                 if let Some(emitter) = progress.as_ref() {
                     emitter
-                        .emit(format!("→ {agent_display}: retrying ({}/{})...", idx + 1, backoffs.len()))
+                        .emit(format!("→ {agent_display}: retrying ({}/{})...", idx + 1, attempt_schedule.len()))
                         .await;
                 }
                 last_err = Some(msg);
@@ -616,7 +668,7 @@ pub(crate) async fn execute_ask_agent(
 
     lifecycle.push(LifecycleEvent {
         state: "FAILED".to_string(),
-        detail: format!("{} failed after {} attempts", agent, backoffs.len()),
+        detail: format!("{} failed after {} attempts", agent, attempt_schedule.len()),
     });
     if let Err(e) = append_outbox_event(&OutboxEvent {
         ts_ms: core_unix_time_ms(),
@@ -639,7 +691,7 @@ pub(crate) async fn execute_ask_agent(
     }
     if let Some(emitter) = progress.as_ref() {
         emitter
-            .emit(format!("→ {agent_display}: FAILED after {} attempts", backoffs.len()))
+            .emit(format!("→ {agent_display}: FAILED after {} attempts", attempt_schedule.len()))
             .await;
     }
 
@@ -850,9 +902,24 @@ async fn run_named_agent_with_session(
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
 ) -> anyhow::Result<ParsedAgentResult> {
+    run_named_agent_with_session_and_model(agent, message, cwd, session_id, events_tx, None).await
+}
+
+async fn run_named_agent_with_session_and_model(
+    agent: &str,
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    model_override: Option<&str>,
+) -> anyhow::Result<ParsedAgentResult> {
     match agent {
         "gemini" => {
-            let (bin, args) = gemini_command();
+            let (bin, mut args) = gemini_command();
+            if let Some(model) = model_override {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
             run_agent_process_with_session(
                 "gemini",
                 &bin,
@@ -1189,12 +1256,18 @@ async fn run_gemini_cli_process_with_session(
         .take()
         .ok_or_else(|| anyhow::anyhow!("gemini stderr missing"))?;
 
+    // Monitor stderr for 429/capacity errors and signal abort via channel
+    let (abort_tx, mut abort_rx) = mpsc::channel::<String>(1);
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 tracing::debug!("gemini stderr: {trimmed}");
+                let lower = trimmed.to_lowercase();
+                if lower.contains("429") || lower.contains("no capacity") || lower.contains("resource exhausted") {
+                    let _ = abort_tx.try_send(trimmed.to_string());
+                }
             }
         }
     });
@@ -1204,17 +1277,35 @@ async fn run_gemini_cli_process_with_session(
     let mut raw_output = String::new();
     let timeout_duration = connector_timeout();
     let read = async {
-        while let Some(line) = reader.next_line().await? {
-            raw_output.push_str(&line);
-            raw_output.push('\n');
-            if let Some(event) = parser.parse_line(&line) {
-                emit_working_event(events_tx.as_ref(), event);
+        loop {
+            tokio::select! {
+                line_result = reader.next_line() => {
+                    match line_result? {
+                        Some(line) => {
+                            raw_output.push_str(&line);
+                            raw_output.push('\n');
+                            if let Some(event) = parser.parse_line(&line) {
+                                emit_working_event(events_tx.as_ref(), event);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                Some(err_msg) = abort_rx.recv() => {
+                    anyhow::bail!("gemini 429 capacity error (fast-fail): {err_msg}");
+                }
             }
         }
         anyhow::Ok(())
     };
     match timeout(timeout_duration, read).await {
-        Ok(result) => result?,
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            kill_process_group(&mut child);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(e);
+        }
         Err(_) => {
             kill_process_group(&mut child);
             let _ = child.kill().await;
