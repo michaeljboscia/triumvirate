@@ -22,3 +22,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "evidence-pack"
+path = "src/bin/evidence_pack.rs"
