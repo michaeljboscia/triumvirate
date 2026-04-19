@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use hdrhistogram::Histogram;
 use serde::Serialize;
-use sysinfo::System;
+use sysinfo::{Pid, ProcessRefreshKind, System};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
@@ -17,8 +17,9 @@ pub struct MetricsCollector {
     successful_ops: Arc<AtomicU64>,
     failed_ops: Arc<AtomicU64>,
     wal_peak_bytes: Arc<AtomicU64>,
-    iowait_milli_sum: Arc<AtomicU64>,
-    iowait_samples: Arc<AtomicU64>,
+    proc_cpu_milli_sum: Arc<AtomicU64>,
+    proc_cpu_samples: Arc<AtomicU64>,
+    load_avg_1m_milli: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,7 +33,8 @@ pub struct MetricsSummary {
     pub successful_ops: u64,
     pub failed_ops: u64,
     pub wal_peak_mb: f64,
-    pub avg_iowait_pct: f64,
+    pub process_cpu_pct: f64,
+    pub system_load_avg_1m: f64,
 }
 
 impl MetricsCollector {
@@ -44,8 +46,9 @@ impl MetricsCollector {
             successful_ops: Arc::new(AtomicU64::new(0)),
             failed_ops: Arc::new(AtomicU64::new(0)),
             wal_peak_bytes: Arc::new(AtomicU64::new(0)),
-            iowait_milli_sum: Arc::new(AtomicU64::new(0)),
-            iowait_samples: Arc::new(AtomicU64::new(0)),
+            proc_cpu_milli_sum: Arc::new(AtomicU64::new(0)),
+            proc_cpu_samples: Arc::new(AtomicU64::new(0)),
+            load_avg_1m_milli: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -78,13 +81,21 @@ impl MetricsCollector {
             wal_sampler.sample_wal_size(&wal_path);
         });
 
-        let iowait_sampler = self.clone();
+        let proc_sampler = self.clone();
         tokio::spawn(async move {
-            let mut system = System::new_all();
+            let pid = Pid::from_u32(std::process::id());
+            let mut system = System::new();
+            system.refresh_process_specifics(pid, ProcessRefreshKind::new().with_cpu());
+            tokio::time::sleep(Duration::from_millis(500)).await;
             while Instant::now() < end_at {
-                system.refresh_cpu();
-                let wait_like = 100.0 - f64::from(system.global_cpu_info().cpu_usage());
-                iowait_sampler.record_iowait(wait_like.max(0.0));
+                system.refresh_process_specifics(pid, ProcessRefreshKind::new().with_cpu());
+                if let Some(proc_info) = system.process(pid) {
+                    proc_sampler.record_proc_cpu(f64::from(proc_info.cpu_usage()));
+                }
+                let la = System::load_average().one;
+                proc_sampler
+                    .load_avg_1m_milli
+                    .store((la * 1000.0) as u64, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
@@ -110,12 +121,14 @@ impl MetricsCollector {
 
         let wal_peak_mb = self.wal_peak_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
 
-        let iowait_samples = self.iowait_samples.load(Ordering::Relaxed);
-        let avg_iowait_pct = if iowait_samples == 0 {
+        let proc_cpu_samples = self.proc_cpu_samples.load(Ordering::Relaxed);
+        let process_cpu_pct = if proc_cpu_samples == 0 {
             0.0
         } else {
-            (self.iowait_milli_sum.load(Ordering::Relaxed) as f64 / 1000.0) / iowait_samples as f64
+            (self.proc_cpu_milli_sum.load(Ordering::Relaxed) as f64 / 1000.0)
+                / proc_cpu_samples as f64
         };
+        let system_load_avg_1m = self.load_avg_1m_milli.load(Ordering::Relaxed) as f64 / 1000.0;
 
         MetricsSummary {
             p50_ms,
@@ -127,7 +140,8 @@ impl MetricsCollector {
             successful_ops,
             failed_ops,
             wal_peak_mb,
-            avg_iowait_pct,
+            process_cpu_pct,
+            system_load_avg_1m,
         }
     }
 
@@ -145,10 +159,10 @@ impl MetricsCollector {
         }
     }
 
-    fn record_iowait(&self, value: f64) {
+    fn record_proc_cpu(&self, value: f64) {
         let milli = (value * 1000.0) as u64;
-        self.iowait_milli_sum.fetch_add(milli, Ordering::Relaxed);
-        self.iowait_samples.fetch_add(1, Ordering::Relaxed);
+        self.proc_cpu_milli_sum.fetch_add(milli, Ordering::Relaxed);
+        self.proc_cpu_samples.fetch_add(1, Ordering::Relaxed);
     }
 }
 
