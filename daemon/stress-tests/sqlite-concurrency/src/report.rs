@@ -55,7 +55,8 @@ Finished (UTC): `{}`\n\n\
 - Failed ops: `{}`\n\n\
 ## WAL and Host\n\n\
 - WAL peak: `{:.3}` MB\n\
-- Avg iowait: `{:.3}` %\n",
+- Harness process CPU: `{:.2}` %\n\
+- System load avg (1m): `{:.2}`\n",
         report.run_id,
         report.profile,
         report.workers,
@@ -71,6 +72,7 @@ Finished (UTC): `{}`\n\n\
         report.metrics.successful_ops,
         report.metrics.failed_ops,
         report.metrics.wal_peak_mb,
-        report.metrics.avg_iowait_pct,
+        report.metrics.process_cpu_pct,
+        report.metrics.system_load_avg_1m,
     )
 }
