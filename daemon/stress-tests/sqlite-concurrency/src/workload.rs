@@ -6,10 +6,57 @@ use serde::Serialize;
 use tokio::sync::Barrier;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+pub enum WorkloadProfileName {
+    Sustained,
+    Wave,
+    Herd,
+    LongTx,
+    MixedRw,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "name", rename_all = "kebab-case")]
 pub enum WorkloadProfile {
     Sustained,
     Wave,
     Herd,
+    LongTx { hold_ms: u64 },
+    MixedRw { read_pct: u8 },
+}
+
+impl WorkloadProfile {
+    pub fn from_cli(profile: WorkloadProfileName, tx_hold_ms: u64, read_pct: u8) -> Self {
+        match profile {
+            WorkloadProfileName::Sustained => Self::Sustained,
+            WorkloadProfileName::Wave => Self::Wave,
+            WorkloadProfileName::Herd => Self::Herd,
+            WorkloadProfileName::LongTx => Self::LongTx {
+                hold_ms: tx_hold_ms,
+            },
+            WorkloadProfileName::MixedRw => Self::MixedRw { read_pct },
+        }
+    }
+
+    pub fn tx_hold_ms(&self) -> u64 {
+        match self {
+            Self::LongTx { hold_ms } => *hold_ms,
+            _ => 0,
+        }
+    }
+
+    pub fn is_reader_worker(&self, worker_id: usize, total_workers: usize) -> bool {
+        match self {
+            Self::MixedRw { read_pct } => worker_id < reader_count(total_workers, *read_pct),
+            _ => false,
+        }
+    }
+}
+
+fn reader_count(total_workers: usize, read_pct: u8) -> usize {
+    if total_workers == 0 || read_pct == 0 {
+        return 0;
+    }
+    ((total_workers * usize::from(read_pct)) / 100).min(total_workers)
 }
 
 pub struct WorkerPacer {
@@ -40,7 +87,9 @@ impl WorkerPacer {
 
     pub async fn tick(&mut self) {
         match self.profile {
-            WorkloadProfile::Sustained => {
+            WorkloadProfile::Sustained
+            | WorkloadProfile::LongTx { .. }
+            | WorkloadProfile::MixedRw { .. } => {
                 let sleep_secs = 3 + (self.jitter() % 8);
                 tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
             }
