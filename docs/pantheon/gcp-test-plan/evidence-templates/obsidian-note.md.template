@@ -1,0 +1,73 @@
+---
+type: pantheon-run
+run_id: {{RUN_ID}}
+date: {{DATE}}
+gate: {{GATE}}
+gate_name: "{{GATE_NAME}}"
+gcp_machine: {{GCP_MACHINE_PRIMARY}}
+region: {{GCP_REGION}}
+duration_min: {{DURATION_MIN}}
+cost_usd: {{TOTAL_COST_USD}}
+models:
+{{MODELS_YAML}}
+hypotheses_tested:
+{{HYPOTHESES_YAML}}
+verdicts:
+{{VERDICTS_YAML}}
+overall_verdict: {{OVERALL_VERDICT}}
+significance: {{SIGNIFICANCE}}
+tags:
+  - pantheon-run
+  - gate-{{GATE}}
+  - {{OVERALL_VERDICT_TAG}}
+{{EXTRA_TAGS}}
+---
+
+# Run {{RUN_ID}} — {{GATE_NAME}}
+
+**Verdict:** {{OVERALL_VERDICT}}
+**Cost:** ${{TOTAL_COST_USD}} · **Duration:** {{DURATION_MIN}} min · **Date:** {{DATE}}
+
+## Summary
+
+{{AUTO_SUMMARY_PARAGRAPH}}
+
+## Hypotheses
+
+{{HYPOTHESES_SECTION_WIKILINKED}}
+
+## Metrics highlights
+
+{{KEY_METRICS_TABLE}}
+
+## Observations
+
+{{AUTO_OBSERVATIONS}}
+
+## Mike's notes
+
+<!-- Add qualitative observations after reviewing the bundle -->
+<!-- - Was the run surprising in any way? -->
+<!-- - Did any behavior feel off that the metrics didn't catch? -->
+<!-- - Any prompt or config tweaks worth capturing for next time? -->
+
+## Promoted lessons (candidates)
+
+{{CANDIDATE_LESSONS}}
+
+## Next actions
+
+{{NEXT_ACTIONS_CHECKLIST}}
+
+## Links
+
+- **Evidence bundle:** `gs://pantheon-evidence/gate-{{GATE}}/{{RUN_ID}}/`
+- **Cost report:** `gs://pantheon-evidence/gate-{{GATE}}/{{RUN_ID}}/cost-report.json`
+- **Prior runs referenced:**
+{{PRIOR_RUN_WIKILINKS}}
+- **Decisions touched:**
+{{DECISION_WIKILINKS}}
+
+---
+
+*Auto-generated from evidence bundle. Augment with qualitative notes before committing to vault.*

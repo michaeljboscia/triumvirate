@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0",
+  "run_id": "{{RUN_ID}}",
+  "generated_at": "{{GENERATED_AT}}",
+  "mode": "{{MODE}}",
+  "billing_account": "{{BILLING_ACCOUNT}}",
+  "machine_type": "{{MACHINE_TYPE}}",
+  "duration_hours": {{DURATION_HOURS}},
+  "line_items": [
+    {
+      "service": "Compute Engine",
+      "sku": "Spot {{MACHINE_TYPE}}",
+      "usage_amount": {{COMPUTE_HOURS}},
+      "usage_unit": "hours",
+      "cost_usd": {{COMPUTE_COST_USD}}
+    },
+    {
+      "service": "Compute Engine",
+      "sku": "Spot Preemptible SSD PD Capacity",
+      "usage_amount": {{DISK_GB_HOURS}},
+      "usage_unit": "GB-hours",
+      "cost_usd": {{DISK_COST_USD}}
+    },
+    {
+      "service": "Cloud Storage",
+      "sku": "Standard Storage US",
+      "usage_amount": {{STORAGE_GB_HOURS}},
+      "usage_unit": "GB-hours",
+      "cost_usd": {{STORAGE_COST_USD}}
+    }
+  ],
+  "total_cost_usd": {{TOTAL_COST_USD}},
+  "budgeted_cost_usd": {{BUDGETED_COST_USD}},
+  "within_budget": {{WITHIN_BUDGET}},
+  "attribution_method": "{{ATTRIBUTION_METHOD}}",
+  "notes": "{{NOTES}}"
+}

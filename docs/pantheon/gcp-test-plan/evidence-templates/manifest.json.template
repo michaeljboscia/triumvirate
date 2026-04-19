@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "run_id": "{{RUN_ID}}",
+  "gate": {{GATE}},
+  "gate_name": "{{GATE_NAME}}",
+  "experimenter": "{{EXPERIMENTER}}",
+  "triumvirate_version": "{{TRIUMVIRATE_VERSION}}",
+  "git_commit": "{{GIT_COMMIT}}",
+  "started_at": "{{STARTED_AT}}",
+  "ended_at": "{{ENDED_AT}}",
+  "duration_sec": {{DURATION_SEC}},
+  "gcp_project": "{{GCP_PROJECT}}",
+  "gcp_region": "{{GCP_REGION}}",
+  "gcp_zone": "{{GCP_ZONE}}",
+  "gcp_machine_types": [{{GCP_MACHINE_TYPES}}],
+  "gcp_accelerators": [{{GCP_ACCELERATORS}}],
+  "gcp_provisioning_model": "{{PROVISIONING_MODEL}}",
+  "models_used": [
+    {{MODELS_USED_JSON}}
+  ],
+  "hypotheses_tested": [{{HYPOTHESES_TESTED}}],
+  "verdicts": {
+    {{VERDICTS_JSON}}
+  },
+  "overall_verdict": "{{OVERALL_VERDICT}}",
+  "prior_runs_referenced": [{{PRIOR_RUNS}}],
+  "decision_rules_applied": [{{DECISION_RULES}}],
+  "decision_rule_outcomes": {
+    {{DECISION_RULE_OUTCOMES_JSON}}
+  },
+  "total_cost_usd": {{TOTAL_COST_USD}},
+  "evidence_bundle_size_mb": {{BUNDLE_SIZE_MB}},
+  "links": {
+    "summary": "gs://pantheon-evidence/gate-{{GATE}}/{{RUN_ID}}/summary.md",
+    "cost_report": "gs://pantheon-evidence/gate-{{GATE}}/{{RUN_ID}}/cost-report.json",
+    "obsidian_note": "gs://pantheon-evidence/gate-{{GATE}}/{{RUN_ID}}/obsidian-note.md",
+    "prior_run_chain": [{{PRIOR_RUN_CHAIN}}]
+  }
+}
