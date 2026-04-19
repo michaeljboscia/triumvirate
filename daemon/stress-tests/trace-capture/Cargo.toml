@@ -3,8 +3,6 @@ name = "trace-capture"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-
 [[bin]]
 name = "trace-emit-test"
 path = "src/bin/trace_emit_test.rs"
