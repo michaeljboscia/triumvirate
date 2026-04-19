@@ -45,6 +45,53 @@ pub async fn write_once(pool: &SqlitePool) -> Result<()> {
     write_once_with_hold(pool, 0).await
 }
 
+pub async fn write_replay_once(pool: &SqlitePool, event_id_str: &str) -> Result<()> {
+    let request_id = event_id_str.to_owned();
+    let reviewer_id = format!("replay-{}", &request_id.chars().take(12).collect::<String>());
+    let comment_id = format!("comment-{request_id}");
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO review_request (id, reviewer_id, status, created_at)
+        VALUES (?1, ?2, 'pending', datetime('now'))
+        ON CONFLICT(id) DO NOTHING
+        "#,
+    )
+    .bind(&request_id)
+    .bind(&reviewer_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO review_status (request_id, status, updated_at)
+        VALUES (?1, 'in_review', datetime('now'))
+        ON CONFLICT(request_id)
+        DO UPDATE SET status='in_review', updated_at=datetime('now')
+        "#,
+    )
+    .bind(&request_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO review_comment (id, request_id, body, created_at)
+        VALUES (?1, ?2, 'Trace replay synthetic comment', datetime('now'))
+        ON CONFLICT(id) DO NOTHING
+        "#,
+    )
+    .bind(&comment_id)
+    .bind(&request_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn write_once_with_hold(pool: &SqlitePool, hold_ms: u64) -> Result<()> {
     let sequence = OP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let request_id = format!("req-{sequence}");

@@ -1,7 +1,15 @@
+use std::collections::hash_map::DefaultHasher;
+use std::fs::File;
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use clap::ValueEnum;
+use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Barrier;
 
@@ -12,9 +20,10 @@ pub enum WorkloadProfileName {
     Herd,
     LongTx,
     MixedRw,
+    TraceReplay,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "name", rename_all = "kebab-case")]
 pub enum WorkloadProfile {
     Sustained,
@@ -22,18 +31,34 @@ pub enum WorkloadProfile {
     Herd,
     LongTx { hold_ms: u64 },
     MixedRw { read_pct: u8 },
+    TraceReplay {
+        trace_path: PathBuf,
+        event_type_filter: Option<String>,
+    },
 }
 
 impl WorkloadProfile {
-    pub fn from_cli(profile: WorkloadProfileName, tx_hold_ms: u64, read_pct: u8) -> Self {
+    pub fn from_cli(
+        profile: WorkloadProfileName,
+        tx_hold_ms: u64,
+        read_pct: u8,
+        trace_file: Option<PathBuf>,
+        event_type_filter: Option<String>,
+    ) -> Result<Self> {
         match profile {
-            WorkloadProfileName::Sustained => Self::Sustained,
-            WorkloadProfileName::Wave => Self::Wave,
-            WorkloadProfileName::Herd => Self::Herd,
-            WorkloadProfileName::LongTx => Self::LongTx {
+            WorkloadProfileName::Sustained => Ok(Self::Sustained),
+            WorkloadProfileName::Wave => Ok(Self::Wave),
+            WorkloadProfileName::Herd => Ok(Self::Herd),
+            WorkloadProfileName::LongTx => Ok(Self::LongTx {
                 hold_ms: tx_hold_ms,
-            },
-            WorkloadProfileName::MixedRw => Self::MixedRw { read_pct },
+            }),
+            WorkloadProfileName::MixedRw => Ok(Self::MixedRw { read_pct }),
+            WorkloadProfileName::TraceReplay => Ok(Self::TraceReplay {
+                trace_path: trace_file.ok_or_else(|| {
+                    anyhow!("--trace-file is required when --profile trace-replay")
+                })?,
+                event_type_filter,
+            }),
         }
     }
 
@@ -50,6 +75,83 @@ impl WorkloadProfile {
             _ => false,
         }
     }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct TraceEventIn {
+    pub event_id: String,
+    pub event_type: String,
+    pub subject: String,
+    pub schema_version: u16,
+    pub emitted_at: DateTime<Utc>,
+    pub correlation_id: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+pub fn load_trace_events(
+    trace_path: &Path,
+    event_type_filter: Option<&str>,
+) -> Result<Vec<TraceEventIn>> {
+    let file = File::open(trace_path)?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let event: TraceEventIn = serde_json::from_str(&line)
+            .map_err(|e| anyhow!("failed to parse trace JSONL line {}: {e}", line_no + 1))?;
+
+        if let Some(filter) = event_type_filter {
+            if !event.event_type.contains(filter) {
+                continue;
+            }
+        }
+        events.push(event);
+    }
+
+    events.sort_by_key(|event| event.emitted_at);
+
+    if events.is_empty() {
+        return Err(anyhow!(
+            "trace file {} produced zero events after filtering",
+            trace_path.display()
+        ));
+    }
+
+    Ok(events)
+}
+
+pub fn assign_trace_events(workers: usize, events: Vec<TraceEventIn>) -> Result<Vec<Vec<TraceEventIn>>> {
+    if workers == 0 {
+        return Err(anyhow!("--workers must be greater than zero"));
+    }
+
+    let mut assignments = vec![Vec::new(); workers];
+    let mut round_robin = 0usize;
+
+    for event in events {
+        let worker_index = match event.correlation_id.as_deref() {
+            Some(correlation_id) => stable_worker_index(correlation_id, workers),
+            None => {
+                let current = round_robin % workers;
+                round_robin = round_robin.wrapping_add(1);
+                current
+            }
+        };
+        assignments[worker_index].push(event);
+    }
+
+    Ok(assignments)
+}
+
+fn stable_worker_index(value: &str, workers: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    (hasher.finish() as usize) % workers
 }
 
 fn reader_count(total_workers: usize, read_pct: u8) -> usize {
@@ -93,6 +195,7 @@ impl WorkerPacer {
                 let sleep_secs = 3 + (self.jitter() % 8);
                 tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
             }
+            WorkloadProfile::TraceReplay { .. } => {}
             WorkloadProfile::Wave => {
                 if self.operation_count == 0 {
                     let skew_ms = (self.worker_id as u64) * 10;

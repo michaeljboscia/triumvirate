@@ -19,8 +19,11 @@ use uuid::Uuid;
 
 use crate::metrics::MetricsCollector;
 use crate::report::{write_reports, RunReport};
-use crate::workload::{WorkerPacer, WorkloadProfile, WorkloadProfileName};
-use crate::writer::{execute_peer_review_transaction, read_once};
+use crate::workload::{
+    assign_trace_events, load_trace_events, TraceEventIn, WorkerPacer, WorkloadProfile,
+    WorkloadProfileName,
+};
+use crate::writer::{execute_peer_review_transaction, read_once, write_replay_once};
 
 #[derive(Debug, Parser)]
 #[command(name = "sqlite-concurrency")]
@@ -45,6 +48,12 @@ struct Args {
 
     #[arg(long)]
     run_id: Option<String>,
+
+    #[arg(long)]
+    trace_file: Option<PathBuf>,
+
+    #[arg(long)]
+    event_type_filter: Option<String>,
 }
 
 #[tokio::main]
@@ -52,11 +61,31 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let args = Args::parse();
-    let profile = WorkloadProfile::from_cli(args.profile, args.tx_hold_ms, args.read_pct);
+    let profile = WorkloadProfile::from_cli(
+        args.profile,
+        args.tx_hold_ms,
+        args.read_pct,
+        args.trace_file.clone(),
+        args.event_type_filter.clone(),
+    )?;
     let run_id = args.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let db_path = args
         .db_path
         .unwrap_or_else(|| PathBuf::from(format!("./results/{}.db", run_id)));
+    let mut trace_assignments = if let WorkloadProfile::TraceReplay {
+        trace_path,
+        event_type_filter,
+    } = &profile
+    {
+        let trace_events = load_trace_events(trace_path, event_type_filter.as_deref())?;
+        let trace_origin = trace_events
+            .first()
+            .map(|event| event.emitted_at)
+            .expect("trace_events should be non-empty after load");
+        Some((trace_origin, assign_trace_events(args.workers, trace_events)?))
+    } else {
+        None
+    };
 
     if let Some(parent) = db_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -85,11 +114,35 @@ async fn main() -> Result<()> {
         let worker_pool = pool.clone();
         let worker_metrics = metrics.clone();
         let worker_barrier = barrier.clone();
-        let worker_profile = profile;
+        let worker_profile = profile.clone();
         let hold_ms = worker_profile.tx_hold_ms();
         let is_reader = worker_profile.is_reader_worker(worker_id, args.workers);
+        let (trace_origin, trace_events_for_worker) = if let Some((origin, assignments)) =
+            trace_assignments.as_mut()
+        {
+            (
+                Some(*origin),
+                Some(std::mem::take(&mut assignments[worker_id])),
+            )
+        } else {
+            (None, None)
+        };
 
         workers.spawn(async move {
+            if let (Some(origin), Some(events)) = (trace_origin, trace_events_for_worker) {
+                run_trace_replay_worker(
+                    worker_id,
+                    worker_pool,
+                    worker_metrics,
+                    events,
+                    origin,
+                    started,
+                    end_at,
+                )
+                .await?;
+                return Result::<(), anyhow::Error>::Ok(());
+            }
+
             let mut pacer = WorkerPacer::new(worker_profile, worker_id, started, worker_barrier);
             let mut op_index = 0_u64;
 
@@ -185,6 +238,56 @@ async fn build_pool(db_path: &Path, workers: usize) -> Result<SqlitePool> {
         .await?;
 
     Ok(pool)
+}
+
+async fn run_trace_replay_worker(
+    worker_id: usize,
+    worker_pool: SqlitePool,
+    worker_metrics: MetricsCollector,
+    events: Vec<TraceEventIn>,
+    trace_origin: chrono::DateTime<Utc>,
+    replay_started: Instant,
+    end_at: Instant,
+) -> Result<()> {
+    for (op_index, event) in events.into_iter().enumerate() {
+        if Instant::now() >= end_at {
+            break;
+        }
+
+        let target_delay = event
+            .emitted_at
+            .signed_duration_since(trace_origin)
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        let target_instant = replay_started + target_delay;
+        let sleep_for = target_instant.saturating_duration_since(Instant::now());
+        if !sleep_for.is_zero() {
+            tokio::time::sleep(sleep_for.min(Duration::from_secs(30))).await;
+        }
+
+        if Instant::now() >= end_at {
+            break;
+        }
+
+        let op_started = Instant::now();
+        match write_replay_once(&worker_pool, &event.event_id).await {
+            Ok(_) => worker_metrics.inc_success(),
+            Err(e) => {
+                worker_metrics.inc_failure();
+                error!(
+                    worker_id,
+                    op_index,
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    error = %e,
+                    "worker replay operation failed"
+                );
+            }
+        }
+        worker_metrics.record_latency(op_started.elapsed()).await;
+    }
+
+    Ok(())
 }
 
 async fn initialize_schema(pool: &SqlitePool) -> Result<()> {
