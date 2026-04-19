@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::metrics::MetricsCollector;
 use crate::report::{write_reports, RunReport};
-use crate::workload::{WorkerPacer, WorkloadProfile};
-use crate::writer::execute_peer_review_transaction;
+use crate::workload::{WorkerPacer, WorkloadProfile, WorkloadProfileName};
+use crate::writer::{execute_peer_review_transaction, read_once};
 
 #[derive(Debug, Parser)]
 #[command(name = "sqlite-concurrency")]
@@ -29,10 +29,16 @@ struct Args {
     workers: usize,
 
     #[arg(long, value_enum)]
-    profile: WorkloadProfile,
+    profile: WorkloadProfileName,
 
     #[arg(long)]
     duration: u64,
+
+    #[arg(long, default_value_t = 0)]
+    tx_hold_ms: u64,
+
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+    read_pct: u8,
 
     #[arg(long)]
     db_path: Option<PathBuf>,
@@ -46,6 +52,7 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let args = Args::parse();
+    let profile = WorkloadProfile::from_cli(args.profile, args.tx_hold_ms, args.read_pct);
     let run_id = args.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let db_path = args
         .db_path
@@ -67,7 +74,7 @@ async fn main() -> Result<()> {
 
     metrics.start_samplers(db_path.clone(), end_at);
 
-    let barrier = match args.profile {
+    let barrier = match profile {
         WorkloadProfile::Herd => Some(Arc::new(tokio::sync::Barrier::new(args.workers))),
         _ => None,
     };
@@ -78,22 +85,43 @@ async fn main() -> Result<()> {
         let worker_pool = pool.clone();
         let worker_metrics = metrics.clone();
         let worker_barrier = barrier.clone();
-        let profile = args.profile;
+        let worker_profile = profile;
+        let hold_ms = worker_profile.tx_hold_ms();
+        let is_reader = worker_profile.is_reader_worker(worker_id, args.workers);
 
         workers.spawn(async move {
-            let mut pacer = WorkerPacer::new(profile, worker_id, started, worker_barrier);
+            let mut pacer = WorkerPacer::new(worker_profile, worker_id, started, worker_barrier);
             let mut op_index = 0_u64;
 
             while Instant::now() < end_at {
                 let op_started = Instant::now();
-                match execute_peer_review_transaction(&worker_pool, worker_id, op_index, &worker_metrics)
-                    .await
-                {
-                    Ok(_) => worker_metrics.inc_success(),
-                    Err(e) => {
-                        worker_metrics.inc_failure();
-                        error!(worker_id, op_index, error = %e, "worker operation failed");
+                if is_reader {
+                    match read_once(&worker_pool).await {
+                        Ok(_rows_touched) => {
+                            worker_metrics.inc_success();
+                            worker_metrics.inc_reads_completed();
+                        }
+                        Err(e) => {
+                            worker_metrics.inc_failure();
+                            error!(worker_id, op_index, error = %e, "worker read operation failed");
+                        }
                     }
+                } else {
+                    match execute_peer_review_transaction(
+                        &worker_pool,
+                        worker_id,
+                        op_index,
+                        hold_ms,
+                        &worker_metrics,
+                    )
+                    .await
+                    {
+                        Ok(_) => worker_metrics.inc_success(),
+                        Err(e) => {
+                            worker_metrics.inc_failure();
+                            error!(worker_id, op_index, error = %e, "worker write operation failed");
+                        }
+                    };
                 }
                 worker_metrics.record_latency(op_started.elapsed()).await;
 
@@ -114,7 +142,7 @@ async fn main() -> Result<()> {
 
     let report = RunReport {
         run_id: run_id.clone(),
-        profile: args.profile,
+        profile,
         workers: args.workers,
         duration_secs: args.duration,
         started_at,

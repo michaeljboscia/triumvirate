@@ -15,6 +15,7 @@ pub struct MetricsCollector {
     latency: Arc<Mutex<Histogram<u64>>>,
     busy_retries: Arc<AtomicU64>,
     successful_ops: Arc<AtomicU64>,
+    reads_completed: Arc<AtomicU64>,
     failed_ops: Arc<AtomicU64>,
     wal_peak_bytes: Arc<AtomicU64>,
     proc_cpu_milli_sum: Arc<AtomicU64>,
@@ -31,6 +32,7 @@ pub struct MetricsSummary {
     pub busy_retries: u64,
     pub busy_rate: f64,
     pub successful_ops: u64,
+    pub reads_completed: u64,
     pub failed_ops: u64,
     pub wal_peak_mb: f64,
     pub process_cpu_pct: f64,
@@ -44,6 +46,7 @@ impl MetricsCollector {
             latency: Arc::new(Mutex::new(histogram)),
             busy_retries: Arc::new(AtomicU64::new(0)),
             successful_ops: Arc::new(AtomicU64::new(0)),
+            reads_completed: Arc::new(AtomicU64::new(0)),
             failed_ops: Arc::new(AtomicU64::new(0)),
             wal_peak_bytes: Arc::new(AtomicU64::new(0)),
             proc_cpu_milli_sum: Arc::new(AtomicU64::new(0)),
@@ -64,6 +67,10 @@ impl MetricsCollector {
 
     pub fn inc_success(&self) {
         self.successful_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_reads_completed(&self) {
+        self.reads_completed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_failure(&self) {
@@ -111,6 +118,7 @@ impl MetricsCollector {
 
         let busy_retries = self.busy_retries.load(Ordering::Relaxed);
         let successful_ops = self.successful_ops.load(Ordering::Relaxed);
+        let reads_completed = self.reads_completed.load(Ordering::Relaxed);
         let failed_ops = self.failed_ops.load(Ordering::Relaxed);
         let total_ops = successful_ops + failed_ops;
         let busy_rate = if total_ops == 0 {
@@ -138,6 +146,7 @@ impl MetricsCollector {
             busy_retries,
             busy_rate,
             successful_ops,
+            reads_completed,
             failed_ops,
             wal_peak_mb,
             process_cpu_pct,
