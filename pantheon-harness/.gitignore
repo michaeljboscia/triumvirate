@@ -1,0 +1,5 @@
+# Pantheon harness build artifacts
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
