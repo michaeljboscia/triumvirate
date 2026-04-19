@@ -5,6 +5,10 @@ edition = "2021"
 
 [workspace]
 
+[[bin]]
+name = "crash-trial"
+path = "src/bin/crash_trial.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
