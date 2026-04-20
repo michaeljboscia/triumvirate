@@ -7,6 +7,11 @@ use shared_types::AskAgentRequest;
 use agent_adapter::AgentVerbosity;
 use tracing::instrument;
 
+pub mod codex_capabilities;
+pub use codex_capabilities::{
+    CodexCapabilities, codex_capabilities, probe_and_cache_codex_capabilities,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
     pub name: &'static str,

@@ -1435,7 +1435,24 @@ async fn run_codex_cli_process_with_session(
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
 ) -> anyhow::Result<ParsedAgentResult> {
-    let protocol = codex_protocol();
+    // If the configured protocol is `app-server` but the installed codex
+    // binary no longer implements the JSON-RPC stdio server there (0.121+
+    // turned that subcommand into a tooling namespace), fall back to `exec`
+    // with a loud warning. Without this, every call silently exits status 1.
+    let configured_protocol = codex_protocol();
+    let caps = mcp_bridge::codex_capabilities();
+    let protocol = if configured_protocol == "app-server"
+        && !caps.has_app_server_protocol_server
+    {
+        tracing::warn!(
+            version = %caps.version,
+            "TRIUMVIRATE_CODEX_PROTOCOL=app-server but installed codex does not \
+             expose the app-server JSON-RPC server; falling back to `exec` protocol"
+        );
+        "exec".to_string()
+    } else {
+        configured_protocol
+    };
     let auto_approve_enabled = codex_auto_approve_enabled();
     let approval_mode = if protocol == "app-server" {
         Some(codex_approval_channel_mode())
@@ -1462,21 +1479,11 @@ async fn run_codex_cli_process_with_session(
             .as_ref()
             .map(|mode| matches!(mode, ApprovalChannelMode::FullAutoFallback))
             .unwrap_or(true);
-    // codex 0.121+ rejects `--full-auto` combined with
-    // `--dangerously-bypass-approvals-and-sandbox`, `-s/--sandbox`, or
-    // `--ask-for-approval`. Respect the user's explicit choice from
-    // TRIUMVIRATE_CODEX_ARGS and only append --full-auto when nothing
-    // else has already configured the approval/sandbox policy.
-    let explicit_approval_policy = has_any_arg(
-        &final_args,
-        &[
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-s",
-            "--sandbox",
-            "--ask-for-approval",
-            "-a",
-        ],
-    );
+    // codex 0.121+ rejects `--full-auto` combined with any other approval /
+    // sandbox policy flag. The authoritative list lives on the probed
+    // `CodexCapabilities` so it can evolve with the upstream CLI without a
+    // scattered-grep refactor.
+    let explicit_approval_policy = caps.args_include_explicit_policy(&final_args);
     if should_use_full_auto
         && !has_any_arg(&final_args, &["--full-auto"])
         && !explicit_approval_policy

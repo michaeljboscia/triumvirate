@@ -2191,6 +2191,16 @@ async fn run_daemon() -> anyhow::Result<()> {
     let token = core_ensure_daemon_token(&triumvirate_home)?;
     let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     info!(%bind_addr, "starting triumvirate daemon");
+
+    // Probe the codex binary so agent_exec can make version-aware flag-injection
+    // decisions. Fire-and-forget is fine — if it hasn't completed by the first
+    // codex call, the safe `unknown()` fallback is used. In practice the probe
+    // finishes in well under a second.
+    let (codex_bin, _codex_default_args) = mcp_bridge::codex_command();
+    tokio::spawn(async move {
+        mcp_bridge::probe_and_cache_codex_capabilities(&codex_bin).await;
+    });
+
     let sessions_file = core_triumvirate_home_dir()
         .ok()
         .map(|home| core_sessions_file_path(&home));
