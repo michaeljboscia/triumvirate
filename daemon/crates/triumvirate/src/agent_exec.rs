@@ -1462,7 +1462,25 @@ async fn run_codex_cli_process_with_session(
             .as_ref()
             .map(|mode| matches!(mode, ApprovalChannelMode::FullAutoFallback))
             .unwrap_or(true);
-    if should_use_full_auto && !has_any_arg(&final_args, &["--full-auto"]) {
+    // codex 0.121+ rejects `--full-auto` combined with
+    // `--dangerously-bypass-approvals-and-sandbox`, `-s/--sandbox`, or
+    // `--ask-for-approval`. Respect the user's explicit choice from
+    // TRIUMVIRATE_CODEX_ARGS and only append --full-auto when nothing
+    // else has already configured the approval/sandbox policy.
+    let explicit_approval_policy = has_any_arg(
+        &final_args,
+        &[
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-s",
+            "--sandbox",
+            "--ask-for-approval",
+            "-a",
+        ],
+    );
+    if should_use_full_auto
+        && !has_any_arg(&final_args, &["--full-auto"])
+        && !explicit_approval_policy
+    {
         final_args.push("--full-auto".to_string());
     }
 
