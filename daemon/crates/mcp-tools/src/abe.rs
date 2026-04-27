@@ -395,6 +395,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     let (cmd, mut args) = (callbacks.codex_command)();
     args.push("exec".to_string());
     args.push("--full-auto".to_string());
+    args.push("--skip-git-repo-check".to_string());
     args.push(req.prompt.clone());
     let start_sha = std::process::Command::new("git")
         .arg("-C")
