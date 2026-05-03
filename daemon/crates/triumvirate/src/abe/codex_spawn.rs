@@ -26,7 +26,12 @@ pub async fn spawn_background(spec: SpawnSpec) -> anyhow::Result<Arc<Mutex<Child
         .current_dir(&spec.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Backstop: if the parent task is dropped (panic, cancel, abnormal
+        // teardown) before the monitor reaps the child, tokio sends SIGKILL
+        // and reaps automatically. Prevents zombie codex processes when the
+        // main monitor task aborts before its select! resolves.
+        .kill_on_drop(true);
     for (k, v) in spec.envs {
         command.env(k, v);
     }
@@ -73,24 +78,35 @@ pub async fn enforce_timeout_with_metrics(
         }
     }
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    // After SIGTERM grace: if the child has exited on its own (e.g. flushed
+    // state and quit cleanly in response to SIGTERM, or finished naturally
+    // milliseconds after the deadline fired), report this as a non-timeout
+    // so the dispatcher can pick up the natural exit via wait() and route
+    // through the normal completion path instead of mark_timeout. Closes
+    // the false-timeout race observed when codex finishes inside the
+    // SIGTERM grace window.
     if child
         .try_wait()
         .context("failed to check child process status before SIGKILL escalation")?
-        .is_none()
+        .is_some()
     {
-        let _ = child
-            .kill()
-            .await
-            .context("failed to send SIGKILL to timed-out child process");
-        tracing::warn!(
-            task_id = "unknown",
-            timeout_sec,
-            signal = "SIGKILL",
-            "abe_timeout_triggered"
-        );
-        if let Some(metrics) = metrics {
-            metrics.abe_timeout_total.inc();
-        }
+        cleanup_git_locks(cwd);
+        return Ok(false);
+    }
+
+    let _ = child
+        .kill()
+        .await
+        .context("failed to send SIGKILL to timed-out child process");
+    tracing::warn!(
+        task_id = "unknown",
+        timeout_sec,
+        signal = "SIGKILL",
+        "abe_timeout_triggered"
+    );
+    if let Some(metrics) = metrics {
+        metrics.abe_timeout_total.inc();
     }
 
     cleanup_git_locks(cwd);

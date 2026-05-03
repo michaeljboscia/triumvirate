@@ -373,6 +373,83 @@ pub(crate) fn build_sandbox_permission_args(perms: Option<&[String]>) -> Vec<Str
     out
 }
 
+/// Outcome of a `git status --porcelain` check used to diagnose why a worker
+/// exited cleanly without producing a commit. The dispatcher emits distinct
+/// error messages so brief authors can see whether the worker forgot the
+/// commit step or never produced any work in the first place.
+enum NoCommitDiagnosis {
+    /// Worker wrote files matching the contract's allowed_files (or wrote
+    /// any files at all when no contract is in scope) but never committed.
+    DirtyAllowedFiles(Vec<String>),
+    /// Worker wrote files outside the allowed_files contract. Worktree-only;
+    /// indicates a contract violation, not just a missing commit step.
+    DirtyOtherFiles(Vec<String>),
+    /// Worker exited without writing or staging anything. Genuinely did
+    /// nothing — distinct from "did work but skipped commit".
+    NoChanges,
+    /// `git status` itself failed — fall back to the original generic message.
+    GitStatusFailed,
+}
+
+fn parse_porcelain_paths(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.get(3..).map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn diagnose_no_commit(path: &Path, allowed_files: Option<&[String]>) -> NoCommitDiagnosis {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain"])
+        .output();
+    let dirty = match output {
+        Ok(out) if out.status.success() => parse_porcelain_paths(&String::from_utf8_lossy(&out.stdout)),
+        _ => return NoCommitDiagnosis::GitStatusFailed,
+    };
+    if dirty.is_empty() {
+        return NoCommitDiagnosis::NoChanges;
+    }
+    match allowed_files {
+        None => NoCommitDiagnosis::DirtyAllowedFiles(dirty),
+        Some(allowed) => {
+            let allowed_set: std::collections::HashSet<&str> =
+                allowed.iter().map(|s| s.as_str()).collect();
+            let in_allowed: Vec<String> = dirty
+                .iter()
+                .filter(|f| allowed_set.contains(f.as_str()))
+                .cloned()
+                .collect();
+            if !in_allowed.is_empty() {
+                NoCommitDiagnosis::DirtyAllowedFiles(in_allowed)
+            } else {
+                NoCommitDiagnosis::DirtyOtherFiles(dirty)
+            }
+        }
+    }
+}
+
+fn no_commit_error_message(diag: NoCommitDiagnosis) -> String {
+    match diag {
+        NoCommitDiagnosis::DirtyAllowedFiles(files) => format!(
+            "codex wrote files but did not commit — uncommitted: {}; run `bash .triumvirate/commit.sh '<msg>'` before exit",
+            files.join(", ")
+        ),
+        NoCommitDiagnosis::DirtyOtherFiles(files) => format!(
+            "codex modified files outside allowed_files and did not commit — dirty paths: {}",
+            files.join(", ")
+        ),
+        NoCommitDiagnosis::NoChanges => {
+            "codex exited cleanly without committing or writing any files — agent produced no work".to_string()
+        }
+        NoCommitDiagnosis::GitStatusFailed => {
+            "codex process exited without creating a commit (git status check failed)".to_string()
+        }
+    }
+}
+
 pub(crate) fn append_codex_exec_mcp_compat_args(args: &mut Vec<String>) {
     // codex exec v0.117+ can auto-cancel MCP tool calls in non-interactive
     // workers when MCP elicitation is enabled. Dispatch workers cannot answer
@@ -452,42 +529,54 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     let task_id_for_monitor = task_id.clone();
     tokio::spawn(async move {
         let wave_label = "mcp";
-        let timed_out = (callbacks_for_monitor.enforce_timeout)(
-            child.clone(),
-            timeout_sec,
-            PathBuf::from(&cwd),
-        )
-        .await
-        .unwrap_or(false);
-        if timed_out {
-            observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
-            tracker_for_monitor
-                .mark_timeout(task_id_for_monitor.clone())
-                .await;
-            return;
-        }
-        let exit = {
-            let mut locked = child.lock().await;
-            match locked.wait().await {
-                Ok(status) => status,
-                Err(err) => {
-                    tracker_for_monitor
-                        .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
-                        .await;
-                    return;
-                }
+        let cwd_path = PathBuf::from(&cwd);
+        let timeout_duration = std::time::Duration::from_secs(timeout_sec);
+
+        // Race the worker against its deadline. The previous structure ran
+        // an unconditional sleep(timeout_sec) before wait(), which both
+        // delayed completion reporting for fast tasks and produced false
+        // "task timed out" results when the worker finished mid-grace.
+        // First-to-finish wins eliminates both bugs.
+        let exit_outcome: Option<std::io::Result<std::process::ExitStatus>> = {
+            let child_for_wait = child.clone();
+            tokio::select! {
+                wait_result = async move {
+                    let mut locked = child_for_wait.lock().await;
+                    locked.wait().await
+                } => Some(wait_result),
+                _ = tokio::time::sleep(timeout_duration) => None,
             }
         };
+
+        let exit = match exit_outcome {
+            Some(Ok(status)) => status,
+            Some(Err(err)) => {
+                tracker_for_monitor
+                    .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
+                    .await;
+                return;
+            }
+            None => {
+                terminate_worker(child.clone()).await;
+                observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
+                tracker_for_monitor
+                    .mark_timeout(task_id_for_monitor.clone())
+                    .await;
+                return;
+            }
+        };
+
         if exit.success() {
-            let cwd_path = PathBuf::from(&cwd);
-            let (commit_sha, files) = (callbacks_for_monitor.resolve_commit_outputs)(&cwd_path, &start_sha);
+            let (commit_sha, files) =
+                (callbacks_for_monitor.resolve_commit_outputs)(&cwd_path, &start_sha);
             if commit_sha.is_empty() {
                 observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
+                let diag = diagnose_no_commit(&cwd_path, None);
                 tracker_for_monitor
                     .mark_failed(
                         task_id_for_monitor.clone(),
                         exit.code(),
-                        "codex process exited without creating a commit".to_string(),
+                        no_commit_error_message(diag),
                     )
                     .await;
                 return;
@@ -839,11 +928,15 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 (callbacks_for_monitor.resolve_commit_outputs)(&worktree_path, &start_sha);
             if commit_sha.is_empty() {
                 observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
+                let diag = diagnose_no_commit(
+                    &worktree_path,
+                    Some(&contract_for_validation.allowed_files),
+                );
                 tracker_for_monitor
                     .mark_failed(
                         task_id_for_monitor.clone(),
                         exit.code(),
-                        "codex process exited without creating a commit".to_string(),
+                        no_commit_error_message(diag),
                     )
                     .await;
                 return;
