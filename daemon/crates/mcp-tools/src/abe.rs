@@ -373,6 +373,15 @@ pub(crate) fn build_sandbox_permission_args(perms: Option<&[String]>) -> Vec<Str
     out
 }
 
+pub(crate) fn append_codex_exec_mcp_compat_args(args: &mut Vec<String>) {
+    // codex exec v0.117+ can auto-cancel MCP tool calls in non-interactive
+    // workers when MCP elicitation is enabled. Dispatch workers cannot answer
+    // prompts, so disable that feature and let Codex's config/server policy
+    // decide which MCP tools are callable.
+    args.push("--disable".to_string());
+    args.push("tool_call_mcp_elicitation".to_string());
+}
+
 #[instrument(skip_all)]
 pub async fn dispatch_codex<T: AbeTaskTracker>(
     tracker: T,
@@ -395,6 +404,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     let (cmd, mut args) = (callbacks.codex_command)();
     args.push("exec".to_string());
     args.push("--full-auto".to_string());
+    append_codex_exec_mcp_compat_args(&mut args);
     args.push("--skip-git-repo-check".to_string());
     args.push(req.prompt.clone());
     let start_sha = std::process::Command::new("git")
@@ -572,6 +582,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     let (cmd, mut args) = (callbacks.codex_command)();
     args.push("exec".to_string());
     args.push("--full-auto".to_string());
+    append_codex_exec_mcp_compat_args(&mut args);
     // Translate sandbox_permissions contract field into `-c key=value` overrides
     // that codex-exec merges ON TOP of --full-auto. See build_sandbox_permission_args.
     args.extend(build_sandbox_permission_args(
@@ -973,7 +984,7 @@ pub async fn cancel_task<T: AbeTaskTracker>(
 
 #[cfg(test)]
 mod sandbox_permissions_tests {
-    use super::build_sandbox_permission_args;
+    use super::{append_codex_exec_mcp_compat_args, build_sandbox_permission_args};
 
     #[test]
     fn none_emits_no_args() {
@@ -1021,6 +1032,21 @@ mod sandbox_permissions_tests {
             vec![
                 "-c".to_string(),
                 "sandbox_workspace_write.network_access=true".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_exec_mcp_compat_args_disable_mcp_elicitation() {
+        let mut args = vec!["exec".to_string(), "--full-auto".to_string()];
+        append_codex_exec_mcp_compat_args(&mut args);
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--full-auto".to_string(),
+                "--disable".to_string(),
+                "tool_call_mcp_elicitation".to_string(),
             ]
         );
     }
