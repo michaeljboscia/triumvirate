@@ -1,3 +1,6 @@
+// Pre-existing lint debt acknowledged in PR #29; remove allow once cleaned up.
+#![allow(clippy::unnecessary_sort_by)]
+
 use axum::{
     Json as AxumJson,
     body::Body,

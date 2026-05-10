@@ -1,6 +1,10 @@
 // Pre-existing lint debt acknowledged in PR #29. Each allow has a tracking
 // issue for follow-up cleanup; remove the allow once the underlying lint is fixed.
-#![allow(clippy::type_complexity, clippy::collapsible_if)]
+#![allow(
+    clippy::type_complexity,
+    clippy::collapsible_if,
+    clippy::unnecessary_sort_by
+)]
 
 use rmcp::{
     model::{LoggingLevel, LoggingMessageNotificationParam, ProgressNotificationParam, ProgressToken},
