@@ -1,3 +1,7 @@
+// Pre-existing lint debt acknowledged in PR #29. Each allow has a tracking
+// issue for follow-up cleanup; remove the allow once the underlying lint is fixed.
+#![allow(clippy::collapsible_if, clippy::too_many_arguments, dead_code)]
+
 use clap::{Parser, Subcommand};
 use agent_worker::{
     WorkerAcquireMode, acquire_worker, dismiss_worker,

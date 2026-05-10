@@ -1,6 +1,6 @@
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -72,7 +72,7 @@ impl JsonlSink {
         Utc::now().date_naive().format("%Y-%m-%d").to_string()
     }
 
-    fn open_file(dir: &PathBuf, date_stamp: &str) -> Result<File> {
+    fn open_file(dir: &Path, date_stamp: &str) -> Result<File> {
         let path = dir.join(format!("{date_stamp}.jsonl"));
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(file)

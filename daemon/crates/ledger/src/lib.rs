@@ -1,3 +1,6 @@
+// Pre-existing lint debt acknowledged in PR #29; remove allow once cleaned up.
+#![allow(clippy::collapsible_match)]
+
 mod compression;
 mod gc;
 mod health;
