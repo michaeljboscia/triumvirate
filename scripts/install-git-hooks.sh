@@ -4,14 +4,26 @@
 set -euo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
-HOOK_SRC="$REPO_ROOT/scripts/version-drift-check.sh"
-HOOK_DEST="$REPO_ROOT/.git/hooks/pre-commit"
+HOOKS_DIR="$REPO_ROOT/.git/hooks"
+mkdir -p "$HOOKS_DIR"
 
-if [ ! -f "$HOOK_SRC" ]; then
-    echo "missing: $HOOK_SRC"; exit 1
-fi
+install_hook() {
+    local src="$1"
+    local dest="$2"
+    if [ ! -f "$src" ]; then
+        echo "missing: $src"; exit 1
+    fi
+    ln -sf "$src" "$dest"
+    chmod +x "$src"
+    echo "installed: $(basename "$dest") → $src"
+}
 
-mkdir -p "$(dirname "$HOOK_DEST")"
-ln -sf "$HOOK_SRC" "$HOOK_DEST"
-chmod +x "$HOOK_SRC"
-echo "installed pre-commit hook → $HOOK_DEST"
+# pre-commit: version drift check on Cargo.toml
+install_hook "$REPO_ROOT/scripts/version-drift-check.sh" "$HOOKS_DIR/pre-commit"
+
+# pre-push: cargo check + clippy gate (mirrors Rust CI Check & Lint)
+install_hook "$REPO_ROOT/scripts/pre-push-ci-checks.sh" "$HOOKS_DIR/pre-push"
+
+echo ""
+echo "Hooks installed. Tip: use 'gh pr merge --auto --squash' so PRs only"
+echo "merge once CI is green — branch protection isn't available on free-tier."
