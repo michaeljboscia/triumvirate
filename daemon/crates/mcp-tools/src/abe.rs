@@ -148,6 +148,13 @@ fn git_latest_commit_message(worktree_path: &Path) -> Option<String> {
 }
 
 fn commit_message_matches_format(commit_message: &str, commit_format: &str) -> bool {
+    let subject = commit_message.lines().next().unwrap_or("");
+    if subject == commit_format {
+        return true;
+    }
+    if !commit_format.starts_with('^') && !commit_format.ends_with('$') {
+        return false;
+    }
     regex_lite::Regex::new(commit_format)
         .map(|re| re.is_match(commit_message))
         .unwrap_or(false)
@@ -1100,6 +1107,24 @@ mod tests {
         assert!(content.contains("pnpm-store/"));
         assert!(content.contains(".triumvirate/logs/"));
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn commit_format_matches_literal_subject_before_regex() {
+        let subject = "feat(T-305b) [model=codex] [worker=W3-T-305b-scoring-reconcile]: rewrite health + opportunity scoring to match Python algorithms per R46/T-304";
+        assert!(commit_message_matches_format(&format!("{subject}\n"), subject));
+    }
+
+    #[test]
+    fn commit_format_preserves_legacy_regex_anchors() {
+        assert!(commit_message_matches_format(
+            "T-003: implement worker change",
+            "^T-003:"
+        ));
+        assert!(!commit_message_matches_format(
+            "featT m",
+            "feat(T-305b) [model=codex]"
+        ));
     }
 }
 

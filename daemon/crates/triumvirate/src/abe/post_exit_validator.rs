@@ -47,27 +47,12 @@ pub fn validate_commit_with_metrics(
     // 2. Check commit message format
     let commit_msg = get_commit_message(worktree_path);
     if !contract.commit_format.is_empty() {
-        let re = regex_lite::Regex::new(&contract.commit_format);
-        match re {
-            Ok(re) => {
-                if !re.is_match(&commit_msg) {
-                    violations.push(format!(
-                        "COMMIT_FORMAT: message '{}' does not match format '{}'",
-                        commit_msg.lines().next().unwrap_or(""),
-                        contract.commit_format
-                    ));
-                }
-            }
-            Err(_) => {
-                // Fallback: simple starts-with check
-                let prefix = contract.commit_format.trim_start_matches('^');
-                if !commit_msg.starts_with(prefix) {
-                    violations.push(format!(
-                        "COMMIT_FORMAT: message does not start with '{}'",
-                        prefix
-                    ));
-                }
-            }
+        if !commit_message_matches_format(&commit_msg, &contract.commit_format) {
+            violations.push(format!(
+                "COMMIT_FORMAT: message '{}' does not match format '{}'",
+                commit_msg.lines().next().unwrap_or(""),
+                contract.commit_format
+            ));
         }
     }
 
@@ -196,6 +181,19 @@ fn get_commit_message(worktree_path: &Path) -> String {
         .unwrap_or_default()
 }
 
+fn commit_message_matches_format(commit_message: &str, commit_format: &str) -> bool {
+    let subject = commit_message.lines().next().unwrap_or("");
+    if subject == commit_format {
+        return true;
+    }
+    if !commit_format.starts_with('^') && !commit_format.ends_with('$') {
+        return false;
+    }
+    regex_lite::Regex::new(commit_format)
+        .map(|re| re.is_match(commit_message))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +227,23 @@ mod tests {
         };
         assert!(!result.passed);
         assert!(result.violations[0].contains("README.md"));
+    }
+
+    #[test]
+    fn commit_format_matches_literal_subject_before_regex() {
+        let subject = "feat(T-305b) [model=codex] [worker=W3-T-305b-scoring-reconcile]: rewrite health + opportunity scoring to match Python algorithms per R46/T-304";
+        assert!(commit_message_matches_format(&format!("{subject}\n"), subject));
+    }
+
+    #[test]
+    fn commit_format_preserves_legacy_regex_anchors() {
+        assert!(commit_message_matches_format(
+            "T-003: implement worker change",
+            "^T-003:"
+        ));
+        assert!(!commit_message_matches_format(
+            "featT m",
+            "feat(T-305b) [model=codex]"
+        ));
     }
 }
