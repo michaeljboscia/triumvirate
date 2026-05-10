@@ -301,6 +301,7 @@ impl McpBridge {
                         args: spec.args,
                         cwd: spec.cwd,
                         envs: spec.envs,
+                        output_log_dir: spec.output_log_dir,
                     })
                     .await
                     .map_err(|e| e.to_string())
