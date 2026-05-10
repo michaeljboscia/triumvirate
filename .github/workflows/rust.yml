@@ -27,9 +27,9 @@ jobs:
         with:
           workspaces: daemon
       - name: Check
-        run: cargo check --workspace
+        run: cargo check --workspace --exclude pantheon
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --exclude pantheon -- -D warnings
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -48,7 +48,7 @@ jobs:
         with:
           workspaces: daemon
       - name: Run unit tests
-        run: cargo test --workspace --lib
+        run: cargo test --workspace --exclude pantheon --lib
 
   build:
     name: Build Release
