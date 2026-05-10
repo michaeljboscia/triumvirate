@@ -361,9 +361,10 @@ if [[ -z "$message_file" || ! -f "$message_file" ]]; then
   exit 1
 fi
 msg=$(cat "$message_file")
+subject="${msg%%$'\n'*}"
 commit_format=$(jq -r '.commit_format // empty' "$contract")
 if [[ -n "$commit_format" ]]; then
-  if ! [[ "$msg" =~ $commit_format ]]; then
+  if [[ "$subject" != "$commit_format" ]] && { [[ "$commit_format" != ^* && "$commit_format" != *'$' ]] || ! [[ "$msg" =~ $commit_format ]]; }; then
     echo "BLOCKED: Commit message does not match contract format"
     exit 1
   fi
