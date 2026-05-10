@@ -1,3 +1,7 @@
+// Pre-existing lint debt acknowledged in PR #29. Each allow has a tracking
+// issue for follow-up cleanup; remove the allow once the underlying lint is fixed.
+#![allow(clippy::large_enum_variant)]
+
 pub mod codex;
 pub mod codex_app_server;
 pub mod gemini;
