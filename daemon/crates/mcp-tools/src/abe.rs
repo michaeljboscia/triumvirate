@@ -80,6 +80,7 @@ pub struct SpawnSpec {
     pub args: Vec<String>,
     pub cwd: String,
     pub envs: HashMap<String, String>,
+    pub output_log_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,7 @@ target/
 dist/
 .turbo/
 .next/
+.triumvirate/logs/
 "#;
 
 fn resolve_worktree_git_path(worktree_path: &Path, git_path: &str) -> Result<PathBuf, String> {
@@ -323,6 +325,17 @@ async fn terminate_worker(child: Arc<Mutex<Child>>) {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     if locked.try_wait().ok().flatten().is_none() {
         let _ = locked.kill().await;
+    }
+}
+
+fn cleanup_failed_worktree(
+    callbacks: &AbeCallbacks,
+    keep_failed: bool,
+    project_root: &Path,
+    worktree_path: &Path,
+) {
+    if !keep_failed {
+        let _ = (callbacks.rollback_worktree)(project_root, worktree_path);
     }
 }
 
@@ -499,6 +512,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         args,
         cwd: cwd.clone(),
         envs: HashMap::new(),
+        output_log_dir: None,
     })
     .await
     .map_err(|e| format!("dispatch_codex failed: {e}"))?;
@@ -715,6 +729,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         args,
         cwd: setup.worktree_path.display().to_string(),
         envs: worker_env,
+        output_log_dir: Some(setup.worktree_path.join(".triumvirate").join("logs")),
     })
     .await
     .map_err(|e| format!("dispatch_codex_worktree failed: {e}"))?;
@@ -755,17 +770,23 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let timeout_child = child.clone();
         let timeout_wave_label = wave_label.clone();
         let timeout_metrics = callbacks_for_monitor.metrics.clone();
+        let timeout_project_root = project_root_for_cleanup.clone();
+        let timeout_cleanup_worktree = worktree_path.clone();
+        let timeout_keep_failed = keep_failed;
         tokio::spawn(async move {
-            let timed_out = (timeout_callbacks.enforce_timeout)(
-                timeout_child,
-                timeout_sec,
-                timeout_worktree,
-            )
-            .await
-            .unwrap_or(false);
+            let enforce_timeout = timeout_callbacks.enforce_timeout.clone();
+            let timed_out = (enforce_timeout)(timeout_child, timeout_sec, timeout_worktree)
+                .await
+                .unwrap_or(false);
             if timed_out {
                 observe_task_duration(&timeout_metrics, &timeout_wave_label, task_started_at);
                 timeout_tracker.mark_timeout(timeout_task_id).await;
+                cleanup_failed_worktree(
+                    &timeout_callbacks,
+                    timeout_keep_failed,
+                    &timeout_project_root,
+                    &timeout_cleanup_worktree,
+                );
             }
         });
 
@@ -873,6 +894,10 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let stuck_child = child.clone();
         let stuck_wave_label = wave_label.clone();
         let stuck_metrics = callbacks_for_monitor.metrics.clone();
+        let stuck_callbacks = callbacks_for_monitor.clone();
+        let stuck_project_root = project_root_for_cleanup.clone();
+        let stuck_cleanup_worktree = worktree_path.clone();
+        let stuck_keep_failed = keep_failed;
         tokio::spawn(async move {
             let mut last_touch = latest_worktree_touch(&stuck_worktree).or_else(|| Some(SystemTime::now()));
             loop {
@@ -906,21 +931,44 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                     .await;
                 observe_task_duration(&stuck_metrics, &stuck_wave_label, task_started_at);
                 terminate_worker(stuck_child).await;
+                cleanup_failed_worktree(
+                    &stuck_callbacks,
+                    stuck_keep_failed,
+                    &stuck_project_root,
+                    &stuck_cleanup_worktree,
+                );
                 break;
             }
         });
 
-        let exit = {
-            let mut locked = child.lock().await;
-            match locked.wait().await {
-                Ok(status) => status,
-                Err(err) => {
-                    tracker_for_monitor
-                        .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
-                        .await;
-                    return;
+        let exit = loop {
+            {
+                let mut locked = child.lock().await;
+                match locked.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracker_for_monitor
+                            .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
+                            .await;
+                        cleanup_failed_worktree(
+                            &callbacks_for_monitor,
+                            keep_failed,
+                            &project_root_for_cleanup,
+                            &worktree_path,
+                        );
+                        return;
+                    }
                 }
             }
+            let status = tracker_for_monitor
+                .get_status(task_id_for_monitor.clone())
+                .await
+                .map(|s| s.status);
+            if !matches!(status, Some(TaskStatus::Working)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         };
 
         if exit.success() {
@@ -939,6 +987,12 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                         no_commit_error_message(diag),
                     )
                     .await;
+                cleanup_failed_worktree(
+                    &callbacks_for_monitor,
+                    keep_failed,
+                    &project_root_for_cleanup,
+                    &worktree_path,
+                );
                 return;
             }
 
@@ -954,6 +1008,12 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                         format!("DAEMON_VALIDATION_FAILED: {violation_summary}"),
                     )
                     .await;
+                cleanup_failed_worktree(
+                    &callbacks_for_monitor,
+                    keep_failed,
+                    &project_root_for_cleanup,
+                    &worktree_path,
+                );
                 return;
             }
 
@@ -979,12 +1039,12 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                     "codex process failed".to_string(),
                 )
                 .await;
-            if !keep_failed {
-                let _ = (callbacks_for_monitor.rollback_worktree)(
-                    &project_root_for_cleanup,
-                    &worktree_path,
-                );
-            }
+            cleanup_failed_worktree(
+                &callbacks_for_monitor,
+                keep_failed,
+                &project_root_for_cleanup,
+                &worktree_path,
+            );
         }
     });
 
@@ -1038,6 +1098,7 @@ mod tests {
         assert!(content.contains("triumvirate-daemon-managed"));
         assert!(content.contains("node_modules/"));
         assert!(content.contains("pnpm-store/"));
+        assert!(content.contains(".triumvirate/logs/"));
         let _ = fs::remove_dir_all(temp_dir);
     }
 }
