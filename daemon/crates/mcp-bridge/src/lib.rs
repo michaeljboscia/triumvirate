@@ -226,6 +226,45 @@ pub fn codex_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "codex")
 }
 
+/// Backend that serves the public `gemini` agent. The public agent name stays
+/// `gemini` (C3); this selects which CLI actually executes the request. REQ-001.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiBackend {
+    /// Legacy `gemini` CLI (stream-json). Default and rollback target; kept until
+    /// the binary stops serving on 2026-06-18.
+    GeminiCli,
+    /// Antigravity CLI (`agy`), single-turn plain text, subscription-OAuth only.
+    Agy,
+}
+
+impl GeminiBackend {
+    /// Stable label used in logs and the degraded-route surface (REQ-005).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeminiBackend::GeminiCli => "gemini-cli",
+            GeminiBackend::Agy => "agy",
+        }
+    }
+}
+
+/// Select the gemini backend from `TRIUMVIRATE_GEMINI_BACKEND`. The value must be
+/// exactly `agy` to select agy; unset or ANY other value is the legacy gemini-cli
+/// path, so the default behavior is byte-for-byte the current path (REQ-001/002).
+#[instrument(skip_all)]
+pub fn gemini_backend() -> GeminiBackend {
+    match std::env::var("TRIUMVIRATE_GEMINI_BACKEND").ok().as_deref() {
+        Some("agy") => GeminiBackend::Agy,
+        _ => GeminiBackend::GeminiCli,
+    }
+}
+
+/// Resolve the agy binary path + extra args, mirroring the gemini/codex connector
+/// resolution (`TRIUMVIRATE_AGY_BIN` default `agy`, `TRIUMVIRATE_AGY_ARGS`). REQ-010.
+#[instrument(skip_all)]
+pub fn agy_command() -> (String, Vec<String>) {
+    resolve_connector_command("TRIUMVIRATE_AGY_BIN", "TRIUMVIRATE_AGY_ARGS", "agy")
+}
+
 #[instrument(skip_all)]
 pub fn agent_verbosity() -> AgentVerbosity {
     let raw = std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok();

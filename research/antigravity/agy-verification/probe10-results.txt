@@ -1,0 +1,17 @@
+=== REQ-062: non-TTY pipe capture (expect '4', exit 0, NON-empty) ===
+exit=0 timed_out=False elapsed=7.0s stdout_bytes=2 stderr_bytes=0
+stdout(repr): b'4\n'
+PIPE CAPTURE CLEAN: True
+
+=== REQ-100: --log-file carries model + auth lines ===
+exit=0 timed_out=False elapsed=6.1s stdout(repr)=b'4\n'
+log bytes=10022
+MODEL line: I0524 16:41:26.665688 99652 model_config_manager.go:157] Propagating selected model override to backend: label="Gemini 3.1 Pro (High)"
+AUTH  line: I0524 16:41:25.890485 99652 server_oauth.go:212] applyAuthResult: email=REDACTED@example.com, authMethod=consumer, quotaProject=
+
+=== REQ-064: exit codes ===
+bad-flag: exit=2 (expect 2) stderr=b'flags provided but not defined: -nonsense-flag-xyz\nUsage of agy:\n  --add-dir                       Add a directory to the workspace (repeatable) (default [])\n  '
+
+=== REQ-063: token reuse (second back-to-back call, expect no interactive prompt) ===
+exit=0 timed_out=False elapsed=6.0s stdout(repr)=b'6\n'
+TOKEN REUSE (no prompt, answered): True

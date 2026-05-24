@@ -14,8 +14,8 @@ use agent_worker::{
 use daemon_core::{resolve_context as core_resolve_context, unix_time_ms as core_unix_time_ms};
 use ledger::LedgerStore;
 use mcp_bridge::{
-    agent_verbosity, codex_command, codex_protocol, gemini_command, gemini_streaming_enabled,
-    is_supported_agent,
+    GeminiBackend, agent_verbosity, agy_command, codex_command, codex_protocol, gemini_backend,
+    gemini_command, gemini_streaming_enabled, is_supported_agent,
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
@@ -63,7 +63,7 @@ Rules:
 - Emit normal prose outside the XML block when needed.";
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     // SAFETY: pre_exec runs in the spawned child process before exec.
     unsafe {
         command.pre_exec(|| {
@@ -76,10 +76,10 @@ fn configure_process_group(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+pub(crate) fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn kill_process_group(child: &mut tokio::process::Child) {
+pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
         let pgid = -(pid as i32);
         // SAFETY: kill is called with a process-group id derived from child pid.
@@ -90,9 +90,9 @@ fn kill_process_group(child: &mut tokio::process::Child) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_child: &mut tokio::process::Child) {}
+pub(crate) fn kill_process_group(_child: &mut tokio::process::Child) {}
 
-fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: WorkingStateEvent) {
+pub(crate) fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: WorkingStateEvent) {
     if let Some(sender) = tx {
         let _ = sender.try_send(event);
     }
@@ -1680,10 +1680,24 @@ async fn run_agent_process_with_session(
     }
 
     match agent {
-        "gemini" => {
-            run_gemini_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
+        // REQ-001/003/005: the backend selector lives at this seam. The public agent
+        // name stays `gemini` (C3); only the executing CLI changes. The gemini-cli path
+        // is kept verbatim for rollback and the degraded route.
+        "gemini" => match gemini_backend() {
+            GeminiBackend::Agy => {
+                let (agy_bin, agy_args) = agy_command();
+                tracing::info!(backend = "agy", "gemini dispatch served by agy backend");
+                crate::agy::run_agy_cli_process_with_session(
+                    &agy_bin, &agy_args, message, cwd, session_id, events_tx,
+                )
                 .await
-        }
+            }
+            GeminiBackend::GeminiCli => {
+                tracing::info!(backend = "gemini-cli", "gemini dispatch served by gemini-cli backend");
+                run_gemini_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
+                    .await
+            }
+        },
         "codex" => {
             run_codex_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
                 .await
