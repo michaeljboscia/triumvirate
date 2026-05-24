@@ -63,6 +63,30 @@ fn agy_capture_is_pty() -> bool {
     )
 }
 
+/// Cap on captured output, to bound memory against a runaway agy (M8). Default 8 MiB.
+fn agy_max_output_bytes() -> usize {
+    std::env::var("TRIUMVIRATE_AGY_MAX_OUTPUT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+/// Apply the non-interactive environment to a pipe-path Command (L10 — previously
+/// PTY-only). Reduces the chance agy blocks on a prompt/pager even under a pipe.
+fn set_noninteractive_env(command: &mut Command) {
+    command
+        .env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat");
+}
+
+/// Grace window for a child to exit after its stdio has closed, before we SIGKILL it
+/// (M5 — bounds `child.wait()` so a process that closes stdio but lingers can't hang).
+const POST_STDIO_WAIT: Duration = Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // Version pin (REQ-059)
 // ---------------------------------------------------------------------------
@@ -98,7 +122,14 @@ fn agy_version_status() -> &'static Result<String, String> {
 fn enforce_version_pin() -> anyhow::Result<()> {
     let expected = mcp_bridge::agy_expected_version();
     let strict = mcp_bridge::agy_strict_version();
-    match agy_version_status() {
+    // M7: strict mode re-checks `agy --version` every dispatch (catches a mid-daemon
+    // upgrade); non-strict uses the cached check to avoid the per-call spawn.
+    let status = if strict {
+        agy_installed_version()
+    } else {
+        agy_version_status().clone()
+    };
+    match &status {
         Ok(v) if v == &expected => Ok(()),
         Ok(v) => {
             if strict {
@@ -404,7 +435,7 @@ async fn run_agy_once(
 ) -> AgyRun {
     // REQ-016: assemble the sandbox-exec-wrapped invocation from the shared builder
     // (one source for the security-critical profile, shared with fleet).
-    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message) {
         Ok(inv) => inv,
         Err(e) => {
             return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));
@@ -415,11 +446,11 @@ async fn run_agy_once(
     command
         .args(&inv.args)
         .current_dir(cwd)
-        .env("NO_COLOR", "1") // minimize ANSI in pipe output (defensive)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    set_noninteractive_env(&mut command); // L10
     configure_process_group(&mut command);
 
     let mut child = match command.spawn() {
@@ -435,19 +466,24 @@ async fn run_agy_once(
     // and returned, so they remain readable after the timeout completes.
     let mut stdout = match child.stdout.take() {
         Some(s) => s,
-        None => return finish_spawn_error(&mut child, &inv, "agy stdout missing"),
+        None => return finish_spawn_error(&mut child, &inv, "agy stdout missing").await,
     };
     let mut stderr = match child.stderr.take() {
         Some(s) => s,
-        None => return finish_spawn_error(&mut child, &inv, "agy stderr missing"),
+        None => return finish_spawn_error(&mut child, &inv, "agy stderr missing").await,
     };
 
+    // M8: cap each stream at max+1 bytes so a runaway agy can't OOM us; len > max ⇒ over cap.
+    let max_out = agy_max_output_bytes();
+    let cap = max_out as u64 + 1;
     let read = async move {
         let mut out_buf = Vec::new();
         let mut err_buf = Vec::new();
+        let mut out_reader = (&mut stdout).take(cap);
+        let mut err_reader = (&mut stderr).take(cap);
         let (a, b) = tokio::join!(
-            stdout.read_to_end(&mut out_buf),
-            stderr.read_to_end(&mut err_buf)
+            out_reader.read_to_end(&mut out_buf),
+            err_reader.read_to_end(&mut err_buf)
         );
         a?;
         b?;
@@ -455,21 +491,48 @@ async fn run_agy_once(
     };
 
     let outcome = match timeout(kill_after, read).await {
-        Ok(Ok((out_buf, err_buf))) => match child.wait().await {
-            Ok(status) if status.success() => AgyRun::Ok {
-                raw: String::from_utf8_lossy(&out_buf).into_owned(),
-                log: read_and_parse_log(&inv.log_path),
-            },
-            Ok(status) => AgyRun::NonZero {
-                code: status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".to_string()),
-                stderr: String::from_utf8_lossy(&err_buf).into_owned(),
-                log: read_and_parse_log(&inv.log_path),
-            },
-            Err(e) => AgyRun::SpawnError(anyhow::anyhow!("failed to reap agy: {e}")),
-        },
+        Ok(Ok((out_buf, err_buf))) => {
+            if out_buf.len() > max_out {
+                // M8: over the output cap — kill and fail loud rather than grow memory.
+                kill_process_group(&mut child);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                AgyRun::NonZero {
+                    code: "output-cap".to_string(),
+                    stderr: format!("agy output exceeded {max_out} bytes; killed"),
+                    log: read_and_parse_log(&inv.log_path),
+                }
+            } else {
+                // M5: bound the post-stdio wait — a process that closed stdio but lingers
+                // must not hang the runtime; SIGKILL after the grace window.
+                match timeout(POST_STDIO_WAIT, child.wait()).await {
+                    Ok(Ok(status)) if status.success() => AgyRun::Ok {
+                        raw: String::from_utf8_lossy(&out_buf).into_owned(),
+                        log: read_and_parse_log(&inv.log_path),
+                    },
+                    Ok(Ok(status)) => AgyRun::NonZero {
+                        code: status
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".to_string()),
+                        stderr: String::from_utf8_lossy(&err_buf).into_owned(),
+                        log: read_and_parse_log(&inv.log_path),
+                    },
+                    Ok(Err(e)) => AgyRun::SpawnError(anyhow::anyhow!("failed to reap agy: {e}")),
+                    Err(_) => {
+                        // stdio EOF'd (complete output) but the process lingered: kill it
+                        // and use the captured output rather than hang.
+                        kill_process_group(&mut child);
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        AgyRun::Ok {
+                            raw: String::from_utf8_lossy(&out_buf).into_owned(),
+                            log: read_and_parse_log(&inv.log_path),
+                        }
+                    }
+                }
+            }
+        }
         Ok(Err(e)) => {
             kill_process_group(&mut child);
             let _ = child.kill().await;
@@ -495,8 +558,11 @@ fn cleanup_invocation(inv: &AgyInvocation) {
     let _ = std::fs::remove_file(&inv.log_path);
 }
 
-fn finish_spawn_error(child: &mut tokio::process::Child, inv: &AgyInvocation, msg: &str) -> AgyRun {
+/// M6: reap the child (don't leave a zombie) on a spawn/pipe setup error.
+async fn finish_spawn_error(child: &mut tokio::process::Child, inv: &AgyInvocation, msg: &str) -> AgyRun {
     kill_process_group(child);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
     cleanup_invocation(inv);
     AgyRun::SpawnError(anyhow::anyhow!("{msg}"))
 }
@@ -557,7 +623,7 @@ async fn run_agy_once_pty(
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::Read;
 
-    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message) {
         Ok(inv) => inv,
         Err(e) => {
             return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));
@@ -619,8 +685,10 @@ async fn run_agy_once_pty(
     };
 
     // Read PTY bytes on a dedicated OS thread, forwarded to async via a channel (REQ-022).
+    // The thread exits on EOF (slave closed = child dead); it is detached, not joined, so
+    // a child that somehow survives SIGKILL can never hang this async fn (H2).
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let reader_thread = std::thread::spawn(move || {
+    let _reader_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
@@ -634,11 +702,17 @@ async fn run_agy_once_pty(
         }
     });
 
+    let max_out = agy_max_output_bytes();
     let mut out: Vec<u8> = Vec::new();
     let mut interactive: Option<&'static str> = None;
+    let mut over_cap = false;
     let collect = async {
         while let Some(chunk) = rx.recv().await {
             out.extend_from_slice(&chunk);
+            if out.len() > max_out {
+                over_cap = true; // M8
+                break;
+            }
             if let Some(p) = tail_interactive_prompt(&out) {
                 interactive = Some(p);
                 break;
@@ -647,42 +721,84 @@ async fn run_agy_once_pty(
     };
     let timed_out = timeout(kill_after, collect).await.is_err();
 
-    let outcome = if let Some(prompt) = interactive {
-        if let Some(p) = pid {
-            sigkill_process_group_pid(p);
+    let outcome = if over_cap {
+        pty_force_kill_and_reap(&mut child, pid).await;
+        AgyRun::NonZero {
+            code: "output-cap".to_string(),
+            stderr: format!("agy output exceeded {max_out} bytes; killed"),
+            log: read_and_parse_log(&inv.log_path),
         }
-        let _ = child.wait();
+    } else if let Some(prompt) = interactive {
+        pty_force_kill_and_reap(&mut child, pid).await;
         AgyRun::NonZero {
             code: "interactive".to_string(),
             stderr: format!("agy blocked on an interactive prompt under PTY: {prompt:?}"),
             log: read_and_parse_log(&inv.log_path),
         }
     } else if timed_out {
-        if let Some(p) = pid {
-            sigkill_process_group_pid(p);
-        }
-        let _ = child.wait();
+        pty_force_kill_and_reap(&mut child, pid).await;
         AgyRun::Timeout
     } else {
-        // EOF — the child closed the PTY, so it has exited; reap for the exit status.
-        match child.wait() {
-            Ok(status) if status.success() => AgyRun::Ok {
+        // EOF — the child closed the PTY, so it has exited (or is about to); reap with a
+        // bounded poll (never a blocking wait that could hang the runtime — H2).
+        match pty_wait_bounded(&mut child, pid, POST_STDIO_WAIT).await {
+            Some(status) if status.success() => AgyRun::Ok {
                 raw: String::from_utf8_lossy(&out).into_owned(),
                 log: read_and_parse_log(&inv.log_path),
             },
-            Ok(status) => AgyRun::NonZero {
+            Some(status) => AgyRun::NonZero {
                 code: status.exit_code().to_string(),
                 stderr: String::from_utf8_lossy(&out).into_owned(),
                 log: read_and_parse_log(&inv.log_path),
             },
-            Err(e) => AgyRun::SpawnError(anyhow::anyhow!("failed to reap agy (pty): {e}")),
+            // Couldn't confirm exit but stdout EOF'd (complete output) — use it.
+            None => AgyRun::Ok {
+                raw: String::from_utf8_lossy(&out).into_owned(),
+                log: read_and_parse_log(&inv.log_path),
+            },
         }
     };
 
-    drop(pair.master); // close master so the reader thread observes EOF and exits
-    let _ = reader_thread.join();
+    drop(pair.master); // close master; the detached reader thread will see EOF and exit
     cleanup_invocation(&inv);
     outcome
+}
+
+/// SIGKILL the PTY child's process group, then the child directly (fallback when the
+/// group kill missed), then poll-reap briefly. Never blocks on a bare `wait()` (H2).
+async fn pty_force_kill_and_reap(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    pid: Option<u32>,
+) {
+    if let Some(p) = pid {
+        sigkill_process_group_pid(p);
+    }
+    let _ = child.kill(); // portable-pty fallback in case the pgid kill missed
+    for _ in 0..50u32 {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+/// Wait for the PTY child to exit within `grace`, polling `try_wait` (never a blocking
+/// `wait()` — H2). If it doesn't exit in time, force-kill it and return `None`.
+async fn pty_wait_bounded(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    pid: Option<u32>,
+    grace: Duration,
+) -> Option<portable_pty::ExitStatus> {
+    let ticks = (grace.as_millis() / 100).max(1);
+    for _ in 0..ticks {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(_) => return None,
+        }
+    }
+    pty_force_kill_and_reap(child, pid).await;
+    None
 }
 
 // ---------------------------------------------------------------------------
