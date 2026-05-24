@@ -277,6 +277,61 @@ pub(crate) async fn run_agy_cli_process_with_session(
 }
 
 // ---------------------------------------------------------------------------
+// Health probe (REQ-056)
+// ---------------------------------------------------------------------------
+
+/// Run one agy health probe through the SAME capture path used in production and
+/// record the classified outcome (REQ-056). A degraded/failed result is recorded for
+/// the `/health` surface and logged WARN; it never affects request traffic. Surfaces
+/// the silent stdout-drop regression that real traffic cannot detect (an empty answer
+/// is legitimate on the request path but a red flag for a known-non-empty probe).
+pub(crate) async fn health_probe() {
+    use mcp_bridge::agy_resilience::{AgyProbeOutcome, agy_record_health};
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let (bin, args) = mcp_bridge::agy_command();
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+
+    match run_agy_cli_process_with_session(
+        &bin,
+        &args,
+        "What is 2+2? Reply with only the digit.",
+        &cwd,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(parsed) if parsed.response_text.contains('4') => {
+            agy_record_health(AgyProbeOutcome::Ok, "probe returned 4", now_ms);
+        }
+        Ok(parsed) => {
+            // Non-empty but unexpected — backend alive, capture working.
+            agy_record_health(
+                AgyProbeOutcome::Ok,
+                format!("probe alive (unexpected text: {:.40})", parsed.response_text),
+                now_ms,
+            );
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // run_agy_cli_process_with_session surfaces a persistent exit-0-empty as
+            // "empty output" after its retry → a capture-drop regression (REQ-024/056).
+            if msg.contains("empty output") {
+                tracing::warn!("agy health: capture DEGRADED — {msg}");
+                agy_record_health(AgyProbeOutcome::CaptureDegraded, msg, now_ms);
+            } else {
+                tracing::warn!("agy health: backend FAILED — {msg}");
+                agy_record_health(AgyProbeOutcome::BackendFailed, msg, now_ms);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // One subprocess run (pipe capture + SIGKILL-process-group timeout)
 // ---------------------------------------------------------------------------
 

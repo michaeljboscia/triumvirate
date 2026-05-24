@@ -272,6 +272,83 @@ pub fn agy_breaker_record_other_failure() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Health probe state (REQ-056)
+// ---------------------------------------------------------------------------
+
+/// How often the daemon runs the agy health probe (default 300s).
+pub fn agy_health_probe_interval() -> Duration {
+    std::env::var("TRIUMVIRATE_AGY_HEALTH_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(300))
+}
+
+/// Classified outcome of a health probe (REQ-056).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgyProbeOutcome {
+    /// Non-empty expected output → healthy.
+    Ok,
+    /// Exit 0 but empty output — the silent stdout-drop regression that production
+    /// traffic cannot distinguish from a legitimate empty answer.
+    CaptureDegraded,
+    /// Non-zero exit / classified backend error.
+    BackendFailed,
+}
+
+/// Snapshot of the last agy health probe, surfaced via the daemon `/health` endpoint.
+#[derive(Debug, Clone)]
+pub struct AgyHealthSnapshot {
+    pub capture_health: String,
+    pub backend_health: String,
+    pub detail: String,
+    pub last_probe_unix_ms: Option<u128>,
+}
+
+impl Default for AgyHealthSnapshot {
+    fn default() -> Self {
+        Self {
+            capture_health: "unknown".to_string(),
+            backend_health: "unknown".to_string(),
+            detail: "no probe run yet".to_string(),
+            last_probe_unix_ms: None,
+        }
+    }
+}
+
+fn health_state() -> &'static Mutex<AgyHealthSnapshot> {
+    static H: OnceLock<Mutex<AgyHealthSnapshot>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(AgyHealthSnapshot::default()))
+}
+
+/// Record the result of a health probe (REQ-056). A capture-degraded result leaves
+/// `backend_health` ok (the process ran), and vice versa.
+pub fn agy_record_health(outcome: AgyProbeOutcome, detail: impl Into<String>, now_unix_ms: u128) {
+    let mut h = health_state().lock().expect("agy health poisoned");
+    h.detail = detail.into();
+    h.last_probe_unix_ms = Some(now_unix_ms);
+    match outcome {
+        AgyProbeOutcome::Ok => {
+            h.capture_health = "ok".to_string();
+            h.backend_health = "ok".to_string();
+        }
+        AgyProbeOutcome::CaptureDegraded => {
+            h.capture_health = "degraded".to_string();
+            h.backend_health = "ok".to_string();
+        }
+        AgyProbeOutcome::BackendFailed => {
+            h.backend_health = "failed".to_string();
+        }
+    }
+}
+
+/// Read the latest agy health snapshot for the `/health` surface.
+pub fn agy_health_snapshot() -> AgyHealthSnapshot {
+    health_state().lock().expect("agy health poisoned").clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +407,24 @@ mod tests {
         assert!(!s.should_skip(t1)); // half-open
         s.record_quota(t1, 3, base); // probe fails → reopen, longer cooldown
         assert!(s.should_skip(t1 + Duration::from_secs(121)), "still open with longer cooldown");
+    }
+
+    #[test]
+    fn health_capture_degraded_keeps_backend_ok() {
+        // The global health state is only mutated here, so the sequence is deterministic.
+        agy_record_health(AgyProbeOutcome::Ok, "probe ok", 100);
+        let ok = agy_health_snapshot();
+        assert_eq!(ok.capture_health, "ok");
+        assert_eq!(ok.backend_health, "ok");
+
+        agy_record_health(AgyProbeOutcome::CaptureDegraded, "empty output", 200);
+        let degraded = agy_health_snapshot();
+        assert_eq!(degraded.capture_health, "degraded");
+        assert_eq!(degraded.backend_health, "ok", "an empty answer is not a backend failure");
+        assert_eq!(degraded.last_probe_unix_ms, Some(200));
+
+        agy_record_health(AgyProbeOutcome::BackendFailed, "exit 2", 300);
+        assert_eq!(agy_health_snapshot().backend_health, "failed");
     }
 
     #[test]
