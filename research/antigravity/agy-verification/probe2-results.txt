@@ -1,0 +1,8 @@
+#1: OK elapsed=6.3s out=b'4' err=b''
+#2: OK elapsed=6.8s out=b'4' err=b''
+#3: OK elapsed=6.6s out=b'4' err=b''
+#4: OK elapsed=6.7s out=b'4' err=b''
+#5: OK elapsed=5.9s out=b'4' err=b''
+#6: OK elapsed=5.8s out=b'4' err=b''
+
+SUMMARY: 6/6 clean, 0/6 hung (killed at 40s)
