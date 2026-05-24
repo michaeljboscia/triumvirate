@@ -330,6 +330,22 @@ mod tests {
     }
 
     #[test]
+    fn gemini_backend_defaults_to_gemini_cli_and_only_agy_selects_agy() {
+        // REQ-001/002 + REQ-083 rollback config: unset or ANY non-"agy" value is the
+        // legacy gemini-cli path; only exactly "agy" selects the agy backend.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "agy") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::Agy);
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "anything-else") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
+    }
+
+    #[test]
     fn default_name_is_stable() {
         let info = super::BridgeInfo::default();
         assert_eq!(info.name, "triumvirate-mcp-bridge");
