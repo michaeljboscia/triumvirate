@@ -15,7 +15,7 @@ use daemon_core::{resolve_context as core_resolve_context, unix_time_ms as core_
 use ledger::LedgerStore;
 use mcp_bridge::{
     GeminiBackend, agent_verbosity, agy_command, codex_command, codex_protocol, gemini_backend,
-    gemini_command, gemini_streaming_enabled, is_supported_agent,
+    gemini_command, gemini_shadow_enabled, gemini_streaming_enabled, is_supported_agent,
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
@@ -380,6 +380,14 @@ pub(crate) async fn execute_ask_agent(
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
 
+    // Slice 6 (shadow-compare): the OTHER Gemini backend to run alongside the primary
+    // for comparison when TRIUMVIRATE_GEMINI_SHADOW is on. None disables shadowing.
+    let shadow_backend = if agent == "gemini" && gemini_shadow_enabled() {
+        gemini_backend_selected.map(GeminiBackend::shadow_counterpart)
+    } else {
+        None
+    };
+
     // REQ-101/103: if the agy circuit breaker is OPEN, skip the agy attempt and route
     // straight around it. The breaker opens on repeated quota, so the reason is set
     // quota-class → the degraded route skips gemini-cli (shared pool) and uses codex.
@@ -630,12 +638,33 @@ pub(crate) async fn execute_ask_agent(
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                     return Err(err);
                 }
+                // Slice 6: shadow-compare — run the other Gemini backend, attach + log.
+                let (sh_backend, sh_resp, sh_err, sh_ms) = if let Some(sb) = shadow_backend {
+                    let primary_label = gemini_backend_selected
+                        .map(GeminiBackend::as_str)
+                        .unwrap_or(agent.as_str());
+                    let (resp, err, ms) = run_gemini_shadow(sb, &execution_prompt, &exec_cwd).await;
+                    log_shadow_comparison(
+                        &request_id,
+                        &req.message,
+                        primary_label,
+                        &parsed.response_text,
+                        sb,
+                        &resp,
+                        &err,
+                        ms,
+                    );
+                    (Some(sb.as_str().to_string()), resp, err, Some(ms))
+                } else {
+                    (None, None, None, None)
+                };
                 return Ok(AskAgentResponse::direct(
                     request_id,
                     agent.clone(),
                     parsed.response_text,
                     lifecycle,
-                ));
+                )
+                .with_shadow(sh_backend, sh_resp, sh_err, sh_ms));
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -853,6 +882,10 @@ pub(crate) async fn execute_ask_agent(
                         answered_by_backend: Some(hop.backend.to_string()),
                         degraded_from_backend: Some("agy".to_string()),
                         degradation_reason: Some(reason.clone()),
+                        shadow_backend: None,
+                        shadow_response: None,
+                        shadow_error: None,
+                        shadow_latency_ms: None,
                     });
                 }
                 Ok(Err(e)) => {
@@ -1111,6 +1144,70 @@ async fn run_named_agent_with_session(
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
 ) -> anyhow::Result<ParsedAgentResult> {
     run_named_agent_with_session_and_model(agent, message, cwd, session_id, events_tx, None).await
+}
+
+/// Run the shadow Gemini backend (the non-primary one) for comparison and return its
+/// (response, error, latency_ms). Shadow-compare mode (Slice 6). Best-effort: it never
+/// affects the primary result — failures are captured, not propagated — and it does NOT
+/// feed the circuit breaker (an observation, not a routing decision).
+async fn run_gemini_shadow(
+    shadow_backend: GeminiBackend,
+    prompt: &str,
+    cwd: &str,
+) -> (Option<String>, Option<String>, u64) {
+    let started = Instant::now();
+    let result = match shadow_backend {
+        GeminiBackend::Agy => {
+            let (bin, args) = agy_command();
+            crate::agy::run_agy_cli_process_with_session(&bin, &args, prompt, cwd, None, None).await
+        }
+        GeminiBackend::GeminiCli => {
+            let (bin, args) = gemini_command();
+            run_gemini_cli_process_with_session(&bin, &args, prompt, cwd, None, None).await
+        }
+    };
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(parsed) => (Some(parsed.response_text), None, latency_ms),
+        Err(e) => (None, Some(e.to_string()), latency_ms),
+    }
+}
+
+/// Append a shadow-compare record to `<triumvirate_home>/agy-shadow-compare.jsonl` for
+/// offline review (Slice 6). Best-effort; logging failures are swallowed.
+#[allow(clippy::too_many_arguments)]
+fn log_shadow_comparison(
+    request_id: &str,
+    prompt: &str,
+    primary_backend: &str,
+    primary_response: &str,
+    shadow_backend: GeminiBackend,
+    shadow_response: &Option<String>,
+    shadow_error: &Option<String>,
+    shadow_latency_ms: u64,
+) {
+    let Ok(home) = daemon_core::triumvirate_home_dir() else {
+        return;
+    };
+    let record = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "request_id": request_id,
+        "prompt": prompt,
+        "primary_backend": primary_backend,
+        "primary_response": primary_response,
+        "shadow_backend": shadow_backend.as_str(),
+        "shadow_response": shadow_response,
+        "shadow_error": shadow_error,
+        "shadow_latency_ms": shadow_latency_ms,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("agy-shadow-compare.jsonl"))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{record}");
+    }
 }
 
 async fn run_named_agent_with_session_and_model(
