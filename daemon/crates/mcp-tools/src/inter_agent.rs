@@ -144,15 +144,19 @@ pub async fn ask_session(
             .map_err(|e| format!("ask_session via daemon failed: {e}"));
     }
 
-    let (agent, cwd) = {
+    let (agent, cwd, had_history) = {
         let mut sessions = sessions.lock().await;
         let state = sessions
             .get_mut(&req.name)
             .ok_or_else(|| format!("session '{}' not found", req.name))?;
-        (state.agent.clone(), state.cwd.clone())
+        (
+            state.agent.clone(),
+            state.cwd.clone(),
+            !state.history.is_empty(),
+        )
     };
 
-    let response = execute_ask_agent(
+    let mut response = execute_ask_agent(
         &AskAgentRequest {
             agent: agent.clone(),
             message: req.message.clone(),
@@ -165,6 +169,18 @@ pub async fn ask_session(
     .await
     .map_err(|e| format!("ask_session failed: {e}"))?
     .response;
+
+    // REQ-044: the agy backend is single-turn. When a follow-up to a named Gemini
+    // session cannot carry the earlier turns, say so — never silently fake continuity.
+    // Only on turn 2+ (turn 1 has no prior context to lose).
+    if agent == "gemini"
+        && had_history
+        && mcp_bridge::gemini_backend() == mcp_bridge::GeminiBackend::Agy
+    {
+        response = format!(
+            "⚠ Multi-turn memory is not available for the Gemini sibling under the agy backend — this answer does not carry the earlier turns of this session.\n\n{response}"
+        );
+    }
 
     let mut sessions = sessions.lock().await;
     if let Some(state) = sessions.get_mut(&req.name) {
