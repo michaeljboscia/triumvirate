@@ -209,6 +209,11 @@ pub(crate) async fn run_agy_cli_process_with_session(
         tracing::debug!("agy backend is single-turn; ignoring inbound session_id");
     }
 
+    // REQ-055/102: bound global concurrency + call rate across ALL agy callers (ask
+    // path + fleet). The permit is held for the lifetime of this dispatch.
+    let _slot = mcp_bridge::agy_resilience::agy_acquire_slot().await;
+    mcp_bridge::agy_resilience::agy_rate_limit().await;
+
     emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::TurnStarted, "turn started (agy)"));
 
     let print_timeout = agy_connector_timeout();
