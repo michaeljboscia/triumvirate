@@ -2947,6 +2947,72 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
     }
 
     #[tokio::test]
+    async fn rollback_gemini_cli_receives_stream_json_and_parses_ndjson() -> anyhow::Result<()> {
+        // REQ-083: with the backend explicitly set to gemini-cli (rollback), the
+        // gemini-cli path still passes `-o stream-json` AND parses the NDJSON stream —
+        // i.e. the selector did NOT route to agy. A non-"mock-" script name forces the
+        // real `run_gemini_cli_process_with_session` (not the test mock connector).
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let argv_file = std::env::temp_dir().join(format!("gemini-rollback-argv-{now}.txt"));
+        let script_path = std::env::temp_dir().join(format!("gemini-rollback-{now}.sh"));
+        let script = format!(
+            "#!/bin/sh\n\
+echo \"$@\" > \"{argv}\"\n\
+echo '{{\"type\":\"init\",\"session_id\":\"sess-rollback\",\"model\":\"gemini-2.5-pro\"}}'\n\
+echo '{{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"rollback NDJSON parsed OK\"}}'\n\
+echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}}'\n",
+            argv = argv_file.display()
+        );
+        fs::write(&script_path, &script)?;
+        let mut perms = fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms)?;
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
+        }
+
+        let resp = crate::agent_exec::execute_ask_agent(
+            &shared_types::AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: "test message".to_string(),
+                cwd: Some("/tmp".to_string()),
+                repo: None,
+                branch: None,
+            },
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("execute_ask_agent failed: {e}"))?;
+
+        // The NDJSON was parsed by the real GeminiStreamParser (not agy plain text).
+        assert!(
+            resp.response.contains("rollback NDJSON parsed OK"),
+            "expected parsed NDJSON, got: {}",
+            resp.response
+        );
+        // The gemini-cli path passed `-o stream-json` (REQ-083).
+        let argv = fs::read_to_string(&argv_file)?;
+        assert!(
+            argv.contains("-o") && argv.contains("stream-json"),
+            "gemini-cli must receive -o stream-json; argv was: {argv}"
+        );
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
+        }
+        let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&argv_file);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ask_agent_gemini_injects_tool_marker_instructions() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_mock_gemini_marker_probe_script()?;

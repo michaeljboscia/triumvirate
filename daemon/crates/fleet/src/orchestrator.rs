@@ -322,6 +322,16 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let worktree_path = worktree_paths[join_handles.len()].clone();
             let jh = tokio::spawn(async move {
                 tracing::info!(fleet_id = %fleet_id, task_id = %task_id, agent = %agent_name, "launching fleet agent subprocess");
+                // REQ-055: hold a shared agy concurrency slot for the lifetime of this
+                // child, so fleet's agy fan-out is bounded by the SAME global cap as the
+                // ask path (not unbounded against the shared quota pool).
+                let _agy_slot = if agent_name == "gemini"
+                    && mcp_bridge::gemini_backend() == mcp_bridge::GeminiBackend::Agy
+                {
+                    Some(mcp_bridge::agy_resilience::agy_acquire_slot().await)
+                } else {
+                    None
+                };
                 let launch_result = launcher
                     .launch(&agent_name, &project_root, &worktree_path, &task_prompt)
                     .await;
@@ -366,34 +376,83 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 }
                             }
                             Ok(status) => {
-                                tracing::error!(
-                                    fleet_id = %fleet_id,
-                                    task_id = %task_id,
-                                    agent = %agent_name,
-                                    code = status.code(),
-                                    "fleet agent subprocess failed"
-                                );
-                                let db_path = project_root.join(".triumvirate").join("ledger.db");
-                                if let Ok(conn) = rusqlite::Connection::open(db_path) {
-                                    let _ = conn.execute(
-                                        "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
-                                        [task_id.as_str()],
+                                // REQ-092: degraded route — when an agy gemini task fails,
+                                // degrade to codex (cross-provider) before failing loud.
+                                // Fleet doesn't capture output to classify quota, so it
+                                // skips the shared-pool gemini-cli and goes straight to
+                                // codex, which is the safe always-available fallback.
+                                let mut degraded_ok = false;
+                                if agent_name == "gemini"
+                                    && mcp_bridge::gemini_backend()
+                                        == mcp_bridge::GeminiBackend::Agy
+                                {
+                                    tracing::warn!(
+                                        fleet_id = %fleet_id,
+                                        task_id = %task_id,
+                                        code = status.code(),
+                                        "agy fleet task failed; degrading to codex"
                                     );
+                                    let codex_ok = match launcher
+                                        .launch("codex", &project_root, &worktree_path, &task_prompt)
+                                        .await
+                                    {
+                                        Ok(mut codex_child) => {
+                                            matches!(codex_child.wait().await, Ok(s) if s.success())
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "fleet codex degraded launch failed");
+                                            false
+                                        }
+                                    };
+                                    if codex_ok {
+                                        degraded_ok = true;
+                                        tracing::info!(fleet_id = %fleet_id, task_id = %task_id, "fleet task completed by codex (degraded from agy)");
+                                        if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
+                                            let _ = task_store.complete_task(&task_id);
+                                        }
+                                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
+                                            let seq = event_sequence_for(&project_root, &fleet_id, "task_completed").unwrap_or(1);
+                                            let _ = store.ingest_event(RawEvent {
+                                                session_id: fleet_id.clone(),
+                                                event_type: "task_completed".to_string(),
+                                                sequence: seq,
+                                                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                                payload_json: serde_json::json!({"task_id": task_id, "agent": "codex", "degraded_from": "agy"}).to_string(),
+                                            });
+                                        }
+                                    }
                                 }
-                                if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                    let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                        .unwrap_or(1);
-                                    let _ = store.ingest_event(RawEvent {
-                                        session_id: fleet_id.clone(),
-                                        event_type: "task_failed".to_string(),
-                                        sequence,
-                                        timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                        payload_json: serde_json::json!({
-                                            "task_id": task_id,
-                                            "error": format!("agent exited with status {:?}", status.code()),
-                                        })
-                                        .to_string(),
-                                    });
+
+                                if !degraded_ok {
+                                    tracing::error!(
+                                        fleet_id = %fleet_id,
+                                        task_id = %task_id,
+                                        agent = %agent_name,
+                                        code = status.code(),
+                                        "fleet agent subprocess failed"
+                                    );
+                                    let db_path = project_root.join(".triumvirate").join("ledger.db");
+                                    if let Ok(conn) = rusqlite::Connection::open(db_path) {
+                                        let _ = conn.execute(
+                                            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
+                                            [task_id.as_str()],
+                                        );
+                                    }
+                                    if let Ok(store) = LedgerStore::open(project_root.clone()) {
+                                        let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
+                                            .unwrap_or(1);
+                                        let _ = store.ingest_event(RawEvent {
+                                            session_id: fleet_id.clone(),
+                                            event_type: "task_failed".to_string(),
+                                            sequence,
+                                            timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                            payload_json: serde_json::json!({
+                                                "task_id": task_id,
+                                                "error": format!("agent exited with status {:?}", status.code()),
+                                            })
+                                            .to_string(),
+                                        });
+                                    }
                                 }
                             }
                             Err(err) => {
