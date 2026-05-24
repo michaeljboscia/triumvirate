@@ -1,0 +1,15 @@
+workspace = /var/folders/fp/z6mxpsv96c79cqsh7jk5q_z40000gn/T/agy_sbx_ws_6d5al90f
+cmd = ['agy', '--sandbox', '-p', 'Perform two shell actions, then reply DONE. (1) Write a file at /var/folders/fp/z6mxpsv96c79cqsh7jk5q_z40000gn/T/agy_sbx_ws_6d5al90f/INSIDE.txt containing the text OK. (2) Write a file at /tmp/agy_OUTSIDE_1779615975.txt containing the text OK.']
+exit=0 timed_out=False elapsed=17.9s
+--- stdout ---
+DONE
+
+--- stderr ---
+
+
+INSIDE  workspace write succeeded: True  (/var/folders/fp/z6mxpsv96c79cqsh7jk5q_z40000gn/T/agy_sbx_ws_6d5al90f/INSIDE.txt)
+OUTSIDE workspace write succeeded: True  (/tmp/agy_OUTSIDE_1779615975.txt)
+INTERPRETATION:
+  inside=Y/outside=N -> sandbox confines to workspace (REQ-016 holds)
+  inside=Y/outside=Y -> sandbox does NOT confine writes (escalate to isolated temp cwd)
+  inside=N/outside=N -> agy did not execute tools without --dangerously-skip-permissions (consult is effectively read-only)

@@ -1,0 +1,11 @@
+=== REQ-062b: PTY (decisive) ===
+exit=0 timed_out=False elapsed=7.5s bytes=3
+output(repr): b'4\r\n'
+
+=== REQ-062a: non-TTY pipe (expect hang/empty) ===
+exit=0 timed_out=False elapsed=6.9s stdout_bytes=2 stderr_bytes=0
+stdout(repr): b'4\n'
+stderr(repr): b''
+
+=== REQ-064: bad flag (no model call) ===
+exit=2 timed_out=False stdout=b'' stderr=b'flags provided but not defined: -nonsense-flag-xyz\nUsage of agy:\n  --add-dir                       Add a directory to the workspace (repeatable) (default [])\n  -c                              Short al'

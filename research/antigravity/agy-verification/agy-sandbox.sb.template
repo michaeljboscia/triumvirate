@@ -1,0 +1,18 @@
+;; Triumvirate sandbox-exec profile for the agy (Antigravity CLI) backend — VERIFIED 2026-05-24 (probe4).
+;; Constrains WRITES, leaves READS + network open (so staged artifacts/repo are readable, API reachable).
+;; Placeholders (@WORKSPACE@, @HOME@, @TMPDIR@, @EXTRA_WRITABLE@) are substituted per dispatch.
+;; Verified: blocked an out-of-home-root write even when agy tried built-in file tool + shell + python;
+;; allowed reading a staged artifact outside the workspace; allowed network; agy ran normally.
+;; NOTE: sandbox-exec is deprecated by Apple but functional (agy's own --sandbox uses it too).
+(version 1)
+(allow default)
+(deny file-write*)
+;; --- writable allowlist ---
+(allow file-write* (subpath "@WORKSPACE@"))            ;; the dispatch's working dir
+(allow file-write* (subpath "@HOME@/.gemini"))         ;; agy state: creds, settings, history, projects
+(allow file-write* (subpath "@HOME@/.antigravitycli")) ;; agy transcript symlinks
+(allow file-write* (subpath "@TMPDIR@"))               ;; per-user temp (env TMPDIR)
+(allow file-write* (subpath "/private/var/folders"))   ;; macOS temp root
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/dtracehelper") (literal "/dev/tty"))
+;; @EXTRA_WRITABLE@  <- per-workflow output dirs injected here, e.g. (allow file-write* (subpath "/path/to/out"))
