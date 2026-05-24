@@ -289,6 +289,23 @@ impl GeminiBackend {
     }
 }
 
+/// The verified-good agy version the backend expects (REQ-059). Defaults to the
+/// last version verified against the live binary (1.0.2). On mismatch the backend
+/// warns, or refuses under `agy_strict_version()`.
+#[instrument(skip_all)]
+pub fn agy_expected_version() -> String {
+    std::env::var("TRIUMVIRATE_AGY_EXPECTED_VERSION").unwrap_or_else(|_| "1.0.2".to_string())
+}
+
+/// Whether an agy version mismatch refuses the backend (vs. warn only). REQ-059.
+#[instrument(skip_all)]
+pub fn agy_strict_version() -> bool {
+    std::env::var("TRIUMVIRATE_AGY_STRICT_VERSION")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
 #[instrument(skip_all)]
 pub fn agent_verbosity() -> AgentVerbosity {
     let raw = std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok();

@@ -7,7 +7,7 @@ use daemon_core::{
 use daemon_http::{fetch_daemon_status, fetch_daemon_status_snapshot};
 use fallback_outbox::{count_pending_fallbacks, list_pending_fallback_paths};
 use ledger::LedgerStore;
-use mcp_bridge::{daemon_base_url, daemon_status_url};
+use mcp_bridge::{agy_command, agy_expected_version, daemon_base_url, daemon_status_url};
 use shared_types::{DaemonHealthResponse, DaemonStatusSnapshot};
 use std::{fs, io::Write as _};
 
@@ -128,6 +128,39 @@ pub(crate) async fn run_doctor() -> anyhow::Result<()> {
         "  last_event_recent: {} (events_last_5min={events_last_5min})",
         if events_last_5min > 0 { "PASS" } else { "FAIL" }
     ))?;
+
+    // AGY backend readiness (REQ-059). Runs a real `agy -p "2+2"` probe — success
+    // proves OAuth + capture both work non-interactively (covers the spec's OAuth and
+    // PTY-probe checks). Costs one quota call.
+    let (agy_bin, _) = agy_command();
+    let expected_version = agy_expected_version();
+    write_line_stdout("AGY backend:")?;
+    write_line_stdout(&format!("  agy_bin: {agy_bin}"))?;
+    match crate::agy::agy_installed_version() {
+        Ok(installed) => {
+            let matches = installed == expected_version;
+            write_line_stdout(&format!(
+                "  version: {} (installed={installed}, expected={expected_version})",
+                if matches { "PASS" } else { "WARN" }
+            ))?;
+            match crate::agy::doctor_probe().await {
+                Ok(resp) if resp.contains('4') => {
+                    write_line_stdout("  probe (agy -p \"2+2\"): PASS (oauth + capture ok)")?;
+                }
+                Ok(resp) => {
+                    let snippet = resp.replace('\n', " ");
+                    let snippet: String = snippet.chars().take(60).collect();
+                    write_line_stdout(&format!("  probe (agy -p \"2+2\"): WARN (no '4' in: {snippet})"))?;
+                }
+                Err(e) => {
+                    write_line_stdout(&format!("  probe (agy -p \"2+2\"): FAIL ({e})"))?;
+                }
+            }
+        }
+        Err(e) => {
+            write_line_stdout(&format!("  binary_runnable: FAIL ({e})"))?;
+        }
+    }
     Ok(())
 }
 
