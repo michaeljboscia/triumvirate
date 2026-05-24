@@ -267,6 +267,28 @@ pub fn agy_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_AGY_BIN", "TRIUMVIRATE_AGY_ARGS", "agy")
 }
 
+/// Shadow-compare mode (Slice 6, opt-in via `TRIUMVIRATE_GEMINI_SHADOW`). When on,
+/// every `gemini` request ALSO dispatches the other Gemini backend for comparison;
+/// the primary still answers. Off by default — it doubles usage of the shared Google
+/// quota pool, so it is a validation tool, not steady-state.
+#[instrument(skip_all)]
+pub fn gemini_shadow_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_GEMINI_SHADOW")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+impl GeminiBackend {
+    /// The other Gemini backend — the one shadow-compare runs alongside this primary.
+    pub fn shadow_counterpart(self) -> GeminiBackend {
+        match self {
+            GeminiBackend::GeminiCli => GeminiBackend::Agy,
+            GeminiBackend::Agy => GeminiBackend::GeminiCli,
+        }
+    }
+}
+
 #[instrument(skip_all)]
 pub fn agent_verbosity() -> AgentVerbosity {
     let raw = std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok();
@@ -343,6 +365,30 @@ mod tests {
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "anything-else") };
         assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
+    }
+
+    #[test]
+    fn shadow_counterpart_is_the_other_backend() {
+        assert_eq!(
+            super::GeminiBackend::GeminiCli.shadow_counterpart(),
+            super::GeminiBackend::Agy
+        );
+        assert_eq!(
+            super::GeminiBackend::Agy.shadow_counterpart(),
+            super::GeminiBackend::GeminiCli
+        );
+    }
+
+    #[test]
+    fn gemini_shadow_is_opt_in() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_SHADOW") };
+        assert!(!super::gemini_shadow_enabled(), "off by default");
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_SHADOW", "on") };
+        assert!(super::gemini_shadow_enabled());
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_SHADOW", "0") };
+        assert!(!super::gemini_shadow_enabled());
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_SHADOW") };
     }
 
     #[test]

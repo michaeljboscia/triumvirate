@@ -56,6 +56,18 @@ pub struct AskAgentResponse {
     pub degraded_from_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<String>,
+    /// Shadow-compare mode (opt-in, TRIUMVIRATE_GEMINI_SHADOW): the OTHER Gemini
+    /// backend ran alongside the primary for comparison. `.response` is still the
+    /// primary's answer; these carry the shadow's answer/latency/error so the caller
+    /// can compare the two backends on real traffic. Omitted from the wire when off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_latency_ms: Option<u64>,
 }
 
 impl AskAgentResponse {
@@ -75,7 +87,26 @@ impl AskAgentResponse {
             answered_by_backend: None,
             degraded_from_backend: None,
             degradation_reason: None,
+            shadow_backend: None,
+            shadow_response: None,
+            shadow_error: None,
+            shadow_latency_ms: None,
         }
+    }
+
+    /// Attach shadow-compare results to a response (Slice 6 / shadow mode).
+    pub fn with_shadow(
+        mut self,
+        backend: Option<String>,
+        response: Option<String>,
+        error: Option<String>,
+        latency_ms: Option<u64>,
+    ) -> Self {
+        self.shadow_backend = backend;
+        self.shadow_response = response;
+        self.shadow_error = error;
+        self.shadow_latency_ms = latency_ms;
+        self
     }
 }
 
