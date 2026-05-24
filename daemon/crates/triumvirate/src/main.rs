@@ -2557,7 +2557,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_agent_emits_progress_notifications() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_mock_agent_script("gemini", 1.0)?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -2887,7 +2887,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_gemini_happy_path_returns_lifecycle() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_mock_gemini_script()?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -2948,7 +2948,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_gemini_injects_tool_marker_instructions() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_mock_gemini_marker_probe_script()?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -2999,7 +2999,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_codex_happy_path_returns_lifecycle() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_mock_agent_script("codex", 0.0)?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -3059,7 +3059,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_retries_and_recovers() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_retry_agent_script("gemini")?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -3112,7 +3112,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_codex_adds_full_auto_only_when_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home = std::env::temp_dir().join(format!("triumvirate-codex-full-auto-{now}"));
         fs::create_dir_all(&test_home)?;
@@ -3159,7 +3159,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_codex_auto_approve_writes_ledger_record() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home =
             std::env::temp_dir().join(format!("triumvirate-codex-auto-approve-ledger-{now}"));
@@ -3203,7 +3203,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_invalid_stale_session_recovers_with_fresh_spawn() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_worker_registry_for_tests().await;
         let script_path = write_invalid_session_recovery_script("gemini")?;
         // SAFETY: test controls env var lifecycle under lock.
@@ -3248,7 +3248,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_requires_peer_review_when_env_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_mock_gemini_script()?;
         let temp = tempfile::tempdir()?;
         let project_root = temp.path().join("peer-review-required");
@@ -3335,7 +3335,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn persistent_worker_reuse_second_call_is_faster_and_marked_reused() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_worker_registry_for_tests().await;
         let script_path = write_mock_worker_warm_script("gemini")?;
         // SAFETY: test controls env var lifecycle under lock.
@@ -3391,7 +3391,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn session_lifecycle_spawn_ask_list_dismiss() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let gemini_script = write_mock_agent_script("gemini", 0.0)?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -3474,7 +3474,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn get_status_reports_active_sessions() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:7777") };
 
@@ -3522,7 +3522,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn get_status_includes_pending_fallback_tickets() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -3566,7 +3566,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn get_status_reports_total_pending_even_when_ticket_list_is_truncated() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -3592,7 +3592,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn get_status_uses_daemon_snapshot_when_proxy_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -3661,7 +3661,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn get_status_falls_back_local_when_daemon_snapshot_unreachable() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -3705,7 +3705,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[test]
     fn daemon_token_is_created_and_reused() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -3760,7 +3760,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[test]
     fn daemon_autostart_attempt_is_one_shot() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_daemon_autostart_flag_for_tests();
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -3817,7 +3817,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn daemon_health_uses_bearer_token() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -3964,7 +3964,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn fetch_daemon_ask_agent_uses_bearer_token() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4041,7 +4041,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn mcp_ask_agent_uses_daemon_when_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4141,7 +4141,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn mcp_ask_agent_returns_daemon_recovery_error_when_unreachable() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4207,7 +4207,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
     #[cfg(any())]
     #[tokio::test]
     async fn mcp_memory_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4357,7 +4357,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn mcp_scratchpad_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4496,7 +4496,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn mcp_fallback_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4645,7 +4645,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn mcp_fallback_gc_uses_daemon_when_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4736,7 +4736,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn mcp_outbox_recent_uses_daemon_when_enabled() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4844,7 +4844,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
     #[cfg(any())]
     #[tokio::test]
     async fn ask_agent_writes_outbox_events() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4927,7 +4927,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ask_agent_failure_creates_dead_drop_ticket() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4974,7 +4974,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[test]
     fn count_pending_fallbacks_reads_dead_drop_directory() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -4997,7 +4997,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn memory_write_and_read_roundtrip() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5035,7 +5035,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn scratchpad_write_and_list_roundtrip() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5072,7 +5072,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn outbox_recent_returns_latest_events() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5126,7 +5126,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn fallback_list_and_ack_roundtrip() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5169,7 +5169,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
     #[cfg(any())]
     #[test]
     fn fallback_ack_rejects_paths_outside_dead_drop() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5195,7 +5195,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn fallback_gc_removes_stale_tickets() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5231,7 +5231,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn sessions_persist_across_bridge_instances() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5280,7 +5280,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ledger_record_and_query_tools_round_trip() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -5318,7 +5318,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn ledger_gc_tool_returns_gc_counts() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -5342,7 +5342,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn lesson_tools_round_trip() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -5402,7 +5402,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn fleet_spawn_and_status_tools_round_trip() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -5479,7 +5479,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn review_tools_round_trip() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -5529,7 +5529,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn abe_phase1_dispatch_poll_output_review_and_cancel() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let project_root = std::env::temp_dir().join(format!("triumvirate-abe-phase1-{now}"));
@@ -5724,7 +5724,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
 
     #[tokio::test]
     async fn abe_red_team_enforcement_blocks_non_compliant_worker() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let project_root = std::env::temp_dir().join(format!("triumvirate-abe-red-team-{now}"));
