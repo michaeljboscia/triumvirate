@@ -240,6 +240,13 @@ pub(crate) async fn execute_ask_agent(
         return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
     }
     let agent = req.agent.to_lowercase();
+    // REQ-001: resolve the gemini backend once, up front — it drives both the attempt
+    // schedule (agy is single-attempt, REQ-013) and the degraded route (REQ-053).
+    let gemini_backend_selected = if agent == "gemini" {
+        Some(gemini_backend())
+    } else {
+        None
+    };
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
@@ -332,20 +339,26 @@ pub(crate) async fn execute_ask_agent(
         emitter.emit(format!("→ {agent_display}: working...")).await;
     }
 
-    // Build the attempt schedule: for gemini, use model faildown chain; for others, 3 retries.
+    // Build the attempt schedule: for gemini-cli, use the model faildown chain; for
+    // the agy backend, a single attempt with no --model (REQ-013 — agy ignores
+    // --model and runs its own internal retry); for others, 3 retries.
     let attempt_schedule: Vec<(Duration, Option<&str>)> = if agent == "gemini" {
-        GEMINI_MODEL_FAILDOWN
-            .iter()
-            .enumerate()
-            .map(|(i, model)| {
-                let backoff = if i == 0 {
-                    Duration::ZERO
-                } else {
-                    Duration::from_millis(500)
-                };
-                (backoff, Some(*model))
-            })
-            .collect()
+        if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+            vec![(Duration::ZERO, None)]
+        } else {
+            GEMINI_MODEL_FAILDOWN
+                .iter()
+                .enumerate()
+                .map(|(i, model)| {
+                    let backoff = if i == 0 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(500)
+                    };
+                    (backoff, Some(*model))
+                })
+                .collect()
+        }
     } else {
         vec![
             (Duration::from_millis(250), None),
@@ -572,12 +585,12 @@ pub(crate) async fn execute_ask_agent(
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                     return Err(err);
                 }
-                return Ok(AskAgentResponse {
+                return Ok(AskAgentResponse::direct(
                     request_id,
-                    agent: agent.clone(),
-                    response: parsed.response_text,
+                    agent.clone(),
+                    parsed.response_text,
                     lifecycle,
-                });
+                ));
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -662,6 +675,144 @@ pub(crate) async fn execute_ask_agent(
                 }
                 last_err = Some(msg);
                 sleep(*backoff).await;
+            }
+        }
+    }
+
+    // REQ-053/054: degraded route. Fires only when the agy backend was selected and
+    // hard-failed (auth/exec/quota). Quota-class failures skip gemini-cli (shared
+    // quota pool) and go straight to codex. The public agent stays `gemini`; a
+    // successful hop returns with substitution-honesty fields + a one-line prefix.
+    if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+        let reason = last_err
+            .clone()
+            .unwrap_or_else(|| "agy backend failed".to_string());
+        let class = crate::agy::classify_failure_message(&reason);
+        let hops = crate::agy::plan_degraded_route(&crate::agy::degraded_route_env(), class);
+        let deadline = started + crate::agy::degraded_total_budget();
+        for hop in hops {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                lifecycle.push(LifecycleEvent {
+                    state: "DEGRADED_BUDGET_EXHAUSTED".to_string(),
+                    detail: "degraded route budget exhausted".to_string(),
+                });
+                break;
+            }
+            let hop_display = display_agent_name(hop.agent);
+            let degraded_detail =
+                format!("agy unavailable ({class:?}); routing to {} ({hop_display})", hop.backend);
+            lifecycle.push(LifecycleEvent {
+                state: "DEGRADED".to_string(),
+                detail: degraded_detail.clone(),
+            });
+            let _ = append_outbox_event(&OutboxEvent {
+                ts_ms: core_unix_time_ms(),
+                request_id: request_id.clone(),
+                tool: "ask_agent".to_string(),
+                status: "DEGRADED".to_string(),
+                agent: Some(agent.clone()),
+                detail: degraded_detail,
+                cwd: resolved_cwd.clone(),
+                repo: resolved_repo.clone(),
+                branch: resolved_branch.clone(),
+                working_state: Some("DEGRADED".to_string()),
+                token_usage: None,
+                tool_name: None,
+            });
+            if let Some(emitter) = progress.as_ref() {
+                emitter
+                    .emit(format!("→ {agent_display} unavailable — falling back to {}…", hop.backend))
+                    .await;
+            }
+
+            // Run the hop within the remaining budget. The gemini-cli hop bypasses the
+            // selector — dispatching agent="gemini" would re-select agy and loop.
+            let hop_result = match hop.backend {
+                "gemini-cli" => {
+                    let (bin, args) = gemini_command();
+                    timeout(
+                        remaining,
+                        run_gemini_cli_process_with_session(
+                            &bin, &args, &execution_prompt, &exec_cwd, None, None,
+                        ),
+                    )
+                    .await
+                }
+                _ => {
+                    timeout(
+                        remaining,
+                        run_named_agent_with_session_and_model(
+                            hop.agent, &execution_prompt, &exec_cwd, None, None, None,
+                        ),
+                    )
+                    .await
+                }
+            };
+
+            match hop_result {
+                Ok(Ok(parsed)) => {
+                    persist_daemon_token_record(
+                        hop.agent, &request_id, &parsed, &resolved_cwd, &resolved_repo,
+                    );
+                    let done_detail = format!("answered by {} (degraded from agy)", hop.backend);
+                    lifecycle.push(LifecycleEvent {
+                        state: "DONE".to_string(),
+                        detail: done_detail.clone(),
+                    });
+                    let _ = append_outbox_event(&OutboxEvent {
+                        ts_ms: core_unix_time_ms(),
+                        request_id: request_id.clone(),
+                        tool: "ask_agent".to_string(),
+                        status: "DONE".to_string(),
+                        agent: Some(agent.clone()),
+                        detail: done_detail,
+                        cwd: resolved_cwd.clone(),
+                        repo: resolved_repo.clone(),
+                        branch: resolved_branch.clone(),
+                        working_state: Some("DONE".to_string()),
+                        token_usage: None,
+                        tool_name: None,
+                    });
+                    if let Some(emitter) = progress.as_ref() {
+                        emitter.emit(format!("→ {hop_display}: responded ✓")).await;
+                    }
+                    span.record("agent.outcome", "degraded_success");
+                    span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+                    // REQ-053 R3: a text prefix only when a DIFFERENT agent answered
+                    // (codex). A gemini-cli hop is the same agent on the legacy backend,
+                    // so honesty lives in the fields/lifecycle, not an alarming prefix.
+                    let prefix = if hop.agent != agent {
+                        format!("⚠ Gemini unavailable — answered by {hop_display}\n\n")
+                    } else {
+                        String::new()
+                    };
+                    return Ok(AskAgentResponse {
+                        request_id,
+                        agent: agent.clone(),
+                        response: format!("{prefix}{}", parsed.response_text),
+                        lifecycle,
+                        answered_by_agent: Some(hop.agent.to_string()),
+                        answered_by_backend: Some(hop.backend.to_string()),
+                        degraded_from_backend: Some("agy".to_string()),
+                        degradation_reason: Some(reason.clone()),
+                    });
+                }
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    lifecycle.push(LifecycleEvent {
+                        state: "DEGRADED_FAILED".to_string(),
+                        detail: format!("{} hop failed: {msg}", hop.backend),
+                    });
+                    last_err = Some(msg);
+                }
+                Err(_) => {
+                    lifecycle.push(LifecycleEvent {
+                        state: "DEGRADED_TIMEOUT".to_string(),
+                        detail: format!("{} hop exceeded remaining degraded budget", hop.backend),
+                    });
+                    last_err = Some(format!("{} hop timed out", hop.backend));
+                }
             }
         }
     }

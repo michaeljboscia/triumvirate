@@ -3964,15 +3964,15 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
-            Ok(AxumJson(AskAgentResponse {
-                request_id: "daemon-req-1".to_string(),
-                agent: req.agent,
-                response: format!("daemon echo: {}", req.message),
-                lifecycle: vec![LifecycleEvent {
+            Ok(AxumJson(AskAgentResponse::direct(
+                "daemon-req-1".to_string(),
+                req.agent,
+                format!("daemon echo: {}", req.message),
+                vec![LifecycleEvent {
                     state: "DONE".to_string(),
                     detail: "served by daemon".to_string(),
                 }],
-            }))
+            )))
         }
 
         let app = Router::new()
@@ -4041,15 +4041,15 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
             if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
-            Ok(AxumJson(AskAgentResponse {
-                request_id: "daemon-req-3".to_string(),
-                agent: req.agent,
-                response: "daemon path used".to_string(),
-                lifecycle: vec![LifecycleEvent {
+            Ok(AxumJson(AskAgentResponse::direct(
+                "daemon-req-3".to_string(),
+                req.agent,
+                "daemon path used".to_string(),
+                vec![LifecycleEvent {
                     state: "DONE".to_string(),
                     detail: "daemon served".to_string(),
                 }],
-            }))
+            )))
         }
 
         let app = Router::new()
