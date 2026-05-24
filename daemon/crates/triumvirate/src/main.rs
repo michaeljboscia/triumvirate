@@ -2405,6 +2405,14 @@ async fn run_daemon() -> anyhow::Result<()> {
     tokio::spawn(async {
         prewarm_daemon_workers().await;
     });
+    // M9: periodically reap leaked agy temp files (the fleet path can't RAII-clean them
+    // because its child outlives the invocation). Cheap; runs regardless of backend.
+    tokio::spawn(async {
+        loop {
+            mcp_bridge::agy::sweep_stale_temp_files();
+            tokio::time::sleep(Duration::from_secs(1800)).await;
+        }
+    });
     // REQ-056: periodic agy health probe (only when the agy backend is selected). Runs
     // the production capture path and records capture/backend health for /health; never
     // touches request traffic, so it catches a silent stdout-drop regression that real

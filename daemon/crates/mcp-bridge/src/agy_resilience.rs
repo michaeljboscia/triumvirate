@@ -149,6 +149,9 @@ struct BreakerState {
     consecutive: u32,
     open_until: Option<Instant>,
     open_count: u32,
+    /// True while a single half-open probe is in flight; blocks a stampede of
+    /// concurrent probes the instant the cooldown elapses (H1).
+    half_open_inflight: bool,
 }
 
 impl BreakerState {
@@ -158,22 +161,34 @@ impl BreakerState {
             consecutive: 0,
             open_until: None,
             open_count: 0,
+            half_open_inflight: false,
         }
     }
 
     /// True if the agy attempt should be skipped (circuit OPEN and cooling). When the
-    /// cooldown has elapsed, transition to half-open and allow one probe (returns false).
+    /// cooldown elapses, transition to half-open and allow exactly ONE probe (returns
+    /// false, marking the probe in-flight); all other concurrent callers keep skipping
+    /// until that probe resolves (record_success/quota/other) — no stampede (H1).
     fn should_skip(&mut self, now: Instant) -> bool {
         match self.phase {
             BreakerPhase::Open => match self.open_until {
                 Some(until) if now >= until => {
                     self.phase = BreakerPhase::HalfOpen;
+                    self.half_open_inflight = true;
                     false
                 }
-                Some(_) => true,
-                None => true,
+                _ => true,
             },
-            _ => false,
+            BreakerPhase::HalfOpen => {
+                if self.half_open_inflight {
+                    // a probe is already running — skip until it resolves
+                    true
+                } else {
+                    self.half_open_inflight = true;
+                    false
+                }
+            }
+            BreakerPhase::Closed => false,
         }
     }
 
@@ -182,6 +197,7 @@ impl BreakerState {
         self.consecutive = 0;
         self.open_until = None;
         self.open_count = 0;
+        self.half_open_inflight = false;
     }
 
     fn trip(&mut self, now: Instant, base: Duration) {
@@ -190,6 +206,7 @@ impl BreakerState {
         self.phase = BreakerPhase::Open;
         self.open_until = Some(now + cooldown);
         self.consecutive = 0;
+        self.half_open_inflight = false;
     }
 
     /// Quota/429 failure: trip immediately on a failed half-open probe, else trip at
@@ -407,6 +424,24 @@ mod tests {
         assert!(!s.should_skip(t1)); // half-open
         s.record_quota(t1, 3, base); // probe fails → reopen, longer cooldown
         assert!(s.should_skip(t1 + Duration::from_secs(121)), "still open with longer cooldown");
+    }
+
+    #[test]
+    fn half_open_allows_only_one_probe_no_stampede() {
+        // H1: when the cooldown elapses, only the FIRST caller probes; concurrent
+        // callers keep skipping until the probe resolves — no stampede on agy.
+        let now = Instant::now();
+        let base = Duration::from_secs(120);
+        let mut s = BreakerState::new();
+        for _ in 0..3 {
+            s.record_quota(now, 3, base);
+        }
+        let later = now + Duration::from_secs(121);
+        assert!(!s.should_skip(later), "first caller after cooldown is the single probe");
+        assert!(s.should_skip(later), "second concurrent caller is blocked");
+        assert!(s.should_skip(later), "third too");
+        s.record_success(); // probe succeeds → closed
+        assert!(!s.should_skip(later), "closed after a successful probe");
     }
 
     #[test]
