@@ -164,6 +164,16 @@ fn persist_daemon_token_record(
     let (task_id, wave) = read_contract_context(resolved_cwd.as_deref());
     let build_id = read_build_id(resolved_cwd.as_deref()).or_else(|| resolved_repo.clone());
 
+    // REQ-057: agy has no honest headless token count → record the dispatch as
+    // `unmetered` (excluded from cost sums) rather than a fake zero. Other backends
+    // carry exact counts.
+    let usage_source = if parsed.parser_mode.starts_with("agy") {
+        token_economics::USAGE_SOURCE_UNMETERED
+    } else {
+        token_economics::USAGE_SOURCE_EXACT
+    }
+    .to_string();
+
     let record = TokenRecord {
         agent: agent.to_string(),
         session_id,
@@ -184,6 +194,7 @@ fn persist_daemon_token_record(
         build_id,
         task_id,
         wave,
+        usage_source,
     };
 
     if let Err(err) = record_daemon_tokens(token_db.as_ref(), &record) {

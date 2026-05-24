@@ -27,6 +27,13 @@ pub struct TokenDb {
     pub(crate) conn: Mutex<Connection>,
 }
 
+/// Token-usage provenance (REQ-057). `exact` = real counts from a CLI; `estimated`
+/// = a local char-based approximation; `unmetered` = no honest count exists (the agy
+/// backend) — recorded as a dispatch occurrence but excluded from cost sums.
+pub const USAGE_SOURCE_EXACT: &str = "exact";
+pub const USAGE_SOURCE_ESTIMATED: &str = "estimated";
+pub const USAGE_SOURCE_UNMETERED: &str = "unmetered";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenRecord {
     pub agent: String,
@@ -48,6 +55,13 @@ pub struct TokenRecord {
     pub build_id: Option<String>,
     pub task_id: Option<String>,
     pub wave: Option<i64>,
+    /// One of `USAGE_SOURCE_*` (REQ-057). Defaults to `exact` for legacy rows.
+    #[serde(default = "default_usage_source")]
+    pub usage_source: String,
+}
+
+fn default_usage_source() -> String {
+    USAGE_SOURCE_EXACT.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,4 +86,7 @@ pub struct TokenSummaryRow {
     pub build_id: Option<String>,
     pub task_id: Option<String>,
     pub wave: Option<i64>,
+    /// One of `USAGE_SOURCE_*` (REQ-057). Defaults to `exact` for legacy rows.
+    #[serde(default = "default_usage_source")]
+    pub usage_source: String,
 }
