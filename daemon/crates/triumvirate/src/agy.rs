@@ -492,8 +492,8 @@ async fn run_agy_once(
 
     let outcome = match timeout(kill_after, read).await {
         Ok(Ok((out_buf, err_buf))) => {
-            if out_buf.len() > max_out {
-                // M8: over the output cap — kill and fail loud rather than grow memory.
+            if out_buf.len() > max_out || err_buf.len() > max_out {
+                // M8: either stream over the output cap — kill and fail loud.
                 kill_process_group(&mut child);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -675,10 +675,7 @@ async fn run_agy_once_pty(
     let mut reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
         Err(e) => {
-            if let Some(p) = pid {
-                sigkill_process_group_pid(p);
-            }
-            let _ = child.wait();
+            pty_force_kill_and_reap(&mut child, pid).await;
             cleanup_invocation(&inv);
             return AgyRun::SpawnError(anyhow::anyhow!("failed to clone pty reader: {e}"));
         }
@@ -780,6 +777,8 @@ async fn pty_force_kill_and_reap(
             Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
+    // SIGKILL was sent; the OS will reap eventually. Surface that we couldn't confirm.
+    tracing::warn!("agy PTY child did not reap within the kill window after SIGKILL");
 }
 
 /// Wait for the PTY child to exit within `grace`, polling `try_wait` (never a blocking

@@ -55,6 +55,11 @@ fn breaker_base_cooldown() -> Duration {
 /// Cap the breaker cooldown at the ~5-hr Ultra quota-reset window (REQ-101).
 const BREAKER_MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60 * 60);
 
+/// Max time a half-open probe may be in flight before the breaker assumes the probing
+/// request was cancelled/dropped (never recorded a result) and lets a new probe take
+/// over — prevents a stuck-inflight deadlock. Generous: well past a normal dispatch.
+const HALF_OPEN_LEASE: Duration = Duration::from_secs(30 * 60);
+
 // ---------------------------------------------------------------------------
 // Concurrency cap (REQ-055)
 // ---------------------------------------------------------------------------
@@ -152,6 +157,8 @@ struct BreakerState {
     /// True while a single half-open probe is in flight; blocks a stampede of
     /// concurrent probes the instant the cooldown elapses (H1).
     half_open_inflight: bool,
+    /// When the in-flight half-open probe started, for lease expiry (cancelled probe).
+    half_open_since: Option<Instant>,
 }
 
 impl BreakerState {
@@ -162,6 +169,7 @@ impl BreakerState {
             open_until: None,
             open_count: 0,
             half_open_inflight: false,
+            half_open_since: None,
         }
     }
 
@@ -175,17 +183,26 @@ impl BreakerState {
                 Some(until) if now >= until => {
                     self.phase = BreakerPhase::HalfOpen;
                     self.half_open_inflight = true;
+                    self.half_open_since = Some(now);
                     false
                 }
                 _ => true,
             },
             BreakerPhase::HalfOpen => {
-                if self.half_open_inflight {
-                    // a probe is already running — skip until it resolves
-                    true
-                } else {
+                if !self.half_open_inflight {
                     self.half_open_inflight = true;
-                    false
+                    self.half_open_since = Some(now);
+                    return false;
+                }
+                // A probe is in flight. If it has been outstanding past the lease, the
+                // probing request was likely cancelled and never recorded a result — let
+                // a new probe take over rather than wedge the breaker forever.
+                match self.half_open_since {
+                    Some(since) if now.saturating_duration_since(since) > HALF_OPEN_LEASE => {
+                        self.half_open_since = Some(now);
+                        false
+                    }
+                    _ => true,
                 }
             }
             BreakerPhase::Closed => false,
@@ -198,6 +215,7 @@ impl BreakerState {
         self.open_until = None;
         self.open_count = 0;
         self.half_open_inflight = false;
+        self.half_open_since = None;
     }
 
     fn trip(&mut self, now: Instant, base: Duration) {
@@ -207,6 +225,7 @@ impl BreakerState {
         self.open_until = Some(now + cooldown);
         self.consecutive = 0;
         self.half_open_inflight = false;
+        self.half_open_since = None;
     }
 
     /// Quota/429 failure: trip immediately on a failed half-open probe, else trip at
@@ -442,6 +461,23 @@ mod tests {
         assert!(s.should_skip(later), "third too");
         s.record_success(); // probe succeeds → closed
         assert!(!s.should_skip(later), "closed after a successful probe");
+    }
+
+    #[test]
+    fn half_open_lease_lets_a_new_probe_take_over_after_stuck_inflight() {
+        // A probe that never records (cancelled request) must not wedge the breaker:
+        // after the lease, a new probe is allowed.
+        let now = Instant::now();
+        let base = Duration::from_secs(120);
+        let mut s = BreakerState::new();
+        for _ in 0..3 {
+            s.record_quota(now, 3, base);
+        }
+        let later = now + Duration::from_secs(121);
+        assert!(!s.should_skip(later), "first probe");
+        assert!(s.should_skip(later), "second blocked (probe in flight)");
+        let after_lease = later + HALF_OPEN_LEASE + Duration::from_secs(1);
+        assert!(!s.should_skip(after_lease), "new probe allowed once the lease expires");
     }
 
     #[test]
