@@ -7,7 +7,8 @@
 //!   `session_id` is ignored and `None` is returned; no resume/continue flags (REQ-040/042).
 //! - **Pipe capture by default** — the non-TTY stdout-drop did NOT reproduce
 //!   (7/7 on 1.0.1, clean on 1.0.2), so capture is a plain pipe (REQ-020). A PTY
-//!   fallback is gated behind `TRIUMVIRATE_AGY_CAPTURE=pty` (Slice 2).
+//!   fallback (REQ-021/022) is gated behind `TRIUMVIRATE_AGY_CAPTURE=pty` for instant
+//!   mitigation if a future agy version regresses to the drop bug.
 //! - **SIGKILL the process group on hang** — agy is a Go binary that ignores soft
 //!   signals; a hung agy runs for hours at 0% CPU. Timeouts hard-kill the group and
 //!   retry once (REQ-014/020/103).
@@ -31,8 +32,9 @@ use tokio::time::timeout;
 
 use crate::agent_exec::{configure_process_group, emit_working_event, kill_process_group};
 
-/// Parser mode recorded on agy results captured over a pipe (REQ-025).
+/// Parser mode recorded on agy results, by capture path (REQ-025).
 const PARSER_MODE_PIPE: &str = "agy-pipe-plain-text";
+const PARSER_MODE_PTY: &str = "agy-pty-plain-text";
 
 // The sandbox profile + invocation assembly (and `agy_connector_timeout`) live in the
 // shared `mcp_bridge::agy` module so the ask path and fleet build the identical command
@@ -53,8 +55,7 @@ fn agy_max_prompt_bytes() -> usize {
 }
 
 /// Capture strategy (REQ-020). `pipe` (default, verified) or `pty` (regression
-/// fallback). The PTY path lands in Slice 2; until then `pty` fails loud rather than
-/// silently degrading.
+/// fallback for a future agy that drops stdout when stdout is not a TTY).
 fn agy_capture_is_pty() -> bool {
     matches!(
         std::env::var("TRIUMVIRATE_AGY_CAPTURE").ok().as_deref(),
@@ -227,12 +228,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
         );
     }
 
-    // REQ-020: the PTY capture path is not wired yet (Slice 2). Be honest, not silent.
-    if agy_capture_is_pty() {
-        anyhow::bail!(
-            "TRIUMVIRATE_AGY_CAPTURE=pty is not yet implemented; unset it to use the default verified pipe capture"
-        );
-    }
+    // REQ-020: capture strategy — pipe (verified default) or PTY (regression fallback
+    // for a future agy that regresses to the non-TTY stdout drop).
+    let use_pty = agy_capture_is_pty();
 
     // REQ-059: version pin — warn on drift, or refuse under strict mode.
     enforce_version_pin()?;
@@ -257,7 +255,12 @@ pub(crate) async fn run_agy_cli_process_with_session(
 
     // One retry on hang/empty (REQ-020/103). A non-zero exit is a real failure → no retry.
     for attempt in 0u32..2 {
-        match run_agy_once(bin, extra_args, message, cwd, kill_after).await {
+        let run = if use_pty {
+            run_agy_once_pty(bin, extra_args, message, cwd, kill_after).await
+        } else {
+            run_agy_once(bin, extra_args, message, cwd, kill_after).await
+        };
+        match run {
             AgyRun::Ok { raw, log } => {
                 let text = strip_ansi(&raw).trim().to_string();
                 if text.is_empty() {
@@ -276,7 +279,8 @@ pub(crate) async fn run_agy_cli_process_with_session(
                     );
                 }
                 emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::TurnCompleted, "turn completed (agy)"));
-                return Ok(build_result(text, &log));
+                let mode = if use_pty { PARSER_MODE_PTY } else { PARSER_MODE_PIPE };
+                return Ok(build_result(text, &log, mode));
             }
             AgyRun::Timeout => {
                 tracing::warn!("agy timed out (attempt {attempt}); SIGKILLed process group");
@@ -498,13 +502,197 @@ fn finish_spawn_error(child: &mut tokio::process::Child, inv: &AgyInvocation, ms
 }
 
 // ---------------------------------------------------------------------------
+// PTY capture (REQ-020/021/022) — regression fallback behind TRIUMVIRATE_AGY_CAPTURE=pty
+// ---------------------------------------------------------------------------
+
+/// SIGKILL a process group by leader pid. The PTY child is a session leader (portable-pty
+/// setsids it onto the controlling terminal), so the negative-pid kill reaps the whole
+/// group — including sandbox-exec's child agy (REQ-014).
+#[cfg(unix)]
+fn sigkill_process_group_pid(pid: u32) {
+    // SAFETY: a negative pid targets the process group led by `pid`.
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+#[cfg(not(unix))]
+fn sigkill_process_group_pid(_pid: u32) {}
+
+/// Interactive-prompt markers the PTY guard watches for at the TAIL of the output — a
+/// process blocked on a prompt leaves it last, so checking the tail (not the whole
+/// buffer) avoids matching the same words inside a normal answer (REQ-020).
+const INTERACTIVE_PROMPTS: &[&str] = &[
+    "[y/n]",
+    "(y/n)",
+    "[y/n/a]",
+    "(yes/no)",
+    "press enter",
+    "press return",
+    "press any key",
+    "continue?",
+    "do you want to continue",
+    "allow?",
+    "authorize?",
+];
+
+fn tail_interactive_prompt(bytes: &[u8]) -> Option<&'static str> {
+    let start = bytes.len().saturating_sub(256);
+    let tail = String::from_utf8_lossy(&bytes[start..]).to_lowercase();
+    let tail = tail.trim_end().trim_end_matches([':', ' ']).trim_end();
+    INTERACTIVE_PROMPTS.iter().copied().find(|p| tail.ends_with(p))
+}
+
+/// PTY capture path (REQ-020/021/022): run agy under a pseudo-terminal so a future agy
+/// that regresses to dropping stdout when stdout is not a TTY still produces output.
+/// PTY bytes are read on a dedicated OS thread and forwarded to async via a channel; a
+/// non-interactive environment is set and the tail is watched for an interactive prompt;
+/// timeouts SIGKILL the process group. stdout+stderr are merged by the PTY.
+async fn run_agy_once_pty(
+    bin: &str,
+    extra_args: &[String],
+    message: &str,
+    cwd: &str,
+    kill_after: Duration,
+) -> AgyRun {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::Read;
+
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
+        Ok(inv) => inv,
+        Err(e) => {
+            return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));
+        }
+    };
+
+    let pty = native_pty_system();
+    let pair = match pty.openpty(PtySize {
+        rows: 24,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            cleanup_invocation(&inv);
+            return AgyRun::SpawnError(anyhow::anyhow!("failed to open pty: {e}"));
+        }
+    };
+
+    let mut cmd = CommandBuilder::new(&inv.program);
+    for arg in &inv.args {
+        cmd.arg(arg);
+    }
+    cmd.cwd(cwd);
+    // Non-interactivity environment (PTY path only) — REQ-020.
+    for (k, v) in [
+        ("CI", "1"),
+        ("NO_COLOR", "1"),
+        ("TERM", "dumb"),
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+    ] {
+        cmd.env(k, v);
+    }
+
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            drop(pair.slave);
+            cleanup_invocation(&inv);
+            return AgyRun::SpawnError(anyhow::anyhow!("failed to spawn agy in pty: {e}"));
+        }
+    };
+    let pid = child.process_id();
+    // Drop the slave in the parent so EOF is delivered when the child exits (REQ-022).
+    drop(pair.slave);
+
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(p) = pid {
+                sigkill_process_group_pid(p);
+            }
+            let _ = child.wait();
+            cleanup_invocation(&inv);
+            return AgyRun::SpawnError(anyhow::anyhow!("failed to clone pty reader: {e}"));
+        }
+    };
+
+    // Read PTY bytes on a dedicated OS thread, forwarded to async via a channel (REQ-022).
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut interactive: Option<&'static str> = None;
+    let collect = async {
+        while let Some(chunk) = rx.recv().await {
+            out.extend_from_slice(&chunk);
+            if let Some(p) = tail_interactive_prompt(&out) {
+                interactive = Some(p);
+                break;
+            }
+        }
+    };
+    let timed_out = timeout(kill_after, collect).await.is_err();
+
+    let outcome = if let Some(prompt) = interactive {
+        if let Some(p) = pid {
+            sigkill_process_group_pid(p);
+        }
+        let _ = child.wait();
+        AgyRun::NonZero {
+            code: "interactive".to_string(),
+            stderr: format!("agy blocked on an interactive prompt under PTY: {prompt:?}"),
+            log: read_and_parse_log(&inv.log_path),
+        }
+    } else if timed_out {
+        if let Some(p) = pid {
+            sigkill_process_group_pid(p);
+        }
+        let _ = child.wait();
+        AgyRun::Timeout
+    } else {
+        // EOF — the child closed the PTY, so it has exited; reap for the exit status.
+        match child.wait() {
+            Ok(status) if status.success() => AgyRun::Ok {
+                raw: String::from_utf8_lossy(&out).into_owned(),
+                log: read_and_parse_log(&inv.log_path),
+            },
+            Ok(status) => AgyRun::NonZero {
+                code: status.exit_code().to_string(),
+                stderr: String::from_utf8_lossy(&out).into_owned(),
+                log: read_and_parse_log(&inv.log_path),
+            },
+            Err(e) => AgyRun::SpawnError(anyhow::anyhow!("failed to reap agy (pty): {e}")),
+        }
+    };
+
+    drop(pair.master); // close master so the reader thread observes EOF and exits
+    let _ = reader_thread.join();
+    cleanup_invocation(&inv);
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // Result assembly + lifecycle
 // ---------------------------------------------------------------------------
 
 /// Build the single-turn agy result (REQ-025): plain text, no session id, no events,
 /// no tool calls, no token usage. The serving-model label (from `--log-file`) is the
 /// closest honest analogue to `cli_version`.
-fn build_result(text: String, log_info: &AgyLogInfo) -> ParsedAgentResult {
+fn build_result(text: String, log_info: &AgyLogInfo, parser_mode: &str) -> ParsedAgentResult {
     ParsedAgentResult {
         response_text: text,
         session_id: None,
@@ -512,7 +700,7 @@ fn build_result(text: String, log_info: &AgyLogInfo) -> ParsedAgentResult {
         tool_calls: Vec::new(),
         token_usage: None,
         cli_version: log_info.model.clone(),
-        parser_mode: PARSER_MODE_PIPE.to_string(),
+        parser_mode: parser_mode.to_string(),
     }
 }
 
@@ -786,7 +974,7 @@ mod tests {
             auth_method: Some("consumer".to_string()),
             quota_signal: None,
         };
-        let r = build_result("hello".to_string(), &info);
+        let r = build_result("hello".to_string(), &info, PARSER_MODE_PIPE);
         assert_eq!(r.response_text, "hello");
         assert_eq!(r.session_id, None);
         assert!(r.events.is_empty());
@@ -918,6 +1106,66 @@ mod tests {
         assert_eq!(b.session_id, None);
         assert_eq!(a.response_text, "4");
         assert_eq!(b.response_text, "4");
+    }
+
+    #[test]
+    fn tail_interactive_prompt_matches_only_at_tail() {
+        assert_eq!(tail_interactive_prompt(b"Proceed? [y/N]"), Some("[y/n]"));
+        assert_eq!(tail_interactive_prompt(b"Continue? "), Some("continue?"));
+        // A normal answer that merely mentions these words mid-text is NOT a prompt.
+        assert_eq!(
+            tail_interactive_prompt(b"To continue? you press enter, but the answer is 42"),
+            None
+        );
+        assert_eq!(tail_interactive_prompt(b"4\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pty_captures_plain_output() {
+        let mock = write_mock_agy("printf '4\\n'");
+        let cwd = std::env::temp_dir();
+        let run = run_agy_once_pty(
+            mock.to_str().unwrap(),
+            &[],
+            "2+2?",
+            cwd.to_str().unwrap(),
+            Duration::from_secs(30),
+        )
+        .await;
+        let _ = std::fs::remove_file(&mock);
+        match run {
+            AgyRun::Ok { raw, .. } => assert!(strip_ansi(&raw).contains('4'), "got {raw:?}"),
+            AgyRun::Timeout => panic!("pty capture timed out"),
+            AgyRun::NonZero { code, stderr, .. } => panic!("pty nonzero: {code} / {stderr}"),
+            AgyRun::SpawnError(e) => panic!("pty spawn error: {e}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pty_recovers_tty_only_output() {
+        // REQ-081 (PTY half): a binary that emits ONLY on a TTY drops over a pipe (caught
+        // by mock_agy_pipe_drop_is_caught_not_silent) but IS recovered under the PTY path.
+        let mock = write_mock_agy("if [ -t 1 ]; then printf '4\\n'; fi");
+        let cwd = std::env::temp_dir();
+        let run = run_agy_once_pty(
+            mock.to_str().unwrap(),
+            &[],
+            "2+2?",
+            cwd.to_str().unwrap(),
+            Duration::from_secs(30),
+        )
+        .await;
+        let _ = std::fs::remove_file(&mock);
+        match run {
+            AgyRun::Ok { raw, .. } => {
+                assert!(strip_ansi(&raw).contains('4'), "pty must recover tty-only output, got {raw:?}")
+            }
+            AgyRun::Timeout => panic!("pty capture timed out"),
+            AgyRun::NonZero { code, stderr, .. } => panic!("pty nonzero: {code} / {stderr}"),
+            AgyRun::SpawnError(e) => panic!("pty spawn error: {e}"),
+        }
     }
 
     #[cfg(target_os = "macos")]
