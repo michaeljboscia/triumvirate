@@ -1836,13 +1836,22 @@ async fn run_daemon() -> anyhow::Result<()> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        Ok(AxumJson(serde_json::json!({
+        let mut body = serde_json::json!({
             "status": "ok",
             "service": "triumvirate-daemon-v2",
             "mode": "incremental-dev",
             "daemon_bind_addr": state.bind_addr,
             "version": daemon_core::VERSION
-        })))
+        });
+        // REQ-056: surface agy health (only when the agy backend is selected).
+        if matches!(mcp_bridge::gemini_backend(), mcp_bridge::GeminiBackend::Agy) {
+            let h = mcp_bridge::agy_resilience::agy_health_snapshot();
+            body["agy_capture_health"] = serde_json::json!(h.capture_health);
+            body["agy_backend_health"] = serde_json::json!(h.backend_health);
+            body["agy_health_detail"] = serde_json::json!(h.detail);
+            body["agy_health_last_probe_unix_ms"] = serde_json::json!(h.last_probe_unix_ms);
+        }
+        Ok(AxumJson(body))
     }
 
     async fn status(
@@ -2396,6 +2405,19 @@ async fn run_daemon() -> anyhow::Result<()> {
     tokio::spawn(async {
         prewarm_daemon_workers().await;
     });
+    // REQ-056: periodic agy health probe (only when the agy backend is selected). Runs
+    // the production capture path and records capture/backend health for /health; never
+    // touches request traffic, so it catches a silent stdout-drop regression that real
+    // dispatches cannot distinguish from a legitimate empty answer.
+    if matches!(mcp_bridge::gemini_backend(), mcp_bridge::GeminiBackend::Agy) {
+        tokio::spawn(async {
+            let interval = mcp_bridge::agy_resilience::agy_health_probe_interval();
+            loop {
+                tokio::time::sleep(interval).await;
+                agy::health_probe().await;
+            }
+        });
+    }
     tokio::spawn({
         let scanner_bus = observability_bus.clone();
         async move {
