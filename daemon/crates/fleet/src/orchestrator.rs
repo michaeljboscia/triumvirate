@@ -112,6 +112,7 @@ impl AgentLauncher for DaemonAgentLauncher {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
         Ok(child)
     }
@@ -332,7 +333,30 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     .await;
                 match launch_result {
                     Ok(mut child) => {
-                        let wait_result = child.wait().await;
+                        // Bound the agy wait so a hung agy can't hold the shared
+                        // concurrency slot forever (Codex H). On timeout the task
+                        // completes (slot released); kill_on_drop kills sandbox-exec and
+                        // agy self-terminates via its own --print-timeout. A non-zero
+                        // agy EXIT still degrades to codex below; a TIMEOUT fails loud.
+                        let agy_primary = agent_name == "gemini"
+                            && mcp_bridge::gemini_backend() == mcp_bridge::GeminiBackend::Agy;
+                        let wait_result = if agy_primary {
+                            match tokio::time::timeout(
+                                mcp_bridge::agy::agy_connector_timeout()
+                                    + std::time::Duration::from_secs(30),
+                                child.wait(),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "agy fleet task exceeded connector timeout",
+                                )),
+                            }
+                        } else {
+                            child.wait().await
+                        };
                         match wait_result {
                             Ok(status) if status.success() => {
                                 tracing::info!(
