@@ -12,6 +12,7 @@ pub use codex_capabilities::{
     CodexCapabilities, codex_capabilities, probe_and_cache_codex_capabilities,
 };
 
+pub mod agy;
 pub mod agy_resilience;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
