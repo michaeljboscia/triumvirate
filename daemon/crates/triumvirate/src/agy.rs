@@ -91,6 +91,89 @@ fn agy_capture_is_pty() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Degraded route + retry classification (REQ-053, 054, 103)
+// ---------------------------------------------------------------------------
+
+/// Failure class used to choose the degraded route and retry policy (REQ-053 R2/103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgyFailureClass {
+    /// Quota / 429 / capacity. gemini-cli shares the same Google subscription pool,
+    /// so it would also be blocked → SKIP it and go straight to codex.
+    Quota,
+    /// Auth / exec / capture / protocol. A different failure mode from quota, so the
+    /// gemini-cli hop is worth trying first (while it still serves).
+    AuthOrExec,
+}
+
+/// Classify a surfaced failure message. Ambiguous errors are NOT treated as quota
+/// here (REQ-053: "Ambiguous errors are NOT treated as quota"); the circuit breaker
+/// biases ambiguous *repeated* failures toward quota separately (Slice 3b).
+pub(crate) fn classify_failure_message(msg: &str) -> AgyFailureClass {
+    let lower = msg.to_lowercase();
+    if lower.contains("capacity/quota")
+        || lower.contains("resource_exhausted")
+        || lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+    {
+        AgyFailureClass::Quota
+    } else {
+        AgyFailureClass::AuthOrExec
+    }
+}
+
+/// One hop of the degraded route: which agent answers and the backend label for the
+/// honesty fields (REQ-053 R3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DegradedHop {
+    /// Agent to dispatch: `gemini` (executed as gemini-cli) or `codex`.
+    pub agent: &'static str,
+    /// Backend label surfaced to the client.
+    pub backend: &'static str,
+}
+
+/// Plan the ordered degraded hops from `TRIUMVIRATE_GEMINI_DEGRADED_ROUTE` given the
+/// failure class (REQ-053). `fail` (or empty) disables all fallback. Quota-class
+/// failures skip the gemini-cli hop (shared quota pool). gemini-cli self-disables by
+/// a failed exec when the binary retires on 2026-06-18 — no date check needed.
+pub(crate) fn plan_degraded_route(route_env: &str, class: AgyFailureClass) -> Vec<DegradedHop> {
+    let trimmed = route_env.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("fail") {
+        return Vec::new();
+    }
+    let mut hops = Vec::new();
+    for token in trimmed.split(',') {
+        match token.trim().to_lowercase().as_str() {
+            "" => {}
+            "gemini-cli" => {
+                if class != AgyFailureClass::Quota {
+                    hops.push(DegradedHop { agent: "gemini", backend: "gemini-cli" });
+                }
+            }
+            "codex" => hops.push(DegradedHop { agent: "codex", backend: "codex" }),
+            other => tracing::warn!("ignoring unknown degraded-route token: {other}"),
+        }
+    }
+    hops
+}
+
+/// The degraded route value (`TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`, default
+/// `gemini-cli,codex`; `fail` disables). REQ-053.
+pub(crate) fn degraded_route_env() -> String {
+    std::env::var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE")
+        .unwrap_or_else(|_| "gemini-cli,codex".to_string())
+}
+
+/// Total wall-clock budget for the whole degraded route (REQ-054, default 900s).
+pub(crate) fn degraded_total_budget() -> Duration {
+    std::env::var("TRIUMVIRATE_GEMINI_DEGRADED_TOTAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(900))
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -529,6 +612,48 @@ mod tests {
         ));
         assert!(quota_signal_in_line("Error: RESOURCE_EXHAUSTED quota exceeded"));
         assert!(quota_signal_in_line("got HTTP 429 rate limit"));
+    }
+
+    #[test]
+    fn classify_quota_vs_auth() {
+        assert_eq!(
+            classify_failure_message("agy capacity/quota error (exit 1): RESOURCE_EXHAUSTED"),
+            AgyFailureClass::Quota
+        );
+        assert_eq!(
+            classify_failure_message("got HTTP 429 rate limit"),
+            AgyFailureClass::Quota
+        );
+        assert_eq!(
+            classify_failure_message("agy auth error (exit 1): not logged in"),
+            AgyFailureClass::AuthOrExec
+        );
+        // Ambiguous → NOT quota (REQ-053).
+        assert_eq!(
+            classify_failure_message("agy connector failed (exit 2): something odd"),
+            AgyFailureClass::AuthOrExec
+        );
+    }
+
+    #[test]
+    fn route_plan_quota_skips_gemini_cli() {
+        let hops = plan_degraded_route("gemini-cli,codex", AgyFailureClass::Quota);
+        assert_eq!(hops.iter().map(|h| h.backend).collect::<Vec<_>>(), vec!["codex"]);
+    }
+
+    #[test]
+    fn route_plan_auth_tries_gemini_cli_first() {
+        let hops = plan_degraded_route("gemini-cli,codex", AgyFailureClass::AuthOrExec);
+        assert_eq!(
+            hops.iter().map(|h| h.backend).collect::<Vec<_>>(),
+            vec!["gemini-cli", "codex"]
+        );
+    }
+
+    #[test]
+    fn route_plan_fail_disables_fallback() {
+        assert!(plan_degraded_route("fail", AgyFailureClass::AuthOrExec).is_empty());
+        assert!(plan_degraded_route("  ", AgyFailureClass::Quota).is_empty());
     }
 
     #[test]
