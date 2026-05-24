@@ -45,6 +45,10 @@ pub fn attribute_records(
 }
 
 fn calculate_cost_usd(db: &TokenDb, record: &TokenRecord) -> anyhow::Result<Option<f64>> {
+    // REQ-057: unmetered rows (agy) have no honest token count → never cost them.
+    if record.usage_source == crate::USAGE_SOURCE_UNMETERED {
+        return Ok(None);
+    }
     let Some(model) = record.model.as_deref() else {
         return Ok(None);
     };
@@ -135,6 +139,7 @@ mod tests {
             build_id: None,
             task_id: None,
             wave: None,
+            usage_source: "exact".to_string(),
         }
     }
 
