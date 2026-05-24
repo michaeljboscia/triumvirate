@@ -126,6 +126,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_exec;
+mod agy;
 mod streaming;
 mod http_mcp;
 mod abe;

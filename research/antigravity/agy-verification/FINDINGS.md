@@ -1,5 +1,7 @@
 # agy Verification Battery — Findings
 
+> **Re-verified on v1.0.2 — 2026-05-24 (build start).** The binary auto-upgraded 1.0.1 → **1.0.2** before the build began; per REQ-059 the REQ-060–064 battery was re-run. **Result: the upgrade is benign — every load-bearing assumption still holds.** `agy --help` is **byte-identical** to 1.0.1 (`diff help.txt help-1.0.2.txt` empty): still no `--output-format`/`--model`, `--sandbox`/`--print-timeout`/`--log-file` present (REQ-060). Pipe capture clean (`agy -p` → `4\n`, exit 0, 7s — REQ-062). `--log-file` still carries `Propagating selected model … label="Gemini 3.1 Pro (High)"` + `authMethod=consumer, quotaProject=` (REQ-100). Exit codes unchanged: success=0, bad-flag=2 (REQ-064). Token reuse, no prompt (REQ-063). **Sandbox-exec profile re-confirmed (probe4 on 1.0.2):** out-of-workspace write BLOCKED even when agy tried shell + escalated permissions; staged read + network OK (REQ-062b). Raw captures: `version-1.0.2.txt`, `help-1.0.2.txt`, `probe10-results.txt`, `probe4-1.0.2-results.txt`.
+
 **Date:** 2026-05-24 · **Binary:** `agy` v**1.0.1** at `~/.local/bin/agy` (140 MB Go binary) · **Host:** macOS (darwin), authenticated via subscription OAuth.
 **Purpose:** Resolve the spec's REQ-060–064 gates against the live binary. Raw captures in this directory (`help.txt`, `version.txt`, `config-layout.txt`, `probe-results.txt`, `probe2-results.txt`).
 
