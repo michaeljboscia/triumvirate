@@ -235,9 +235,11 @@ pub(crate) async fn run_agy_cli_process_with_session(
         match run {
             AgyRun::Ok(raw) => {
                 let text = strip_ansi(&raw).trim().to_string();
-                if text.is_empty() && attempt == 0 {
-                    // REQ-020/024 canary: exit 0 + empty → retry once (transient / PTY-drop regression).
-                    tracing::warn!("agy returned exit 0 with empty output (attempt {attempt}); retrying once");
+                if text.is_empty() {
+                    // REQ-024 canary: exit 0 + empty is NEVER a silent success (US-2).
+                    // Retry once (transient / capture-drop regression); a still-empty
+                    // result falls through the loop and fails loud via last_err.
+                    tracing::warn!("agy returned exit 0 with empty output (attempt {attempt})");
                     last_err = Some(anyhow::anyhow!("agy returned empty output"));
                     continue;
                 }
@@ -632,6 +634,58 @@ fn classify_failure(code: String, stderr: &str, log_info: &AgyLogInfo) -> anyhow
     }
 }
 
+// ---------------------------------------------------------------------------
+// ANSI stripping (REQ-023)
+// ---------------------------------------------------------------------------
+
+/// Strip ANSI/CSI/OSC escape sequences from captured text (REQ-023). Char-based and
+/// UTF-8 safe (the pipe path is near-clean; this matters more for the PTY fallback).
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next(); // consume '['
+                // CSI: consume until a final byte in @..~ (0x40..=0x7e).
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next(); // consume ']'
+                // OSC: until BEL (0x07) or ST (ESC \).
+                while let Some(&n) = chars.peek() {
+                    if n == '\u{07}' {
+                        chars.next();
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            Some(_) => {
+                chars.next(); // two-char ESC sequence
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,56 +780,169 @@ mod tests {
         assert!(args.contains(&"--print-timeout".to_string()));
         assert!(args.contains(&"--log-file".to_string()));
     }
-}
 
-// ---------------------------------------------------------------------------
-// ANSI stripping (REQ-023)
-// ---------------------------------------------------------------------------
-
-/// Strip ANSI/CSI/OSC escape sequences from captured text (REQ-023). Char-based and
-/// UTF-8 safe (the pipe path is near-clean; this matters more for the PTY fallback).
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                chars.next(); // consume '['
-                // CSI: consume until a final byte in @..~ (0x40..=0x7e).
-                while let Some(&n) = chars.peek() {
-                    chars.next();
-                    if ('\u{40}'..='\u{7e}').contains(&n) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next(); // consume ']'
-                // OSC: until BEL (0x07) or ST (ESC \).
-                while let Some(&n) = chars.peek() {
-                    if n == '\u{07}' {
-                        chars.next();
-                        break;
-                    }
-                    if n == '\u{1b}' {
-                        chars.next();
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
-                    }
-                    chars.next();
-                }
-            }
-            Some(_) => {
-                chars.next(); // two-char ESC sequence
-            }
-            None => {}
-        }
+    #[test]
+    fn build_result_is_single_turn_plain_text() {
+        // REQ-025/040: no session id, no events, no tool calls, no token usage.
+        let info = AgyLogInfo {
+            model: Some("Gemini 3.1 Pro (High)".to_string()),
+            auth_method: Some("consumer".to_string()),
+            quota_signal: None,
+        };
+        let r = build_result("hello".to_string(), &info);
+        assert_eq!(r.response_text, "hello");
+        assert_eq!(r.session_id, None);
+        assert!(r.events.is_empty());
+        assert!(r.tool_calls.is_empty());
+        assert!(r.token_usage.is_none());
+        assert_eq!(r.parser_mode, PARSER_MODE_PIPE);
+        assert_eq!(r.cli_version.as_deref(), Some("Gemini 3.1 Pro (High)"));
     }
-    out
+
+    // ---- Subprocess reality tests (REQ-080-083) ----
+    //
+    // These drive the REAL `run_agy_cli_process_with_session` against a mock `agy`
+    // binary that the real agy cannot impersonate on command: a binary that drops
+    // stdout over a pipe, exits non-zero with a quota string, or returns empty. They
+    // run under the production sandbox-exec wrapper, so they are macOS-gated (the agy
+    // backend targets macOS — C2). The real-binary happy path is covered separately by
+    // the verification battery and the #[ignore]d test below.
+
+    #[cfg(target_os = "macos")]
+    fn write_mock_agy(body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("mock-agy-{}.sh", Uuid::new_v4()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write mock agy");
+        let mut perms = std::fs::metadata(&path).expect("mock meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod mock");
+        path
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn run_mock(
+        body: &str,
+        msg: &str,
+        session: Option<&str>,
+    ) -> anyhow::Result<ParsedAgentResult> {
+        let mock = write_mock_agy(body);
+        let cwd = std::env::temp_dir();
+        let result = run_agy_cli_process_with_session(
+            mock.to_str().unwrap(),
+            &[],
+            msg,
+            cwd.to_str().unwrap(),
+            session,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_file(&mock);
+        result
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_pipe_captures_plain_text() {
+        // REQ-080 happy path: text over a pipe (agy 1.0.2's real behavior) is captured.
+        let parsed = run_mock("printf '4\\n'", "2+2?", None)
+            .await
+            .expect("mock agy should succeed");
+        assert_eq!(parsed.response_text, "4");
+        assert_eq!(parsed.session_id, None); // REQ-040
+        assert_eq!(parsed.parser_mode, PARSER_MODE_PIPE); // REQ-025
+        assert!(parsed.events.is_empty() && parsed.tool_calls.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_strips_ansi() {
+        // REQ-023: ANSI is stripped from captured output.
+        let parsed = run_mock("printf '\\033[32m4\\033[0m\\n'", "2+2?", None)
+            .await
+            .expect("mock agy should succeed");
+        assert_eq!(parsed.response_text, "4");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_empty_exit0_fails_loud_never_silent() {
+        // REQ-024 canary: exit 0 + empty is retried once, then fails — NEVER reported
+        // as a successful empty answer.
+        let err = run_mock("exit 0", "2+2?", None)
+            .await
+            .expect_err("empty output must fail, not succeed silently");
+        assert!(err.to_string().contains("empty output"), "got: {err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_pipe_drop_is_caught_not_silent() {
+        // REQ-081 trap: a binary that emits over a TTY but DROPS over a pipe must not
+        // be reported as success. Our pipe path retries then fails loud. (The PTY path
+        // that RECOVERS this output lands in Slice 2.)
+        let err = run_mock("if [ -t 1 ]; then printf '4\\n'; fi", "2+2?", None)
+            .await
+            .expect_err("a silent stdout drop must be caught");
+        assert!(err.to_string().contains("empty output"), "got: {err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_quota_exit_classifies_as_quota() {
+        // REQ-051/053: a non-zero exit with a quota string classifies as quota (which
+        // feeds the breaker + skips gemini-cli in the degraded route).
+        let err = run_mock(
+            "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2",
+            "2+2?",
+            None,
+        )
+        .await
+        .expect_err("non-zero exit must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("quota") || msg.contains("capacity"), "got: {msg}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_concurrent_dispatches_carry_no_session_id() {
+        // REQ-082: two simultaneous dispatches pass no resume flags (build_agy_args
+        // test) and persist no synthetic session id; inbound session ids are ignored.
+        let mock = write_mock_agy("printf '4\\n'");
+        let bin = mock.to_str().unwrap().to_string();
+        let cwd = std::env::temp_dir().to_str().unwrap().to_string();
+        let (a, b) = tokio::join!(
+            run_agy_cli_process_with_session(&bin, &[], "q1", &cwd, Some("inbound-a"), None),
+            run_agy_cli_process_with_session(&bin, &[], "q2", &cwd, Some("inbound-b"), None),
+        );
+        let _ = std::fs::remove_file(&mock);
+        let a = a.expect("dispatch a");
+        let b = b.expect("dispatch b");
+        assert_eq!(a.session_id, None);
+        assert_eq!(b.session_id, None);
+        assert_eq!(a.response_text, "4");
+        assert_eq!(b.response_text, "4");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires a live, authenticated agy install; run with: cargo test -- --ignored"]
+    async fn real_agy_end_to_end_two_plus_two() {
+        // The real-binary counterpart to the mock tests: proves the assembled command
+        // works against live agy. Opt-in (needs OAuth + network + quota), never in CI.
+        let (bin, args) = mcp_bridge::agy_command();
+        let cwd = std::env::temp_dir();
+        let parsed = run_agy_cli_process_with_session(
+            &bin,
+            &args,
+            "What is 2+2? Reply with only the digit.",
+            cwd.to_str().unwrap(),
+            None,
+            None,
+        )
+        .await
+        .expect("real agy dispatch");
+        assert!(parsed.response_text.contains('4'), "got: {}", parsed.response_text);
+        assert_eq!(parsed.session_id, None);
+        assert_eq!(parsed.parser_mode, PARSER_MODE_PIPE);
+    }
 }
