@@ -78,20 +78,40 @@ impl AgentLauncher for DaemonAgentLauncher {
             return Ok(child);
         }
 
-        let (cmd, args): (&str, Vec<String>) = match agent {
+        let (cmd, args): (String, Vec<String>) = match agent {
             "codex" => (
-                "codex",
+                "codex".to_string(),
                 vec![
                     "exec".to_string(),
                     "--message".to_string(),
                     task_prompt.to_string(),
                 ],
             ),
-            "gemini" => ("gemini", vec!["-p".to_string(), task_prompt.to_string()]),
+            "gemini" => match mcp_bridge::gemini_backend() {
+                // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
+                // Under agy it spawns the shared sandbox-exec invocation (single-turn,
+                // no resume flags — REQ-091) instead of the soon-dead `gemini` binary;
+                // pipe capture is fine (agy doesn't drop over a pipe). The per-dispatch
+                // profile/log temp files are reaped by the OS from the temp dir.
+                mcp_bridge::GeminiBackend::Agy => {
+                    let (bin, extra) = mcp_bridge::agy_command();
+                    let inv = mcp_bridge::agy::build_agy_invocation(
+                        &bin,
+                        &extra,
+                        task_prompt,
+                        worktree_path.to_str().unwrap_or("."),
+                    )
+                    .map_err(|e| anyhow::anyhow!("failed to assemble agy invocation for fleet: {e}"))?;
+                    (inv.program, inv.args)
+                }
+                mcp_bridge::GeminiBackend::GeminiCli => {
+                    ("gemini".to_string(), vec!["-p".to_string(), task_prompt.to_string()])
+                }
+            },
             _ => anyhow::bail!("unsupported fleet agent: {agent}"),
         };
-        let child = Command::new(cmd)
-            .args(args)
+        let child = Command::new(&cmd)
+            .args(&args)
             .current_dir(worktree_path)
             .env("TRIUMVIRATE_PROJECT_ROOT", project_root.as_os_str())
             .stdin(Stdio::null())

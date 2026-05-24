@@ -18,57 +18,29 @@
 //! - **`--log-file` is the observability substitute** — serving model + auth method
 //!   are recoverable from a per-dispatch glog file; token counts are not (REQ-100/057).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use agent_adapter::{ParsedAgentResult, WorkingState, WorkingStateEvent};
+use mcp_bridge::agy::AgyInvocation;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 use crate::agent_exec::{configure_process_group, emit_working_event, kill_process_group};
 
 /// Parser mode recorded on agy results captured over a pipe (REQ-025).
 const PARSER_MODE_PIPE: &str = "agy-pipe-plain-text";
 
-/// Verified `sandbox-exec` profile (probe4, 1.0.1 + 1.0.2). Constrains WRITES, leaves
-/// READS + network open so staged artifacts/repo files stay readable and the Google
-/// API stays reachable. Placeholders are substituted per dispatch. The canonical copy
-/// lives at `research/antigravity/agy-verification/agy-sandbox.sb.template`; this is
-/// the shipped duplicate (the research file is not present in a deployed binary).
-const SANDBOX_PROFILE_TEMPLATE: &str = r#";; Triumvirate sandbox-exec profile for the agy backend.
-;; Constrains WRITES; leaves READS + network open. Verified by probe4 (REQ-016/062b).
-(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write* (subpath "@WORKSPACE@"))
-(allow file-write* (subpath "@HOME@/.gemini"))
-(allow file-write* (subpath "@HOME@/.antigravitycli"))
-(allow file-write* (subpath "@TMPDIR@"))
-(allow file-write* (subpath "/private/var/folders"))
-(allow file-write* (subpath "/private/tmp"))
-(allow file-write* (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/dtracehelper") (literal "/dev/tty"))
-@EXTRA_WRITABLE@
-"#;
+// The sandbox profile + invocation assembly (and `agy_connector_timeout`) live in the
+// shared `mcp_bridge::agy` module so the ask path and fleet build the identical command
+// from one source (REQ-016/090). Capture, retry, and log parsing stay here.
 
 // ---------------------------------------------------------------------------
-// Env knobs (REQ-014, 020, 058)
+// Env knobs (REQ-058, 020)
 // ---------------------------------------------------------------------------
-
-/// agy's dedicated connector timeout (REQ-014). Default 900s — agy is blocking and
-/// non-streaming, so the 180s gemini/codex timeout is far too short for multi-tool
-/// runs. The same value is passed to agy's own `--print-timeout`; the outer SIGKILL
-/// bound adds a small grace so agy's clean exit wins the race when it works.
-fn agy_connector_timeout() -> Duration {
-    std::env::var("TRIUMVIRATE_AGY_CONNECTOR_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(900))
-}
 
 /// Fail-loud guard for the argv size limit (REQ-058). agy has no stdin/`@file` input
 /// path, so an oversized prompt would otherwise hit an opaque OS `E2BIG`. macOS
@@ -277,24 +249,16 @@ pub(crate) async fn run_agy_cli_process_with_session(
 
     emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::TurnStarted, "turn started (agy)"));
 
-    let print_timeout = agy_connector_timeout();
     // Outer hard-kill bound: a small grace beyond agy's own --print-timeout so a
     // clean agy exit wins the race; if agy ignores its own timeout (hang), we SIGKILL.
-    let kill_after = print_timeout + Duration::from_secs(15);
+    let kill_after = mcp_bridge::agy::agy_connector_timeout() + Duration::from_secs(15);
 
     let mut last_err: Option<anyhow::Error> = None;
 
     // One retry on hang/empty (REQ-020/103). A non-zero exit is a real failure → no retry.
     for attempt in 0u32..2 {
-        let log_path = agy_log_path();
-        let run = run_agy_once(bin, extra_args, message, cwd, &log_path, print_timeout, kill_after).await;
-
-        // REQ-100: parse the per-dispatch log for model/auth/quota, then delete it.
-        let log_info = read_and_parse_log(&log_path);
-        let _ = std::fs::remove_file(&log_path);
-
-        match run {
-            AgyRun::Ok(raw) => {
+        match run_agy_once(bin, extra_args, message, cwd, kill_after).await {
+            AgyRun::Ok { raw, log } => {
                 let text = strip_ansi(&raw).trim().to_string();
                 if text.is_empty() {
                     // REQ-024 canary: exit 0 + empty is NEVER a silent success (US-2).
@@ -304,15 +268,15 @@ pub(crate) async fn run_agy_cli_process_with_session(
                     last_err = Some(anyhow::anyhow!("agy returned empty output"));
                     continue;
                 }
-                if let Some(model) = &log_info.model {
+                if let Some(model) = &log.model {
                     tracing::info!(
                         agy_model = %model,
-                        agy_auth = log_info.auth_method.as_deref().unwrap_or("?"),
+                        agy_auth = log.auth_method.as_deref().unwrap_or("?"),
                         "agy dispatch completed"
                     );
                 }
                 emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::TurnCompleted, "turn completed (agy)"));
-                return Ok(build_result(text, &log_info));
+                return Ok(build_result(text, &log));
             }
             AgyRun::Timeout => {
                 tracing::warn!("agy timed out (attempt {attempt}); SIGKILLed process group");
@@ -322,11 +286,11 @@ pub(crate) async fn run_agy_cli_process_with_session(
                 ));
                 continue; // hang → retry once (REQ-103)
             }
-            AgyRun::NonZero { code, stderr } => {
+            AgyRun::NonZero { code, stderr, log } => {
                 // REQ-034/051/052: classify for a user-visible message. Non-zero is a
-                // real failure → no retry (the degraded route lands in Slice 3).
+                // real failure → no retry (the degraded route is at the dispatch loop).
                 emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::Error, "error (agy)"));
-                return Err(classify_failure(code, &stderr, &log_info));
+                return Err(classify_failure(code, &stderr, &log));
             }
             AgyRun::SpawnError(e) => {
                 emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::Error, "error (agy)"));
@@ -417,34 +381,35 @@ pub(crate) async fn health_probe() {
 // ---------------------------------------------------------------------------
 
 enum AgyRun {
-    Ok(String),
+    Ok { raw: String, log: AgyLogInfo },
     Timeout,
-    NonZero { code: String, stderr: String },
+    NonZero {
+        code: String,
+        stderr: String,
+        log: AgyLogInfo,
+    },
     SpawnError(anyhow::Error),
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_agy_once(
     bin: &str,
     extra_args: &[String],
     message: &str,
     cwd: &str,
-    log_path: &Path,
-    print_timeout: Duration,
     kill_after: Duration,
 ) -> AgyRun {
-    let profile_path = match write_sandbox_profile(cwd) {
-        Ok(p) => p,
-        Err(e) => return AgyRun::SpawnError(anyhow::anyhow!("failed to write agy sandbox profile: {e}")),
+    // REQ-016: assemble the sandbox-exec-wrapped invocation from the shared builder
+    // (one source for the security-critical profile, shared with fleet).
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
+        Ok(inv) => inv,
+        Err(e) => {
+            return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));
+        }
     };
 
-    let agy_args = build_agy_args(message, log_path, print_timeout, extra_args);
-
-    // REQ-016: spawn agy UNDER our sandbox-exec profile (containment), never with
-    // --dangerously-skip-permissions on the consult path.
-    let mut command = Command::new("sandbox-exec");
-    command.arg("-f").arg(&profile_path).arg(bin).args(&agy_args);
+    let mut command = Command::new(&inv.program);
     command
+        .args(&inv.args)
         .current_dir(cwd)
         .env("NO_COLOR", "1") // minimize ANSI in pipe output (defensive)
         .stdin(Stdio::null())
@@ -456,7 +421,7 @@ async fn run_agy_once(
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = std::fs::remove_file(&profile_path);
+            cleanup_invocation(&inv);
             return AgyRun::SpawnError(anyhow::anyhow!("failed to spawn agy under sandbox-exec: {e}"));
         }
     };
@@ -466,11 +431,11 @@ async fn run_agy_once(
     // and returned, so they remain readable after the timeout completes.
     let mut stdout = match child.stdout.take() {
         Some(s) => s,
-        None => return finish_spawn_error(&mut child, &profile_path, "agy stdout missing"),
+        None => return finish_spawn_error(&mut child, &inv, "agy stdout missing"),
     };
     let mut stderr = match child.stderr.take() {
         Some(s) => s,
-        None => return finish_spawn_error(&mut child, &profile_path, "agy stderr missing"),
+        None => return finish_spawn_error(&mut child, &inv, "agy stderr missing"),
     };
 
     let read = async move {
@@ -487,15 +452,17 @@ async fn run_agy_once(
 
     let outcome = match timeout(kill_after, read).await {
         Ok(Ok((out_buf, err_buf))) => match child.wait().await {
-            Ok(status) if status.success() => {
-                AgyRun::Ok(String::from_utf8_lossy(&out_buf).into_owned())
-            }
+            Ok(status) if status.success() => AgyRun::Ok {
+                raw: String::from_utf8_lossy(&out_buf).into_owned(),
+                log: read_and_parse_log(&inv.log_path),
+            },
             Ok(status) => AgyRun::NonZero {
                 code: status
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".to_string()),
                 stderr: String::from_utf8_lossy(&err_buf).into_owned(),
+                log: read_and_parse_log(&inv.log_path),
             },
             Err(e) => AgyRun::SpawnError(anyhow::anyhow!("failed to reap agy: {e}")),
         },
@@ -514,61 +481,20 @@ async fn run_agy_once(
         }
     };
 
-    let _ = std::fs::remove_file(&profile_path);
+    cleanup_invocation(&inv);
     outcome
 }
 
-fn finish_spawn_error(child: &mut tokio::process::Child, profile_path: &Path, msg: &str) -> AgyRun {
+/// Remove the per-dispatch sandbox profile + log file.
+fn cleanup_invocation(inv: &AgyInvocation) {
+    let _ = std::fs::remove_file(&inv.profile_path);
+    let _ = std::fs::remove_file(&inv.log_path);
+}
+
+fn finish_spawn_error(child: &mut tokio::process::Child, inv: &AgyInvocation, msg: &str) -> AgyRun {
     kill_process_group(child);
-    let _ = std::fs::remove_file(profile_path);
+    cleanup_invocation(inv);
     AgyRun::SpawnError(anyhow::anyhow!("{msg}"))
-}
-
-// ---------------------------------------------------------------------------
-// Command assembly
-// ---------------------------------------------------------------------------
-
-/// Build agy's argument vector. REQ-011/012/013: prompt via `-p`, never
-/// `-o/--output-format`, `-r/--resume`, `--session-id`, `-c/--continue`, or `--model`.
-/// `--print-timeout` and `--log-file` are always set; operator `TRIUMVIRATE_AGY_ARGS`
-/// are appended verbatim.
-fn build_agy_args(message: &str, log_path: &Path, print_timeout: Duration, extra: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
-        message.to_string(),
-        "--print-timeout".to_string(),
-        format!("{}s", print_timeout.as_secs()),
-        "--log-file".to_string(),
-        log_path.to_string_lossy().into_owned(),
-    ];
-    args.extend(extra.iter().cloned());
-    args
-}
-
-/// Render the per-dispatch sandbox-exec profile and write it to a temp file (REQ-016).
-/// The workspace path is canonicalized so subpath matching works under macOS symlinks
-/// (`/var` → `/private/var`), which is why the verified profile uses `/private/...`.
-fn write_sandbox_profile(cwd: &str) -> std::io::Result<PathBuf> {
-    let workspace = std::fs::canonicalize(cwd)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| cwd.to_string());
-    let home = std::env::var("HOME").unwrap_or_default();
-    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let tmpdir = tmpdir.trim_end_matches('/').to_string();
-
-    let profile = SANDBOX_PROFILE_TEMPLATE
-        .replace("@WORKSPACE@", &workspace)
-        .replace("@HOME@", &home)
-        .replace("@TMPDIR@", &tmpdir)
-        .replace("@EXTRA_WRITABLE@", ""); // per-workflow output dirs: Slice 3+
-
-    let path = std::env::temp_dir().join(format!("agy-sandbox-{}.sb", Uuid::new_v4()));
-    std::fs::write(&path, profile)?;
-    Ok(path)
-}
-
-fn agy_log_path() -> PathBuf {
-    std::env::temp_dir().join(format!("agy-log-{}.txt", Uuid::new_v4()))
 }
 
 // ---------------------------------------------------------------------------
@@ -849,16 +775,8 @@ mod tests {
         assert!(plan_degraded_route("  ", AgyFailureClass::Quota).is_empty());
     }
 
-    #[test]
-    fn build_args_never_includes_forbidden_flags() {
-        let args = build_agy_args("hi", Path::new("/tmp/x.log"), Duration::from_secs(900), &[]);
-        for forbidden in ["-o", "--output-format", "-r", "--resume", "-c", "--continue", "--model"] {
-            assert!(!args.iter().any(|a| a == forbidden), "must not pass {forbidden}");
-        }
-        assert!(args.windows(2).any(|w| w[0] == "-p" && w[1] == "hi"));
-        assert!(args.contains(&"--print-timeout".to_string()));
-        assert!(args.contains(&"--log-file".to_string()));
-    }
+    // Note: agy argument assembly (no -o/-r/-c/--model) is tested in
+    // mcp_bridge::agy::tests::agy_args_never_include_forbidden_flags.
 
     #[test]
     fn build_result_is_single_turn_plain_text() {
@@ -890,7 +808,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn write_mock_agy(body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("mock-agy-{}.sh", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("mock-agy-{}.sh", uuid::Uuid::new_v4()));
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write mock agy");
         let mut perms = std::fs::metadata(&path).expect("mock meta").permissions();
         perms.set_mode(0o755);

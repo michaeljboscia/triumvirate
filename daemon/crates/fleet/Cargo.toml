@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 shared-types = { path = "../shared-types" }
+mcp-bridge = { path = "../mcp-bridge" }
 daemon-core = { path = "../daemon-core" }
 agent-worker = { path = "../agent-worker" }
 ledger = { path = "../ledger" }
