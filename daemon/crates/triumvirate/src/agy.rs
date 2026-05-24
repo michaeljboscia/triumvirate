@@ -91,6 +91,64 @@ fn agy_capture_is_pty() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Version pin (REQ-059)
+// ---------------------------------------------------------------------------
+
+/// Read the installed agy version via `agy --version` (REQ-059). Sync + quick;
+/// used uncached by `triumvirate doctor` and cached on the dispatch path.
+pub(crate) fn agy_installed_version() -> Result<String, String> {
+    let (bin, _) = mcp_bridge::agy_command();
+    let out = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("failed to run `{bin} --version`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("`{bin} --version` exited with {}", out.status));
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        Err(format!("`{bin} --version` produced no output"))
+    } else {
+        Ok(v)
+    }
+}
+
+/// Cached version check — runs `agy --version` once per process for the dispatch path.
+fn agy_version_status() -> &'static Result<String, String> {
+    static V: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    V.get_or_init(agy_installed_version)
+}
+
+/// Enforce the version pin (REQ-059): warn on drift, or refuse under strict mode. A
+/// pinned binary still can't stop Google's server-side harness updates — this bounds
+/// LOCAL drift only.
+fn enforce_version_pin() -> anyhow::Result<()> {
+    let expected = mcp_bridge::agy_expected_version();
+    let strict = mcp_bridge::agy_strict_version();
+    match agy_version_status() {
+        Ok(v) if v == &expected => Ok(()),
+        Ok(v) => {
+            if strict {
+                anyhow::bail!(
+                    "agy version {v} != expected {expected}; refusing (TRIUMVIRATE_AGY_STRICT_VERSION). Re-run the verification battery (REQ-060-064) and update TRIUMVIRATE_AGY_EXPECTED_VERSION."
+                );
+            }
+            tracing::warn!(
+                "agy version {v} != expected {expected}; proceeding (set TRIUMVIRATE_AGY_STRICT_VERSION=true to refuse)"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            if strict {
+                anyhow::bail!("could not determine agy version ({e}); refusing under strict mode");
+            }
+            tracing::warn!("could not determine agy version: {e}");
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Degraded route + retry classification (REQ-053, 054, 103)
 // ---------------------------------------------------------------------------
 
@@ -204,6 +262,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
         );
     }
 
+    // REQ-059: version pin — warn on drift, or refuse under strict mode.
+    enforce_version_pin()?;
+
     // REQ-040/042: single-turn. Ignore inbound session id; never pass resume flags.
     if session_id.is_some() {
         tracing::debug!("agy backend is single-turn; ignoring inbound session_id");
@@ -276,6 +337,24 @@ pub(crate) async fn run_agy_cli_process_with_session(
 
     emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::Error, "error (agy)"));
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("agy dispatch failed")))
+}
+
+/// One-shot agy readiness probe for `triumvirate doctor` (REQ-059): runs the real
+/// dispatch path on "2+2". Success proves OAuth + capture both work non-interactively.
+pub(crate) async fn doctor_probe() -> Result<String, String> {
+    let (bin, args) = mcp_bridge::agy_command();
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    run_agy_cli_process_with_session(
+        &bin,
+        &args,
+        "What is 2+2? Reply with only the digit.",
+        &cwd,
+        None,
+        None,
+    )
+    .await
+    .map(|p| p.response_text)
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
