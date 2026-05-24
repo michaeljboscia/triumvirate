@@ -369,7 +369,38 @@ pub(crate) async fn execute_ask_agent(
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
 
+    // REQ-101/103: if the agy circuit breaker is OPEN, skip the agy attempt and route
+    // straight around it. The breaker opens on repeated quota, so the reason is set
+    // quota-class → the degraded route skips gemini-cli (shared pool) and uses codex.
+    let agy_breaker_open = matches!(gemini_backend_selected, Some(GeminiBackend::Agy))
+        && mcp_bridge::agy_resilience::agy_breaker_should_skip();
+    if agy_breaker_open {
+        let detail = "agy circuit breaker open (repeated quota) — skipping agy, routing around";
+        lifecycle.push(LifecycleEvent {
+            state: "BREAKER_OPEN".to_string(),
+            detail: detail.to_string(),
+        });
+        let _ = append_outbox_event(&OutboxEvent {
+            ts_ms: core_unix_time_ms(),
+            request_id: request_id.clone(),
+            tool: "ask_agent".to_string(),
+            status: "BREAKER_OPEN".to_string(),
+            agent: Some(agent.clone()),
+            detail: detail.to_string(),
+            cwd: resolved_cwd.clone(),
+            repo: resolved_repo.clone(),
+            branch: resolved_branch.clone(),
+            working_state: Some("BREAKER_OPEN".to_string()),
+            token_usage: None,
+            tool_name: None,
+        });
+        last_err = Some("agy capacity/quota: circuit breaker open".to_string());
+    }
+
     for (idx, (backoff, model_override)) in attempt_schedule.iter().enumerate() {
+        if agy_breaker_open {
+            break;
+        }
         if let Some(model) = model_override {
             tracing::info!("faildown attempt {}/{}: trying model {model}", idx + 1, attempt_schedule.len());
             if let Some(emitter) = progress.as_ref() {
@@ -521,6 +552,9 @@ pub(crate) async fn execute_ask_agent(
 
         match attempt_result {
             Ok(parsed) => {
+                if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+                    mcp_bridge::agy_resilience::agy_breaker_record_success();
+                }
                 let tokens = token_total(&parsed);
                 if let Some(metrics) = process_metrics() {
                     metrics.agent_tokens_total.inc_by(tokens);
@@ -594,6 +628,18 @@ pub(crate) async fn execute_ask_agent(
             }
             Err(e) => {
                 let msg = e.to_string();
+                // REQ-101/103: feed the agy circuit breaker. Quota trips it faster;
+                // ambiguous failures bias toward OPEN at a slightly higher bar.
+                if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+                    match crate::agy::classify_failure_message(&msg) {
+                        crate::agy::AgyFailureClass::Quota => {
+                            mcp_bridge::agy_resilience::agy_breaker_record_quota()
+                        }
+                        crate::agy::AgyFailureClass::AuthOrExec => {
+                            mcp_bridge::agy_resilience::agy_breaker_record_other_failure()
+                        }
+                    }
+                }
                 if session_for_attempt.is_some() && should_invalidate_cached_session(&msg) {
                     worker_session_id = None;
                     update_worker_session(&agent, &exec_cwd, None).await;
