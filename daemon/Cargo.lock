@@ -1326,6 +1326,7 @@ dependencies = [
  "daemon-core",
  "daemon-http",
  "ledger",
+ "mcp-bridge",
  "peer-review",
  "rusqlite",
  "serde_json",
@@ -2628,6 +2629,7 @@ version = "3.9.0"
 dependencies = [
  "agent-adapter",
  "shared-types",
+ "tokio",
  "tracing",
 ]
 
@@ -5475,6 +5477,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio 1.2.0",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -5728,6 +5731,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
+name = "trace-capture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5870,6 +5887,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "peer-review",
+ "portable-pty",
  "prometheus",
  "regex-lite",
  "reqwest 0.12.28",

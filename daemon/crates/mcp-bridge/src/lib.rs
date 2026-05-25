@@ -12,6 +12,9 @@ pub use codex_capabilities::{
     CodexCapabilities, codex_capabilities, probe_and_cache_codex_capabilities,
 };
 
+pub mod agy;
+pub mod agy_resilience;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
     pub name: &'static str,
@@ -226,6 +229,84 @@ pub fn codex_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "codex")
 }
 
+/// Backend that serves the public `gemini` agent. The public agent name stays
+/// `gemini` (C3); this selects which CLI actually executes the request. REQ-001.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiBackend {
+    /// Legacy `gemini` CLI (stream-json). Default and rollback target; kept until
+    /// the binary stops serving on 2026-06-18.
+    GeminiCli,
+    /// Antigravity CLI (`agy`), single-turn plain text, subscription-OAuth only.
+    Agy,
+}
+
+impl GeminiBackend {
+    /// Stable label used in logs and the degraded-route surface (REQ-005).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeminiBackend::GeminiCli => "gemini-cli",
+            GeminiBackend::Agy => "agy",
+        }
+    }
+}
+
+/// Select the gemini backend from `TRIUMVIRATE_GEMINI_BACKEND`. The value must be
+/// exactly `agy` to select agy; unset or ANY other value is the legacy gemini-cli
+/// path, so the default behavior is byte-for-byte the current path (REQ-001/002).
+#[instrument(skip_all)]
+pub fn gemini_backend() -> GeminiBackend {
+    match std::env::var("TRIUMVIRATE_GEMINI_BACKEND").ok().as_deref() {
+        Some("agy") => GeminiBackend::Agy,
+        _ => GeminiBackend::GeminiCli,
+    }
+}
+
+/// Resolve the agy binary path + extra args, mirroring the gemini/codex connector
+/// resolution (`TRIUMVIRATE_AGY_BIN` default `agy`, `TRIUMVIRATE_AGY_ARGS`). REQ-010.
+#[instrument(skip_all)]
+pub fn agy_command() -> (String, Vec<String>) {
+    resolve_connector_command("TRIUMVIRATE_AGY_BIN", "TRIUMVIRATE_AGY_ARGS", "agy")
+}
+
+/// Shadow-compare mode (Slice 6, opt-in via `TRIUMVIRATE_GEMINI_SHADOW`). When on,
+/// every `gemini` request ALSO dispatches the other Gemini backend for comparison;
+/// the primary still answers. Off by default — it doubles usage of the shared Google
+/// quota pool, so it is a validation tool, not steady-state.
+#[instrument(skip_all)]
+pub fn gemini_shadow_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_GEMINI_SHADOW")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+impl GeminiBackend {
+    /// The other Gemini backend — the one shadow-compare runs alongside this primary.
+    pub fn shadow_counterpart(self) -> GeminiBackend {
+        match self {
+            GeminiBackend::GeminiCli => GeminiBackend::Agy,
+            GeminiBackend::Agy => GeminiBackend::GeminiCli,
+        }
+    }
+}
+
+/// The verified-good agy version the backend expects (REQ-059). Defaults to the
+/// last version verified against the live binary (1.0.2). On mismatch the backend
+/// warns, or refuses under `agy_strict_version()`.
+#[instrument(skip_all)]
+pub fn agy_expected_version() -> String {
+    std::env::var("TRIUMVIRATE_AGY_EXPECTED_VERSION").unwrap_or_else(|_| "1.0.2".to_string())
+}
+
+/// Whether an agy version mismatch refuses the backend (vs. warn only). REQ-059.
+#[instrument(skip_all)]
+pub fn agy_strict_version() -> bool {
+    std::env::var("TRIUMVIRATE_AGY_STRICT_VERSION")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
 #[instrument(skip_all)]
 pub fn agent_verbosity() -> AgentVerbosity {
     let raw = std::env::var("TRIUMVIRATE_AGENT_VERBOSITY").ok();
@@ -286,6 +367,46 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn gemini_backend_defaults_to_gemini_cli_and_only_agy_selects_agy() {
+        // REQ-001/002 + REQ-083 rollback config: unset or ANY non-"agy" value is the
+        // legacy gemini-cli path; only exactly "agy" selects the agy backend.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "agy") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::Agy);
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "anything-else") };
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
+    }
+
+    #[test]
+    fn shadow_counterpart_is_the_other_backend() {
+        assert_eq!(
+            super::GeminiBackend::GeminiCli.shadow_counterpart(),
+            super::GeminiBackend::Agy
+        );
+        assert_eq!(
+            super::GeminiBackend::Agy.shadow_counterpart(),
+            super::GeminiBackend::GeminiCli
+        );
+    }
+
+    #[test]
+    fn gemini_shadow_is_opt_in() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_SHADOW") };
+        assert!(!super::gemini_shadow_enabled(), "off by default");
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_SHADOW", "on") };
+        assert!(super::gemini_shadow_enabled());
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_SHADOW", "0") };
+        assert!(!super::gemini_shadow_enabled());
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_SHADOW") };
     }
 
     #[test]

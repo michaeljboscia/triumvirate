@@ -71,6 +71,7 @@ mod tests {
             build_id: Some("abe-v3-main".to_string()),
             task_id: Some("T-114".to_string()),
             wave: Some(3),
+            usage_source: "exact".to_string(),
         };
 
         record_daemon_tokens(&db, record).expect("record daemon tokens");
@@ -106,6 +107,7 @@ mod tests {
             build_id: None,
             task_id: None,
             wave: None,
+            usage_source: "exact".to_string(),
         };
 
         let err = record_daemon_tokens(&db, record).expect_err("should reject empty session_id");

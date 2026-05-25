@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS token_records (
     context_window INTEGER,
     build_id TEXT,
     task_id TEXT,
-    wave INTEGER
+    wave INTEGER,
+    usage_source TEXT NOT NULL DEFAULT 'exact'
 );
 
 CREATE TABLE IF NOT EXISTS scan_state (
@@ -71,12 +72,37 @@ pub fn open(path: &Path) -> anyhow::Result<TokenDb> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(CREATE_SCHEMA_SQL)?;
+    migrate_schema(&conn)?;
 
     debug!(db_path = %path.display(), "token economics DB initialized");
 
     Ok(TokenDb {
         conn: std::sync::Mutex::new(conn),
     })
+}
+
+/// Idempotent forward migrations for DBs created before a column existed. `CREATE
+/// TABLE IF NOT EXISTS` does not add columns to an existing table, so add them here.
+fn migrate_schema(conn: &Connection) -> anyhow::Result<()> {
+    if !column_exists(conn, "token_records", "usage_source")? {
+        conn.execute_batch(
+            "ALTER TABLE token_records ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'exact';",
+        )?;
+        debug!("migrated token_records: added usage_source column (REQ-057)");
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn insert_record(db: &TokenDb, record: &TokenRecord) -> anyhow::Result<()> {
@@ -102,10 +128,11 @@ pub fn insert_record(db: &TokenDb, record: &TokenRecord) -> anyhow::Result<()> {
                 context_window,
                 build_id,
                 task_id,
-                wave
+                wave,
+                usage_source
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
             )
             "#,
             params![
@@ -128,6 +155,7 @@ pub fn insert_record(db: &TokenDb, record: &TokenRecord) -> anyhow::Result<()> {
                 record.build_id,
                 record.task_id,
                 record.wave,
+                record.usage_source,
             ],
         )?;
         Ok(())
@@ -163,7 +191,8 @@ pub fn query_summary(
                 context_window,
                 build_id,
                 task_id,
-                wave
+                wave,
+                usage_source
             FROM token_records
             WHERE 1 = 1
             "#,
@@ -210,6 +239,7 @@ pub fn query_summary(
                 build_id: row.get(17)?,
                 task_id: row.get(18)?,
                 wave: row.get(19)?,
+                usage_source: row.get(20)?,
             });
         }
 
@@ -293,6 +323,7 @@ mod tests {
             build_id: Some("abe-v3-main".to_string()),
             task_id: Some("T-102".to_string()),
             wave: Some(0),
+            usage_source: "exact".to_string(),
         };
 
         insert_record(&db, &record).expect("insert token record");
@@ -325,6 +356,7 @@ mod tests {
         assert_eq!(row.build_id, record.build_id);
         assert_eq!(row.task_id, record.task_id);
         assert_eq!(row.wave, record.wave);
+        assert_eq!(row.usage_source, record.usage_source);
     }
 
     #[test]
@@ -353,6 +385,7 @@ mod tests {
             build_id: None,
             task_id: None,
             wave: None,
+            usage_source: "exact".to_string(),
         };
         let mut codex = claude.clone();
         codex.agent = "codex".to_string();
@@ -392,6 +425,7 @@ mod tests {
             build_id: None,
             task_id: None,
             wave: None,
+            usage_source: "exact".to_string(),
         };
         let mut inside = before.clone();
         inside.session_id = "session-inside".to_string();

@@ -39,9 +39,75 @@ pub struct AskAgentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AskAgentResponse {
     pub request_id: String,
+    /// The agent that was REQUESTED. Stays stable (e.g. `gemini`) even when a
+    /// degraded hop answers with a different agent — clients keyed on this field
+    /// are unaffected by backend substitution (REQ-053).
     pub agent: String,
     pub response: String,
     pub lifecycle: Vec<LifecycleEvent>,
+    /// Substitution honesty (REQ-053 R3): set only when a degraded route answered
+    /// with a different agent/backend than requested. Omitted from the wire on the
+    /// normal path so existing clients see an unchanged shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_from_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    /// Shadow-compare mode (opt-in, TRIUMVIRATE_GEMINI_SHADOW): the OTHER Gemini
+    /// backend ran alongside the primary for comparison. `.response` is still the
+    /// primary's answer; these carry the shadow's answer/latency/error so the caller
+    /// can compare the two backends on real traffic. Omitted from the wire when off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_latency_ms: Option<u64>,
+}
+
+impl AskAgentResponse {
+    /// A normal, non-degraded response: the requested agent answered directly.
+    pub fn direct(
+        request_id: String,
+        agent: String,
+        response: String,
+        lifecycle: Vec<LifecycleEvent>,
+    ) -> Self {
+        Self {
+            request_id,
+            agent,
+            response,
+            lifecycle,
+            answered_by_agent: None,
+            answered_by_backend: None,
+            degraded_from_backend: None,
+            degradation_reason: None,
+            shadow_backend: None,
+            shadow_response: None,
+            shadow_error: None,
+            shadow_latency_ms: None,
+        }
+    }
+
+    /// Attach shadow-compare results to a response (Slice 6 / shadow mode).
+    pub fn with_shadow(
+        mut self,
+        backend: Option<String>,
+        response: Option<String>,
+        error: Option<String>,
+        latency_ms: Option<u64>,
+    ) -> Self {
+        self.shadow_backend = backend;
+        self.shadow_response = response;
+        self.shadow_error = error;
+        self.shadow_latency_ms = latency_ms;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

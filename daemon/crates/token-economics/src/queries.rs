@@ -83,20 +83,28 @@ pub fn summary_query(db: &TokenDb, filters: &SummaryQueryFilters) -> anyhow::Res
     let mut per_agent: BTreeMap<String, SummaryAccumulator> = BTreeMap::new();
     let mut total_tokens: i64 = 0;
     let mut total_cost_usd: f64 = 0.0;
+    // REQ-057: dispatches with no honest token count (agy) are recorded but excluded
+    // from cost/token sums; surface the occurrence count so dashboards show an honest
+    // "unmetered" marker instead of fake-zero spend.
+    let mut unmetered_records: i64 = 0;
     let mut first_timestamp: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
 
     for row in &rows {
-        total_tokens += row.total_tokens;
-        total_cost_usd += row.cost_usd.unwrap_or(0.0);
         first_timestamp = min_timestamp(first_timestamp, &row.timestamp);
         last_timestamp = max_timestamp(last_timestamp, &row.timestamp);
-
         let entry = per_agent.entry(row.agent.clone()).or_default();
-        entry.total_tokens += row.total_tokens;
-        entry.total_cost_usd += row.cost_usd.unwrap_or(0.0);
         entry.record_count += 1;
         entry.sessions.insert(row.session_id.clone());
+
+        if row.usage_source == crate::USAGE_SOURCE_UNMETERED {
+            unmetered_records += 1;
+            continue; // excluded from cost + token sums
+        }
+        total_tokens += row.total_tokens;
+        total_cost_usd += row.cost_usd.unwrap_or(0.0);
+        entry.total_tokens += row.total_tokens;
+        entry.total_cost_usd += row.cost_usd.unwrap_or(0.0);
     }
 
     let agents: Vec<AgentTokenSummary> = per_agent
@@ -122,6 +130,7 @@ pub fn summary_query(db: &TokenDb, filters: &SummaryQueryFilters) -> anyhow::Res
         "filters": filters,
         "time_range": time_range,
         "record_count": rows.len(),
+        "unmetered_records": unmetered_records,
         "total_tokens": total_tokens,
         "total_cost_usd": total_cost_usd,
         "agents": agents
@@ -213,7 +222,8 @@ pub fn by_session_query(db: &TokenDb, session_id: &str) -> anyhow::Result<Sessio
             context_window,
             build_id,
             task_id,
-            wave
+            wave,
+            usage_source
         FROM token_records
         WHERE session_id = ?1
         ORDER BY timestamp ASC, id ASC
@@ -242,6 +252,7 @@ pub fn by_session_query(db: &TokenDb, session_id: &str) -> anyhow::Result<Sessio
             build_id: row.get(17)?,
             task_id: row.get(18)?,
             wave: row.get(19)?,
+            usage_source: row.get(20)?,
         })
     })?;
 
@@ -384,6 +395,7 @@ mod tests {
             build_id: Some("abe-v3-main".to_string()),
             task_id: Some("T-115".to_string()),
             wave: Some(4),
+            usage_source: "exact".to_string(),
         }
     }
 
@@ -398,6 +410,28 @@ mod tests {
         assert_eq!(payload["record_count"], serde_json::json!(2));
         assert_eq!(payload["total_tokens"], serde_json::json!(32));
         assert_eq!(payload["agents"].as_array().map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn summary_query_excludes_unmetered_from_cost_but_counts_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open db");
+        // One exact codex row, one unmetered agy row (no honest count).
+        insert_record(&db, &sample_record("codex", "sess-1", "2026-04-10T01:00:00Z"))
+            .expect("insert exact row");
+        let mut agy = sample_record("gemini", "sess-2", "2026-04-10T02:00:00Z");
+        agy.usage_source = crate::USAGE_SOURCE_UNMETERED.to_string();
+        agy.total_tokens = 0;
+        agy.cost_usd = None;
+        insert_record(&db, &agy).expect("insert unmetered row");
+
+        let payload = summary_query(&db, &SummaryQueryFilters::default()).expect("summary query");
+        // The dispatch is counted...
+        assert_eq!(payload["record_count"], serde_json::json!(2));
+        assert_eq!(payload["unmetered_records"], serde_json::json!(1));
+        // ...but excluded from token/cost sums (only the exact codex row counts).
+        assert_eq!(payload["total_tokens"], serde_json::json!(16));
+        assert_eq!(payload["total_cost_usd"], serde_json::json!(0.01));
     }
 
     #[test]
