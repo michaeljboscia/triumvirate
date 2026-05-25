@@ -176,6 +176,7 @@ fn build_record_from_line(
         build_id: None,
         task_id: None,
         wave: None,
+        usage_source: crate::USAGE_SOURCE_EXACT.to_string(),
     })
 }
 
@@ -209,6 +210,7 @@ fn collect_records_from_value(
             build_id: None,
             task_id: None,
             wave: None,
+            usage_source: crate::USAGE_SOURCE_EXACT.to_string(),
         });
     }
 

@@ -14,8 +14,8 @@ use agent_worker::{
 use daemon_core::{resolve_context as core_resolve_context, unix_time_ms as core_unix_time_ms};
 use ledger::LedgerStore;
 use mcp_bridge::{
-    agent_verbosity, codex_command, codex_protocol, gemini_command, gemini_streaming_enabled,
-    is_supported_agent,
+    GeminiBackend, agent_verbosity, agy_command, codex_command, codex_protocol, gemini_backend,
+    gemini_command, gemini_shadow_enabled, gemini_streaming_enabled, is_supported_agent,
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
@@ -63,7 +63,7 @@ Rules:
 - Emit normal prose outside the XML block when needed.";
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     // SAFETY: pre_exec runs in the spawned child process before exec.
     unsafe {
         command.pre_exec(|| {
@@ -76,10 +76,10 @@ fn configure_process_group(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+pub(crate) fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn kill_process_group(child: &mut tokio::process::Child) {
+pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
         let pgid = -(pid as i32);
         // SAFETY: kill is called with a process-group id derived from child pid.
@@ -90,9 +90,9 @@ fn kill_process_group(child: &mut tokio::process::Child) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_child: &mut tokio::process::Child) {}
+pub(crate) fn kill_process_group(_child: &mut tokio::process::Child) {}
 
-fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: WorkingStateEvent) {
+pub(crate) fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: WorkingStateEvent) {
     if let Some(sender) = tx {
         let _ = sender.try_send(event);
     }
@@ -164,6 +164,16 @@ fn persist_daemon_token_record(
     let (task_id, wave) = read_contract_context(resolved_cwd.as_deref());
     let build_id = read_build_id(resolved_cwd.as_deref()).or_else(|| resolved_repo.clone());
 
+    // REQ-057: agy has no honest headless token count → record the dispatch as
+    // `unmetered` (excluded from cost sums) rather than a fake zero. Other backends
+    // carry exact counts.
+    let usage_source = if parsed.parser_mode.starts_with("agy") {
+        token_economics::USAGE_SOURCE_UNMETERED
+    } else {
+        token_economics::USAGE_SOURCE_EXACT
+    }
+    .to_string();
+
     let record = TokenRecord {
         agent: agent.to_string(),
         session_id,
@@ -184,6 +194,7 @@ fn persist_daemon_token_record(
         build_id,
         task_id,
         wave,
+        usage_source,
     };
 
     if let Err(err) = record_daemon_tokens(token_db.as_ref(), &record) {
@@ -240,6 +251,13 @@ pub(crate) async fn execute_ask_agent(
         return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
     }
     let agent = req.agent.to_lowercase();
+    // REQ-001: resolve the gemini backend once, up front — it drives both the attempt
+    // schedule (agy is single-attempt, REQ-013) and the degraded route (REQ-053).
+    let gemini_backend_selected = if agent == "gemini" {
+        Some(gemini_backend())
+    } else {
+        None
+    };
     let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
@@ -332,20 +350,26 @@ pub(crate) async fn execute_ask_agent(
         emitter.emit(format!("→ {agent_display}: working...")).await;
     }
 
-    // Build the attempt schedule: for gemini, use model faildown chain; for others, 3 retries.
+    // Build the attempt schedule: for gemini-cli, use the model faildown chain; for
+    // the agy backend, a single attempt with no --model (REQ-013 — agy ignores
+    // --model and runs its own internal retry); for others, 3 retries.
     let attempt_schedule: Vec<(Duration, Option<&str>)> = if agent == "gemini" {
-        GEMINI_MODEL_FAILDOWN
-            .iter()
-            .enumerate()
-            .map(|(i, model)| {
-                let backoff = if i == 0 {
-                    Duration::ZERO
-                } else {
-                    Duration::from_millis(500)
-                };
-                (backoff, Some(*model))
-            })
-            .collect()
+        if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+            vec![(Duration::ZERO, None)]
+        } else {
+            GEMINI_MODEL_FAILDOWN
+                .iter()
+                .enumerate()
+                .map(|(i, model)| {
+                    let backoff = if i == 0 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(500)
+                    };
+                    (backoff, Some(*model))
+                })
+                .collect()
+        }
     } else {
         vec![
             (Duration::from_millis(250), None),
@@ -356,7 +380,46 @@ pub(crate) async fn execute_ask_agent(
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
 
+    // Slice 6 (shadow-compare): the OTHER Gemini backend to run alongside the primary
+    // for comparison when TRIUMVIRATE_GEMINI_SHADOW is on. None disables shadowing.
+    let shadow_backend = if agent == "gemini" && gemini_shadow_enabled() {
+        gemini_backend_selected.map(GeminiBackend::shadow_counterpart)
+    } else {
+        None
+    };
+
+    // REQ-101/103: if the agy circuit breaker is OPEN, skip the agy attempt and route
+    // straight around it. The breaker opens on repeated quota, so the reason is set
+    // quota-class → the degraded route skips gemini-cli (shared pool) and uses codex.
+    let agy_breaker_open = matches!(gemini_backend_selected, Some(GeminiBackend::Agy))
+        && mcp_bridge::agy_resilience::agy_breaker_should_skip();
+    if agy_breaker_open {
+        let detail = "agy circuit breaker open (repeated quota) — skipping agy, routing around";
+        lifecycle.push(LifecycleEvent {
+            state: "BREAKER_OPEN".to_string(),
+            detail: detail.to_string(),
+        });
+        let _ = append_outbox_event(&OutboxEvent {
+            ts_ms: core_unix_time_ms(),
+            request_id: request_id.clone(),
+            tool: "ask_agent".to_string(),
+            status: "BREAKER_OPEN".to_string(),
+            agent: Some(agent.clone()),
+            detail: detail.to_string(),
+            cwd: resolved_cwd.clone(),
+            repo: resolved_repo.clone(),
+            branch: resolved_branch.clone(),
+            working_state: Some("BREAKER_OPEN".to_string()),
+            token_usage: None,
+            tool_name: None,
+        });
+        last_err = Some("agy capacity/quota: circuit breaker open".to_string());
+    }
+
     for (idx, (backoff, model_override)) in attempt_schedule.iter().enumerate() {
+        if agy_breaker_open {
+            break;
+        }
         if let Some(model) = model_override {
             tracing::info!("faildown attempt {}/{}: trying model {model}", idx + 1, attempt_schedule.len());
             if let Some(emitter) = progress.as_ref() {
@@ -508,6 +571,9 @@ pub(crate) async fn execute_ask_agent(
 
         match attempt_result {
             Ok(parsed) => {
+                if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+                    mcp_bridge::agy_resilience::agy_breaker_record_success();
+                }
                 let tokens = token_total(&parsed);
                 if let Some(metrics) = process_metrics() {
                     metrics.agent_tokens_total.inc_by(tokens);
@@ -572,15 +638,48 @@ pub(crate) async fn execute_ask_agent(
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                     return Err(err);
                 }
-                return Ok(AskAgentResponse {
+                // Slice 6: shadow-compare — run the other Gemini backend, attach + log.
+                let (sh_backend, sh_resp, sh_err, sh_ms) = if let Some(sb) = shadow_backend {
+                    let primary_label = gemini_backend_selected
+                        .map(GeminiBackend::as_str)
+                        .unwrap_or(agent.as_str());
+                    let (resp, err, ms) = run_gemini_shadow(sb, &execution_prompt, &exec_cwd).await;
+                    log_shadow_comparison(
+                        &request_id,
+                        &req.message,
+                        primary_label,
+                        &parsed.response_text,
+                        sb,
+                        &resp,
+                        &err,
+                        ms,
+                    );
+                    (Some(sb.as_str().to_string()), resp, err, Some(ms))
+                } else {
+                    (None, None, None, None)
+                };
+                return Ok(AskAgentResponse::direct(
                     request_id,
-                    agent: agent.clone(),
-                    response: parsed.response_text,
+                    agent.clone(),
+                    parsed.response_text,
                     lifecycle,
-                });
+                )
+                .with_shadow(sh_backend, sh_resp, sh_err, sh_ms));
             }
             Err(e) => {
                 let msg = e.to_string();
+                // REQ-101/103: feed the agy circuit breaker. Quota trips it faster;
+                // ambiguous failures bias toward OPEN at a slightly higher bar.
+                if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+                    match crate::agy::classify_failure_message(&msg) {
+                        crate::agy::AgyFailureClass::Quota => {
+                            mcp_bridge::agy_resilience::agy_breaker_record_quota()
+                        }
+                        crate::agy::AgyFailureClass::AuthOrExec => {
+                            mcp_bridge::agy_resilience::agy_breaker_record_other_failure()
+                        }
+                    }
+                }
                 if session_for_attempt.is_some() && should_invalidate_cached_session(&msg) {
                     worker_session_id = None;
                     update_worker_session(&agent, &exec_cwd, None).await;
@@ -662,6 +761,148 @@ pub(crate) async fn execute_ask_agent(
                 }
                 last_err = Some(msg);
                 sleep(*backoff).await;
+            }
+        }
+    }
+
+    // REQ-053/054: degraded route. Fires only when the agy backend was selected and
+    // hard-failed (auth/exec/quota). Quota-class failures skip gemini-cli (shared
+    // quota pool) and go straight to codex. The public agent stays `gemini`; a
+    // successful hop returns with substitution-honesty fields + a one-line prefix.
+    if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+        let reason = last_err
+            .clone()
+            .unwrap_or_else(|| "agy backend failed".to_string());
+        let class = crate::agy::classify_failure_message(&reason);
+        let hops = crate::agy::plan_degraded_route(&crate::agy::degraded_route_env(), class);
+        let deadline = started + crate::agy::degraded_total_budget();
+        for hop in hops {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                lifecycle.push(LifecycleEvent {
+                    state: "DEGRADED_BUDGET_EXHAUSTED".to_string(),
+                    detail: "degraded route budget exhausted".to_string(),
+                });
+                break;
+            }
+            let hop_display = display_agent_name(hop.agent);
+            let degraded_detail =
+                format!("agy unavailable ({class:?}); routing to {} ({hop_display})", hop.backend);
+            lifecycle.push(LifecycleEvent {
+                state: "DEGRADED".to_string(),
+                detail: degraded_detail.clone(),
+            });
+            let _ = append_outbox_event(&OutboxEvent {
+                ts_ms: core_unix_time_ms(),
+                request_id: request_id.clone(),
+                tool: "ask_agent".to_string(),
+                status: "DEGRADED".to_string(),
+                agent: Some(agent.clone()),
+                detail: degraded_detail,
+                cwd: resolved_cwd.clone(),
+                repo: resolved_repo.clone(),
+                branch: resolved_branch.clone(),
+                working_state: Some("DEGRADED".to_string()),
+                token_usage: None,
+                tool_name: None,
+            });
+            if let Some(emitter) = progress.as_ref() {
+                emitter
+                    .emit(format!("→ {agent_display} unavailable — falling back to {}…", hop.backend))
+                    .await;
+            }
+
+            // Run the hop within the remaining budget. The gemini-cli hop bypasses the
+            // selector — dispatching agent="gemini" would re-select agy and loop.
+            let hop_result = match hop.backend {
+                "gemini-cli" => {
+                    let (bin, args) = gemini_command();
+                    timeout(
+                        remaining,
+                        run_gemini_cli_process_with_session(
+                            &bin, &args, &execution_prompt, &exec_cwd, None, None,
+                        ),
+                    )
+                    .await
+                }
+                _ => {
+                    timeout(
+                        remaining,
+                        run_named_agent_with_session_and_model(
+                            hop.agent, &execution_prompt, &exec_cwd, None, None, None,
+                        ),
+                    )
+                    .await
+                }
+            };
+
+            match hop_result {
+                Ok(Ok(parsed)) => {
+                    persist_daemon_token_record(
+                        hop.agent, &request_id, &parsed, &resolved_cwd, &resolved_repo,
+                    );
+                    let done_detail = format!("answered by {} (degraded from agy)", hop.backend);
+                    lifecycle.push(LifecycleEvent {
+                        state: "DONE".to_string(),
+                        detail: done_detail.clone(),
+                    });
+                    let _ = append_outbox_event(&OutboxEvent {
+                        ts_ms: core_unix_time_ms(),
+                        request_id: request_id.clone(),
+                        tool: "ask_agent".to_string(),
+                        status: "DONE".to_string(),
+                        agent: Some(agent.clone()),
+                        detail: done_detail,
+                        cwd: resolved_cwd.clone(),
+                        repo: resolved_repo.clone(),
+                        branch: resolved_branch.clone(),
+                        working_state: Some("DONE".to_string()),
+                        token_usage: None,
+                        tool_name: None,
+                    });
+                    if let Some(emitter) = progress.as_ref() {
+                        emitter.emit(format!("→ {hop_display}: responded ✓")).await;
+                    }
+                    span.record("agent.outcome", "degraded_success");
+                    span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+                    // REQ-053 R3: a text prefix only when a DIFFERENT agent answered
+                    // (codex). A gemini-cli hop is the same agent on the legacy backend,
+                    // so honesty lives in the fields/lifecycle, not an alarming prefix.
+                    let prefix = if hop.agent != agent {
+                        format!("⚠ Gemini unavailable — answered by {hop_display}\n\n")
+                    } else {
+                        String::new()
+                    };
+                    return Ok(AskAgentResponse {
+                        request_id,
+                        agent: agent.clone(),
+                        response: format!("{prefix}{}", parsed.response_text),
+                        lifecycle,
+                        answered_by_agent: Some(hop.agent.to_string()),
+                        answered_by_backend: Some(hop.backend.to_string()),
+                        degraded_from_backend: Some("agy".to_string()),
+                        degradation_reason: Some(reason.clone()),
+                        shadow_backend: None,
+                        shadow_response: None,
+                        shadow_error: None,
+                        shadow_latency_ms: None,
+                    });
+                }
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    lifecycle.push(LifecycleEvent {
+                        state: "DEGRADED_FAILED".to_string(),
+                        detail: format!("{} hop failed: {msg}", hop.backend),
+                    });
+                    last_err = Some(msg);
+                }
+                Err(_) => {
+                    lifecycle.push(LifecycleEvent {
+                        state: "DEGRADED_TIMEOUT".to_string(),
+                        detail: format!("{} hop exceeded remaining degraded budget", hop.backend),
+                    });
+                    last_err = Some(format!("{} hop timed out", hop.backend));
+                }
             }
         }
     }
@@ -903,6 +1144,70 @@ async fn run_named_agent_with_session(
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
 ) -> anyhow::Result<ParsedAgentResult> {
     run_named_agent_with_session_and_model(agent, message, cwd, session_id, events_tx, None).await
+}
+
+/// Run the shadow Gemini backend (the non-primary one) for comparison and return its
+/// (response, error, latency_ms). Shadow-compare mode (Slice 6). Best-effort: it never
+/// affects the primary result — failures are captured, not propagated — and it does NOT
+/// feed the circuit breaker (an observation, not a routing decision).
+async fn run_gemini_shadow(
+    shadow_backend: GeminiBackend,
+    prompt: &str,
+    cwd: &str,
+) -> (Option<String>, Option<String>, u64) {
+    let started = Instant::now();
+    let result = match shadow_backend {
+        GeminiBackend::Agy => {
+            let (bin, args) = agy_command();
+            crate::agy::run_agy_cli_process_with_session(&bin, &args, prompt, cwd, None, None).await
+        }
+        GeminiBackend::GeminiCli => {
+            let (bin, args) = gemini_command();
+            run_gemini_cli_process_with_session(&bin, &args, prompt, cwd, None, None).await
+        }
+    };
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(parsed) => (Some(parsed.response_text), None, latency_ms),
+        Err(e) => (None, Some(e.to_string()), latency_ms),
+    }
+}
+
+/// Append a shadow-compare record to `<triumvirate_home>/agy-shadow-compare.jsonl` for
+/// offline review (Slice 6). Best-effort; logging failures are swallowed.
+#[allow(clippy::too_many_arguments)]
+fn log_shadow_comparison(
+    request_id: &str,
+    prompt: &str,
+    primary_backend: &str,
+    primary_response: &str,
+    shadow_backend: GeminiBackend,
+    shadow_response: &Option<String>,
+    shadow_error: &Option<String>,
+    shadow_latency_ms: u64,
+) {
+    let Ok(home) = daemon_core::triumvirate_home_dir() else {
+        return;
+    };
+    let record = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "request_id": request_id,
+        "prompt": prompt,
+        "primary_backend": primary_backend,
+        "primary_response": primary_response,
+        "shadow_backend": shadow_backend.as_str(),
+        "shadow_response": shadow_response,
+        "shadow_error": shadow_error,
+        "shadow_latency_ms": shadow_latency_ms,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("agy-shadow-compare.jsonl"))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{record}");
+    }
 }
 
 async fn run_named_agent_with_session_and_model(
@@ -1680,10 +1985,24 @@ async fn run_agent_process_with_session(
     }
 
     match agent {
-        "gemini" => {
-            run_gemini_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
+        // REQ-001/003/005: the backend selector lives at this seam. The public agent
+        // name stays `gemini` (C3); only the executing CLI changes. The gemini-cli path
+        // is kept verbatim for rollback and the degraded route.
+        "gemini" => match gemini_backend() {
+            GeminiBackend::Agy => {
+                let (agy_bin, agy_args) = agy_command();
+                tracing::info!(backend = "agy", "gemini dispatch served by agy backend");
+                crate::agy::run_agy_cli_process_with_session(
+                    &agy_bin, &agy_args, message, cwd, session_id, events_tx,
+                )
                 .await
-        }
+            }
+            GeminiBackend::GeminiCli => {
+                tracing::info!(backend = "gemini-cli", "gemini dispatch served by gemini-cli backend");
+                run_gemini_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
+                    .await
+            }
+        },
         "codex" => {
             run_codex_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
                 .await
