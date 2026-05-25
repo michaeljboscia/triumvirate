@@ -1,0 +1,9 @@
+=== ~/.gemini/oauth_creds.json (secrets redacted) ===
+  access_token = <redacted, len=260>
+  scope = https://www.googleapis.com/auth/userinfo.email openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.profile
+  token_type = Bearer
+  id_token = <redacted, len=1013>
+  expiry_date = 1779620415870
+  refresh_token = <redacted, len=103>
+  -> access-token expiry: 2026-05-24 07:00:15.870000  (7.9 min from now)
+NOTE: expiry_date here is the short-lived ACCESS token; the refresh token (redacted) is what governs long-run persistence.

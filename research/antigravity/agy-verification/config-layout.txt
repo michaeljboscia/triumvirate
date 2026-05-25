@@ -1,0 +1,25 @@
+ls: /Users/REDACTED/.antigravity: No such file or directory
+ls: /Users/REDACTED/.config/antigravity: No such file or directory
+/Users/REDACTED/.antigravitycli:
+total 0
+drwxr-xr-x   3 michaelboscia  staff    96 May 23 08:50 .
+drwxr-x---+ 41 michaelboscia  staff  1312 May 23 22:33 ..
+lrwxr-xr-x   1 michaelboscia  staff    86 May 23 08:50 36ee9262-92ad-489e-80f8-17cf1feac0fb.json -> /Users/REDACTED/.gemini/config/projects/36ee9262-92ad-489e-80f8-17cf1feac0fb.json
+
+/Users/REDACTED/.gemini:
+total 48
+drwxr-xr-x  15 michaelboscia  staff   480 May 23 22:32 .
+drwxr-x---+ 41 michaelboscia  staff  1312 May 23 22:33 ..
+drwxr-xr-x@  7 michaelboscia  staff   224 May 23 08:44 antigravity
+drwxr-xr-x  16 michaelboscia  staff   512 May 23 08:51 antigravity-cli
+drwxr-xr-x@  8 michaelboscia  staff   256 May 23 08:44 config
+-rw-r--r--   1 michaelboscia  staff    55 May 22 21:10 google_accounts.json
+drwxr-xr-x   6 michaelboscia  staff   192 May 23 16:31 history
+-rw-r--r--   1 michaelboscia  staff    36 May 22 21:06 installation_id
+-rw-------   1 michaelboscia  staff  1663 May 23 22:17 oauth_creds.json
+-rw-r--r--   1 michaelboscia  staff   218 May 23 16:31 projects.json
+-rw-r--r--   1 michaelboscia  staff     0 May 22 21:06 projects.json.4a4dfeb7-3bd6-4bca-8da8-37622b8fc3ed.tmp
+-rw-r--r--   1 michaelboscia  staff     0 May 22 21:06 projects.json.6afedf6d-d764-497c-b60a-f24e18fef75c.tmp
+-rw-r--r--   1 michaelboscia  staff   767 May 23 08:41 settings.json
+-rw-r--r--   1 michaelboscia  staff   188 May 23 14:00 state.json
+drwxr-xr-x   6 michaelboscia  staff   192 May 23 16:31 tmp

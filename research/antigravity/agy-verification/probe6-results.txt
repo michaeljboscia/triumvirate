@@ -1,0 +1,15 @@
+conv A = 08bc2545-116f-4b08-8fef-f602a94117cc
+conv B = e0c24bdb-7770-42f6-b865-0c1f49e0e6af
+
+1. set codeword ALPHA1 in conv A
+   (0, False, 'OK.', '')
+2. set codeword BETA2 in conv B
+   (0, False, 'OK.', '')
+3. ask conv A for its codeword
+   (None, True, '', '')
+4. ask conv B for its codeword
+   (0, False, 'You have not told me a codeword in this conversation.', '')
+
+conv A resumed correctly & isolated: False
+conv B resumed correctly & isolated: False
+VERDICT: ANTIGRAVITY_CONVERSATION_ID gives isolated resumable multi-turn = False
