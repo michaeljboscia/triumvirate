@@ -55,10 +55,18 @@ fn breaker_base_cooldown() -> Duration {
 /// Cap the breaker cooldown at the ~5-hr Ultra quota-reset window (REQ-101).
 const BREAKER_MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60 * 60);
 
+/// Floor for the half-open probe lease.
+const HALF_OPEN_LEASE_MIN: Duration = Duration::from_secs(30 * 60);
+
 /// Max time a half-open probe may be in flight before the breaker assumes the probing
 /// request was cancelled/dropped (never recorded a result) and lets a new probe take
-/// over — prevents a stuck-inflight deadlock. Generous: well past a normal dispatch.
-const HALF_OPEN_LEASE: Duration = Duration::from_secs(30 * 60);
+/// over — prevents a stuck-inflight deadlock. Sized to comfortably EXCEED any real
+/// probe (connector timeout x3, incl. the one retry) so a slow-but-alive probe can
+/// never trigger a second concurrent probe / stale-result overwrite — only a genuinely
+/// abandoned probe (which never completes) ever hits the lease.
+fn half_open_lease() -> Duration {
+    (crate::agy::agy_connector_timeout() * 3).max(HALF_OPEN_LEASE_MIN)
+}
 
 // ---------------------------------------------------------------------------
 // Concurrency cap (REQ-055)
@@ -177,7 +185,7 @@ impl BreakerState {
     /// cooldown elapses, transition to half-open and allow exactly ONE probe (returns
     /// false, marking the probe in-flight); all other concurrent callers keep skipping
     /// until that probe resolves (record_success/quota/other) — no stampede (H1).
-    fn should_skip(&mut self, now: Instant) -> bool {
+    fn should_skip(&mut self, now: Instant, lease: Duration) -> bool {
         match self.phase {
             BreakerPhase::Open => match self.open_until {
                 Some(until) if now >= until => {
@@ -196,9 +204,10 @@ impl BreakerState {
                 }
                 // A probe is in flight. If it has been outstanding past the lease, the
                 // probing request was likely cancelled and never recorded a result — let
-                // a new probe take over rather than wedge the breaker forever.
+                // a new probe take over rather than wedge the breaker forever. The lease
+                // exceeds any real probe, so this never fires for a slow-but-alive probe.
                 match self.half_open_since {
-                    Some(since) if now.saturating_duration_since(since) > HALF_OPEN_LEASE => {
+                    Some(since) if now.saturating_duration_since(since) > lease => {
                         self.half_open_since = Some(now);
                         false
                     }
@@ -272,10 +281,11 @@ fn breaker() -> &'static Mutex<BreakerState> {
 /// True if the agy attempt should be short-circuited (caller routes straight to the
 /// degraded route / codex). Transitions OPEN→half-open when the cooldown elapses.
 pub fn agy_breaker_should_skip() -> bool {
+    let lease = half_open_lease();
     let skip = breaker()
         .lock()
         .expect("agy breaker poisoned")
-        .should_skip(Instant::now());
+        .should_skip(Instant::now(), lease);
     if skip {
         tracing::warn!("agy circuit breaker OPEN — skipping agy attempt, routing around");
     }
@@ -408,12 +418,12 @@ mod tests {
         let now = Instant::now();
         let base = Duration::from_secs(120);
         let mut s = BreakerState::new();
-        assert!(!s.should_skip(now));
+        assert!(!s.should_skip(now, HALF_OPEN_LEASE_MIN));
         s.record_quota(now, 3, base);
         s.record_quota(now, 3, base);
-        assert!(!s.should_skip(now), "still closed below threshold");
+        assert!(!s.should_skip(now, HALF_OPEN_LEASE_MIN), "still closed below threshold");
         s.record_quota(now, 3, base);
-        assert!(s.should_skip(now), "OPEN at threshold");
+        assert!(s.should_skip(now, HALF_OPEN_LEASE_MIN), "OPEN at threshold");
     }
 
     #[test]
@@ -424,11 +434,11 @@ mod tests {
         for _ in 0..3 {
             s.record_quota(now, 3, base);
         }
-        assert!(s.should_skip(now), "OPEN");
+        assert!(s.should_skip(now, HALF_OPEN_LEASE_MIN), "OPEN");
         let later = now + Duration::from_secs(121);
-        assert!(!s.should_skip(later), "half-open allows a probe after cooldown");
+        assert!(!s.should_skip(later, HALF_OPEN_LEASE_MIN), "half-open allows a probe after cooldown");
         s.record_success();
-        assert!(!s.should_skip(later), "closed after a successful probe");
+        assert!(!s.should_skip(later, HALF_OPEN_LEASE_MIN), "closed after a successful probe");
     }
 
     #[test]
@@ -440,9 +450,9 @@ mod tests {
             s.record_quota(now, 3, base);
         }
         let t1 = now + Duration::from_secs(121);
-        assert!(!s.should_skip(t1)); // half-open
+        assert!(!s.should_skip(t1, HALF_OPEN_LEASE_MIN)); // half-open
         s.record_quota(t1, 3, base); // probe fails → reopen, longer cooldown
-        assert!(s.should_skip(t1 + Duration::from_secs(121)), "still open with longer cooldown");
+        assert!(s.should_skip(t1 + Duration::from_secs(121), HALF_OPEN_LEASE_MIN), "still open with longer cooldown");
     }
 
     #[test]
@@ -456,11 +466,11 @@ mod tests {
             s.record_quota(now, 3, base);
         }
         let later = now + Duration::from_secs(121);
-        assert!(!s.should_skip(later), "first caller after cooldown is the single probe");
-        assert!(s.should_skip(later), "second concurrent caller is blocked");
-        assert!(s.should_skip(later), "third too");
+        assert!(!s.should_skip(later, HALF_OPEN_LEASE_MIN), "first caller after cooldown is the single probe");
+        assert!(s.should_skip(later, HALF_OPEN_LEASE_MIN), "second concurrent caller is blocked");
+        assert!(s.should_skip(later, HALF_OPEN_LEASE_MIN), "third too");
         s.record_success(); // probe succeeds → closed
-        assert!(!s.should_skip(later), "closed after a successful probe");
+        assert!(!s.should_skip(later, HALF_OPEN_LEASE_MIN), "closed after a successful probe");
     }
 
     #[test]
@@ -474,10 +484,10 @@ mod tests {
             s.record_quota(now, 3, base);
         }
         let later = now + Duration::from_secs(121);
-        assert!(!s.should_skip(later), "first probe");
-        assert!(s.should_skip(later), "second blocked (probe in flight)");
-        let after_lease = later + HALF_OPEN_LEASE + Duration::from_secs(1);
-        assert!(!s.should_skip(after_lease), "new probe allowed once the lease expires");
+        assert!(!s.should_skip(later, HALF_OPEN_LEASE_MIN), "first probe");
+        assert!(s.should_skip(later, HALF_OPEN_LEASE_MIN), "second blocked (probe in flight)");
+        let after_lease = later + HALF_OPEN_LEASE_MIN + Duration::from_secs(1);
+        assert!(!s.should_skip(after_lease, HALF_OPEN_LEASE_MIN), "new probe allowed once the lease expires");
     }
 
     #[test]

@@ -495,8 +495,7 @@ async fn run_agy_once(
             if out_buf.len() > max_out || err_buf.len() > max_out {
                 // M8: either stream over the output cap — kill and fail loud.
                 kill_process_group(&mut child);
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                let _ = child.kill().await; // tokio kill() reaps; no separate wait needed
                 AgyRun::NonZero {
                     code: "output-cap".to_string(),
                     stderr: format!("agy output exceeded {max_out} bytes; killed"),
@@ -523,8 +522,7 @@ async fn run_agy_once(
                         // stdio EOF'd (complete output) but the process lingered: kill it
                         // and use the captured output rather than hang.
                         kill_process_group(&mut child);
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        let _ = child.kill().await; // tokio kill() reaps; no separate wait needed
                         AgyRun::Ok {
                             raw: String::from_utf8_lossy(&out_buf).into_owned(),
                             log: read_and_parse_log(&inv.log_path),
@@ -535,15 +533,13 @@ async fn run_agy_once(
         }
         Ok(Err(e)) => {
             kill_process_group(&mut child);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.kill().await; // tokio kill() reaps; no separate wait needed
             AgyRun::SpawnError(anyhow::anyhow!("agy capture error: {e}"))
         }
         Err(_) => {
             // REQ-014: SIGKILL the process group — Go ignores soft signals.
             kill_process_group(&mut child);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.kill().await; // tokio kill() reaps; no separate wait needed
             AgyRun::Timeout
         }
     };
@@ -748,9 +744,13 @@ async fn run_agy_once_pty(
                 stderr: String::from_utf8_lossy(&out).into_owned(),
                 log: read_and_parse_log(&inv.log_path),
             },
-            // Couldn't confirm exit but stdout EOF'd (complete output) — use it.
-            None => AgyRun::Ok {
-                raw: String::from_utf8_lossy(&out).into_owned(),
+            // Stdout EOF'd but we force-killed and couldn't confirm a clean exit — do
+            // NOT report clean success; surface it as a failure (output kept as
+            // diagnostic) so it routes to the degraded path rather than masking an
+            // anomaly (Codex round-3).
+            None => AgyRun::NonZero {
+                code: "unconfirmed-exit".to_string(),
+                stderr: String::from_utf8_lossy(&out).into_owned(),
                 log: read_and_parse_log(&inv.log_path),
             },
         }

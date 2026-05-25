@@ -349,10 +349,22 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             .await
                             {
                                 Ok(r) => r,
-                                Err(_) => Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "agy fleet task exceeded connector timeout",
-                                )),
+                                Err(_) => {
+                                    // Explicit kill + bounded reap (don't rely only on
+                                    // kill_on_drop): SIGKILL sandbox-exec now and reap it
+                                    // so the slot is freed promptly; agy's own
+                                    // --print-timeout bounds any orphaned grandchild.
+                                    let _ = child.start_kill();
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        child.wait(),
+                                    )
+                                    .await;
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "agy fleet task exceeded connector timeout",
+                                    ))
+                                }
                             }
                         } else {
                             child.wait().await
