@@ -1,0 +1,10 @@
+exit: 0 | out: Hi.
+
+=== --log-file written? === True
+  size=10016  model-ish hits: ['Gemini', 'GeminiDir', 'Pro', 'gemini']
+
+=== newest transcripts (~/.gemini/config/projects) ===
+  08e0e38b-e036-4fe6-a3f2-4f03dfc3d79b.json mtime Sun May 24 06:10:56 2026
+    size=381  model-ish hits: []
+  ba1a3b62-771b-4aaa-86a8-59901aebe9f5.json mtime Sun May 24 05:56:03 2026
+    size=381  model-ish hits: []

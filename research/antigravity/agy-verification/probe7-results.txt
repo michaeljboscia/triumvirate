@@ -1,0 +1,42 @@
+Hang characterization: 3 conditions x 10 calls, 30s SIGKILL watchdog
+
+[A plain (no resume)]
+   1: ok     8.9s rc=0
+   2: ok     5.5s rc=0
+   3: ok     5.8s rc=0
+   4: ok     5.6s rc=0
+   5: ok     5.7s rc=0
+   6: ok     5.6s rc=0
+   7: ok     5.9s rc=0
+   8: ok     6.0s rc=0
+   9: ok     7.1s rc=0
+  10: ok     6.4s rc=0
+  => A plain (no resume): 0/10 hung; t min/med/max = 5.5/5.9/8.9
+
+[B -c resume-most-recent]
+   1: ok     5.5s rc=0
+   2: ok     6.0s rc=0
+   3: ok     5.2s rc=0
+   4: ok     5.5s rc=0
+   5: ok     5.7s rc=0
+   6: ok     5.0s rc=0
+   7: ok     5.2s rc=0
+   8: ok     5.2s rc=0
+   9: ok     5.9s rc=0
+  10: ok     5.5s rc=0
+  => B -c resume-most-recent: 0/10 hung; t min/med/max = 5.0/5.5/6.0
+
+[C fixed CONVERSATION_ID resume]
+   1: ok     5.8s rc=0
+   2: ok     6.6s rc=0
+   3: ok     5.8s rc=0
+   4: ok     5.6s rc=0
+   5: ok     6.0s rc=0
+   6: ok     5.4s rc=0
+   7: ok     5.6s rc=0
+   8: ok     5.7s rc=0
+   9: ok     5.3s rc=0
+  10: ok     5.6s rc=0
+  => C fixed CONVERSATION_ID resume: 0/10 hung; t min/med/max = 5.3/5.7/6.6
+
+SUMMARY hangs:  A(plain)=0/10   B(-c)=0/10   C(conv-id)=0/10

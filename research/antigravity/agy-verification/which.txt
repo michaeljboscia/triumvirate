@@ -1,0 +1,2 @@
+/Users/michaelboscia/.local/bin/agy
+-rwxr-xr-x  1 michaelboscia  staff  140403216 May 23 08:50 /Users/michaelboscia/.local/bin/agy

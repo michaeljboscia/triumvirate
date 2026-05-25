@@ -1,0 +1,106 @@
+============================================================ 
+1. ENV VAR DISCOVERY (strings, free, no model call)
+antigravity_as_browser_prompting
+antigravity_as_browser_promptingB
+antigravity_browser
+ANTIGRAVITY_BROWSER
+ANTIGRAVITY_BROWSER_TOOLS_ENABLED
+ANTIGRAVITY_BROWSER_TOOLS_ENABLEDMODEL_GOOGLE_GEMINI_EXAMPLE_GEMAX_SAMPLERunable
+ANTIGRAVITY_BROWSERBROWSER_JS_EXECUTION_POLICY_DISABLEDCORTEX_ERROR_CATEGORY_ACTION_PREPAREBROWSER_INSTALLATION_STATUS_COMPLETETHIRD_PARTY_WEB_SEARCH_MODEL_GPT_
+antigravity_browserknowledge_retrievalknowledge_past_workimplementation_plangooglesql
+ANTIGRAVITY_CLICK
+ANTIGRAVITY_CONVERSATION_ID
+ANTIGRAVITY_CROSS_SELL
+ANTIGRAVITY_CROSS_SELLLAST_UPDATE_TYPE_LAST_AUTOCOMPLETE_USAGE_TIMESUPERCOMPLETE_ALWAYS_USE_CACHE_ON_EQUAL_STATEMODEL_GOOGLE_GEMINI_COMPUTER_USE_EXPERIMENTALfile
+antigravity_deployment_id
+ANTIGRAVITY_DESKTOP_PRIMES
+antigravity_desktopNODE_EXTRA_CA_CERTSANTIGRAVITY_AGENT
+antigravity_download_
+ANTIGRAVITY_EDITOR_APP_ROOTdirectory
+ANTIGRAVITY_EDITOR_READY
+ANTIGRAVITY_EXECUTABLE_DATA_DIR
+ANTIGRAVITY_EXECUTABLE_DATA_DIRencoding
+ANTIGRAVITY_EXTENSION_ACTIVATED
+ANTIGRAVITY_EXTENSION_START
+antigravity_hub
+ANTIGRAVITY_LS_ADDRESSANTIGRAVITY_CSRF_TOKENANTIGRAVITY_PROJECT_IDLazy
+ANTIGRAVITY_NUDGE_IMPRESSION
+antigravity_pro_trial_end_time
+antigravity_project_id
+ANTIGRAVITY_RESEARCH
+ANTIGRAVITY_RESEARCH_THINKING
+ANTIGRAVITY_REVIEW
+ANTIGRAVITY_SENTRY_SAMPLE_RATE
+ANTIGRAVITY_SENTRY_SAMPLE_RATESUPERCOMPLETE_USE_CURRENT_LINECASCADE_GLOBAL_CONFIG_OVERRIDECASCADE_MEMORY_CONFIG_OVERRIDECASCADE_DEFAULT_MODEL_OVERRIDEFIREWORKS_ON_DEMAND_DEPLOYMENTAPI_SERVER_ENABLE_MORE_LOGGINGSUPERCOMPLETE_REGULAR_DEBOUNCEMODEL_GOOGLE_GEMINI_RIFTRUNNERMODEL_CLAUDE_
+ANTIGRAVITY_SIDECAR_WEB_PORT
+ANTIGRAVITY_SIDECAR_WEB_PORTcannot
+ANTIGRAVITY_SOURCE_METADATA
+antigravity_state
+ANTIGRAVITY_TRAJECTORY_ID
+antigravity_use_time
+antigravity_user
+antigravity_versionR
+GEMINI_CLI
+gemini_coder
+gemini_coder_cider_proto_trajectory_steps_proto_init
+gemini_coder_framework_executor_agentexecutor_proto_inputs_proto_init
+gemini_coder_go_proto
+gemini_coder_proto_service_proto_init
+gemini_coder_proto_trajectory_proto_init
+gemini_codercommand_lineevery
+GEMINI_COMPUTER_USE_EXPERIMENTAL
+GEMINI_COSMICFORGE
+gemini_defaultclaude
+gemini_dir
+gemini_dir_uri
+gemini_dirbg
+gemini_example
+GEMINI_EXAMPLE_GEMAX_SAMPLER
+GEMINI_EXP_
+gemini_extensions
+GEMINI_FOR_GOOGLE_
+GEMINI_GENTLEISLAND
+GEMINI_GENTLEISLANDMODEL_CLAUDE_
+GEMINI_HORIZONDAWN
+GEMINI_HORIZONDAWNMODEL_GOOGLE_GEMINI_COSMICFORGEMODEL_GOOGLE_GEMINI_INFINITYJETMODEL_CLAUDE_
+GEMINI_HUMAN_DATA
+GEMINI_INFINITYBLOOM
+GEMINI_INFINITYJET
+GEMINI_INTERNAL_BYOM
+GEMINI_INTERNAL_BYOMMODEL_GOOGLE_GEMINI_INFINITYBLOOMidentifier
+GEMINI_INTERNAL_TAB_FLASH_LITE
+GEMINI_INTERNAL_TAB_FLASH_LITEMODEL_GOOGLE_GEMINI_RIFTRUNNER_THINKING_LOWUsing
+GEMINI_INTERNAL_TAB_JUMP_FLASH_LITE
+GEMINI_INTERNAL_TAB_JUMP_FLASH_LITEhttps
+GEMINI_IOS_PRIMES
+GEMINI_NEMOSREEF
+GEMINI_NEMOSREEFMODEL_GOOGLE_GEMINI_PUREPRISMMODEL_GOOGLE_GEMINI_ORIONFIREAPI_PROVIDER_ANTHROPIC_VERTEXAPI_PROVIDER_GOOGLE_EVERGREENunexpected
+GEMINI_ORIONFIRE
+GEMINI_PUREPRISM
+GEMINI_RAINSONG
+GEMINI_RAINSONGMODEL_CLAUDE_
+GEMINI_RIFTRUNNER
+============================================================ 
+2. MULTI-TURN -c SEMANTICS
+  setup:       exit=0 dt=6.8s out='OK.'
+  -c continue: exit=0 dt=5.5s out='OK.\nBANANA42'
+  -> -c CONTINUED prior conversation? True
+============================================================ 
+3. CONCURRENCY (3 simultaneous agy -p — shared-state collision?)
+  worker 101: exit=0 timed_out=False out='101' err=''
+  worker 202: exit=0 timed_out=False out='202' err=''
+  worker 303: exit=0 timed_out=False out='303' err=''
+  wall=7.6s
+  -> all answered with their own number? True
+============================================================ 
+4. ARG_MAX (~280KB single-arg prompt, > macOS 256KB)
+  exit=0 timed_out=False dt=6.9s out='OK.' err=''
+============================================================ 
+5. PROFILE ROBUSTNESS (richer task under our sandbox-exec)
+  exit=0 timed_out=False dt=36.1s
+  stdout: DONE
+  stderr: 
+  out.txt created in workspace? False
+  hit a denied path it NEEDED? (look for 'not permitted'/'denied'): False
+============================================================ 
+BATCH DONE
