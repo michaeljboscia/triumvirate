@@ -156,6 +156,33 @@ config surface (per REQ-DS-015 / round-3 review).
 
 ---
 
+## 3.5 Operator findings from the 2026-05-26 live TIER-2 probes
+
+Two surprises surfaced when we ran the validator probe sweep against the
+live API. Neither requires a code change — they're calibration notes for
+the operator.
+
+### Cache hits are opportunistic, NOT a reliable cost-saver
+Probe B.11 sent an identical 76-token prompt twice (above the documented
+64-token chunk threshold), 2 seconds apart. **Both calls reported zero
+cache hits** (`hit=0 miss=76` × 2). This matches DeepSeek's "best-effort"
+disclaimer in the official docs but contradicts the implied 120× discount
+($0.003625/M cache hit vs $0.435/M miss for v4-pro). Plan operational
+budgets assuming **miss-rate pricing**; treat cache hits as a windfall, not
+a baseline.
+
+### `max_tokens` must cover reasoning AND content
+Probe B.14: `max_tokens=30` + `thinking=enabled` + a math prompt →
+`finish_reason=length`, `content=""`, 30 reasoning tokens, **zero content
+tokens**. The caller paid for 30 output tokens and got nothing usable.
+Our `BadFinishReason::Length` typed failure catches this, but the
+mitigation is operator-side: **set `max_tokens` high enough to cover the
+reasoning + the answer**. Suggested floors with thinking enabled:
+  - Trivial yes/no / single-token answer: ≥256 tokens
+  - Non-trivial single-paragraph answer: ≥1024 tokens
+  - Complex reasoning + answer: ≥4096 tokens
+Below those floors, expect to pay for thinking that never produces output.
+
 ## 4. Observability
 
 ### 4.1 Per-request log file — REQ-DS-018 / REQ-DS-023
