@@ -2629,6 +2629,7 @@ version = "3.9.0"
 dependencies = [
  "agent-adapter",
  "chrono",
+ "futures-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

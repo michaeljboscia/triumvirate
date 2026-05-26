@@ -17,6 +17,8 @@ serde_json.workspace = true
 # T-009: per-request log records carry an RFC3339 timestamp. Same chrono shape
 # as the rest of the daemon (default-features = false + clock for SystemTime).
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# T-010: runner consumes reqwest's bytes_stream() (which yields a Stream).
+futures-util = "0.3"
 tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt", "net", "io-util"] }
 tracing.workspace = true
 
