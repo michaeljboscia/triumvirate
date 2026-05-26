@@ -97,7 +97,9 @@ pub async fn spawn_session(
     }
     let agent = req.agent.to_lowercase();
     if !is_supported_agent_name(&agent) {
-        return Err("spawn_session supports only 'gemini' or 'codex'".to_string());
+        return Err(
+            "spawn_session supports only 'gemini', 'codex', or 'deepseek'".to_string(),
+        );
     }
     let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
     let worker = acquire_worker(&agent, &cwd).await;
@@ -163,6 +165,7 @@ pub async fn ask_session(
             cwd: cwd.clone(),
             repo: None,
             branch: None,
+            ..Default::default()
         },
         None,
     )
@@ -272,7 +275,11 @@ pub async fn get_status(
     Json(StatusResponse {
         daemon_mode: "incremental-dev".to_string(),
         active_sessions: sessions.len(),
-        supported_agents: vec!["gemini".to_string(), "codex".to_string()],
+        supported_agents: vec![
+            "gemini".to_string(),
+            "codex".to_string(),
+            "deepseek".to_string(), // T-001 (REQ-DS-001/013/016)
+        ],
         pending_fallbacks,
         fallback_tickets: fallback_tickets
             .into_iter()

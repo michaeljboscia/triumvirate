@@ -7,5 +7,23 @@ license.workspace = true
 [dependencies]
 agent-adapter = { path = "../agent-adapter" }
 shared-types = { path = "../shared-types" }
-tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt"] }
+# T-005: reqwest is needed for the DeepSeek HTTP client builder. We extend the
+# workspace tokio features with `net` + `io-util` to support the in-process TCP
+# test server in the deepseek module's #[cfg(test)] block.
+reqwest.workspace = true
+# T-006: SSE parser uses serde_derive structs + serde_json for `data: <json>`.
+serde.workspace = true
+serde_json.workspace = true
+# T-009: per-request log records carry an RFC3339 timestamp. Same chrono shape
+# as the rest of the daemon (default-features = false + clock for SystemTime).
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# T-010: runner consumes reqwest's bytes_stream() (which yields a Stream).
+futures-util = "0.3"
+tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt", "net", "io-util"] }
 tracing.workspace = true
+
+[dev-dependencies]
+# T-009 test-only: real cost calculation against the seeded price table to
+# anchor the no-double-add usage mapping to the Wave-0 probe-04 numbers.
+token-economics = { path = "../token-economics" }
+tempfile = "3"

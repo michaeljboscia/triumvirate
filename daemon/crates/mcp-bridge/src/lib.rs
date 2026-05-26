@@ -15,6 +15,16 @@ pub use codex_capabilities::{
 pub mod agy;
 pub mod agy_resilience;
 
+// T-002 (REQ-DS-002/003/015): authoritative env-config loader for the DeepSeek sibling.
+pub mod deepseek_config;
+
+// T-004 (REQ-DS-006/010): semaphore, token bucket, three-state breaker, classify().
+pub mod deepseek_resilience;
+
+// T-005 (REQ-DS-007): reqwest::Client builder honouring rolling read_timeout.
+pub mod deepseek;
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
     pub name: &'static str,
@@ -36,7 +46,7 @@ pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
 #[instrument(skip_all)]
 pub fn is_supported_agent_name(agent: &str) -> bool {
     let agent = agent.to_lowercase();
-    agent == "gemini" || agent == "codex"
+    agent == "gemini" || agent == "codex" || agent == "deepseek"
 }
 
 #[instrument(skip_all)]
@@ -423,6 +433,7 @@ mod tests {
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         }));
         assert!(!super::is_supported_agent(&AskAgentRequest {
             agent: "claude".to_string(),
@@ -430,9 +441,26 @@ mod tests {
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         }));
         assert!(super::is_supported_agent_name("gemini"));
         assert!(!super::is_supported_agent_name("claude"));
+    }
+
+    // T-001: deepseek joins the supported-agent set as a top-level name.
+    // Stub guard: a function that always returns `false` fails the deepseek/gemini/codex
+    // asserts; a function that always returns `true` fails the claude/empty asserts.
+    #[test]
+    fn supports_deepseek_name() {
+        assert!(super::is_supported_agent_name("deepseek"));
+        assert!(super::is_supported_agent_name("DeepSeek"));   // case-insensitive (fn lower-cases)
+        assert!(super::is_supported_agent_name("DEEPSEEK"));
+        assert!(super::is_supported_agent_name("gemini"));     // regression
+        assert!(super::is_supported_agent_name("codex"));      // regression
+        assert!(!super::is_supported_agent_name("claude"));    // negative
+        assert!(!super::is_supported_agent_name(""));          // negative
+        assert!(!super::is_supported_agent_name("deep"));      // not a prefix match
+        assert!(!super::is_supported_agent_name("deepseek-v4-pro")); // model id ≠ agent name
     }
 
     #[test]

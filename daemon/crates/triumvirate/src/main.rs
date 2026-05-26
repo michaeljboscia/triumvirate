@@ -200,6 +200,12 @@ fn init_process_token_db() -> anyhow::Result<Arc<TokenDb>> {
     let home = core_triumvirate_home_dir()?;
     let db_path = home.join("token-economics.db");
     let db = token_economics::open(&db_path)?;
+    // T-003 (REQ-DS-009): seed the DeepSeek price rows on first run so the runner's
+    // synchronous per-consult cost calc (calculate_cost_usd) finds them. Idempotent —
+    // safe to call on every daemon boot.
+    if let Err(err) = token_economics::ensure_deepseek_prices(&db) {
+        tracing::warn!(?err, "deepseek price seeding failed; per-consult cost calc may return None until resolved");
+    }
     let db = Arc::new(db);
     let _ = PROCESS_TOKEN_DB.set(db.clone());
     Ok(db)
@@ -1871,7 +1877,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             "daemon": "running",
             "auth": "bearer-required",
             "daemon_mode": "incremental-dev",
-            "supported_agents": ["gemini", "codex"],
+            "supported_agents": ["gemini", "codex", "deepseek"],
             "pending_fallbacks": pending,
             "fallback_tickets": tickets,
             "daemon_bind_addr": state.bind_addr
@@ -2006,7 +2012,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
         let agent = req.agent.to_lowercase();
         if !is_supported_agent_name(&agent) {
-            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'gemini' or 'codex'" }))));
+            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'gemini', 'codex', or 'deepseek'" }))));
         }
         let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
         let worker = acquire_worker(&agent, &cwd).await;
@@ -2055,6 +2061,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 cwd,
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -2991,6 +2998,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some("/tmp".to_string()),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3208,6 +3216,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some(test_home.display().to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         };
         let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
         let captured = fs::read_to_string(&args_file)?;
@@ -3256,6 +3265,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some(test_home.display().to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         };
         let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
 
@@ -3297,6 +3307,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some(cwd.to_string()),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3343,6 +3354,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some(project_root_str.clone()),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3386,6 +3398,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some(project_root_str),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3424,6 +3437,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some("/tmp/worker-reuse".to_string()),
             repo: None,
             branch: None,
+            ..Default::default()
         };
         let first_start = Instant::now();
         let first = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
@@ -3584,7 +3598,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .map(|t| t.text.clone())
             .unwrap_or_default();
         assert!(status_text.contains("\"active_sessions\":1"));
-        assert!(status_text.contains("\"supported_agents\":[\"gemini\",\"codex\"]"));
+        // T-001 (REQ-DS-001/013/016): deepseek joins the supported-agent set as a top-level name.
+        assert!(status_text.contains("\"supported_agents\":[\"gemini\",\"codex\",\"deepseek\"]"));
         assert!(status_text.contains("\"daemon_bind_addr\":\"127.0.0.1:7777\""));
 
         client.cancel().await?;
@@ -4095,6 +4110,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         })
         .await?;
         assert_eq!(out.agent, "gemini");
@@ -4955,6 +4971,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some(test_home.display().to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         }, None)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -5022,6 +5039,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some("/tmp/project".to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         }, None)
         .await
         .err()
