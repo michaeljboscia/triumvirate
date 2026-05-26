@@ -11,5 +11,8 @@ shared-types = { path = "../shared-types" }
 # workspace tokio features with `net` + `io-util` to support the in-process TCP
 # test server in the deepseek module's #[cfg(test)] block.
 reqwest.workspace = true
+# T-006: SSE parser uses serde_derive structs + serde_json for `data: <json>`.
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt", "net", "io-util"] }
 tracing.workspace = true
