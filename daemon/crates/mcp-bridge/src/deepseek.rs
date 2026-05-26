@@ -21,8 +21,11 @@ pub fn build_client(cfg: &DeepSeekConfig) -> Result<reqwest::Client, reqwest::Er
         // if the total wall-clock exceeds it. This is the property the spec
         // (REQ-DS-007) is leaning on for long thinking-mode responses.
         .read_timeout(cfg.read_timeout)
-        // Absolute outer ceiling on a single HTTP request.
-        .timeout(cfg.timeout)
+        // Codex W3-review SHOULD-FIX #1: do NOT set reqwest .timeout(cfg.timeout)
+        // here. The runner's `tokio::time::timeout(cfg.timeout, ...)` is the
+        // SINGLE owner of the absolute SLA ceiling — two competing absolute
+        // timeouts created a race where a hung request could surface as
+        // NetworkPreFirstByte(reqwest timeout) instead of AbsoluteTimeoutExceeded.
         // TCP keep-alive probes detect dead peers between requests.
         .tcp_keepalive(cfg.tcp_keepalive)
         .build()
@@ -249,44 +252,58 @@ impl StreamParser {
         event: &str,
         events: &mut Vec<ParseEvent>,
     ) -> Result<(), ParseError> {
-        // One SSE event can be multiple lines. Per the SSE spec, lines starting
-        // with `:` are comments; lines starting with `data:` are data. We handle
-        // both. Empty events (\n\n with no content) are valid heartbeats too.
-        let mut had_data = false;
+        // Codex W3-review SHOULD-FIX #3: per the SSE spec, multiple `data:`
+        // lines within ONE event must be JOINED by '\n' and dispatched as a
+        // single payload. DeepSeek emits one-data-per-event today but a
+        // proxy that pretty-prints JSON across lines would have broken the
+        // previous "parse each data: line independently" implementation.
+        //
+        // Algorithm:
+        //   1. Scan lines; collect data: payloads in order.
+        //   2. Ignore `:` comment lines (count as keep-alive marker).
+        //   3. Silently ignore unknown SSE field names (event:, id:, retry:).
+        //   4. After scanning: if any data: payload exists, join with '\n'
+        //      and dispatch as ONE chunk.
+        //
+        // [DONE] handling: if ANY of the data: payloads is exactly "[DONE]"
+        // after the join, we treat it as the sentinel. (In practice the
+        // sentinel is a single-line event so this matches reality; the join
+        // path is defensive against pathological proxies.)
+        let mut data_lines: Vec<&str> = Vec::new();
+        let mut had_comment_only = false;
+        let mut had_any_data = false;
         for raw_line in event.split('\n') {
-            // Strip the trailing CR if present (CRLF tolerance).
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-
             if line.is_empty() {
                 continue;
             }
-            if let Some(_comment) = line.strip_prefix(':') {
-                // Per the SSE spec, comment lines are ignored. We count them so
-                // the runner can confirm keep-alives are being received.
+            if line.starts_with(':') {
+                had_comment_only = true;
                 continue;
             }
-            // Per the spec, `data: <value>` — note the space is optional and a
-            // single-line event may have multiple `data:` lines that get joined
-            // by newlines. DeepSeek emits one-data-per-event so we don't bother.
             if let Some(payload) = line.strip_prefix("data:") {
-                let payload = payload.trim_start();
-                had_data = true;
-                if payload == "[DONE]" {
-                    self.done = true;
-                    events.push(ParseEvent::Done);
-                    continue;
-                }
-                self.consume_data_chunk(payload, events)?;
+                data_lines.push(payload.trim_start());
+                had_any_data = true;
+                continue;
             }
-            // Anything else (event:, id:, retry:) — silently ignore. DeepSeek
-            // doesn't currently use them; if they appear, we don't want to error.
+            // Unknown SSE field (event:, id:, retry:, …) — ignore.
         }
-        if !had_data {
-            // An event with no `data:` lines that isn't pure-empty is a keep-alive
-            // (the leading `:` comment is the canonical form).
+
+        if had_any_data {
+            let joined = data_lines.join("\n");
+            if joined == "[DONE]" {
+                self.done = true;
+                events.push(ParseEvent::Done);
+            } else {
+                self.consume_data_chunk(&joined, events)?;
+            }
+        } else if had_comment_only {
+            // Pure heartbeat event.
             self.keepalive_count += 1;
             events.push(ParseEvent::KeepAlive);
         }
+        // Else: event was completely empty (e.g. trailing \n\n at stream end);
+        // do nothing.
         Ok(())
     }
 
@@ -296,9 +313,11 @@ impl StreamParser {
         events: &mut Vec<ParseEvent>,
     ) -> Result<(), ParseError> {
         let chunk: RawChunk = serde_json::from_str(payload).map_err(|e| {
-            // Bound the snippet so a 1MB blob doesn't end up in the log.
+            // Codex W3-review SHOULD-FIX #4: bound the snippet at a UTF-8
+            // boundary. `&payload[..200]` would panic if byte 200 lands inside
+            // a multi-byte char (e.g. an emoji in an error message).
             let snippet = if payload.len() > 200 {
-                format!("{}…", &payload[..200])
+                format!("{}…", cap_reasoning(payload, 200))
             } else {
                 payload.to_string()
             };
@@ -410,6 +429,12 @@ pub enum DeepSeekFailureKind {
     /// transient SSE-malformed condition for breaker purposes — DeepSeek
     /// streaming format isn't expected to break, so this is a real signal.
     ParserError(String),
+    /// Codex W3-review SHOULD-FIX #6: the response stream closed cleanly (no
+    /// reqwest body Err) but `data: [DONE]` was never seen. `[DONE]` is the
+    /// application-layer terminator per the OpenAI-compatible streaming
+    /// contract; missing it means the response was truncated even if the
+    /// underlying socket reported a normal EOF. Treated as transient.
+    StreamEndedWithoutDone,
 }
 
 impl std::fmt::Display for DeepSeekFailureKind {
@@ -444,6 +469,9 @@ impl std::fmt::Display for DeepSeekFailureKind {
             }
             DeepSeekFailureKind::ParserError(detail) => {
                 write!(f, "deepseek SSE parser error: {detail}")
+            }
+            DeepSeekFailureKind::StreamEndedWithoutDone => {
+                write!(f, "deepseek stream ended without [DONE] sentinel")
             }
         }
     }
@@ -619,8 +647,22 @@ pub fn cap_reasoning(s: &str, cap_bytes: usize) -> &str {
 
 /// The JSON shape persisted to `$LOG_DIR/<request_id>.json`. Borrows the
 /// underlying strings so the writer doesn't double the memory cost of a big
-/// reasoning trace. Privacy guard (REQ-DS-023 scope_out): MUST NOT contain
-/// the API key or the request messages — only response artifacts.
+/// reasoning trace.
+///
+/// Privacy guard (REQ-DS-023 scope_out): MUST NOT contain the API key or the
+/// request messages — only RESPONSE artifacts (model output, reasoning trace,
+/// usage, fingerprint, cost). The serialised JSON has no field named
+/// `messages`, `api_key`, or `Authorization`; the privacy regression test in
+/// the runner asserts this on a real consult.
+///
+/// Caveat operators should know (Codex W3-review NIT #3): `reasoning_content`
+/// and `content` are model OUTPUT. A model that parrots or quotes the user's
+/// prompt verbatim CAN cause user-prompt fragments to land in the log file
+/// indirectly. This is not a daemon-side secret leak — the runner never
+/// writes the request payload — but it is a data-retention concern for any
+/// deployment with sensitive prompts. Operators who need stricter isolation
+/// should set `log_reasoning_cap_bytes` very low (or disable the log
+/// directory entirely, planned for a future knob).
 #[derive(serde::Serialize)]
 pub struct PerRequestLogRecord<'a> {
     pub request_id: &'a str,
@@ -657,13 +699,38 @@ pub fn write_per_request_log(
 /// `request_id` comes from DeepSeek and is ordinarily a safe slug, but we
 /// strip path separators defensively so a malicious value can't escape
 /// `log_dir` (REQ-DS-018 — observability must not be a vector).
+/// Codex W3-review NIT #2: also reject Windows-reserved basenames (CON, PRN,
+/// AUX, NUL, COM1..COM9, LPT1..LPT9), as well as the empty / "." / ".." cases
+/// that would either fail or escape on any platform.
 fn sanitize_for_filename(s: &str) -> String {
-    s.chars()
+    let cleaned: String = s
+        .chars()
         .map(|c| match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
             _ => '_',
         })
-        .collect()
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return format!("req-{}", cleaned.len());
+    }
+    if is_windows_reserved(&cleaned) {
+        return format!("req-{cleaned}");
+    }
+    cleaned
+}
+
+fn is_windows_reserved(name: &str) -> bool {
+    // Compare on the stem before the first '.' (Windows blocks reserved
+    // basenames even with extensions, e.g. CON.txt).
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+            | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5"
+            | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
 }
 
 /// Current wall-clock as RFC3339 UTC, matching the rest of the daemon's
@@ -699,7 +766,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::deepseek_resilience::{
-    AcquireDecision, Breaker, BreakerState, ConcurrencyCap, Outcome, classify,
+    AcquireDecision, Breaker, BreakerState, ConcurrencyCap, Outcome, TokenBucket, classify,
 };
 
 /// One DeepSeek consult's request. The runner uses these fields to build the
@@ -725,12 +792,16 @@ pub struct RequestMessage {
 
 /// Shared resilience state — the dispatch layer (T-012) constructs this once
 /// per daemon process and passes a reference to every `run()` invocation.
-/// `Arc<Mutex<Breaker>>` because the breaker is stateful AND shared across
-/// concurrent consults.
+/// All three primitives are shared across concurrent consults:
+///   - `breaker` (state machine; `std::sync::Mutex` — short critical sections)
+///   - `concurrency` (Arc<Semaphore> wrapper; cheap to clone)
+///   - `rpm` (token bucket; `std::sync::Mutex` — short critical sections,
+///     NEVER held across an .await per Codex W3-review BLOCKER fix)
 #[derive(Clone)]
 pub struct ResilienceState {
     pub breaker: Arc<std::sync::Mutex<Breaker>>,
     pub concurrency: ConcurrencyCap,
+    pub rpm: Arc<std::sync::Mutex<TokenBucket>>,
 }
 
 impl ResilienceState {
@@ -738,6 +809,10 @@ impl ResilienceState {
         Self {
             breaker: Arc::new(std::sync::Mutex::new(Breaker::new(Default::default()))),
             concurrency: ConcurrencyCap::new(cfg.max_concurrent),
+            rpm: Arc::new(std::sync::Mutex::new(TokenBucket::new(
+                cfg.max_rpm,
+                Instant::now(),
+            ))),
         }
     }
 }
@@ -776,11 +851,17 @@ impl DeepSeekFailureKind {
     }
 
     pub fn is_runner_transient(&self) -> bool {
+        // Codex W3-review SHOULD-FIX #2: this MUST match the breaker-recording
+        // path in run(). Any failure that run() reports to the breaker as
+        // Outcome::TransientError is_runner_transient; anything else is not.
         matches!(
             self,
             DeepSeekFailureKind::Transient(_)
+                | DeepSeekFailureKind::NetworkPreFirstByte(_)
                 | DeepSeekFailureKind::NetworkMidStream(_)
+                | DeepSeekFailureKind::ParserError(_)
                 | DeepSeekFailureKind::AbsoluteTimeoutExceeded
+                | DeepSeekFailureKind::StreamEndedWithoutDone
                 | DeepSeekFailureKind::GhostSuccessEmbedded {
                     classification: Classification::Transient,
                     ..
@@ -813,7 +894,44 @@ pub async fn run(
     req: &RunRequest,
     resilience: &ResilienceState,
 ) -> Result<agent_adapter::ParsedAgentResult, DeepSeekFailure> {
-    // Phase 1: breaker check (cheap; happens before any IO).
+    // Codex W3-review SHOULD-FIX #5 ordering: acquire the concurrency permit
+    // BEFORE consulting the breaker. Otherwise a caller can transition the
+    // breaker to HalfOpen (consuming the lease) and then sit waiting on the
+    // semaphore, holding the lease without ever firing the probe HTTP call —
+    // which lets later callers expire the breaker or compete over the
+    // probe slot incorrectly.
+
+    // Phase 1: concurrency cap (semaphore — async wait, no breaker state mutated).
+    let _permit = resilience.concurrency.acquire().await;
+
+    // Phase 2: RPM gate (Codex W3-review BLOCKER fix). Lock → compute wait →
+    // drop lock → sleep → re-acquire. The lock is NEVER held across the
+    // await. Bounded by cfg.timeout indirectly via the outer SLA wrap below.
+    loop {
+        let wait_until = {
+            let now = Instant::now();
+            let mut bucket = resilience
+                .rpm
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if bucket.try_take(now) {
+                None
+            } else {
+                Some(bucket.next_available(now))
+            }
+        };
+        match wait_until {
+            None => break,
+            Some(until) => {
+                let now = Instant::now();
+                if until > now {
+                    tokio::time::sleep(until.duration_since(now)).await;
+                }
+            }
+        }
+    }
+
+    // Phase 3: breaker check (cheap, after the semaphore + RPM have admitted us).
     let decision = {
         let mut b = resilience
             .breaker
@@ -844,10 +962,9 @@ pub async fn run(
         }
     }
 
-    // Phase 2: concurrency cap (semaphore — async wait).
-    let _permit = resilience.concurrency.acquire().await;
-
-    // Phase 3: wrap the whole consult in the absolute-timeout SLA.
+    // Phase 4: wrap the whole consult in the absolute-timeout SLA (single owner
+    // per Codex W3-review SHOULD-FIX #1 — reqwest .timeout() has been removed
+    // from build_client so this is the only absolute ceiling).
     let inner = run_inner(cfg, client, req);
     let outcome = tokio::time::timeout(cfg.timeout, inner).await;
 
@@ -861,7 +978,7 @@ pub async fn run(
         }),
     };
 
-    // Phase 4: report the outcome to the breaker. RunawayReasoning and
+    // Phase 5: report the outcome to the breaker. RunawayReasoning and
     // BadFinishReason are budget/policy decisions — do NOT touch the breaker.
     {
         let mut b = resilience
@@ -877,7 +994,8 @@ pub async fn run(
                 DeepSeekFailureKind::NetworkMidStream(_)
                 | DeepSeekFailureKind::NetworkPreFirstByte(_)
                 | DeepSeekFailureKind::ParserError(_)
-                | DeepSeekFailureKind::AbsoluteTimeoutExceeded => {
+                | DeepSeekFailureKind::AbsoluteTimeoutExceeded
+                | DeepSeekFailureKind::StreamEndedWithoutDone => {
                     b.record(Outcome::TransientError(0), now)
                 }
                 DeepSeekFailureKind::GhostSuccessEmbedded { classification, .. } => match classification {
@@ -942,16 +1060,16 @@ async fn run_inner(
         let status = resp.status().as_u16();
 
         if status == 429 && !retry_after_used {
-            // Honor Retry-After once.
-            let wait = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(1)
-                .min(10);
+            // Honor Retry-After once. Per RFC 7231, it can be either
+            // delta-seconds or an HTTP-date (RFC 1123 / RFC 2822 subset).
+            // Codex W3-review NIT #1: parse both, clamp to 10s.
+            let wait_secs = parse_retry_after(
+                resp.headers().get(reqwest::header::RETRY_AFTER),
+            )
+            .unwrap_or(1)
+            .min(10);
             retry_after_used = true;
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
             continue;
         }
 
@@ -1027,7 +1145,25 @@ async fn consume_stream(
         }
     }
 
-    // Stream ended (either [DONE] or the upstream closed cleanly).
+    // Codex W3-review SHOULD-FIX #6: `[DONE]` is the application-layer
+    // terminator. If the stream closed cleanly (no reqwest body Err) but we
+    // never saw [DONE], the response is truncated even though the socket is
+    // happy. Fail loud with a typed transient.
+    if !parser.done {
+        let usage = parser
+            .usage
+            .as_ref()
+            .map(map_usage)
+            .or_else(|| Some(estimate_usage(bytes_received, prompt_chars_estimate / 4)));
+        return Err(DeepSeekFailure {
+            kind: DeepSeekFailureKind::StreamEndedWithoutDone,
+            usage,
+            bytes_received,
+            request_id: parser.request_id.clone(),
+        });
+    }
+
+    // Stream completed normally with [DONE].
     let finalized = match finalize_stream(&parser) {
         Ok(f) => f,
         Err(kind) => {
@@ -1083,6 +1219,31 @@ async fn consume_stream(
         cli_version: None,
         parser_mode: "deepseek-sse".to_string(),
     })
+}
+
+/// Parse a `Retry-After` HTTP header value into seconds. Per RFC 7231 the
+/// value is either delta-seconds OR an HTTP-date (RFC 1123-shaped). Returns
+/// None for missing/malformed values; the caller substitutes a default.
+fn parse_retry_after(v: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    let raw = v?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Delta-seconds path first (cheap).
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs);
+    }
+    // HTTP-date path. chrono can parse RFC 2822, which accepts the
+    // RFC 1123 / IMF-fixdate shape ("Wed, 21 Oct 2015 07:28:00 GMT").
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(raw) {
+        let now = chrono::Utc::now();
+        let target = dt.with_timezone(&chrono::Utc);
+        if target > now {
+            return Some((target - now).num_seconds() as u64);
+        }
+        return Some(0);
+    }
+    None
 }
 
 fn to_adapter_token_usage(u: &TokenUsage) -> agent_adapter::TokenUsage {
@@ -2075,7 +2236,10 @@ mod tests {
         }
     }
 
-    /// Confirms the absolute SLA ceiling actually fires loud.
+    /// Codex W3-review SHOULD-FIX #1 verification: with reqwest .timeout()
+    /// removed, the outer tokio::time::timeout is the only absolute ceiling.
+    /// The failure typing is now DETERMINISTIC — AbsoluteTimeoutExceeded is
+    /// the only acceptable answer.
     #[tokio::test]
     async fn deepseek_runner_absolute_timeout_returns_typed_failure() {
         // Server accepts the connection but never responds — request hangs.
@@ -2083,13 +2247,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
         tokio::spawn(async move {
-            // Hold the connection open indefinitely without sending anything.
             let (mut sock, _) = listener.accept().await.unwrap();
             let _ = tokio::time::sleep(Duration::from_secs(30)).await;
             let _ = sock.shutdown().await;
         });
 
-        // Short absolute timeout so the test doesn't drag.
         let cfg = cfg_for(&url, Duration::from_millis(500));
         let client = build_client(&cfg).expect("client");
         let resilience = ResilienceState::from_cfg(&cfg);
@@ -2099,14 +2261,205 @@ mod tests {
             .await
             .expect_err("must time out");
         match failure.kind {
-            DeepSeekFailureKind::AbsoluteTimeoutExceeded
-            // reqwest's read_timeout (5s in cfg_for) is longer than absolute (500ms),
-            // so AbsoluteTimeoutExceeded should win. But a stub that surfaces
-            // reqwest's connect/request timeout instead would land here too —
-            // accept either flavor since both indicate the SLA fired.
-            | DeepSeekFailureKind::NetworkPreFirstByte(_) => {}
-            other => panic!("expected timeout-class failure, got {other:?}"),
+            DeepSeekFailureKind::AbsoluteTimeoutExceeded => {}
+            other => panic!(
+                "expected AbsoluteTimeoutExceeded (the only absolute timeout owner); got {other:?}"
+            ),
         }
+    }
+
+    /// Codex W3-review BLOCKER regression: max_rpm now gates requests. With
+    /// max_rpm=1 the bucket holds 1 token initially; the SECOND call within
+    /// 0.5s must wait at least ~0.5s for the bucket to refill (60 RPM = 1
+    /// token/sec, so 1 RPM = 1 token/min — we use a more relaxed cap so the
+    /// test doesn't crawl).
+    #[tokio::test]
+    async fn deepseek_runner_rpm_gate_waits_for_token() {
+        // Two happy responses in queue.
+        let body = happy_sse_body();
+        let s1 = http_response_with_body("HTTP/1.1 200 OK", &body, "");
+        let s2 = http_response_with_body("HTTP/1.1 200 OK", &body, "");
+        let url = spawn_scripted_server(vec![s1, s2]).await;
+
+        // max_rpm = 4 → 4 tokens/min → ~15s per token. That's too slow for a
+        // unit test. Instead, exhaust the bucket FIRST via direct take and
+        // measure the wait on the next take.
+        let mut cfg = cfg_for(&url, Duration::from_secs(10));
+        cfg.max_rpm = 60; // 1 token/sec — easy to measure.
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        // Drain the bucket synthetically so the first run() call has to wait
+        // for refill. The bucket starts full (60 tokens) — take all of them.
+        {
+            let now = Instant::now();
+            let mut b = resilience.rpm.lock().unwrap();
+            for _ in 0..60 {
+                assert!(b.try_take(now), "drain");
+            }
+            assert!(!b.try_take(now), "drained");
+        }
+
+        let started = Instant::now();
+        let _r1 = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect("first should eventually succeed after refill");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(800),
+            "RPM gate should have waited ~1s for refill; got {waited:?}"
+        );
+    }
+
+    /// Codex W3-review SHOULD-FIX #3 regression: multi-line `data:` events
+    /// must be joined by '\n' and parsed as one JSON payload, not parsed
+    /// per-line.
+    #[test]
+    fn deepseek_parser_joins_multiline_data_payloads() {
+        // The JSON is split across THREE `data:` lines within ONE event.
+        let stream = b"data: {\"choices\":[{\"delta\":\ndata: {\"content\":\"hi\"}\ndata: }]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let mut parser = StreamParser::new();
+        parser.feed(stream).expect("multi-line data: must reassemble");
+        assert_eq!(parser.content_acc, "hi");
+        assert!(parser.done);
+    }
+
+    /// Codex W3-review SHOULD-FIX #4 regression: a malformed JSON containing a
+    /// multi-byte character near byte 200 must NOT panic during snippet
+    /// truncation in the InvalidJson error path.
+    #[test]
+    fn deepseek_parser_invalid_json_snippet_is_utf8_safe() {
+        let mut malformed = String::with_capacity(300);
+        // Pad with ASCII so byte 198 lands inside a multi-byte char.
+        for _ in 0..198 {
+            malformed.push('x');
+        }
+        malformed.push('🦀'); // 4 bytes — straddles byte 200
+        malformed.push_str("not-json}");
+        let stream = format!("data: {}\n\n", malformed);
+        let mut parser = StreamParser::new();
+        let err = parser.feed(stream.as_bytes()).expect_err("must Err, not panic");
+        match err {
+            ParseError::InvalidJson { snippet, .. } => {
+                // Snippet must be ≤ original AND UTF-8 valid.
+                assert!(snippet.len() <= malformed.len() + 8); // +8 for "…"
+                assert!(std::str::from_utf8(snippet.as_bytes()).is_ok());
+            }
+            other => panic!("expected InvalidJson, got {other:?}"),
+        }
+    }
+
+    /// Codex W3-review SHOULD-FIX #6 regression: a stream that ends cleanly
+    /// (socket-EOF, finish_reason=stop) but never emits `[DONE]` is now a
+    /// typed StreamEndedWithoutDone failure, not a silent Ok.
+    #[tokio::test]
+    async fn deepseek_runner_stream_without_done_sentinel_returns_typed_failure() {
+        // Build a body that has the usage chunk with finish_reason=stop, then
+        // ENDS — no `data: [DONE]\n\n`.
+        let body = format!(
+            "{}\n\n{}\n\n{}\n\n",
+            sample_reasoning_chunk(),
+            sample_content_chunk(),
+            sample_usage_chunk(),
+        );
+        let script = http_response_with_body("HTTP/1.1 200 OK", &body, "");
+        let url = spawn_scripted_server(vec![script]).await;
+
+        let cfg = cfg_for(&url, Duration::from_secs(10));
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        let failure = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect_err("stream without [DONE] must Err");
+        match failure.kind {
+            DeepSeekFailureKind::StreamEndedWithoutDone => {}
+            other => panic!("expected StreamEndedWithoutDone, got {other:?}"),
+        }
+        // Usage is best-effort populated from the usage chunk we DID see.
+        let usage = failure.usage.as_ref().expect("usage populated");
+        assert_eq!(usage.output_tokens, 174);
+    }
+
+    /// Codex W3-review NIT #1 regression: Retry-After accepts HTTP-date AND
+    /// delta-seconds. Both paths must produce a reasonable wait.
+    #[test]
+    fn parse_retry_after_handles_seconds_and_http_date() {
+        use reqwest::header::HeaderValue;
+        // delta-seconds
+        let v = HeaderValue::from_static("7");
+        assert_eq!(parse_retry_after(Some(&v)), Some(7));
+        // HTTP-date in the past → 0
+        let v = HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(parse_retry_after(Some(&v)), Some(0));
+        // Garbage
+        let v = HeaderValue::from_static("not a date");
+        assert_eq!(parse_retry_after(Some(&v)), None);
+        // None
+        assert_eq!(parse_retry_after(None), None);
+        // Future HTTP-date → positive wait. Build one ~10s out.
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(10))
+            .to_rfc2822()
+            // chrono's to_rfc2822 produces "+0000" but HTTP-date wants "GMT";
+            // RFC 2822 parser accepts both, so this works.
+            ;
+        let v = HeaderValue::from_str(&future).expect("header value");
+        let secs = parse_retry_after(Some(&v)).expect("parsed");
+        assert!(secs >= 8 && secs <= 11, "expected ~10s, got {secs}");
+    }
+
+    /// Codex W3-review NIT #2 regression: Windows-reserved basenames AND the
+    /// empty/"."/"..": cases get safely rewritten by the sanitizer.
+    #[test]
+    fn sanitize_for_filename_rejects_windows_reserved_and_dot_cases() {
+        for r in &["CON", "PRN", "AUX", "NUL", "COM1", "LPT9", "con", "con.txt"] {
+            let out = sanitize_for_filename(r);
+            assert!(out.starts_with("req-"), "{r} → {out} (expected req- prefix)");
+        }
+        assert_eq!(sanitize_for_filename(""), "req-0");
+        assert_eq!(sanitize_for_filename("."), "req-1");
+        assert_eq!(sanitize_for_filename(".."), "req-2");
+        // Normal slugs are unchanged.
+        assert_eq!(sanitize_for_filename("chatcmpl-001"), "chatcmpl-001");
+        assert_eq!(sanitize_for_filename("abc.def"), "abc.def");
+    }
+
+    /// Codex W3-review NIT #4 regression: the runner correctly consumes a
+    /// chunked-transfer-encoding SSE response (DeepSeek's actual transport),
+    /// not just Content-Length + Connection: close.
+    #[tokio::test]
+    async fn deepseek_runner_handles_chunked_transfer_encoding() {
+        // Build a chunked HTTP/1.1 response by hand. Each chunk:
+        //   <hex-len>\r\n<bytes>\r\n
+        // Terminator: 0\r\n\r\n
+        fn chunk(body: &str) -> Vec<u8> {
+            let mut out = format!("{:X}\r\n", body.len()).into_bytes();
+            out.extend_from_slice(body.as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out
+        }
+
+        // Each SSE event is a separate HTTP chunk so we test cross-chunk
+        // boundary AND chunked decoding at the same time.
+        let mut script = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        script.extend(chunk(&format!("{}\n\n", sample_reasoning_chunk())));
+        script.extend(chunk(&format!("{}\n\n", sample_content_chunk())));
+        script.extend(chunk(&format!("{}\n\n", sample_usage_chunk())));
+        script.extend(chunk("data: [DONE]\n\n"));
+        script.extend_from_slice(b"0\r\n\r\n");
+
+        let url = spawn_scripted_server(vec![script]).await;
+        let cfg = cfg_for(&url, Duration::from_secs(10));
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+        let result = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect("chunked transport must work");
+        assert_eq!(result.response_text, "final answer text");
     }
 
     /// Estimated-path test for the log writer — confirms usage_source
