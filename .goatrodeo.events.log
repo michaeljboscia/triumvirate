@@ -65,3 +65,8 @@ GR_EVT step_started phase=4 step=1 note=canonical-docs
 GR_EVT step_done phase=4 step=4 verdict=APPROVED auditors=codex+gemini fixes=19
 GR_EVT step_done phase=4 step=5 note=inherited-existing-sdlc
 GR_EVT step_done phase=4 verdict=PASS
+GR_EVT step_redo phase=5 step=2 reason=rebase-from-agy-to-main old_wave0=a9b5c9f new_wave0=a9b5c9f6abb762bc0696e64ae9a075bf6e67ada3
+GR_EVT step_redo phase=5 step=2 reason=rebase-from-agy-to-main old_wave0=a9b5c9f new_wave0=a9b5c9f6abb762bc0696e64ae9a075bf6e67ada3 parent=main
+GR_EVT step_redo phase=5 step=2 reason=rebase-from-agy-to-main old_wave0=a9b5c9f new_wave0=9ead5f88872d1bcb8d7bc408b58316f842189618 parent=main
+GR_EVT wave_started wave=0 task=T-000
+GR_EVT wave_done wave=0 task=T-000 verdict=PASS probes_passed=8 probes_total=8 cost_usd=~0.01
