@@ -114,7 +114,10 @@ enforcement:
   # Per-task enforcement contract (mirrors Execution Contract in IMPLEMENTATION_PLAN.md)
   per_task:
     files_lock: "code changes restricted to <files> list; <scope_out> rules HARD-enforced"
-    commit_format_regex: "^(T-\\d{3}|collateral-fix: T-\\d{3}(?: --) ): "
+    # Permissive: a commit subject must contain a task ID (T-### or collateral-fix: T-###)
+    # somewhere on the first line. Allows the daemon-repo convention "feat(deepseek): T-001 — …"
+    # as well as the strict "T-001: …" form. Searchable either way via `git log --grep='T-001'`.
+    commit_format_regex: "(T-\\d{3}|collateral-fix:\\s*T-\\d{3})"
     test_command: "cargo test --workspace"
     lint_command: "cargo clippy --workspace -- -D warnings"
     format_command: "cargo fmt --check"
