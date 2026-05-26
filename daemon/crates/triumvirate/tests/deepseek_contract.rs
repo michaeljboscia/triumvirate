@@ -460,3 +460,52 @@ async fn probe_08_flash_non_thinking_no_reasoning_content() {
     );
     println!("PROBE-08 OK: flash non-think — content={content:?} reasoning='' ");
 }
+
+/// PROBE-09 (B.9 follow-up, added 2026-05-26): end-to-end runner integration
+/// probe. Verifies that `mcp_bridge::deepseek::run()` — the ACTUAL production
+/// entry point — succeeds against api.deepseek.com. Caught the build_request_body
+/// nested-thinking-shape bug that probes 01-08 missed because they hand-craft
+/// JSON instead of going through the runner.
+///
+/// A regression that breaks the wire shape (e.g. reverts the
+/// `thinking: {type: ...}` nesting to a flat string) would fail this probe
+/// with HTTP 400 / invalid_request_error.
+#[tokio::test]
+#[ignore = "live API contract — set TRIUMVIRATE_DEEPSEEK_API_KEY and run with --ignored"]
+async fn probe_09_runner_end_to_end_against_live_api() {
+    use mcp_bridge::deepseek as ds;
+    use mcp_bridge::deepseek_config::DeepSeekConfig;
+
+    if std::env::var("TRIUMVIRATE_DEEPSEEK_API_KEY").is_err() {
+        println!("SKIP: TRIUMVIRATE_DEEPSEEK_API_KEY not set — probe skipped");
+        return;
+    }
+
+    let cfg = DeepSeekConfig::from_env().expect("config from env");
+    assert!(!cfg.api_key.is_empty(), "API key must be present");
+    let client = ds::build_client(&cfg).expect("build_client");
+    let resilience = ds::ResilienceState::from_cfg(&cfg);
+    let req = ds::RunRequest {
+        messages: vec![ds::RequestMessage {
+            role: "user".to_string(),
+            content: "Reply with exactly: ok".to_string(),
+        }],
+        session_id: format!("deepseek-probe-09-{}", std::process::id()),
+        prompt_chars_estimate: 24,
+        include_reasoning: false,
+    };
+    let result = ds::run(&cfg, &client, &req, &resilience)
+        .await
+        .expect("PROBE-09: runner must succeed end-to-end against live API");
+    assert!(!result.response_text.is_empty(),
+        "PROBE-09: response_text must be non-empty (model returned content)");
+    let sid = result.session_id.as_deref().unwrap_or("");
+    assert!(sid.starts_with("deepseek-probe-09-"),
+        "PROBE-09: session_id must round-trip from request; got {sid}");
+    let usage = result.token_usage.as_ref().expect("PROBE-09: usage populated");
+    assert!(usage.output.unwrap_or(0) > 0, "PROBE-09: output tokens > 0");
+    println!(
+        "PROBE-09 OK: response={:?} session_id={} usage=input:{:?}/output:{:?}/cached:{:?}",
+        result.response_text, sid, usage.input, usage.output, usage.cached,
+    );
+}
