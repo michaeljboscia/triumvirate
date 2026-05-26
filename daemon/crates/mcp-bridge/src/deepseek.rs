@@ -324,6 +324,138 @@ impl StreamParser {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// T-007 (REQ-DS-029, REQ-DS-030): guards — ghost-success + finish_reason.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// DeepSeek occasionally streams a 200-with-embedded-error: the HTTP envelope
+// is 200 OK, the SSE stream looks normal, but one of the `data:` chunks
+// contains a top-level `error` object. T-006 stashed it in
+// `parser.embedded_error`; T-007 detects it at finalize and converts it to a
+// typed failure routed through the same classification path as HTTP errors
+// (per REQ-DS-029 — no new breaker policy).
+//
+// REQ-DS-030 covers the other side: finish_reason ∈ {length, content_filter,
+// null, "unknown"} means the model output is INCOMPLETE or REJECTED — never
+// return Ok(parsed) with partial content. Always fail loud.
+
+use crate::deepseek_resilience::Classification;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BadFinishReasonKind {
+    Length,
+    ContentFilter,
+    Missing,
+    Unknown(String),
+}
+
+/// Typed failure surface for the DeepSeek runner. T-007 introduces the first
+/// two variants; T-008/T-010 will add the rest in subsequent commits.
+#[derive(Debug)]
+pub enum DeepSeekFailureKind {
+    /// A `data:` chunk carried a top-level `error` object. The accompanying
+    /// classification mirrors what the same condition would map to as an HTTP
+    /// status code (e.g. insufficient_balance → Hard, like 402).
+    GhostSuccessEmbedded {
+        error: EmbeddedError,
+        classification: Classification,
+    },
+    /// finish_reason was not `stop`. Partial output is NOT returned — the
+    /// caller learns the kind and decides whether to retry.
+    BadFinishReason(BadFinishReasonKind),
+    // T-008 will add: RunawayReasoning { observed_tokens: i64 }
+    // T-010 will add: HardProvider(u16), Transient(u16), NetworkMidStream,
+    //                  AbsoluteTimeoutExceeded, ...
+}
+
+impl std::fmt::Display for DeepSeekFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeepSeekFailureKind::GhostSuccessEmbedded { error, classification } => {
+                write!(
+                    f,
+                    "ghost-success: embedded error (classification={classification:?}) code={:?} message={:?}",
+                    error.code, error.message
+                )
+            }
+            DeepSeekFailureKind::BadFinishReason(kind) => {
+                write!(f, "bad finish_reason: {kind:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeepSeekFailureKind {}
+
+/// The clean-success result of finalizing a parsed stream.
+#[derive(Clone, Debug)]
+pub struct FinalizedStream {
+    pub content: String,
+    pub reasoning: String,
+    pub usage: Option<RawUsage>,
+    pub finish_reason: String,
+    pub request_id: Option<String>,
+    pub system_fingerprint: Option<String>,
+}
+
+/// Apply T-007's guards to a parsed stream and either return the clean result
+/// or a typed failure. Ghost-success takes precedence over finish_reason
+/// because an embedded error means the stream is a lie regardless of how it
+/// "ended". The finalized stream is borrowed from the parser, so the caller
+/// retains ownership of the parser for downstream usage (T-009).
+pub fn finalize_stream(parser: &StreamParser) -> Result<FinalizedStream, DeepSeekFailureKind> {
+    // (a) Ghost-success: detect FIRST. A 402-equivalent embedded payload looks
+    //     like a 200 success on the wire, so the only thing protecting the
+    //     caller from acting on a lie is this check.
+    if let Some(err) = &parser.embedded_error {
+        return Err(DeepSeekFailureKind::GhostSuccessEmbedded {
+            classification: classify_embedded_error(err),
+            error: err.clone(),
+        });
+    }
+
+    // (b) finish_reason guard. "stop" is the only clean exit.
+    match parser.finish_reason.as_deref() {
+        Some("stop") => Ok(FinalizedStream {
+            content: parser.content_acc.clone(),
+            reasoning: parser.reasoning_acc.clone(),
+            usage: parser.usage.clone(),
+            finish_reason: "stop".to_string(),
+            request_id: parser.request_id.clone(),
+            system_fingerprint: parser.system_fingerprint.clone(),
+        }),
+        Some("length") => {
+            Err(DeepSeekFailureKind::BadFinishReason(BadFinishReasonKind::Length))
+        }
+        Some("content_filter") => Err(DeepSeekFailureKind::BadFinishReason(
+            BadFinishReasonKind::ContentFilter,
+        )),
+        Some(other) => Err(DeepSeekFailureKind::BadFinishReason(
+            BadFinishReasonKind::Unknown(other.to_string()),
+        )),
+        None => Err(DeepSeekFailureKind::BadFinishReason(BadFinishReasonKind::Missing)),
+    }
+}
+
+/// Map an embedded error to the same Hard/Transient axis as HTTP status codes.
+/// Unknown / unrecognised codes default to Hard — better to fail loud than
+/// quietly retry on something the parser doesn't understand.
+fn classify_embedded_error(err: &EmbeddedError) -> Classification {
+    let code = err.code.as_deref().unwrap_or("").to_lowercase();
+    let msg = err.message.as_deref().unwrap_or("").to_lowercase();
+    let kind = err.kind.as_deref().unwrap_or("").to_lowercase();
+    let combined = format!("{code} {msg} {kind}");
+
+    // Transient first — these map to 429/5xx-like behavior.
+    let transient_markers = ["rate_limit", "rate limit", "429", "overloaded", "server_error"];
+    if transient_markers.iter().any(|m| combined.contains(m)) {
+        return Classification::Transient;
+    }
+    // Everything else (insufficient_balance, billing, auth, invalid_*, ...)
+    // is Hard. Including the catch-all unknown case.
+    Classification::Hard
+}
+
 /// Scan for the first SSE event terminator — `\n\n` (LF-LF) OR `\r\n\r\n`
 /// (CRLF-CRLF). Returns `(payload_end_index, terminator_len)` so the caller
 /// can drain accordingly. Per the SSE spec both terminators are valid; DeepSeek
@@ -676,5 +808,118 @@ mod tests {
         let stream = b": ping\r\n\r\n";
         parser.feed(stream).expect("CRLF keepalive parses");
         assert_eq!(parser.keepalive_count, 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-007 guards tests.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Reality test (a): stream with an embedded {"error":...} chunk in the
+    /// middle → finalize returns GhostSuccessEmbedded classified as Hard,
+    /// matching the same Hard classification as a 402 HTTP status.
+    ///
+    /// Stub guard: a finalize that returns Ok on this stream (because the
+    /// finish_reason is technically "stop") would fail — embedded error must
+    /// take precedence.
+    #[test]
+    fn deepseek_guards_ghost_success_insufficient_balance_is_hard() {
+        let stream = format!(
+            "{}\n\ndata: {{\"choices\":[],\"error\":{{\"code\":\"insufficient_balance\",\"message\":\"Insufficient Balance\",\"type\":\"billing\"}}}}\n\ndata: {{\"id\":\"x\",\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+            sample_reasoning_chunk(),
+        );
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+
+        // Sanity: the parser DID see the error AND the subsequent stop+done.
+        assert!(parser.embedded_error.is_some());
+        assert_eq!(parser.finish_reason.as_deref(), Some("stop"));
+        assert!(parser.done);
+
+        match finalize_stream(&parser) {
+            Err(DeepSeekFailureKind::GhostSuccessEmbedded { classification, error }) => {
+                assert_eq!(classification, Classification::Hard);
+                assert_eq!(error.code.as_deref(), Some("insufficient_balance"));
+            }
+            other => panic!("expected GhostSuccessEmbedded(Hard), got {other:?}"),
+        }
+    }
+
+    /// Embedded errors with rate-limit markers map to Transient (mirror 429).
+    #[test]
+    fn deepseek_guards_embedded_rate_limit_is_transient() {
+        let stream = "data: {\"choices\":[],\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Too many requests\"}}\n\ndata: [DONE]\n\n";
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        match finalize_stream(&parser) {
+            Err(DeepSeekFailureKind::GhostSuccessEmbedded { classification, .. }) => {
+                assert_eq!(classification, Classification::Transient);
+            }
+            other => panic!("expected GhostSuccessEmbedded(Transient), got {other:?}"),
+        }
+    }
+
+    /// Reality test (b): finish_reason="length" → BadFinishReason(Length).
+    /// NOT Ok(parsed) with partial content. A stub that returns Ok with the
+    /// accumulated content would fail this test.
+    #[test]
+    fn deepseek_guards_finish_reason_length_is_bad() {
+        let stream = format!(
+            "{}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\ndata: [DONE]\n\n",
+            sample_content_chunk(),
+        );
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        assert!(!parser.content_acc.is_empty(), "parser DID accumulate partial content");
+        match finalize_stream(&parser) {
+            Err(DeepSeekFailureKind::BadFinishReason(BadFinishReasonKind::Length)) => {}
+            other => panic!("expected BadFinishReason(Length), got {other:?}"),
+        }
+    }
+
+    /// content_filter is its own bucket so callers can apply policy-specific UI.
+    #[test]
+    fn deepseek_guards_finish_reason_content_filter_is_bad() {
+        let stream = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n";
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        match finalize_stream(&parser) {
+            Err(DeepSeekFailureKind::BadFinishReason(BadFinishReasonKind::ContentFilter)) => {}
+            other => panic!("expected BadFinishReason(ContentFilter), got {other:?}"),
+        }
+    }
+
+    /// Stream that finished without ever emitting a finish_reason. The runner
+    /// should NOT treat this as Ok — it's the "stream truncated cleanly but
+    /// missed the final delta" case.
+    #[test]
+    fn deepseek_guards_missing_finish_reason_is_bad() {
+        let stream = format!("{}\n\ndata: [DONE]\n\n", sample_content_chunk());
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        match finalize_stream(&parser) {
+            Err(DeepSeekFailureKind::BadFinishReason(BadFinishReasonKind::Missing)) => {}
+            other => panic!("expected BadFinishReason(Missing), got {other:?}"),
+        }
+    }
+
+    /// Reality test (c): finish_reason="stop" with no embedded error → Ok.
+    /// Confirms the happy path actually works (without this, the guards above
+    /// could be passing by always returning Err).
+    #[test]
+    fn deepseek_guards_finish_reason_stop_returns_ok() {
+        let stream = format!(
+            "{}\n\n{}\n\n{}\n\ndata: [DONE]\n\n",
+            sample_reasoning_chunk(),
+            sample_content_chunk(),
+            sample_usage_chunk(),
+        );
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        let finalized = finalize_stream(&parser).expect("clean stop must return Ok");
+        assert_eq!(finalized.finish_reason, "stop");
+        assert_eq!(finalized.content, "final answer text");
+        assert_eq!(finalized.reasoning, "step 1 then step 2");
+        assert!(finalized.usage.is_some());
+        assert_eq!(finalized.system_fingerprint.as_deref(), Some("fp_abc"));
     }
 }
