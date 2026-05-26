@@ -914,24 +914,35 @@ impl DeepSeekFailureKind {
 /// Build the JSON request body. Pulled out for tests + so the body can be
 /// inspected without making an HTTP call.
 pub fn build_request_body(cfg: &DeepSeekConfig, req: &RunRequest) -> serde_json::Value {
-    // B.9 (test-plan TIER 2) live-probe finding 2026-05-26: the `thinking`
-    // field must be a NESTED object `{"type": "enabled"|"disabled"}`, not a
-    // flat string. The API rejects flat strings with HTTP 400
-    // `Failed to deserialize the JSON body into the target type: thinking:
-    // invalid type: string, expected struct ThinkingOptions`. The contract
-    // probes in tests/deepseek_contract.rs hand-craft the nested shape
-    // directly, which is why they passed; build_request_body never exercised
-    // the wire shape against the live API until B.9.
+    // B.9 (TIER 2 live probe 2026-05-26): the `thinking` field is a NESTED
+    // object `{"type": "enabled"|"disabled"}`, not a flat string. Flat strings
+    // get HTTP 400 `invalid type: string, expected struct ThinkingOptions`.
     //
-    // `reasoning_effort` IS a flat string per the live probe — keep it flat.
-    serde_json::json!({
+    // B.9b (2026-05-26, found via live MCP test post-PR#37): when
+    // `thinking={type:"disabled"}`, `reasoning_effort` MUST be omitted entirely.
+    // The API rejects the combo with HTTP 400:
+    //   "thinking options type cannot be disabled when reasoning_effort is set"
+    // The two parameters are mutually exclusive on the wire. The contract
+    // probes never exercised the combination: probe-08 sent thinking=disabled
+    // with NO reasoning_effort field at all (which is why it passed); every
+    // OTHER probe sent thinking=enabled (so the combo was incidentally legal).
+    // build_request_body was the first thing to assemble disabled+effort.
+    //
+    // `reasoning_effort` IS a flat string per the live probe — keep it flat
+    // when included.
+    let mut body = serde_json::json!({
         "model": cfg.model,
         "messages": req.messages,
         "stream": true,
         "max_tokens": cfg.max_tokens,
         "thinking": { "type": cfg.thinking.as_api_str() },
-        "reasoning_effort": cfg.reasoning_effort.as_api_str(),
-    })
+    });
+    // Only include reasoning_effort when thinking is enabled. Both v4-pro
+    // and v4-flash accept this combination; both reject disabled+effort.
+    if matches!(cfg.thinking, crate::deepseek_config::ThinkingMode::Enabled) {
+        body["reasoning_effort"] = serde_json::json!(cfg.reasoning_effort.as_api_str());
+    }
+    body
 }
 
 /// REQ-DS-004 / REQ-DS-005 / REQ-DS-008 / REQ-DS-014 / REQ-DS-024 — top-level
@@ -2708,6 +2719,53 @@ mod tests {
             assert!(!s.contains("\"thinking\":\"disabled\""),
                 "B.9 regression: flat thinking:disabled detected (API would 400)");
         }
+    }
+
+    /// B.9b (live MCP test 2026-05-26 post-PR#37 merge): when
+    /// `thinking={type:"disabled"}`, the API rejects requests that ALSO
+    /// include `reasoning_effort` with HTTP 400:
+    ///   "thinking options type cannot be disabled when reasoning_effort is set"
+    /// The build_request_body must OMIT reasoning_effort entirely when
+    /// thinking is disabled. With thinking enabled, reasoning_effort must
+    /// still be present (it's how callers select effort tier — see T-011).
+    #[test]
+    fn b9b_reasoning_effort_omitted_when_thinking_disabled() {
+        // thinking=Enabled → reasoning_effort PRESENT
+        let mut cfg = cfg_with_timings(Duration::from_secs(5), Duration::from_secs(10));
+        cfg.thinking = crate::deepseek_config::ThinkingMode::Enabled;
+        cfg.reasoning_effort = crate::deepseek_config::ReasoningEffort::High;
+        let req = RunRequest {
+            messages: vec![RequestMessage { role: "user".to_string(), content: "x".to_string() }],
+            session_id: "b9b-enabled".to_string(),
+            prompt_chars_estimate: 1,
+            include_reasoning: false,
+        };
+        let body = build_request_body(&cfg, &req);
+        assert_eq!(
+            body["reasoning_effort"], serde_json::json!("high"),
+            "thinking=enabled MUST include reasoning_effort; got: {body}"
+        );
+
+        // thinking=Disabled → reasoning_effort OMITTED (the bug we just fixed)
+        let mut cfg = cfg_with_timings(Duration::from_secs(5), Duration::from_secs(10));
+        cfg.thinking = crate::deepseek_config::ThinkingMode::Disabled;
+        cfg.reasoning_effort = crate::deepseek_config::ReasoningEffort::High;
+        let req = RunRequest {
+            messages: vec![RequestMessage { role: "user".to_string(), content: "x".to_string() }],
+            session_id: "b9b-disabled".to_string(),
+            prompt_chars_estimate: 1,
+            include_reasoning: false,
+        };
+        let body = build_request_body(&cfg, &req);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "thinking=disabled MUST omit reasoning_effort entirely (API rejects \
+             'thinking options type cannot be disabled when reasoning_effort is set'); got: {body}"
+        );
+        // Same as a string-grep guard against partial reverts.
+        let s = body.to_string();
+        assert!(!s.contains("\"reasoning_effort\""),
+            "B.9b regression: reasoning_effort key found in body with thinking=disabled");
     }
 
     /// B.3 — Cache invariant warn: when the streamed `usage` violates
