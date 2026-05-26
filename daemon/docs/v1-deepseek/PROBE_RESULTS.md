@@ -287,3 +287,130 @@ the live API was the one we wrote AFTER suspecting a wire bug. Going
 forward, any module that builds an HTTP request body should have at least
 one `#[ignore]`-gated probe that hits the real endpoint with that exact
 builder output.
+
+---
+
+## TIER 2 sweep — B.10 → B.14 (2026-05-26)
+
+Five validator probes against the live API to ground-truth assumptions our
+mock-server tests can't verify. Total spend: **sub-cent** (balance display
+unchanged at $9.99 to 2dp precision before vs after).
+
+### B.10 — Usage + cost math validation ✅
+
+Small consult to `deepseek-v4-pro` with thinking enabled:
+
+```
+prompt=8 miss=8 hit=0
+completion=34 (incl reasoning=32)
+computed: miss=$0.0000035 + hit=$0.0000000 + out=$0.0000296 = $0.0000331
+invariant: hit + miss == prompt? 8 == 8: True
+```
+
+**Confirms:**
+  - Our `map_usage` no-double-add is correct on the live wire (output_tokens
+    is 34 — the reported `completion_tokens` — not 34+32=66).
+  - The cache-token invariant (`hit + miss == prompt_tokens`) holds — our
+    B.3 warn would NOT fire on this normal traffic.
+  - Reasoning_tokens billed at the output rate (32 of the 34 completion
+    tokens here were reasoning, all priced as output).
+
+### B.11 — Cache hit on identical repeat ❌ (FAIL — important)
+
+Identical 76-token prompt sent twice, 2 seconds apart:
+
+```
+call 1: prompt=76 hit=0 miss=76
+call 2: prompt=76 hit=0 miss=76
+```
+
+Despite the prompt exceeding the documented 64-token chunk threshold,
+**no cache hit observed on the second call**. This is consistent with
+DeepSeek's published "best-effort" cache disclaimer, but it has real
+operational consequences:
+
+**Implication for cost estimates:** the $0.003625/M cache-hit price for
+v4-pro is **120× cheaper** than the $0.435/M miss price. Our seeded
+`price_table` assumes cache hits will materialize for repeated prompts,
+but the live behavior says otherwise. **Operators should NOT plan cost
+budgets around achieving high cache-hit rates.** When hits DO occur
+they're a windfall, not a baseline.
+
+**No code change required** — our `map_usage` records `cached_tokens` from
+whatever the wire reports, and `calculate_cost_usd` prices them correctly.
+The change is in the OPERATOR's mental model: assume miss-rate pricing.
+
+### B.12 — Single-byte prefix change ⚠️ inconclusive
+
+Same prompt with one `X ` prepended to the system message:
+
+```
+call with X-prefix: prompt=77 hit=0 miss=77
+```
+
+The +1 char added 1 token (76 → 77), but since B.11 didn't establish any
+cache to invalidate, we can't confirm prefix-byte sensitivity from this
+probe. Test the property structurally instead: verify in code review that
+no per-call uuids/timestamps land in the prompt prefix.
+
+### B.13 — Large prompt, no silent truncation ✅
+
+5KB prompt (1216 tokens — about 4 chars/token, slightly under DeepSeek's
+documented 0.3 ratio):
+
+```
+prompt_tokens=1216
+completion_tokens=1
+content='ok'
+wall_clock_ms=960
+```
+
+The model received and processed the full prompt — the response correctly
+addresses the embedded instruction ("Please count to ten and then reply
+ok") with `ok`. **No silent truncation.** Latency under 1 second for a
+5KB input is well within our `read_timeout` (60s) and `timeout` (1800s).
+
+### B.14 — max_tokens low + thinking → empty content ⚠️ (worst-case bill surprise)
+
+`max_tokens=30` + `thinking=enabled` + a math prompt:
+
+```
+finish_reason=length
+content=''
+reasoning_content='We are asked: "What is the integral of x^2 from 0 to 5?" This is a definite inte'
+completion_tokens=30 (incl reasoning=30)
+```
+
+All 30 completion tokens were consumed by reasoning before the model
+emitted a single content token. The caller paid for 30 output tokens
+($0.0000084 on flash, $0.0000261 on pro) and got **nothing usable** —
+just a truncated reasoning trace and `finish_reason=length`.
+
+**Our T-007 `BadFinishReason::Length` catches this and routes it as a
+typed failure** (not an Ok with empty content). Per-request log captures
+the partial reasoning so the operator can see why.
+
+**The mitigation an operator should know:** set `max_tokens` AT LEAST
+high enough to cover BOTH reasoning AND content. For thinking-enabled
+calls, a reasonable floor is ~256 tokens for trivial answers, ~1024 for
+non-trivial. Anything lower risks all-reasoning-no-content responses
+that cost money and return nothing.
+
+### TIER 2 sweep — verdict
+
+| Probe | Status | What it grounds |
+|---|---|---|
+| B.10 | ✅ PASS | usage map + cost math is correct end-to-end |
+| B.11 | ⚠️ behavior NOT what docs implied | cache hits are NOT reliable; don't budget on them |
+| B.12 | ⚠️ inconclusive | (skip — structural review is sufficient) |
+| B.13 | ✅ PASS | large prompts work; no silent truncation |
+| B.14 | ✅ PASS | low max_tokens + thinking = empty-content trap; T-007 catches |
+
+**Total spend:** sub-cent. Balance unchanged at $9.99 (2dp display
+precision).
+
+**Net effect on the integration:** zero code changes from TIER 2. The
+findings are operator-facing — the runner is correct; the operator's
+expectations need calibrating around (a) cache hits being opportunistic
+not reliable, and (b) max_tokens having to cover BOTH reasoning AND
+content on thinking-mode calls.
