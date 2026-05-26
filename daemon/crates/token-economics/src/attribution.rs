@@ -71,10 +71,16 @@ pub fn ensure_deepseek_prices(db: &TokenDb) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Idempotent: inserts the price row for `model` only if no row for that model
-/// already exists in the table. (We could add a UNIQUE constraint and use
-/// INSERT OR IGNORE, but that would be a schema change; the SELECT-then-INSERT
-/// check is sufficient for the seed-once-at-startup case.)
+/// Idempotent: inserts the canonical open-ended price row for `model` UNLESS an
+/// open-ended row already covers "now" for that model.
+///
+/// Codex P5-review fix: the previous `SELECT EXISTS(model = ?)` check would skip
+/// seeding when ANY row existed — including historical, ended, or future-dated
+/// rows that the temporal lookup in `query_active_price_components` would reject.
+/// That left `calculate_cost_usd` returning `None` even after a "successful" seed.
+/// The corrected check mirrors the lookup invariant: only consider rows that are
+/// active for the current wall-clock timestamp AND open-ended (`end_date IS NULL`),
+/// which is exactly the shape this function emits.
 fn ensure_price_row(
     db: &TokenDb,
     model: &str,
@@ -87,15 +93,27 @@ fn ensure_price_row(
         .lock()
         .map_err(|_| anyhow::anyhow!("token DB connection mutex poisoned"))?;
 
-    let exists: bool = conn
+    // SQLite generates the "now" timestamp in the same ISO-8601 shape
+    // ("YYYY-MM-DDTHH:MM:SSZ") that the existing `query_active_price_components`
+    // lookup string-compares against — no extra crate dep required.
+    let active_open_ended_exists: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM price_table WHERE model = ?1)",
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM price_table
+                WHERE model = ?1
+                  AND effective_date <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                  AND end_date IS NULL
+            )
+            "#,
             params![model],
             |row| row.get(0),
         )
-        .with_context(|| format!("failed to check existence of price row for model '{model}'"))?;
+        .with_context(|| {
+            format!("failed to check active-open-ended price row for model '{model}'")
+        })?;
 
-    if exists {
+    if active_open_ended_exists {
         return Ok(());
     }
 
@@ -426,6 +444,51 @@ mod tests {
         // Still exactly 1 row per model — not 5, not 10.
         assert_eq!(row_count_for_model(&db, "deepseek-v4-pro"), 1);
         assert_eq!(row_count_for_model(&db, "deepseek-v4-flash"), 1);
+    }
+
+    // Codex P5-review regression: an ended or future-dated row for the model must
+    // NOT block the seed. The previous SELECT EXISTS(model = ?) version would have
+    // returned early and left calculate_cost_usd returning None for "now" queries.
+    #[test]
+    fn ensure_deepseek_prices_seeds_even_when_an_ended_row_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open token db");
+
+        // Insert an ENDED historical row for v4-pro that does NOT cover "now".
+        {
+            let conn = db.conn.lock().expect("lock db");
+            conn.execute(
+                r#"
+                INSERT INTO price_table (
+                    model, input_per_mtok, output_per_mtok, cached_per_mtok,
+                    effective_date, end_date
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    "deepseek-v4-pro",
+                    9.99,
+                    9.99,
+                    9.99,
+                    "2020-01-01T00:00:00Z",
+                    Some("2020-06-01T00:00:00Z"),
+                ],
+            )
+            .expect("insert ended row");
+        }
+
+        // Sanity: a row exists, but no OPEN-ENDED active row does.
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-pro"), 1);
+
+        ensure_deepseek_prices(&db).expect("seed must still run despite stale row");
+
+        // Two v4-pro rows now: the stale ended one + the freshly-seeded open one.
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-pro"), 2);
+
+        // The lookup at "now" returns the seeded (correct) prices, not the stale ones.
+        let rec = record_for_cost("deepseek-v4-pro", 1_000_000, 1_000_000, 0);
+        let cost = calculate_cost_usd(&db, &rec).expect("cost calc").expect("priced");
+        // 1M tokens × $0.435 input + 1M × $0.87 output = $1.305 (NOT 9.99-shaped).
+        assert!((cost - 1.305).abs() < 1e-6, "expected $1.305, got ${cost}");
     }
 
     #[test]
