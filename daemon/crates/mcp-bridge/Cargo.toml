@@ -14,5 +14,14 @@ reqwest.workspace = true
 # T-006: SSE parser uses serde_derive structs + serde_json for `data: <json>`.
 serde.workspace = true
 serde_json.workspace = true
+# T-009: per-request log records carry an RFC3339 timestamp. Same chrono shape
+# as the rest of the daemon (default-features = false + clock for SystemTime).
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt", "net", "io-util"] }
 tracing.workspace = true
+
+[dev-dependencies]
+# T-009 test-only: real cost calculation against the seeded price table to
+# anchor the no-double-add usage mapping to the Wave-0 probe-04 numbers.
+token-economics = { path = "../token-economics" }
+tempfile = "3"

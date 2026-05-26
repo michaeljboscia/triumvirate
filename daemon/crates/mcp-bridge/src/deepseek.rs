@@ -482,6 +482,159 @@ fn classify_embedded_error(err: &EmbeddedError) -> Classification {
     Classification::Hard
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// T-009 (REQ-DS-009, REQ-DS-018, REQ-DS-021, REQ-DS-023, REQ-DS-026):
+// usage mapping + estimated fallback + per-request log writer.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Three concerns through the same finalize path:
+//
+//   (a) Usage mapping (REQ-DS-009 / A-04b). DeepSeek's `usage` chunk has the
+//       form { prompt_tokens, completion_tokens, prompt_cache_hit_tokens,
+//       prompt_cache_miss_tokens, completion_tokens_details.reasoning_tokens }.
+//       `completion_tokens` ALREADY INCLUDES `reasoning_tokens` — adding them
+//       overstates output and breaks cost math. The mapping:
+//         input_tokens  ← prompt_cache_miss_tokens   (priced as "miss")
+//         output_tokens ← completion_tokens          (NOT + reasoning_tokens)
+//         cached_tokens ← prompt_cache_hit_tokens    (priced as "cached")
+//
+//   (b) Estimated fallback when the usage chunk is missing (dirty disconnect,
+//       runaway abort, bad finish_reason). bytes_received / 4 for output +
+//       prompt_estimate for input. usage_source = "estimated".
+//
+//   (c) Per-request log file. JSON dropped at $LOG_DIR/<request_id>.json
+//       containing { request_id, model, system_fingerprint, reasoning_content
+//       (size-capped), content, usage, cost_usd, finish_reason, timestamp }.
+//       This is the NAMED storage target for REQ-DS-023 (CoT bifurcation)
+//       and REQ-DS-018 (system_fingerprint observability). Privacy guard:
+//       MUST NOT contain the API key or the request `messages` payload.
+//
+// The cost number itself is computed by the caller via the now-pub
+// `token_economics::calculate_cost_usd` — keeping that out of mcp-bridge
+// keeps the production dep graph clean (token-economics is a dev-dep here
+// purely so the test can anchor against probe-04 numbers).
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageSource {
+    /// Came from the `usage` SSE chunk — DeepSeek's authoritative count.
+    Exact,
+    /// Synthesized from bytes_received/4 + prompt_estimate when no usage
+    /// chunk arrived (mid-stream disconnect, runaway abort, bad finish).
+    Estimated,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub usage_source: UsageSource,
+}
+
+/// REQ-DS-009 / A-04b mapping. The single source of truth — every other
+/// caller in the daemon goes through this, NEVER touches RawUsage fields
+/// directly to derive a final number.
+///
+/// Stub guard: a stub that does `output ← completion_tokens +
+/// completion_tokens_details.reasoning_tokens` overstates and is caught by
+/// the test `deepseek_usage_map_no_double_add`.
+pub fn map_usage(raw: &RawUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: raw.prompt_cache_miss_tokens,
+        output_tokens: raw.completion_tokens,
+        cached_tokens: raw.prompt_cache_hit_tokens,
+        usage_source: UsageSource::Exact,
+    }
+}
+
+/// Fallback when the `usage` chunk never arrived. The runner computes
+/// `bytes_received` itself (sum of chunk lengths) and supplies a prompt-side
+/// estimate (chars/4 of the request messages, computed without ever logging
+/// them).
+pub fn estimate_usage(bytes_received: i64, prompt_estimate: i64) -> TokenUsage {
+    TokenUsage {
+        input_tokens: prompt_estimate,
+        output_tokens: bytes_received / 4,
+        cached_tokens: 0,
+        usage_source: UsageSource::Estimated,
+    }
+}
+
+/// Truncate a reasoning string to `cap_bytes` while preserving UTF-8
+/// boundaries. Used by the log writer so a multi-MB reasoning string doesn't
+/// produce a multi-MB log file by default (cap defaults to 256KB per
+/// REQ-DS-023 / DeepSeekConfig.log_reasoning_cap_bytes).
+pub fn cap_reasoning(s: &str, cap_bytes: usize) -> &str {
+    if s.len() <= cap_bytes {
+        return s;
+    }
+    let mut idx = cap_bytes;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    &s[..idx]
+}
+
+/// The JSON shape persisted to `$LOG_DIR/<request_id>.json`. Borrows the
+/// underlying strings so the writer doesn't double the memory cost of a big
+/// reasoning trace. Privacy guard (REQ-DS-023 scope_out): MUST NOT contain
+/// the API key or the request messages — only response artifacts.
+#[derive(serde::Serialize)]
+pub struct PerRequestLogRecord<'a> {
+    pub request_id: &'a str,
+    pub model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<&'a str>,
+    pub reasoning_content: &'a str,
+    pub content: &'a str,
+    pub usage: &'a TokenUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    pub finish_reason: &'a str,
+    pub timestamp: String,
+}
+
+/// Write the per-request log file to `log_dir/{request_id}.json`. Creates the
+/// directory if it doesn't exist. The runner (T-010) calls this AFTER it has
+/// emitted the lifecycle cost tracing line — log-write errors are visible
+/// to the runner so it can log a warning but MUST NOT propagate as a consult
+/// failure (observability is best-effort, not blocking).
+pub fn write_per_request_log(
+    log_dir: &Path,
+    record: &PerRequestLogRecord<'_>,
+) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(log_dir)?;
+    let safe_id = sanitize_for_filename(record.request_id);
+    let path = log_dir.join(format!("{safe_id}.json"));
+    let json = serde_json::to_string_pretty(record)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    std::fs::write(&path, json)?;
+    Ok(path)
+}
+
+/// `request_id` comes from DeepSeek and is ordinarily a safe slug, but we
+/// strip path separators defensively so a malicious value can't escape
+/// `log_dir` (REQ-DS-018 — observability must not be a vector).
+fn sanitize_for_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// Current wall-clock as RFC3339 UTC, matching the rest of the daemon's
+/// timestamps (e.g. token-economics price_table effective_date).
+pub fn now_rfc3339_utc() -> String {
+    chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// Scan for the first SSE event terminator — `\n\n` (LF-LF) OR `\r\n\r\n`
 /// (CRLF-CRLF). Returns `(payload_end_index, terminator_len)` so the caller
 /// can drain accordingly. Per the SSE spec both terminators are valid; DeepSeek
@@ -980,6 +1133,258 @@ mod tests {
         parser.feed(stream.as_bytes()).expect("feed");
         assert!(parser.is_runaway(250), "boundary (==) must trip");
         assert!(!parser.is_runaway(251), "251 should NOT trip on 250 observed");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-009 usage map / estimated fallback / per-request log tests.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Reality test (REQ-DS-009 / A-04b): the mapping does NOT double-add
+    /// completion_tokens_details.reasoning_tokens into output. The Wave-0
+    /// probe-04 numbers (prompt 18, completion 174 incl 120 reasoning,
+    /// cached 0) produce output=174 — NOT 294.
+    ///
+    /// Stub guard: a map_usage that does
+    ///   output = completion_tokens + completion_tokens_details.reasoning_tokens
+    /// fails here (174+120 = 294 ≠ 174).
+    #[test]
+    fn deepseek_usage_map_no_double_add() {
+        let raw = RawUsage {
+            prompt_tokens: 18,
+            completion_tokens: 174,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 18,
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: 120,
+            }),
+        };
+        let usage = map_usage(&raw);
+        assert_eq!(usage.input_tokens, 18);
+        assert_eq!(usage.output_tokens, 174, "must NOT be 294 (no double-add)");
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.usage_source, UsageSource::Exact);
+    }
+
+    /// Reality test cont'd: the resulting TokenUsage flowed through
+    /// `token_economics::calculate_cost_usd` against the seeded
+    /// deepseek-v4-pro prices must produce ≈ $0.0001592 — the same number the
+    /// Wave-0 probe-04 live API call would imply if the daemon were
+    /// integrated.  Window ±$0.0000001 catches a stub that doubles output.
+    #[test]
+    fn deepseek_usage_map_probe04_cost_anchor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = token_economics::open(&temp.path().join("token-economics.db"))
+            .expect("open token db");
+        token_economics::ensure_deepseek_prices(&db).expect("seed prices");
+
+        let raw = RawUsage {
+            prompt_tokens: 18,
+            completion_tokens: 174,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 18,
+            completion_tokens_details: Some(CompletionTokensDetails { reasoning_tokens: 120 }),
+        };
+        let usage = map_usage(&raw);
+
+        // Wrap the mapped usage in a TokenRecord (timestamp after effective_date
+        // 2026-01-01).
+        let record = token_economics::TokenRecord {
+            agent: "deepseek".to_string(),
+            session_id: "sess-probe-04".to_string(),
+            timestamp: "2026-06-01T00:00:00Z".to_string(),
+            model: Some("deepseek-v4-pro".to_string()),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_tokens: usage.cached_tokens,
+            thinking_tokens: 120, // recorded but not priced separately
+            total_tokens: usage.input_tokens + usage.output_tokens + usage.cached_tokens,
+            cost_usd: None,
+            latency_ms: None,
+            tool_calls: None,
+            lines_added: None,
+            lines_removed: None,
+            rate_limit_pct: None,
+            context_window: None,
+            build_id: None,
+            task_id: None,
+            wave: None,
+            usage_source: token_economics::USAGE_SOURCE_EXACT.to_string(),
+        };
+        let cost = token_economics::calculate_cost_usd(&db, &record)
+            .expect("cost calc")
+            .expect("priced");
+        // 18 × 0.435/1M + 174 × 0.87/1M = 7.83e-6 + 1.5138e-4 ≈ 1.5921e-4
+        assert!(
+            (cost - 0.00015921).abs() < 1e-7,
+            "expected ≈$0.00015921, got ${cost}"
+        );
+
+        // Stub guard: if the mapping had double-added reasoning_tokens into
+        // output, output would be 294 and cost would be ~$0.000264, far
+        // outside the ±$0.0000001 window. Compute the would-be-bad cost
+        // explicitly and assert our actual cost is NOT in that neighborhood.
+        let bad_cost = (18.0 * 0.435 + 294.0 * 0.87) / 1_000_000.0;
+        assert!(
+            (cost - bad_cost).abs() > 1e-5,
+            "cost {cost} suspiciously close to the double-add value {bad_cost}"
+        );
+    }
+
+    /// Estimated fallback: bytes_received=800 + prompt_estimate=200 →
+    /// {input: 200, output: 200, cached: 0, source: estimated}.
+    #[test]
+    fn deepseek_usage_estimate_fallback_uses_bytes_over_4() {
+        let usage = estimate_usage(800, 200);
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 200, "800 bytes / 4 = 200 tokens");
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.usage_source, UsageSource::Estimated);
+    }
+
+    /// cap_reasoning preserves UTF-8 boundaries — a naive byte-slice at a
+    /// non-boundary index would panic. Use a multi-byte character to prove it.
+    #[test]
+    fn deepseek_cap_reasoning_preserves_utf8_boundary() {
+        // "🦀" is 4 bytes. Cap at 3 must truncate to "" (no whole char fits).
+        let s = "🦀abc";
+        assert_eq!(cap_reasoning(s, 3), "");
+        // Cap at 4 keeps the crab.
+        assert_eq!(cap_reasoning(s, 4), "🦀");
+        // Cap >= len returns the whole string.
+        assert_eq!(cap_reasoning(s, 1000), "🦀abc");
+    }
+
+    /// Reality test (privacy): the log file contains reasoning_content +
+    /// system_fingerprint + cost_usd AND does NOT contain the API key or
+    /// the request messages. The runner never passes those into the record
+    /// — this asserts the SHAPE of the record forbids them.
+    #[test]
+    fn deepseek_per_request_log_writes_expected_fields_and_excludes_secrets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_dir = temp.path();
+
+        let usage = TokenUsage {
+            input_tokens: 18,
+            output_tokens: 174,
+            cached_tokens: 0,
+            usage_source: UsageSource::Exact,
+        };
+
+        // The "secrets" the test pretends the runner is holding — both must
+        // be ABSENT from the log file, regardless of what the runner does.
+        let api_key_plaintext = "sk-LIVE-test-key-must-not-leak-XYZ";
+        let request_messages_text = "PRIVATE-USER-PROMPT-do-not-log-this";
+        let _ = (api_key_plaintext, request_messages_text); // marker for grep
+
+        let record = PerRequestLogRecord {
+            request_id: "chatcmpl-001",
+            model: "deepseek-v4-pro",
+            system_fingerprint: Some("fp_abc"),
+            reasoning_content: "step 1 then step 2",
+            content: "final answer text",
+            usage: &usage,
+            cost_usd: Some(0.00015921),
+            finish_reason: "stop",
+            timestamp: "2026-05-26T00:00:00Z".to_string(),
+        };
+        let path = write_per_request_log(log_dir, &record).expect("write log");
+        let body = std::fs::read_to_string(&path).expect("read log");
+
+        // Positive: required fields present.
+        assert!(body.contains("\"request_id\""), "missing request_id");
+        assert!(body.contains("\"chatcmpl-001\""));
+        assert!(body.contains("\"system_fingerprint\""));
+        assert!(body.contains("\"fp_abc\""));
+        assert!(body.contains("\"reasoning_content\""));
+        assert!(body.contains("step 1 then step 2"));
+        assert!(body.contains("\"cost_usd\""));
+        assert!(body.contains("0.00015921"));
+        assert!(body.contains("\"finish_reason\""));
+        assert!(body.contains("\"stop\""));
+        assert!(body.contains("\"usage_source\""));
+        assert!(body.contains("\"exact\""));
+
+        // Privacy regression guards.
+        assert!(
+            !body.contains(api_key_plaintext),
+            "REGRESSION: log file contained the API key string"
+        );
+        assert!(
+            !body.contains("Authorization"),
+            "REGRESSION: log file contained 'Authorization' (header name)"
+        );
+        assert!(
+            !body.contains(request_messages_text),
+            "REGRESSION: log file contained the request-messages text"
+        );
+        assert!(
+            !body.contains("\"messages\""),
+            "REGRESSION: log file contained a 'messages' field"
+        );
+    }
+
+    /// Per-request log path uses the request_id as the filename slug, and the
+    /// sanitizer prevents an evil request_id from escaping log_dir.
+    #[test]
+    fn deepseek_per_request_log_sanitizes_filename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            usage_source: UsageSource::Estimated,
+        };
+        let record = PerRequestLogRecord {
+            request_id: "../../escape/attempt",
+            model: "deepseek-v4-pro",
+            system_fingerprint: None,
+            reasoning_content: "",
+            content: "",
+            usage: &usage,
+            cost_usd: None,
+            finish_reason: "stop",
+            timestamp: "2026-05-26T00:00:00Z".to_string(),
+        };
+        let path = write_per_request_log(temp.path(), &record).expect("write");
+        // The sanitized filename keeps the file INSIDE log_dir.
+        assert!(
+            path.starts_with(temp.path()),
+            "sanitiser failed — escape attempt landed at {path:?}"
+        );
+        let name = path.file_name().unwrap().to_string_lossy();
+        // The relevant escape vectors are path separators. Literal ".." chars
+        // are harmless once they can't be combined with a separator.
+        assert!(!name.contains('/'), "filename leaked '/': {name}");
+        assert!(!name.contains('\\'), "filename leaked '\\\\': {name}");
+        // Belt-and-braces: the resolved file is INSIDE log_dir (already asserted
+        // via starts_with, but re-checking the parent for clarity).
+        assert_eq!(path.parent(), Some(temp.path()));
+    }
+
+    /// Estimated-path test for the log writer — confirms usage_source
+    /// serializes as "estimated" (lowercase) per the contract.
+    #[test]
+    fn deepseek_per_request_log_records_estimated_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let usage = estimate_usage(800, 200);
+        assert_eq!(usage.usage_source, UsageSource::Estimated);
+        let record = PerRequestLogRecord {
+            request_id: "chatcmpl-est-001",
+            model: "deepseek-v4-pro",
+            system_fingerprint: None,
+            reasoning_content: "",
+            content: "",
+            usage: &usage,
+            cost_usd: None,
+            finish_reason: "missing",
+            timestamp: "2026-05-26T00:00:00Z".to_string(),
+        };
+        let path = write_per_request_log(temp.path(), &record).expect("write");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(body.contains("\"usage_source\""));
+        assert!(body.contains("\"estimated\""));
+        assert!(body.contains("\"output_tokens\""));
+        assert!(body.contains("200")); // 800/4
     }
 
     /// Cross-task contract: a RunawayReasoning failure MUST NOT trip the
