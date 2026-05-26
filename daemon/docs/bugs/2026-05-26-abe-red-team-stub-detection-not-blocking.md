@@ -1,5 +1,26 @@
 # BUG REPORT — ABE red-team enforcement: stub-detection is not blocking the third compliance scenario
 
+**STATUS: RESOLVED 2026-05-26** — root-caused as a pattern-set drift; validator's
+`stub_patterns` didn't match the test's `// pending: stub` marker. Fixed by adding
+`"// pending"` and `"// stub"` to the pattern list in
+`daemon/crates/triumvirate/src/abe/post_exit_validator.rs`.
+
+Approach decided via a 3-agent council (DeepSeek v4-pro, Codex, Gemini) — all
+three independently recommended adding comment-prefixed patterns to avoid
+false positives on legitimate identifiers like `pending_orders` / `stub_module`.
+Two of three (DeepSeek + Codex) wanted no colon suffix; Gemini wanted a colon.
+No-colon won 2-1 to also catch realistic markers like `// pending implementation`.
+3-agent council cost: ~$0.005.
+
+Test now passes:
+`cargo test --bin triumvirate -- tests::abe_red_team_enforcement_blocks_non_compliant_worker --exact`
+Full workspace: **172/172 triumvirate tests pass** (was 171/172 with this as
+the sole failure).
+
+---
+
+## Original bug report
+
 **Discovered:** 2026-05-26 during the DeepSeek T-001 build, while running `cargo test --workspace` as the blast-radius guard.
 **Tree where reproduced:** confirmed on both `f529123` (pre-T-001 spec/dispatch commit) and `765086e` (post-T-001) — i.e. PRE-EXISTING; not caused by the DeepSeek work.
 **Branch:** `spec/deepseek-integration-v1` (but bug exists wherever the ABE red-team test lives — also on `main`).
