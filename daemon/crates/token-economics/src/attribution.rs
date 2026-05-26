@@ -44,7 +44,91 @@ pub fn attribute_records(
         .collect()
 }
 
-fn calculate_cost_usd(db: &TokenDb, record: &TokenRecord) -> anyhow::Result<Option<f64>> {
+// ─────────────────────────────────────────────────────────────────────────────
+// T-003 (REQ-DS-009): seed the DeepSeek price rows in production.
+//
+// The existing INSERT pattern in this file (~line 156) is inside `#[cfg(test)]` and
+// is therefore test-only. Production needs an explicit seed mechanism that runs at
+// daemon startup. ensure_deepseek_prices is idempotent (only inserts if a row for
+// the given model doesn't already exist), so it's safe to call on every daemon boot.
+//
+// Prices (per million tokens) — locked in by the spec's verification pass on
+// 2026-05-25, with v4-pro's 75% promo becoming permanent 2026-05-31 15:59 UTC.
+//
+//   model              input-miss    input-hit (cached)    output
+//   deepseek-v4-pro    $0.435        $0.003625             $0.87
+//   deepseek-v4-flash  $0.14         $0.0028               $0.28
+//
+// The DeepSeek runner's usage mapping (REQ-DS-009 / A-04b):
+//   output_tokens ← completion_tokens (already INCLUDES reasoning_tokens — no double-add)
+//   input_tokens  ← prompt_cache_miss_tokens
+//   cached_tokens ← prompt_cache_hit_tokens
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn ensure_deepseek_prices(db: &TokenDb) -> anyhow::Result<()> {
+    ensure_price_row(db, "deepseek-v4-pro", 0.435, 0.87, 0.003625)?;
+    ensure_price_row(db, "deepseek-v4-flash", 0.14, 0.28, 0.0028)?;
+    Ok(())
+}
+
+/// Idempotent: inserts the price row for `model` only if no row for that model
+/// already exists in the table. (We could add a UNIQUE constraint and use
+/// INSERT OR IGNORE, but that would be a schema change; the SELECT-then-INSERT
+/// check is sufficient for the seed-once-at-startup case.)
+fn ensure_price_row(
+    db: &TokenDb,
+    model: &str,
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+    cached_per_mtok: f64,
+) -> anyhow::Result<()> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| anyhow::anyhow!("token DB connection mutex poisoned"))?;
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM price_table WHERE model = ?1)",
+            params![model],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to check existence of price row for model '{model}'"))?;
+
+    if exists {
+        return Ok(());
+    }
+
+    conn.execute(
+        r#"
+        INSERT INTO price_table (
+            model,
+            input_per_mtok,
+            output_per_mtok,
+            cached_per_mtok,
+            effective_date,
+            end_date
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+        params![
+            model,
+            input_per_mtok,
+            output_per_mtok,
+            cached_per_mtok,
+            "2026-01-01T00:00:00Z",
+            Option::<String>::None,
+        ],
+    )
+    .with_context(|| format!("failed to insert price row for model '{model}'"))?;
+
+    Ok(())
+}
+
+// T-003 (REQ-DS-009 / REQ-DS-021): pub so the DeepSeek runner can compute the per-consult
+// cost synchronously after the usage chunk arrives, instead of waiting for the deferred
+// attribution sweep. Returns None for unmetered records and for any model with no
+// price_table row at the record's timestamp.
+pub fn calculate_cost_usd(db: &TokenDb, record: &TokenRecord) -> anyhow::Result<Option<f64>> {
     // REQ-057: unmetered rows (agy) have no honest token count → never cost them.
     if record.usage_source == crate::USAGE_SOURCE_UNMETERED {
         return Ok(None);
@@ -286,5 +370,130 @@ mod tests {
 
         let expected = ((1_000.0 * 30.0) + (500.0 * 40.0)) / 1_000_000.0;
         assert!((cost - expected).abs() < 1e-12);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // T-003 (REQ-DS-009): ensure_deepseek_prices seeds production rows.
+    //
+    // Stub guard: a no-op helper (one that returns Ok(()) without inserting)
+    // would fail the "both rows present" assertion. A wrong-numbers helper
+    // would fail the calculate_cost_usd math.
+    // ─────────────────────────────────────────────────────────────────────────
+    use super::{calculate_cost_usd, ensure_deepseek_prices};
+
+    fn row_count_for_model(db: &crate::TokenDb, model: &str) -> i64 {
+        let conn = db.conn.lock().expect("lock db");
+        conn.query_row(
+            "SELECT COUNT(*) FROM price_table WHERE model = ?1",
+            params![model],
+            |row| row.get(0),
+        )
+        .expect("count rows")
+    }
+
+    fn record_for_cost(model: &str, input: i64, output: i64, cached: i64) -> TokenRecord {
+        let mut r = sample_record("sess-ds-cost", model);
+        r.timestamp = "2026-06-01T00:00:00Z".to_string(); // after effective_date
+        r.input_tokens = input;
+        r.output_tokens = output;
+        r.cached_tokens = cached;
+        r
+    }
+
+    #[test]
+    fn ensure_deepseek_prices_seeds_both_v4_pro_and_v4_flash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open token db");
+
+        // Fresh DB: no price rows exist for either model.
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-pro"), 0);
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-flash"), 0);
+
+        ensure_deepseek_prices(&db).expect("seed runs");
+
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-pro"), 1);
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-flash"), 1);
+    }
+
+    #[test]
+    fn ensure_deepseek_prices_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open token db");
+
+        for _ in 0..5 {
+            ensure_deepseek_prices(&db).expect("seed runs repeatedly without error");
+        }
+        // Still exactly 1 row per model — not 5, not 10.
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-pro"), 1);
+        assert_eq!(row_count_for_model(&db, "deepseek-v4-flash"), 1);
+    }
+
+    #[test]
+    fn calculate_cost_usd_matches_spec_pricing_v4_pro() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open token db");
+        ensure_deepseek_prices(&db).expect("seed");
+
+        // 1M input-miss tokens + 1M output tokens, no cached → 0.435 + 0.87 = $1.305
+        let r = record_for_cost("deepseek-v4-pro", 1_000_000, 1_000_000, 0);
+        let cost = calculate_cost_usd(&db, &r).expect("cost calc").expect("cost is Some");
+        assert!(
+            (cost - 1.305).abs() < 1e-9,
+            "v4-pro cost expected ~$1.305, got ${cost}"
+        );
+
+        // 1M cached + 1M output, no miss → 0.003625 + 0.87 = $0.873625
+        let r = record_for_cost("deepseek-v4-pro", 0, 1_000_000, 1_000_000);
+        let cost = calculate_cost_usd(&db, &r).expect("cost calc").expect("cost is Some");
+        assert!(
+            (cost - 0.873625).abs() < 1e-9,
+            "v4-pro cached-only cost expected ~$0.873625, got ${cost}"
+        );
+    }
+
+    #[test]
+    fn calculate_cost_usd_matches_spec_pricing_v4_flash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open token db");
+        ensure_deepseek_prices(&db).expect("seed");
+
+        // 1M input-miss + 1M output → 0.14 + 0.28 = $0.42
+        let r = record_for_cost("deepseek-v4-flash", 1_000_000, 1_000_000, 0);
+        let cost = calculate_cost_usd(&db, &r).expect("cost calc").expect("cost is Some");
+        assert!(
+            (cost - 0.42).abs() < 1e-9,
+            "v4-flash cost expected ~$0.42, got ${cost}"
+        );
+
+        // Cache discount: 1M cached + 1M output → 0.0028 + 0.28 = $0.2828
+        let r = record_for_cost("deepseek-v4-flash", 0, 1_000_000, 1_000_000);
+        let cost = calculate_cost_usd(&db, &r).expect("cost calc").expect("cost is Some");
+        assert!(
+            (cost - 0.2828).abs() < 1e-9,
+            "v4-flash cached-only cost expected ~$0.2828, got ${cost}"
+        );
+    }
+
+    // Realistic small-call check anchored to the live PROBE-04 numbers from Wave 0:
+    //   prompt_cache_miss=18, completion (incl reasoning)=174, cached=0, v4-pro.
+    //   cost = 174e-6 * 0.87 + 18e-6 * 0.435 ≈ $0.0001592
+    // A stub that adds reasoning_tokens to output (the A-04b anti-pattern) would
+    // overstate cost and fail. A stub returning a fixed value also fails.
+    #[test]
+    fn calculate_cost_usd_matches_wave0_probe_04_numbers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = open(&temp.path().join("token-economics.db")).expect("open token db");
+        ensure_deepseek_prices(&db).expect("seed");
+
+        let r = record_for_cost("deepseek-v4-pro", 18, 174, 0);
+        let cost = calculate_cost_usd(&db, &r).expect("cost calc").expect("cost is Some");
+
+        let expected = (174.0 * 0.87 + 18.0 * 0.435) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "expected ~${expected}, got ${cost}"
+        );
+        // Sanity: well under a cent for a single small consult.
+        assert!(cost < 0.001, "small consult cost should be sub-cent; got ${cost}");
     }
 }
