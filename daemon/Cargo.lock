@@ -2628,6 +2628,7 @@ name = "mcp-bridge"
 version = "3.9.0"
 dependencies = [
  "agent-adapter",
+ "reqwest 0.12.28",
  "shared-types",
  "tokio",
  "tracing",
