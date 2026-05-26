@@ -56,10 +56,21 @@ pub fn validate_commit_with_metrics(
         }
     }
 
-    // 3. Scan for stub markers in modified files
+    // 3. Scan for stub markers in modified files.
+    //
+    // Bug fix 2026-05-26: the previous pattern set didn't match `// pending: stub`
+    // — the marker the red-team test deliberately writes. Three independent
+    // agents (DeepSeek v4-pro, Codex, Gemini) converged on adding comment-
+    // prefixed patterns ("// pending", "// stub") to catch the test's marker
+    // AND realistic comment-marker stubs in production code, while avoiding
+    // false positives on legitimate identifiers (`pending_orders`, `stub_module`).
+    // The bare-word approach (Option A) was rejected for the false-positive risk;
+    // the regex approach (Option D) was rejected for adding a dep + perf overhead
+    // on every commit. See `daemon/docs/bugs/2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
     let stub_patterns = [
         "todo!()", "unimplemented!()", "TODO", "FIXME", "XXX", "HACK",
         "NotImplementedError", "placeholder", "not implemented", "implement me",
+        "// pending", "// stub",
     ];
     for file in &modified {
         let full_path = worktree_path.join(file);
