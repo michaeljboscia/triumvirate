@@ -433,6 +433,7 @@ mod tests {
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         }));
         assert!(!super::is_supported_agent(&AskAgentRequest {
             agent: "claude".to_string(),
@@ -440,6 +441,7 @@ mod tests {
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         }));
         assert!(super::is_supported_agent_name("gemini"));
         assert!(!super::is_supported_agent_name("claude"));

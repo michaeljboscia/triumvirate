@@ -27,13 +27,48 @@ pub struct LifecycleEvent {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AskAgentRequest {
     pub agent: String,
     pub message: String,
     pub cwd: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
+
+    // T-011 (REQ-DS-027): per-call overrides for the DeepSeek sibling. ALL
+    // four fields are Optional and skip-serialize-on-None so the wire shape
+    // is unchanged for Gemini/Codex callers. The runner (T-012) reads them
+    // when present, otherwise falls back to DeepSeekConfig defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_thinking: Option<DeepSeekThinking>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_reasoning_effort: Option<DeepSeekEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_include_reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_max_tokens: Option<u32>,
+}
+
+/// T-011: per-call thinking override. Lower-case wire form mirrors the
+/// DeepSeek API string.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeepSeekThinking {
+    Enabled,
+    Disabled,
+}
+
+/// T-011: per-call reasoning-effort override. We accept all four caller
+/// strings but the runner (T-012) collapses `Xhigh` → `Max` to match the
+/// DeepSeek API wire surface (the API itself does the same mapping).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeepSeekEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+    Xhigh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -536,6 +571,7 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             repo: None,
             branch: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let decoded: super::AskAgentRequest =
@@ -635,5 +671,83 @@ mod tests {
         assert_eq!(decoded.latency_ms, Some(900));
         assert_eq!(decoded.tool_calls, Some(2));
         assert_eq!(decoded.total, Some(145));
+    }
+
+    // T-011 (REQ-DS-027) reality test: the 4 optional DeepSeek per-call
+    // overrides are backward-compatible. A Gemini/Codex request without them
+    // deserialises with all 4 fields == None. A DeepSeek request with them
+    // round-trips losslessly.
+    //
+    // Stub guard: a serializer that drops `Disabled` on round-trip (e.g. by
+    // defaulting to Enabled at decode time) would fail the round-trip
+    // assertion.
+    #[test]
+    fn ask_agent_request_optional_deepseek_backward_compatible() {
+        // (1) Gemini-shape: no deepseek_* keys → all None.
+        let gemini: super::AskAgentRequest =
+            serde_json::from_str(r#"{"agent":"gemini","message":"x"}"#)
+                .expect("gemini parse");
+        assert_eq!(gemini.agent, "gemini");
+        assert_eq!(gemini.deepseek_thinking, None);
+        assert_eq!(gemini.deepseek_reasoning_effort, None);
+        assert_eq!(gemini.deepseek_include_reasoning, None);
+        assert_eq!(gemini.deepseek_max_tokens, None);
+    }
+
+    #[test]
+    fn ask_agent_request_optional_deepseek_populates_and_round_trips() {
+        let raw = r#"{
+            "agent":"deepseek",
+            "message":"x",
+            "deepseek_thinking":"disabled",
+            "deepseek_reasoning_effort":"xhigh",
+            "deepseek_include_reasoning":true,
+            "deepseek_max_tokens":512
+        }"#;
+        let req: super::AskAgentRequest = serde_json::from_str(raw).expect("parse");
+        assert_eq!(req.deepseek_thinking, Some(super::DeepSeekThinking::Disabled));
+        assert_eq!(
+            req.deepseek_reasoning_effort,
+            Some(super::DeepSeekEffort::Xhigh)
+        );
+        assert_eq!(req.deepseek_include_reasoning, Some(true));
+        assert_eq!(req.deepseek_max_tokens, Some(512));
+
+        // Round-trip must preserve all four values (stub guard).
+        let json = serde_json::to_string(&req).expect("serialize");
+        let again: super::AskAgentRequest = serde_json::from_str(&json).expect("re-parse");
+        assert_eq!(again.deepseek_thinking, Some(super::DeepSeekThinking::Disabled));
+        assert_eq!(again.deepseek_reasoning_effort, Some(super::DeepSeekEffort::Xhigh));
+        assert_eq!(again.deepseek_include_reasoning, Some(true));
+        assert_eq!(again.deepseek_max_tokens, Some(512));
+
+        // Wire-shape stability: when None, the fields MUST be omitted (the
+        // serialisation matches what Gemini/Codex clients have always sent).
+        let bare = super::AskAgentRequest {
+            agent: "gemini".to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).expect("serialize");
+        assert!(
+            !bare_json.contains("deepseek_"),
+            "None fields must be omitted from the wire; got: {bare_json}"
+        );
+    }
+
+    #[test]
+    fn deepseek_effort_accepts_all_five_levels() {
+        for (s, expected) in &[
+            ("low", super::DeepSeekEffort::Low),
+            ("medium", super::DeepSeekEffort::Medium),
+            ("high", super::DeepSeekEffort::High),
+            ("max", super::DeepSeekEffort::Max),
+            ("xhigh", super::DeepSeekEffort::Xhigh),
+        ] {
+            let raw = format!(r#""{}""#, s);
+            let parsed: super::DeepSeekEffort =
+                serde_json::from_str(&raw).expect("parse");
+            assert_eq!(&parsed, expected);
+        }
     }
 }
