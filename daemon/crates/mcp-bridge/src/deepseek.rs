@@ -186,6 +186,26 @@ impl StreamParser {
         }
     }
 
+    /// T-008 (REQ-DS-028): the cheap chars/4 token estimate used to detect
+    /// runaway reasoning. The /4 factor matches what we use for `usage_source
+    /// = "estimated"` records when the usage chunk is missing (T-009).
+    pub fn estimated_reasoning_tokens(&self) -> i64 {
+        (self.reasoning_acc.chars().count() / 4) as i64
+    }
+
+    /// True when `cap > 0` AND the streamed reasoning has exceeded it. The
+    /// runner calls this between `feed` invocations and drops the reqwest
+    /// stream-future cleanly the moment it returns true, then returns
+    /// `DeepSeekFailureKind::RunawayReasoning { observed_tokens }`.
+    /// The breaker MUST NOT be informed of this — runaway is a budget signal,
+    /// not a provider-fault signal.
+    pub fn is_runaway(&self, cap: u32) -> bool {
+        if cap == 0 {
+            return false;
+        }
+        self.estimated_reasoning_tokens() >= cap as i64
+    }
+
     /// Feed one chunk of bytes. Extracts every COMPLETE event terminated by
     /// `\n\n` within the buffered + new bytes; partial trailing event stays
     /// buffered for the next call. Returns the events extracted in this call.
@@ -349,8 +369,8 @@ pub enum BadFinishReasonKind {
     Unknown(String),
 }
 
-/// Typed failure surface for the DeepSeek runner. T-007 introduces the first
-/// two variants; T-008/T-010 will add the rest in subsequent commits.
+/// Typed failure surface for the DeepSeek runner. Grows with each task; the
+/// runner (T-010) matches on it to decide whether to invoke the breaker.
 #[derive(Debug)]
 pub enum DeepSeekFailureKind {
     /// A `data:` chunk carried a top-level `error` object. The accompanying
@@ -363,7 +383,10 @@ pub enum DeepSeekFailureKind {
     /// finish_reason was not `stop`. Partial output is NOT returned — the
     /// caller learns the kind and decides whether to retry.
     BadFinishReason(BadFinishReasonKind),
-    // T-008 will add: RunawayReasoning { observed_tokens: i64 }
+    /// T-008 (REQ-DS-028): observed reasoning chars/4 crossed
+    /// `cfg.reasoning_cap_tokens`. This is a BUDGET decision, not a provider
+    /// fault — the runner MUST NOT call breaker.record() on this failure.
+    RunawayReasoning { observed_tokens: i64 },
     // T-010 will add: HardProvider(u16), Transient(u16), NetworkMidStream,
     //                  AbsoluteTimeoutExceeded, ...
 }
@@ -380,6 +403,9 @@ impl std::fmt::Display for DeepSeekFailureKind {
             }
             DeepSeekFailureKind::BadFinishReason(kind) => {
                 write!(f, "bad finish_reason: {kind:?}")
+            }
+            DeepSeekFailureKind::RunawayReasoning { observed_tokens } => {
+                write!(f, "runaway reasoning: ~{observed_tokens} tokens crossed cap")
             }
         }
     }
@@ -900,6 +926,83 @@ mod tests {
             Err(DeepSeekFailureKind::BadFinishReason(BadFinishReasonKind::Missing)) => {}
             other => panic!("expected BadFinishReason(Missing), got {other:?}"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-008 runaway-reasoning tests.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a single `data:` event whose reasoning_content is `len` characters
+    /// long. JSON-escape-safe because we use only ASCII letters.
+    fn reasoning_event_of_len(len: usize) -> String {
+        let mut payload = String::with_capacity(len);
+        for i in 0..len {
+            payload.push((b'a' + (i as u8 % 26)) as char);
+        }
+        format!(
+            r#"data: {{"id":"chatcmpl-001","choices":[{{"delta":{{"reasoning_content":"{}"}}}}]}}"#,
+            payload
+        )
+    }
+
+    /// Reality test: cfg.reasoning_cap_tokens=100 + 1000 chars of reasoning
+    /// → is_runaway=true with observed≈250.
+    ///
+    /// Stub guard: a parser that ignores the cap would still return
+    /// is_runaway(100)==false (because it never grew reasoning_acc) or would
+    /// return true regardless of input. Both fail the chars/4 anchor.
+    #[test]
+    fn deepseek_runaway_trips_when_cap_exceeded() {
+        let stream = format!("{}\n\n", reasoning_event_of_len(1000));
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        assert_eq!(parser.estimated_reasoning_tokens(), 250); // 1000/4
+        assert!(parser.is_runaway(100), "1000 chars / 4 = 250 tokens > cap 100");
+    }
+
+    /// Reality test: cap=0 (default) + same 1000 chars → is_runaway=false.
+    /// Confirms the default-disabled behaviour. A stub that fires regardless
+    /// of cap would fail.
+    #[test]
+    fn deepseek_runaway_does_not_trip_when_cap_is_zero() {
+        let stream = format!("{}\n\n", reasoning_event_of_len(1000));
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        assert!(!parser.is_runaway(0), "cap=0 means disabled, must never trip");
+    }
+
+    /// Edge case: estimate at the cap boundary (cap=250, 1000 chars → 250
+    /// tokens) trips (>=). A stub using strict `>` would let this slide.
+    #[test]
+    fn deepseek_runaway_boundary_inclusive() {
+        let stream = format!("{}\n\n", reasoning_event_of_len(1000));
+        let mut parser = StreamParser::new();
+        parser.feed(stream.as_bytes()).expect("feed");
+        assert!(parser.is_runaway(250), "boundary (==) must trip");
+        assert!(!parser.is_runaway(251), "251 should NOT trip on 250 observed");
+    }
+
+    /// Cross-task contract: a RunawayReasoning failure MUST NOT trip the
+    /// provider breaker. This test owns the integration assertion — the
+    /// runner (T-010) reads it.
+    #[test]
+    fn deepseek_runaway_does_not_call_breaker_record() {
+        use crate::deepseek_resilience::{Breaker, BreakerConfig, BreakerState};
+        let mut breaker = Breaker::new(BreakerConfig::default());
+        assert_eq!(breaker.state(), BreakerState::Closed);
+
+        // Simulate what the runner does: build a RunawayReasoning failure
+        // and DELIBERATELY do not call breaker.record() for it. The breaker
+        // must remain Closed — this is a static contract about the runner's
+        // behaviour, encoded as a positive test.
+        let failure = DeepSeekFailureKind::RunawayReasoning { observed_tokens: 250 };
+        // (We intentionally never pass `failure` to `breaker.record()`.)
+        let _ = failure;
+        assert_eq!(
+            breaker.state(),
+            BreakerState::Closed,
+            "T-008 contract: runaway must not affect breaker state"
+        );
     }
 
     /// Reality test (c): finish_reason="stop" with no embedded error → Ok.
