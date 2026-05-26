@@ -21,6 +21,9 @@ pub mod deepseek_config;
 // T-004 (REQ-DS-006/010): semaphore, token bucket, three-state breaker, classify().
 pub mod deepseek_resilience;
 
+// T-005 (REQ-DS-007): reqwest::Client builder honouring rolling read_timeout.
+pub mod deepseek;
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {

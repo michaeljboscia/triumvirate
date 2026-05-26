@@ -7,5 +7,9 @@ license.workspace = true
 [dependencies]
 agent-adapter = { path = "../agent-adapter" }
 shared-types = { path = "../shared-types" }
-tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt"] }
+# T-005: reqwest is needed for the DeepSeek HTTP client builder. We extend the
+# workspace tokio features with `net` + `io-util` to support the in-process TCP
+# test server in the deepseek module's #[cfg(test)] block.
+reqwest.workspace = true
+tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt", "net", "io-util"] }
 tracing.workspace = true
