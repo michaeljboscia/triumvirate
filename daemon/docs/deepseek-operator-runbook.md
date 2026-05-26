@@ -55,6 +55,30 @@ error chains, or the per-request log file. Plaintext access is restricted to
 `ApiKey::expose()`, called exactly once per request in the `Authorization`
 header construction at `mcp-bridge/src/deepseek.rs::run_inner`.
 
+**Recommended: use the on-disk key file** instead of the env var, since the
+daemon is launched by the MCP shim and the env-var path requires the parent
+shell of every launch chain to have the variable exported. The file fallback
+is set once and works for every future daemon process regardless of who
+launches it:
+
+```sh
+mkdir -p ~/.triumvirate
+echo -n 'sk-YOUR-KEY-HERE' > ~/.triumvirate/deepseek.key
+chmod 600 ~/.triumvirate/deepseek.key
+```
+
+The daemon checks `TRIUMVIRATE_DEEPSEEK_API_KEY` first (so tests and CI can
+override) then falls back to the file. If NEITHER is set, the daemon fails
+loud at first DeepSeek consult with a typed `MissingApiKey` error that
+names BOTH searched sources — operator immediately knows where to put the
+key. (Pre-2026-05-26 the daemon would silently send an empty `Bearer ` to
+the API and surface a misleading HTTP 401 — see the bug-fix commit at PR #38.)
+
+The file path is configurable via `$TRIUMVIRATE_HOME` (defaults to
+`$HOME/.triumvirate/`). Loose file permissions (mode > 0600) get a runtime
+warning but the daemon still reads the file — fail-soft for operator
+flexibility.
+
 ### 1.4 Smoke test
 After setting the key and confirming balance, run the live contract probe
 battery as a smoke test:
