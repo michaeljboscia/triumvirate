@@ -1871,7 +1871,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             "daemon": "running",
             "auth": "bearer-required",
             "daemon_mode": "incremental-dev",
-            "supported_agents": ["gemini", "codex"],
+            "supported_agents": ["gemini", "codex", "deepseek"],
             "pending_fallbacks": pending,
             "fallback_tickets": tickets,
             "daemon_bind_addr": state.bind_addr
@@ -2006,7 +2006,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
         let agent = req.agent.to_lowercase();
         if !is_supported_agent_name(&agent) {
-            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'gemini' or 'codex'" }))));
+            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'gemini', 'codex', or 'deepseek'" }))));
         }
         let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
         let worker = acquire_worker(&agent, &cwd).await;
@@ -3584,7 +3584,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .map(|t| t.text.clone())
             .unwrap_or_default();
         assert!(status_text.contains("\"active_sessions\":1"));
-        assert!(status_text.contains("\"supported_agents\":[\"gemini\",\"codex\"]"));
+        // T-001 (REQ-DS-001/013/016): deepseek joins the supported-agent set as a top-level name.
+        assert!(status_text.contains("\"supported_agents\":[\"gemini\",\"codex\",\"deepseek\"]"));
         assert!(status_text.contains("\"daemon_bind_addr\":\"127.0.0.1:7777\""));
 
         client.cancel().await?;

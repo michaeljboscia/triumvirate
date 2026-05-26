@@ -93,6 +93,9 @@ pub fn display_agent_name(agent: &str) -> String {
     match agent.to_lowercase().as_str() {
         "codex" => "Codex".to_string(),
         "gemini" => "Gemini".to_string(),
+        // T-001: explicit arm — the generic first-letter capitaliser below would produce
+        // "Deepseek" (wrong); the canonical brand spelling is "DeepSeek".
+        "deepseek" => "DeepSeek".to_string(),
         other => {
             let mut chars = other.chars();
             match chars.next() {
@@ -108,5 +111,39 @@ pub fn next_heartbeat_offset(current: Duration) -> Duration {
         Duration::from_secs(40)
     } else {
         current.saturating_add(Duration::from_secs(60))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_agent_name;
+
+    // T-001: deepseek gets its canonical brand spelling "DeepSeek", not the
+    // generic-capitaliser "Deepseek" — caught by the GAUNTLET Filter verifier.
+    // Stub guard: a function returning `String::new()` or `other.to_string()`
+    // fails the exact-equality asserts.
+    #[test]
+    fn display_agent_name_returns_canonical_deepseek_brand() {
+        assert_eq!(display_agent_name("deepseek"), "DeepSeek");
+        // case-insensitive input still produces canonical output:
+        assert_eq!(display_agent_name("DeepSeek"), "DeepSeek");
+        assert_eq!(display_agent_name("DEEPSEEK"), "DeepSeek");
+        assert_eq!(display_agent_name("Deepseek"), "DeepSeek");
+    }
+
+    #[test]
+    fn display_agent_name_preserves_existing_agents() {
+        assert_eq!(display_agent_name("gemini"), "Gemini");
+        assert_eq!(display_agent_name("Gemini"), "Gemini");
+        assert_eq!(display_agent_name("codex"), "Codex");
+        assert_eq!(display_agent_name("CODEX"), "Codex");
+    }
+
+    #[test]
+    fn display_agent_name_falls_back_for_unknown() {
+        // generic first-letter capitaliser for anything not explicitly named
+        assert_eq!(display_agent_name("custom"), "Custom");
+        // empty input → "Agent" sentinel
+        assert_eq!(display_agent_name(""), "Agent");
     }
 }

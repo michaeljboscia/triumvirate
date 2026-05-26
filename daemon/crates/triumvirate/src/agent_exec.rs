@@ -248,7 +248,10 @@ pub(crate) async fn execute_ask_agent(
         span.record("agent.outcome", "rejected");
         span.record("agent.tokens", 0_u64);
         span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
-        return Err("ask_agent supports only agent='gemini' or agent='codex'".to_string());
+        return Err(
+            "ask_agent supports only agent='gemini', agent='codex', or agent='deepseek'"
+                .to_string(),
+        );
     }
     let agent = req.agent.to_lowercase();
     // REQ-001: resolve the gemini backend once, up front — it drives both the attempt
