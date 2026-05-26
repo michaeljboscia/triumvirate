@@ -231,7 +231,7 @@ impl DeepSeekConfig {
 
         let log_dir = read_env("TRIUMVIRATE_DEEPSEEK_LOG_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| default_log_dir());
+            .unwrap_or_else(default_log_dir);
 
         let log_reasoning_cap_bytes =
             read_env_usize_nonzero("TRIUMVIRATE_DEEPSEEK_LOG_REASONING_CAP_BYTES")?
