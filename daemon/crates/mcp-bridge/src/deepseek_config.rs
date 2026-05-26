@@ -155,6 +155,16 @@ pub enum ConfigError {
         value: String,
         expected: &'static str,
     },
+    /// Post-merge bug fix 2026-05-26: the daemon used to start successfully with
+    /// no API key in its environment and then send `Authorization: Bearer ` (empty)
+    /// to api.deepseek.com on every consult — surfacing as a misleading HTTP 401
+    /// that looked like a stale-key problem. Now the loader fails loud at startup
+    /// (lazy OnceLock first-use) with the list of sources it searched, so the
+    /// operator's first surprise is a clear "no key found, here's where I looked"
+    /// instead of a 401 against a key they think they configured.
+    MissingApiKey {
+        searched: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -172,6 +182,12 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{name}={value:?} is not a valid value; expected {expected}"
             ),
+            ConfigError::MissingApiKey { searched } => write!(
+                f,
+                "DeepSeek API key not found. Searched (in order): {}. \
+                 Set the env var or write the key to the file (mode 0600).",
+                searched.join(", ")
+            ),
         }
     }
 }
@@ -180,16 +196,22 @@ impl std::error::Error for ConfigError {}
 
 impl DeepSeekConfig {
     /// Load all 15 knobs from env, applying documented defaults for anything absent.
-    /// Returns Err only on validation failures (e.g. reasoning cap >= max_tokens).
-    /// An ABSENT or empty `TRIUMVIRATE_DEEPSEEK_API_KEY` is NOT an error here — the
-    /// runner is responsible for noticing an empty key and failing loud at request time.
+    /// Returns Err on validation failures AND on missing API key (post-2026-05-26
+    /// fix: the loader now fails loud instead of returning a struct with an empty
+    /// key that produces misleading 401s at request time).
+    ///
+    /// API key resolution order (first non-empty source wins):
+    ///   1. `TRIUMVIRATE_DEEPSEEK_API_KEY` env var
+    ///   2. File at `$TRIUMVIRATE_HOME/deepseek.key` (or `$HOME/.triumvirate/deepseek.key`
+    ///      if `TRIUMVIRATE_HOME` is unset)
+    ///
+    /// If NEITHER source has a non-empty key, returns `ConfigError::MissingApiKey`
+    /// with the searched paths so the operator knows what to fix.
     pub fn from_env() -> Result<Self, ConfigError> {
         let base_url = read_env("TRIUMVIRATE_DEEPSEEK_BASE_URL")
             .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
 
-        let api_key = ApiKey::new(
-            read_env("TRIUMVIRATE_DEEPSEEK_API_KEY").unwrap_or_default(),
-        );
+        let api_key = ApiKey::new(load_api_key()?);
 
         let model = read_env("TRIUMVIRATE_DEEPSEEK_MODEL")
             .unwrap_or_else(|| "deepseek-v4-pro".to_string());
@@ -277,6 +299,80 @@ fn read_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Resolve the path the on-disk key fallback is read from. `$TRIUMVIRATE_HOME`
+/// override is honored (so tests can isolate to a tempdir); otherwise it's
+/// `$HOME/.triumvirate/deepseek.key`. Same convention as `daemon.token`.
+fn key_file_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("TRIUMVIRATE_HOME") {
+        return PathBuf::from(home).join("deepseek.key");
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".triumvirate").join("deepseek.key")
+}
+
+/// API key resolution. Env var first; on-disk file second; typed error if neither.
+fn load_api_key() -> Result<String, ConfigError> {
+    if let Some(key) = read_env("TRIUMVIRATE_DEEPSEEK_API_KEY") {
+        return Ok(key);
+    }
+    let path = key_file_path();
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let key = contents.trim().to_string();
+            if !key.is_empty() {
+                check_key_file_permissions(&path);
+                return Ok(key);
+            }
+            // File exists but is empty — treat as not configured.
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Fall through to the typed error.
+        }
+        Err(e) => {
+            // Permission denied, IO error, etc. — surface it but route through
+            // the same typed error so the caller has one match arm.
+            tracing::warn!(
+                path = %path.display(),
+                err = %e,
+                "deepseek key file present but unreadable"
+            );
+        }
+    }
+    Err(ConfigError::MissingApiKey {
+        searched: vec![
+            "TRIUMVIRATE_DEEPSEEK_API_KEY (env)".to_string(),
+            format!("{} (file)", path.display()),
+        ],
+    })
+}
+
+/// Warn (don't fail) if the key file has loose permissions. SSH-style: mode
+/// should be 0600 (owner-read-write only). Anything granting group or other
+/// access gets a warn. We still READ the file — the operator may have a
+/// reason, and refusing to start is worse than logging the leak risk.
+#[cfg(unix)]
+fn check_key_file_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{:o}", mode),
+                "deepseek key file has loose permissions — run \
+                 `chmod 600 ~/.triumvirate/deepseek.key` to restrict to owner only"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn check_key_file_permissions(_path: &std::path::Path) {
+    // Windows ACLs would go here. Not relevant for the daemon's current target.
+}
+
 // Codex P5-review fix: numeric parsers now fail loud on garbage values (and the
 // `_nonzero` variants also reject 0 for knobs where 0 is meaningless). Each helper
 // requires a `&'static str` name so the ConfigError can carry the env-var name
@@ -355,8 +451,12 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // All 15 env vars this module reads.
+    // All env vars this module reads. Includes TRIUMVIRATE_HOME so the on-disk
+    // key fallback (~/.triumvirate/deepseek.key) is isolated to a tempdir during
+    // tests — prevents a developer with a real key file from accidentally
+    // satisfying from_env() when the test thinks the key is absent.
     const ENV_VARS: &[&str] = &[
+        "TRIUMVIRATE_HOME",
         "TRIUMVIRATE_DEEPSEEK_BASE_URL",
         "TRIUMVIRATE_DEEPSEEK_API_KEY",
         "TRIUMVIRATE_DEEPSEEK_MODEL",
@@ -419,10 +519,22 @@ mod tests {
     /// Run `f` with the ENV_VARS list cleared (saved + restored after, even on
     /// panic), holding the process-global ENV_LOCK to prevent concurrent test
     /// interference. Tests should set whichever env vars they need INSIDE `f`.
+    ///
+    /// Post-2026-05-26 (key-file fallback added to from_env): we also point
+    /// TRIUMVIRATE_HOME at a fresh tempdir for the duration of `f`, so the
+    /// disk-fallback path resolves to an empty directory. A developer who has
+    /// a real `~/.triumvirate/deepseek.key` on their machine would otherwise
+    /// see tests silently pass via the file fallback when they thought they
+    /// were testing the "no key" path.
     fn with_clean_env<F: FnOnce()>(f: F) {
         let _g = EnvGuard::acquire();
+        // Force the file-fallback to a clean tempdir so disk leakage from
+        // a real ~/.triumvirate/deepseek.key cannot pollute tests.
+        let tmp = tempfile::tempdir().expect("tempdir for TRIUMVIRATE_HOME");
+        set_env("TRIUMVIRATE_HOME", &tmp.path().display().to_string());
         f();
         // _g drops here (or on unwind if f panics) — env is restored either way.
+        // tmp drops here too, removing the tempdir.
     }
 
     fn set_env(name: &str, value: &str) {
@@ -647,6 +759,114 @@ mod tests {
             set_env("TRIUMVIRATE_DEEPSEEK_REASONING_CAP_TOKENS", "0");
             let cfg = DeepSeekConfig::from_env().expect("cap=0 is disabled, must load");
             assert_eq!(cfg.reasoning_cap_tokens, 0);
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 2026-05-26 fix tests — MissingApiKey + file fallback.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// REGRESSION (the bug that motivated this fix): with NO env var and NO
+    /// file, from_env() returns MissingApiKey — not a struct with an empty key
+    /// that would produce a misleading 401 at request time.
+    #[test]
+    fn from_env_without_key_returns_missing_api_key_error() {
+        with_clean_env(|| {
+            // TRIUMVIRATE_HOME is set to a clean tempdir by with_clean_env,
+            // so no file is present. No env var either.
+            let err = DeepSeekConfig::from_env()
+                .expect_err("must Err when neither env nor file has the key");
+            match err {
+                ConfigError::MissingApiKey { searched } => {
+                    assert_eq!(searched.len(), 2, "must list both searched sources");
+                    assert!(
+                        searched[0].contains("TRIUMVIRATE_DEEPSEEK_API_KEY"),
+                        "first source must be the env var; got {searched:?}"
+                    );
+                    assert!(
+                        searched[1].contains("deepseek.key"),
+                        "second source must be the file path; got {searched:?}"
+                    );
+                }
+                other => panic!("expected MissingApiKey, got {other:?}"),
+            }
+        });
+    }
+
+    /// FILE FALLBACK works: writing the key to $TRIUMVIRATE_HOME/deepseek.key
+    /// is the SAME as setting the env var. Operator sets it once on disk and
+    /// every future daemon (any launcher, any shell) picks it up.
+    #[test]
+    fn from_env_reads_api_key_from_file_when_env_var_absent() {
+        with_clean_env(|| {
+            let home = std::env::var("TRIUMVIRATE_HOME").expect("set by with_clean_env");
+            let key_path = std::path::PathBuf::from(&home).join("deepseek.key");
+            std::fs::write(&key_path, "sk-file-fallback-key\n").expect("write key file");
+            // Lock permissions to 0600 to also avoid the loose-perms warn.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &key_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            let cfg = DeepSeekConfig::from_env()
+                .expect("key file must satisfy from_env when env var is absent");
+            assert_eq!(cfg.api_key.expose(), "sk-file-fallback-key");
+        });
+    }
+
+    /// ENV TAKES PRECEDENCE: if BOTH the env var and the file are set,
+    /// the env value wins. This matches "env > file > error" convention.
+    #[test]
+    fn from_env_prefers_env_var_over_file_when_both_present() {
+        with_clean_env(|| {
+            let home = std::env::var("TRIUMVIRATE_HOME").expect("set by with_clean_env");
+            let key_path = std::path::PathBuf::from(&home).join("deepseek.key");
+            std::fs::write(&key_path, "sk-from-the-file").expect("write key file");
+            set_env("TRIUMVIRATE_DEEPSEEK_API_KEY", "sk-from-the-env");
+            let cfg = DeepSeekConfig::from_env().expect("load");
+            assert_eq!(
+                cfg.api_key.expose(),
+                "sk-from-the-env",
+                "env var must win over file when both are present"
+            );
+        });
+    }
+
+    /// EMPTY FILE does not satisfy: an operator who wrote an empty file (or
+    /// who deleted the contents but kept the file) sees the same MissingApiKey
+    /// error as if no file existed. Avoids "I have the file, why doesn't it
+    /// work?" confusion.
+    #[test]
+    fn from_env_empty_file_falls_through_to_missing_api_key() {
+        with_clean_env(|| {
+            let home = std::env::var("TRIUMVIRATE_HOME").expect("set by with_clean_env");
+            let key_path = std::path::PathBuf::from(&home).join("deepseek.key");
+            std::fs::write(&key_path, "   \n  \n").expect("write empty/whitespace file");
+            let err = DeepSeekConfig::from_env()
+                .expect_err("empty file must NOT satisfy from_env");
+            assert!(matches!(err, ConfigError::MissingApiKey { .. }));
+        });
+    }
+
+    /// The DISPLAY message lists both searched sources so the operator can
+    /// see EXACTLY where to put the key. A stub that just said "missing key"
+    /// without the paths fails this.
+    #[test]
+    fn missing_api_key_error_lists_both_searched_sources() {
+        with_clean_env(|| {
+            let err = DeepSeekConfig::from_env().unwrap_err();
+            let display = format!("{err}");
+            assert!(
+                display.contains("TRIUMVIRATE_DEEPSEEK_API_KEY"),
+                "must mention the env var name"
+            );
+            assert!(
+                display.contains("deepseek.key"),
+                "must mention the file name"
+            );
         });
     }
 }
