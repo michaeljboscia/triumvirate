@@ -1,20 +1,11 @@
-//! T-005 (REQ-DS-007): DeepSeek HTTP client builder.
+//! DeepSeek module — HTTP client, SSE parser, guards, runaway abort, runner.
 //!
-//! Constructs a `reqwest::Client` configured with the timeouts and TCP keep-alive
-//! from `DeepSeekConfig`. The DEEPSEEK API streams SSE chunks; the client's
-//! `read_timeout` is the per-chunk rolling idle limit (each byte that arrives
-//! resets the timer), while `timeout` is the absolute outer ceiling. The runner
-//! (T-010) layers `tokio::time::timeout` on top of `timeout` for an extra-firm
-//! request-level cap.
-//!
-//! This module owns ONLY the client-builder concern. It MUST NOT:
-//!   - construct request bodies (T-009/T-010 territory)
-//!   - parse SSE (T-006)
-//!   - read or pass the API key (the runner injects `Authorization` per request)
-//!
-//! Keeping it builder-only means tests don't need a real DeepSeek endpoint —
-//! they only need to confirm reqwest honours the rolling read_timeout, which is
-//! a property of the reqwest configuration, not the wire content.
+//! T-005 build_client (REQ-DS-007): reqwest::Client with rolling read_timeout.
+//! T-006 StreamParser (REQ-DS-019): chunk-boundary-safe SSE parser.
+//! T-007 guards (REQ-DS-029/030): ghost-success detect + finish_reason guard.
+//! T-008 runaway (REQ-DS-028): reasoning-cap early-abort.
+//! T-009 finalize (REQ-DS-009/018/021/023/026): usage map + cost + per-request log.
+//! T-010 run() (REQ-DS-004/005/008/014/024): top-level orchestrator.
 
 use crate::deepseek_config::DeepSeekConfig;
 
@@ -35,6 +26,325 @@ pub fn build_client(cfg: &DeepSeekConfig) -> Result<reqwest::Client, reqwest::Er
         // TCP keep-alive probes detect dead peers between requests.
         .tcp_keepalive(cfg.tcp_keepalive)
         .build()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-006 (REQ-DS-019): SSE stream parser.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// DeepSeek's /v1/chat/completions endpoint streams Server-Sent Events:
+//
+//     : ping\n\n                          ← comment / keep-alive (line starts with ':')
+//     data: {"id":"...","choices":[{"delta":{"reasoning_content":"…"}}]}\n\n
+//     data: {"id":"...","choices":[{"delta":{"content":"…"}}]}\n\n
+//     data: {"id":"...","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{…}}\n\n
+//     data: [DONE]\n\n
+//
+// The parser is stateful — call `feed(&mut self, chunk)` repeatedly with
+// arbitrary byte slices (reqwest's `bytes_stream` yields these at TCP-packet
+// granularity, which has zero relationship to SSE event boundaries). Buffered
+// bytes are held until an event terminator (`\n\n`) is seen, so a JSON object
+// split across N chunks is reassembled correctly.
+//
+// The parser MUST NOT make decisions about retry / breaker state — it just
+// reports what it saw. T-007 / T-008 / T-009 / T-010 wrap it.
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RawUsage {
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens: i64,
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: i64,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: i64,
+}
+
+/// T-007 ghost-success: a `data:` chunk whose JSON has a top-level `error`
+/// object. DeepSeek occasionally streams a 200-with-embedded-error.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+pub struct EmbeddedError {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+}
+
+/// Internal raw chunk shape — only the fields the parser cares about. Extra
+/// fields are ignored by serde's default.
+#[derive(Debug, serde::Deserialize)]
+struct RawChunk {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
+    #[serde(default)]
+    choices: Vec<RawChoice>,
+    #[serde(default)]
+    usage: Option<RawUsage>,
+    #[serde(default)]
+    error: Option<EmbeddedError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawChoice {
+    #[serde(default)]
+    delta: RawDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawDelta {
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Events the parser surfaces from `feed`. Callers use these for telemetry
+/// (e.g. counting keep-alives, tracking reasoning growth for T-008); the
+/// post-stream accumulators on `StreamParser` are the authoritative result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParseEvent {
+    /// `: …\n\n` comment / heartbeat line.
+    KeepAlive,
+    /// One `data: {…}` chunk parsed; the parser already merged its content into
+    /// the accumulators. Variants record what was extracted, in order, so a
+    /// caller can implement T-008's running token estimate cheaply.
+    ReasoningDelta { added_chars: usize },
+    ContentDelta { added_chars: usize },
+    Usage,
+    EmbeddedError,
+    /// `data: [DONE]\n\n` sentinel.
+    Done,
+}
+
+#[derive(Debug)]
+pub enum ParseError {
+    Utf8 { context: String },
+    InvalidJson { snippet: String, cause: String },
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Utf8 { context } => write!(f, "invalid UTF-8 in SSE event ({context})"),
+            ParseError::InvalidJson { snippet, cause } => {
+                write!(f, "invalid JSON in `data:` event ({cause}): {snippet}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+pub struct StreamParser {
+    /// Bytes received but not yet terminated by `\n\n`.
+    buffer: Vec<u8>,
+    pub reasoning_acc: String,
+    pub content_acc: String,
+    pub usage: Option<RawUsage>,
+    pub finish_reason: Option<String>,
+    pub request_id: Option<String>,
+    pub system_fingerprint: Option<String>,
+    pub embedded_error: Option<EmbeddedError>,
+    pub done: bool,
+    pub keepalive_count: u32,
+}
+
+impl Default for StreamParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamParser {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(4096),
+            reasoning_acc: String::new(),
+            content_acc: String::new(),
+            usage: None,
+            finish_reason: None,
+            request_id: None,
+            system_fingerprint: None,
+            embedded_error: None,
+            done: false,
+            keepalive_count: 0,
+        }
+    }
+
+    /// Feed one chunk of bytes. Extracts every COMPLETE event terminated by
+    /// `\n\n` within the buffered + new bytes; partial trailing event stays
+    /// buffered for the next call. Returns the events extracted in this call.
+    ///
+    /// Idempotent on empty input. Safe to call after `done == true` (no-op
+    /// beyond buffering, which the runner shouldn't be doing anyway).
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<ParseEvent>, ParseError> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+
+        // Scan for `\n\n` or `\r\n\r\n` boundaries, draining as we go.
+        loop {
+            let Some((payload_end, term_len)) = find_event_terminator(&self.buffer) else {
+                break;
+            };
+            // Event payload is everything BEFORE the terminator; drain past
+            // both so subsequent boundary searches start fresh.
+            let event_bytes: Vec<u8> = self.buffer.drain(..payload_end).collect();
+            self.buffer.drain(..term_len);
+
+            // SSE events can contain CR/LF combinations; we accept LF-only here,
+            // but explicitly strip a trailing \r before parsing each line so that
+            // CRLF-emitting servers don't break us.
+            let event_str = match std::str::from_utf8(&event_bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(ParseError::Utf8 {
+                        context: format!("event of {} bytes", event_bytes.len()),
+                    });
+                }
+            };
+
+            self.consume_event(event_str, &mut events)?;
+        }
+
+        Ok(events)
+    }
+
+    fn consume_event(
+        &mut self,
+        event: &str,
+        events: &mut Vec<ParseEvent>,
+    ) -> Result<(), ParseError> {
+        // One SSE event can be multiple lines. Per the SSE spec, lines starting
+        // with `:` are comments; lines starting with `data:` are data. We handle
+        // both. Empty events (\n\n with no content) are valid heartbeats too.
+        let mut had_data = false;
+        for raw_line in event.split('\n') {
+            // Strip the trailing CR if present (CRLF tolerance).
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(_comment) = line.strip_prefix(':') {
+                // Per the SSE spec, comment lines are ignored. We count them so
+                // the runner can confirm keep-alives are being received.
+                continue;
+            }
+            // Per the spec, `data: <value>` — note the space is optional and a
+            // single-line event may have multiple `data:` lines that get joined
+            // by newlines. DeepSeek emits one-data-per-event so we don't bother.
+            if let Some(payload) = line.strip_prefix("data:") {
+                let payload = payload.trim_start();
+                had_data = true;
+                if payload == "[DONE]" {
+                    self.done = true;
+                    events.push(ParseEvent::Done);
+                    continue;
+                }
+                self.consume_data_chunk(payload, events)?;
+            }
+            // Anything else (event:, id:, retry:) — silently ignore. DeepSeek
+            // doesn't currently use them; if they appear, we don't want to error.
+        }
+        if !had_data {
+            // An event with no `data:` lines that isn't pure-empty is a keep-alive
+            // (the leading `:` comment is the canonical form).
+            self.keepalive_count += 1;
+            events.push(ParseEvent::KeepAlive);
+        }
+        Ok(())
+    }
+
+    fn consume_data_chunk(
+        &mut self,
+        payload: &str,
+        events: &mut Vec<ParseEvent>,
+    ) -> Result<(), ParseError> {
+        let chunk: RawChunk = serde_json::from_str(payload).map_err(|e| {
+            // Bound the snippet so a 1MB blob doesn't end up in the log.
+            let snippet = if payload.len() > 200 {
+                format!("{}…", &payload[..200])
+            } else {
+                payload.to_string()
+            };
+            ParseError::InvalidJson {
+                snippet,
+                cause: e.to_string(),
+            }
+        })?;
+
+        if let Some(id) = chunk.id {
+            if self.request_id.is_none() {
+                self.request_id = Some(id);
+            }
+        }
+        if let Some(fp) = chunk.system_fingerprint {
+            self.system_fingerprint = Some(fp);
+        }
+        if let Some(err) = chunk.error {
+            self.embedded_error = Some(err);
+            events.push(ParseEvent::EmbeddedError);
+            return Ok(());
+        }
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage);
+            events.push(ParseEvent::Usage);
+        }
+        for choice in chunk.choices {
+            if let Some(reason) = choice.finish_reason {
+                self.finish_reason = Some(reason);
+            }
+            if let Some(r) = choice.delta.reasoning_content {
+                let added = r.chars().count();
+                self.reasoning_acc.push_str(&r);
+                events.push(ParseEvent::ReasoningDelta { added_chars: added });
+            }
+            if let Some(c) = choice.delta.content {
+                let added = c.chars().count();
+                self.content_acc.push_str(&c);
+                events.push(ParseEvent::ContentDelta { added_chars: added });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Scan for the first SSE event terminator — `\n\n` (LF-LF) OR `\r\n\r\n`
+/// (CRLF-CRLF). Returns `(payload_end_index, terminator_len)` so the caller
+/// can drain accordingly. Per the SSE spec both terminators are valid; DeepSeek
+/// currently emits LF-LF but proxies may rewrite.
+fn find_event_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some((i, 2));
+        }
+        if i + 3 < buf.len()
+            && buf[i] == b'\r'
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some((i, 4));
+        }
+        i += 1;
+    }
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,5 +528,153 @@ mod tests {
     fn build_client_succeeds_with_defaultish_config() {
         let cfg = cfg_with_timings(Duration::from_secs(60), Duration::from_secs(1800));
         build_client(&cfg).expect("build_client should not fail on default-shaped config");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-006 parser tests.
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn sample_reasoning_chunk() -> String {
+        // Mid-stream reasoning delta — id, choices[0].delta.reasoning_content.
+        r#"data: {"id":"chatcmpl-001","object":"chat.completion.chunk","model":"deepseek-v4-pro","system_fingerprint":"fp_abc","choices":[{"index":0,"delta":{"reasoning_content":"step 1 then step 2"},"finish_reason":null}]}"#
+            .to_string()
+    }
+    fn sample_content_chunk() -> String {
+        r#"data: {"id":"chatcmpl-001","choices":[{"index":0,"delta":{"content":"final answer text"},"finish_reason":null}]}"#
+            .to_string()
+    }
+    fn sample_usage_chunk() -> String {
+        // The final delta also carries finish_reason and usage.
+        // completion_tokens INCLUDES reasoning_tokens — that's the contract A-04b
+        // bakes into T-009. We test the parser preserves the raw numbers; T-009
+        // owns the no-double-add mapping.
+        r#"data: {"id":"chatcmpl-001","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":18,"completion_tokens":174,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":18,"completion_tokens_details":{"reasoning_tokens":120}}}"#
+            .to_string()
+    }
+
+    /// Reality test (REQ-DS-019): a synthetic byte sequence containing a
+    /// keep-alive, reasoning, content, usage, and DONE — split into 3 pieces
+    /// with one mid-JSON boundary. The parser must reassemble it correctly.
+    ///
+    /// Stub guard: a parser that does ONE serde_json::from_str over the whole
+    /// buffer would barf on the mid-JSON split. A parser that yields one event
+    /// per `feed()` call regardless of content would miscount keep-alives.
+    #[test]
+    fn deepseek_parser_chunked_handles_arbitrary_boundaries() {
+        let stream = format!(
+            ": keep-alive\n\n{}\n\n{}\n\n{}\n\ndata: [DONE]\n\n",
+            sample_reasoning_chunk(),
+            sample_content_chunk(),
+            sample_usage_chunk(),
+        );
+
+        // Deliberately put one boundary INSIDE the usage-chunk JSON so the parser
+        // has to buffer across `feed` calls.
+        let bytes = stream.as_bytes();
+        // Boundary 1: between keep-alive and reasoning chunks (roughly).
+        let split1 = bytes.iter().position(|&b| b == b'd').unwrap(); // start of first `data:`
+        // Boundary 2: somewhere inside the usage JSON body — we want the second
+        // `{"prompt_tokens"` substring to land mid-flight.
+        let usage_marker = b"\"prompt_tokens\"";
+        let usage_pos = bytes
+            .windows(usage_marker.len())
+            .position(|w| w == usage_marker)
+            .expect("usage marker present");
+        // Cut mid-`prompt_tokens` keyword to force the parser to glue back across feed calls.
+        let split2 = usage_pos + 6;
+
+        let chunk_a = &bytes[..split1];
+        let chunk_b = &bytes[split1..split2];
+        let chunk_c = &bytes[split2..];
+
+        let mut parser = StreamParser::new();
+        let events_a = parser.feed(chunk_a).expect("feed a");
+        let events_b = parser.feed(chunk_b).expect("feed b");
+        let events_c = parser.feed(chunk_c).expect("feed c");
+
+        // Keep-alive landed in the first chunk (the only event before any data).
+        assert_eq!(parser.keepalive_count, 1, "exactly one keep-alive seen");
+        let total_events = events_a.len() + events_b.len() + events_c.len();
+        assert!(
+            total_events >= 5,
+            "expected at least 5 events across all chunks (keepalive, reasoning, content, usage, done); got {total_events}"
+        );
+
+        assert_eq!(parser.reasoning_acc, "step 1 then step 2");
+        assert_eq!(parser.content_acc, "final answer text");
+        let usage = parser.usage.as_ref().expect("usage extracted");
+        assert_eq!(usage.prompt_tokens, 18);
+        assert_eq!(usage.completion_tokens, 174);
+        assert_eq!(usage.prompt_cache_miss_tokens, 18);
+        assert_eq!(usage.prompt_cache_hit_tokens, 0);
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .as_ref()
+                .map(|d| d.reasoning_tokens),
+            Some(120)
+        );
+        assert_eq!(parser.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(parser.request_id.as_deref(), Some("chatcmpl-001"));
+        assert_eq!(parser.system_fingerprint.as_deref(), Some("fp_abc"));
+        assert!(parser.done, "must see [DONE]");
+        assert!(parser.embedded_error.is_none());
+    }
+
+    /// Stub guard: a parser that ignores keep-alive `:` lines as data would
+    /// trip over them; one that miscounts them as data chunks would inflate
+    /// the deltas list.
+    #[test]
+    fn deepseek_parser_ignores_comment_keepalives() {
+        let mut parser = StreamParser::new();
+        let stream = b": ping\n\n: ping\n\n: ping\n\n";
+        let events = parser.feed(stream).expect("feed");
+        assert_eq!(parser.keepalive_count, 3);
+        assert!(events.iter().all(|e| matches!(e, ParseEvent::KeepAlive)));
+        assert!(parser.content_acc.is_empty());
+        assert!(parser.reasoning_acc.is_empty());
+        assert!(!parser.done);
+    }
+
+    /// One-byte-at-a-time pathological feed — confirms the chunk-boundary
+    /// reassembly is correct for ANY split, not just the boundary in the
+    /// reality test.
+    #[test]
+    fn deepseek_parser_handles_byte_at_a_time_feed() {
+        let stream = format!(
+            "{}\n\ndata: [DONE]\n\n",
+            sample_content_chunk(),
+        );
+        let mut parser = StreamParser::new();
+        for byte in stream.as_bytes() {
+            parser.feed(&[*byte]).expect("feed one byte");
+        }
+        assert_eq!(parser.content_acc, "final answer text");
+        assert!(parser.done);
+    }
+
+    /// Invalid JSON in a `data:` line surfaces as a typed error — the parser
+    /// must NOT silently swallow it.
+    #[test]
+    fn deepseek_parser_invalid_json_returns_typed_error() {
+        let mut parser = StreamParser::new();
+        let stream = b"data: {not-json}\n\n";
+        let err = parser.feed(stream).expect_err("must error");
+        match err {
+            ParseError::InvalidJson { snippet, .. } => {
+                assert!(snippet.contains("not-json"));
+            }
+            other => panic!("expected InvalidJson, got {other:?}"),
+        }
+    }
+
+    /// CRLF tolerance — DeepSeek emits LF-only today, but some proxies rewrite
+    /// to CRLF. The parser strips the trailing \r before parsing each line.
+    #[test]
+    fn deepseek_parser_tolerates_crlf_line_endings() {
+        let mut parser = StreamParser::new();
+        let stream = b": ping\r\n\r\n";
+        parser.feed(stream).expect("CRLF keepalive parses");
+        assert_eq!(parser.keepalive_count, 1);
     }
 }
