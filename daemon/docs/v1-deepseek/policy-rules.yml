@@ -1,0 +1,211 @@
+# Policy Rules — DeepSeek v1 Build Enforcement
+# Source: daemon/docs/specs/deepseek-integration-spec.md (3-round goat rodeo + live API
+# probe verification, Phase 3 CLEAN, Phase 4.4 APPROVED). 30 REQ-IDs, 18 tasks.
+# Mirrors the schema of daemon/docs/v2.2/policy-rules.yml; see Execution Contract
+# appendix of daemon/docs/v1-deepseek/IMPLEMENTATION_PLAN.md for the prose form.
+
+enforcement:
+  # Every task MUST have a behavioral reality_test. Compile-only verify is insufficient.
+  # (Pythia v2 lesson: a stub satisfying the type system must NOT pass.)
+  reality_tests_mandatory: true
+
+  # Worktree dispatch requires committed Wave 0 (Pythia v2 lesson — 5 worktrees lost).
+  worktree_sha_gate: true
+
+  # No stub implementations
+  stub_detection:
+    patterns:
+      - "todo!()"
+      - "unimplemented!()"
+      - "unreachable!()"
+      - "placeholder"
+      - "NotImplementedError"
+      - "not implemented"
+    fail_on_match: true
+
+  # DeepSeek-specific architectural rules (from the spec's settled decisions D-01..D-07
+  # and the live-probe-verified constraints). These are HARD enforcement points; a build
+  # that violates any is REJECTED at the Reality Gate, regardless of test count.
+  deepseek_rules:
+    # REQ-DS-006 — error classification keys on HTTP status, NOT error.code.
+    # (Live probe showed error.code="invalid_request_error" for BOTH 402 and 401.)
+    - http_status_classification: "classification keys on HTTP status; error.body is advisory only"
+    # REQ-DS-009 — completion_tokens already INCLUDES reasoning_tokens (live-verified).
+    - no_double_add_reasoning: "output_tokens ← completion_tokens directly; do NOT add reasoning_tokens separately"
+    # REQ-DS-023 — CoT bifurcation by default
+    - cot_bifurcation_default: ".response carries final content ONLY; reasoning_content to per-request log; include_reasoning=true opts in"
+    # REQ-DS-008 / REQ-DS-024 — fail-loud always
+    - fail_loud_no_substitution: "DeepSeek failures bubble up to the orchestrator; NEVER silently swap to another sibling"
+    # REQ-DS-006 — bypass generic retry loop
+    - bypass_generic_retry: "attempt_schedule for agent==\"deepseek\" is ONE outer attempt; runner owns retry+classification"
+    # REQ-DS-006 — network failure handling
+    - pre_first_byte_one_retry: "pre-first-byte connection failure: 1 internal retry; mid-stream dirty disconnect: fail loud (no double-pay)"
+    # REQ-DS-026 — metering source rule
+    - usage_chunk_meters_exact: "usage_source=exact iff final usage chunk arrived (incl. on length/embedded-error); else estimated (bytes/4 + prompt_estimate)"
+    - all_paid_paths_meter: "every paid failure path persists a token record (dirty-disconnect, runaway-abort, ghost-success, finish_reason, ceiling/idle timeout)"
+    # REQ-DS-026 — blast-radius safeguard
+    - blast_radius_guard: "persist-before-Err is gated to DeepSeek typed-failure-with-usage ONLY; Gemini/Codex/Claude Err paths unchanged (no collateral persistence)"
+    # REQ-DS-005 — frugality posture
+    - generous_max_tokens: "_MAX_TOKENS default 32768; NOT a frugality throttle (shared with reasoning — tight cap empties answer)"
+    - frugality_via_thinking_toggle: "frugality lever is the per-call thinking on/off (REQ-DS-027); NOT max_tokens"
+    # REQ-DS-007 — two-timer model
+    - two_timer_model: "idle/read_timeout 60s (rolling, primary detector) + absolute ceiling 1800s (outer tokio::time::timeout backstop)"
+    # REQ-DS-012 — no sandbox v1
+    - no_sandbox_v1: "deepseek path has ZERO sandbox invocations; ask_agent is consult/Q&A only"
+    # REQ-DS-011 — explicit route
+    - no_auto_routing: "no auto-router for deepseek; explicit consult only; /council is a deferred skill follow-on"
+    # REQ-DS-020 — stateless
+    - stateless_single_turn: "synthetic session_id=deepseek-<uuid>; no remote resume; require_reused_worker handles missing session as success"
+    - prewarm_no_op: "prewarm slot for deepseek is a safe no-op (stateless API, nothing to prewarm)"
+    # REQ-DS-029 — ghost success
+    - ghost_success_detection: "per-chunk check for top-level `error` key in SSE data; route through same classification as HTTP errors"
+    # REQ-DS-030 — finish_reason handling
+    - finish_reason_loud_fail: "finish_reason ∈ {length, content_filter, null, unknown} → hard error (NOT Ok(parsed)); tokens still metered; provider breaker NOT tripped"
+    # REQ-DS-028 — runaway protection
+    - runaway_cap_default_disabled: "_REASONING_CAP_TOKENS default 0 (disabled); when set, validated < _MAX_TOKENS; local abort (NOT provider-breaker trip)"
+
+  # Privacy / secret rules (HARD — these block at lint/test stage)
+  privacy:
+    # REQ-DS-003 / REQ-DS-015
+    - api_key_only_as_bearer: "TRIUMVIRATE_DEEPSEEK_API_KEY only used as `Authorization: Bearer`; never in argv, never logged"
+    - api_key_debug_redacted: "Debug impl for the API-key wrapper MUST redact the secret"
+    # REQ-DS-009 / REQ-DS-023 — per-request log privacy
+    - log_response_artifacts_only: "per-request JSON log captures response artifacts only (reasoning_content, content, usage, fingerprint); NOT the request `messages` text and NOT the API key"
+    # Source-code guard
+    - no_secrets_in_source: "grep -rE 'TRIUMVIRATE_DEEPSEEK_API_KEY=sk-' daemon/ returns ZERO matches"
+
+  # Anti-bulk (REQ-DS-025)
+  payload_limits:
+    deepseek_bulk_bytes_default: 16384       # TRIUMVIRATE_DEEPSEEK_BULK_BYTES default
+    deepseek_bulk_intercept_only_on_deepseek: true   # Gemini/Codex unaffected
+    soft_guidance_in_tool_doc: true          # ask_agent tool description notes "remote+metered"
+
+  # Token economics (REQ-DS-009, REQ-DS-010, REQ-DS-021)
+  pricing:
+    require_deepseek_v4_pro_row: true        # in-miss 0.435, in-hit 0.003625, out 0.87
+    require_deepseek_v4_flash_row: true      # in-miss 0.14, in-hit 0.0028, out 0.28
+    seed_mechanism: "pub fn ensure_deepseek_prices(db) — idempotent INSERT OR IGNORE, called at daemon startup (T-003 wires it via triumvirate/src/main.rs)"
+    seed_not_test_only: "the existing INSERT at attribution.rs:156 is #[cfg(test)] — production seed MUST be the new helper"
+    calculate_cost_usd_public: true          # T-003 makes it `pub`
+    cost_visibility_v1: true                  # lifecycle/progress cost line per consult
+    cumulative_hard_cap_deferred: true        # REQ-DS-021 deferred — only visibility in v1
+
+  # Operational prerequisites
+  operational:
+    funded_account_required: true             # $0 balance → 402 on every call (live-probe-verified)
+    balance_endpoint: "GET /user/balance — monitor topped_up_balance + granted_balance"
+    five_million_grant_assumption: false      # 5M free grant is UNVERIFIED (live probe showed granted=0)
+    peak_hour_503_expected: "02:00-14:00 UTC; 503 → OpenTransient breaker (NOT hard-open)"
+    system_fingerprint_capture: "per-request log record (NOT cli_version, which is the token model key)"
+    data_egress_note_documented: true         # consult content goes to DeepSeek/China-routed
+
+  # Verification levels
+  verification:
+    per_task: "cargo check + <reality_test> + ~/.claude/scripts/validate-task.sh"
+    per_wave: "cargo test --workspace (affected crates) + cumulative validate-task.sh report"
+    pre_ship:
+      - "cargo test --workspace"
+      - "cargo test -p triumvirate -- --ignored deepseek_contract   # live probes, funded account"
+      - "cargo clippy --workspace -- -D warnings"
+      - "cargo fmt --check"
+      - "grep -rE 'TRIUMVIRATE_DEEPSEEK_API_KEY=sk-' daemon/ returns zero"
+      - "BUILD_MANIFEST.md + PROBE_RESULTS.md present in daemon/docs/v1-deepseek/"
+
+  # Per-task enforcement contract (mirrors Execution Contract in IMPLEMENTATION_PLAN.md)
+  per_task:
+    files_lock: "code changes restricted to <files> list; <scope_out> rules HARD-enforced"
+    commit_format_regex: "^(T-\\d{3}|collateral-fix: T-\\d{3}(?: --) ): "
+    test_command: "cargo test --workspace"
+    lint_command: "cargo clippy --workspace -- -D warnings"
+    format_command: "cargo fmt --check"
+    secret_scan_must_be_zero: true
+    max_attempts_per_task: 3      # then escalate, never grind
+    context_switch_refusal: true   # mid-execution scope-change → blocked_on: scope-change
+
+# Waves (mirrors IMPLEMENTATION_PLAN.md build overview; STRICT wave ordering)
+waves:
+  - id: 0
+    name: "Live API contract probe (Wave-0 gate)"
+    tasks: [T-000]
+    parallel_safe: true       # only one task; trivially "safe"
+    prereq: "Funded DeepSeek account; TRIUMVIRATE_DEEPSEEK_API_KEY env set; balance > $0."
+    gate: "Probe battery green against funded account; PROBE_RESULTS.md captured."
+    blocks_subsequent_waves: true
+
+  - id: 1
+    name: "Foundation (gate, env knobs, price seed)"
+    tasks: [T-001, T-002, T-003]
+    parallel_safe: true
+    depends_on: [0]
+    gate: |
+      - is_supported_agent_name("deepseek") == true; /status lists "deepseek"
+      - DeepSeekConfig::from_env() loads ALL 15 env knobs with documented defaults
+      - ensure_deepseek_prices() seeds both v4-pro + v4-flash idempotently;
+        calculate_cost_usd is `pub` and returns documented numbers within FP tolerance
+
+  - id: 2
+    name: "Resilience + HTTP client base"
+    tasks: [T-004, T-005]
+    parallel_safe: true
+    depends_on: [1]
+    gate: |
+      - deepseek_resilience: breaker state machine passes synthetic-outcome suite;
+        classify(402)=Hard, classify(429)=Transient, classify(503)=Transient
+      - reqwest client config: slow-drip stream (1 byte every 5s for 90s) COMPLETES
+        (proves read_timeout rolling-reset works)
+
+  - id: 3
+    name: "Runner (SSE parser, guards, runaway, usage, top-level)"
+    tasks: [T-006, T-007, T-008, T-009, T-010]
+    parallel_safe: false      # see <depends> chain (T-006 → T-007/T-008/T-009 → T-010)
+    depends_on: [2]
+    gate: |
+      - SSE parser handles cross-chunk JSON + keep-alive + [DONE]
+      - ghost-success detector: embedded {"error":...} routes via classification path
+      - finish_reason: length/filter/null → loud fail (no Ok with partial content)
+      - runaway cap (when enabled <max_tokens) aborts locally, breaker untouched
+      - usage mapping: output ← completion_tokens (no double-add); per-request log written
+      - run() against mock HTTP server: happy + 402 + 429+retry + dirty-disconnect all covered
+
+  - id: 4
+    name: "Dispatch + per-call surface + persistence + stateless + anti-bulk"
+    tasks: [T-011, T-012, T-013, T-014, T-015]
+    parallel_safe: false      # T-013 depends on T-010,T-012; T-014 on T-012; T-015 on T-001
+    depends_on: [3]
+    gate: |
+      - AskAgentRequest gains 4 optional deepseek_* fields; backward-compatible round-trip
+      - ask_agent {agent:"deepseek"} reaches runner; .response = content only (default);
+        include_reasoning:true opts in
+      - execute_ask_agent: attempt_schedule for deepseek=1 (no generic 3-attempt loop);
+        persist-before-Err gated to deepseek typed failure (Codex/Gemini Err writes ZERO records)
+      - stateless: 2 sequential calls succeed with distinct synthetic session_ids;
+        prewarm_daemon_workers does NOT spawn deepseek
+      - anti-bulk: 20KB deepseek payload → loud error; same to gemini → success
+
+  - id: 5
+    name: "Verification re-run + runbook"
+    tasks: [T-016, T-017]
+    parallel_safe: true       # T-017 has no deps; T-016 depends on T-000..T-015
+    depends_on: [4]
+    gate: |
+      - Wave-0 probes re-run green against funded account; PROBE_RESULTS.md updated
+      - daemon/docs/deepseek-operator-runbook.md present; covers all 9 required sections
+        (verified by the explicit grep in T-017)
+
+# Definition of done (mirrors Execution Contract end-of-execution report)
+done_when:
+  all_waves_passed: true
+  full_test_suite: "cargo test --workspace exits 0"
+  ignored_probes: "cargo test -p triumvirate -- --ignored deepseek_contract exits 0"
+  lint: "cargo clippy --workspace -- -D warnings exits 0"
+  format: "cargo fmt --check exits 0"
+  secret_scan: "grep -rE 'TRIUMVIRATE_DEEPSEEK_API_KEY=sk-' daemon/ returns ZERO"
+  build_manifest_written: "daemon/docs/v1-deepseek/BUILD_MANIFEST.md exists with all 18 tasks logged + commit SHAs"
+  probe_results_captured: "daemon/docs/v1-deepseek/PROBE_RESULTS.md exists with live-probe outputs"
+  blast_radius_regression_guard: "non-deepseek failing-runner test writes ZERO new token records"
+
+# Recovery rules (when a wave fails)
+recovery:
+  blocked_on: "use the 'blocked_on: ...' contract format (Execution Contract §Blocked Protocol)"
+  collateral_fix: "label commit `collateral-fix: T-XXX -- <justification>` when touching files outside <files>"
+  scope_change_refusal: "any new requirement mid-execution → 'Outside current execution contract' STOP; only an explicit 'cancel backlog' / 'pause backlog' allows context-switch"
