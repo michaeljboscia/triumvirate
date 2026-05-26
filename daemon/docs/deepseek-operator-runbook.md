@@ -115,6 +115,7 @@ in `shared-types/src/lib.rs::AskAgentRequest`):
 | `deepseek_reasoning_effort` | `"low" \| "medium" \| "high" \| "max" \| "xhigh"` | Low/Medium/High → API "high"; Max/Xhigh → API "max". |
 | `deepseek_include_reasoning` | `true \| false` | When `true`, the response carries `<reasoning>…</reasoning>` ahead of the content. |
 | `deepseek_max_tokens` | `u32` | Per-call max_tokens override. |
+| `deepseek_model` | `"deepseek-v4-pro" \| "deepseek-v4-flash"` (string) | **Default: `deepseek-v4-pro`** (held pending capability eval — see `PRO_VS_FLASH_TEST_PLAN.md`). Per-call override of `cfg.model`. Unknown values surface as HardProvider(400). Flip the default with `TRIUMVIRATE_DEEPSEEK_MODEL=deepseek-v4-flash` operator-wide; or use the per-call field for selective override. |
 
 Gemini and Codex callers ignore these fields (they're optional and
 `#[serde(skip_serializing_if = "Option::is_none")]`).
