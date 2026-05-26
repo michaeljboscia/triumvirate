@@ -446,6 +446,7 @@ pub(crate) async fn execute_ask_agent(
             session_for_attempt.as_deref(),
             Some(events_tx),
             *model_override,
+            Some(req),
         ));
         let started = Instant::now();
         let mut next_heartbeat = Duration::from_secs(30);
@@ -832,7 +833,7 @@ pub(crate) async fn execute_ask_agent(
                     timeout(
                         remaining,
                         run_named_agent_with_session_and_model(
-                            hop.agent, &execution_prompt, &exec_cwd, None, None, None,
+                            hop.agent, &execution_prompt, &exec_cwd, None, None, None, None,
                         ),
                     )
                     .await
@@ -1146,7 +1147,7 @@ async fn run_named_agent_with_session(
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
 ) -> anyhow::Result<ParsedAgentResult> {
-    run_named_agent_with_session_and_model(agent, message, cwd, session_id, events_tx, None).await
+    run_named_agent_with_session_and_model(agent, message, cwd, session_id, events_tx, None, None).await
 }
 
 /// Run the shadow Gemini backend (the non-primary one) for comparison and return its
@@ -1220,7 +1221,12 @@ async fn run_named_agent_with_session_and_model(
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
     model_override: Option<&str>,
+    // T-012: per-call DeepSeek overrides come from AskAgentRequest. Only the
+    // deepseek arm reads these — Gemini/Codex ignore. Caller passes None when
+    // there is no upstream request context (degraded route, prewarm, etc.).
+    req_overrides: Option<&AskAgentRequest>,
 ) -> anyhow::Result<ParsedAgentResult> {
+    let _ = session_id; // deepseek arm intentionally ignores resume tokens — T-014.
     match agent {
         "gemini" => {
             let (bin, mut args) = gemini_command();
@@ -1252,7 +1258,123 @@ async fn run_named_agent_with_session_and_model(
             )
             .await
         }
+        "deepseek" => run_deepseek_agent(message, req_overrides).await,
         _ => anyhow::bail!("unsupported agent: {agent}"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-012 (REQ-DS-014 / REQ-DS-023): DeepSeek dispatch arm.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use mcp_bridge::deepseek as ds;
+use mcp_bridge::deepseek_config::{
+    DeepSeekConfig, ReasoningEffort as CfgEffort, ThinkingMode,
+};
+use shared_types::{DeepSeekEffort, DeepSeekThinking};
+
+/// Process-static DeepSeek runtime state — config + reqwest client + resilience
+/// state. Initialised on first use. Returns an `anyhow::Error` if the env-load
+/// validation rejects something (e.g. MAX_TOKENS=oops, REASONING_CAP >= MAX_TOKENS).
+fn deepseek_runtime()
+-> anyhow::Result<&'static (DeepSeekConfig, reqwest::Client, ds::ResilienceState)> {
+    static CELL: std::sync::OnceLock<
+        Result<(DeepSeekConfig, reqwest::Client, ds::ResilienceState), String>,
+    > = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let cfg = DeepSeekConfig::from_env().map_err(|e| e.to_string())?;
+        let client = ds::build_client(&cfg).map_err(|e| e.to_string())?;
+        let resilience = ds::ResilienceState::from_cfg(&cfg);
+        Ok((cfg, client, resilience))
+    })
+    .as_ref()
+    .map_err(|s| anyhow::anyhow!("deepseek runtime init failed: {s}"))
+}
+
+/// Clone the cached cfg and overlay per-call overrides from AskAgentRequest.
+/// Returns a borrowed reference to the cached cfg when no overrides apply
+/// (avoiding an allocation on the hot path).
+fn cfg_with_overrides(base: &DeepSeekConfig, req: Option<&AskAgentRequest>) -> DeepSeekConfig {
+    let mut cfg = base.clone();
+    let Some(r) = req else {
+        return cfg;
+    };
+    if let Some(t) = r.deepseek_thinking {
+        cfg.thinking = match t {
+            DeepSeekThinking::Enabled => ThinkingMode::Enabled,
+            DeepSeekThinking::Disabled => ThinkingMode::Disabled,
+        };
+    }
+    if let Some(e) = r.deepseek_reasoning_effort {
+        cfg.reasoning_effort = match e {
+            // Wire surface accepts five levels; the API treats Low/Medium/High
+            // as High and Xhigh as Max. Collapse here so the runner only sees
+            // High|Max (T-011 contract).
+            DeepSeekEffort::Low | DeepSeekEffort::Medium | DeepSeekEffort::High => {
+                CfgEffort::High
+            }
+            DeepSeekEffort::Max | DeepSeekEffort::Xhigh => CfgEffort::Max,
+        };
+    }
+    if let Some(n) = r.deepseek_max_tokens {
+        cfg.max_tokens = n;
+    }
+    cfg
+}
+
+/// Wrap a DeepSeekFailure inside anyhow::Error so T-013 (execute_ask_agent)
+/// can downcast and inspect the typed `usage` field for persist-before-Err.
+#[derive(Debug)]
+pub(crate) struct DeepSeekFailureWrapper(pub(crate) ds::DeepSeekFailure);
+
+impl std::fmt::Display for DeepSeekFailureWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.kind)
+    }
+}
+
+impl std::error::Error for DeepSeekFailureWrapper {}
+
+async fn run_deepseek_agent(
+    message: &str,
+    req_overrides: Option<&AskAgentRequest>,
+) -> anyhow::Result<ParsedAgentResult> {
+    let (base_cfg, client, resilience) = deepseek_runtime()?;
+    run_deepseek_with_runtime(base_cfg, client, resilience, message, req_overrides).await
+}
+
+/// Testable inner. Tests inject their own (cfg, client, resilience) tuple,
+/// bypassing the OnceLock-cached process-global runtime.
+pub(crate) async fn run_deepseek_with_runtime(
+    base_cfg: &DeepSeekConfig,
+    client: &reqwest::Client,
+    resilience: &ds::ResilienceState,
+    message: &str,
+    req_overrides: Option<&AskAgentRequest>,
+) -> anyhow::Result<ParsedAgentResult> {
+    let cfg = cfg_with_overrides(base_cfg, req_overrides);
+
+    // T-014 (REQ-DS-020): synthetic session_id `deepseek-<uuid>`. Inbound
+    // session_id is intentionally NOT consulted — DeepSeek is stateless v1.
+    let session_id = format!("deepseek-{}", Uuid::new_v4());
+
+    let include_reasoning = req_overrides
+        .and_then(|r| r.deepseek_include_reasoning)
+        .unwrap_or(false);
+
+    let run_req = ds::RunRequest {
+        messages: vec![ds::RequestMessage {
+            role: "user".to_string(),
+            content: message.to_string(),
+        }],
+        session_id: session_id.clone(),
+        prompt_chars_estimate: message.chars().count() as i64,
+        include_reasoning,
+    };
+
+    match ds::run(&cfg, client, &run_req, resilience).await {
+        Ok(parsed) => Ok(parsed),
+        Err(failure) => Err(anyhow::Error::new(DeepSeekFailureWrapper(failure))),
     }
 }
 
@@ -2011,5 +2133,207 @@ async fn run_agent_process_with_session(
                 .await
         }
         _ => anyhow::bail!("unsupported agent: {agent}"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-012 (REQ-DS-014, REQ-DS-023) tests — dispatch arm + CoT bifurcation.
+//
+// These tests use the testable inner `run_deepseek_with_runtime` so the
+// process-static OnceLock cache stays untouched. The mock server is a
+// scripted TCP responder.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod deepseek_dispatch_tests {
+    use super::*;
+    use mcp_bridge::deepseek as ds;
+    use mcp_bridge::deepseek_config::{ApiKey, DeepSeekConfig, ReasoningEffort, ThinkingMode};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn spawn_scripted_server(scripts: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            for script in scripts {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 8192];
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    tokio::io::AsyncReadExt::read(&mut sock, &mut buf),
+                )
+                .await;
+                let _ = sock.write_all(&script).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        url
+    }
+
+    fn happy_sse_body() -> String {
+        let reasoning = r#"data: {"id":"chatcmpl-T012","object":"chat.completion.chunk","model":"deepseek-v4-pro","system_fingerprint":"fp_T012","choices":[{"index":0,"delta":{"reasoning_content":"the model is thinking carefully"},"finish_reason":null}]}"#;
+        let content = r#"data: {"id":"chatcmpl-T012","choices":[{"index":0,"delta":{"content":"clean final answer"},"finish_reason":null}]}"#;
+        let usage = r#"data: {"id":"chatcmpl-T012","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":18,"completion_tokens":174,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":18}}"#;
+        format!("{reasoning}\n\n{content}\n\n{usage}\n\ndata: [DONE]\n\n")
+    }
+
+    fn make_cfg(url: &str) -> DeepSeekConfig {
+        DeepSeekConfig {
+            base_url: url.to_string(),
+            api_key: ApiKey::new("sk-test-dispatch"),
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 1024,
+            thinking: ThinkingMode::Enabled,
+            reasoning_effort: ReasoningEffort::High,
+            read_timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(10),
+            tcp_keepalive: Duration::from_secs(30),
+            max_concurrent: 4,
+            max_rpm: 60,
+            reasoning_cap_tokens: 0,
+            log_dir: std::env::temp_dir().join("deepseek-t012-test"),
+            log_reasoning_cap_bytes: 262_144,
+            bulk_bytes: 16_384,
+        }
+    }
+
+    /// Reality test (a): default CoT bifurcation. Response carries content
+    /// ONLY; reasoning is captured to the per-request log file.
+    #[tokio::test]
+    async fn deepseek_dispatch_default_response_is_content_only() {
+        let body = happy_sse_body();
+        let script = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        ).into_bytes();
+        let url = spawn_scripted_server(vec![script]).await;
+
+        let mut cfg = make_cfg(&url);
+        let log_dir = tempfile::tempdir().expect("tempdir");
+        cfg.log_dir = log_dir.path().to_path_buf();
+        let client = ds::build_client(&cfg).expect("client");
+        let resilience = ds::ResilienceState::from_cfg(&cfg);
+
+        let req = shared_types::AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "what is 2+2".to_string(),
+            ..Default::default()
+        };
+        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+            .await
+            .expect("dispatch ok");
+
+        assert_eq!(parsed.response_text, "clean final answer");
+        assert!(
+            !parsed.response_text.contains("the model is thinking"),
+            "default response MUST NOT contain reasoning"
+        );
+        let sid = parsed.session_id.expect("session_id populated");
+        assert!(sid.starts_with("deepseek-"), "session_id={sid}");
+
+        let entries: Vec<_> = std::fs::read_dir(log_dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!entries.is_empty(), "per-request log must be written");
+        let log_body = std::fs::read_to_string(entries[0].path()).expect("read log");
+        assert!(
+            log_body.contains("the model is thinking carefully"),
+            "reasoning must be persisted to the log"
+        );
+    }
+
+    /// Reality test (b): include_reasoning=true → reasoning in response.
+    #[tokio::test]
+    async fn deepseek_dispatch_include_reasoning_true_returns_reasoning_in_response() {
+        let body = happy_sse_body();
+        let script = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        ).into_bytes();
+        let url = spawn_scripted_server(vec![script]).await;
+
+        let mut cfg = make_cfg(&url);
+        let log_dir = tempfile::tempdir().expect("tempdir");
+        cfg.log_dir = log_dir.path().to_path_buf();
+        let client = ds::build_client(&cfg).expect("client");
+        let resilience = ds::ResilienceState::from_cfg(&cfg);
+
+        let req = shared_types::AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "x".to_string(),
+            deepseek_include_reasoning: Some(true),
+            ..Default::default()
+        };
+        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+            .await
+            .expect("dispatch ok");
+
+        assert!(parsed.response_text.contains("the model is thinking carefully"),
+            "include_reasoning=true must surface reasoning; got: {}", parsed.response_text);
+        assert!(parsed.response_text.contains("clean final answer"));
+        assert!(parsed.response_text.contains("<reasoning>"));
+    }
+
+    /// cfg_with_overrides — every Effort variant collapses correctly.
+    #[test]
+    fn cfg_with_overrides_collapses_effort_levels() {
+        use shared_types::{AskAgentRequest, DeepSeekEffort, DeepSeekThinking};
+        let base = make_cfg("http://unused");
+
+        for (in_effort, want) in &[
+            (DeepSeekEffort::Low, ReasoningEffort::High),
+            (DeepSeekEffort::Medium, ReasoningEffort::High),
+            (DeepSeekEffort::High, ReasoningEffort::High),
+            (DeepSeekEffort::Max, ReasoningEffort::Max),
+            (DeepSeekEffort::Xhigh, ReasoningEffort::Max),
+        ] {
+            let req = AskAgentRequest {
+                agent: "deepseek".to_string(),
+                message: "x".to_string(),
+                deepseek_reasoning_effort: Some(*in_effort),
+                ..Default::default()
+            };
+            let cfg = cfg_with_overrides(&base, Some(&req));
+            assert_eq!(cfg.reasoning_effort, *want, "effort={in_effort:?}");
+        }
+
+        let req = AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "x".to_string(),
+            deepseek_thinking: Some(DeepSeekThinking::Disabled),
+            ..Default::default()
+        };
+        let cfg = cfg_with_overrides(&base, Some(&req));
+        assert_eq!(cfg.thinking, ThinkingMode::Disabled);
+
+        let req = AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "x".to_string(),
+            deepseek_max_tokens: Some(2048),
+            ..Default::default()
+        };
+        let cfg = cfg_with_overrides(&base, Some(&req));
+        assert_eq!(cfg.max_tokens, 2048);
+
+        let cfg = cfg_with_overrides(&base, None);
+        assert_eq!(cfg.reasoning_effort, base.reasoning_effort);
+        assert_eq!(cfg.thinking, base.thinking);
+        assert_eq!(cfg.max_tokens, base.max_tokens);
+    }
+
+    /// Cross-task regression: gemini/codex dispatch arms remain.
+    #[test]
+    fn deepseek_arm_exists_and_does_not_displace_gemini_or_codex() {
+        assert!(mcp_bridge::is_supported_agent_name("gemini"));
+        assert!(mcp_bridge::is_supported_agent_name("codex"));
+        assert!(mcp_bridge::is_supported_agent_name("deepseek"));
+        assert!(!mcp_bridge::is_supported_agent_name("fake-agent"));
     }
 }
