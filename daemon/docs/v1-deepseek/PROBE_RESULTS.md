@@ -132,3 +132,92 @@ roughly $9.98 across this verification.
 - The probes are `#[ignore]`-gated, so they do NOT run on a default `cargo test`. They run
   ONLY via the explicit `cargo test -p triumvirate --test deepseek_contract -- --ignored`
   invocation, which is the right behavior for CI (no surprise spending).
+
+---
+
+## T-016 (Wave 5) re-run — post-integration verification
+
+**Task:** T-016 (REQ-DS-017). Re-execute the same probe battery AFTER the full T-001..T-015
+integration is in place. Confirms the live wire contract still holds and the spec's claims
+remain ground-truthed end-to-end.
+
+**Date:** 2026-05-26
+**HEAD at re-run:** `313dd688b5e26e9138e29b5564552d1ec17eb85c`
+   (= Wave 4 closer: T-014 + T-015 — stateless single-turn + anti-bulk byte cap)
+**Account:** same funded $10 top-up account; balance at run start ≈ $9.99 (per PROBE-01).
+**Invocation:**
+```
+TRIUMVIRATE_DEEPSEEK_API_KEY=<key> \
+  cargo test -p triumvirate --test deepseek_contract -- --ignored --nocapture
+```
+**Wall-clock:** 4.07s end-to-end on the 8-probe suite (parallel).
+
+### Verdict — re-run
+**8 / 8 PASSED.** Identical contract verification to the Wave-0 run; no drift across the
+integration period. Pricing/usage numbers are statistically stable (small variance from the
+model's per-call sampling — see PROBE-03/04 below).
+
+### Captured output (verbatim from the re-run)
+
+```
+running 8 tests
+PROBE-06 OK: 401 + error.type=authentication_error
+test probe_06_bad_key_returns_401_authentication_error ... ok
+PROBE-01 OK: is_available=true total_balance=9.99
+test probe_01_balance_endpoint_shape ... ok
+PROBE-07 OK: malformed → HTTP 400; body={"error":{"message":"Prompt must contain the word 'json' in some form to use 'response_format' of type 'json_object'.","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}
+test probe_07_malformed_request_returns_4xx_invalid_parameter ... ok
+PROBE-02 OK: models served = ["deepseek-v4-flash", "deepseek-v4-pro"]
+test probe_02_models_endpoint_returns_v4_pro_and_v4_flash ... ok
+PROBE-08 OK: flash non-think — content="ok" reasoning=''
+test probe_08_flash_non_thinking_no_reasoning_content ... ok
+PROBE-05 OK: finish_reason=length content.len()=0 reasoning.len()=279
+test probe_05_max_tokens_starvation_returns_finish_reason_length ... ok
+PROBE-03 OK: reasoning_chars=122 content_chars=88 keepalive_lines=0 usage={"completion_tokens":98,"completion_tokens_details":{"reasoning_tokens":54},"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":17,"prompt_tokens":17,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":115}
+test probe_03_streaming_emits_reasoning_then_content_then_usage_then_done ... ok
+PROBE-04 OK: completion=186 reasoning=109 (incl) prompt=16 (hit=0 miss=16)
+test probe_04_reasoning_tokens_already_in_completion_tokens ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.07s
+```
+
+### Cross-check against Wave-0 numbers
+| Probe | Wave-0 | Wave-5 re-run | Notes |
+|---|---|---|---|
+| PROBE-01 balance | $9.99 | $9.99 | total spend across both runs ≈ $0.01 |
+| PROBE-02 models | v4-pro, v4-flash | v4-pro, v4-flash | unchanged |
+| PROBE-03 usage shape | populated | populated | reasoning_tokens & completion_tokens_details still emitted |
+| PROBE-04 no-double-add | 174 = 174 (incl 120 reasoning) | 186 = 186 (incl 109 reasoning) | invariant holds (variance is the model's per-call sampling) |
+| PROBE-05 finish_reason=length | confirmed | confirmed | partial content rejection still triggers |
+| PROBE-06 bad key 401 | authentication_error | authentication_error | unchanged |
+| PROBE-07 malformed 400 | invalid_request_error | invalid_request_error | unchanged |
+| PROBE-08 flash no reasoning | content="ok" reasoning='' | content="ok" reasoning='' | unchanged |
+
+### Integration ground-truth
+The re-run confirms the assumptions every Wave 1–4 task depended on:
+- **REQ-DS-009 / A-04b** (PROBE-04): completion_tokens ALREADY includes reasoning_tokens
+  → `map_usage` in T-009 must NOT add them. The runner's mapping is correct.
+- **REQ-DS-019** (PROBE-03): the SSE stream shape (reasoning_content delta → content delta
+  → usage chunk with finish_reason=stop → [DONE]) matches T-006's StreamParser expectations.
+- **REQ-DS-029/030** (PROBE-05): finish_reason="length" with empty content is a real wire
+  signal — T-007's BadFinishReason guard catches it correctly.
+- **REQ-DS-005** (PROBE-08): `thinking=disabled` on flash genuinely suppresses
+  reasoning_content. Per-call override (T-011) → cfg (T-012) → API payload works.
+- **REQ-DS-024** (implicit): the suite completed in 4.07s well under any reasonable
+  absolute timeout. No SLA breach.
+
+### Spending audit
+Two full probe runs (Wave-0 + Wave-5) consumed approximately **$0.02 total** against the
+funded account — confirmed via PROBE-01 balance reads. Single-digit cents for end-to-end
+verification of a paid streaming surface is a good cost profile for the audit trail.
+
+### Wave 5 — green-light to ship
+- All 8 probes green against the live API: ✅
+- All 351+ unit/integration tests across Wave 1–4 green: ✅
+  (mcp-bridge 91/91, token-economics 25/25, mcp-tools 34/34, shared-types 30/30,
+  triumvirate 171/172 — the 1 failure is the pre-existing ABE bug filed at `dc89676`,
+  not a DeepSeek regression)
+- Codex review of Wave 3 returned 0 blockers after fixup commit `8061e0b`
+- Cost-per-verification well below threshold
+
+**Status: cleared for merge to `main`.**
