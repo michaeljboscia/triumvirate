@@ -772,7 +772,7 @@ use crate::deepseek_resilience::{
 /// One DeepSeek consult's request. The runner uses these fields to build the
 /// JSON request body; nothing else (notably, `messages_text` is NEVER logged
 /// — REQ-DS-023).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RunRequest {
     pub messages: Vec<RequestMessage>,
     /// Caller-provided session id. The runner attaches it to the returned
@@ -782,6 +782,12 @@ pub struct RunRequest {
     /// Best-effort caller estimate of prompt size in chars, used for the
     /// estimated-usage fallback (T-009). Zero is fine.
     pub prompt_chars_estimate: i64,
+    /// REQ-DS-023 CoT bifurcation knob (T-012). Default: false — response_text
+    /// carries the model's `content` only and reasoning_content is captured
+    /// to the per-request log. When set to true, response_text is the
+    /// reasoning wrapped in `<reasoning>...</reasoning>` followed by content,
+    /// so callers can inspect the trace in-line.
+    pub include_reasoning: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1091,7 +1097,14 @@ async fn run_inner(
         }
 
         // Happy path entry: consume the SSE stream.
-        return consume_stream(resp, cfg, &req.session_id, req.prompt_chars_estimate).await;
+        return consume_stream(
+            resp,
+            cfg,
+            &req.session_id,
+            req.prompt_chars_estimate,
+            req.include_reasoning,
+        )
+        .await;
     }
 }
 
@@ -1100,6 +1113,7 @@ async fn consume_stream(
     cfg: &DeepSeekConfig,
     session_id: &str,
     prompt_chars_estimate: i64,
+    include_reasoning: bool,
 ) -> Result<agent_adapter::ParsedAgentResult, DeepSeekFailure> {
     let mut parser = StreamParser::new();
     let mut bytes_received: i64 = 0;
@@ -1210,8 +1224,22 @@ async fn consume_stream(
         }
     }
 
+    // REQ-DS-023 CoT bifurcation. Default: response_text = content only;
+    // reasoning is captured in the per-request log written above. With
+    // include_reasoning=true the reasoning is interleaved at the head of
+    // response_text inside <reasoning>…</reasoning> tags so the caller sees
+    // the trace without parsing the per-request log file.
+    let response_text = if include_reasoning && !finalized.reasoning.is_empty() {
+        format!(
+            "<reasoning>\n{}\n</reasoning>\n\n{}",
+            finalized.reasoning, finalized.content,
+        )
+    } else {
+        finalized.content.clone()
+    };
+
     Ok(agent_adapter::ParsedAgentResult {
-        response_text: finalized.content.clone(),
+        response_text,
         session_id: Some(session_id.to_string()),
         events: Vec::new(),
         tool_calls: Vec::new(),
@@ -2074,6 +2102,7 @@ mod tests {
             }],
             session_id: "deepseek-test-session-001".to_string(),
             prompt_chars_estimate: 36,
+            include_reasoning: false,
         }
     }
 
