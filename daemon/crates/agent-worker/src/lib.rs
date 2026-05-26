@@ -112,9 +112,37 @@ pub async fn require_reused_worker(agent: &str, cwd: &str) -> Result<WorkerState
     let mut workers = worker_registry_store().lock().await;
     let now = core_unix_time_ms();
     let Some(state) = workers.get_mut(&key) else {
+        // T-014 (REQ-DS-020): DeepSeek is stateless single-turn — there's no
+        // remote session to reuse, so a missing worker entry is EXPECTED, not
+        // an error. We still create a stub state so callers that key off
+        // `worker.ask_count` get monotonic numbers.
+        if agent == "deepseek" {
+            let stub = WorkerState {
+                agent: agent.to_string(),
+                cwd: cwd.to_string(),
+                session_id: None,
+                spawn_count: 0,
+                ask_count: 1,
+                last_used_ms: now,
+            };
+            workers.insert(key, stub.clone());
+            persist_worker_registry_if_enabled(&workers);
+            return Ok(stub);
+        }
         return Err(format!("worker_missing agent={agent} cwd={cwd}"));
     };
     if state.session_id.is_none() {
+        // T-014 (REQ-DS-020): same as above, but for the case where a worker
+        // exists from a prior consult but never carries a session_id (which
+        // is the normal state for DeepSeek, since the runner returns a
+        // synthetic `deepseek-<uuid>` per call but we never resume it).
+        if agent == "deepseek" {
+            state.ask_count = state.ask_count.saturating_add(1);
+            state.last_used_ms = now;
+            let out = state.clone();
+            persist_worker_registry_if_enabled(&workers);
+            return Ok(out);
+        }
         return Err(format!("worker_missing_session agent={agent} cwd={cwd}"));
     }
     state.ask_count = state.ask_count.saturating_add(1);
