@@ -221,3 +221,69 @@ verification of a paid streaming surface is a good cost profile for the audit tr
 - Cost-per-verification well below threshold
 
 **Status: cleared for merge to `main`.**
+
+---
+
+## PROBE-09 (TIER 2 follow-up, B.9 wire-shape verification)
+
+**Task:** Verify that `mcp_bridge::deepseek::run()` — the actual production
+entry point — succeeds end-to-end against `api.deepseek.com`. Wave 0/5 probes
+hand-craft their JSON and bypass `build_request_body`, so they would NOT have
+caught a wire-shape bug in our production builder.
+
+**Date:** 2026-05-26 (same session, post-Wave-5)
+**Trigger:** test-plan TIER 2 B.9 ("thinking-disabled wire-shape verification")
+
+### The bug B.9 caught
+
+Live curl side-by-side against api.deepseek.com:
+
+```
+SHAPE A: {"thinking": "enabled"}  (flat string — what build_request_body sent)
+→ HTTP 400 {"error":{"message":"Failed to deserialize the JSON body into the target
+   type: thinking: invalid type: string \"enabled\", expected struct ThinkingOptions",
+   "type":"invalid_request_error","code":"invalid_request_error"}}
+
+SHAPE B: {"thinking": {"type": "enabled"}}  (nested object — what the API expects)
+→ HTTP 200 with normal content + usage
+```
+
+**Impact:** EVERY production consult through `run()` would have failed at the
+wire with HTTP 400. The Wave 0–5 unit tests passed because they use scripted
+mock servers that return canned responses regardless of request shape. The
+8 contract probes (Wave 0/5) passed because each probe hand-crafts its own
+JSON with the nested shape — they don't exercise `build_request_body`.
+
+**Fix:** `build_request_body` now emits `"thinking": {"type": "enabled"|"disabled"}`
+(nested ThinkingOptions struct). `reasoning_effort` stays flat — confirmed
+accepted by the live API in the same probe.
+
+### PROBE-09 result (post-fix)
+
+```
+PROBE-09 OK: response="ok" session_id=deepseek-probe-09-<pid>
+             usage=input:Some(9)/output:Some(39)/cached:Some(0)
+```
+
+Cost: ~$0.002. The 9 input tokens line up with our cache-miss expectation
+(fresh prompt, no prior). 39 output tokens reflects thinking_mode=enabled
+(default), so reasoning + the "ok" response.
+
+### New permanent regression guards
+
+  1. `probe_09_runner_end_to_end_against_live_api` (this file) — end-to-end
+     production-path live test. Any future change to `build_request_body`
+     that reverts to the flat shape fails here.
+  2. `b9_thinking_wire_shape_is_nested_object_not_flat_string`
+     (`crates/mcp-bridge/src/deepseek.rs`) — unit test pins the nested
+     shape and EXPLICITLY rejects the flat form via grep on the JSON body.
+
+### Lesson
+
+**Unit tests against mock servers do NOT verify wire correctness against
+the real API.** Every other Wave 0–5 test pretended to be the production
+path but the only test that actually exercised `build_request_body` against
+the live API was the one we wrote AFTER suspecting a wire bug. Going
+forward, any module that builds an HTTP request body should have at least
+one `#[ignore]`-gated probe that hits the real endpoint with that exact
+builder output.

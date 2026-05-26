@@ -918,12 +918,22 @@ impl DeepSeekFailureKind {
 /// Build the JSON request body. Pulled out for tests + so the body can be
 /// inspected without making an HTTP call.
 pub fn build_request_body(cfg: &DeepSeekConfig, req: &RunRequest) -> serde_json::Value {
+    // B.9 (test-plan TIER 2) live-probe finding 2026-05-26: the `thinking`
+    // field must be a NESTED object `{"type": "enabled"|"disabled"}`, not a
+    // flat string. The API rejects flat strings with HTTP 400
+    // `Failed to deserialize the JSON body into the target type: thinking:
+    // invalid type: string, expected struct ThinkingOptions`. The contract
+    // probes in tests/deepseek_contract.rs hand-craft the nested shape
+    // directly, which is why they passed; build_request_body never exercised
+    // the wire shape against the live API until B.9.
+    //
+    // `reasoning_effort` IS a flat string per the live probe — keep it flat.
     serde_json::json!({
         "model": cfg.model,
         "messages": req.messages,
         "stream": true,
         "max_tokens": cfg.max_tokens,
-        "thinking": cfg.thinking.as_api_str(),
+        "thinking": { "type": cfg.thinking.as_api_str() },
         "reasoning_effort": cfg.reasoning_effort.as_api_str(),
     })
 }
@@ -2662,21 +2672,59 @@ mod tests {
     /// `ThinkingMode::Enabled`. A future change that defaults flash to
     /// `Disabled` (which the test-plan recommends as an improvement) would
     /// fail this test — at which point update the assertion deliberately.
+    ///
+    /// Updated 2026-05-26 after B.9 live-probe finding: the wire shape is
+    /// NESTED `{"type":"enabled"}`, not flat `"enabled"`.
     #[test]
     fn b2_default_thinking_mode_is_enabled_even_for_flash() {
         let cfg = cfg_with_timings(Duration::from_secs(5), Duration::from_secs(10));
-        // base cfg from cfg_with_timings hardcodes ThinkingMode::Enabled.
         assert_eq!(cfg.thinking, crate::deepseek_config::ThinkingMode::Enabled);
-        // The wire shape carries `"thinking":"enabled"` per ThinkingMode::as_api_str.
         let req = RunRequest {
             messages: vec![RequestMessage { role: "user".to_string(), content: "x".to_string() }],
             session_id: "b2".to_string(),
             prompt_chars_estimate: 1,
             include_reasoning: false,
         };
-        let body = build_request_body(&cfg, &req).to_string();
-        assert!(body.contains("\"thinking\":\"enabled\""),
-            "default request body must carry thinking=enabled; got: {body}");
+        let body = build_request_body(&cfg, &req);
+        // Default thinking is enabled AND wrapped in the nested ThinkingOptions struct.
+        assert_eq!(body["thinking"]["type"], serde_json::json!("enabled"),
+            "default request body must carry thinking={{type:enabled}}; got: {body}");
+    }
+
+    /// B.9 (test-plan TIER 2, found via 2026-05-26 live probe): the API
+    /// rejects flat `"thinking":"enabled"|"disabled"` with HTTP 400. The
+    /// CORRECT wire shape is the nested `{"type":"enabled"|"disabled"}`
+    /// (ThinkingOptions struct, per the deserialization error message). This
+    /// test pins the nested shape so a future change can't accidentally
+    /// revert to the flat form that broke every production consult.
+    #[test]
+    fn b9_thinking_wire_shape_is_nested_object_not_flat_string() {
+        for mode in &[
+            crate::deepseek_config::ThinkingMode::Enabled,
+            crate::deepseek_config::ThinkingMode::Disabled,
+        ] {
+            let mut cfg = cfg_with_timings(Duration::from_secs(5), Duration::from_secs(10));
+            cfg.thinking = *mode;
+            let req = RunRequest {
+                messages: vec![RequestMessage { role: "user".to_string(), content: "x".to_string() }],
+                session_id: "b9".to_string(),
+                prompt_chars_estimate: 1,
+                include_reasoning: false,
+            };
+            let body = build_request_body(&cfg, &req);
+            // MUST be an object with a `type` field, NOT a flat string.
+            assert!(body["thinking"].is_object(),
+                "thinking field must be a JSON object (ThinkingOptions struct); got: {body}");
+            assert_eq!(body["thinking"]["type"], serde_json::json!(mode.as_api_str()),
+                "thinking.type must mirror the as_api_str value; got: {body}");
+            // Pin the regression: the body string must NOT contain the flat form
+            // for either truthy value (would indicate a partial revert).
+            let s = body.to_string();
+            assert!(!s.contains("\"thinking\":\"enabled\""),
+                "B.9 regression: flat thinking:enabled detected (API would 400)");
+            assert!(!s.contains("\"thinking\":\"disabled\""),
+                "B.9 regression: flat thinking:disabled detected (API would 400)");
+        }
     }
 
     /// B.3 — Cache invariant warn: when the streamed `usage` violates
