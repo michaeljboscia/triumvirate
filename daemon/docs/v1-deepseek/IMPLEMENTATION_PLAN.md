@@ -52,14 +52,23 @@
   execute_ask_agent error text, display_agent_name, inter_agent supported-agents fallback.
   deepseek is a new TOP-LEVEL name, NOT a GeminiBackend enum variant.</description>
   <files>daemon/crates/mcp-bridge/src/lib.rs, daemon/crates/triumvirate/src/main.rs,
-    daemon/crates/triumvirate/src/agent_exec.rs, daemon/crates/mcp-tools/src/inter_agent.rs</files>
+    daemon/crates/triumvirate/src/agent_exec.rs, daemon/crates/mcp-tools/src/inter_agent.rs,
+    daemon/crates/mcp-tools/src/lib.rs, daemon/crates/triumvirate/tests/integration_http.rs</files>
   <scope_out>Do NOT modify dispatch routing (T-012 territory). Do NOT add the deepseek HTTP
     runner. Do NOT touch token-economics. Do NOT change Gemini/Codex behavior in any way.</scope_out>
   <tools>cargo check, cargo test, file read/write within the files list.</tools>
   <verify>cargo check --workspace</verify>
   <reality_test>cargo test -p mcp-bridge supports_deepseek_name asserts
     is_supported_agent_name("deepseek")==true and ("claude")==false; an in-process /status
-    test asserts the JSON response's supported_agents array contains "deepseek".</reality_test>
+    test asserts the JSON response's supported_agents array contains "deepseek";
+    AND two INDEPENDENT assertions (one per error path; the two are separate code paths and
+    one alone leaves the other stale):
+    (a) a SESSION-SPAWN request with an unknown agent returns an error whose supported-agents
+    list explicitly contains "deepseek" (covers main.rs ~2008);
+    (b) a POST /ask-agent HTTP request with an unknown agent returns an error response whose
+    supported-agents list explicitly contains "deepseek" — covers agent_exec.rs ~247 via its
+    PUBLIC HTTP surface (execute_ask_agent is pub(crate); /ask-agent is the correct integration-test surface).
+    A stub that flips only the gate, or updates only ONE of the two error texts, fails this.</reality_test>
   <done_when>Every gate/surface hardcoding gemini/codex now also accepts deepseek; daemon
     /status lists "deepseek"; display name returns "DeepSeek".</done_when>
 </task>
