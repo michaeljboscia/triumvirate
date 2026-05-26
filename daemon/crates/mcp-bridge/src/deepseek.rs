@@ -220,10 +220,7 @@ impl StreamParser {
         let mut events = Vec::new();
 
         // Scan for `\n\n` or `\r\n\r\n` boundaries, draining as we go.
-        loop {
-            let Some((payload_end, term_len)) = find_event_terminator(&self.buffer) else {
-                break;
-            };
+        while let Some((payload_end, term_len)) = find_event_terminator(&self.buffer) {
             // Event payload is everything BEFORE the terminator; drain past
             // both so subsequent boundary searches start fresh.
             let event_bytes: Vec<u8> = self.buffer.drain(..payload_end).collect();
@@ -327,10 +324,10 @@ impl StreamParser {
             }
         })?;
 
-        if let Some(id) = chunk.id {
-            if self.request_id.is_none() {
-                self.request_id = Some(id);
-            }
+        if let Some(id) = chunk.id
+            && self.request_id.is_none()
+        {
+            self.request_id = Some(id);
         }
         if let Some(fp) = chunk.system_fingerprint {
             self.system_fingerprint = Some(fp);
@@ -724,8 +721,7 @@ pub fn write_per_request_log(
     std::fs::create_dir_all(log_dir)?;
     let safe_id = sanitize_for_filename(record.request_id);
     let path = log_dir.join(format!("{safe_id}.json"));
-    let json = serde_json::to_string_pretty(record)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(record).map_err(io::Error::other)?;
     std::fs::write(&path, json)?;
     Ok(path)
 }
@@ -1343,29 +1339,17 @@ pub(crate) fn record_fingerprint_for_model(model: &str, fingerprint: &str) -> Op
     let map = MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
     let prev = guard.insert(model.to_string(), fingerprint.to_string());
-    if let Some(ref old) = prev {
-        if old != fingerprint {
-            tracing::warn!(
-                model = %model,
-                old_fingerprint = %old,
-                new_fingerprint = %fingerprint,
-                "deepseek system_fingerprint changed — backend rollover detected"
-            );
-        }
+    if let Some(ref old) = prev
+        && old != fingerprint
+    {
+        tracing::warn!(
+            model = %model,
+            old_fingerprint = %old,
+            new_fingerprint = %fingerprint,
+            "deepseek system_fingerprint changed — backend rollover detected"
+        );
     }
     prev
-}
-
-/// Test-only helper: clear the fingerprint-tracker state so tests don't
-/// interfere with each other.
-#[cfg(test)]
-pub(crate) fn reset_fingerprint_tracker_for_tests() {
-    use std::sync::Mutex;
-    static MAP: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> =
-        std::sync::OnceLock::new();
-    let _ = MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    // Note: cannot reach the production OnceLock from here (different binding).
-    // Tests that need isolation use a distinct model name per test instead.
 }
 
 /// Parse a `Retry-After` HTTP header value into seconds. Per RFC 7231 the
@@ -2324,10 +2308,9 @@ mod tests {
     async fn deepseek_runner_mid_stream_disconnect_returns_network_mid_stream() {
         // Headers claim Content-Length 100000 but we only send a small chunk.
         let partial_body = format!("{}\n\n", sample_reasoning_chunk());
-        let mut script = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
-        )
-        .into_bytes();
+        let mut script: Vec<u8> =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
+                .to_vec();
         script.extend_from_slice(partial_body.as_bytes());
         let url = spawn_scripted_server(vec![script]).await;
 
@@ -2555,7 +2538,7 @@ mod tests {
             ;
         let v = HeaderValue::from_str(&future).expect("header value");
         let secs = parse_retry_after(Some(&v)).expect("parsed");
-        assert!(secs >= 8 && secs <= 11, "expected ~10s, got {secs}");
+        assert!((8..=11).contains(&secs), "expected ~10s, got {secs}");
     }
 
     /// Codex W3-review NIT #2 regression: Windows-reserved basenames AND the
