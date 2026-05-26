@@ -18,6 +18,9 @@ pub mod agy_resilience;
 // T-002 (REQ-DS-002/003/015): authoritative env-config loader for the DeepSeek sibling.
 pub mod deepseek_config;
 
+// T-004 (REQ-DS-006/010): semaphore, token bucket, three-state breaker, classify().
+pub mod deepseek_resilience;
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
