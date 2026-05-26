@@ -202,6 +202,20 @@ fn persist_daemon_token_record(
     }
 }
 
+/// T-015 (REQ-DS-025): byte-size ceiling for the DeepSeek ask_agent path.
+/// Env-configurable via TRIUMVIRATE_DEEPSEEK_BULK_BYTES; default 16384 (16KB).
+/// Invalid env values fall back to the default (the DeepSeekConfig loader is
+/// the authoritative validator — this helper exists so the cap can be read
+/// WITHOUT triggering full config load + OnceLock init for every ask_agent).
+fn deepseek_bulk_bytes_cap() -> usize {
+    const DEFAULT: usize = 16_384;
+    std::env::var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT)
+}
+
 /// T-013 (REQ-DS-026): persist a token record on the DeepSeek Err path so we
 /// don't lose billable tokens when the call fails mid-stream (e.g. 402 hard,
 /// 429 transient, mid-stream disconnect). Gated to the DeepSeek typed-failure
@@ -320,6 +334,28 @@ pub(crate) async fn execute_ask_agent(
         );
     }
     let agent = req.agent.to_lowercase();
+
+    // T-015 (REQ-DS-025) anti-bulk: reject oversized payloads on the metered
+    // DeepSeek path BEFORE any worker is acquired. The default ceiling (16KB)
+    // comes from TRIUMVIRATE_DEEPSEEK_BULK_BYTES (env-configurable). Gemini
+    // and Codex are local CLIs — bulk is free — so the check is GATED to
+    // agent=='deepseek'. The error message names both surfaces ("payload too
+    // large" + "metered") so callers see the cost vector explicitly.
+    if agent == "deepseek" {
+        let cap = deepseek_bulk_bytes_cap();
+        if req.message.len() > cap {
+            span.record("agent.outcome", "rejected_payload_too_large");
+            span.record("agent.tokens", 0_u64);
+            span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+            return Err(format!(
+                "deepseek: payload too large ({} bytes > {} byte cap) — DeepSeek is remote+metered, \
+                 set TRIUMVIRATE_DEEPSEEK_BULK_BYTES to raise the limit",
+                req.message.len(),
+                cap
+            ));
+        }
+    }
+
     // REQ-001: resolve the gemini backend once, up front — it drives both the attempt
     // schedule (agy is single-attempt, REQ-013) and the degraded route (REQ-053).
     let gemini_backend_selected = if agent == "gemini" {
@@ -2503,6 +2539,279 @@ mod deepseek_dispatch_tests {
             None, // no ds_request_id → falls back to fallback_session_id
             &None,
             &None,
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-014 (REQ-DS-020): stateless single-turn.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Reality test: two sequential DeepSeek consults produce DIFFERENT
+    /// session_ids, both starting with "deepseek-". No resume token is
+    /// constructed; the runner generates a fresh uuid per call.
+    #[tokio::test]
+    async fn deepseek_stateless_distinct_session_ids_across_calls() {
+        let body = happy_sse_body();
+        let s1 = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        ).into_bytes();
+        let s2 = s1.clone();
+        let url = spawn_scripted_server(vec![s1, s2]).await;
+
+        let mut cfg = make_cfg(&url);
+        let log_dir = tempfile::tempdir().expect("tempdir");
+        cfg.log_dir = log_dir.path().to_path_buf();
+        let client = ds::build_client(&cfg).expect("client");
+        let resilience = ds::ResilienceState::from_cfg(&cfg);
+
+        let req = shared_types::AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+
+        let r1 = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+            .await
+            .expect("call 1 ok");
+        let r2 = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+            .await
+            .expect("call 2 ok");
+
+        let s1 = r1.session_id.expect("s1");
+        let s2 = r2.session_id.expect("s2");
+        assert!(s1.starts_with("deepseek-"));
+        assert!(s2.starts_with("deepseek-"));
+        assert_ne!(s1, s2, "each consult must mint a fresh uuid; got the same");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T-015 (REQ-DS-011, REQ-DS-012, REQ-DS-025): anti-bulk + entry guards.
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Tests that mutate TRIUMVIRATE_DEEPSEEK_BULK_BYTES share this lock so
+    // they don't race each other (cargo test runs in parallel by default).
+    static BULK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reality test (a): DeepSeek payload over the cap rejects with an error
+    /// message containing both "payload too large" AND "metered". The check
+    /// runs at the very top of execute_ask_agent — we exercise it via the
+    /// public surface using a unit-style helper invocation.
+    #[tokio::test]
+    async fn deepseek_anti_bulk_rejects_oversized_payload() {
+        let _g = BULK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Clear any env override so the default 16KB applies.
+        unsafe { std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES"); }
+        let big = "x".repeat(20_000);
+        let req = shared_types::AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: big,
+            ..Default::default()
+        };
+        let err = execute_ask_agent(&req, None)
+            .await
+            .expect_err("oversized deepseek payload must Err");
+        let lower = err.to_lowercase();
+        assert!(lower.contains("payload too large"), "missing 'payload too large': {err}");
+        assert!(lower.contains("metered"), "missing 'metered': {err}");
+    }
+
+    /// Reality test (b): Gemini accepts the same size. The intercept is
+    /// AGENT-GATED — gemini/codex are local CLIs so bulk is free.
+    ///
+    /// We assert by source-grep that the intercept is wrapped in
+    /// `if agent == "deepseek"`. A runtime test would require gemini-cli
+    /// binaries; the structural test is what the IMPL_PLAN's regression-guard
+    /// pattern calls for.
+    #[test]
+    fn deepseek_anti_bulk_does_not_apply_to_gemini_or_codex() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("agent_exec.rs"),
+        )
+        .expect("read agent_exec.rs");
+
+        let production_src = match src.find("mod deepseek_dispatch_tests") {
+            Some(test_mod_start) => &src[..test_mod_start],
+            None => &src[..],
+        };
+
+        // The intercept is a `req.message.len() > cap` check. Find the
+        // production call site (not the test reference) and confirm the
+        // preceding ~200 chars contain the deepseek gate.
+        let needle = "req.message.len() > cap";
+        let abs = production_src.find(needle).expect(
+            "expected the anti-bulk intercept `req.message.len() > cap` in agent_exec.rs"
+        );
+        let lookback = &production_src[abs.saturating_sub(300)..abs];
+        assert!(
+            lookback.contains("if agent == \"deepseek\""),
+            "anti-bulk intercept must be gated to agent==\"deepseek\""
+        );
+    }
+
+    /// Reality test (c): the cap is env-configurable. Override
+    /// TRIUMVIRATE_DEEPSEEK_BULK_BYTES=32768 and a 20KB payload no longer
+    /// rejects at the intercept (it'll still proceed to the dispatch arm
+    /// which fails because there's no real DeepSeek server in the test).
+    #[tokio::test]
+    async fn deepseek_anti_bulk_cap_is_env_configurable() {
+        let _g = BULK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES", "32768"); }
+        let big = "x".repeat(20_000);
+        let req = shared_types::AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: big,
+            ..Default::default()
+        };
+        let err = execute_ask_agent(&req, None).await.err();
+        unsafe { std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES"); }
+        // Whatever error surfaces, it must NOT be "payload too large".
+        if let Some(msg) = err {
+            assert!(
+                !msg.to_lowercase().contains("payload too large"),
+                "raised cap should not produce the anti-bulk error; got: {msg}"
+            );
+        }
+        // err == None means it succeeded all the way through (improbable in
+        // unit tests without a live DeepSeek server, but explicitly allowed).
+    }
+
+    /// Reality test (d) REQ-DS-011: NO auto-routing on the deepseek path.
+    /// Grep for any router-keyed term landing inside a deepseek branch.
+    #[test]
+    fn deepseek_path_has_no_auto_routing() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("agent_exec.rs"),
+        )
+        .expect("read agent_exec.rs");
+
+        let production_src = match src.find("mod deepseek_dispatch_tests") {
+            Some(t) => &src[..t],
+            None => &src[..],
+        };
+
+        // Find every `"deepseek"` arm/check in production code and verify the
+        // surrounding ~500 chars don't contain "auto_route" or "router.route".
+        let mut i = 0;
+        while let Some(rel) = production_src[i..].find("\"deepseek\"") {
+            let abs = i + rel;
+            let start = abs.saturating_sub(500);
+            let end = (abs + 500).min(production_src.len());
+            let window = &production_src[start..end];
+            assert!(
+                !window.contains("auto_route") && !window.contains("router.route"),
+                "REQ-DS-011 violation: auto-routing logic detected near deepseek branch at offset {abs}"
+            );
+            i = abs + "\"deepseek\"".len();
+        }
+    }
+
+    /// Reality test (e) REQ-DS-012: no sandbox initialization on the
+    /// deepseek path. The deepseek runner files MUST NOT call any sandbox
+    /// init helper.
+    #[test]
+    fn deepseek_path_has_no_sandbox_init() {
+        // Both mcp-bridge deepseek.rs (the runner) and the dispatch arm in
+        // agent_exec.rs are in scope. The sandbox bring-up is keyed off
+        // `sandbox_` symbols and `init_sandbox` in the rest of the daemon.
+        let runner = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("mcp-bridge/src/deepseek.rs"),
+        )
+        .expect("read deepseek.rs");
+        for forbidden in &["sandbox_init", "init_sandbox", "ensure_sandbox"] {
+            assert!(
+                !runner.contains(forbidden),
+                "REQ-DS-012 violation: deepseek runner contains '{forbidden}'"
+            );
+        }
+        // The dispatch arm (run_deepseek_agent in agent_exec.rs) similarly.
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("agent_exec.rs"),
+        )
+        .expect("read agent_exec.rs");
+        let production = match src.find("mod deepseek_dispatch_tests") {
+            Some(t) => &src[..t],
+            None => &src[..],
+        };
+        let fn_start = production
+            .find("async fn run_deepseek_agent(")
+            .expect("run_deepseek_agent exists");
+        // Find the matching close brace (rough — just scan to the next
+        // top-level "async fn " or end of production_src).
+        let next_fn = production[fn_start + 1..]
+            .find("\nasync fn ")
+            .or_else(|| production[fn_start + 1..].find("\nfn "))
+            .map(|d| fn_start + 1 + d)
+            .unwrap_or(production.len());
+        let body = &production[fn_start..next_fn];
+        for forbidden in &["sandbox_init", "init_sandbox", "ensure_sandbox"] {
+            assert!(
+                !body.contains(forbidden),
+                "REQ-DS-012 violation: run_deepseek_agent contains '{forbidden}'"
+            );
+        }
+    }
+
+    /// prewarm_daemon_workers MUST NOT spawn a deepseek worker. We assert
+    /// structurally — by source-grep — that the prewarm function only calls
+    /// `prewarm_worker("gemini"...)` and `prewarm_worker("codex"...)`, not
+    /// deepseek. (A runtime test would need an HTTP daemon spun up; the
+    /// source-grep is the canary the IMPL_PLAN demands.)
+    #[test]
+    fn deepseek_prewarm_slot_is_a_safe_no_op() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("agent_exec.rs"),
+        )
+        .expect("read agent_exec.rs");
+
+        // Restrict to the prewarm_daemon_workers function body.
+        let fn_start = src
+            .find("pub(crate) async fn prewarm_daemon_workers()")
+            .expect("prewarm_daemon_workers exists");
+        let body_start = src[fn_start..]
+            .find('{')
+            .expect("function body opens")
+            + fn_start;
+        // Find the matching closing brace.
+        let bytes = src.as_bytes();
+        let mut depth = 0i32;
+        let mut body_end = body_start;
+        for i in body_start..bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[body_start..=body_end];
+        assert!(
+            body.contains("prewarm_worker(\"gemini\""),
+            "prewarm must still spawn gemini"
+        );
+        assert!(
+            body.contains("prewarm_worker(\"codex\""),
+            "prewarm must still spawn codex"
+        );
+        assert!(
+            !body.contains("prewarm_worker(\"deepseek\""),
+            "prewarm MUST NOT spawn a deepseek worker (REQ-DS-020 — stateless)"
         );
     }
 
