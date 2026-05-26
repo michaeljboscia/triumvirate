@@ -109,7 +109,11 @@ pub struct DeepSeekConfig {
     pub base_url: String,
     /// REQ-DS-003. Required (no default); empty if env var absent.
     pub api_key: ApiKey,
-    /// REQ-DS-005. Default: `deepseek-v4-pro`. Set to `deepseek-v4-flash` to swap models.
+    /// REQ-DS-005. **Default: `deepseek-v4-pro`** — held pending the empirical
+    /// Pro-vs-Flash capability eval (see PRO_VS_FLASH_TEST_PLAN.md). The
+    /// per-call `deepseek_model` override is available for callers who want
+    /// Flash today; the default flip happens after the eval produces a
+    /// data-driven recommendation.
     pub model: String,
     /// REQ-DS-005. Default: 32768 (generous; shared with reasoning budget).
     pub max_tokens: u32,
@@ -213,6 +217,18 @@ impl DeepSeekConfig {
 
         let api_key = ApiKey::new(load_api_key()?);
 
+        // Default remains deepseek-v4-pro pending the empirical Pro-vs-Flash
+        // capability eval (see daemon/docs/v1-deepseek/PRO_VS_FLASH_TEST_PLAN.md).
+        // The per-call `deepseek_model` override on AskAgentRequest is the
+        // mechanism for switching to flash on a per-consult basis today;
+        // operator default flip will land in a follow-up PR once the eval
+        // data justifies it. Concrete signal driving the hold:
+        //   - 2026-05-26 production session: caller hit a "truncated response"
+        //     symptom (model emitted a `<triumvirate_tool>` tag with no review
+        //     content). Possibly a Flash failure mode tied to identifier-
+        //     bleeding / tool-tag mimicry; until we have eval data we can't
+        //     blame the model variant — but we shouldn't ship the default
+        //     flip until we know.
         let model = read_env("TRIUMVIRATE_DEEPSEEK_MODEL")
             .unwrap_or_else(|| "deepseek-v4-pro".to_string());
 

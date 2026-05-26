@@ -1454,6 +1454,14 @@ fn cfg_with_overrides(base: &DeepSeekConfig, req: Option<&AskAgentRequest>) -> D
     if let Some(n) = r.deepseek_max_tokens {
         cfg.max_tokens = n;
     }
+    // 2026-05-26 follow-up: per-call model override. Empty strings are ignored
+    // (treated as not-set) so a caller sending an explicit "" doesn't blank
+    // the configured default with an invalid value.
+    if let Some(m) = r.deepseek_model.as_deref()
+        && !m.trim().is_empty()
+    {
+        cfg.model = m.to_string();
+    }
     cfg
 }
 
@@ -2461,6 +2469,54 @@ mod deepseek_dispatch_tests {
         assert_eq!(cfg.reasoning_effort, base.reasoning_effort);
         assert_eq!(cfg.thinking, base.thinking);
         assert_eq!(cfg.max_tokens, base.max_tokens);
+    }
+
+    /// 2026-05-26 follow-up: per-call model override picks Pro/Flash without
+    /// daemon restart. Empty strings are ignored (don't blank the configured
+    /// default). None preserves the cfg default.
+    #[test]
+    fn cfg_with_overrides_picks_model_per_call() {
+        use shared_types::AskAgentRequest;
+        let base = make_cfg("http://unused"); // base.model = "deepseek-v4-pro"
+
+        // None → cfg model unchanged.
+        let cfg = cfg_with_overrides(&base, None);
+        assert_eq!(cfg.model, "deepseek-v4-pro");
+
+        // Some("deepseek-v4-flash") → swap to flash for this call.
+        let req = AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "x".to_string(),
+            deepseek_model: Some("deepseek-v4-flash".to_string()),
+            ..Default::default()
+        };
+        let cfg = cfg_with_overrides(&base, Some(&req));
+        assert_eq!(cfg.model, "deepseek-v4-flash");
+
+        // Empty string → ignored, default preserved (defensive against a
+        // caller mistakenly sending "" instead of omitting the field).
+        let req = AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "x".to_string(),
+            deepseek_model: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let cfg = cfg_with_overrides(&base, Some(&req));
+        assert_eq!(
+            cfg.model, "deepseek-v4-pro",
+            "empty/whitespace deepseek_model must not blank the cfg default"
+        );
+
+        // Arbitrary string passes through — the API will reject unknown
+        // models with 400 via the runner's HardProvider classification.
+        let req = AskAgentRequest {
+            agent: "deepseek".to_string(),
+            message: "x".to_string(),
+            deepseek_model: Some("deepseek-v5-experimental".to_string()),
+            ..Default::default()
+        };
+        let cfg = cfg_with_overrides(&base, Some(&req));
+        assert_eq!(cfg.model, "deepseek-v5-experimental");
     }
 
     /// Cross-task regression: gemini/codex dispatch arms remain.
