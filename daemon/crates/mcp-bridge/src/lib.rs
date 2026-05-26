@@ -15,6 +15,10 @@ pub use codex_capabilities::{
 pub mod agy;
 pub mod agy_resilience;
 
+// T-002 (REQ-DS-002/003/015): authoritative env-config loader for the DeepSeek sibling.
+pub mod deepseek_config;
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
     pub name: &'static str,
