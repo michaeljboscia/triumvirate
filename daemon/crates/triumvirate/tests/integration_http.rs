@@ -485,9 +485,9 @@ async fn i_ds_03_ask_agent_unknown_agent_error_mentions_deepseek() -> anyhow::Re
         .json(&json!({"agent": "fake-agent", "message": "test", "cwd": "."}))
         .send()
         .await?;
-    // /ask-agent returns 200 with a structured response carrying the error string
-    // (the execute_ask_agent error path bubbles up as the response body, not as a
-    // 4xx). Either status path is acceptable — we assert on the body content.
+    // /ask-agent serialises the execute_ask_agent error into a JSON body that lists
+    // the supported agents. Status code varies (the daemon-http executor-error path
+    // currently maps to 502) — this test asserts on the body content, not the status.
     let body: Value = resp.json().await?;
     let body_str = serde_json::to_string(&body)?;
     assert!(
