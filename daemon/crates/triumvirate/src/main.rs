@@ -200,6 +200,12 @@ fn init_process_token_db() -> anyhow::Result<Arc<TokenDb>> {
     let home = core_triumvirate_home_dir()?;
     let db_path = home.join("token-economics.db");
     let db = token_economics::open(&db_path)?;
+    // T-003 (REQ-DS-009): seed the DeepSeek price rows on first run so the runner's
+    // synchronous per-consult cost calc (calculate_cost_usd) finds them. Idempotent —
+    // safe to call on every daemon boot.
+    if let Err(err) = token_economics::ensure_deepseek_prices(&db) {
+        tracing::warn!(?err, "deepseek price seeding failed; per-consult cost calc may return None until resolved");
+    }
     let db = Arc::new(db);
     let _ = PROCESS_TOKEN_DB.set(db.clone());
     Ok(db)
