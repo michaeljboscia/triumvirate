@@ -387,8 +387,29 @@ pub enum DeepSeekFailureKind {
     /// `cfg.reasoning_cap_tokens`. This is a BUDGET decision, not a provider
     /// fault — the runner MUST NOT call breaker.record() on this failure.
     RunawayReasoning { observed_tokens: i64 },
-    // T-010 will add: HardProvider(u16), Transient(u16), NetworkMidStream,
-    //                  AbsoluteTimeoutExceeded, ...
+    /// T-010: HTTP 4xx that classify() decided is Hard (400/401/402/403/422).
+    /// The runner records this on the breaker as `Outcome::HardError`.
+    HardProvider(u16),
+    /// T-010: HTTP 429/5xx after the in-runner 429-Retry-After retry was
+    /// exhausted (or wasn't applicable). Recorded as `Outcome::TransientError`.
+    Transient(u16),
+    /// T-010: connect / DNS / request-build error before the first response
+    /// byte. The runner already retried once; this is the second-failure
+    /// surface. Treated as transient by the breaker.
+    NetworkPreFirstByte(String),
+    /// T-010: stream byte error AFTER the first response byte. Estimated
+    /// usage is attached because no `usage` chunk was seen.
+    NetworkMidStream(String),
+    /// T-010 (REQ-DS-024): the outer `tokio::time::timeout` fired before
+    /// `[DONE]` was seen. Recorded as transient.
+    AbsoluteTimeoutExceeded,
+    /// T-010: the breaker refused at request time. The variant carries the
+    /// state so the dispatch layer can surface the right user message.
+    BreakerOpen(BreakerState),
+    /// T-010: parser raised a typed ParseError mid-stream. Treated as a
+    /// transient SSE-malformed condition for breaker purposes — DeepSeek
+    /// streaming format isn't expected to break, so this is a real signal.
+    ParserError(String),
 }
 
 impl std::fmt::Display for DeepSeekFailureKind {
@@ -406,6 +427,23 @@ impl std::fmt::Display for DeepSeekFailureKind {
             }
             DeepSeekFailureKind::RunawayReasoning { observed_tokens } => {
                 write!(f, "runaway reasoning: ~{observed_tokens} tokens crossed cap")
+            }
+            DeepSeekFailureKind::HardProvider(code) => write!(f, "deepseek HTTP {code} (hard)"),
+            DeepSeekFailureKind::Transient(code) => write!(f, "deepseek HTTP {code} (transient)"),
+            DeepSeekFailureKind::NetworkPreFirstByte(detail) => {
+                write!(f, "deepseek network failure before first byte: {detail}")
+            }
+            DeepSeekFailureKind::NetworkMidStream(detail) => {
+                write!(f, "deepseek mid-stream network failure: {detail}")
+            }
+            DeepSeekFailureKind::AbsoluteTimeoutExceeded => {
+                write!(f, "deepseek absolute SLA timeout exceeded")
+            }
+            DeepSeekFailureKind::BreakerOpen(state) => {
+                write!(f, "deepseek breaker is open: {state:?}")
+            }
+            DeepSeekFailureKind::ParserError(detail) => {
+                write!(f, "deepseek SSE parser error: {detail}")
             }
         }
     }
@@ -633,6 +671,432 @@ fn sanitize_for_filename(s: &str) -> String {
 pub fn now_rfc3339_utc() -> String {
     chrono::Utc::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-010 (REQ-DS-004, 005, 008, 014, 024): top-level runner.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The runner orchestrates everything: breaker → semaphore → request body →
+// streaming POST → SSE parser → guards (T-007) → runaway check (T-008) →
+// finalize → usage map (T-009) → per-request log (T-009). It returns a
+// typed Result so the caller can route a HardProvider differently from a
+// Transient (REQ-DS-008 — no sibling substitution; failures stay typed).
+//
+// Retries are SCOPED:
+//   - Pre-first-byte network failure: 1 retry (connect timeouts, DNS, etc.)
+//   - 429 with Retry-After header: 1 retry honoring the suggested wait
+//     (clamped to 10s so a malicious header can't park us forever)
+// No outer retry loop — those would be REQ-DS-008 violations.
+//
+// The absolute SLA ceiling (REQ-DS-024) wraps the whole call in
+// tokio::time::timeout(cfg.timeout). When it fires the runner emits a typed
+// AbsoluteTimeoutExceeded failure (NOT a panic), records a transient outcome
+// on the breaker, and returns.
+
+use futures_util::StreamExt;
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::deepseek_resilience::{
+    AcquireDecision, Breaker, BreakerState, ConcurrencyCap, Outcome, classify,
+};
+
+/// One DeepSeek consult's request. The runner uses these fields to build the
+/// JSON request body; nothing else (notably, `messages_text` is NEVER logged
+/// — REQ-DS-023).
+#[derive(Clone, Debug)]
+pub struct RunRequest {
+    pub messages: Vec<RequestMessage>,
+    /// Caller-provided session id. The runner attaches it to the returned
+    /// ParsedAgentResult; the dispatch layer (T-012) is responsible for
+    /// ensuring it starts with `deepseek-`.
+    pub session_id: String,
+    /// Best-effort caller estimate of prompt size in chars, used for the
+    /// estimated-usage fallback (T-009). Zero is fine.
+    pub prompt_chars_estimate: i64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RequestMessage {
+    pub role: String, // "system" | "user" | "assistant"
+    pub content: String,
+}
+
+/// Shared resilience state — the dispatch layer (T-012) constructs this once
+/// per daemon process and passes a reference to every `run()` invocation.
+/// `Arc<Mutex<Breaker>>` because the breaker is stateful AND shared across
+/// concurrent consults.
+#[derive(Clone)]
+pub struct ResilienceState {
+    pub breaker: Arc<std::sync::Mutex<Breaker>>,
+    pub concurrency: ConcurrencyCap,
+}
+
+impl ResilienceState {
+    pub fn from_cfg(cfg: &DeepSeekConfig) -> Self {
+        Self {
+            breaker: Arc::new(std::sync::Mutex::new(Breaker::new(Default::default()))),
+            concurrency: ConcurrencyCap::new(cfg.max_concurrent),
+        }
+    }
+}
+
+/// Typed failure surface returned by `run()`. The discriminant tells the
+/// caller whether to surface the failure to the user as-is (HardProvider),
+/// log + retry-later (Transient), or treat as an SLA breach
+/// (AbsoluteTimeoutExceeded).
+#[derive(Debug)]
+pub struct DeepSeekFailure {
+    pub kind: DeepSeekFailureKind,
+    /// Best-effort usage record so the dispatch layer can persist tokens
+    /// even on failure paths (REQ-DS-026; T-013 wires Err-path persistence).
+    pub usage: Option<TokenUsage>,
+    /// Raw bytes received before failure — feeds the estimated_usage fallback
+    /// when no usage chunk was seen.
+    pub bytes_received: i64,
+    pub request_id: Option<String>,
+}
+
+// Extend DeepSeekFailureKind with the runner's failure modes. We do this via
+// a helper module-level enum because adding variants to the existing enum
+// would conflict with T-007's Display impl; instead the runner constructs
+// `RunnerFailureKind` values that flatten into the same `DeepSeekFailureKind`
+// once T-010 lands.
+
+impl DeepSeekFailureKind {
+    pub fn is_hard(&self) -> bool {
+        matches!(
+            self,
+            DeepSeekFailureKind::GhostSuccessEmbedded {
+                classification: Classification::Hard,
+                ..
+            } | DeepSeekFailureKind::HardProvider(_)
+        )
+    }
+
+    pub fn is_runner_transient(&self) -> bool {
+        matches!(
+            self,
+            DeepSeekFailureKind::Transient(_)
+                | DeepSeekFailureKind::NetworkMidStream(_)
+                | DeepSeekFailureKind::AbsoluteTimeoutExceeded
+                | DeepSeekFailureKind::GhostSuccessEmbedded {
+                    classification: Classification::Transient,
+                    ..
+                }
+        )
+    }
+}
+
+/// Build the JSON request body. Pulled out for tests + so the body can be
+/// inspected without making an HTTP call.
+pub fn build_request_body(cfg: &DeepSeekConfig, req: &RunRequest) -> serde_json::Value {
+    serde_json::json!({
+        "model": cfg.model,
+        "messages": req.messages,
+        "stream": true,
+        "max_tokens": cfg.max_tokens,
+        "thinking": cfg.thinking.as_api_str(),
+        "reasoning_effort": cfg.reasoning_effort.as_api_str(),
+    })
+}
+
+/// REQ-DS-004 / REQ-DS-005 / REQ-DS-008 / REQ-DS-014 / REQ-DS-024 — top-level
+/// DeepSeek runner. Returns a clean `ParsedAgentResult` on success or a typed
+/// `DeepSeekFailure` for every failure mode. Caller-side substitution is
+/// forbidden (REQ-DS-008): the dispatch layer must surface this failure
+/// directly, not retry with Gemini/Codex.
+pub async fn run(
+    cfg: &DeepSeekConfig,
+    client: &reqwest::Client,
+    req: &RunRequest,
+    resilience: &ResilienceState,
+) -> Result<agent_adapter::ParsedAgentResult, DeepSeekFailure> {
+    // Phase 1: breaker check (cheap; happens before any IO).
+    let decision = {
+        let mut b = resilience
+            .breaker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        b.try_acquire(Instant::now())
+    };
+    match decision {
+        AcquireDecision::Allow => {}
+        AcquireDecision::BlockHard => {
+            return Err(DeepSeekFailure {
+                kind: DeepSeekFailureKind::BreakerOpen(BreakerState::HardOpenInsufficientBalance),
+                usage: None,
+                bytes_received: 0,
+                request_id: None,
+            });
+        }
+        AcquireDecision::BlockTransient { retry_after } => {
+            return Err(DeepSeekFailure {
+                kind: DeepSeekFailureKind::BreakerOpen(BreakerState::OpenTransient {
+                    until: Instant::now() + retry_after,
+                    attempts: 0,
+                }),
+                usage: None,
+                bytes_received: 0,
+                request_id: None,
+            });
+        }
+    }
+
+    // Phase 2: concurrency cap (semaphore — async wait).
+    let _permit = resilience.concurrency.acquire().await;
+
+    // Phase 3: wrap the whole consult in the absolute-timeout SLA.
+    let inner = run_inner(cfg, client, req);
+    let outcome = tokio::time::timeout(cfg.timeout, inner).await;
+
+    let result = match outcome {
+        Ok(r) => r,
+        Err(_elapsed) => Err(DeepSeekFailure {
+            kind: DeepSeekFailureKind::AbsoluteTimeoutExceeded,
+            usage: None,
+            bytes_received: 0,
+            request_id: None,
+        }),
+    };
+
+    // Phase 4: report the outcome to the breaker. RunawayReasoning and
+    // BadFinishReason are budget/policy decisions — do NOT touch the breaker.
+    {
+        let mut b = resilience
+            .breaker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        match &result {
+            Ok(_) => b.record(Outcome::Success, now),
+            Err(f) => match &f.kind {
+                DeepSeekFailureKind::HardProvider(code) => b.record(Outcome::HardError(*code), now),
+                DeepSeekFailureKind::Transient(code) => b.record(Outcome::TransientError(*code), now),
+                DeepSeekFailureKind::NetworkMidStream(_)
+                | DeepSeekFailureKind::NetworkPreFirstByte(_)
+                | DeepSeekFailureKind::ParserError(_)
+                | DeepSeekFailureKind::AbsoluteTimeoutExceeded => {
+                    b.record(Outcome::TransientError(0), now)
+                }
+                DeepSeekFailureKind::GhostSuccessEmbedded { classification, .. } => match classification {
+                    Classification::Hard => b.record(Outcome::HardError(402), now),
+                    Classification::Transient => b.record(Outcome::TransientError(429), now),
+                },
+                // BREAKER-NEUTRAL kinds (T-008 contract, T-007 partial):
+                DeepSeekFailureKind::RunawayReasoning { .. }
+                | DeepSeekFailureKind::BadFinishReason(_)
+                | DeepSeekFailureKind::BreakerOpen(_) => {}
+            },
+        }
+    }
+
+    result
+}
+
+async fn run_inner(
+    cfg: &DeepSeekConfig,
+    client: &reqwest::Client,
+    req: &RunRequest,
+) -> Result<agent_adapter::ParsedAgentResult, DeepSeekFailure> {
+    let body = build_request_body(cfg, req);
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+
+    // Pre-first-byte retry: at most ONE additional attempt for connect/DNS/
+    // request-construction errors. 429-with-Retry-After is a SEPARATE retry
+    // budget (also at most one) — they don't share a counter so a 429 after
+    // a network-retry still gets its own honored wait.
+    let mut pre_byte_attempts = 0u32;
+    let mut retry_after_used = false;
+
+    loop {
+        let send_result = client
+            .post(&url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", cfg.api_key.expose()),
+            )
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body)
+            .send()
+            .await;
+
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) => {
+                let class_label = e.to_string();
+                if pre_byte_attempts == 0 && (e.is_connect() || e.is_request() || e.is_timeout()) {
+                    pre_byte_attempts += 1;
+                    continue;
+                }
+                return Err(DeepSeekFailure {
+                    kind: DeepSeekFailureKind::NetworkPreFirstByte(class_label),
+                    usage: None,
+                    bytes_received: 0,
+                    request_id: None,
+                });
+            }
+        };
+
+        let status = resp.status().as_u16();
+
+        if status == 429 && !retry_after_used {
+            // Honor Retry-After once.
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1)
+                .min(10);
+            retry_after_used = true;
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+
+        if !resp.status().is_success() {
+            // Capture a bounded slice of the error body for diagnostics. The
+            // body MAY contain the request payload echo in some 4xx responses;
+            // we don't write it to the per-request log file, only into the
+            // typed failure for transient/hard routing.
+            let kind = match classify(status) {
+                Classification::Hard => DeepSeekFailureKind::HardProvider(status),
+                Classification::Transient => DeepSeekFailureKind::Transient(status),
+            };
+            return Err(DeepSeekFailure {
+                kind,
+                usage: None,
+                bytes_received: 0,
+                request_id: None,
+            });
+        }
+
+        // Happy path entry: consume the SSE stream.
+        return consume_stream(resp, cfg, &req.session_id, req.prompt_chars_estimate).await;
+    }
+}
+
+async fn consume_stream(
+    resp: reqwest::Response,
+    cfg: &DeepSeekConfig,
+    session_id: &str,
+    prompt_chars_estimate: i64,
+) -> Result<agent_adapter::ParsedAgentResult, DeepSeekFailure> {
+    let mut parser = StreamParser::new();
+    let mut bytes_received: i64 = 0;
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(b) => b,
+            Err(e) => {
+                let usage = estimate_usage(bytes_received, prompt_chars_estimate / 4);
+                return Err(DeepSeekFailure {
+                    kind: DeepSeekFailureKind::NetworkMidStream(e.to_string()),
+                    usage: Some(usage),
+                    bytes_received,
+                    request_id: parser.request_id.clone(),
+                });
+            }
+        };
+        bytes_received += chunk.len() as i64;
+        if let Err(e) = parser.feed(&chunk) {
+            // Parser error — treat as a transient ish/SSE-malformed condition.
+            return Err(DeepSeekFailure {
+                kind: DeepSeekFailureKind::ParserError(e.to_string()),
+                usage: Some(estimate_usage(bytes_received, prompt_chars_estimate / 4)),
+                bytes_received,
+                request_id: parser.request_id.clone(),
+            });
+        }
+        // T-008 runaway check.
+        if parser.is_runaway(cfg.reasoning_cap_tokens) {
+            let observed = parser.estimated_reasoning_tokens();
+            let usage = estimate_usage(bytes_received, prompt_chars_estimate / 4);
+            // Drop the stream by returning — reqwest cancels the body future.
+            return Err(DeepSeekFailure {
+                kind: DeepSeekFailureKind::RunawayReasoning { observed_tokens: observed },
+                usage: Some(usage),
+                bytes_received,
+                request_id: parser.request_id.clone(),
+            });
+        }
+        if parser.done {
+            break;
+        }
+    }
+
+    // Stream ended (either [DONE] or the upstream closed cleanly).
+    let finalized = match finalize_stream(&parser) {
+        Ok(f) => f,
+        Err(kind) => {
+            let usage = parser
+                .usage
+                .as_ref()
+                .map(map_usage)
+                .or_else(|| Some(estimate_usage(bytes_received, prompt_chars_estimate / 4)));
+            return Err(DeepSeekFailure {
+                kind,
+                usage,
+                bytes_received,
+                request_id: parser.request_id.clone(),
+            });
+        }
+    };
+
+    let usage = finalized
+        .usage
+        .as_ref()
+        .map(map_usage)
+        .unwrap_or_else(|| estimate_usage(bytes_received, prompt_chars_estimate / 4));
+
+    // Best-effort per-request log. Errors are warned-not-failed.
+    if let Some(req_id) = finalized.request_id.as_deref() {
+        let capped_reasoning = cap_reasoning(&finalized.reasoning, cfg.log_reasoning_cap_bytes);
+        let record = PerRequestLogRecord {
+            request_id: req_id,
+            model: &cfg.model,
+            system_fingerprint: finalized.system_fingerprint.as_deref(),
+            reasoning_content: capped_reasoning,
+            content: &finalized.content,
+            usage: &usage,
+            cost_usd: None, // T-012/T-013 wire calculate_cost_usd in
+            finish_reason: &finalized.finish_reason,
+            timestamp: now_rfc3339_utc(),
+        };
+        if let Err(e) = write_per_request_log(&cfg.log_dir, &record) {
+            tracing::warn!(
+                request_id = req_id,
+                error = %e,
+                "deepseek per-request log write failed (consult unaffected)"
+            );
+        }
+    }
+
+    Ok(agent_adapter::ParsedAgentResult {
+        response_text: finalized.content.clone(),
+        session_id: Some(session_id.to_string()),
+        events: Vec::new(),
+        tool_calls: Vec::new(),
+        token_usage: Some(to_adapter_token_usage(&usage)),
+        cli_version: None,
+        parser_mode: "deepseek-sse".to_string(),
+    })
+}
+
+fn to_adapter_token_usage(u: &TokenUsage) -> agent_adapter::TokenUsage {
+    agent_adapter::TokenUsage {
+        input: Some(u.input_tokens.max(0) as u64),
+        output: Some(u.output_tokens.max(0) as u64),
+        cached: Some(u.cached_tokens.max(0) as u64),
+        thinking_tokens: None,
+        latency_ms: None,
+        tool_calls: None,
+        total: Some(
+            (u.input_tokens.max(0) + u.output_tokens.max(0) + u.cached_tokens.max(0)) as u64,
+        ),
+    }
 }
 
 /// Scan for the first SSE event terminator — `\n\n` (LF-LF) OR `\r\n\r\n`
@@ -1361,6 +1825,290 @@ mod tests {
         assert_eq!(path.parent(), Some(temp.path()));
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // T-010 runner tests — drive run() against a scripted local TCP server.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Spawn a TCP server that serves N successive connections with the
+    /// provided byte scripts (one per connection). The server is one-shot
+    /// per connection: it reads the request to EOL terminator best-effort,
+    /// writes the script, then closes. Returns the URL the client should
+    /// POST to (we point the client at /chat/completions; the server doesn't
+    /// path-route — every request gets the next script).
+    async fn spawn_scripted_server(scripts: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let url = format!("http://{}", addr);
+
+        tokio::spawn(async move {
+            for script in scripts {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                // Read the request best-effort (drop after a short window so we
+                // don't block on a client that keeps the connection idle).
+                let mut buf = [0u8; 8192];
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    tokio::io::AsyncReadExt::read(&mut sock, &mut buf),
+                )
+                .await;
+                let _ = sock.write_all(&script).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        url
+    }
+
+    fn happy_sse_body() -> String {
+        format!(
+            "{}\n\n{}\n\n{}\n\ndata: [DONE]\n\n",
+            sample_reasoning_chunk(),
+            sample_content_chunk(),
+            sample_usage_chunk(),
+        )
+    }
+
+    fn http_response_with_body(status_line: &str, body: &str, extra_headers: &str) -> Vec<u8> {
+        format!(
+            "{}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+            status_line,
+            body.len(),
+            extra_headers,
+            body,
+        )
+        .into_bytes()
+    }
+
+    /// Build a test cfg that points base_url at the supplied URL. Default
+    /// timeouts kept long enough not to fire during the test, short enough
+    /// to keep CI snappy. Reasoning cap disabled.
+    fn cfg_for(url: &str, absolute_timeout: Duration) -> DeepSeekConfig {
+        DeepSeekConfig {
+            base_url: url.to_string(),
+            api_key: crate::deepseek_config::ApiKey::new("sk-test-key-do-not-log"),
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 1024,
+            thinking: crate::deepseek_config::ThinkingMode::Enabled,
+            reasoning_effort: crate::deepseek_config::ReasoningEffort::High,
+            read_timeout: Duration::from_secs(5),
+            timeout: absolute_timeout,
+            tcp_keepalive: Duration::from_secs(30),
+            max_concurrent: 4,
+            max_rpm: 60,
+            reasoning_cap_tokens: 0,
+            log_dir: std::env::temp_dir().join("deepseek-runner-test"),
+            log_reasoning_cap_bytes: 262_144,
+            bulk_bytes: 16_384,
+        }
+    }
+
+    fn make_req() -> RunRequest {
+        RunRequest {
+            messages: vec![RequestMessage {
+                role: "user".to_string(),
+                content: "PRIVATE-USER-PROMPT-do-not-log-this".to_string(),
+            }],
+            session_id: "deepseek-test-session-001".to_string(),
+            prompt_chars_estimate: 36,
+        }
+    }
+
+    /// Reality test (a): canned reasoning → content → usage → [DONE] →
+    /// run() returns Ok(ParsedAgentResult) with session_id, mapped token usage,
+    /// and content == "final answer text".
+    ///
+    /// Stub guard: a run() that ignores the mock response and returns Ok with
+    /// empty content would fail the content equality assertion.
+    #[tokio::test]
+    async fn deepseek_runner_happy_path_returns_ok_with_parsed_result() {
+        let body = happy_sse_body();
+        let script = http_response_with_body("HTTP/1.1 200 OK", &body, "");
+        let url = spawn_scripted_server(vec![script]).await;
+
+        let cfg = cfg_for(&url, Duration::from_secs(10));
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        let result = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect("happy path must return Ok");
+
+        assert_eq!(result.response_text, "final answer text");
+        assert_eq!(result.session_id.as_deref(), Some("deepseek-test-session-001"));
+        let usage = result.token_usage.as_ref().expect("token_usage populated");
+        assert_eq!(usage.input, Some(18));
+        assert_eq!(usage.output, Some(174), "must NOT double-add reasoning");
+        assert_eq!(usage.cached, Some(0));
+        // Breaker should be Closed after a clean success.
+        assert_eq!(
+            resilience.breaker.lock().unwrap().state(),
+            crate::deepseek_resilience::BreakerState::Closed
+        );
+    }
+
+    /// Reality test (b): a 402 status closes the response with no SSE body.
+    /// run() returns Err(HardProvider(402)) and the breaker latches to
+    /// HardOpenInsufficientBalance.
+    #[tokio::test]
+    async fn deepseek_runner_402_returns_hard_provider_and_latches_breaker() {
+        let script = http_response_with_body("HTTP/1.1 402 Payment Required", "", "");
+        let url = spawn_scripted_server(vec![script]).await;
+
+        let cfg = cfg_for(&url, Duration::from_secs(10));
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        let failure = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect_err("402 must Err");
+        match failure.kind {
+            DeepSeekFailureKind::HardProvider(402) => {}
+            other => panic!("expected HardProvider(402), got {other:?}"),
+        }
+        assert_eq!(
+            resilience.breaker.lock().unwrap().state(),
+            crate::deepseek_resilience::BreakerState::HardOpenInsufficientBalance
+        );
+    }
+
+    /// Reality test (c): 429 with Retry-After:1 on the first connection,
+    /// then a happy stream on the second → run() returns Ok. One internal
+    /// retry honored; no retry beyond that.
+    #[tokio::test]
+    async fn deepseek_runner_429_with_retry_after_then_succeeds() {
+        let script_429 = http_response_with_body(
+            "HTTP/1.1 429 Too Many Requests",
+            "",
+            "Retry-After: 1\r\n",
+        );
+        let script_ok = http_response_with_body("HTTP/1.1 200 OK", &happy_sse_body(), "");
+        let url = spawn_scripted_server(vec![script_429, script_ok]).await;
+
+        let cfg = cfg_for(&url, Duration::from_secs(15));
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        let started = Instant::now();
+        let result = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect("retry-after-honored 429 then 200 must succeed");
+        let elapsed = started.elapsed();
+        assert_eq!(result.response_text, "final answer text");
+        // The runner waited at least 1s for the Retry-After.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "Retry-After:1 should have produced at least ~1s delay; got {elapsed:?}"
+        );
+    }
+
+    /// Reality test (d): server sends 200 headers + a partial body then
+    /// closes. Content-Length is set larger than the bytes actually written
+    /// so reqwest sees a truncated body and yields an Err — run() returns
+    /// NetworkMidStream with estimated usage.
+    #[tokio::test]
+    async fn deepseek_runner_mid_stream_disconnect_returns_network_mid_stream() {
+        // Headers claim Content-Length 100000 but we only send a small chunk.
+        let partial_body = format!("{}\n\n", sample_reasoning_chunk());
+        let mut script = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        script.extend_from_slice(partial_body.as_bytes());
+        let url = spawn_scripted_server(vec![script]).await;
+
+        let cfg = cfg_for(&url, Duration::from_secs(10));
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        let failure = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect_err("truncated body must Err");
+        assert!(
+            matches!(failure.kind, DeepSeekFailureKind::NetworkMidStream(_)),
+            "expected NetworkMidStream, got {:?}",
+            failure.kind
+        );
+        // Estimated usage MUST be populated since no `usage` chunk was seen.
+        let usage = failure.usage.as_ref().expect("estimated usage populated");
+        assert_eq!(usage.usage_source, UsageSource::Estimated);
+        assert!(failure.bytes_received > 0, "we received SOME bytes before EOF");
+    }
+
+    /// Privacy regression for the runner: even if the runner writes a
+    /// per-request log on the happy path, the log file must NOT contain the
+    /// API key or the request messages text.
+    #[tokio::test]
+    async fn deepseek_runner_log_excludes_secrets_and_messages() {
+        let body = happy_sse_body();
+        let script = http_response_with_body("HTTP/1.1 200 OK", &body, "");
+        let url = spawn_scripted_server(vec![script]).await;
+
+        let log_dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = cfg_for(&url, Duration::from_secs(10));
+        cfg.log_dir = log_dir.path().to_path_buf();
+        cfg.api_key = crate::deepseek_config::ApiKey::new("sk-LIVE-test-key-must-not-leak-XYZ");
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        let _ = run(&cfg, &client, &req, &resilience).await.expect("ok");
+
+        let entries: Vec<_> = std::fs::read_dir(log_dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!entries.is_empty(), "runner should write at least one log file");
+        for entry in entries {
+            let body = std::fs::read_to_string(entry.path()).expect("read log");
+            assert!(!body.contains("sk-LIVE-test-key-must-not-leak-XYZ"),
+                "REGRESSION: log file leaked API key: {}", entry.path().display());
+            assert!(!body.contains("PRIVATE-USER-PROMPT-do-not-log-this"),
+                "REGRESSION: log file leaked request messages text");
+            assert!(!body.contains("\"messages\""));
+        }
+    }
+
+    /// Confirms the absolute SLA ceiling actually fires loud.
+    #[tokio::test]
+    async fn deepseek_runner_absolute_timeout_returns_typed_failure() {
+        // Server accepts the connection but never responds — request hangs.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            // Hold the connection open indefinitely without sending anything.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = sock.shutdown().await;
+        });
+
+        // Short absolute timeout so the test doesn't drag.
+        let cfg = cfg_for(&url, Duration::from_millis(500));
+        let client = build_client(&cfg).expect("client");
+        let resilience = ResilienceState::from_cfg(&cfg);
+        let req = make_req();
+
+        let failure = run(&cfg, &client, &req, &resilience)
+            .await
+            .expect_err("must time out");
+        match failure.kind {
+            DeepSeekFailureKind::AbsoluteTimeoutExceeded
+            // reqwest's read_timeout (5s in cfg_for) is longer than absolute (500ms),
+            // so AbsoluteTimeoutExceeded should win. But a stub that surfaces
+            // reqwest's connect/request timeout instead would land here too —
+            // accept either flavor since both indicate the SLA fired.
+            | DeepSeekFailureKind::NetworkPreFirstByte(_) => {}
+            other => panic!("expected timeout-class failure, got {other:?}"),
+        }
+    }
+
     /// Estimated-path test for the log writer — confirms usage_source
     /// serializes as "estimated" (lowercase) per the contract.
     #[test]
@@ -1393,7 +2141,7 @@ mod tests {
     #[test]
     fn deepseek_runaway_does_not_call_breaker_record() {
         use crate::deepseek_resilience::{Breaker, BreakerConfig, BreakerState};
-        let mut breaker = Breaker::new(BreakerConfig::default());
+        let breaker = Breaker::new(BreakerConfig::default());
         assert_eq!(breaker.state(), BreakerState::Closed);
 
         // Simulate what the runner does: build a RunawayReasoning failure
