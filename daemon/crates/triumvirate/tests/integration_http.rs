@@ -409,3 +409,93 @@ async fn i_tok_05_startup_reconciliation_non_blocking() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-001 (REQ-DS-001/013/016/022): deepseek is recognized as a top-level agent.
+// Three independent assertions matching the dispatch contract's reality_test:
+//   - /status JSON `supported_agents` array contains "deepseek"
+//   - POST /session/spawn with unknown agent → error mentions "deepseek"
+//   - POST /ask-agent with unknown agent → error mentions "deepseek"
+// All #[ignore]-gated since they require a running daemon (matches the file's
+// existing pattern; run via `cargo test -- --ignored`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "integration: requires daemon running"]
+async fn i_ds_01_status_supported_agents_includes_deepseek() -> anyhow::Result<()> {
+    let token = daemon_token()?;
+    let client = http_client()?;
+    let resp = client
+        .get(format!("{}/status", daemon_base_url()))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await?;
+    let agents = body
+        .get("supported_agents")
+        .and_then(|v| v.as_array())
+        .expect("/status returns supported_agents array");
+    let names: Vec<&str> = agents.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        names.contains(&"deepseek"),
+        "/status supported_agents must contain 'deepseek'; got {names:?}"
+    );
+    // Regression guards — existing agents must remain.
+    assert!(names.contains(&"gemini"), "regression: gemini missing from /status");
+    assert!(names.contains(&"codex"), "regression: codex missing from /status");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration: requires daemon running"]
+async fn i_ds_02_session_spawn_unknown_agent_error_mentions_deepseek() -> anyhow::Result<()> {
+    let token = daemon_token()?;
+    let client = http_client()?;
+    let resp = client
+        .post(format!("{}/session/spawn", daemon_base_url()))
+        .bearer_auth(token)
+        .json(&json!({"name": "fake-session", "agent": "fake-agent"}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await?;
+    let err = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .expect("/session/spawn 400 response carries an error string");
+    assert!(
+        err.contains("deepseek"),
+        "spawn-session error must list 'deepseek' as supported; got: {err}"
+    );
+    // Regression guards.
+    assert!(err.contains("gemini"), "regression: gemini missing from spawn-session error");
+    assert!(err.contains("codex"), "regression: codex missing from spawn-session error");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "integration: requires daemon running"]
+async fn i_ds_03_ask_agent_unknown_agent_error_mentions_deepseek() -> anyhow::Result<()> {
+    let token = daemon_token()?;
+    let client = http_client()?;
+    let resp = client
+        .post(format!("{}/ask-agent", daemon_base_url()))
+        .bearer_auth(token)
+        .json(&json!({"agent": "fake-agent", "message": "test", "cwd": "."}))
+        .send()
+        .await?;
+    // /ask-agent serialises the execute_ask_agent error into a JSON body that lists
+    // the supported agents. Status code varies (the daemon-http executor-error path
+    // currently maps to 502) — this test asserts on the body content, not the status.
+    let body: Value = resp.json().await?;
+    let body_str = serde_json::to_string(&body)?;
+    assert!(
+        body_str.contains("deepseek"),
+        "ask-agent unknown-agent response must list 'deepseek' as supported; got: {body_str}"
+    );
+    // Regression guards.
+    assert!(body_str.contains("gemini"), "regression: gemini missing from ask-agent unknown-agent response");
+    assert!(body_str.contains("codex"), "regression: codex missing from ask-agent unknown-agent response");
+    Ok(())
+}

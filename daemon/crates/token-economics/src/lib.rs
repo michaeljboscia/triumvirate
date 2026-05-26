@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-pub use attribution::{OutboxAttributionEvent, attribute_records};
+pub use attribution::{
+    OutboxAttributionEvent, attribute_records, calculate_cost_usd, ensure_deepseek_prices,
+};
 pub use direct::record_daemon_tokens;
 pub use lifecycle::run_scanner_loop;
 pub use queries::{
