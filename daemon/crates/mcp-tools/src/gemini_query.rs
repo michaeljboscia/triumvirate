@@ -23,6 +23,7 @@ where
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         })
         .await
         .map_err(|e| format!("query_gemini failed: {e}"))?;
@@ -63,6 +64,7 @@ where
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         })
         .await
         .map_err(|e| format!("query_gemini_review failed: {e}"))?;

@@ -165,6 +165,7 @@ pub async fn ask_session(
             cwd: cwd.clone(),
             repo: None,
             branch: None,
+            ..Default::default()
         },
         None,
     )

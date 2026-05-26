@@ -2061,6 +2061,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 cwd,
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -2997,6 +2998,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some("/tmp".to_string()),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3214,6 +3216,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some(test_home.display().to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         };
         let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
         let captured = fs::read_to_string(&args_file)?;
@@ -3262,6 +3265,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some(test_home.display().to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         };
         let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
 
@@ -3303,6 +3307,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some(cwd.to_string()),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3349,6 +3354,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some(project_root_str.clone()),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3392,6 +3398,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some(project_root_str),
                 repo: None,
                 branch: None,
+                ..Default::default()
             },
             None,
         )
@@ -3430,6 +3437,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some("/tmp/worker-reuse".to_string()),
             repo: None,
             branch: None,
+            ..Default::default()
         };
         let first_start = Instant::now();
         let first = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
@@ -4102,6 +4110,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: None,
             repo: None,
             branch: None,
+            ..Default::default()
         })
         .await?;
         assert_eq!(out.agent, "gemini");
@@ -4962,6 +4971,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some(test_home.display().to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         }, None)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -5029,6 +5039,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             cwd: Some("/tmp/project".to_string()),
             repo: Some("triumvirate".to_string()),
             branch: Some("feat/mcp-first".to_string()),
+            ..Default::default()
         }, None)
         .await
         .err()
