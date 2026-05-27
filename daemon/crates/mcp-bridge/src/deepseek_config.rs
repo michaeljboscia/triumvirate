@@ -109,11 +109,16 @@ pub struct DeepSeekConfig {
     pub base_url: String,
     /// REQ-DS-003. Required (no default); empty if env var absent.
     pub api_key: ApiKey,
-    /// REQ-DS-005. **Default: `deepseek-v4-pro`** — held pending the empirical
-    /// Pro-vs-Flash capability eval (see PRO_VS_FLASH_TEST_PLAN.md). The
-    /// per-call `deepseek_model` override is available for callers who want
-    /// Flash today; the default flip happens after the eval produces a
-    /// data-driven recommendation.
+    /// REQ-DS-005. **Default: `deepseek-v4-flash`** — flipped from `-pro` on
+    /// 2026-05-26 based on the empirical Pro-vs-Flash capability eval (see
+    /// PRO_VS_FLASH_EVAL_RESULTS.md). Across 130 consults / 13 task types,
+    /// including 4 tasks specifically designed to probe Pro's published
+    /// advantages (long-context, complex JSON, hard algorithm, factual
+    /// recall), Pro and Flash tied on quality (19/20 vs 19/20 on the
+    /// Pro-favoring run) while Pro used ~8.6% more total tokens, ~12.4% more
+    /// reasoning tokens, and ~3.4× more API spend at promo pricing. The
+    /// per-call `deepseek_model` override remains for callers who want Pro
+    /// on a specific consult.
     pub model: String,
     /// REQ-DS-005. Default: 32768 (generous; shared with reasoning budget).
     pub max_tokens: u32,
@@ -217,20 +222,26 @@ impl DeepSeekConfig {
 
         let api_key = ApiKey::new(load_api_key()?);
 
-        // Default remains deepseek-v4-pro pending the empirical Pro-vs-Flash
-        // capability eval (see daemon/docs/v1-deepseek/PRO_VS_FLASH_TEST_PLAN.md).
-        // The per-call `deepseek_model` override on AskAgentRequest is the
-        // mechanism for switching to flash on a per-consult basis today;
-        // operator default flip will land in a follow-up PR once the eval
-        // data justifies it. Concrete signal driving the hold:
-        //   - 2026-05-26 production session: caller hit a "truncated response"
-        //     symptom (model emitted a `<triumvirate_tool>` tag with no review
-        //     content). Possibly a Flash failure mode tied to identifier-
-        //     bleeding / tool-tag mimicry; until we have eval data we can't
-        //     blame the model variant — but we shouldn't ship the default
-        //     flip until we know.
+        // Default flipped to deepseek-v4-flash on 2026-05-26 based on the
+        // empirical Pro-vs-Flash eval (see daemon/docs/v1-deepseek/
+        // PRO_VS_FLASH_EVAL_RESULTS.md). Across 130 consults / 13 task types
+        // — including 4 tasks specifically designed to probe Pro's published
+        // advantages (long-context cross-file synthesis, complex 15-field
+        // nested JSON, hard algorithm with space optimisation, PostgreSQL
+        // factual recall) — Pro and Flash tied on quality (19/20 vs 19/20 on
+        // the Pro-favoring run) while Pro used ~8.6% more total tokens,
+        // ~12.4% more reasoning tokens, and ~3.4× more API spend at promo
+        // pricing. The one quality signal that emerged (S11 / Pro emitting
+        // duplicate JSON with leaked meta-reasoning between the copies) cut
+        // against Pro, not for it. The per-call `deepseek_model` override on
+        // AskAgentRequest remains for callers who want Pro on a specific
+        // consult. The 2026-05-26 tool-tag-leakage symptom that originally
+        // motivated holding the default at Pro turned out to affect BOTH
+        // model variants (intermittent at the model layer; mitigated via
+        // the daemon's NO_TOOL_EMULATION_SYSTEM prompt) — so it does not
+        // discriminate between Pro and Flash.
         let model = read_env("TRIUMVIRATE_DEEPSEEK_MODEL")
-            .unwrap_or_else(|| "deepseek-v4-pro".to_string());
+            .unwrap_or_else(|| "deepseek-v4-flash".to_string());
 
         // Codex P5-review: numeric env vars now fail loud on parse errors and reject
         // zero for knobs where it's nonsensical (timeouts, concurrency caps, log caps,
@@ -569,7 +580,7 @@ mod tests {
 
             assert_eq!(cfg.base_url, "https://api.deepseek.com/v1");
             assert_eq!(cfg.api_key.expose(), "sk-test-key-do-not-log");
-            assert_eq!(cfg.model, "deepseek-v4-pro");
+            assert_eq!(cfg.model, "deepseek-v4-flash");
             assert_eq!(cfg.max_tokens, 32768);
             assert_eq!(cfg.thinking, ThinkingMode::Enabled);
             assert_eq!(cfg.reasoning_effort, ReasoningEffort::High);
