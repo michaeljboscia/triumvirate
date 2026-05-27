@@ -115,7 +115,7 @@ in `shared-types/src/lib.rs::AskAgentRequest`):
 | `deepseek_reasoning_effort` | `"low" \| "medium" \| "high" \| "max" \| "xhigh"` | Low/Medium/High → API "high"; Max/Xhigh → API "max". |
 | `deepseek_include_reasoning` | `true \| false` | When `true`, the response carries `<reasoning>…</reasoning>` ahead of the content. |
 | `deepseek_max_tokens` | `u32` | Per-call max_tokens override. |
-| `deepseek_model` | `"deepseek-v4-pro" \| "deepseek-v4-flash"` (string) | **Default: `deepseek-v4-pro`** (held pending capability eval — see `PRO_VS_FLASH_TEST_PLAN.md`). Per-call override of `cfg.model`. Unknown values surface as HardProvider(400). Flip the default with `TRIUMVIRATE_DEEPSEEK_MODEL=deepseek-v4-flash` operator-wide; or use the per-call field for selective override. |
+| `deepseek_model` | `"deepseek-v4-flash" \| "deepseek-v4-pro"` (string) | **Default: `deepseek-v4-flash`** (flipped 2026-05-26 based on the empirical v1–v4 eval — see `PRO_VS_FLASH_EVAL_RESULTS.md`; Pro and Flash tied on quality across 130 consults / 13 task types, Flash ~3.4× cheaper). Per-call override of `cfg.model`. Unknown values surface as HardProvider(400). Override the default with `TRIUMVIRATE_DEEPSEEK_MODEL=deepseek-v4-pro` operator-wide; or use the per-call field for selective override to Pro. |
 
 Gemini and Codex callers ignore these fields (they're optional and
 `#[serde(skip_serializing_if = "Option::is_none")]`).
@@ -350,7 +350,7 @@ when opted in, in the response body.
 |---|---|---|
 | `TRIUMVIRATE_DEEPSEEK_API_KEY` | (required) | Empty/absent disables DeepSeek dispatch. Wrapped in redacted-Debug `ApiKey`. |
 | `TRIUMVIRATE_DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | Override only for local stub servers. |
-| `TRIUMVIRATE_DEEPSEEK_MODEL` | `deepseek-v4-pro` | Set to `deepseek-v4-flash` for the faster/cheaper model. |
+| `TRIUMVIRATE_DEEPSEEK_MODEL` | `deepseek-v4-flash` | Set to `deepseek-v4-pro` to opt back into Pro operator-wide. Default flipped on 2026-05-26 per `PRO_VS_FLASH_EVAL_RESULTS.md`. |
 | `TRIUMVIRATE_DEEPSEEK_MAX_TOKENS` | `32768` | Per-request response token budget. Invalid values FAIL LOUD (Codex W1 fix). |
 | `TRIUMVIRATE_DEEPSEEK_THINKING` | `enabled` | `disabled` suppresses reasoning_content emission. |
 | `TRIUMVIRATE_DEEPSEEK_REASONING_EFFORT` | `high` | `max`/`xhigh` raises the reasoning ceiling. |
