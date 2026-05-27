@@ -46,7 +46,10 @@ pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
 #[instrument(skip_all)]
 pub fn is_supported_agent_name(agent: &str) -> bool {
     let agent = agent.to_lowercase();
-    agent == "gemini" || agent == "codex" || agent == "deepseek"
+    matches!(
+        agent.as_str(),
+        "gemini" | "codex" | "deepseek" | "claude" | "agy"
+    )
 }
 
 #[instrument(skip_all)]
@@ -435,7 +438,7 @@ mod tests {
             branch: None,
             ..Default::default()
         }));
-        assert!(!super::is_supported_agent(&AskAgentRequest {
+        assert!(super::is_supported_agent(&AskAgentRequest {
             agent: "claude".to_string(),
             message: "x".to_string(),
             cwd: None,
@@ -444,12 +447,14 @@ mod tests {
             ..Default::default()
         }));
         assert!(super::is_supported_agent_name("gemini"));
-        assert!(!super::is_supported_agent_name("claude"));
+        assert!(super::is_supported_agent_name("claude"));
+        assert!(super::is_supported_agent_name("agy"));
+        assert!(!super::is_supported_agent_name("unknown"));
     }
 
     // T-001: deepseek joins the supported-agent set as a top-level name.
     // Stub guard: a function that always returns `false` fails the deepseek/gemini/codex
-    // asserts; a function that always returns `true` fails the claude/empty asserts.
+    // asserts; a function that always returns `true` fails the unknown/empty asserts.
     #[test]
     fn supports_deepseek_name() {
         assert!(super::is_supported_agent_name("deepseek"));
@@ -457,7 +462,8 @@ mod tests {
         assert!(super::is_supported_agent_name("DEEPSEEK"));
         assert!(super::is_supported_agent_name("gemini"));     // regression
         assert!(super::is_supported_agent_name("codex"));      // regression
-        assert!(!super::is_supported_agent_name("claude"));    // negative
+        assert!(super::is_supported_agent_name("claude"));     // regression
+        assert!(super::is_supported_agent_name("agy"));        // regression
         assert!(!super::is_supported_agent_name(""));          // negative
         assert!(!super::is_supported_agent_name("deep"));      // not a prefix match
         assert!(!super::is_supported_agent_name("deepseek-v4-pro")); // model id ≠ agent name

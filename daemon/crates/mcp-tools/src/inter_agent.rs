@@ -98,7 +98,8 @@ pub async fn spawn_session(
     let agent = req.agent.to_lowercase();
     if !is_supported_agent_name(&agent) {
         return Err(
-            "spawn_session supports only 'gemini', 'codex', or 'deepseek'".to_string(),
+            "spawn_session supports only 'gemini', 'codex', 'deepseek', 'claude', or 'agy'"
+                .to_string(),
         );
     }
     let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
