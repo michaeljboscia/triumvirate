@@ -49,9 +49,10 @@ pub struct AskAgentRequest {
     pub deepseek_max_tokens: Option<u32>,
     /// 2026-05-26 follow-up to T-011: per-call model override. When set, this
     /// value replaces `cfg.model` for this consult only — lets callers pick
-    /// between `"deepseek-v4-pro"` (default; deep reasoning) and
-    /// `"deepseek-v4-flash"` (cheaper, faster, ~3× lower price) per request
-    /// without restarting the daemon. Unrecognised models get surfaced as
+    /// between `"deepseek-v4-flash"` (default; matches Pro on quality across
+    /// the v1–v4 eval at ~3.4× lower cost — see PRO_VS_FLASH_EVAL_RESULTS.md)
+    /// and `"deepseek-v4-pro"` (deeper reasoning available per-call) without
+    /// restarting the daemon. Unrecognised models get surfaced as
     /// HardProvider(400) from DeepSeek; no client-side validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_model: Option<String>,
