@@ -75,6 +75,11 @@ pub fn daemon_autostart_enabled(var_value: Option<&str>) -> bool {
 }
 
 #[instrument(skip_all)]
+pub fn caller_driver_identity() -> Option<String> {
+    std::env::var("TRIUMVIRATE_DRIVER").ok()
+}
+
+#[instrument(skip_all)]
 pub fn is_bearer_authorized(raw_auth_header: Option<&str>, token: &str) -> bool {
     let expected = format!("Bearer {token}");
     raw_auth_header.map(|v| v == expected).unwrap_or(false)
@@ -240,6 +245,11 @@ pub fn gemini_command() -> (String, Vec<String>) {
 #[instrument(skip_all)]
 pub fn codex_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "codex")
+}
+
+#[instrument(skip_all)]
+pub fn claude_command() -> (String, Vec<String>) {
+    resolve_connector_command("TRIUMVIRATE_CLAUDE_BIN", "TRIUMVIRATE_CLAUDE_ARGS", "claude")
 }
 
 /// Backend that serves the public `gemini` agent. The public agent name stays
@@ -685,5 +695,18 @@ mod tests {
         // SAFETY: test controls env var lifecycle in-process.
         unsafe { std::env::set_var("TRIUMVIRATE_CODEX_PROTOCOL", "unknown") };
         assert_eq!(super::codex_protocol(), "exec");
+    }
+
+    #[test]
+    fn caller_driver_identity_reads_from_env() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::remove_var("TRIUMVIRATE_DRIVER") };
+        assert_eq!(super::caller_driver_identity(), None);
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe { std::env::set_var("TRIUMVIRATE_DRIVER", "gemini") };
+        assert_eq!(super::caller_driver_identity(), Some("gemini".to_string()));
+        unsafe { std::env::set_var("TRIUMVIRATE_DRIVER", "claude") };
+        assert_eq!(super::caller_driver_identity(), Some("claude".to_string()));
     }
 }

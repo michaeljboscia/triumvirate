@@ -10,7 +10,7 @@ use daemon_http::{
     fetch_daemon_status_snapshot,
 };
 use fallback_outbox::{count_pending_fallbacks, list_pending_fallback_paths};
-use mcp_bridge::is_supported_agent_name;
+use mcp_bridge::{caller_driver_identity, is_supported_agent_name};
 use rmcp::{
     Json,
     service::{RequestContext, RoleServer},
@@ -44,6 +44,12 @@ pub async fn ask_agent(
     local_test_execution_allowed: bool,
     execute_ask_agent: ExecuteAskAgentFn,
 ) -> Result<Json<AskAgentResponse>, String> {
+    if let Some(driver) = caller_driver_identity() {
+        if req.agent.to_lowercase() == driver.to_lowercase() {
+            return Err("cannot ask yourself — caller identity matches target".to_string());
+        }
+    }
+
     let emitter = ProgressEmitter::from_context(context);
     if !local_test_execution_allowed {
         let display = display_agent_name(&req.agent);

@@ -95,7 +95,8 @@ impl AgentLauncher for DaemonAgentLauncher {
                 // profile/log temp files are reaped by the OS from the temp dir.
                 mcp_bridge::GeminiBackend::Agy => {
                     let (bin, extra) = mcp_bridge::agy_command();
-                    let inv = mcp_bridge::agy::build_agy_invocation(&bin, &extra, task_prompt)
+                    let cwd = worktree_path.to_string_lossy();
+                    let inv = mcp_bridge::agy::build_agy_invocation(&bin, &extra, task_prompt, &cwd)
                         .map_err(|e| anyhow::anyhow!("failed to assemble agy invocation for fleet: {e}"))?;
                     (inv.program, inv.args)
                 }

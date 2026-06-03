@@ -124,31 +124,89 @@ fn agy_args(prompt: &str, log_path: &Path, print_timeout: Duration, extra: &[Str
     args
 }
 
-/// Build (and write the sandbox profile for) one agy invocation (REQ-016). `bin` +
-/// `extra_args` come from `agy_command()`. Rejects forbidden operator flags (H3).
+/// Whether the legacy `sandbox-exec` seatbelt wraps agy. Default OFF (yolo): agy
+/// runs unsandboxed with `--dangerously-skip-permissions` so it can actually write
+/// the files a consult asks for. Set `TRIUMVIRATE_AGY_SANDBOX=1` to restore the
+/// old write-confined `(deny file-write*)` profile (rollback / hardened hosts).
+pub fn agy_sandbox_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_AGY_SANDBOX")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Directories agy may write to in yolo mode (`--add-dir`, repeatable). The dispatch
+/// `cwd` plus its parent so sibling projects under the same root (the common
+/// "consult about project X while the daemon runs in project Y" case) are writable.
+fn yolo_add_dirs(cwd: &str) -> Vec<String> {
+    let mut dirs = Vec::new();
+    if !cwd.is_empty() {
+        dirs.push(cwd.to_string());
+        if let Some(parent) = Path::new(cwd).parent() {
+            let parent = parent.to_string_lossy().into_owned();
+            if !parent.is_empty() && parent != cwd {
+                dirs.push(parent);
+            }
+        }
+    }
+    dirs
+}
+
+/// Build one agy invocation (REQ-016). `bin` + `extra_args` come from `agy_command()`.
+/// Rejects forbidden operator flags (H3). Yolo by default (no seatbelt); the legacy
+/// `sandbox-exec` wrapper is opt-in via `TRIUMVIRATE_AGY_SANDBOX` — see
+/// [`agy_sandbox_enabled`]. `cwd` scopes the yolo `--add-dir` write grant.
 pub fn build_agy_invocation(
     bin: &str,
     extra_args: &[String],
     prompt: &str,
+    cwd: &str,
 ) -> std::io::Result<AgyInvocation> {
     validate_extra_args(extra_args)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let print_timeout = agy_connector_timeout();
-    let profile_path = unique_temp("agy-sandbox", "sb");
-    std::fs::write(&profile_path, render_sandbox_profile())?;
     let log_path = unique_temp("agy-log", "txt");
 
+    if agy_sandbox_enabled() {
+        // Legacy seatbelt: sandbox-exec -f <profile> agy ... (write-confined, H4).
+        let profile_path = unique_temp("agy-sandbox", "sb");
+        std::fs::write(&profile_path, render_sandbox_profile())?;
+        let mut args = vec![
+            "-f".to_string(),
+            profile_path.to_string_lossy().into_owned(),
+            bin.to_string(),
+        ];
+        args.extend(agy_args(prompt, &log_path, print_timeout, extra_args));
+        return Ok(AgyInvocation {
+            program: "sandbox-exec".to_string(),
+            args,
+            profile_path,
+            log_path,
+            print_timeout,
+        });
+    }
+
+    // Yolo: spawn agy directly, auto-approve tool actions, grant write scope. No
+    // profile file is written, so profile_path is a sentinel cleanup ignores.
     let mut args = vec![
-        "-f".to_string(),
-        profile_path.to_string_lossy().into_owned(),
-        bin.to_string(),
+        "-p".to_string(),
+        prompt.to_string(),
+        "--print-timeout".to_string(),
+        format!("{}s", print_timeout.as_secs()),
+        "--log-file".to_string(),
+        log_path.to_string_lossy().into_owned(),
+        "--dangerously-skip-permissions".to_string(),
     ];
-    args.extend(agy_args(prompt, &log_path, print_timeout, extra_args));
+    for dir in yolo_add_dirs(cwd) {
+        args.push("--add-dir".to_string());
+        args.push(dir);
+    }
+    args.extend(extra_args.iter().cloned());
 
     Ok(AgyInvocation {
-        program: "sandbox-exec".to_string(),
+        program: bin.to_string(),
         args,
-        profile_path,
+        profile_path: PathBuf::new(),
         log_path,
         print_timeout,
     })
@@ -211,16 +269,26 @@ mod tests {
     }
 
     #[test]
-    fn invocation_wraps_agy_in_sandbox_exec() {
-        let inv = build_agy_invocation("agy", &[], "2+2?").expect("invocation");
-        assert_eq!(inv.program, "sandbox-exec");
-        // sandbox-exec -f <profile> agy -p 2+2? ...
-        assert_eq!(inv.args[0], "-f");
-        assert_eq!(inv.args[1], inv.profile_path.to_string_lossy());
-        assert_eq!(inv.args[2], "agy");
+    fn yolo_invocation_runs_agy_directly() {
+        // Default (no TRIUMVIRATE_AGY_SANDBOX): no sandbox-exec wrapper. agy runs
+        // directly with auto-approve + a write grant for the dispatch cwd.
+        let inv = build_agy_invocation("agy", &[], "2+2?", "/Users/me/projects/triumvirate")
+            .expect("invocation");
+        assert_eq!(inv.program, "agy");
+        assert_eq!(inv.args[0], "-p");
+        assert_eq!(inv.args[1], "2+2?");
         assert!(inv.args.iter().any(|a| a == "--log-file"));
-        assert!(inv.profile_path.exists(), "profile written");
-        let _ = std::fs::remove_file(&inv.profile_path);
+        assert!(
+            inv.args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "yolo auto-approves tool actions"
+        );
+        // cwd + its parent are granted as writable dirs.
+        assert!(inv.args.windows(2).any(|w| w[0] == "--add-dir"
+            && w[1] == "/Users/me/projects/triumvirate"));
+        assert!(inv.args.windows(2).any(|w| w[0] == "--add-dir"
+            && w[1] == "/Users/me/projects"));
+        // No profile file is written in yolo mode.
+        assert!(inv.profile_path.as_os_str().is_empty(), "no sandbox profile");
     }
 
     #[test]
@@ -234,12 +302,12 @@ mod tests {
             vec!["-o".to_string(), "json".to_string()],
         ] {
             assert!(
-                build_agy_invocation("agy", &bad, "2+2?").is_err(),
+                build_agy_invocation("agy", &bad, "2+2?", "/tmp").is_err(),
                 "must reject {bad:?}"
             );
         }
         // A benign extra arg is allowed.
-        let ok = build_agy_invocation("agy", &["--add-dir".to_string(), "/x".to_string()], "2+2?");
+        let ok = build_agy_invocation("agy", &["--add-dir".to_string(), "/x".to_string()], "2+2?", "/tmp");
         if let Ok(inv) = &ok {
             let _ = std::fs::remove_file(&inv.profile_path);
         }

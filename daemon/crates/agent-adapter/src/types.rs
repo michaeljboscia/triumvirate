@@ -84,7 +84,7 @@ pub struct WorkingStateEvent {
     pub ts_ms: Option<u128>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedAgentResult {
     pub response_text: String,
     pub session_id: Option<String>,

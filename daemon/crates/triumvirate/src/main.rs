@@ -3207,6 +3207,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             std::env::set_var("TRIUMVIRATE_CODEX_BIN", script_path.as_os_str());
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
             std::env::set_var("TRIUMVIRATE_CODEX_AUTO_APPROVE", "1");
+            // Exercise the legacy --full-auto path: yolo (default) suppresses it.
+            std::env::set_var("TRIUMVIRATE_CODEX_SANDBOX", "1");
             std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
         }
 
@@ -3228,11 +3230,26 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let captured_without = fs::read_to_string(&args_file)?;
         assert!(!captured_without.lines().any(|line| line == "--full-auto"));
 
+        // Yolo (default — sandbox off): codex gets the no-sandbox bypass flag, and
+        // --full-auto is suppressed (codex rejects it alongside another policy flag).
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_SANDBOX") };
+        let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
+        let captured_yolo = fs::read_to_string(&args_file)?;
+        assert!(
+            captured_yolo
+                .lines()
+                .any(|line| line == "--dangerously-bypass-approvals-and-sandbox"),
+            "yolo default passes the no-sandbox bypass flag"
+        );
+        assert!(!captured_yolo.lines().any(|line| line == "--full-auto"));
+
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
             std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
+            std::env::remove_var("TRIUMVIRATE_CODEX_SANDBOX");
             std::env::remove_var("HOME");
         }
         let _ = fs::remove_file(script_path);

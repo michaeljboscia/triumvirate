@@ -433,9 +433,9 @@ async fn run_agy_once(
     cwd: &str,
     kill_after: Duration,
 ) -> AgyRun {
-    // REQ-016: assemble the sandbox-exec-wrapped invocation from the shared builder
-    // (one source for the security-critical profile, shared with fleet).
-    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message) {
+    // REQ-016: assemble the invocation from the shared builder (one source of truth,
+    // shared with fleet). Yolo by default; seatbelt opt-in via TRIUMVIRATE_AGY_SANDBOX.
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
         Ok(inv) => inv,
         Err(e) => {
             return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));
@@ -619,7 +619,7 @@ async fn run_agy_once_pty(
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::Read;
 
-    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message) {
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
         Ok(inv) => inv,
         Err(e) => {
             return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));

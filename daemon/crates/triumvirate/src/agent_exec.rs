@@ -14,8 +14,9 @@ use agent_worker::{
 use daemon_core::{resolve_context as core_resolve_context, unix_time_ms as core_unix_time_ms};
 use ledger::LedgerStore;
 use mcp_bridge::{
-    GeminiBackend, agent_verbosity, agy_command, codex_command, codex_protocol, gemini_backend,
-    gemini_command, gemini_shadow_enabled, gemini_streaming_enabled, is_supported_agent,
+    GeminiBackend, agent_verbosity, agy_command, claude_command, codex_command, codex_protocol,
+    gemini_backend, gemini_command, gemini_shadow_enabled, gemini_streaming_enabled,
+    is_supported_agent,
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
@@ -1393,6 +1394,21 @@ async fn run_named_agent_with_session_and_model(
             )
             .await
         }
+        "claude" => {
+            let (bin, args) = claude_command();
+            // Assuming claude CLI can be invoked similarly to codex/gemini via JSON streaming.
+            // If the user's brief mentioned Option A (subprocess), we use run_agent_process_with_session.
+            run_agent_process_with_session(
+                "claude",
+                &bin,
+                &args,
+                message,
+                cwd,
+                session_id,
+                events_tx,
+            )
+            .await
+        }
         "deepseek" => run_deepseek_agent(message, req_overrides).await,
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
@@ -1770,6 +1786,18 @@ fn codex_auto_approve_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Yolo by default: launch codex with `--dangerously-bypass-approvals-and-sandbox`
+/// (no sandbox, no approval prompts, full FS access) so it can write outside its
+/// cwd — e.g. into a sibling project the consult is about. Set
+/// `TRIUMVIRATE_CODEX_SANDBOX=1` to fall back to the `--full-auto` workspace-write
+/// preset (writes confined to cwd). Mirrors agy's `TRIUMVIRATE_AGY_SANDBOX`.
+fn codex_yolo_enabled() -> bool {
+    !std::env::var("TRIUMVIRATE_CODEX_SANDBOX")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn codex_approval_channel_mode() -> ApprovalChannelMode {
     let probe_response = match std::env::var("TRIUMVIRATE_CODEX_APPROVAL_PROBE_RESPONSE") {
         Ok(response) => response,
@@ -2085,6 +2113,13 @@ async fn run_codex_cli_process_with_session(
             .as_ref()
             .map(|mode| matches!(mode, ApprovalChannelMode::FullAutoFallback))
             .unwrap_or(true);
+    // Yolo (default): no sandbox, no approval prompts, full FS access — so codex can
+    // write outside cwd (e.g. the sibling project a consult is about). Opt out with
+    // TRIUMVIRATE_CODEX_SANDBOX=1, which leaves the --full-auto preset below in force.
+    if codex_yolo_enabled() && !caps.args_include_explicit_policy(&final_args) {
+        final_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+
     // codex 0.121+ rejects `--full-auto` combined with any other approval /
     // sandbox policy flag. The authoritative list lives on the probed
     // `CodexCapabilities` so it can evolve with the upstream CLI without a
@@ -2261,6 +2296,114 @@ async fn run_codex_cli_process_with_session(
     Ok(parsed)
 }
 
+async fn run_claude_cli_process_with_session(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+) -> anyhow::Result<ParsedAgentResult> {
+    let mut final_args = args.to_vec();
+    final_args.push("-p".to_string());
+    final_args.push(message.to_string());
+
+    if let Some(events_tx) = events_tx.as_ref() {
+        emit_working_event(
+            Some(events_tx),
+            WorkingStateEvent {
+                agent: "claude".to_string(),
+                state: WorkingState::TurnStarted,
+                detail: "claude process started".to_string(),
+                tool_name: None,
+                tool_args_json: None,
+                token_usage: None,
+                ts_ms: Some(core_unix_time_ms()),
+            },
+        );
+    }
+
+    let mut command = Command::new(bin);
+    command
+        .args(&final_args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    
+    configure_process_group(&mut command);
+    let mut child = command.spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("claude stdout missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("claude stderr missing"))?;
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                tracing::debug!("claude stderr: {trimmed}");
+            }
+        }
+    });
+
+    let mut reader = BufReader::new(stdout).lines();
+    let mut raw_output = String::new();
+    let timeout_duration = connector_timeout();
+
+    let read = async {
+        while let Some(line) = reader.next_line().await? {
+            raw_output.push_str(&line);
+            raw_output.push('\n');
+            if let Some(events_tx) = events_tx.as_ref() {
+                emit_working_event(
+                    Some(events_tx),
+                    WorkingStateEvent {
+                        agent: "claude".to_string(),
+                        state: WorkingState::MessageDelta,
+                        detail: line.to_string(),
+                        tool_name: None,
+                        tool_args_json: None,
+                        token_usage: None,
+                        ts_ms: Some(core_unix_time_ms()),
+                    },
+                );
+            }
+        }
+        anyhow::Ok(())
+    };
+
+    match timeout(timeout_duration, read).await {
+        Ok(result) => result?,
+        Err(_) => {
+            kill_process_group(&mut child);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!("claude connector timed out");
+        }
+    }
+    let status = child.wait().await?;
+
+    if !status.success() {
+        anyhow::bail!("claude connector failed: exited with status {status}");
+    }
+
+    let mut parsed = ParsedAgentResult::default();
+    parsed.response_text = raw_output.trim().to_string();
+    if parsed.session_id.is_none() {
+        parsed.session_id = session_id.map(ToString::to_string);
+    }
+
+    Ok(parsed)
+}
+
 async fn run_agent_process_with_session(
     agent: &str,
     bin: &str,
@@ -2306,6 +2449,10 @@ async fn run_agent_process_with_session(
         },
         "codex" => {
             run_codex_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
+                .await
+        }
+        "claude" => {
+            run_claude_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
                 .await
         }
         _ => anyhow::bail!("unsupported agent: {agent}"),

@@ -109,20 +109,32 @@ async fn daemon_get_json<T: serde::de::DeserializeOwned>(url: String) -> anyhow:
     match first {
         Ok(response) => {
             if !response.status().is_success() {
-                anyhow::bail!("daemon responded with HTTP {}", response.status());
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let body = body.trim();
+                if body.is_empty() {
+                    anyhow::bail!("daemon responded with HTTP {status}");
+                }
+                anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
             }
             Ok(response.json::<T>().await?)
         }
-        Err(_) => {
+        Err(e) => {
             if attempt_daemon_autostart_once().unwrap_or(false) {
                 sleep(Duration::from_millis(300)).await;
                 let retry = client.get(&url).bearer_auth(token).timeout(timeout).send().await?;
                 if !retry.status().is_success() {
-                    anyhow::bail!("daemon responded with HTTP {}", retry.status());
+                    let status = retry.status();
+                    let body = retry.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    if body.is_empty() {
+                        anyhow::bail!("daemon responded with HTTP {status}");
+                    }
+                    anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
                 }
                 return Ok(retry.json::<T>().await?);
             }
-            anyhow::bail!("daemon request failed")
+            anyhow::bail!("daemon request failed: {e}")
         }
     }
 }
@@ -152,11 +164,17 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
     match first {
         Ok(response) => {
             if !response.status().is_success() {
-                anyhow::bail!("daemon responded with HTTP {}", response.status());
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let body = body.trim();
+                if body.is_empty() {
+                    anyhow::bail!("daemon responded with HTTP {status}");
+                }
+                anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
             }
             Ok(response.json::<TResp>().await?)
         }
-        Err(_) => {
+        Err(e) => {
             if attempt_daemon_autostart_once().unwrap_or(false) {
                 sleep(Duration::from_millis(300)).await;
                 let retry = client
@@ -167,11 +185,17 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
                     .send()
                     .await?;
                 if !retry.status().is_success() {
-                    anyhow::bail!("daemon responded with HTTP {}", retry.status());
+                    let status = retry.status();
+                    let body = retry.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    if body.is_empty() {
+                        anyhow::bail!("daemon responded with HTTP {status}");
+                    }
+                    anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
                 }
                 return Ok(retry.json::<TResp>().await?);
             }
-            anyhow::bail!("daemon request failed")
+            anyhow::bail!("daemon request failed: {e}")
         }
     }
 }
