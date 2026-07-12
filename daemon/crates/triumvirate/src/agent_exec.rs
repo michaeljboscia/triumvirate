@@ -1627,6 +1627,20 @@ async fn prewarm_worker(agent: &str, cwd: &str) {
     let warm_prompt = "Prewarm this session. Reply with only: ready";
     let warm_result = timeout(
         daemon_prewarm_timeout(),
+
+    // If a session already exists for this (agent, cwd), the worker IS warm — there is nothing
+    // to prewarm. Calling anyway was actively harmful in two ways:
+    //   1. It RESUMED that session to say "reply with only: ready". For codex, resume replays the
+    //      entire transcript as input — so prewarm paid the full replay cost (measured elsewhere
+    //      at ~164k tokens) to send three words.
+    //   2. It wrote the result back via update_worker_session, so a prewarm could overwrite the
+    //      session a named ask_session depends on.
+    // Prewarm now only ever CREATES a session, never resumes or replaces one.
+    if worker.session_id.is_some() {
+        tracing::debug!("prewarm skipped for {agent} cwd={cwd}: session already warm");
+        return;
+    }
+
         run_named_agent_with_session(agent, warm_prompt, cwd, worker.session_id.as_deref(), None),
     )
     .await;

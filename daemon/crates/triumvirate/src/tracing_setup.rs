@@ -33,6 +33,14 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
         });
     match otel_endpoint {
         Some(endpoint) => {
+            // Without a registered propagator, `inject_context` writes NOTHING and the daemon
+            // never learns it is a child of the MCP bridge's span — the two processes would keep
+            // producing two unrelated traces for one call. This is the line that makes the
+            // traceparent header in daemon-http actually carry something.
+            opentelemetry::global::set_text_map_propagator(
+                opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+            );
+
             let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
 
             // --- traces (OTLP /v1/traces) ---
@@ -62,15 +70,26 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
             let logger_provider = LOGGER_PROVIDER.get_or_init(|| logger_provider);
             let otel_log_layer = OpenTelemetryTracingBridge::new(logger_provider);
 
-            // A span costs money to ship and store, and dilutes every query written against
-            // it. Without a filter of its own this layer exports EVERY #[instrument] in the
-            // tree: a sample run produced 74 `triumvirate_home_dir` and 48 `unix_time_ms`
-            // spans (0ms each, unable to answer any question anyone would ask) against 3
-            // `ask_agent` spans -- the only ones that carry agent/outcome/duration. Export
-            // this crate's spans; leave the sub-crate plumbing to the stderr layer, which
-            // keeps its own, chattier filter.
+            // A span costs money to ship and store, and dilutes every query written against it.
+            // Without a filter of its own this layer exports EVERY #[instrument] in the tree: a
+            // sample run shipped 74 `triumvirate_home_dir` and 48 `unix_time_ms` spans (0ms each,
+            // unable to answer any question anyone would ask) against 3 `ask_agent` spans.
+            //
+            // But the filter must not be so tight that it severs the tree. Spans DO nest correctly
+            // (verified: `ask_agent` parents `acquire_worker` under one trace_id) -- and
+            // `acquire_worker` lives in `agent_worker`, so a `triumvirate`-only filter would keep
+            // the root and throw away its children, leaving a lone span pretending to be a trace.
+            //
+            // So: keep this crate plus the worker lifecycle (acquire/update/dismiss_worker, which
+            // is exactly where session and cost bugs hide). Drop `daemon_core` -- that is where the
+            // home_dir/unix_time_ms/persist_json_file noise comes from -- and the `mcp_bridge`
+            // string helpers. The stderr layer keeps its own, chattier filter regardless.
+            // `daemon_http` must stay in: it owns `daemon_ask_agent`, the span that adopts the
+            // MCP bridge's traceparent. Filter it out and the daemon's `ask_agent` inherits a
+            // parent that was never exported — a dangling edge, which renders worse than no
+            // parent at all.
             let otel_span_filter = tracing_subscriber::EnvFilter::try_from_env("OTEL_SPAN_FILTER")
-                .unwrap_or_else(|_| "triumvirate=info".into());
+                .unwrap_or_else(|_| "triumvirate=info,agent_worker=info,daemon_http=info".into());
 
             tracing_subscriber::registry()
                 .with(env_filter)

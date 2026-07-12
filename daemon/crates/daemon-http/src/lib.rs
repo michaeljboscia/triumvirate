@@ -146,6 +146,62 @@ async fn daemon_post_json<TReq: serde::Serialize, TResp: serde::de::DeserializeO
     daemon_post_json_with_timeout(url, payload, daemon_http_timeout()).await
 }
 
+/// Carries the current trace context into outbound headers as W3C `traceparent`.
+///
+/// The MCP bridge and the daemon are SEPARATE PROCESSES, so without this every call produces two
+/// unrelated traces: the bridge's spans in one, the daemon's `ask_agent` in another, with no way
+/// to know they were the same request. Injecting `traceparent` lets the daemon adopt the bridge's
+/// trace as its parent, and the whole call finally reads as one trace end to end.
+struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
+
+impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
+
+/// Reads W3C `traceparent` off an inbound request.
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Make the current span a child of the caller's trace, if the caller sent one.
+///
+/// No-op when there is no `traceparent` (a direct HTTP client, or tracing not configured): the
+/// propagator returns an invalid context and `set_parent` leaves the span as a root. So this is
+/// safe on every path, not just the MCP one.
+pub fn adopt_remote_trace_parent(headers: &HeaderMap) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let parent_cx = opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.extract(&HeaderExtractor(headers))
+    });
+    tracing::Span::current().set_parent(parent_cx);
+}
+
+/// Headers carrying the current span's trace context. Empty when tracing is not configured —
+/// `TraceContextPropagator` simply injects nothing for an invalid/absent context.
+fn trace_headers() -> reqwest::header::HeaderMap {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let mut headers = reqwest::header::HeaderMap::new();
+    let cx = tracing::Span::current().context();
+    opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.inject_context(&cx, &mut HeaderInjector(&mut headers));
+    });
+    headers
+}
+
 async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de::DeserializeOwned>(
     url: String,
     payload: &TReq,
@@ -157,6 +213,7 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
     let first = client
         .post(&url)
         .bearer_auth(&token)
+        .headers(trace_headers())
         .json(payload)
         .timeout(timeout)
         .send()
@@ -180,6 +237,7 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
                 let retry = client
                     .post(&url)
                     .bearer_auth(token)
+                    .headers(trace_headers())
                     .json(payload)
                     .timeout(timeout)
                     .send()
@@ -708,6 +766,11 @@ pub async fn token_by_session_route(
     Ok(AxumJson(response))
 }
 
+// This span is what the remote parent gets attached to. Without a span of its own,
+// `Span::current()` here is disabled and `set_parent` silently does nothing — the traceparent
+// would be extracted and thrown away, which is exactly the bug this comment exists to prevent.
+// Everything the daemon then does (including the `ask_agent` span) nests underneath it.
+#[tracing::instrument(skip_all, name = "daemon_ask_agent")]
 pub async fn ask_agent_route(
     State(state): State<DaemonHttpState>,
     headers: HeaderMap,
@@ -719,6 +782,10 @@ pub async fn ask_agent_route(
             AxumJson(serde_json::json!({ "error": "unauthorized" })),
         ));
     }
+    // Adopt the MCP bridge's trace as our parent. Without this the daemon starts a brand-new trace
+    // and one logical call shows up in PostHog as two unrelated ones — bridge spans over here,
+    // ask_agent over there, with nothing tying them together.
+    adopt_remote_trace_parent(&headers);
     // Serialize agent execution per project to keep ordering predictable for concurrent bridges.
     let queue =
         core_acquire_project_queue(&state.queues, core_project_queue_key(req.cwd.as_ref(), req.repo.as_ref()))

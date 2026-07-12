@@ -296,11 +296,19 @@ pub(crate) fn record_exception(agent: &str, kind: &str, message: &str, trace_id:
         "$exception",
         json!({
             "$exception_list": [{
-                "type":  kind,        // -> Exception::exception_type   (the grouping key)
-                "value": message,     // -> Exception::exception_message
+                "type":  kind,        // -> Exception::exception_type
+                "value": message,     // -> Exception::exception_message (full, unredacted)
+                // `handled: true` is honest: this is a failure we caught and returned as an Err,
+                // not an uncaught crash. Marking it unhandled would imply the daemon died.
                 "mechanism": { "handled": true, "type": "generic" },
             }],
-            "tv_agent":    agent,
+            // Without a stacktrace PostHog groups by type + MESSAGE. Any varying token in a
+            // message — a UUID, a duration, a byte count, a port — would then mint a brand-new
+            // Issue for every single failure and bury the UI. Pin the grouping to the pair we
+            // actually want to reason about ("how often does codex fail?") and let the message
+            // stay detailed for the human reading the Issue.
+            "$exception_fingerprint": [agent, kind],
+            "tv_agent":     agent,
             "$ai_trace_id": trace_id,   // joins the exception to its $ai_generation
         }),
     );
