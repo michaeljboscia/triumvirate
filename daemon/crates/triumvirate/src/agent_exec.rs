@@ -329,7 +329,13 @@ pub(crate) async fn execute_ask_agent(
     // cover them. Everything after this point reports exactly once, on drop, whichever exit
     // is taken — including exits that do not exist yet.
     let request_id = Uuid::new_v4().to_string();
-    let mut tel = crate::posthog::CallTelemetry::new(&req.agent, &request_id);
+    // The model only matters for pricing, and DeepSeek is the only metered sibling — codex and
+    // gemini run on subscriptions, where one more call costs exactly $0.
+    let mut tel = crate::posthog::CallTelemetry::new(
+        &req.agent,
+        &request_id,
+        req.deepseek_model.as_deref(),
+    );
 
     if !is_supported_agent(req) {
         span.record("agent.outcome", "rejected");
