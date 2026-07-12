@@ -4,7 +4,7 @@ import json
 import sys
 import os
 
-TRANSCRIPT = '/Users/mikeboscia/.claude/projects/-Users-mikeboscia/7cd83b80-ca38-4b6c-979c-0c86105f0f35.jsonl'
+TRANSCRIPT = '/Users/you/.claude/projects/-Users-mikeboscia/7cd83b80-ca38-4b6c-979c-0c86105f0f35.jsonl'
 
 def inspect():
     print("=== TOOL RESULT STRUCTURE ===")

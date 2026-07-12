@@ -2,7 +2,7 @@
 
 **Status:** Final
 **Source:** PRD.md (FEAT-001 through FEAT-010), GOATRODEO_FLOW_STATE.md
-**Working Directory:** /Users/mikeboscia/projects/triumvirate/daemon-v2
+**Working Directory:** /Users/you/projects/triumvirate/daemon-v2
 
 ---
 

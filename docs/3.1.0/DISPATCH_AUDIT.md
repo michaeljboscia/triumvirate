@@ -38,7 +38,7 @@ Phase 5.6 (Doc Reconciliation in postrodeo) should not need to handle these — 
 
 ### Final Approved Artifact
 
-See `/Users/mikeboscia/projects/triumvirate/docs/3.1.0/dispatch-packages/T-000.md` at git HEAD after the R5 commit for the briefing + contract that was actually dispatched.
+See `/Users/you/projects/triumvirate/docs/3.1.0/dispatch-packages/T-000.md` at git HEAD after the R5 commit for the briefing + contract that was actually dispatched.
 
 ### Executor Spawn
 

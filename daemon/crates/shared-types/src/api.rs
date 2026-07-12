@@ -112,7 +112,7 @@ mod tests {
                 parent_session_id: Some("sess-main-1".into()),
                 root_session_id: Some("sess-main-1".into()),
                 pantheon_session_id: Some("uuid-from-pantheon".into()),
-                cwd: Some("/Users/mikeboscia/projects/triumvirate".into()),
+                cwd: Some("/Users/you/projects/triumvirate".into()),
                 started_at: "2026-04-11T22:00:00Z".into(),
                 elapsed_ms: 45000,
             }],

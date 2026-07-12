@@ -520,6 +520,6 @@ Each increment produces a runnable, demonstrable slice. Real e2e test at EVERY i
 
 9 rounds. 62 interrogator questions. 52 decisions (25 by user, 27 by clanker consensus). 2 crystallized lessons. 6 external research reports. 359 outbox messages mined. 118 daemon sessions cataloged. 3 live dead drop tests (Gemini, Codex, and Codex retry all confirmed via osascript Terminal spawn).
 
-Decision ledger: `/Users/mikeboscia/projects/triumvirate/docs/v2/GOATRODEO_LEDGER.md`
-Usage analysis: `/Users/mikeboscia/projects/triumvirate/research/usage-analysis-inter-agent-20260405.md`
-UX research: `/Users/mikeboscia/projects/triumvirate/research/multi-agent-ux-patterns-20260405.md`
+Decision ledger: `/Users/you/projects/triumvirate/docs/v2/GOATRODEO_LEDGER.md`
+Usage analysis: `/Users/you/projects/triumvirate/research/usage-analysis-inter-agent-20260405.md`
+UX research: `/Users/you/projects/triumvirate/research/multi-agent-ux-patterns-20260405.md`

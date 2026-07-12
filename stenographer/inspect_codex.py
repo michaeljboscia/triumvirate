@@ -2,7 +2,7 @@
 """Inspect Codex JSONL transcript structure."""
 import json, os
 
-codex_file = '/Users/mikeboscia/.codex/sessions/2026/03/01/rollout-2026-03-01T09-14-03-019ca9bf-c5e9-7962-939c-e468e1144ec9.jsonl'
+codex_file = '/Users/you/.codex/sessions/2026/03/01/rollout-2026-03-01T09-14-03-019ca9bf-c5e9-7962-939c-e468e1144ec9.jsonl'
 if not os.path.exists(codex_file):
     print(f"File not found: {codex_file}")
     exit(1)

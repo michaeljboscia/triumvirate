@@ -1,7 +1,7 @@
 # Goat Rodeo Round 2-6 — Decision Ledger
 
 **Date:** 2026-04-05
-**Spec:** /Users/mikeboscia/projects/triumvirate/SPEC.md
+**Spec:** /Users/you/projects/triumvirate/SPEC.md
 **Rounds:** 6 (2 decision rounds from GR1 already existed, 4 new decision rounds, 2 validation rounds)
 **New REQ added:** REQ-7 (Dynamic Multi-Agent Fleet)
 

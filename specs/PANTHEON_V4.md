@@ -2,7 +2,7 @@
 
 **Status:** SPEC FINAL — goatrodeo Phase 3 passed, 4 twin-validated rounds  
 **Branch:** v3.9.0 (daemon backend) → v4.0.0 (Tauri app)  
-**Working Directory:** /Users/mikeboscia/projects/triumvirate  
+**Working Directory:** /Users/you/projects/triumvirate  
 **Author:** Mike Boscia  
 **Date:** 2026-04-11  
 

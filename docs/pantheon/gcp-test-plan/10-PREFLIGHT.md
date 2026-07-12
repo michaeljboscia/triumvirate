@@ -642,10 +642,10 @@ gcloud compute instances delete pantheon-baker-gpu --zone=$DEFAULT_ZONE --quiet
 
 ## Phase 7 — Fixtures + Pythia seed (1-2 hours, $0)
 
-### Step 7.1 — Export Pythia corpus from Homebox
+### Step 7.1 — Export Pythia corpus from Server
 
 ```bash
-# On Homebox:
+# On Server:
 cd ~/projects/triumvirate
 sqlite3 data/pythia.db ".backup /tmp/pythia-snapshot-v1.db"
 tar czf /tmp/pythia-corpus-v1.tar.gz -C /tmp pythia-snapshot-v1.db

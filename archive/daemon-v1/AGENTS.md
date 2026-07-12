@@ -1,32 +1,32 @@
 # Triumvirate Daemon — Codex Implementation Instructions
 
-**Working Directory:** /Users/mikeboscia/projects/triumvirate/daemon
+**Working Directory:** /Users/you/projects/triumvirate/daemon
 **Language:** Rust (edition 2024, Rust 1.93+)
 **Git Branch:** Check before starting. Do NOT work on main.
 
 ## Session Startup
 
-1. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` — where is the project
-2. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` — what phase/step is next
-3. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/LESSONS.md` — mistakes to avoid
-4. Read `/Users/mikeboscia/projects/triumvirate/docs/v2/TEST_PLAN.md` — what tests to write alongside code
+1. Read `/Users/you/projects/triumvirate/docs/v2/progress.txt` — where is the project
+2. Read `/Users/you/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` — what phase/step is next
+3. Read `/Users/you/projects/triumvirate/docs/v2/LESSONS.md` — mistakes to avoid
+4. Read `/Users/you/projects/triumvirate/docs/v2/TEST_PLAN.md` — what tests to write alongside code
 
 ## Canonical Docs
 
 | Doc | Full Path |
 |-----|-----------|
-| SPEC | `/Users/mikeboscia/projects/triumvirate/SPEC.md` |
-| PRD | `/Users/mikeboscia/projects/triumvirate/docs/v2/PRD.md` |
-| BACKEND_STRUCTURE | `/Users/mikeboscia/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md` |
-| TECH_STACK | `/Users/mikeboscia/projects/triumvirate/docs/v2/TECH_STACK.md` |
-| IMPLEMENTATION_PLAN | `/Users/mikeboscia/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` |
-| TEST_PLAN | `/Users/mikeboscia/projects/triumvirate/docs/v2/TEST_PLAN.md` |
-| DESIGN_SYSTEM | `/Users/mikeboscia/projects/triumvirate/docs/v2/DESIGN_SYSTEM.md` |
-| FRONTEND_GUIDELINES | `/Users/mikeboscia/projects/triumvirate/docs/v2/FRONTEND_GUIDELINES.md` |
-| APP_FLOW | `/Users/mikeboscia/projects/triumvirate/docs/v2/APP_FLOW.md` |
-| BUILD | `/Users/mikeboscia/projects/triumvirate/daemon/BUILD.md` |
-| progress | `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` |
-| LESSONS | `/Users/mikeboscia/projects/triumvirate/docs/v2/LESSONS.md` |
+| SPEC | `/Users/you/projects/triumvirate/SPEC.md` |
+| PRD | `/Users/you/projects/triumvirate/docs/v2/PRD.md` |
+| BACKEND_STRUCTURE | `/Users/you/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md` |
+| TECH_STACK | `/Users/you/projects/triumvirate/docs/v2/TECH_STACK.md` |
+| IMPLEMENTATION_PLAN | `/Users/you/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md` |
+| TEST_PLAN | `/Users/you/projects/triumvirate/docs/v2/TEST_PLAN.md` |
+| DESIGN_SYSTEM | `/Users/you/projects/triumvirate/docs/v2/DESIGN_SYSTEM.md` |
+| FRONTEND_GUIDELINES | `/Users/you/projects/triumvirate/docs/v2/FRONTEND_GUIDELINES.md` |
+| APP_FLOW | `/Users/you/projects/triumvirate/docs/v2/APP_FLOW.md` |
+| BUILD | `/Users/you/projects/triumvirate/daemon/BUILD.md` |
+| progress | `/Users/you/projects/triumvirate/docs/v2/progress.txt` |
+| LESSONS | `/Users/you/projects/triumvirate/docs/v2/LESSONS.md` |
 
 ## Architecture Summary
 

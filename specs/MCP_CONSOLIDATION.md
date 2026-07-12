@@ -184,7 +184,7 @@ daemon/crates/mcp-tools/src/
 | `dismiss_daemon` | alias | `dismiss_session` | Map `daemon_id` → `name`. Drop `hard` param (Rust doesn't support — log warning if passed) |
 | `list_daemons` | alias | `list_sessions` | Optional `target` filter applied post-fetch |
 | `send_message` | alias (synchronous) | `ask_session` | Map `target` → `name`, `question` → `message`. Auto-spawn session if needed. Returns response directly (NOT a job_id — the async pattern was eliminated per Decision R1-D1) |
-| `get_response` | deprecated shim | returns static message | "Use ask_session directly — the async job queue was removed in 3.1.0. See /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md for the new synchronous pattern." |
+| `get_response` | deprecated shim | returns static message | "Use ask_session directly — the async job queue was removed in 3.1.0. See /Users/you/.claude/skills/send-to-codex/SKILL.md for the new synchronous pattern." |
 | `list_jobs` | alias | `get_status` (shape-mapped) | Returns a list with `job_id=session_id`, `state=agent_state`, `target=agent` to preserve the old shape |
 | `write_scratchpad` | alias (schema-mapped) | `scratchpad_write` | Map TS params `topic/content/cwd/owner/daemon_id` → Rust `scratchpad_write` schema. Owner resolution: if `daemon_id` present, derive owner from its `gd_`/`cd_` prefix; else use explicit `owner`; else default to `inter-agent`. Topic becomes filename stem, content is the body. |
 | `list_scratchpad` | alias | `scratchpad_list` | Name swap only |
@@ -293,9 +293,9 @@ triumvirate (binary — startup wiring only)
 | `daemon/Cargo.toml` | Workspace version bumped from 0.1.0 → 3.1.0 |
 | `scripts/version-drift-check.sh` | NEW — pre-commit hook script (tracked in repo) |
 | `scripts/install-git-hooks.sh` | NEW — installer that symlinks the hook into .git/hooks/ |
-| `/Users/mikeboscia/.claude.json` | Updated — inter-agent entry removed. Orchestrator-executed with user approval (not in repo). |
+| `/Users/you/.claude.json` | Updated — inter-agent entry removed. Orchestrator-executed with user approval (not in repo). |
 | `mcp-server/` | Archived to `archive/mcp-server-ts/` via git mv |
-| `/Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md` et al. | Updated — orchestrator edits (not in repo) |
+| `/Users/you/.claude/skills/send-to-codex/SKILL.md` et al. | Updated — orchestrator edits (not in repo) |
 
 **`.git/hooks/pre-commit`** is NOT in this list. It is local state, not repo state. The hook logic lives in `scripts/version-drift-check.sh` (tracked) and is symlinked into `.git/hooks/` by `scripts/install-git-hooks.sh` which each developer runs once after cloning.
 

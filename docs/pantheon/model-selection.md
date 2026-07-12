@@ -5,7 +5,7 @@
 **Created:** 2026-04-16
 **Companion docs:**
 - `docs/pantheon/graduated-gcp-validation-plan.md` — GCP test tiers where these models get evaluated
-- `/Users/mikeboscia/PANTHEON_ARCHITECTURE.md` — the $20K hardware blueprint
+- `/Users/you/PANTHEON_ARCHITECTURE.md` — the $20K hardware blueprint
 
 **Key benchmark context:** HumanEval is considered saturated/contaminated in 2026. The industry gold standards are now **SWE-bench Verified** (single-file patches, 500 human-curated tasks) and **SWE-bench Pro** (multi-file, avg 4.1 files per task). **LiveCodeBench v6** is the primary speed+quality composite for local models.
 

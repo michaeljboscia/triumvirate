@@ -4,7 +4,7 @@
 > (see `PRO_VS_FLASH_DRIVER_SPEC.md` and `PRO_VS_FLASH_TEST_PLAN.md`).
 >
 > **Date:** 2026-05-26
-> **Eval harness:** promptfoo via `llm-olly-promptfoo` container on homebox (REDACTED_HOST:3200)
+> **Eval harness:** promptfoo via `llm-olly-promptfoo` container on server (REDACTED_HOST:3200)
 > **Provider:** `openai:chat:*` against `https://api.deepseek.com/v1`
 > **Models compared:** `deepseek-v4-pro` vs `deepseek-v4-flash`, both with `thinking: enabled`, `reasoning_effort: high`
 > **Total empirical sample:** 130 consults across 13 distinct task prompts
@@ -157,7 +157,7 @@ workload as of 2026-05-26.
 
 ## Reproduce
 
-Configs live on homebox at `~/services/llm-olly-promptfoo/configs/`. To re-run any wave:
+Configs live on server at `~/services/llm-olly-promptfoo/configs/`. To re-run any wave:
 
 ```sh
 ssh -i ~/.ssh/REDACTED_KEY user@REDACTED_HOST \

@@ -40,7 +40,7 @@ A human reviewer reads documents sequentially. By the time they finish the git w
 
 3. **The Ollama model default mismatch.** Gemini compared the configuration reference defaults against the installer's interactive menu and found three documents claiming different defaults for the same variable.
 
-4. **Personal paths in committed plan files.** Gemini scanned beyond the requested files and found the `docs/superpowers/plans/` directory contained hundreds of raw `/Users/mikeboscia/.claude/...` paths and explicit business name references. These were implementation plans that should never have been committed to a public repo.
+4. **Personal paths in committed plan files.** Gemini scanned beyond the requested files and found the `docs/superpowers/plans/` directory contained hundreds of raw `/Users/you/.claude/...` paths and explicit business name references. These were implementation plans that should never have been committed to a public repo.
 
 **What Gemini is bad at:** It didn't look at the TypeScript code. It didn't run anything. It didn't think about security. Its review was entirely text-based — consistency, accuracy, completeness. If a doc said "12 hooks" and the settings.json configured 11, Gemini caught it. But it wouldn't have found the shell injection in a million years, because that requires understanding code execution semantics, not document cross-referencing.
 

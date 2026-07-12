@@ -277,11 +277,11 @@ All four must pass. The first three are the same shape as T-008's verify list. T
 
 ## How to start
 
-1. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/daemon-http/src/lib.rs` lines 350-395 — that's the existing `/ws` route. Understand what it does. Do NOT copy it; do NOT modify it.
-2. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/daemon-core/src/replay.rs` — `EventReplayBuffer.push` and `replay_since` are the only public methods you'll call.
-3. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/shared-types/src/api.rs` — confirm the exact field names and types of `StateResponse`, `ReplayRequest`, `ReplayResponse`.
-4. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/shared-types/src/streaming.rs` — `AgentStreamEvent::seq()` is how you get the sequence number for dedup.
-5. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/triumvirate/src/main.rs` lines 1395-1445 — the existing per-handler bearer auth pattern.
+1. Read `/Users/you/projects/triumvirate/daemon/crates/daemon-http/src/lib.rs` lines 350-395 — that's the existing `/ws` route. Understand what it does. Do NOT copy it; do NOT modify it.
+2. Read `/Users/you/projects/triumvirate/daemon/crates/daemon-core/src/replay.rs` — `EventReplayBuffer.push` and `replay_since` are the only public methods you'll call.
+3. Read `/Users/you/projects/triumvirate/daemon/crates/shared-types/src/api.rs` — confirm the exact field names and types of `StateResponse`, `ReplayRequest`, `ReplayResponse`.
+4. Read `/Users/you/projects/triumvirate/daemon/crates/shared-types/src/streaming.rs` — `AgentStreamEvent::seq()` is how you get the sequence number for dedup.
+5. Read `/Users/you/projects/triumvirate/daemon/crates/triumvirate/src/main.rs` lines 1395-1445 — the existing per-handler bearer auth pattern.
 6. Implement the two handlers.
 7. Register the routes in the chain inside `run_daemon`.
 8. Write the test module.

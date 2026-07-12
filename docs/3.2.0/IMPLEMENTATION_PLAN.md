@@ -3,7 +3,7 @@
 **Spec:** `specs/OBSERVABILITY_TOKEN_ECONOMICS.md`
 **Target version:** `3.2.0`
 **Baseline:** tag `3.1.0` (commit `53a5583`)
-**Working Directory:** `/Users/mikeboscia/projects/triumvirate`
+**Working Directory:** `/Users/you/projects/triumvirate`
 **Git Branch:** `main`
 
 ---

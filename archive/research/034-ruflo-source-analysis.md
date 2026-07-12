@@ -2,9 +2,9 @@
 
 **Date:** 2026-04-05  
 **Repo:** `https://github.com/ruvnet/ruflo`  
-**Local clone:** `/Users/mikeboscia/projects/triumvirate/.phase0_sources/ruflo`  
+**Local clone:** `/Users/you/projects/triumvirate/.phase0_sources/ruflo`  
 **Commit analyzed:** `322b2ae`  
-**License:** MIT (`/Users/mikeboscia/projects/triumvirate/.phase0_sources/ruflo/LICENSE`)  
+**License:** MIT (`/Users/you/projects/triumvirate/.phase0_sources/ruflo/LICENSE`)  
 **FEAT targets:** FEAT-001, FEAT-010
 
 ---
@@ -16,10 +16,10 @@ This repo is large and polyglot. For Triumvirate v2, the useful pieces are:
 - Swarm coordination surfaces that can be translated to Rust daemon patterns
 
 ## Key Source Files Reviewed
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/ruflo/v3/src/task-execution/application/WorkflowEngine.ts`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/ruflo/v3/src/task-execution/domain/Task.ts`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/ruflo/v3/@claude-flow/cli/src/ruvector/model-router.ts`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/ruflo/v3/@claude-flow/cli/src/ruvector/q-learning-router.ts`
+- `/Users/you/projects/triumvirate/.phase0_sources/ruflo/v3/src/task-execution/application/WorkflowEngine.ts`
+- `/Users/you/projects/triumvirate/.phase0_sources/ruflo/v3/src/task-execution/domain/Task.ts`
+- `/Users/you/projects/triumvirate/.phase0_sources/ruflo/v3/@claude-flow/cli/src/ruvector/model-router.ts`
+- `/Users/you/projects/triumvirate/.phase0_sources/ruflo/v3/@claude-flow/cli/src/ruvector/q-learning-router.ts`
 
 ## Patterns Worth Borrowing
 1. Explicit task domain object with dependency resolution

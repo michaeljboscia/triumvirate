@@ -2,9 +2,9 @@
 
 **Date:** 2026-04-05  
 **Repo:** `https://github.com/temporalio/temporal`  
-**Local clone:** `/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal`  
+**Local clone:** `/Users/you/projects/triumvirate/.phase0_sources/temporal`  
 **Commit analyzed:** `53e0444`  
-**License:** MIT (`/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal/LICENSE`)  
+**License:** MIT (`/Users/you/projects/triumvirate/.phase0_sources/temporal/LICENSE`)  
 **FEAT targets:** FEAT-007
 
 ---
@@ -13,12 +13,12 @@
 Temporal provides mature patterns for event-sourced workflow state, deterministic rebuild/replay, buffered query handling, and retry/backoff policy orchestration.
 
 ## Key Source Files Reviewed
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/mutable_state_impl.go`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/mutable_state_rebuilder.go`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/query_registry.go`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/retry.go`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal/common/backoff/retry.go`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/temporal/common/backoff/retrypolicy.go`
+- `/Users/you/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/mutable_state_impl.go`
+- `/Users/you/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/mutable_state_rebuilder.go`
+- `/Users/you/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/query_registry.go`
+- `/Users/you/projects/triumvirate/.phase0_sources/temporal/service/history/workflow/retry.go`
+- `/Users/you/projects/triumvirate/.phase0_sources/temporal/common/backoff/retry.go`
+- `/Users/you/projects/triumvirate/.phase0_sources/temporal/common/backoff/retrypolicy.go`
 
 ## Patterns Worth Borrowing
 1. Mutable state + append-only event history split

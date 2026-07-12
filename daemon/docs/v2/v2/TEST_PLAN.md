@@ -546,7 +546,7 @@ Artifact requirements:
 
 ### 8.5 Command Matrix
 
-From `/Users/mikeboscia/projects/triumvirate/daemon`:
+From `/Users/you/projects/triumvirate/daemon`:
 
 ```bash
 # Build gates

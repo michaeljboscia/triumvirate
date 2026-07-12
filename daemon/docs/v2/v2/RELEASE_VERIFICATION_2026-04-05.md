@@ -6,7 +6,7 @@ Validation pass for Triumvirate v2 branch `feat/phase-0` toward v0.1.0/1.0 readi
 
 ## Automated Gates
 
-All of the following passed from `/Users/mikeboscia/projects/triumvirate/daemon`:
+All of the following passed from `/Users/you/projects/triumvirate/daemon`:
 
 - `cargo check`
 - `cargo test`

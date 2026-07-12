@@ -21,8 +21,8 @@ User is asking to reset direction and salvage with another agent.
 
 ## Current Repo/Work Status
 
-**Branch:** `feat/phase-0` in `/Users/mikeboscia/projects/triumvirate`
-**Working dir:** `/Users/mikeboscia/projects/triumvirate/daemon`
+**Branch:** `feat/phase-0` in `/Users/you/projects/triumvirate`
+**Working dir:** `/Users/you/projects/triumvirate/daemon`
 
 ### Commits Made This Session
 
@@ -122,15 +122,15 @@ Tested 8+ JSON formats — none produced a response. The feature either expects 
 
 | Doc | Path |
 |-----|------|
-| Test Plan | `/Users/mikeboscia/projects/triumvirate/docs/v2/TEST_PLAN.md` |
-| Progress | `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` |
-| PRD | `/Users/mikeboscia/projects/triumvirate/docs/v2/PRD.md` |
-| SPEC | `/Users/mikeboscia/projects/triumvirate/SPEC.md` |
-| CLAUDE.md (project) | `/Users/mikeboscia/projects/triumvirate/docs/v2/CLAUDE.md` |
-| CLAUDE.md (daemon) | `/Users/mikeboscia/projects/triumvirate/daemon/.claude/CLAUDE.md` |
-| Design System | `/Users/mikeboscia/projects/triumvirate/docs/v2/DESIGN_SYSTEM.md` |
-| Backend Structure | `/Users/mikeboscia/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md` |
-| BUG-001 Diagnosis | `/Users/mikeboscia/projects/triumvirate/docs/v2/BUG-001-DIAGNOSIS.md` |
+| Test Plan | `/Users/you/projects/triumvirate/docs/v2/TEST_PLAN.md` |
+| Progress | `/Users/you/projects/triumvirate/docs/v2/progress.txt` |
+| PRD | `/Users/you/projects/triumvirate/docs/v2/PRD.md` |
+| SPEC | `/Users/you/projects/triumvirate/SPEC.md` |
+| CLAUDE.md (project) | `/Users/you/projects/triumvirate/docs/v2/CLAUDE.md` |
+| CLAUDE.md (daemon) | `/Users/you/projects/triumvirate/daemon/.claude/CLAUDE.md` |
+| Design System | `/Users/you/projects/triumvirate/docs/v2/DESIGN_SYSTEM.md` |
+| Backend Structure | `/Users/you/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md` |
+| BUG-001 Diagnosis | `/Users/you/projects/triumvirate/docs/v2/BUG-001-DIAGNOSIS.md` |
 
 ---
 

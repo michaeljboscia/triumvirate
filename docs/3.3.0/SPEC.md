@@ -1,7 +1,7 @@
 # v3.3.0 — Live Agent Streaming
 
 **Version:** 3.3.0
-**Working Directory:** /Users/mikeboscia/projects/triumvirate
+**Working Directory:** /Users/you/projects/triumvirate
 **Git Branch:** main (will branch to v3.3.0 for build)
 **Goatrodeo:** 7 rounds, 8 decisions, 38 auto-resolves, Phase 3 PASS
 

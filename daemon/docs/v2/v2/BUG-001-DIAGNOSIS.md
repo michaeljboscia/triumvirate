@@ -165,7 +165,7 @@ The rest of the pipeline is fine:
 After fixing, this should work:
 ```bash
 # Build
-cd /Users/mikeboscia/projects/triumvirate/daemon
+cd /Users/you/projects/triumvirate/daemon
 cd frontend && npm run build && cd ..
 cargo build
 
