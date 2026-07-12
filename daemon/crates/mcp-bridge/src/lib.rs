@@ -43,12 +43,33 @@ pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
     is_supported_agent_name(&req.agent)
 }
 
+/// Normalize a caller-supplied agent name to its canonical execution key.
+///
+/// The public Antigravity sibling is served by the internal execution key
+/// `gemini` (the name is kept internally for now; the transport already runs the
+/// `agy`/Antigravity CLI). Callers may say `antigravity` (product name) or `agy`
+/// (CLI short form) — both normalize to the `gemini` key so a single dispatch
+/// arm, worker-cache slot, and session record serve every alias. Everything else
+/// passes through lowercased.
+///
+/// Apply this at EVERY boundary where a caller's agent string is first trusted —
+/// before worker-acquire, before session storage, and before dispatch — or state
+/// splits between the aliases (Codex/Gemini twin review, 2026-07-06).
+#[instrument(skip_all)]
+pub fn normalize_agent_name(agent: &str) -> String {
+    match agent.to_lowercase().as_str() {
+        "antigravity" | "agy" => "gemini".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[instrument(skip_all)]
 pub fn is_supported_agent_name(agent: &str) -> bool {
-    let agent = agent.to_lowercase();
+    // Validate the CANONICAL name so aliases (antigravity/agy) are accepted via the
+    // same allowlist the dispatch arms match on — no raw alias reaches dispatch.
     matches!(
-        agent.as_str(),
-        "gemini" | "codex" | "deepseek" | "claude" | "agy"
+        normalize_agent_name(agent).as_str(),
+        "gemini" | "codex" | "deepseek" | "claude"
     )
 }
 
@@ -477,6 +498,26 @@ mod tests {
         assert!(!super::is_supported_agent_name(""));          // negative
         assert!(!super::is_supported_agent_name("deep"));      // not a prefix match
         assert!(!super::is_supported_agent_name("deepseek-v4-pro")); // model id ≠ agent name
+    }
+
+    #[test]
+    fn normalize_maps_antigravity_aliases_to_gemini_key() {
+        // antigravity/agy are the product/CLI aliases of the internal `gemini` key.
+        assert_eq!(super::normalize_agent_name("antigravity"), "gemini");
+        assert_eq!(super::normalize_agent_name("Antigravity"), "gemini");
+        assert_eq!(super::normalize_agent_name("agy"), "gemini");
+        assert_eq!(super::normalize_agent_name("AGY"), "gemini");
+        // canonical + other agents pass through lowercased, unchanged
+        assert_eq!(super::normalize_agent_name("gemini"), "gemini");
+        assert_eq!(super::normalize_agent_name("Codex"), "codex");
+        assert_eq!(super::normalize_agent_name("deepseek"), "deepseek");
+        // idempotent: normalizing an already-canonical alias result is a no-op
+        assert_eq!(
+            super::normalize_agent_name(&super::normalize_agent_name("agy")),
+            "gemini"
+        );
+        // aliases satisfy the supported-name allowlist via the canonical key
+        assert!(super::is_supported_agent_name("antigravity"));
     }
 
     #[test]

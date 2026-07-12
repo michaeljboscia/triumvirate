@@ -16,7 +16,7 @@ use ledger::LedgerStore;
 use mcp_bridge::{
     GeminiBackend, agent_verbosity, agy_command, claude_command, codex_command, codex_protocol,
     gemini_backend, gemini_command, gemini_shadow_enabled, gemini_streaming_enabled,
-    is_supported_agent,
+    is_supported_agent, normalize_agent_name,
 };
 use mcp_tools::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use peer_review::{PeerReviewEngine, ReviewRequest};
@@ -413,7 +413,7 @@ pub(crate) async fn execute_ask_agent(
             } else {
                 "Reused"
             },
-            agent,
+            agent_display,
             req.cwd
                 .as_ref()
                 .map(|v| format!(" cwd={v}"))
@@ -454,7 +454,7 @@ pub(crate) async fn execute_ask_agent(
 
     lifecycle.push(LifecycleEvent {
         state: "WORKING".to_string(),
-        detail: format!("{agent} is processing request"),
+        detail: format!("{agent_display} is processing request"),
     });
     if let Err(e) = append_outbox_event(&OutboxEvent {
         ts_ms: core_unix_time_ms(),
@@ -697,7 +697,7 @@ pub(crate) async fn execute_ask_agent(
                             }
                         }
                         let elapsed = started.elapsed().as_secs();
-                        let detail = format!("{agent} still working ({elapsed}s elapsed)");
+                        let detail = format!("{agent_display} still working ({elapsed}s elapsed)");
                         lifecycle.push(LifecycleEvent {
                             state: "WORKING".to_string(),
                             detail,
@@ -750,7 +750,7 @@ pub(crate) async fn execute_ask_agent(
                 );
                 lifecycle.push(LifecycleEvent {
                     state: "DONE".to_string(),
-                    detail: format!("{agent} responded on attempt {}", idx + 1),
+                    detail: format!("{agent_display} responded on attempt {}", idx + 1),
                 });
                 if let Err(e) = append_outbox_event(&OutboxEvent {
                     ts_ms: core_unix_time_ms(),
@@ -865,7 +865,7 @@ pub(crate) async fn execute_ask_agent(
                     worker_session_id = None;
                     update_worker_session(&agent, &exec_cwd, None).await;
                     let invalidated_detail = format!(
-                        "{agent} session invalidated after stale resume ID; retrying with a fresh session"
+                        "{agent_display} session invalidated after stale resume ID; retrying with a fresh session"
                     );
                     lifecycle.push(LifecycleEvent {
                         state: "SESSION_INVALIDATED".to_string(),
@@ -896,7 +896,7 @@ pub(crate) async fn execute_ask_agent(
                 if msg.contains("timed out") {
                     lifecycle.push(LifecycleEvent {
                         state: "TIMEOUT".to_string(),
-                        detail: format!("{agent} timed out on attempt {}", idx + 1),
+                        detail: format!("{agent_display} timed out on attempt {}", idx + 1),
                     });
                     if let Some(emitter) = progress.as_ref() {
                         emitter
@@ -1054,7 +1054,10 @@ pub(crate) async fn execute_ask_agent(
                     // (codex). A gemini-cli hop is the same agent on the legacy backend,
                     // so honesty lives in the fields/lifecycle, not an alarming prefix.
                     let prefix = if hop.agent != agent {
-                        format!("⚠ Gemini unavailable — answered by {hop_display}\n\n")
+                        format!(
+                            "⚠ {} unavailable — answered by {hop_display}\n\n",
+                            display_agent_name(&agent)
+                        )
                     } else {
                         String::new()
                     };
@@ -1094,7 +1097,11 @@ pub(crate) async fn execute_ask_agent(
 
     lifecycle.push(LifecycleEvent {
         state: "FAILED".to_string(),
-        detail: format!("{} failed after {} attempts", agent, attempt_schedule.len()),
+        detail: format!(
+            "{} failed after {} attempts",
+            agent_display,
+            attempt_schedule.len()
+        ),
     });
     if let Err(e) = append_outbox_event(&OutboxEvent {
         ts_ms: core_unix_time_ms(),
@@ -1158,9 +1165,6 @@ pub(crate) async fn execute_ask_agent(
     span.record("agent.outcome", "failure");
     span.record("agent.tokens", 0_u64);
     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
-    Err(format!(
-        "ask_agent failed after lifecycle {:?}: {}{}",
-        lifecycle
 
     let failure_detail = last_err.unwrap_or_else(|| "unknown error".to_string());
 
@@ -1168,6 +1172,9 @@ pub(crate) async fn execute_ask_agent(
     // this is a real failure, an $exception — once, on drop.
     tel.failure(failure_detail.clone());
 
+    Err(format!(
+        "ask_agent failed after lifecycle {:?}: {}{}",
+        lifecycle
             .iter()
             .map(|e| e.state.as_str())
             .collect::<Vec<_>>(),
@@ -1624,9 +1631,6 @@ pub(crate) async fn run_deepseek_with_runtime(
 
 async fn prewarm_worker(agent: &str, cwd: &str) {
     let worker = acquire_worker(agent, cwd).await;
-    let warm_prompt = "Prewarm this session. Reply with only: ready";
-    let warm_result = timeout(
-        daemon_prewarm_timeout(),
 
     // If a session already exists for this (agent, cwd), the worker IS warm — there is nothing
     // to prewarm. Calling anyway was actively harmful in two ways:
@@ -1641,7 +1645,10 @@ async fn prewarm_worker(agent: &str, cwd: &str) {
         return;
     }
 
-        run_named_agent_with_session(agent, warm_prompt, cwd, worker.session_id.as_deref(), None),
+    let warm_prompt = "Prewarm this session. Reply with only: ready";
+    let warm_result = timeout(
+        daemon_prewarm_timeout(),
+        run_named_agent_with_session(agent, warm_prompt, cwd, None, None),
     )
     .await;
 
@@ -1764,11 +1771,11 @@ async fn run_mock_connector_process(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow::anyhow!("gemini stdout missing"))?;
+        .ok_or_else(|| anyhow::anyhow!("Antigravity stdout missing"))?;
     let mut stderr_reader = child
         .stderr
         .take()
-        .ok_or_else(|| anyhow::anyhow!("gemini stderr missing"))?;
+        .ok_or_else(|| anyhow::anyhow!("Antigravity stderr missing"))?;
     let mut lines = BufReader::new(stdout).lines();
     let mut non_json_line: Option<String> = None;
 
@@ -1950,11 +1957,11 @@ async fn run_gemini_cli_process_with_session(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow::anyhow!("gemini stdout missing"))?;
+        .ok_or_else(|| anyhow::anyhow!("Antigravity stdout missing"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| anyhow::anyhow!("gemini stderr missing"))?;
+        .ok_or_else(|| anyhow::anyhow!("Antigravity stderr missing"))?;
 
     // Monitor stderr for 429/capacity errors and signal abort via channel
     let (abort_tx, mut abort_rx) = mpsc::channel::<String>(1);
@@ -1992,7 +1999,10 @@ async fn run_gemini_cli_process_with_session(
                     }
                 }
                 Some(err_msg) = abort_rx.recv() => {
-                    anyhow::bail!("gemini 429 capacity error (fast-fail): {err_msg}");
+                    // Operator-facing error text: the product is Antigravity, not "gemini".
+                    // (Caught by an actual 429 during verification — the internal dispatch key
+                    // was surfacing straight into the error a human reads.)
+                    anyhow::bail!("Antigravity 429 capacity error (fast-fail): {err_msg}");
                 }
             }
         }
@@ -2010,13 +2020,13 @@ async fn run_gemini_cli_process_with_session(
             kill_process_group(&mut child);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            anyhow::bail!("gemini connector timed out");
+            anyhow::bail!("Antigravity connector timed out");
         }
     }
 
     let status = child.wait().await?;
     if !status.success() {
-        anyhow::bail!("gemini connector failed: exited with status {status}");
+        anyhow::bail!("Antigravity connector failed: exited with status {status}");
     }
 
     let mut parsed = parser.finish();
@@ -2062,10 +2072,10 @@ async fn run_gemini_batch_process_with_session(
             .output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("gemini connector timed out"))??;
+    .map_err(|_| anyhow::anyhow!("Antigravity connector timed out"))??;
 
     if !output.status.success() {
-        anyhow::bail!("gemini connector failed: exited with status {}", output.status);
+        anyhow::bail!("Antigravity connector failed: exited with status {}", output.status);
     }
     let mut parser = GeminiStreamParser::new();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

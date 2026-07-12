@@ -53,7 +53,7 @@ pub fn classify_failure_with_metrics(
     } else {
         Classification {
             class: FailureClass::OrchestratorBriefingError,
-            reason: "unclassified failure — conservative default, send to Gemini".to_string(),
+            reason: "unclassified failure — conservative default, send to Antigravity".to_string(),
         }
     };
     if let Some(metrics) = metrics {

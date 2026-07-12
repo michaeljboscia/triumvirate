@@ -37,7 +37,7 @@ use ledger::LedgerStore;
 #[cfg(test)]
 use peer_review::PeerReviewEngine;
 use mcp_bridge::{
-    codex_command, is_bearer_authorized, is_supported_agent_name,
+    codex_command, is_bearer_authorized, is_supported_agent_name, normalize_agent_name,
 };
 #[cfg(not(test))]
 use mcp_bridge::use_daemon_for_mcp_from_env;
@@ -845,7 +845,31 @@ impl McpBridge {
             .map(Json)
     }
 
-    #[tool(description = "Query Gemini synchronously and return response text.")]
+    #[tool(description = "Query the Antigravity sibling synchronously and return response text.")]
+    async fn query_antigravity(
+        &self,
+        Parameters(req): Parameters<QueryGeminiRequest>,
+    ) -> Result<Json<QueryGeminiResponse>, String> {
+        let response = mcp_gemini_query::query_gemini(req, |ask_req| async move {
+            execute_ask_agent(&ask_req, None).await
+        })
+        .await?;
+        Ok(Json(response))
+    }
+
+    #[tool(description = "Query the Antigravity sibling for code review verdicts on pass/failure contexts.")]
+    async fn query_antigravity_review(
+        &self,
+        Parameters(req): Parameters<QueryGeminiReviewRequest>,
+    ) -> Result<Json<QueryGeminiReviewResponse>, String> {
+        let response = mcp_gemini_query::query_gemini_review(req, |ask_req| async move {
+            execute_ask_agent(&ask_req, None).await
+        })
+        .await?;
+        Ok(Json(response))
+    }
+
+    #[tool(description = "Deprecated alias of query_antigravity — kept for back-compat. Query the Antigravity sibling synchronously.")]
     async fn query_gemini(
         &self,
         Parameters(req): Parameters<QueryGeminiRequest>,
@@ -857,7 +881,7 @@ impl McpBridge {
         Ok(Json(response))
     }
 
-    #[tool(description = "Query Gemini for code review verdicts on pass/failure contexts.")]
+    #[tool(description = "Deprecated alias of query_antigravity_review — kept for back-compat.")]
     async fn query_gemini_review(
         &self,
         Parameters(req): Parameters<QueryGeminiReviewRequest>,
@@ -2015,9 +2039,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
         }
-        let agent = req.agent.to_lowercase();
+        let agent = normalize_agent_name(&req.agent);
         if !is_supported_agent_name(&agent) {
-            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'gemini', 'codex', or 'deepseek'" }))));
+            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'antigravity' (aliases: agy, gemini), 'codex', or 'deepseek'" }))));
         }
         let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
         let worker = acquire_worker(&agent, &cwd).await;
@@ -2066,6 +2090,10 @@ async fn run_daemon() -> anyhow::Result<()> {
                 cwd,
                 repo: None,
                 branch: None,
+                // This is the HTTP twin of mcp-tools' ask_session: a NAMED session, so it must
+                // resume. Without this it silently loses multi-turn memory while the MCP path
+                // keeps it — the two surfaces would disagree about what a session is.
+                reuse_session: Some(true),
                 ..Default::default()
             },
             None,
@@ -2090,10 +2118,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
         AxumJson(req): AxumJson<DismissSessionRequest>,
-                // This is the HTTP twin of mcp-tools' ask_session: a NAMED session, so it must
-                // resume. Without this it silently loses multi-turn memory while the MCP path
-                // keeps it — the two surfaces would disagree about what a session is.
-                reuse_session: Some(true),
     ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
@@ -2630,8 +2654,10 @@ mod tests {
                 .lock()
                 .expect("logging lock poisoned")
                 .clone();
-            assert!(all_logs.iter().any(|m| m.contains("Gemini: sent")));
-            assert!(all_logs.iter().any(|m| m.contains("Gemini: responded")));
+            // Label flip: the sibling now presents as Antigravity (agent="gemini"
+            // is the internal key; the rendered progress label is the product name).
+            assert!(all_logs.iter().any(|m| m.contains("Antigravity: sent")));
+            assert!(all_logs.iter().any(|m| m.contains("Antigravity: responded")));
         }
 
         // SAFETY: test controls env var lifecycle under lock.
@@ -3333,6 +3359,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 cwd: Some(cwd.to_string()),
                 repo: None,
                 branch: None,
+                // Stale-session recovery only applies to a caller that RESUMES. A one-shot
+                // ask_agent no longer reads the cached session at all (that inheritance was the
+                // bug: the worker registry is keyed only by (agent, cwd), so a one-shot would
+                // silently adopt — and get billed for — whatever named session last ran in this
+                // directory). So this scenario belongs to the session-scoped path.
+                reuse_session: Some(true),
                 ..Default::default()
             },
             None,
@@ -3357,38 +3389,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
-    #[tokio::test]
-    async fn ask_agent_requires_peer_review_when_env_enabled() -> anyhow::Result<()> {
-                // Stale-session recovery only applies to a caller that RESUMES. A one-shot
-                // ask_agent no longer reads the cached session at all (that inheritance was the
-                // bug: the worker registry is keyed only by (agent, cwd), so a one-shot would
-                // silently adopt — and get billed for — whatever named session last ran in this
-                // directory). So this scenario belongs to the session-scoped path.
-                reuse_session: Some(true),
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let script_path = write_mock_gemini_script()?;
-        let temp = tempfile::tempdir()?;
-        let project_root = temp.path().join("peer-review-required");
-        fs::create_dir_all(&project_root)?;
-        let project_root_str = project_root.display().to_string();
-
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-            std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
-        }
-
-        let reviewed = execute_ask_agent(
-            &AskAgentRequest {
-                agent: "gemini".to_string(),
-                message: "test message".to_string(),
-                cwd: Some(project_root_str.clone()),
-                repo: None,
-                branch: None,
-                ..Default::default()
-            },
-            None,
     /// The other half of the same rule, and the half that costs money: a ONE-SHOT ask_agent must
     /// never adopt the session cached for (agent, cwd).
     ///
@@ -3455,6 +3455,32 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    #[tokio::test]
+    async fn ask_agent_requires_peer_review_when_env_enabled() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let script_path = write_mock_gemini_script()?;
+        let temp = tempfile::tempdir()?;
+        let project_root = temp.path().join("peer-review-required");
+        fs::create_dir_all(&project_root)?;
+        let project_root_str = project_root.display().to_string();
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
+        }
+
+        let reviewed = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: "test message".to_string(),
+                cwd: Some(project_root_str.clone()),
+                repo: None,
+                branch: None,
+                ..Default::default()
+            },
+            None,
         )
         .await
         .map_err(anyhow::Error::msg)?;
@@ -3557,10 +3583,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .lifecycle
             .iter()
             .any(|e| e.state == "SPAWNED"));
+        // Lifecycle details are read by a human, so they carry the PRODUCT name. The internal
+        // dispatch key is still `gemini` — this asserts the presentation layer, not the key.
         assert!(second
             .lifecycle
             .iter()
-            .any(|e| e.detail.contains("Reused gemini worker")));
+            .any(|e| e.detail.contains("Reused Antigravity worker")));
         assert!(
             second_elapsed < first_elapsed,
             "expected second call ({second_elapsed:?}) to be faster than first ({first_elapsed:?})"

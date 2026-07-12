@@ -165,7 +165,8 @@ pub struct ReviewRequestLike {
 
 fn map_target_to_agent(target: String) -> Result<String, AliasMappingError> {
     match target.as_str() {
-        "gemini" => Ok("gemini".to_string()),
+        // antigravity/agy are the product/CLI aliases of the internal `gemini` key.
+        "gemini" | "antigravity" | "agy" => Ok("gemini".to_string()),
         "codex" => Ok("codex".to_string()),
         _ => Err(AliasMappingError::InvalidTarget(target)),
     }

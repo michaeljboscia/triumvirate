@@ -10,7 +10,7 @@ use daemon_http::{
     fetch_daemon_status_snapshot,
 };
 use fallback_outbox::{count_pending_fallbacks, list_pending_fallback_paths};
-use mcp_bridge::{caller_driver_identity, is_supported_agent_name};
+use mcp_bridge::{caller_driver_identity, is_supported_agent_name, normalize_agent_name};
 use rmcp::{
     Json,
     service::{RequestContext, RoleServer},
@@ -45,7 +45,9 @@ pub async fn ask_agent(
     execute_ask_agent: ExecuteAskAgentFn,
 ) -> Result<Json<AskAgentResponse>, String> {
     if let Some(driver) = caller_driver_identity() {
-        if req.agent.to_lowercase() == driver.to_lowercase() {
+        // Compare canonical identities so an agy/antigravity caller can't slip past
+        // the self-ask guard by using an alias of its own name.
+        if normalize_agent_name(&req.agent) == normalize_agent_name(&driver) {
             return Err("cannot ask yourself — caller identity matches target".to_string());
         }
     }
@@ -101,10 +103,10 @@ pub async fn spawn_session(
             .await
             .map_err(|e| format!("spawn_session via daemon failed: {e}"));
     }
-    let agent = req.agent.to_lowercase();
+    let agent = normalize_agent_name(&req.agent);
     if !is_supported_agent_name(&agent) {
         return Err(
-            "spawn_session supports only 'gemini', 'codex', 'deepseek', 'claude', or 'agy'"
+            "spawn_session supports only 'antigravity' (aliases: agy, gemini), 'codex', 'deepseek', or 'claude'"
                 .to_string(),
         );
     }
@@ -159,7 +161,10 @@ pub async fn ask_session(
             .get_mut(&req.name)
             .ok_or_else(|| format!("session '{}' not found", req.name))?;
         (
-            state.agent.clone(),
+            // Normalize on read: any session persisted under a raw alias (e.g. an
+            // older `agent:"agy"` record) must resolve to the canonical key so it
+            // does not hit the unsupported-agent dispatch path.
+            normalize_agent_name(&state.agent),
             state.cwd.clone(),
             !state.history.is_empty(),
         )
@@ -172,26 +177,26 @@ pub async fn ask_session(
             cwd: cwd.clone(),
             repo: None,
             branch: None,
+            // A named session is the one caller that genuinely wants to resume: multi-turn
+            // memory is the whole point. One-shot ask_agent leaves this None and starts fresh.
+            reuse_session: Some(true),
             ..Default::default()
         },
         None,
     )
     .await
-            // A named session is the one caller that genuinely wants to resume: multi-turn
-            // memory is the whole point. One-shot ask_agent leaves this None and starts fresh.
-            reuse_session: Some(true),
     .map_err(|e| format!("ask_session failed: {e}"))?
     .response;
 
-    // REQ-044: the agy backend is single-turn. When a follow-up to a named Gemini
-    // session cannot carry the earlier turns, say so — never silently fake continuity.
-    // Only on turn 2+ (turn 1 has no prior context to lose).
+    // REQ-044: the agy backend is single-turn. When a follow-up to a named
+    // Antigravity session cannot carry the earlier turns, say so — never silently
+    // fake continuity. Only on turn 2+ (turn 1 has no prior context to lose).
     if agent == "gemini"
         && had_history
         && mcp_bridge::gemini_backend() == mcp_bridge::GeminiBackend::Agy
     {
         response = format!(
-            "⚠ Multi-turn memory is not available for the Gemini sibling under the agy backend — this answer does not carry the earlier turns of this session.\n\n{response}"
+            "⚠ Multi-turn memory is not available for the Antigravity sibling — this answer does not carry the earlier turns of this session.\n\n{response}"
         );
     }
 

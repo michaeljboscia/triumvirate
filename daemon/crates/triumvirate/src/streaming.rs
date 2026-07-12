@@ -40,8 +40,13 @@ pub async fn execute_ask_agent_streaming(
     // For now, we create a channel, send no events, and return the blob.
     let (tx, rx) = mpsc::channel::<AgentStreamEvent>(64);
 
-    // Send a TurnStarted event so the adapter test can verify the channel works
-    let agent = req.agent.clone();
+    // Send a TurnStarted event so the adapter test can verify the channel works.
+    //
+    // These events are rendered to a human by AgentStreamEvent::display_text(), so the label must
+    // be the PRODUCT name, not the internal execution key. normalize_agent_name() returns "gemini"
+    // (the dispatch key); display_agent_name() returns "Antigravity" (what an operator should ever
+    // see). Alias callers (antigravity/agy) land on the same label either way.
+    let agent = mcp_tools::display_agent_name(&req.agent);
     let session_name = req.cwd.clone().unwrap_or_default();
     let _ = tx
         .send(AgentStreamEvent::TurnStarted {

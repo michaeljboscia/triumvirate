@@ -90,9 +90,13 @@ fn should_emit_progress_notifications() -> bool {
 }
 
 pub fn display_agent_name(agent: &str) -> String {
-    match agent.to_lowercase().as_str() {
+    // Normalize first so the alias inputs (antigravity/agy) render the product
+    // label instead of falling through to the generic capitaliser ("Agy").
+    match mcp_bridge::normalize_agent_name(agent).as_str() {
         "codex" => "Codex".to_string(),
-        "gemini" => "Gemini".to_string(),
+        // The internal execution key is still `gemini`, but the operator-facing
+        // product name is Antigravity — never render "Gemini" to a human.
+        "gemini" => "Antigravity".to_string(),
         // T-001: explicit arm — the generic first-letter capitaliser below would produce
         // "Deepseek" (wrong); the canonical brand spelling is "DeepSeek".
         "deepseek" => "DeepSeek".to_string(),
@@ -133,8 +137,13 @@ mod tests {
 
     #[test]
     fn display_agent_name_preserves_existing_agents() {
-        assert_eq!(display_agent_name("gemini"), "Gemini");
-        assert_eq!(display_agent_name("Gemini"), "Gemini");
+        // The internal `gemini` key renders as the product name Antigravity, and
+        // both alias inputs resolve to the same label (never "Agy"/"Antigravity"
+        // via the generic capitaliser).
+        assert_eq!(display_agent_name("gemini"), "Antigravity");
+        assert_eq!(display_agent_name("Gemini"), "Antigravity");
+        assert_eq!(display_agent_name("antigravity"), "Antigravity");
+        assert_eq!(display_agent_name("agy"), "Antigravity");
         assert_eq!(display_agent_name("codex"), "Codex");
         assert_eq!(display_agent_name("CODEX"), "Codex");
     }
@@ -145,5 +154,26 @@ mod tests {
         assert_eq!(display_agent_name("custom"), "Custom");
         // empty input → "Agent" sentinel
         assert_eq!(display_agent_name(""), "Agent");
+    }
+
+    /// The rename's whole contract, in one test.
+    ///
+    /// The internal execution key stays `gemini` — renaming it would split every historical row,
+    /// chart and saved insight in two. What changes is what a HUMAN reads. So every alias, and the
+    /// canonical key itself, must render as the product name, and "Gemini" must never reach an
+    /// operator-facing surface (lifecycle details, stream events, PostHog dashboards).
+    #[test]
+    fn every_alias_renders_as_antigravity_never_gemini() {
+        for alias in ["antigravity", "agy", "gemini", "Gemini", "AGY", "Antigravity"] {
+            let shown = display_agent_name(alias);
+            assert_eq!(shown, "Antigravity", "input {alias:?} rendered as {shown:?}");
+            assert!(
+                !shown.contains("Gemini"),
+                "never render 'Gemini' to a human (input {alias:?})"
+            );
+        }
+        // The dispatch key is deliberately unchanged — display is a presentation concern only.
+        assert_eq!(mcp_bridge::normalize_agent_name("antigravity"), "gemini");
+        assert_eq!(mcp_bridge::normalize_agent_name("agy"), "gemini");
     }
 }

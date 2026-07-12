@@ -333,7 +333,12 @@ pub(crate) fn record_ai_generation(g: &AiGeneration<'_>) {
             // the price is unknown, so a chart can never silently sum a guess.
             "$ai_total_cost_usd": g.cost_usd,
             // --- Triumvirate-specific dimensions (what makes the dashboards useful) ---
+            // tv_agent is the stable internal KEY ("gemini") — never rename it, or every chart
+            // and saved insight built on historical rows silently splits in two. tv_agent_display
+            // is the product name an operator should actually read ("Antigravity"). A dashboard
+            // is a human surface, so it gets the human label; the key stays for continuity.
             "tv_agent":            g.agent,
+            "tv_agent_display":    mcp_tools::display_agent_name(g.agent),
             "tv_outcome":          g.outcome,            // incl. "degraded_success"
             "tv_billing":          g.billing,            // metered | subscription | unknown
             "tv_cached_tokens":    g.cached_tokens.unwrap_or(0),
