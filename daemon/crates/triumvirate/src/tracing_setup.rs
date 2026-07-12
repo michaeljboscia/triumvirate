@@ -1,8 +1,17 @@
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use opentelemetry_sdk::{Resource, logs::SdkLoggerProvider, trace::SdkTracerProvider};
+use std::sync::OnceLock;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const SERVICE_NAME: &str = "triumvirate-daemon-v2";
+
+/// The logger provider owns the batch processor that ships logs. If it is dropped at the
+/// end of `init_tracing`, the processor shuts down and every log is silently discarded.
+/// Pin it for the life of the process.
+static LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 
 pub(crate) fn init_tracing() -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -24,20 +33,40 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
         });
     match otel_endpoint {
         Some(endpoint) => {
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
+            let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
+
+            // --- traces (OTLP /v1/traces) ---
+            // NOTE: opentelemetry-otlp resolves OTEL_EXPORTER_OTLP_ENDPOINT as a *base* and
+            // appends the signal path ("/v1/traces", "/v1/logs"). Pass the base, not the
+            // full signal URL, or you get "/v1/traces/v1/traces" and a silent 404.
+            let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint.clone())
+                .build()?;
+            let tracer_provider = SdkTracerProvider::builder()
+                .with_batch_exporter(span_exporter)
+                .with_resource(resource.clone())
+                .build();
+            let tracer = tracer_provider.tracer(SERVICE_NAME);
+            opentelemetry::global::set_tracer_provider(tracer_provider);
+
+            // --- logs (OTLP /v1/logs) ---
+            let log_exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_http()
                 .with_endpoint(endpoint)
                 .build()?;
-            let provider = SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .with_resource(Resource::builder().with_service_name("triumvirate-daemon-v2").build())
+            let logger_provider = SdkLoggerProvider::builder()
+                .with_batch_exporter(log_exporter)
+                .with_resource(resource)
                 .build();
-            let tracer = provider.tracer("triumvirate-daemon-v2");
-            opentelemetry::global::set_tracer_provider(provider);
+            let logger_provider = LOGGER_PROVIDER.get_or_init(|| logger_provider);
+            let otel_log_layer = OpenTelemetryTracingBridge::new(logger_provider);
+
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer)
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .with(otel_log_layer)
                 .init();
         }
         None => {

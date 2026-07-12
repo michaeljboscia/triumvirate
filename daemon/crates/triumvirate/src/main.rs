@@ -132,6 +132,7 @@ mod http_mcp;
 mod abe;
 mod cli_ops;
 mod git_ops_impl;
+mod posthog;
 mod proxy;
 mod tracing_setup;
 mod watch;

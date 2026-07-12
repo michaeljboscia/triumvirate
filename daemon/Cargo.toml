@@ -29,7 +29,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.29"
 opentelemetry = "0.28"
 opentelemetry_sdk = "0.28"
-opentelemetry-otlp = { version = "0.28", features = ["http-proto", "reqwest-client"] }
+# default-features=false is REQUIRED: otlp's defaults enable BOTH reqwest-client and
+# reqwest-blocking-client, whose client-selection cfgs are mutually exclusive — with both
+# on NEITHER matches and the exporter dies at init with "no http client". It must also be
+# the BLOCKING client: OTEL's BatchProcessor runs on its own thread with no Tokio reactor,
+# so an async client panics with "there is no reactor running".
+opentelemetry-otlp = { version = "0.28", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs"] }
+opentelemetry-appender-tracing = "0.28"
 prometheus = "0.13"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"

@@ -701,6 +701,22 @@ pub(crate) async fn execute_ask_agent(
                     &resolved_cwd,
                     &resolved_repo,
                 );
+                // PostHog LLM analytics ($ai_generation). No-op unless POSTHOG_HOST +
+                // POSTHOG_API_KEY are set — same opt-in shape as the OTEL exporter.
+                {
+                    let u = parsed.token_usage.as_ref();
+                    crate::posthog::record_ai_generation(&crate::posthog::AiGeneration {
+                        agent: &agent,
+                        outcome: "success",
+                        trace_id: &request_id,
+                        input_tokens: u.and_then(|x| x.input),
+                        output_tokens: u.and_then(|x| x.output),
+                        cached_tokens: u.and_then(|x| x.cached),
+                        thinking_tokens: u.and_then(|x| x.thinking_tokens),
+                        tool_calls: u.and_then(|x| x.tool_calls),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
                 span.record("agent.outcome", "success");
                 span.record("agent.tokens", tokens);
                 span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
@@ -750,6 +766,17 @@ pub(crate) async fn execute_ask_agent(
                     )
                     .await
                 {
+                    crate::posthog::record_ai_generation(&crate::posthog::AiGeneration {
+                        agent: &agent,
+                        outcome: "failure",
+                        trace_id: &request_id,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_tokens: None,
+                        thinking_tokens: None,
+                        tool_calls: None,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
                     span.record("agent.outcome", "failure");
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                     return Err(err);

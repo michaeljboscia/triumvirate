@@ -21,6 +21,7 @@ tracing-opentelemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
+opentelemetry-appender-tracing.workspace = true
 prometheus.workspace = true
 rust-embed = "8"
 mime_guess = "2"
