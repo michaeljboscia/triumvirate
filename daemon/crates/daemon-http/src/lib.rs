@@ -190,7 +190,7 @@ pub fn adopt_remote_trace_parent(headers: &HeaderMap) {
     tracing::Span::current().set_parent(parent_cx);
 }
 
-/// Headers carrying the current span's trace context. Empty when tracing is not configured —
+/// Headers carrying the current span's trace context. Empty when tracing is not configured , 
 /// `TraceContextPropagator` simply injects nothing for an invalid/absent context.
 fn trace_headers() -> reqwest::header::HeaderMap {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -767,7 +767,7 @@ pub async fn token_by_session_route(
 }
 
 // This span is what the remote parent gets attached to. Without a span of its own,
-// `Span::current()` here is disabled and `set_parent` silently does nothing — the traceparent
+// `Span::current()` here is disabled and `set_parent` silently does nothing, the traceparent
 // would be extracted and thrown away, which is exactly the bug this comment exists to prevent.
 // Everything the daemon then does (including the `ask_agent` span) nests underneath it.
 #[tracing::instrument(skip_all, name = "daemon_ask_agent")]
@@ -783,7 +783,7 @@ pub async fn ask_agent_route(
         ));
     }
     // Adopt the MCP bridge's trace as our parent. Without this the daemon starts a brand-new trace
-    // and one logical call shows up in PostHog as two unrelated ones — bridge spans over here,
+    // and one logical call shows up in PostHog as two unrelated ones, bridge spans over here,
     // ask_agent over there, with nothing tying them together.
     adopt_remote_trace_parent(&headers);
     // Serialize agent execution per project to keep ordering predictable for concurrent bridges.

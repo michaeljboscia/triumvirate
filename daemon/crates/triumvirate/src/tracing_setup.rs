@@ -34,7 +34,7 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
     match otel_endpoint {
         Some(endpoint) => {
             // Without a registered propagator, `inject_context` writes NOTHING and the daemon
-            // never learns it is a child of the MCP bridge's span — the two processes would keep
+            // never learns it is a child of the MCP bridge's span, the two processes would keep
             // producing two unrelated traces for one call. This is the line that makes the
             // traceparent header in daemon-http actually carry something.
             opentelemetry::global::set_text_map_propagator(
@@ -86,7 +86,7 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
             // string helpers. The stderr layer keeps its own, chattier filter regardless.
             // `daemon_http` must stay in: it owns `daemon_ask_agent`, the span that adopts the
             // MCP bridge's traceparent. Filter it out and the daemon's `ask_agent` inherits a
-            // parent that was never exported — a dangling edge, which renders worse than no
+            // parent that was never exported, a dangling edge, which renders worse than no
             // parent at all.
             let otel_span_filter = tracing_subscriber::EnvFilter::try_from_env("OTEL_SPAN_FILTER")
                 .unwrap_or_else(|_| "triumvirate=info,agent_worker=info,daemon_http=info".into());

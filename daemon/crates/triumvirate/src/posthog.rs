@@ -1,8 +1,8 @@
-//! PostHog LLM analytics — emits one `$ai_generation` event per agent call.
+//! PostHog LLM analytics, emits one `$ai_generation` event per agent call.
 //!
 //! This is the Langfuse replacement. PostHog captures LLM observability as ordinary
 //! analytics events (their docs: "All AI Observability events are captured as standard
-//! PostHog events"), so there is no SDK and no new dependency — it is a plain POST on
+//! PostHog events"), so there is no SDK and no new dependency, it is a plain POST on
 //! `reqwest`, which this crate already carries.
 //!
 //! Opt-in via env, exactly like the existing OTEL exporter in `tracing_setup.rs`:
@@ -31,13 +31,13 @@ pub(crate) struct AiGeneration<'a> {
     pub tool_calls: Option<u64>,
     pub duration_ms: u64,
     /// Real USD for metered agents; 0.0 for subscription agents (their marginal cost IS zero);
-    /// None when the model's price is unknown — we emit no cost rather than a fabricated one.
+    /// None when the model's price is unknown, we emit no cost rather than a fabricated one.
     pub cost_usd: Option<f64>,
     /// "metered" | "subscription" | "unknown". Never aggregate cost across these without it.
     pub billing: &'a str,
 }
 
-/// Emits exactly one `$ai_generation` per agent call, on `Drop` — so it fires no matter
+/// Emits exactly one `$ai_generation` per agent call, on `Drop`, so it fires no matter
 /// which of `execute_ask_agent`'s many exits is taken.
 ///
 /// This exists because the sprinkle-a-call-at-each-exit pattern demonstrably does not work.
@@ -45,11 +45,11 @@ pub(crate) struct AiGeneration<'a> {
 /// DeepSeek payload) emitted nothing; `degraded_success` emitted nothing; and worst, the success
 /// event was emitted *before* mandatory peer review ran, so a peer-review failure reported
 /// `success` and then returned `Err`. Every one of those is a class of bug that reappears the
-/// moment someone adds a new `return Err(..)` — so the emit is no longer something a caller can
+/// moment someone adds a new `return Err(..)`, so the emit is no longer something a caller can
 /// forget to do.
 ///
 /// The default outcome is `"unreported"`. If that ever shows up in PostHog it means a new exit
-/// path was added that never classified itself — the dashboard tells on us instead of going quiet.
+/// path was added that never classified itself, the dashboard tells on us instead of going quiet.
 pub(crate) struct CallTelemetry {
     agent: String,
     /// Only meaningful for metered agents (DeepSeek), where price varies by model.
@@ -130,7 +130,7 @@ impl Drop for CallTelemetry {
             billing,
         });
 
-        // A failure is also an issue in error tracking. Only on a real failure — a
+        // A failure is also an issue in error tracking. Only on a real failure, a
         // degraded_success still produced an answer.
         if self.outcome == "failure" {
             let detail = self.detail.as_deref().unwrap_or("unknown error");
@@ -144,7 +144,7 @@ impl Drop for CallTelemetry {
 ///
 /// Only DeepSeek bills per token here: it authenticates with a raw API key against
 /// api.deepseek.com. Codex authenticates with ChatGPT OAuth tokens (`OPENAI_API_KEY` is unset in
-/// ~/.codex/auth.json) and Claude runs on a Max subscription — for both, the MARGINAL cost of one
+/// ~/.codex/auth.json) and Claude runs on a Max subscription, for both, the MARGINAL cost of one
 /// more call is exactly $0. Reporting a dollar figure for those would describe a world we don't
 /// live in; the scarce resource there is quota, not money, and quota is measured in tokens.
 enum Billing {
@@ -162,7 +162,7 @@ enum Billing {
 
 /// Prices are USD per 1M tokens, from DeepSeek's official pricing page
 /// (https://api-docs.deepseek.com/quick_start/pricing/, checked 2026-07-12). If a model is not
-/// listed here we return UnknownPrice and emit no cost — a wrong cost is worse than no cost.
+/// listed here we return UnknownPrice and emit no cost, a wrong cost is worse than no cost.
 fn billing_for(agent: &str, model: Option<&str>) -> Billing {
     match agent {
         // Subscription-backed: ChatGPT OAuth (codex), Max plan (claude), Google plan (gemini/agy).
@@ -190,8 +190,8 @@ fn billing_for(agent: &str, model: Option<&str>) -> Billing {
 ///
 /// - **codex** (OpenAI convention): `input_tokens` is the TOTAL prompt and *includes*
 ///   `cached_input_tokens`. So `cached ⊆ input`.
-/// - **deepseek**: `mcp-bridge/src/deepseek.rs::map_usage` — the file that calls itself "the single
-///   source of truth" — sets `input_tokens = prompt_cache_MISS_tokens` and
+/// - **deepseek**: `mcp-bridge/src/deepseek.rs::map_usage`, the file that calls itself "the single
+///   source of truth", sets `input_tokens = prompt_cache_MISS_tokens` and
 ///   `cached_tokens = prompt_cache_HIT_tokens`. They are **disjoint**; the total prompt is their sum.
 ///
 /// Observed live and impossible under the subset assumption: `input=46, cached=256`.
@@ -251,7 +251,7 @@ fn capture(event: &str, properties: serde_json::Value) {
         std::env::var("POSTHOG_HOST"),
         std::env::var("POSTHOG_API_KEY"),
     ) else {
-        return; // not configured — stay silent, exactly like the OTEL exporter
+        return; // not configured, stay silent, exactly like the OTEL exporter
     };
 
     let url = format!("{}/i/v0/e/", host.trim_end_matches('/'));
@@ -277,7 +277,7 @@ fn capture(event: &str, properties: serde_json::Value) {
 /// Report a failed agent call to PostHog **error tracking** (the `$exception` event).
 ///
 /// PostHog's docs say never to hand-build `$exception` because "the exception event schema
-/// is strict" — and there is no Rust SDK to build it for us. So this is written against the
+/// is strict", and there is no Rust SDK to build it for us. So this is written against the
 /// schema their ingestion service actually deserializes into, not against the docs:
 /// `rust/cymbal/src/core/types/exception.rs`
 ///
@@ -289,7 +289,7 @@ fn capture(event: &str, properties: serde_json::Value) {
 ///     }
 ///
 /// `stacktrace` is optional, and we deliberately omit it: an agent failure is not a Rust
-/// panic, so there is no meaningful frame list. PostHog then groups by type + message —
+/// panic, so there is no meaningful frame list. PostHog then groups by type + message , 
 /// which is the axis worth grouping on anyway ("how often does codex time out?").
 pub(crate) fn record_exception(agent: &str, kind: &str, message: &str, trace_id: &str) {
     capture(
@@ -303,7 +303,7 @@ pub(crate) fn record_exception(agent: &str, kind: &str, message: &str, trace_id:
                 "mechanism": { "handled": true, "type": "generic" },
             }],
             // Without a stacktrace PostHog groups by type + MESSAGE. Any varying token in a
-            // message — a UUID, a duration, a byte count, a port — would then mint a brand-new
+            // message, a UUID, a duration, a byte count, a port, would then mint a brand-new
             // Issue for every single failure and bury the UI. Pin the grouping to the pair we
             // actually want to reason about ("how often does codex fail?") and let the message
             // stay detailed for the human reading the Issue.
@@ -328,12 +328,12 @@ pub(crate) fn record_ai_generation(g: &AiGeneration<'_>) {
             "$ai_output_tokens":  g.output_tokens.unwrap_or(0),
             "$ai_latency":        (g.duration_ms as f64) / 1000.0,   // seconds
             "$ai_is_error":       is_error,
-            // Real dollars ONLY for metered agents. 0.0 for a subscription is not a placeholder —
+            // Real dollars ONLY for metered agents. 0.0 for a subscription is not a placeholder , 
             // it is the true marginal cost of one more call on a fixed plan. Omitted entirely when
             // the price is unknown, so a chart can never silently sum a guess.
             "$ai_total_cost_usd": g.cost_usd,
             // --- Triumvirate-specific dimensions (what makes the dashboards useful) ---
-            // tv_agent is the stable internal KEY ("gemini") — never rename it, or every chart
+            // tv_agent is the stable internal KEY ("gemini"), never rename it, or every chart
             // and saved insight built on historical rows silently splits in two. tv_agent_display
             // is the product name an operator should actually read ("Antigravity"). A dashboard
             // is a human surface, so it gets the human label; the key stays for continuity.
@@ -379,7 +379,7 @@ mod tests {
         assert!((usd.unwrap() - expected).abs() < 1e-12);
     }
 
-    /// A subscription call costs exactly nothing at the margin. Not a placeholder — the truth.
+    /// A subscription call costs exactly nothing at the margin. Not a placeholder, the truth.
     #[test]
     fn subscription_agents_cost_zero_not_list_price() {
         for agent in ["codex", "claude", "gemini"] {
