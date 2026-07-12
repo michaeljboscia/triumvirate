@@ -177,6 +177,9 @@ pub async fn ask_session(
         None,
     )
     .await
+            // A named session is the one caller that genuinely wants to resume: multi-turn
+            // memory is the whole point. One-shot ask_agent leaves this None and starts fresh.
+            reuse_session: Some(true),
     .map_err(|e| format!("ask_session failed: {e}"))?
     .response;
 

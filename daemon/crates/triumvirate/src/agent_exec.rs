@@ -372,7 +372,15 @@ pub(crate) async fn execute_ask_agent(
         .unwrap_or_else(|| ".".to_string());
     let execution_prompt = inject_tool_marker_prompt(&req.message);
     let worker = acquire_worker(&agent, &exec_cwd).await;
-    let mut worker_session_id = worker.session_id.clone();
+    // Resume is opt-in. The worker registry is keyed only by (agent, cwd), so a one-shot
+    // ask_agent would otherwise resume — and get billed for — whatever named session last
+    // ran in this directory, replaying its whole transcript as input on every call.
+    let reuse_session = req.reuse_session.unwrap_or(false);
+    let mut worker_session_id = if reuse_session {
+        worker.session_id.clone()
+    } else {
+        None
+    };
     span.record(
         "session_id",
         tracing::field::display(worker_session_id.as_deref().unwrap_or("none")),
@@ -721,7 +729,12 @@ pub(crate) async fn execute_ask_agent(
                 span.record("agent.tokens", tokens);
                 span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                 let next_session_id = parsed.session_id.clone();
-                update_worker_session(&agent, &exec_cwd, next_session_id).await;
+                // Only a session-scoped call may publish its session id. A one-shot that
+                // wrote here would clobber the named session cached under the same
+                // (agent, cwd) key and silently destroy its continuity.
+                if reuse_session {
+                    update_worker_session(&agent, &exec_cwd, next_session_id).await;
+                }
                 span.record(
                     "session_id",
                     tracing::field::display(parsed.session_id.as_deref().unwrap_or("none")),

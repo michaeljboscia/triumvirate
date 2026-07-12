@@ -35,6 +35,17 @@ pub struct AskAgentRequest {
     pub repo: Option<String>,
     pub branch: Option<String>,
 
+    /// Resume the cached worker session for (agent, cwd) instead of starting a
+    /// fresh one. Opt-in, and `None`/`false` for every one-shot caller.
+    ///
+    /// Resuming replays the ENTIRE prior transcript as input on every turn (for
+    /// codex, `codex exec resume <id>`), so the cost of a call tracks the age of
+    /// the session, not the size of the question — a one-word ask on a long-lived
+    /// session was measured at 189,930 input tokens against 26,215 fresh. Only
+    /// named sessions (`ask_session`/`ask_daemon`) want that; they set this true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_session: Option<bool>,
+
     // T-011 (REQ-DS-027): per-call overrides for the DeepSeek sibling. ALL
     // four fields are Optional and skip-serialize-on-None so the wire shape
     // is unchanged for Gemini/Codex callers. The runner (T-012) reads them
