@@ -41,7 +41,9 @@ fn provider_for(agent: &str) -> &'static str {
 }
 
 /// Emit a `$ai_generation` event. No-op unless POSTHOG_HOST and POSTHOG_API_KEY are both set.
-pub(crate) fn record_ai_generation(g: &AiGeneration<'_>) {
+/// POST one event to PostHog. Fire-and-forget; every error is swallowed, because a
+/// telemetry failure must never be able to fail an agent call.
+fn capture(event: &str, properties: serde_json::Value) {
     let (Ok(host), Ok(key)) = (
         std::env::var("POSTHOG_HOST"),
         std::env::var("POSTHOG_API_KEY"),
@@ -50,13 +52,63 @@ pub(crate) fn record_ai_generation(g: &AiGeneration<'_>) {
     };
 
     let url = format!("{}/i/v0/e/", host.trim_end_matches('/'));
-    let is_error = g.outcome != "success" && g.outcome != "degraded_success";
-
     let body = json!({
         "api_key": key,
-        "event": "$ai_generation",
+        "event": event,
         "distinct_id": "triumvirate-daemon",
-        "properties": {
+        "properties": properties,
+    });
+
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let _ = client.post(&url).json(&body).send().await;
+    });
+}
+
+/// Report a failed agent call to PostHog **error tracking** (the `$exception` event).
+///
+/// PostHog's docs say never to hand-build `$exception` because "the exception event schema
+/// is strict" — and there is no Rust SDK to build it for us. So this is written against the
+/// schema their ingestion service actually deserializes into, not against the docs:
+/// `rust/cymbal/src/core/types/exception.rs`
+///
+///     pub struct Exception {
+///         #[serde(rename = "type")]  pub exception_type: String,      // required
+///         #[serde(rename = "value", default)] pub exception_message: String,
+///         pub mechanism: Option<Mechanism>,   // optional
+///         pub stacktrace: Option<Stacktrace>, // optional
+///     }
+///
+/// `stacktrace` is optional, and we deliberately omit it: an agent failure is not a Rust
+/// panic, so there is no meaningful frame list. PostHog then groups by type + message —
+/// which is the axis worth grouping on anyway ("how often does codex time out?").
+pub(crate) fn record_exception(agent: &str, kind: &str, message: &str, trace_id: &str) {
+    capture(
+        "$exception",
+        json!({
+            "$exception_list": [{
+                "type":  kind,        // -> Exception::exception_type   (the grouping key)
+                "value": message,     // -> Exception::exception_message
+                "mechanism": { "handled": true, "type": "generic" },
+            }],
+            "tv_agent":    agent,
+            "$ai_trace_id": trace_id,   // joins the exception to its $ai_generation
+        }),
+    );
+}
+
+pub(crate) fn record_ai_generation(g: &AiGeneration<'_>) {
+    let is_error = g.outcome != "success" && g.outcome != "degraded_success";
+
+    capture(
+        "$ai_generation",
+        json!({
             // --- PostHog's LLM analytics schema ---
             "$ai_trace_id":       g.trace_id,
             "$ai_provider":       provider_for(g.agent),
@@ -72,18 +124,6 @@ pub(crate) fn record_ai_generation(g: &AiGeneration<'_>) {
             "tv_thinking_tokens":  g.thinking_tokens.unwrap_or(0),
             "tv_tool_calls":       g.tool_calls.unwrap_or(0),
             "tv_duration_ms":      g.duration_ms,
-        }
-    });
-
-    tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        // Deliberately ignore the result: a telemetry failure is not an agent failure.
-        let _ = client.post(&url).json(&body).send().await;
-    });
+        }),
+    );
 }

@@ -779,17 +779,6 @@ pub(crate) async fn execute_ask_agent(
                     )
                     .await
                 {
-                    crate::posthog::record_ai_generation(&crate::posthog::AiGeneration {
-                        agent: &agent,
-                        outcome: "failure",
-                        trace_id: &request_id,
-                        input_tokens: None,
-                        output_tokens: None,
-                        cached_tokens: None,
-                        thinking_tokens: None,
-                        tool_calls: None,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
                     span.record("agent.outcome", "failure");
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                     return Err(err);
@@ -1158,8 +1147,28 @@ pub(crate) async fn execute_ask_agent(
         lifecycle
             .iter()
             .map(|e| e.state.as_str())
+
+    let failure_detail = last_err.unwrap_or_else(|| "unknown error".to_string());
+
+    // THE terminal failure path: every ask_agent that exhausts its retries returns here.
+    // Report it twice, on purpose — $ai_generation keeps the failure in the LLM analytics
+    // (so success-rate-by-agent is honest), and $exception raises it as an issue in error
+    // tracking. Both carry request_id, so an issue joins back to the call that produced it.
+    crate::posthog::record_ai_generation(&crate::posthog::AiGeneration {
+        agent: &agent,
+        outcome: "failure",
+        trace_id: &request_id,
+        input_tokens: None,
+        output_tokens: None,
+        cached_tokens: None,
+        thinking_tokens: None,
+        tool_calls: None,
+        duration_ms: started.elapsed().as_millis() as u64,
+    });
+    crate::posthog::record_exception(&agent, "AgentCallFailed", &failure_detail, &request_id);
+
             .collect::<Vec<_>>(),
-        last_err.unwrap_or_else(|| "unknown error".to_string()),
+        failure_detail,
         fallback_path
             .map(|p| format!("; dead drop launched at {}", p.display()))
             .unwrap_or_default()

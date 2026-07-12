@@ -4,7 +4,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{Resource, logs::SdkLoggerProvider, trace::SdkTracerProvider};
 use std::sync::OnceLock;
 use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const SERVICE_NAME: &str = "triumvirate-daemon-v2";
 
@@ -62,10 +62,24 @@ pub(crate) fn init_tracing() -> anyhow::Result<()> {
             let logger_provider = LOGGER_PROVIDER.get_or_init(|| logger_provider);
             let otel_log_layer = OpenTelemetryTracingBridge::new(logger_provider);
 
+            // A span costs money to ship and store, and dilutes every query written against
+            // it. Without a filter of its own this layer exports EVERY #[instrument] in the
+            // tree: a sample run produced 74 `triumvirate_home_dir` and 48 `unix_time_ms`
+            // spans (0ms each, unable to answer any question anyone would ask) against 3
+            // `ask_agent` spans -- the only ones that carry agent/outcome/duration. Export
+            // this crate's spans; leave the sub-crate plumbing to the stderr layer, which
+            // keeps its own, chattier filter.
+            let otel_span_filter = tracing_subscriber::EnvFilter::try_from_env("OTEL_SPAN_FILTER")
+                .unwrap_or_else(|_| "triumvirate=info".into());
+
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer)
-                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .with(
+                    tracing_opentelemetry::layer()
+                        .with_tracer(tracer)
+                        .with_filter(otel_span_filter),
+                )
                 .with(otel_log_layer)
                 .init();
         }
