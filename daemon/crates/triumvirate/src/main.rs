@@ -3359,6 +3359,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
     #[tokio::test]
     async fn ask_agent_requires_peer_review_when_env_enabled() -> anyhow::Result<()> {
+                // Stale-session recovery only applies to a caller that RESUMES. A one-shot
+                // ask_agent no longer reads the cached session at all (that inheritance was the
+                // bug: the worker registry is keyed only by (agent, cwd), so a one-shot would
+                // silently adopt — and get billed for — whatever named session last ran in this
+                // directory). So this scenario belongs to the session-scoped path.
+                reuse_session: Some(true),
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let script_path = write_mock_gemini_script()?;
         let temp = tempfile::tempdir()?;
@@ -3383,6 +3389,72 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 ..Default::default()
             },
             None,
+    /// The other half of the same rule, and the half that costs money: a ONE-SHOT ask_agent must
+    /// never adopt the session cached for (agent, cwd).
+    ///
+    /// The worker registry is keyed only by (agent, cwd), so before this a one-shot would resume
+    /// whatever named session last ran in that directory — replaying its entire transcript as
+    /// input on every call (measured: 189,930 input tokens to answer "ok", against 26,215 fresh)
+    /// and then clobbering that session's id on the way out.
+    ///
+    /// If this test ever fails, the cached session has leaked back into the one-shot path.
+    #[tokio::test]
+    async fn one_shot_ask_agent_does_not_inherit_a_cached_session() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_worker_registry_for_tests().await;
+        let script_path = write_invalid_session_recovery_script("gemini")?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+
+        let cwd = "/tmp/one-shot-no-inherit";
+        let _ = acquire_worker("gemini", cwd).await;
+        update_worker_session("gemini", cwd, Some("stale-session-id".to_string())).await;
+
+        let response = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "gemini".to_string(),
+                message: "recover please".to_string(),
+                cwd: Some(cwd.to_string()),
+                repo: None,
+                branch: None,
+                // reuse_session deliberately unset -> this is a one-shot.
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+        // It never touched the stale session, so there was nothing to invalidate.
+        assert!(
+            !response
+                .lifecycle
+                .iter()
+                .any(|e| e.state == "SESSION_INVALIDATED"),
+            "one-shot must not resume the cached session"
+        );
+        assert!(response.lifecycle.iter().any(|e| e.state == "DONE"));
+
+        // And it must not have overwritten the session a named ask_session depends on.
+        let worker = acquire_worker("gemini", cwd).await;
+        assert_eq!(
+            worker.session_id.as_deref(),
+            Some("stale-session-id"),
+            "one-shot must not clobber the cached session id"
+        );
+
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+        }
+        let _ = fs::remove_file(script_path);
+        Ok(())
+    }
+
         )
         .await
         .map_err(anyhow::Error::msg)?;
