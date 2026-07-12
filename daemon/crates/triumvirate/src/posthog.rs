@@ -30,6 +30,86 @@ pub(crate) struct AiGeneration<'a> {
     pub duration_ms: u64,
 }
 
+/// Emits exactly one `$ai_generation` per agent call, on `Drop` — so it fires no matter
+/// which of `execute_ask_agent`'s many exits is taken.
+///
+/// This exists because the sprinkle-a-call-at-each-exit pattern demonstrably does not work.
+/// Reviewers found three separate holes in it: two early returns (unsupported agent, oversized
+/// DeepSeek payload) emitted nothing; `degraded_success` emitted nothing; and worst, the success
+/// event was emitted *before* mandatory peer review ran, so a peer-review failure reported
+/// `success` and then returned `Err`. Every one of those is a class of bug that reappears the
+/// moment someone adds a new `return Err(..)` — so the emit is no longer something a caller can
+/// forget to do.
+///
+/// The default outcome is `"unreported"`. If that ever shows up in PostHog it means a new exit
+/// path was added that never classified itself — the dashboard tells on us instead of going quiet.
+pub(crate) struct CallTelemetry {
+    agent: String,
+    trace_id: String,
+    started: std::time::Instant,
+    outcome: &'static str,
+    tokens: Option<agent_adapter::TokenUsage>,
+    detail: Option<String>,
+}
+
+impl CallTelemetry {
+    pub(crate) fn new(agent: &str, trace_id: &str) -> Self {
+        Self {
+            agent: agent.to_string(),
+            trace_id: trace_id.to_string(),
+            started: std::time::Instant::now(),
+            outcome: "unreported",
+            tokens: None,
+            detail: None,
+        }
+    }
+
+    /// The agent name is normalized *after* the guard is built (the unsupported-agent check
+    /// runs first), so allow it to be corrected once it is known.
+    pub(crate) fn set_agent(&mut self, agent: &str) {
+        self.agent = agent.to_string();
+    }
+
+    pub(crate) fn success(&mut self, tokens: Option<agent_adapter::TokenUsage>) {
+        self.outcome = "success";
+        self.tokens = tokens;
+    }
+
+    pub(crate) fn degraded_success(&mut self, tokens: Option<agent_adapter::TokenUsage>) {
+        self.outcome = "degraded_success";
+        self.tokens = tokens;
+    }
+
+    pub(crate) fn failure(&mut self, detail: impl Into<String>) {
+        self.outcome = "failure";
+        self.detail = Some(detail.into());
+    }
+}
+
+impl Drop for CallTelemetry {
+    fn drop(&mut self) {
+        let u = self.tokens.as_ref();
+        record_ai_generation(&AiGeneration {
+            agent: &self.agent,
+            outcome: self.outcome,
+            trace_id: &self.trace_id,
+            input_tokens: u.and_then(|x| x.input),
+            output_tokens: u.and_then(|x| x.output),
+            cached_tokens: u.and_then(|x| x.cached),
+            thinking_tokens: u.and_then(|x| x.thinking_tokens),
+            tool_calls: u.and_then(|x| x.tool_calls),
+            duration_ms: self.started.elapsed().as_millis() as u64,
+        });
+
+        // A failure is also an issue in error tracking. Only on a real failure — a
+        // degraded_success still produced an answer.
+        if self.outcome == "failure" {
+            let detail = self.detail.as_deref().unwrap_or("unknown error");
+            record_exception(&self.agent, "AgentCallFailed", detail, &self.trace_id);
+        }
+    }
+}
+
 /// Map an agent to the provider PostHog expects in `$ai_provider`.
 fn provider_for(agent: &str) -> &'static str {
     match agent {

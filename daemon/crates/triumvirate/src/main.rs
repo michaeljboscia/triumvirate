@@ -2086,6 +2086,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
         AxumJson(req): AxumJson<DismissSessionRequest>,
+                // This is the HTTP twin of mcp-tools' ask_session: a NAMED session, so it must
+                // resume. Without this it silently loses multi-turn memory while the MCP path
+                // keeps it — the two surfaces would disagree about what a session is.
+                reuse_session: Some(true),
     ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));

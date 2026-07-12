@@ -325,16 +325,24 @@ pub(crate) async fn execute_ask_agent(
     let started = Instant::now();
     let span = Span::current();
 
+    // request_id is minted here, ABOVE the early returns, so the telemetry guard below can
+    // cover them. Everything after this point reports exactly once, on drop, whichever exit
+    // is taken — including exits that do not exist yet.
+    let request_id = Uuid::new_v4().to_string();
+    let mut tel = crate::posthog::CallTelemetry::new(&req.agent, &request_id);
+
     if !is_supported_agent(req) {
         span.record("agent.outcome", "rejected");
         span.record("agent.tokens", 0_u64);
         span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
-        return Err(
-            "ask_agent supports only agent='gemini', agent='codex', or agent='deepseek'"
-                .to_string(),
-        );
+        let msg = "ask_agent supports only agent='antigravity' (aliases: agy, gemini), agent='codex', or agent='deepseek'";
+        tel.failure(msg);
+        return Err(msg.to_string());
     }
-    let agent = req.agent.to_lowercase();
+    // Normalize BEFORE worker-acquire and dispatch so antigravity/agy callers land
+    // on the canonical `gemini` execution key (shared worker slot + dispatch arm).
+    let agent = normalize_agent_name(&req.agent);
+    tel.set_agent(&agent);
 
     // T-015 (REQ-DS-025) anti-bulk: reject oversized payloads on the metered
     // DeepSeek path BEFORE any worker is acquired. The default ceiling (16KB)
@@ -348,12 +356,14 @@ pub(crate) async fn execute_ask_agent(
             span.record("agent.outcome", "rejected_payload_too_large");
             span.record("agent.tokens", 0_u64);
             span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
-            return Err(format!(
+            let msg = format!(
                 "deepseek: payload too large ({} bytes > {} byte cap) — DeepSeek is remote+metered, \
                  set TRIUMVIRATE_DEEPSEEK_BULK_BYTES to raise the limit",
                 req.message.len(),
                 cap
-            ));
+            );
+            tel.failure(msg.clone());
+            return Err(msg);
         }
     }
 
@@ -364,7 +374,6 @@ pub(crate) async fn execute_ask_agent(
     } else {
         None
     };
-    let request_id = Uuid::new_v4().to_string();
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
     let exec_cwd = resolved_cwd
@@ -551,8 +560,13 @@ pub(crate) async fn execute_ask_agent(
                     .await;
             }
         }
-        let session_for_attempt = if model_override.is_some() && idx > 0 {
-            // Don't reuse cached sessions across model faildown — different models can't resume each other's sessions
+        // A faildown attempt runs on a DIFFERENT model, which cannot resume the primary
+        // model's session — so it starts fresh. Crucially, its fresh session id must also
+        // never be written back (see the success arm): doing so would overwrite the primary
+        // session cached for this (agent, cwd) and permanently orphan the user's transcript,
+        // turning a transient 429 into total memory loss for a named session.
+        let is_faildown_attempt = model_override.is_some() && idx > 0;
+        let session_for_attempt = if is_faildown_attempt {
             None
         } else {
             worker_session_id.clone()
@@ -709,22 +723,11 @@ pub(crate) async fn execute_ask_agent(
                     &resolved_cwd,
                     &resolved_repo,
                 );
-                // PostHog LLM analytics ($ai_generation). No-op unless POSTHOG_HOST +
-                // POSTHOG_API_KEY are set — same opt-in shape as the OTEL exporter.
-                {
-                    let u = parsed.token_usage.as_ref();
-                    crate::posthog::record_ai_generation(&crate::posthog::AiGeneration {
-                        agent: &agent,
-                        outcome: "success",
-                        trace_id: &request_id,
-                        input_tokens: u.and_then(|x| x.input),
-                        output_tokens: u.and_then(|x| x.output),
-                        cached_tokens: u.and_then(|x| x.cached),
-                        thinking_tokens: u.and_then(|x| x.thinking_tokens),
-                        tool_calls: u.and_then(|x| x.tool_calls),
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
-                }
+                // Provisional: mandatory peer review can still fail below and overwrite this
+                // with failure(). The guard emits only ONCE, on drop, with whatever the final
+                // outcome turned out to be — which is precisely the bug that made the old
+                // "emit here" version report success for a call that then returned Err.
+                tel.success(parsed.token_usage.clone());
                 span.record("agent.outcome", "success");
                 span.record("agent.tokens", tokens);
                 span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
@@ -732,7 +735,7 @@ pub(crate) async fn execute_ask_agent(
                 // Only a session-scoped call may publish its session id. A one-shot that
                 // wrote here would clobber the named session cached under the same
                 // (agent, cwd) key and silently destroy its continuity.
-                if reuse_session {
+                if reuse_session && !is_faildown_attempt {
                     update_worker_session(&agent, &exec_cwd, next_session_id).await;
                 }
                 span.record(
@@ -781,6 +784,9 @@ pub(crate) async fn execute_ask_agent(
                 {
                     span.record("agent.outcome", "failure");
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+                    // Overwrites the provisional success() above. The call produced a response
+                    // but is being rejected, so it is a failure — and must not be counted twice.
+                    tel.failure(err.clone());
                     return Err(err);
                 }
                 // Slice 6: shadow-compare — run the other Gemini backend, attach + log.
@@ -1034,6 +1040,10 @@ pub(crate) async fn execute_ask_agent(
                     }
                     span.record("agent.outcome", "degraded_success");
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+                    // Previously emitted NOTHING: a degraded success vanished from LLM
+                    // analytics entirely, so "how often does gemini degrade rather than fail?"
+                    // — the exact question this taxonomy exists to answer — was unanswerable.
+                    tel.degraded_success(None);
                     // REQ-053 R3: a text prefix only when a DIFFERENT agent answered
                     // (codex). A gemini-cli hop is the same agent on the legacy backend,
                     // so honesty lives in the fields/lifecycle, not an alarming prefix.
@@ -1145,28 +1155,15 @@ pub(crate) async fn execute_ask_agent(
     Err(format!(
         "ask_agent failed after lifecycle {:?}: {}{}",
         lifecycle
-            .iter()
-            .map(|e| e.state.as_str())
 
     let failure_detail = last_err.unwrap_or_else(|| "unknown error".to_string());
 
-    // THE terminal failure path: every ask_agent that exhausts its retries returns here.
-    // Report it twice, on purpose — $ai_generation keeps the failure in the LLM analytics
-    // (so success-rate-by-agent is honest), and $exception raises it as an issue in error
-    // tracking. Both carry request_id, so an issue joins back to the call that produced it.
-    crate::posthog::record_ai_generation(&crate::posthog::AiGeneration {
-        agent: &agent,
-        outcome: "failure",
-        trace_id: &request_id,
-        input_tokens: None,
-        output_tokens: None,
-        cached_tokens: None,
-        thinking_tokens: None,
-        tool_calls: None,
-        duration_ms: started.elapsed().as_millis() as u64,
-    });
-    crate::posthog::record_exception(&agent, "AgentCallFailed", &failure_detail, &request_id);
+    // The terminal failure path (retries exhausted). The guard emits $ai_generation AND, because
+    // this is a real failure, an $exception — once, on drop.
+    tel.failure(failure_detail.clone());
 
+            .iter()
+            .map(|e| e.state.as_str())
             .collect::<Vec<_>>(),
         failure_detail,
         fallback_path
