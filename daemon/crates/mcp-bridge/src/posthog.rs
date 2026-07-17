@@ -623,61 +623,6 @@ pub fn record_session_invalidated(agent: &str, backend: Option<&str>, repo: Opti
 /// No task_id and no prompt: both unbounded. This event is for counting and grouping ("how
 /// often does codex silently produce nothing, and in which repo?"); the local tracker stays
 /// the place to inspect one dispatch.
-/// Fires `tv_codex_dispatch{outcome:"unreported"}` on Drop UNLESS disarmed.
-///
-/// This is deliberately NOT the old Drop guard, and the distinction is the whole point: it
-/// never authors a VERDICT. The arbiter (the tracker) decides how a dispatch ended, and the
-/// monitor reports that verdict by reading it back. But if the monitor panics or is aborted,
-/// that report never runs and the dispatch vanishes from every surface, which is precisely
-/// the silent-failure class this work exists to kill. Replacing the guard with a plain
-/// `classify.await; report(...)` traded a lying event for a missing one.
-///
-/// So: the canary only ever says "nobody reported this", which is always true when it fires.
-/// `disarm()` is called immediately after the real report succeeds.
-pub struct DispatchCanary {
-    surface: &'static str,
-    started: std::time::Instant,
-    repo: Option<String>,
-    armed: bool,
-}
-
-impl DispatchCanary {
-    pub fn new(surface: &'static str, repo: Option<&str>, started: std::time::Instant) -> Self {
-        Self {
-            surface,
-            started,
-            repo: repo.map(|r| r.to_string()),
-            armed: true,
-        }
-    }
-
-    /// The arbiter's verdict was reported; this canary has nothing left to say.
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for DispatchCanary {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Reached only when the monitor died before reporting. Say so; do not guess an
-        // outcome we never observed.
-        tracing::warn!(
-            surface = self.surface,
-            "codex dispatch monitor ended without reporting an outcome (panic or abort?)"
-        );
-        record_codex_dispatch(
-            self.surface,
-            "unreported",
-            self.started.elapsed().as_millis() as u64,
-            self.repo.as_deref(),
-            None,
-            None,
-        );
-    }
-}
 
 pub fn record_codex_dispatch(
     surface: &str,

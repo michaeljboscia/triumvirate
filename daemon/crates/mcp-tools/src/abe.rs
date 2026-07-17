@@ -34,6 +34,7 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
     /// themselves as a Pantheon session; in that case the WorkerLifecycle
     /// events will have `parent_session_id = None` and Pantheon's sidebar
     /// will render the worker as a top-level root.
+    #[allow(clippy::too_many_arguments)]
     fn register(
         &self,
         task_id: String,
@@ -42,6 +43,14 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
         worktree_path: Option<PathBuf>,
         parent_session_id: Option<String>,
         root_session_id: Option<String>,
+        // Which dispatch tool + which repo, so the tracker (the arbiter, and therefore the
+        // authoritative emitter) can report tv_codex_dispatch at terminal time. surface=None
+        // means a non-codex task and suppresses the event. dispatch_started_at is the caller's
+        // clock, taken BEFORE cwd resolution / spawn / worktree setup, so the reported duration
+        // covers the whole dispatch, not just the monitored portion.
+        dispatch_surface: Option<&'static str>,
+        dispatch_repo: Option<String>,
+        dispatch_started_at: Instant,
     ) -> BoxFuture<()>;
 
     fn mark_completed(
@@ -479,66 +488,6 @@ pub(crate) fn append_codex_exec_mcp_compat_args(args: &mut Vec<String>) {
     args.push("tool_call_mcp_elicitation".to_string());
 }
 
-#[instrument(skip_all)]
-/// Report a dispatch's outcome to PostHog by reading the TRACKER's verdict, once, after the
-/// monitor has finished.
-///
-/// Three independent reviewers converged on the rule this implements: when N observers race
-/// to describe one outcome, only the ARBITER of the race may report it. An observer knows
-/// whether IT won, never whether someone else won first, so an observer-authored event can
-/// contradict the recorded truth. The concrete case: `cancel_task` can set `Cancelled` while
-/// the monitor is mid-classification, and a self-reporting monitor would cheerfully emit
-/// "completed" for a task the tracker recorded as cancelled.
-///
-/// Reading the status BACK is race-free because a terminal status is immutable: every
-/// `mark_*` refuses to move a task that `is_terminal`, so whatever we read here is final and
-/// is what every other surface will report forever.
-///
-/// `no_commit` is derived STRUCTURALLY rather than by matching on an error string: a task is
-/// Failed with `exit_code == Some(0)` only when codex exited cleanly and produced no commit.
-/// A real failure carries a non-zero code. That silent no-op is the most valuable outcome
-/// here, because nothing else reveals it: the agent reports success and the repo is untouched.
-async fn report_dispatch_outcome<T: AbeTaskTracker>(
-    tracker: &T,
-    task_id: &str,
-    surface: &'static str,
-    repo: Option<&str>,
-    started_at: Instant,
-) {
-    let Some(status) = tracker.get_status(task_id.to_string()).await else {
-        // The task vanished from the tracker. Nothing truthful left to report.
-        tracing::warn!(task_id = %task_id, "dispatch outcome unreportable: task not found");
-        return;
-    };
-    let outcome = match status.status {
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed if status.exit_code == Some(0) => "no_commit",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Timeout => "timeout",
-        TaskStatus::Stuck => "stuck",
-        TaskStatus::Cancelled => "cancelled",
-        TaskStatus::SetupFailed => "setup_failed",
-        // The monitor finished while the tracker still says Working. Not a state we expect;
-        // say so out loud rather than inventing a verdict.
-        TaskStatus::Working => "unreported",
-    };
-    let files_changed = if matches!(status.status, TaskStatus::Completed) {
-        tracker
-            .get_output(task_id.to_string())
-            .await
-            .map(|o| o.modified_files.len())
-    } else {
-        None
-    };
-    mcp_bridge::posthog::record_codex_dispatch(
-        surface,
-        outcome,
-        started_at.elapsed().as_millis() as u64,
-        repo,
-        files_changed,
-        status.exit_code,
-    );
-}
 
 pub async fn dispatch_codex<T: AbeTaskTracker>(
     tracker: T,
@@ -607,7 +556,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
             mcp_bridge::posthog::record_codex_dispatch(
                 "dispatch_codex",
                 "spawn_failed",
-                0,
+                task_started_at.elapsed().as_millis() as u64,
                 Some(&cwd),
                 None,
                 None,
@@ -633,30 +582,21 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
             None,
             parent_session_id,
             root_session_id,
+            Some("dispatch_codex"),
+            Some(cwd.clone()),
+            task_started_at,
         )
         .await;
 
     let tracker_for_monitor = tracker.clone();
     let callbacks_for_monitor = callbacks.clone();
     let task_id_for_monitor = task_id.clone();
-    // Clones for the reporter: it must outlive the classification body below, which owns the
-    // originals and returns from several arms.
-    let tracker_for_report = tracker.clone();
-    let task_id_for_report = task_id.clone();
-    let cwd_for_report = cwd.clone();
-    tokio::spawn(async move {
-        // Canary first: if the body below panics or this task is aborted, the report never
-        // runs and the dispatch would vanish from every surface. The canary never invents a
-        // verdict, it only reports that nobody reported one.
-        let mut canary = mcp_bridge::posthog::DispatchCanary::new(
-            "dispatch_codex",
-            Some(&cwd_for_report),
-            task_started_at,
-        );
-        // The classification body keeps its early `return`s; wrapping it means the report
-        // below runs on EVERY path instead of relying on someone remembering to add an emit
-        // to a new arm. One reporter, one event, always reached.
-        let classify = async move {
+    // Supervisor clones: reach the tracker if the monitor dies before any transition.
+    let tracker_for_sup = tracker.clone();
+    let task_id_for_sup = task_id.clone();
+    // The monitor calls mark_* on the tracker, and the TRACKER emits tv_codex_dispatch on the
+    // terminal transition (it is the arbiter). No report/canary here: those would double-emit.
+    let monitor = tokio::spawn(async move {
         let wave_label = "mcp";
         let cwd_path = PathBuf::from(&cwd);
         let timeout_duration = std::time::Duration::from_secs(timeout_sec);
@@ -734,29 +674,48 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 )
                 .await;
         }
-        };
-        classify.await;
-        // Disarm BEFORE reporting, not after. Disarmed after, a panic inside the report would
-        // let BOTH fire: a real verdict plus a contradictory "unreported", and a consumer
-        // cannot reconcile those. The canary's question is "did we reach the reporting step",
-        // and by here the answer is yes.
-        canary.disarm();
-        // Report the ARBITER's verdict, not our own: cancel_task may have won the terminal
-        // transition while we were classifying, and only the tracker knows.
-        report_dispatch_outcome(
-            &tracker_for_report,
-            &task_id_for_report,
-            "dispatch_codex",
-            Some(&cwd_for_report),
-            task_started_at,
-        )
-        .await;
+    });
+
+    // Supervisor (Antigravity's JoinHandle pattern, replacing the old Drop canary): if the
+    // monitor PANICS or is aborted before it reaches any mark_*, the tracker never transitions
+    // and nothing is emitted — the dispatch would vanish. Route that through mark_failed, which
+    // emits via the tracker exactly once (AlreadyTerminal if the body already transitioned, so
+    // no double-emit). Unified path, immediate detection, no cross-crate canary state.
+    tokio::spawn(async move {
+        match monitor.await {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => {
+                tracker_for_sup
+                    .mark_failed(task_id_for_sup, None, "dispatch monitor panicked".to_string())
+                    .await;
+            }
+            Err(e) if e.is_cancelled() => {
+                tracker_for_sup
+                    .mark_failed(task_id_for_sup, None, "dispatch monitor cancelled".to_string())
+                    .await;
+            }
+            Err(_) => {}
+        }
     });
 
     Ok(DispatchCodexResponse {
         task_id,
         status: "dispatched".to_string(),
     })
+}
+
+/// Report a worktree dispatch that died during pre-register setup. These paths call
+/// register_setup_failed (which stores no dispatch_surface, so the tracker can't emit) and
+/// return, so this is the only place that knows a worktree dispatch failed at setup.
+fn emit_worktree_setup_failed(project_root: &Path, started_at: Instant) {
+    mcp_bridge::posthog::record_codex_dispatch(
+        "dispatch_codex_worktree",
+        "setup_failed",
+        started_at.elapsed().as_millis() as u64,
+        Some(&project_root.display().to_string()),
+        None,
+        None,
+    );
 }
 
 #[instrument(skip_all, fields(task_id = %req.contract_fields.task_id))]
@@ -780,12 +739,30 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         return Err(err);
     }
 
-    let project_root = req
+    let project_root = match req
         .project_root
         .clone()
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| "failed to resolve project_root".to_string())?;
+    {
+        Some(root) => root,
+        None => {
+            // The `?` used to skip telemetry here (Antigravity), leaving worktree root-
+            // resolution failures dark. Emit directly; no repo is known.
+            mcp_bridge::posthog::record_codex_dispatch(
+                "dispatch_codex_worktree",
+                "project_root_unresolved",
+                0,
+                None,
+                None,
+                None,
+            );
+            return Err("failed to resolve project_root".to_string());
+        }
+    };
+    // Dispatch clock starts here, before setup + spawn, so the terminal duration covers the
+    // whole dispatch (Codex: worktree setup/spawn happen before register).
+    let dispatch_started_at = Instant::now();
     let setup = (callbacks.setup_worktree)(WorktreeSetupRequest {
         project_root: project_root.clone(),
         sha: req.sha.clone(),
@@ -796,6 +773,11 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     let setup = match setup {
         Ok(s) => s,
         Err(err) => {
+            // Pre-register path: register_setup_failed inserts a record directly without a
+            // dispatch_surface, so it can't emit via the tracker. Report it here (all three
+            // worktree setup-failure sites do), the only place that knows this was a worktree
+            // dispatch.
+            emit_worktree_setup_failed(&project_root, dispatch_started_at);
             tracker
                 .register_setup_failed(task_id.clone(), err.to_string())
                 .await;
@@ -803,12 +785,14 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         }
     };
     if let Err(err) = write_worktree_exclude_file(&setup.worktree_path) {
+        emit_worktree_setup_failed(&project_root, dispatch_started_at);
         tracker
             .register_setup_failed(task_id.clone(), err.clone())
             .await;
         return Err(format!("SETUP_FAILED: {err}"));
     }
     if let Err(err) = write_worktree_commit_helper(&setup.worktree_path, &req.contract_fields.allowed_files) {
+        emit_worktree_setup_failed(&project_root, dispatch_started_at);
         tracker
             .register_setup_failed(task_id.clone(), err.clone())
             .await;
@@ -859,7 +843,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             .to_string(),
     );
 
-    let child = (callbacks.spawn_background)(SpawnSpec {
+    let child = match (callbacks.spawn_background)(SpawnSpec {
         cmd,
         args,
         cwd: setup.worktree_path.display().to_string(),
@@ -867,7 +851,21 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         output_log_dir: Some(setup.worktree_path.join(".triumvirate").join("logs")),
     })
     .await
-    .map_err(|e| format!("dispatch_codex_worktree failed: {e}"))?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            // Pre-register (like dispatch_codex): no monitor exists to report it. Emit directly.
+            mcp_bridge::posthog::record_codex_dispatch(
+                "dispatch_codex_worktree",
+                "spawn_failed",
+                dispatch_started_at.elapsed().as_millis() as u64,
+                Some(&project_root.display().to_string()),
+                None,
+                None,
+            );
+            return Err(format!("dispatch_codex_worktree failed: {e}"));
+        }
+    };
 
     // FEAT-014 (REQ-010) T-004: capture Pantheon lineage once in the request
     // task before the monitor task is spawned; see dispatch_codex for rationale.
@@ -883,9 +881,19 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             Some(setup.worktree_path.clone()),
             parent_session_id,
             root_session_id,
+            Some("dispatch_codex_worktree"),
+            Some(project_root.display().to_string()),
+            dispatch_started_at,
         )
         .await;
 
+    // KNOWN LIMITATION (Antigravity): unlike dispatch_codex, these worktree watchers are not
+    // wrapped in a JoinHandle supervisor. A watcher that PANICS before any mark_* is not
+    // attributed as a panic — the timeout watcher eventually marks the task `timeout`, which
+    // masks a daemon crash as an agent-speed issue. The tracker still emits (as timeout), so
+    // nothing vanishes; only the ATTRIBUTION is wrong. A per-watcher supervisor is the fix and
+    // is deferred: worktree dispatch is cold (last real run 2026-05-12) and the 4-watcher
+    // structure makes supervision a larger change than dispatch_codex's single monitor.
     let tracker_for_monitor = tracker.clone();
     let callbacks_for_monitor = callbacks.clone();
     let worktree_path = setup.worktree_path.clone();

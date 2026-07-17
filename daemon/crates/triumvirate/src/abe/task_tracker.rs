@@ -45,6 +45,13 @@ struct TaskRecord {
     /// dispatches (v4.0+) it identifies the original Pantheon session at
     /// the top of the chain.
     root_session_id: Option<String>,
+    /// Which dispatch tool created this task ("dispatch_codex" | "dispatch_codex_worktree").
+    /// `None` for any future non-codex ABE task, which then emits NO tv_codex_dispatch — the
+    /// arbiter must not mislabel work it did not dispatch as a codex run.
+    dispatch_surface: Option<&'static str>,
+    /// Repo the dispatch ran against, for the PostHog `tv_repo` slice. Stored so the tracker
+    /// (which is the arbiter and therefore the emitter) can report it at terminal time.
+    dispatch_repo: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +201,7 @@ impl TaskTracker {
     }
 
     #[instrument(skip_all, fields(task_id = %task_id, wave))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         task_id: String,
@@ -202,9 +210,14 @@ impl TaskTracker {
         worktree_path: Option<PathBuf>,
         parent_session_id: Option<String>,
         root_session_id: Option<String>,
+        dispatch_surface: Option<&'static str>,
+        dispatch_repo: Option<String>,
+        dispatch_started_at: Instant,
     ) {
         let mut guard = self.inner.lock().await;
-        let started_at = Instant::now();
+        // Use the caller's dispatch clock, not now(): the dispatch (cwd resolution, spawn,
+        // worktree setup) began before register, and the reported duration must cover it.
+        let started_at = dispatch_started_at;
         guard.insert(
             task_id.clone(),
             TaskRecord {
@@ -219,6 +232,8 @@ impl TaskTracker {
                 worktree_path,
                 parent_session_id: parent_session_id.clone(),
                 root_session_id: root_session_id.clone(),
+                dispatch_surface,
+                dispatch_repo,
             },
         );
         self.emit_task_state(&task_id, wave, "dispatched", 0, None);
@@ -232,6 +247,44 @@ impl TaskTracker {
             None,
             None,
             None,
+        );
+    }
+
+    /// Emit the `tv_codex_dispatch` terminal event. The tracker is the ARBITER of a dispatch's
+    /// terminal status (only one caller wins each transition), so it is the only place that can
+    /// author a truthful, exactly-once outcome event — a racing observer knows only whether IT
+    /// won, never whether someone else won first (the rule all three siblings converged on).
+    ///
+    /// MUST be called AFTER the inner lock is released: `record_codex_dispatch` is sync and
+    /// `capture()` detaches the POST via its own `tokio::spawn`, so nothing network-y is awaited
+    /// here, but holding the tracker mutex across any spawn is a latency trap. Every call site
+    /// below builds a snapshot under the lock, `drop(guard)`, then calls this.
+    ///
+    /// `surface: None` means a non-codex ABE task: emit nothing rather than mislabel it.
+    ///
+    /// KNOWN, ACCEPTED weakness (DeepSeek): if the calling mark_* panics in the narrow window
+    /// between `drop(guard)` and this call, the record is already terminal (immutable) but no
+    /// event fires, and the supervisor's mark_failed then sees AlreadyTerminal and also emits
+    /// nothing — a terminal task with no telemetry. This is a best-effort observability loss,
+    /// not a state-correctness bug, and closing it (emit-under-lock, or a two-phase pending_emit
+    /// flag) is not worth the cost for fire-and-forget analytics. The state is always right; the
+    /// event is best-effort, exactly like every other capture() in this module.
+    fn emit_terminal(
+        surface: Option<&'static str>,
+        repo: Option<&str>,
+        outcome: &'static str,
+        duration_ms: u64,
+        exit_code: Option<i32>,
+        files_changed: Option<usize>,
+    ) {
+        let Some(surface) = surface else { return };
+        mcp_bridge::posthog::record_codex_dispatch(
+            surface,
+            outcome,
+            duration_ms,
+            repo,
+            files_changed,
+            exit_code,
         );
     }
 
@@ -289,6 +342,12 @@ impl TaskTracker {
             None,
             Some(duration_ms as u64),
         );
+        let surface = task.dispatch_surface;
+        let repo = task.dispatch_repo.clone();
+        let files = task.output.as_ref().map(|o| o.modified_files.len());
+        let exit_code = task.exit_code;
+        drop(guard);
+        Self::emit_terminal(surface, repo.as_deref(), "completed", duration_ms as u64, exit_code, files);
         TransitionOutcome::Transitioned
     }
 
@@ -323,6 +382,13 @@ impl TaskTracker {
             Some(error_message),
             Some(duration_ms as u64),
         );
+        // exit 0 with a Failed status is the silent no-op: codex exited clean and committed
+        // nothing. Derived structurally from exit_code, exactly as the old read-back did.
+        let outcome = if exit_code == Some(0) { "no_commit" } else { "failed" };
+        let surface = task.dispatch_surface;
+        let repo = task.dispatch_repo.clone();
+        drop(guard);
+        Self::emit_terminal(surface, repo.as_deref(), outcome, duration_ms as u64, exit_code, None);
         TransitionOutcome::Transitioned
     }
 
@@ -341,6 +407,10 @@ impl TaskTracker {
         task.child = None;
         self.inc_dispatch_status("timeout");
         self.emit_task_state(task_id, task.wave, "timeout", duration_ms, task.commit_sha.as_deref());
+        let surface = task.dispatch_surface;
+        let repo = task.dispatch_repo.clone();
+        drop(guard);
+        Self::emit_terminal(surface, repo.as_deref(), "timeout", duration_ms as u64, None, None);
         TransitionOutcome::Transitioned
     }
 
@@ -369,6 +439,11 @@ impl TaskTracker {
         task.status = TaskStatus::Stuck;
         task.error_message = Some(error_message);
         task.child = None;
+        let duration_ms = task.started_at.elapsed().as_millis() as u64;
+        let surface = task.dispatch_surface;
+        let repo = task.dispatch_repo.clone();
+        drop(guard);
+        Self::emit_terminal(surface, repo.as_deref(), "stuck", duration_ms, None, None);
         TransitionOutcome::Transitioned
     }
 
@@ -384,6 +459,11 @@ impl TaskTracker {
         task.status = TaskStatus::SetupFailed;
         task.error_message = Some(error_message);
         task.child = None;
+        let duration_ms = task.started_at.elapsed().as_millis() as u64;
+        let surface = task.dispatch_surface;
+        let repo = task.dispatch_repo.clone();
+        drop(guard);
+        Self::emit_terminal(surface, repo.as_deref(), "setup_failed", duration_ms, None, None);
         TransitionOutcome::Transitioned
     }
 
@@ -454,19 +534,34 @@ impl TaskTracker {
 
         let mut guard = self.inner.lock().await;
         let task = guard.get_mut(task_id)?;
+        // Re-check terminality AFTER the kill window. The old code wrote Cancelled
+        // unconditionally, so a completion that won during the ~10s SIGTERM grace was
+        // silently overwritten — a real correctness bug (a done task flips to cancelled),
+        // flagged by all three siblings, not just a telemetry issue. If it already finished,
+        // report its true terminal status and emit nothing (that transition already did).
+        if is_terminal(&task.status) {
+            let status = task.status.clone();
+            return Some(CancelTaskResponse {
+                task_id: task_id.to_string(),
+                status: format!("already-{}", status_label(&status)),
+                worktree_path: task.worktree_path.as_ref().map(|p| p.display().to_string()),
+            });
+        }
         task.status = TaskStatus::Cancelled;
         let duration_ms = task.started_at.elapsed().as_millis();
         task.child = None;
         self.inc_dispatch_status("cancelled");
         self.emit_task_state(task_id, task.wave, "cancelled", duration_ms, task.commit_sha.as_deref());
+        let surface = task.dispatch_surface;
+        let repo = task.dispatch_repo.clone();
+        let worktree_display = task.worktree_path.as_ref().map(|p| p.display().to_string());
+        drop(guard);
+        Self::emit_terminal(surface, repo.as_deref(), "cancelled", duration_ms as u64, None, None);
 
         Some(CancelTaskResponse {
             task_id: task_id.to_string(),
             status: "cancelled".to_string(),
-            worktree_path: task
-                .worktree_path
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            worktree_path: worktree_display,
         })
     }
 
@@ -499,6 +594,11 @@ impl TaskTracker {
                 worktree_path: None,
                 parent_session_id: None,
                 root_session_id: None,
+                // This path inserts a terminal SetupFailed record directly (no register), so it
+                // never emits tv_codex_dispatch via the tracker. The dispatch_codex_worktree
+                // call site reports setup_failed directly instead.
+                dispatch_surface: None,
+                dispatch_repo: None,
             },
         );
         self.emit_task_state(&task_id, 0, "failed", 0, None);

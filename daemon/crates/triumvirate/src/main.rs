@@ -375,6 +375,9 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
         worktree_path: Option<PathBuf>,
         parent_session_id: Option<String>,
         root_session_id: Option<String>,
+        dispatch_surface: Option<&'static str>,
+        dispatch_repo: Option<String>,
+        dispatch_started_at: std::time::Instant,
     ) -> mcp_tools::abe::BoxFuture<()> {
         let tracker = self.clone();
         Box::pin(async move {
@@ -386,6 +389,9 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
                     worktree_path,
                     parent_session_id,
                     root_session_id,
+                    dispatch_surface,
+                    dispatch_repo,
+                    dispatch_started_at,
                 )
                 .await
         })
