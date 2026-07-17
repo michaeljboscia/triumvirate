@@ -1976,12 +1976,16 @@ async fn run_daemon() -> anyhow::Result<()> {
                         "ledger background sweep failed for {}: {err}",
                         project_root.display()
                     );
+                    // Silent until now (warn-only). A ledger that stops draining is a data-
+                    // integrity problem that hides behind a green dashboard.
+                    mcp_bridge::posthog::record_maintenance("ledger_sweep", "failed", 0);
                 }
                 Err(err) => {
                     tracing::warn!(
                         "ledger background sweep join failure for {}: {err}",
                         project_root.display()
                     );
+                    mcp_bridge::posthog::record_maintenance("ledger_sweep", "failed", 0);
                 }
             }
         }
@@ -2289,6 +2293,40 @@ async fn run_daemon() -> anyhow::Result<()> {
     let token_db = init_process_token_db()?;
     let observability_bus =
         ObservabilityBus::new(metrics.clone(), ws_events.clone(), token_db.clone());
+
+    // Forward the token scanner's per-cycle summary to PostHog. The scanner lives in
+    // token-economics, which mcp-bridge depends on, so it cannot call posthog directly
+    // without a dependency cycle; it publishes "token_scan" to this bus and the daemon layer
+    // (which sees both) forwards it. This is the only PostHog visibility into the money/quota
+    // attribution loop, which was otherwise entirely silent.
+    {
+        let mut rx = ws_events.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) else { continue };
+                        if v.get("type").and_then(|t| t.as_str()) != Some("token_scan") {
+                            continue;
+                        }
+                        let p = v.get("payload").cloned().unwrap_or_default();
+                        mcp_bridge::posthog::record_token_scan(
+                            p.get("source").and_then(|s| s.as_str()).unwrap_or("unknown"),
+                            p.get("records").and_then(|n| n.as_u64()).unwrap_or(0),
+                            p.get("tokens").and_then(|n| n.as_u64()).unwrap_or(0),
+                            p.get("cost_usd").and_then(|n| n.as_f64()).unwrap_or(0.0),
+                            p.get("scan_duration_ms").and_then(|n| n.as_u64()).unwrap_or(0),
+                        );
+                    }
+                    // A lagged broadcast receiver dropped some messages under a burst. Keep
+                    // going; losing an aggregate telemetry event must never stop the loop.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     let state = DaemonRuntimeState::new(
         token,
         Arc::new(Mutex::new(HashMap::new())),

@@ -224,6 +224,7 @@ pub fn sweep_stale_temp_files() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
+    let mut reaped: u64 = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -235,8 +236,16 @@ pub fn sweep_stale_temp_files() {
         if let Ok(modified) = entry.metadata().and_then(|m| m.modified())
             && modified < cutoff
         {
-            let _ = std::fs::remove_file(entry.path());
+            if std::fs::remove_file(entry.path()).is_ok() {
+                reaped += 1;
+            }
         }
+    }
+    // Only report when we actually reaped something: a clean sweep is not news, but a steady
+    // stream of leaked agy temp files means a dispatch path is not cleaning up after itself.
+    if reaped > 0 {
+        tracing::info!(reaped, "swept stale agy temp files");
+        crate::posthog::record_maintenance("temp_sweep", "ok", reaped);
     }
 }
 

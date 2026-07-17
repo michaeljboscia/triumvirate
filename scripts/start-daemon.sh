@@ -113,10 +113,17 @@ mkdir -p "$(dirname "$LOG")"
 # survives the terminal that started it.
 # RUST_LOG passes through when set, so an operator can raise the log level without editing
 # the MCP env block. Everything else comes from ~/.claude.json, on purpose.
+# RUST_LOG and the agy tuning knobs pass through when explicitly set in the calling env, so
+# an operator can raise the log level or tighten a limit for a test WITHOUT editing the MCP
+# block. They come LAST so they override the block's values. Everything else is the single
+# source of truth from ~/.claude.json. Placed after "${ENV_ARGS[@]}" so a passthrough wins.
 nohup env -i \
   HOME="$HOME" USER="${USER:-$(id -un)}" \
-  ${RUST_LOG:+RUST_LOG="$RUST_LOG"} \
   "${ENV_ARGS[@]}" \
+  ${RUST_LOG:+RUST_LOG="$RUST_LOG"} \
+  ${TRIUMVIRATE_AGY_MAX_RPM:+TRIUMVIRATE_AGY_MAX_RPM="$TRIUMVIRATE_AGY_MAX_RPM"} \
+  ${TRIUMVIRATE_AGY_MAX_CONCURRENT:+TRIUMVIRATE_AGY_MAX_CONCURRENT="$TRIUMVIRATE_AGY_MAX_CONCURRENT"} \
+  ${TRIUMVIRATE_AGY_BREAKER_THRESHOLD:+TRIUMVIRATE_AGY_BREAKER_THRESHOLD="$TRIUMVIRATE_AGY_BREAKER_THRESHOLD"} \
   "$BIN" daemon >>"$LOG" 2>&1 < /dev/null &
 disown 2>/dev/null || true
 

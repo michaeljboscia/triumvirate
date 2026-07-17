@@ -62,7 +62,7 @@ where
         .unwrap_or_else(|| "Implement the assigned fleet task.".to_string());
 
     let orchestrator = orchestrator_factory(project_root.clone())?;
-    let result = orchestrator
+    let run = orchestrator
         .fleet_spawn(FleetSpawnRunRequest {
             project_root: project_root.clone(),
             agents: agents.clone(),
@@ -70,8 +70,19 @@ where
             wait: Some(wait),
             task_description,
         })
-        .await
-        .map_err(|e| format!("fleet_spawn failed: {e}"))?;
+        .await;
+    // A fleet that FAILS to spawn (gitops error, worktree failure) is a spawn attempt worth
+    // seeing; emitting only after the `?` would hide every failure and show 100% success
+    // (Antigravity's survivorship catch). Emit here on error, before returning.
+    if run.is_err() {
+        mcp_bridge::posthog::record_fleet_spawn(
+            "spawn_failed",
+            dry_run,
+            agents.len(),
+            Some(&project_root.display().to_string()),
+        );
+    }
+    let result = run.map_err(|e| format!("fleet_spawn failed: {e}"))?;
 
     let state = if dry_run {
         "planned".to_string()
@@ -98,6 +109,16 @@ where
         .count();
     metrics.fleet_active_total.set(active as i64);
     emit_fleet_progress(ws_events, &result.fleet_id, &state, active);
+
+    // Intent-level event: a fleet was launched (or planned). The per-task tv_fleet_task
+    // events only fire when a real fleet runs its agents, so without this the default
+    // dry_run planning path and the "how often / how wide" question were invisible.
+    mcp_bridge::posthog::record_fleet_spawn(
+        &state,
+        dry_run,
+        agents.len(),
+        Some(&project_root.display().to_string()),
+    );
 
     Ok(FleetSpawnResponse {
         fleet_id: result.fleet_id,
@@ -170,7 +191,11 @@ pub async fn fleet_cancel(
     req: FleetCancelRequest,
 ) -> Result<FleetCancelResponse, String> {
     let mut fleet_states = fleet_states.lock().await;
-    let canceled = fleet_states.remove(&req.fleet_id).is_some();
+    // Keep the removed status so the cancel event can report the fleet's ACTUAL width
+    // (worktree_paths.len()) instead of a misleading zero.
+    let removed = fleet_states.remove(&req.fleet_id);
+    let canceled = removed.is_some();
+    let cancelled_width = removed.map(|s| s.worktree_paths.len()).unwrap_or(0);
     let active = fleet_states
         .values()
         .filter(|status| status.state == "running" || status.state == "spawning")
@@ -178,6 +203,11 @@ pub async fn fleet_cancel(
     metrics.fleet_active_total.set(active as i64);
     if canceled {
         emit_fleet_progress(ws_events, &req.fleet_id, "cancelled", active);
+        // Cancelling an in-flight fleet aborts real agent work / spend. Dark until now. This
+        // rides tv_fleet_spawn as another point in the fleet lifecycle (tv_state=cancelled),
+        // reporting the fleet's real width from the status we just removed. `canceled=false`
+        // (unknown fleet_id) is not reported: nothing was aborted, so there is no work event.
+        mcp_bridge::posthog::record_fleet_spawn("cancelled", false, cancelled_width, None);
     }
     Ok(FleetCancelResponse { canceled })
 }

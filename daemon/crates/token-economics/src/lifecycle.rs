@@ -64,27 +64,72 @@ pub async fn run_scanner_loop(db: Arc<TokenDb>, bus: ObservabilityBus) {
                     warn!("token scanner file event channel closed; switching to periodic reconciliation only");
                     continue;
                 };
-                if let Err(err) = scan_single_path(db.clone(), &bus, path).await {
-                    warn!("token scanner incremental scan failed: {err}");
+                // Incremental: emit per file (a single file change is not a burst).
+                match scan_single_path(db.clone(), &bus, path).await {
+                    Ok(t) if t.records > 0 => publish_token_scan(&bus, "incremental", t),
+                    Ok(_) => {}
+                    Err(err) => warn!("token scanner incremental scan failed: {err}"),
                 }
             }
         }
     }
 }
 
+/// One token-economics scan cycle's aggregate, for the `token_scan` summary event.
+#[derive(Default, Clone, Copy)]
+struct ScanTotals {
+    records: u64,
+    tokens: u64,
+    cost_usd: f64,
+    duration_ms: u64,
+}
+
 async fn run_full_reconciliation(db: Arc<TokenDb>, bus: &ObservabilityBus) -> Result<()> {
+    let started = Instant::now();
     let paths = collect_known_session_files()?;
+    // Accumulate across ALL files and emit ONE token_scan for the whole run. Emitting per file
+    // (a reconciliation can touch hundreds) would burst-overflow the shared broadcast channel
+    // and get Lag-dropped on the receiver, silently losing most of the events (Antigravity).
+    let mut totals = ScanTotals::default();
     for path in paths {
-        if let Err(err) = scan_single_path(db.clone(), bus, path).await {
-            warn!("token scanner reconciliation scan failed: {err}");
+        match scan_single_path(db.clone(), bus, path).await {
+            Ok(t) => {
+                totals.records = totals.records.saturating_add(t.records);
+                totals.tokens = totals.tokens.saturating_add(t.tokens);
+                totals.cost_usd += t.cost_usd;
+            }
+            Err(err) => warn!("token scanner reconciliation scan failed: {err}"),
         }
+    }
+    totals.duration_ms = started.elapsed().as_millis() as u64;
+    if totals.records > 0 {
+        publish_token_scan(bus, "reconciliation", totals);
     }
     Ok(())
 }
 
-async fn scan_single_path(db: Arc<TokenDb>, bus: &ObservabilityBus, path: PathBuf) -> Result<()> {
+/// Publish the per-cycle `token_scan` summary onto the bus. This crate cannot call
+/// mcp_bridge::posthog (mcp-bridge depends on token-economics, so the reverse would cycle);
+/// main.rs subscribes to the bus and forwards it to PostHog.
+fn publish_token_scan(bus: &ObservabilityBus, source: &'static str, t: ScanTotals) {
+    bus.publish_event(
+        "token_scan",
+        serde_json::json!({
+            "source": source,
+            "records": t.records,
+            "tokens": t.tokens,
+            "cost_usd": t.cost_usd,
+            "scan_duration_ms": t.duration_ms,
+        }),
+    );
+}
+
+/// Scan one file, store its records, emit per-record `token_update`s (dashboard tail), and
+/// RETURN the aggregate. It no longer emits the `token_scan` summary itself — the caller does,
+/// so the incremental path emits per file while reconciliation emits once for the whole run.
+async fn scan_single_path(db: Arc<TokenDb>, bus: &ObservabilityBus, path: PathBuf) -> Result<ScanTotals> {
     if !path.is_file() {
-        return Ok(());
+        return Ok(ScanTotals::default());
     }
 
     let started = Instant::now();
@@ -94,10 +139,19 @@ async fn scan_single_path(db: Arc<TokenDb>, bus: &ObservabilityBus, path: PathBu
         .context("scanner worker task join failure")??;
 
     if scanned_records.is_empty() {
-        return Ok(());
+        return Ok(ScanTotals::default());
     }
 
     let scan_duration_ms = started.elapsed().as_millis() as u64;
+    let totals = ScanTotals {
+        records: scanned_records.len() as u64,
+        tokens: scanned_records
+            .iter()
+            .fold(0u64, |acc, r| acc.saturating_add(r.total_tokens.max(0) as u64)),
+        cost_usd: scanned_records.iter().filter_map(|r| r.cost_usd).sum(),
+        duration_ms: scan_duration_ms,
+    };
+
     for record in scanned_records {
         bus.publish_event(
             "token_update",
@@ -111,7 +165,7 @@ async fn scan_single_path(db: Arc<TokenDb>, bus: &ObservabilityBus, path: PathBu
         );
     }
 
-    Ok(())
+    Ok(totals)
 }
 
 fn scan_and_store_records(db: &TokenDb, path: &Path) -> Result<Vec<TokenRecord>> {

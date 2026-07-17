@@ -706,6 +706,138 @@ pub fn record_codex_dispatch(
     );
 }
 
+/// Emit `tv_token_scan` for a token-economics scan that stored records.
+///
+/// The scanner watches agent telemetry FILES on disk and attributes spend that did not
+/// necessarily flow through `execute_ask_agent` (a raw codex/gemini CLI run, a backfill).
+/// The entire token-economics crate had zero PostHog coverage before this.
+///
+/// Scope and honesty:
+///   - This is OBSERVABILITY, not the accounting record. The token DB is the source of truth;
+///     it is written before this fires. This event rides the shared in-process bus and can be
+///     dropped under load (broadcast lag), so it may UNDERCOUNT. Never reconcile money from it.
+///   - Emitted once per scanned file that stored records (`source` distinguishes an
+///     incremental file-change scan from a reconciliation sweep). A reconciliation over many
+///     files produces many events, one per file, not one per run.
+///   - Empty scans emit nothing: a file change that added no billable records is not news.
+pub fn record_token_scan(source: &str, records: u64, tokens: u64, cost_usd: f64, duration_ms: u64) {
+    capture(
+        "tv_token_scan",
+        json!({
+            // "incremental" (a watched file changed) | "reconciliation" (startup/backfill sweep)
+            "tv_scan_source":   source,
+            "tv_records":       records,
+            "tv_tokens":        tokens,
+            "tv_cost_usd":      cost_usd,
+            "tv_duration_ms":   duration_ms,
+        }),
+    );
+}
+
+/// Emit `tv_fleet_spawn` when a fleet is launched (or planned).
+///
+/// The per-task `tv_fleet_task` events only fire once a REAL fleet runs its agents, so
+/// "someone launched a fleet" as an intent was invisible, and the default `dry_run=true`
+/// planning path emitted nothing at all. This is the intent-level counterpart: how often
+/// fleets are spawned, at what width, real vs dry-run.
+pub fn record_fleet_spawn(state: &str, dry_run: bool, agent_count: usize, repo: Option<&str>) {
+    capture(
+        "tv_fleet_spawn",
+        json!({
+            // planned (dry_run) | running (wait) | spawning (background)
+            "tv_state":        state,
+            "tv_dry_run":      dry_run,
+            "tv_agent_count":  agent_count,
+            "tv_repo":         repo.map(repo_name),
+            "tv_surface":      "fleet",
+        }),
+    );
+}
+
+/// Emit `tv_review_requested` when a peer review is assigned. A cross-agent workflow that
+/// emitted nothing: who reviews whom, and how often, was invisible. Agent names are
+/// normalized (they arrive as raw MCP-request strings); review_type is capped so a caller
+/// cannot mint unbounded property values through it.
+pub fn record_review_requested(reviewer_agent: &str, author_agent: &str, review_type: &str, ok: bool) {
+    // review_type is low-cardinality in practice ("code", "design", ...) but is raw input;
+    // cap its length so an abusive value cannot explode the PostHog breakdown.
+    let review_type: String = review_type.chars().take(32).collect();
+    // normalize_agent_name passes UNKNOWN input through verbatim, so a raw name would be an
+    // unbounded property. Collapse anything not in the known agent set to "other" — for the
+    // DISPLAY field too (display_agent_name only capitalizes an unknown string, so a raw one
+    // would still leak; Antigravity).
+    let bound_agent = |a: &str| -> (String, String) {
+        if crate::is_supported_agent_name(a) {
+            (crate::normalize_agent_name(a), crate::display_agent_name(a))
+        } else {
+            ("other".to_string(), "Other".to_string())
+        }
+    };
+    let (reviewer_key, reviewer_display) = bound_agent(reviewer_agent);
+    let (author_key, _) = bound_agent(author_agent);
+    capture(
+        "tv_review_requested",
+        json!({
+            "tv_reviewer_agent":         reviewer_key,
+            "tv_reviewer_display":       reviewer_display,
+            "tv_author_agent":           author_key,
+            "tv_review_type":            review_type,
+            // A review the engine FAILED to assign is invisible if we only emit on success —
+            // the survivorship trap the Drop-guard on the ask path exists to avoid.
+            "tv_ok":                     ok,
+        }),
+    );
+}
+
+/// Emit `tv_review_verdict` when a peer review is submitted. The verdict is the high-signal
+/// outcome and only ever reached local Prometheus before this. Comments (unbounded) are
+/// omitted, and the verdict is NORMALIZED to a known set: it arrives as a raw MCP-request
+/// String, so charting it verbatim would let a caller mint unbounded property values. An
+/// unrecognized verdict collapses to "other" (with the raw kept out of PostHog).
+pub fn record_review_verdict(verdict: &str, ok: bool) {
+    let normalized = match verdict.trim().to_ascii_lowercase().as_str() {
+        "clean" => "clean",
+        "concerns" => "concerns",
+        "regression" => "regression",
+        "pass" => "pass",
+        "fail" | "failure" => "fail",
+        "skip" | "skipped" => "skip",
+        _ => "other",
+    };
+    // An unknown verdict is LOGGED, not sent as a PostHog property. DeepSeek wanted the raw
+    // signal preserved; Antigravity noted a capped raw is still unbounded cardinality (a
+    // hallucinated 32-char string mints a new property every time). A warn keeps the signal
+    // where humans and log search can see it without polluting PostHog's property index.
+    if normalized == "other" {
+        tracing::warn!(raw_verdict = %verdict.trim().chars().take(64).collect::<String>(),
+            "peer review submitted an unrecognized verdict");
+    }
+    capture(
+        "tv_review_verdict",
+        json!({
+            "tv_verdict": normalized,
+            // A submit the engine rejected is invisible if we only emit on success.
+            "tv_ok":      ok,
+        }),
+    );
+}
+
+/// Emit `tv_maintenance` for a background maintenance cycle (ledger sweep, temp-file sweep).
+///
+/// Deliberately NOT emitted on every quiet success: a sweep runs often and a clean no-op is
+/// not news. Emit on FAILURE (the silent case, warn-only today) and on a non-trivial result
+/// (files reaped = a leak signal). `count` is whatever the job counts (files removed, etc.).
+pub fn record_maintenance(job: &str, outcome: &str, count: u64) {
+    capture(
+        "tv_maintenance",
+        json!({
+            "tv_job":     job,        // "ledger_sweep" | "temp_sweep"
+            "tv_outcome": outcome,    // "ok" | "failed"
+            "tv_count":   count,
+        }),
+    );
+}
+
 pub fn record_ai_generation(g: &AiGeneration<'_>) {
     let is_error = g.outcome != "success" && g.outcome != "degraded_success";
 
