@@ -480,6 +480,66 @@ pub(crate) fn append_codex_exec_mcp_compat_args(args: &mut Vec<String>) {
 }
 
 #[instrument(skip_all)]
+/// Report a dispatch's outcome to PostHog by reading the TRACKER's verdict, once, after the
+/// monitor has finished.
+///
+/// Three independent reviewers converged on the rule this implements: when N observers race
+/// to describe one outcome, only the ARBITER of the race may report it. An observer knows
+/// whether IT won, never whether someone else won first, so an observer-authored event can
+/// contradict the recorded truth. The concrete case: `cancel_task` can set `Cancelled` while
+/// the monitor is mid-classification, and a self-reporting monitor would cheerfully emit
+/// "completed" for a task the tracker recorded as cancelled.
+///
+/// Reading the status BACK is race-free because a terminal status is immutable: every
+/// `mark_*` refuses to move a task that `is_terminal`, so whatever we read here is final and
+/// is what every other surface will report forever.
+///
+/// `no_commit` is derived STRUCTURALLY rather than by matching on an error string: a task is
+/// Failed with `exit_code == Some(0)` only when codex exited cleanly and produced no commit.
+/// A real failure carries a non-zero code. That silent no-op is the most valuable outcome
+/// here, because nothing else reveals it: the agent reports success and the repo is untouched.
+async fn report_dispatch_outcome<T: AbeTaskTracker>(
+    tracker: &T,
+    task_id: &str,
+    surface: &'static str,
+    repo: Option<&str>,
+    started_at: Instant,
+) {
+    let Some(status) = tracker.get_status(task_id.to_string()).await else {
+        // The task vanished from the tracker. Nothing truthful left to report.
+        tracing::warn!(task_id = %task_id, "dispatch outcome unreportable: task not found");
+        return;
+    };
+    let outcome = match status.status {
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed if status.exit_code == Some(0) => "no_commit",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Timeout => "timeout",
+        TaskStatus::Stuck => "stuck",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::SetupFailed => "setup_failed",
+        // The monitor finished while the tracker still says Working. Not a state we expect;
+        // say so out loud rather than inventing a verdict.
+        TaskStatus::Working => "unreported",
+    };
+    let files_changed = if matches!(status.status, TaskStatus::Completed) {
+        tracker
+            .get_output(task_id.to_string())
+            .await
+            .map(|o| o.modified_files.len())
+    } else {
+        None
+    };
+    mcp_bridge::posthog::record_codex_dispatch(
+        surface,
+        outcome,
+        started_at.elapsed().as_millis() as u64,
+        repo,
+        files_changed,
+        status.exit_code,
+    );
+}
+
 pub async fn dispatch_codex<T: AbeTaskTracker>(
     tracker: T,
     req: DispatchCodexRequest,
@@ -491,11 +551,27 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         .with_label_values(&["dispatched"])
         .inc();
     let task_id = format!("abe-{}", Uuid::new_v4().simple());
+    // Clock starts HERE, before cwd resolution and before the spawn. Started after the
+    // spawn (as it was), the reported duration silently omits spawn negotiation, which is
+    // slowest exactly when the machine is loaded and you most want to see it.
+    let task_started_at = Instant::now();
     let cwd = req
         .cwd
         .clone()
         .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
-        .ok_or_else(|| "failed to resolve cwd".to_string())?;
+        .ok_or_else(|| {
+            // Early return that bypassed telemetry: a dispatch that never happened is still
+            // a dispatch someone asked for, and silence here looks identical to no traffic.
+            mcp_bridge::posthog::record_codex_dispatch(
+                "dispatch_codex",
+                "cwd_unresolved",
+                0,
+                None,
+                None,
+                None,
+            );
+            "failed to resolve cwd".to_string()
+        })?;
     let timeout_sec = req.timeout_sec.unwrap_or(600);
 
     let (cmd, mut args) = (callbacks.codex_command)();
@@ -514,7 +590,10 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .unwrap_or_default();
 
-    let child = (callbacks.spawn_background)(SpawnSpec {
+    // A spawn failure returns before the monitor task exists, so nothing downstream can
+    // report it: we were blind to every "codex would not even start". Emit here, the only
+    // place that knows.
+    let child = match (callbacks.spawn_background)(SpawnSpec {
         cmd,
         args,
         cwd: cwd.clone(),
@@ -522,7 +601,20 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         output_log_dir: None,
     })
     .await
-    .map_err(|e| format!("dispatch_codex failed: {e}"))?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            mcp_bridge::posthog::record_codex_dispatch(
+                "dispatch_codex",
+                "spawn_failed",
+                0,
+                Some(&cwd),
+                None,
+                None,
+            );
+            return Err(format!("dispatch_codex failed: {e}"));
+        }
+    };
 
     // FEAT-014 (REQ-010) T-004: Capture Pantheon lineage from the inbound
     // MCP request's task-local BEFORE we spawn the monitor task. task-locals
@@ -546,27 +638,28 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
 
     let tracker_for_monitor = tracker.clone();
     let callbacks_for_monitor = callbacks.clone();
-    let task_started_at = Instant::now();
     let task_id_for_monitor = task_id.clone();
+    // Clones for the reporter: it must outlive the classification body below, which owns the
+    // originals and returns from several arms.
+    let tracker_for_report = tracker.clone();
+    let task_id_for_report = task_id.clone();
+    let cwd_for_report = cwd.clone();
     tokio::spawn(async move {
+        // Canary first: if the body below panics or this task is aborted, the report never
+        // runs and the dispatch would vanish from every surface. The canary never invents a
+        // verdict, it only reports that nobody reported one.
+        let mut canary = mcp_bridge::posthog::DispatchCanary::new(
+            "dispatch_codex",
+            Some(&cwd_for_report),
+            task_started_at,
+        );
+        // The classification body keeps its early `return`s; wrapping it means the report
+        // below runs on EVERY path instead of relying on someone remembering to add an emit
+        // to a new arm. One reporter, one event, always reached.
+        let classify = async move {
         let wave_label = "mcp";
         let cwd_path = PathBuf::from(&cwd);
         let timeout_duration = std::time::Duration::from_secs(timeout_sec);
-
-        // Guard constructed BEFORE the wait race, for two reasons:
-        //  1. Duration. Built after the race, its clock would start once codex had already
-        //     exited, so tv_duration_ms would measure classification (microseconds) instead
-        //     of the dispatch. A plausible-looking number that is silently meaningless is
-        //     worse than no number.
-        //  2. Canary. Only code AFTER construction is covered by Drop, so building it late
-        //     leaves the race itself unreported if the monitor panics or is aborted.
-        // It borrows task_started_at as its origin so the reported duration is the WHOLE
-        // dispatch, matching what observe_task_duration already measures.
-        let mut tel = mcp_bridge::posthog::CodexDispatchTelemetry::new_started_at(
-            "dispatch_codex",
-            Some(&cwd),
-            task_started_at,
-        );
 
         // Race the worker against its deadline. The previous structure ran
         // an unconditional sleep(timeout_sec) before wait(), which both
@@ -587,7 +680,6 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         let exit = match exit_outcome {
             Some(Ok(status)) => status,
             Some(Err(err)) => {
-                tel.wait_error();
                 tracker_for_monitor
                     .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
                     .await;
@@ -596,7 +688,6 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
             None => {
                 terminate_worker(child.clone()).await;
                 observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
-                tel.timeout();
                 tracker_for_monitor
                     .mark_timeout(task_id_for_monitor.clone())
                     .await;
@@ -612,7 +703,6 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 // Exit 0, no commit: codex reported success and changed nothing. The most
                 // valuable event here, because it is the one a human only discovers by going
                 // to look for a commit that was never made.
-                tel.no_commit(exit.code());
                 let diag = diagnose_no_commit(&cwd_path, None);
                 tracker_for_monitor
                     .mark_failed(
@@ -624,7 +714,6 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 return;
             }
             observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
-            tel.completed(files.len(), exit.code());
             tracker_for_monitor
                 .mark_completed(
                     task_id_for_monitor.clone(),
@@ -637,7 +726,6 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 .await;
         } else {
             observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
-            tel.failed(exit.code());
             tracker_for_monitor
                 .mark_failed(
                     task_id_for_monitor.clone(),
@@ -646,6 +734,23 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 )
                 .await;
         }
+        };
+        classify.await;
+        // Disarm BEFORE reporting, not after. Disarmed after, a panic inside the report would
+        // let BOTH fire: a real verdict plus a contradictory "unreported", and a consumer
+        // cannot reconcile those. The canary's question is "did we reach the reporting step",
+        // and by here the answer is yes.
+        canary.disarm();
+        // Report the ARBITER's verdict, not our own: cancel_task may have won the terminal
+        // transition while we were classifying, and only the tracker knows.
+        report_dispatch_outcome(
+            &tracker_for_report,
+            &task_id_for_report,
+            "dispatch_codex",
+            Some(&cwd_for_report),
+            task_started_at,
+        )
+        .await;
     });
 
     Ok(DispatchCodexResponse {

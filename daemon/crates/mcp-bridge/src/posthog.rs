@@ -610,6 +610,9 @@ pub fn record_session_invalidated(agent: &str, backend: Option<&str>, repo: Opti
 ///
 /// `outcome` is the taxonomy that matters here, and it is NOT just pass/fail:
 ///   completed  - exited 0 AND produced a commit
+///   cancelled  - an external cancel_task won the terminal transition
+///   stuck      - the watchdog saw no filesystem activity
+///   setup_failed / spawn_failed - never got as far as running
 ///   no_commit  - exited 0 and produced NOTHING. The silent one. Codex reported success and
 ///                the repo is unchanged; without this it is indistinguishable from a real
 ///                success on every surface except a human going to look for the commit.
@@ -620,84 +623,58 @@ pub fn record_session_invalidated(agent: &str, backend: Option<&str>, repo: Opti
 /// No task_id and no prompt: both unbounded. This event is for counting and grouping ("how
 /// often does codex silently produce nothing, and in which repo?"); the local tracker stays
 /// the place to inspect one dispatch.
-/// Emits exactly one `tv_codex_dispatch` on Drop, whichever way the monitor task exits.
+/// Fires `tv_codex_dispatch{outcome:"unreported"}` on Drop UNLESS disarmed.
 ///
-/// Same reasoning as `CallTelemetry`, and for the same reason: `dispatch_codex_worktree`'s
-/// monitor has EIGHT terminal arms (timeout, sentinel commit, head commit, wait error, two
-/// no-commit paths, completed, failed). Hand-placing an emit in each is the pattern this
-/// module's own history says fails — reviewers found three holes in exactly that approach on
-/// the ask path. A guard cannot forget an arm, and `"unreported"` makes a new, unclassified
-/// exit visible in the dashboard instead of silently absent.
-pub struct CodexDispatchTelemetry {
+/// This is deliberately NOT the old Drop guard, and the distinction is the whole point: it
+/// never authors a VERDICT. The arbiter (the tracker) decides how a dispatch ended, and the
+/// monitor reports that verdict by reading it back. But if the monitor panics or is aborted,
+/// that report never runs and the dispatch vanishes from every surface, which is precisely
+/// the silent-failure class this work exists to kill. Replacing the guard with a plain
+/// `classify.await; report(...)` traded a lying event for a missing one.
+///
+/// So: the canary only ever says "nobody reported this", which is always true when it fires.
+/// `disarm()` is called immediately after the real report succeeds.
+pub struct DispatchCanary {
     surface: &'static str,
     started: std::time::Instant,
-    outcome: &'static str,
     repo: Option<String>,
-    files_changed: Option<usize>,
-    exit_code: Option<i32>,
+    armed: bool,
 }
 
-impl CodexDispatchTelemetry {
-    pub fn new(surface: &'static str, repo: Option<&str>) -> Self {
-        Self::new_started_at(surface, repo, std::time::Instant::now())
-    }
-
-    /// Build with a caller-supplied origin, for monitors that begin observing AFTER the work
-    /// started. ABE dispatches the child, then a separate task waits on it; a guard built in
-    /// that task with `Instant::now()` would report the classification time, not the
-    /// dispatch. Pass the dispatch's own start so the duration means what it says.
-    pub fn new_started_at(
-        surface: &'static str,
-        repo: Option<&str>,
-        started: std::time::Instant,
-    ) -> Self {
+impl DispatchCanary {
+    pub fn new(surface: &'static str, repo: Option<&str>, started: std::time::Instant) -> Self {
         Self {
             surface,
             started,
-            outcome: "unreported",
             repo: repo.map(|r| r.to_string()),
-            files_changed: None,
-            exit_code: None,
+            armed: true,
         }
     }
 
-    /// Exited 0 AND produced a commit.
-    pub fn completed(&mut self, files_changed: usize, exit_code: Option<i32>) {
-        self.outcome = "completed";
-        self.files_changed = Some(files_changed);
-        self.exit_code = exit_code;
-    }
-
-    /// Exited 0 and changed NOTHING. The silent one.
-    pub fn no_commit(&mut self, exit_code: Option<i32>) {
-        self.outcome = "no_commit";
-        self.files_changed = Some(0);
-        self.exit_code = exit_code;
-    }
-
-    pub fn failed(&mut self, exit_code: Option<i32>) {
-        self.outcome = "failed";
-        self.exit_code = exit_code;
-    }
-
-    pub fn timeout(&mut self) {
-        self.outcome = "timeout";
-    }
-
-    pub fn wait_error(&mut self) {
-        self.outcome = "wait_error";
+    /// The arbiter's verdict was reported; this canary has nothing left to say.
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
-impl Drop for CodexDispatchTelemetry {
+impl Drop for DispatchCanary {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Reached only when the monitor died before reporting. Say so; do not guess an
+        // outcome we never observed.
+        tracing::warn!(
+            surface = self.surface,
+            "codex dispatch monitor ended without reporting an outcome (panic or abort?)"
+        );
         record_codex_dispatch(
             self.surface,
-            self.outcome,
+            "unreported",
             self.started.elapsed().as_millis() as u64,
             self.repo.as_deref(),
-            self.files_changed,
-            self.exit_code,
+            None,
+            None,
         );
     }
 }
@@ -738,12 +715,18 @@ pub fn record_ai_generation(g: &AiGeneration<'_>) {
             // --- PostHog's LLM analytics schema ---
             "$ai_trace_id":       g.trace_id,
             "$ai_provider":       provider_for(g.agent),
-            // CLI agents report no model id, so this falls back to the agent. It must fall
-            // back to the DISPLAY name ("Antigravity"), never the internal key ("gemini"):
-            // the key is a routing detail, and Gemini the product is retired. An operator
-            // reading a chart should never see a name we no longer call anything.
+            // "unknown" when we genuinely do not know, NEVER the agent's name.
+            //
+            // This first fell back to the internal key ("gemini"), which charted every
+            // Antigravity call as the model "gemini" and answered nothing. The fix was to
+            // fall back to the DISPLAY name instead, which was the same bug wearing better
+            // clothes: "Antigravity" is a CLIENT, not a model, and putting it in $ai_model
+            // still contaminates model analytics with a client name. The client is Agy; the
+            // model is a Gemini model. When the connector does not tell us which, the honest
+            // answer is that we do not know, and an "unknown" slice on the dashboard is the
+            // signal that our model parsing has regressed.
             "$ai_model":          g.model.map(str::to_string)
-                                    .unwrap_or_else(|| crate::display_agent_name(g.agent)),
+                                    .unwrap_or_else(|| "unknown".to_string()),
             "$ai_input_tokens":   g.input_tokens.unwrap_or(0),
             "$ai_output_tokens":  g.output_tokens.unwrap_or(0),
             "$ai_latency":        (g.duration_ms as f64) / 1000.0,   // seconds

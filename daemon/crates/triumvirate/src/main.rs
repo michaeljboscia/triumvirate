@@ -5845,7 +5845,20 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             forbidden_commands: vec![],
             commit_format: "^T-021:".to_string(),
             test_command: "true".to_string(),
-            task_timeout_sec: 1,
+            // Do not use the PRODUCTION timeout as this test's liveness budget.
+            //
+            // This is a happy-path test: it asserts the task reaches Completed. At 1s it
+            // raced its own timeout watcher and lost, once, under `cargo test --workspace`.
+            // The mock worker is not a no-op — it writes a file and runs real `git add` +
+            // `git commit`, and a slow commit can exceed one second on a loaded machine. The
+            // watcher then marks Timeout, and a terminal status can never be overwritten by
+            // the completion that arrives a moment later, so the assertion fails.
+            //
+            // 10s sits between the two bounds that matter: far above real git work, and still
+            // inside the poll loop's 14s budget (140 x 100ms) below, so a genuinely wedged
+            // task still surfaces as Timeout instead of hanging the suite. Timeout BEHAVIOR
+            // is covered by its own test; this one should not depend on losing a race.
+            task_timeout_sec: 10,
             done_when: "phase 1 e2e verified".to_string(),
             reality_test: "dispatch->status->output->review->cancel".to_string(),
             sandbox_permissions: None,
