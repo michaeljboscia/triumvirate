@@ -292,7 +292,11 @@ pub(crate) fn persist_deepseek_err_tokens(
         request_type = "ask_agent",
         agent.tokens = tracing::field::Empty,
         agent.outcome = tracing::field::Empty,
-        agent.duration_ms = tracing::field::Empty
+        agent.duration_ms = tracing::field::Empty,
+        // Declared, or span.record() silently no-ops and the drift stays invisible in the
+        // one place an operator would look for it.
+        agent.backend = tracing::field::Empty,
+        agent.model = tracing::field::Empty
     )
 )]
 pub(crate) async fn execute_ask_agent(
@@ -331,7 +335,7 @@ pub(crate) async fn execute_ask_agent(
     let request_id = Uuid::new_v4().to_string();
     // The model only matters for pricing, and DeepSeek is the only metered sibling — codex and
     // gemini run on subscriptions, where one more call costs exactly $0.
-    let mut tel = crate::posthog::CallTelemetry::new(
+    let mut tel = mcp_bridge::posthog::CallTelemetry::new(
         &req.agent,
         &request_id,
         req.deepseek_model.as_deref(),
@@ -380,8 +384,40 @@ pub(crate) async fn execute_ask_agent(
     } else {
         None
     };
+    // Surface the RESOLVED backend on the call's telemetry and in the log. The backend is
+    // read from this process's env, so a daemon started without TRIUMVIRATE_GEMINI_BACKEND
+    // silently serves gemini-cli while the caller's config says agy — invisible until now,
+    // because both backends report agent="gemini".
+    if let Some(backend) = gemini_backend_selected {
+        let label = match backend {
+            GeminiBackend::Agy => "agy",
+            GeminiBackend::GeminiCli => "gemini-cli",
+        };
+        tel.set_backend(label);
+        span.record("agent.backend", label);
+        // gemini-cli is RETIRED and no longer works. Selecting it is always a config
+        // defect, and it is reachable only by accident: gemini_backend() defaults to it
+        // whenever TRIUMVIRATE_GEMINI_BACKEND is unset in THIS process. A daemon started
+        // without the MCP env block therefore serves a dead backend, burns its whole
+        // 4-model faildown chain per request, and leaves the agy limiter+breaker inert
+        // (every gate is `== Agy`). That ran for four days in silence. Say it out loud.
+        if matches!(backend, GeminiBackend::GeminiCli) {
+            tracing::warn!(
+                backend = label,
+                "DEAD BACKEND SELECTED: gemini-cli is retired and does not work. This process \
+                 has no TRIUMVIRATE_GEMINI_BACKEND=agy in its env. Start the daemon via \
+                 scripts/start-daemon.sh so it inherits the MCP env block."
+            );
+        }
+    }
     let (resolved_cwd, resolved_repo, resolved_branch) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
+    // Slice cost and quota by project. set_repo keeps the NAME only: resolved_repo is an
+    // absolute toplevel path, which would be both cardinality garbage and a home-directory
+    // leak into a SaaS.
+    if let Some(repo) = resolved_repo.as_deref() {
+        tel.set_repo(repo);
+    }
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
@@ -558,6 +594,9 @@ pub(crate) async fn execute_ask_agent(
         if agy_breaker_open {
             break;
         }
+        // Count every attempt we are about to spend against the provider, not the size of
+        // the schedule: success on the first try must report 1.
+        tel.record_attempt();
         if let Some(model) = model_override {
             tracing::info!("faildown attempt {}/{}: trying model {model}", idx + 1, attempt_schedule.len());
             if let Some(emitter) = progress.as_ref() {
@@ -733,6 +772,25 @@ pub(crate) async fn execute_ask_agent(
                 // with failure(). The guard emits only ONCE, on drop, with whatever the final
                 // outcome turned out to be — which is precisely the bug that made the old
                 // "emit here" version report success for a call that then returned Err.
+                // The agy connector reports the model it CHOSE at runtime ("Gemini 3.1 Pro
+                // (High)") and stashes it in cli_version (agy.rs::build_result). Without
+                // this, $ai_model falls back to the agent key and every Antigravity call
+                // charts as the model "gemini", which cannot answer which model ran.
+                if agent == "gemini" {
+                    match parsed.cli_version.as_deref() {
+                        Some(model) if !model.trim().is_empty() => {
+                            tel.set_model(model);
+                            span.record("agent.model", model);
+                        }
+                        // Record "unknown" rather than leaving the field Empty. An absent
+                        // field is indistinguishable from a span that never reached here, so
+                        // silence would hide the very parse regression worth catching: agy
+                        // changing its log format and us quietly losing the model forever.
+                        _ => {
+                            span.record("agent.model", "unknown");
+                        }
+                    }
+                }
                 tel.success(parsed.token_usage.clone());
                 span.record("agent.outcome", "success");
                 span.record("agent.tokens", tokens);
@@ -864,6 +922,19 @@ pub(crate) async fn execute_ask_agent(
                 if session_for_attempt.is_some() && should_invalidate_cached_session(&msg) {
                     worker_session_id = None;
                     update_worker_session(&agent, &exec_cwd, None).await;
+                    // The one outbox status PostHog could not otherwise see. A stale resume
+                    // id is invisible to $ai_generation (the call still succeeds on the
+                    // retry), yet it is the failure mode that orphans a named session's
+                    // transcript. 26 of these are already in the local outbox and nobody
+                    // ever knew.
+                    mcp_bridge::posthog::record_session_invalidated(
+                        &agent,
+                        gemini_backend_selected.map(|b| match b {
+                            GeminiBackend::Agy => "agy",
+                            GeminiBackend::GeminiCli => "gemini-cli",
+                        }),
+                        resolved_repo.as_deref(),
+                    );
                     let invalidated_detail = format!(
                         "{agent_display} session invalidated after stale resume ID; retrying with a fresh session"
                     );
@@ -940,6 +1011,22 @@ pub(crate) async fn execute_ask_agent(
                         .emit(format!("→ {agent_display}: retrying ({}/{})...", idx + 1, attempt_schedule.len()))
                         .await;
                 }
+                // The REASON an attempt failed reached only the outbox and the lifecycle
+                // vec, never the tracing log. So the log showed "trying model X" four
+                // times and never once said why, and `grep 429 daemon.log` came back empty
+                // while the provider was actively throttling us. A retry that does not say
+                // what it is retrying past is a silent failure wearing a progress bar.
+                tracing::warn!(
+                    attempt = idx + 1,
+                    attempts_total = attempt_schedule.len(),
+                    model = model_label,
+                    backend = gemini_backend_selected.map(|b| match b {
+                        GeminiBackend::Agy => "agy",
+                        GeminiBackend::GeminiCli => "gemini-cli",
+                    }),
+                    error = %msg,
+                    "agent attempt failed"
+                );
                 last_err = Some(msg);
                 sleep(*backoff).await;
             }

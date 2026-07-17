@@ -132,7 +132,6 @@ mod http_mcp;
 mod abe;
 mod cli_ops;
 mod git_ops_impl;
-mod posthog;
 mod proxy;
 mod tracing_setup;
 mod watch;
@@ -2246,6 +2245,28 @@ async fn run_daemon() -> anyhow::Result<()> {
     let token = core_ensure_daemon_token(&triumvirate_home)?;
     let bind_addr = core_daemon_bind_addr(std::env::var("TRIUMVIRATE_DAEMON_BIND_ADDR").ok().as_deref());
     info!(%bind_addr, "starting triumvirate daemon");
+
+    // Report the RESOLVED config, to the log and to PostHog, before serving anything. The
+    // daemon is the only process that dispatches, and it picks its backend from its own
+    // env, so this line is the difference between "the config says agy" and "this process
+    // will use agy". Those were different for four days and nothing said so.
+    let resolved_backend = match mcp_bridge::gemini_backend() {
+        mcp_bridge::GeminiBackend::Agy => "agy",
+        mcp_bridge::GeminiBackend::GeminiCli => "gemini-cli",
+    };
+    let (agy_bin, _) = mcp_bridge::agy_command();
+    let (agy_max_concurrent, agy_max_rpm) = mcp_bridge::agy_resilience::agy_limits();
+    if resolved_backend == "gemini-cli" {
+        warn!(
+            backend = resolved_backend,
+            "DEAD BACKEND: this daemon resolved gemini-cli, which is retired and does not \
+             work. TRIUMVIRATE_GEMINI_BACKEND=agy is missing from THIS process's env. Start \
+             it with scripts/start-daemon.sh."
+        );
+    } else {
+        info!(backend = resolved_backend, %agy_bin, agy_max_concurrent, agy_max_rpm, "daemon config resolved");
+    }
+    mcp_bridge::posthog::record_daemon_started(resolved_backend, &agy_bin, agy_max_concurrent, agy_max_rpm);
 
     // Probe the codex binary so agent_exec can make version-aware flag-injection
     // decisions. Fire-and-forget is fine — if it hasn't completed by the first

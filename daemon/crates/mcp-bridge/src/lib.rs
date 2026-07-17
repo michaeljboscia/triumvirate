@@ -14,6 +14,8 @@ pub use codex_capabilities::{
 
 pub mod agy;
 pub mod agy_resilience;
+/// Shared PostHog telemetry. Every crate that dispatches an agent emits through this.
+pub mod posthog;
 
 // T-002 (REQ-DS-002/003/015): authoritative env-config loader for the DeepSeek sibling.
 pub mod deepseek_config;
@@ -56,6 +58,31 @@ pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
 /// before worker-acquire, before session storage, and before dispatch — or state
 /// splits between the aliases (Codex/Gemini twin review, 2026-07-06).
 #[instrument(skip_all)]
+/// The operator-facing product name for an agent. Lives here, next to its sibling
+/// `normalize_agent_name`, because every crate that emits telemetry needs it and the crate
+/// it used to live in (`mcp-tools`) sits ABOVE `fleet` in the dependency graph, so fleet
+/// could never reach it.
+pub fn display_agent_name(agent: &str) -> String {
+    // Normalize first so the alias inputs (antigravity/agy) render the product
+    // label instead of falling through to the generic capitaliser ("Agy").
+    match normalize_agent_name(agent).as_str() {
+        "codex" => "Codex".to_string(),
+        // The internal execution key is still `gemini`, but the operator-facing
+        // product name is Antigravity — never render "Gemini" to a human.
+        "gemini" => "Antigravity".to_string(),
+        // T-001: explicit arm — the generic first-letter capitaliser below would produce
+        // "Deepseek" (wrong); the canonical brand spelling is "DeepSeek".
+        "deepseek" => "DeepSeek".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Agent".to_string(),
+            }
+        }
+    }
+}
+
 pub fn normalize_agent_name(agent: &str) -> String {
     match agent.to_lowercase().as_str() {
         "antigravity" | "agy" => "gemini".to_string(),

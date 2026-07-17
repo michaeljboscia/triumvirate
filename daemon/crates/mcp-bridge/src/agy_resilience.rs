@@ -52,6 +52,13 @@ fn breaker_base_cooldown() -> Duration {
         .unwrap_or(Duration::from_secs(120))
 }
 
+/// The resolved concurrency + RPM ceilings, for reporting at startup. These are read from
+/// env with defaults, so the only way to know the ceiling a running daemon is ENFORCING is
+/// to ask the process itself. Reading the env var from outside answers a different question.
+pub fn agy_limits() -> (usize, f64) {
+    (agy_max_concurrent(), agy_max_rpm())
+}
+
 /// Cap the breaker cooldown at the ~5-hr Ultra quota-reset window (REQ-101).
 const BREAKER_MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60 * 60);
 
@@ -132,14 +139,32 @@ fn rate_bucket() -> &'static Mutex<TokenBucket> {
 /// Block until the rate limiter grants one agy call (REQ-102). The mutex is never held
 /// across the await — wait time is computed under lock, then released before sleeping.
 pub async fn agy_rate_limit() {
+    let started = Instant::now();
+    let mut throttled = false;
     loop {
         let wait = {
             let mut bucket = rate_bucket().lock().expect("agy rate bucket poisoned");
             bucket.try_take(Instant::now())
         };
         match wait {
-            None => return,
-            Some(d) => tokio::time::sleep(d).await,
+            None => {
+                // Report only calls we actually DELAYED. Emitting on every call would make
+                // the throttle indistinguishable from normal traffic; the whole question is
+                // "are we hitting our own ceiling, and how hard?"
+                if throttled {
+                    let waited = started.elapsed();
+                    tracing::warn!(
+                        waited_ms = waited.as_millis() as u64,
+                        "agy call throttled by local RPM ceiling"
+                    );
+                    crate::posthog::record_rate_limit_wait(waited.as_millis() as u64, agy_max_rpm());
+                }
+                return;
+            }
+            Some(d) => {
+                throttled = true;
+                tokio::time::sleep(d).await;
+            }
         }
     }
 }
@@ -167,6 +192,9 @@ struct BreakerState {
     half_open_inflight: bool,
     /// When the in-flight half-open probe started, for lease expiry (cancelled probe).
     half_open_since: Option<Instant>,
+    /// Calls refused during the current OPEN epoch. Reported once, as an aggregate, rather
+    /// than one event per refusal (see posthog::record_breaker_event).
+    shed: u64,
 }
 
 impl BreakerState {
@@ -178,6 +206,7 @@ impl BreakerState {
             open_count: 0,
             half_open_inflight: false,
             half_open_since: None,
+            shed: 0,
         }
     }
 
@@ -225,6 +254,7 @@ impl BreakerState {
         self.open_count = 0;
         self.half_open_inflight = false;
         self.half_open_since = None;
+        self.shed = 0;
     }
 
     fn trip(&mut self, now: Instant, base: Duration) {
@@ -235,6 +265,8 @@ impl BreakerState {
         self.consecutive = 0;
         self.half_open_inflight = false;
         self.half_open_since = None;
+        // New OPEN epoch: shed is counted per epoch, so it must not carry over.
+        self.shed = 0;
     }
 
     /// Quota/429 failure: trip immediately on a failed half-open probe, else trip at
@@ -282,40 +314,106 @@ fn breaker() -> &'static Mutex<BreakerState> {
 /// degraded route / codex). Transitions OPEN→half-open when the cooldown elapses.
 pub fn agy_breaker_should_skip() -> bool {
     let lease = half_open_lease();
-    let skip = breaker()
-        .lock()
-        .expect("agy breaker poisoned")
-        .should_skip(Instant::now(), lease);
+    let (skip, phase, shed) = {
+        let mut b = breaker().lock().expect("agy breaker poisoned");
+        let skip = b.should_skip(Instant::now(), lease);
+        if skip {
+            b.shed = b.shed.saturating_add(1);
+        }
+        (skip, b.phase, b.shed)
+    };
     if skip {
-        tracing::warn!("agy circuit breaker OPEN — skipping agy attempt, routing around");
+        tracing::warn!(shed, "agy circuit breaker OPEN — skipping agy attempt, routing around");
+        // Emitted HERE, not at the call sites, so every caller (ask path + fleet) counts
+        // once and identically. Only the FIRST refusal of each OPEN epoch emits: while open,
+        // every call is refused, so per-call events would make event volume track traffic
+        // volume for a signal that is one bit. The running total ships with "recovered".
+        if shed == 1 {
+            crate::posthog::record_breaker_event(
+                "opened_shedding",
+                "gemini",
+                "breaker open — agy calls now routed around",
+                None,
+            );
+        }
+    } else if phase == BreakerPhase::HalfOpen {
+        // Carry the running shed total on every probe. If the breaker opens on exhausted
+        // daily quota and NEVER recovers (or the daemon restarts first), "recovered" never
+        // fires and the count would be lost exactly when it matters most: a long outage is
+        // when you most need to know how much traffic you could not serve. A probe fires
+        // once per cooldown, so a long OPEN period checkpoints itself without a timer loop.
+        crate::posthog::record_breaker_event(
+            "half_open_probe",
+            "gemini",
+            "single probe allowed after cooldown",
+            Some(shed),
+        );
     }
     skip
 }
 
 /// Record a successful agy dispatch — closes the circuit.
 pub fn agy_breaker_record_success() {
-    breaker()
-        .lock()
-        .expect("agy breaker poisoned")
-        .record_success();
+    // Only a RECOVERY is newsworthy: a success while already Closed is the normal case and
+    // would drown the signal. Compare phase across the transition, inside the lock.
+    let recovered = {
+        let mut b = breaker().lock().expect("agy breaker poisoned");
+        let was = b.phase;
+        let shed = b.shed;
+        b.record_success();
+        (was != BreakerPhase::Closed).then_some(shed)
+    };
+    if let Some(shed) = recovered {
+        // The shed total lands HERE, closing the epoch: "the breaker was open and it cost
+        // us N calls." That is the number worth charting, and it is only knowable now.
+        crate::posthog::record_breaker_event(
+            "recovered",
+            "gemini",
+            "probe succeeded, circuit closed",
+            Some(shed),
+        );
+    }
 }
 
 /// Record a quota/429 agy failure (REQ-101).
 pub fn agy_breaker_record_quota() {
-    breaker().lock().expect("agy breaker poisoned").record_quota(
-        Instant::now(),
-        breaker_threshold(),
-        breaker_base_cooldown(),
-    );
+    if let Some(shed) = record_and_report(|b, now| {
+        b.record_quota(now, breaker_threshold(), breaker_base_cooldown())
+    }) {
+        crate::posthog::record_breaker_event(
+            "tripped_quota",
+            "gemini",
+            "repeated agy quota/429",
+            Some(shed),
+        );
+    }
 }
 
 /// Record an ambiguous/other agy failure (REQ-103 — biases toward OPEN).
 pub fn agy_breaker_record_other_failure() {
-    breaker().lock().expect("agy breaker poisoned").record_other(
-        Instant::now(),
-        breaker_threshold(),
-        breaker_base_cooldown(),
-    );
+    if let Some(shed) = record_and_report(|b, now| {
+        b.record_other(now, breaker_threshold(), breaker_base_cooldown())
+    }) {
+        crate::posthog::record_breaker_event(
+            "tripped_other",
+            "gemini",
+            "repeated ambiguous agy failures",
+            Some(shed),
+        );
+    }
+}
+
+/// Apply a failure to the breaker and report whether it TRANSITIONED into Open. Emitting on
+/// every failure would conflate "one bad call" with "the circuit just opened"; only the
+/// transition changes what the system does.
+fn record_and_report(apply: impl FnOnce(&mut BreakerState, Instant)) -> Option<u64> {
+    let mut b = breaker().lock().expect("agy breaker poisoned");
+    let was_open = b.phase == BreakerPhase::Open;
+    // Read shed BEFORE applying: trip() resets it for the new epoch, and the number worth
+    // reporting is what the epoch just ENDED shed, not the zero that starts the next one.
+    let shed = b.shed;
+    apply(&mut b, Instant::now());
+    (b.phase == BreakerPhase::Open && !was_open).then_some(shed)
 }
 
 // ---------------------------------------------------------------------------
@@ -372,22 +470,29 @@ fn health_state() -> &'static Mutex<AgyHealthSnapshot> {
 /// Record the result of a health probe (REQ-056). A capture-degraded result leaves
 /// `backend_health` ok (the process ran), and vice versa.
 pub fn agy_record_health(outcome: AgyProbeOutcome, detail: impl Into<String>, now_unix_ms: u128) {
-    let mut h = health_state().lock().expect("agy health poisoned");
-    h.detail = detail.into();
-    h.last_probe_unix_ms = Some(now_unix_ms);
-    match outcome {
-        AgyProbeOutcome::Ok => {
-            h.capture_health = "ok".to_string();
-            h.backend_health = "ok".to_string();
+    let snapshot = {
+        let mut h = health_state().lock().expect("agy health poisoned");
+        h.detail = detail.into();
+        h.last_probe_unix_ms = Some(now_unix_ms);
+        match outcome {
+            AgyProbeOutcome::Ok => {
+                h.capture_health = "ok".to_string();
+                h.backend_health = "ok".to_string();
+            }
+            AgyProbeOutcome::CaptureDegraded => {
+                h.capture_health = "degraded".to_string();
+                h.backend_health = "ok".to_string();
+            }
+            AgyProbeOutcome::BackendFailed => {
+                h.backend_health = "failed".to_string();
+            }
         }
-        AgyProbeOutcome::CaptureDegraded => {
-            h.capture_health = "degraded".to_string();
-            h.backend_health = "ok".to_string();
-        }
-        AgyProbeOutcome::BackendFailed => {
-            h.backend_health = "failed".to_string();
-        }
-    }
+        (h.capture_health.clone(), h.backend_health.clone(), h.detail.clone())
+    };
+    // Ship it, don't just store it. The lock is released first: capture() spawns onto the
+    // runtime, and holding a std Mutex across that is how a telemetry call starts blocking
+    // the thing it is supposed to be observing.
+    crate::posthog::record_health_probe(&snapshot.0, &snapshot.1, &snapshot.2);
 }
 
 /// Read the latest agy health snapshot for the `/health` surface.
@@ -506,6 +611,34 @@ mod tests {
 
         agy_record_health(AgyProbeOutcome::BackendFailed, "exit 2", 300);
         assert_eq!(agy_health_snapshot().backend_health, "failed");
+    }
+
+    #[test]
+    fn shed_counts_per_open_epoch_and_resets_on_recovery() {
+        // The shed total is what makes "the breaker was open" chartable as a cost. It must
+        // count per OPEN epoch and never carry across epochs, or the number is cumulative
+        // nonsense that grows forever.
+        let now = Instant::now();
+        let base = Duration::from_secs(120);
+        let mut s = BreakerState::new();
+        for _ in 0..3 {
+            s.record_quota(now, 3, base);
+        }
+        assert_eq!(s.shed, 0, "a fresh OPEN epoch starts at zero");
+        for _ in 0..5 {
+            assert!(s.should_skip(now, HALF_OPEN_LEASE_MIN));
+            s.shed += 1; // mirrors the wrapper's increment
+        }
+        assert_eq!(s.shed, 5, "every refused call is counted");
+
+        s.record_success();
+        assert_eq!(s.shed, 0, "recovery closes the epoch and resets the count");
+
+        // A NEW epoch must not inherit the previous total.
+        for _ in 0..3 {
+            s.record_quota(now, 3, base);
+        }
+        assert_eq!(s.shed, 0, "trip() starts a fresh epoch");
     }
 
     #[test]

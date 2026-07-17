@@ -78,6 +78,35 @@ pub fn reset_daemon_autostart_flag_for_tests() {
     DAEMON_AUTOSTART_ATTEMPTED.store(false, Ordering::SeqCst);
 }
 
+/// Open the daemon log for append, returning independent stdout/stderr handles.
+///
+/// Path resolution mirrors `scripts/start-daemon.sh` so a hand-started and an autostarted
+/// daemon write to the SAME file: `TRIUMVIRATE_DAEMON_LOG`, else `$TRIUMVIRATE_HOME/daemon.log`,
+/// else `$HOME/.triumvirate/daemon.log`. Returns None if it cannot be opened; the caller
+/// then falls back to /dev/null rather than refusing to start.
+fn open_daemon_log() -> Option<(std::fs::File, std::fs::File)> {
+    let path = match std::env::var("TRIUMVIRATE_DAEMON_LOG") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            let home = std::env::var("TRIUMVIRATE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|_| std::env::var("HOME").map(|h| std::path::Path::new(&h).join(".triumvirate")))
+                .ok()?;
+            home.join("daemon.log")
+        }
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    let err = out.try_clone().ok()?;
+    Some((out, err))
+}
+
 pub fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
     if !daemon_autostart_enabled(std::env::var("TRIUMVIRATE_DAEMON_AUTOSTART").ok().as_deref()) {
         return Ok(false);
@@ -91,12 +120,27 @@ pub fn attempt_daemon_autostart_once() -> anyhow::Result<bool> {
     }
 
     let exe = std::env::current_exe()?;
-    let _child = std::process::Command::new(exe)
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon").stdin(std::process::Stdio::null());
+
+    // An autostarted daemon used to send BOTH stdout and stderr to /dev/null, so the only
+    // process that dispatches agents ran permanently blind: no startup line, no resolved
+    // backend, no failure reason, nothing to grep. The one daemon that DID have logs only
+    // had them because a human happened to redirect it into /tmp by hand. Append to the
+    // same log the start script uses, so logs exist no matter who started the daemon.
+    // Falling back to null on an unopenable path is deliberate: autostart must never be
+    // the reason the daemon fails to come up.
+    match open_daemon_log() {
+        Some((out, err)) => {
+            cmd.stdout(std::process::Stdio::from(out))
+                .stderr(std::process::Stdio::from(err));
+        }
+        None => {
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
+    let _child = cmd.spawn()?;
     Ok(true)
 }
 

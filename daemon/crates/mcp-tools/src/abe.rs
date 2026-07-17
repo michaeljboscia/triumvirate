@@ -553,6 +553,21 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         let cwd_path = PathBuf::from(&cwd);
         let timeout_duration = std::time::Duration::from_secs(timeout_sec);
 
+        // Guard constructed BEFORE the wait race, for two reasons:
+        //  1. Duration. Built after the race, its clock would start once codex had already
+        //     exited, so tv_duration_ms would measure classification (microseconds) instead
+        //     of the dispatch. A plausible-looking number that is silently meaningless is
+        //     worse than no number.
+        //  2. Canary. Only code AFTER construction is covered by Drop, so building it late
+        //     leaves the race itself unreported if the monitor panics or is aborted.
+        // It borrows task_started_at as its origin so the reported duration is the WHOLE
+        // dispatch, matching what observe_task_duration already measures.
+        let mut tel = mcp_bridge::posthog::CodexDispatchTelemetry::new_started_at(
+            "dispatch_codex",
+            Some(&cwd),
+            task_started_at,
+        );
+
         // Race the worker against its deadline. The previous structure ran
         // an unconditional sleep(timeout_sec) before wait(), which both
         // delayed completion reporting for fast tasks and produced false
@@ -572,6 +587,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         let exit = match exit_outcome {
             Some(Ok(status)) => status,
             Some(Err(err)) => {
+                tel.wait_error();
                 tracker_for_monitor
                     .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
                     .await;
@@ -580,6 +596,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
             None => {
                 terminate_worker(child.clone()).await;
                 observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
+                tel.timeout();
                 tracker_for_monitor
                     .mark_timeout(task_id_for_monitor.clone())
                     .await;
@@ -592,6 +609,10 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 (callbacks_for_monitor.resolve_commit_outputs)(&cwd_path, &start_sha);
             if commit_sha.is_empty() {
                 observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
+                // Exit 0, no commit: codex reported success and changed nothing. The most
+                // valuable event here, because it is the one a human only discovers by going
+                // to look for a commit that was never made.
+                tel.no_commit(exit.code());
                 let diag = diagnose_no_commit(&cwd_path, None);
                 tracker_for_monitor
                     .mark_failed(
@@ -603,6 +624,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 return;
             }
             observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
+            tel.completed(files.len(), exit.code());
             tracker_for_monitor
                 .mark_completed(
                     task_id_for_monitor.clone(),
@@ -615,6 +637,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 .await;
         } else {
             observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
+            tel.failed(exit.code());
             tracker_for_monitor
                 .mark_failed(
                     task_id_for_monitor.clone(),

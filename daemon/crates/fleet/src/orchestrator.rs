@@ -319,18 +319,62 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let worktree_path = worktree_paths[join_handles.len()].clone();
             let jh = tokio::spawn(async move {
                 tracing::info!(fleet_id = %fleet_id, task_id = %task_id, agent = %agent_name, "launching fleet agent subprocess");
+                let task_started = std::time::Instant::now();
+                let agy_backend = agent_name == "gemini"
+                    && mcp_bridge::gemini_backend() == mcp_bridge::GeminiBackend::Agy;
+                let backend_label = if agent_name == "gemini" {
+                    Some(match mcp_bridge::gemini_backend() {
+                        mcp_bridge::GeminiBackend::Agy => "agy",
+                        mcp_bridge::GeminiBackend::GeminiCli => "gemini-cli",
+                    })
+                } else {
+                    None
+                };
+                // REQ-101: honour the circuit breaker BEFORE launching. Fleet used to ignore
+                // it entirely, so while the ask path correctly routed around a quota-tripped
+                // agy, fleet kept hammering the same pool and starved every half-open probe
+                // that would have let the breaker close. A breaker only 2 of 3 callers
+                // respect is not a breaker.
+                let breaker_open = agy_backend
+                    && mcp_bridge::agy_resilience::agy_breaker_should_skip();
+                if breaker_open {
+                    tracing::warn!(
+                        fleet_id = %fleet_id,
+                        task_id = %task_id,
+                        "agy circuit breaker OPEN — skipping agy, degrading fleet task to codex"
+                    );
+                    // No breaker event emitted here: agy_breaker_should_skip() already emits
+                    // "blocked_call" for every caller. Emitting again would double-count
+                    // fleet's shed traffic against the ask path's.
+                }
+                // Route around agy for real. Emitting "skipped" and then launching agy
+                // anyway would be a lying event, which is the failure mode this whole pass
+                // exists to kill. codex is a different provider (different quota pool), and
+                // is already the degraded target for a failed agy task below (REQ-092).
+                let launch_agent: String = if breaker_open { "codex".to_string() } else { agent_name.clone() };
+                let use_agy = agy_backend && !breaker_open;
+                // The backend label must describe what we LAUNCHED, not what was asked for.
+                // Reporting codex-with-backend=agy would be a lie: codex has no agy backend,
+                // it is a different provider on a different quota pool, which is the entire
+                // reason it is the degraded target. Both reviewers caught this independently.
+                let launched_backend = if breaker_open { None } else { backend_label };
                 // REQ-055: hold a shared agy concurrency slot for the lifetime of this
                 // child, so fleet's agy fan-out is bounded by the SAME global cap as the
                 // ask path (not unbounded against the shared quota pool).
-                let _agy_slot = if agent_name == "gemini"
-                    && mcp_bridge::gemini_backend() == mcp_bridge::GeminiBackend::Agy
-                {
-                    Some(mcp_bridge::agy_resilience::agy_acquire_slot().await)
+                let _agy_slot = if use_agy {
+                    let slot = mcp_bridge::agy_resilience::agy_acquire_slot().await;
+                    // REQ-102: fleet held the concurrency slot but NEVER took a rate-limit
+                    // token, so its fan-out was concurrency-bounded and RPM-unbounded
+                    // against a pool the ask path was carefully throttling. The module doc
+                    // claimed these limits were global across "ask path + fleet"; for the
+                    // RPM ceiling that was simply untrue until this line.
+                    mcp_bridge::agy_resilience::agy_rate_limit().await;
+                    Some(slot)
                 } else {
                     None
                 };
                 let launch_result = launcher
-                    .launch(&agent_name, &project_root, &worktree_path, &task_prompt)
+                    .launch(&launch_agent, &project_root, &worktree_path, &task_prompt)
                     .await;
                 match launch_result {
                     Ok(mut child) => {
@@ -339,8 +383,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         // completes (slot released); kill_on_drop kills sandbox-exec and
                         // agy self-terminates via its own --print-timeout. A non-zero
                         // agy EXIT still degrades to codex below; a TIMEOUT fails loud.
-                        let agy_primary = agent_name == "gemini"
-                            && mcp_bridge::gemini_backend() == mcp_bridge::GeminiBackend::Agy;
+                        // Must track what we ACTUALLY launched, not what was requested: with
+                        // the breaker open this task is a codex child, and applying agy's
+                        // connector timeout to it would kill a healthy codex run early.
+                        let agy_primary = use_agy;
                         let wait_result = if agy_primary {
                             match tokio::time::timeout(
                                 mcp_bridge::agy::agy_connector_timeout()
@@ -378,6 +424,20 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     agent = %agent_name,
                                     "fleet agent subprocess completed successfully"
                                 );
+                                // A working agy closes the breaker for EVERY caller. Fleet
+                                // never reported its successes, so its healthy traffic could
+                                // not help the shared breaker recover.
+                                if use_agy {
+                                    mcp_bridge::agy_resilience::agy_breaker_record_success();
+                                }
+                                mcp_bridge::posthog::record_fleet_task(
+                                    &launch_agent,
+                                    launched_backend,
+                                    if breaker_open { "degraded_success" } else { "success" },
+                                    task_started.elapsed().as_millis() as u64,
+                                    &fleet_id,
+                                    &task_id,
+                                );
                                 if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                                     let _ = task_store.complete_task(&task_id);
                                 }
@@ -389,20 +449,33 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         event_type: "task_completed".to_string(),
                                         sequence: seq,
                                         timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                        payload_json: serde_json::json!({"task_id": task_id, "agent": agent_name}).to_string(),
+                                        // The agent that DID the work, plus what was asked
+                                        // for when they differ. Recording the requested agent
+                                        // alone would credit gemini for a codex commit once
+                                        // the breaker degrades a task, and the ledger is the
+                                        // record we reason about later.
+                                        payload_json: serde_json::json!({
+                                            "task_id": task_id,
+                                            "agent": launch_agent,
+                                            "requested_agent": agent_name,
+                                            "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
+                                        }).to_string(),
                                     });
                                 }
                                 if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.clone()) {
+                                    // author_agent must be whoever actually wrote the code, or
+                                    // peer review can hand a codex diff back to codex to review
+                                    // its own work.
                                     let _ = review_engine.request_review(peer_review::ReviewRequest {
                                         fleet_id: Some(fleet_id.clone()),
-                                        author_agent: agent_name.clone(),
+                                        author_agent: launch_agent.clone(),
                                         artifact: format!("fleet/{fleet_id}/{task_id}"),
                                         review_type: "code".to_string(),
                                     });
                                     tracing::info!(
                                         fleet_id = %fleet_id,
                                         task_id = %task_id,
-                                        reviewer_target = %agent_name,
+                                        author_agent = %launch_agent,
                                         "peer review requested for completed task"
                                     );
                                 }
@@ -413,11 +486,19 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 // Fleet doesn't capture output to classify quota, so it
                                 // skips the shared-pool gemini-cli and goes straight to
                                 // codex, which is the safe always-available fallback.
+                                // Fleet reads only an exit status, so it CANNOT tell a quota
+                                // failure from a crash. Recording this as quota would be a
+                                // guess that trips the shared breaker on evidence we do not
+                                // have; record_other_failure is the honest arm (REQ-103
+                                // biases repeated ambiguous failures toward OPEN anyway).
+                                if use_agy {
+                                    // record_other_failure emits "tripped_other" itself, and
+                                    // only on the actual transition to OPEN. Emitting here
+                                    // too would report a trip on every failed task.
+                                    mcp_bridge::agy_resilience::agy_breaker_record_other_failure();
+                                }
                                 let mut degraded_ok = false;
-                                if agent_name == "gemini"
-                                    && mcp_bridge::gemini_backend()
-                                        == mcp_bridge::GeminiBackend::Agy
-                                {
+                                if use_agy {
                                     tracing::warn!(
                                         fleet_id = %fleet_id,
                                         task_id = %task_id,
@@ -439,6 +520,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     if codex_ok {
                                         degraded_ok = true;
                                         tracing::info!(fleet_id = %fleet_id, task_id = %task_id, "fleet task completed by codex (degraded from agy)");
+                                        mcp_bridge::posthog::record_fleet_task(
+                                            "codex",
+                                            None,
+                                            "degraded_success",
+                                            task_started.elapsed().as_millis() as u64,
+                                            &fleet_id,
+                                            &task_id,
+                                        );
                                         if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                                             let _ = task_store.complete_task(&task_id);
                                         }
@@ -463,6 +552,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         code = status.code(),
                                         "fleet agent subprocess failed"
                                     );
+                                    mcp_bridge::posthog::record_fleet_task(
+                                        &launch_agent,
+                                        launched_backend,
+                                        "failed",
+                                        task_started.elapsed().as_millis() as u64,
+                                        &fleet_id,
+                                        &task_id,
+                                    );
                                     let db_path = project_root.join(".triumvirate").join("ledger.db");
                                     if let Ok(conn) = rusqlite::Connection::open(db_path) {
                                         let _ = conn.execute(
@@ -478,8 +575,13 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             event_type: "task_failed".to_string(),
                                             sequence,
                                             timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                            // Without the agent, a task_failed row cannot tell
+                                            // a degraded codex failure from the requested
+                                            // gemini failing: the two demand opposite fixes.
                                             payload_json: serde_json::json!({
                                                 "task_id": task_id,
+                                                "agent": launch_agent,
+                                                "requested_agent": agent_name,
                                                 "error": format!("agent exited with status {:?}", status.code()),
                                             })
                                             .to_string(),
@@ -493,6 +595,23 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     task_id = %task_id,
                                     error = %err,
                                     "fleet agent process wait failed"
+                                );
+                                // This arm swallows the agy TIMEOUT synthesized above, and a
+                                // timeout is a classic quota symptom (the provider stalls
+                                // before it refuses). It fed neither the breaker nor
+                                // PostHog, so a fleet full of agy timeouts left the breaker
+                                // closed and the dashboard empty. Cause is unknowable here
+                                // (fleet reads no output), hence the honest "other" arm.
+                                if use_agy {
+                                    mcp_bridge::agy_resilience::agy_breaker_record_other_failure();
+                                }
+                                mcp_bridge::posthog::record_fleet_task(
+                                    &launch_agent,
+                                    launched_backend,
+                                    if err.kind() == std::io::ErrorKind::TimedOut { "timeout" } else { "failed" },
+                                    task_started.elapsed().as_millis() as u64,
+                                    &fleet_id,
+                                    &task_id,
                                 );
                                 let db_path = project_root.join(".triumvirate").join("ledger.db");
                                 if let Ok(conn) = rusqlite::Connection::open(db_path) {
@@ -511,6 +630,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         timestamp: "2030-01-01T00:00:00Z".to_string(),
                                         payload_json: serde_json::json!({
                                             "task_id": task_id,
+                                            "agent": launch_agent,
+                                            "requested_agent": agent_name,
                                             "error": err.to_string()
                                         })
                                         .to_string(),
@@ -525,6 +646,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             task_id = %task_id,
                             error = %err,
                             "fleet agent failed to launch"
+                        );
+                        // "launch_failed" was documented in record_fleet_task's taxonomy and
+                        // never emitted by anyone: a value that can only ever be absent. A
+                        // documented-but-unreachable outcome reads as "this never happens"
+                        // when it means "we never looked".
+                        mcp_bridge::posthog::record_fleet_task(
+                            &launch_agent,
+                            launched_backend,
+                            "launch_failed",
+                            task_started.elapsed().as_millis() as u64,
+                            &fleet_id,
+                            &task_id,
                         );
                         let db_path = project_root.join(".triumvirate").join("ledger.db");
                         if let Ok(conn) = rusqlite::Connection::open(db_path) {
@@ -543,6 +676,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 timestamp: "2030-01-01T00:00:00Z".to_string(),
                                 payload_json: serde_json::json!({
                                     "task_id": task_id,
+                                    "agent": launch_agent,
+                                    "requested_agent": agent_name,
                                     "error": err.to_string()
                                 })
                                 .to_string(),

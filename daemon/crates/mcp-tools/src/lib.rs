@@ -89,26 +89,10 @@ fn should_emit_progress_notifications() -> bool {
     })
 }
 
-pub fn display_agent_name(agent: &str) -> String {
-    // Normalize first so the alias inputs (antigravity/agy) render the product
-    // label instead of falling through to the generic capitaliser ("Agy").
-    match mcp_bridge::normalize_agent_name(agent).as_str() {
-        "codex" => "Codex".to_string(),
-        // The internal execution key is still `gemini`, but the operator-facing
-        // product name is Antigravity — never render "Gemini" to a human.
-        "gemini" => "Antigravity".to_string(),
-        // T-001: explicit arm — the generic first-letter capitaliser below would produce
-        // "Deepseek" (wrong); the canonical brand spelling is "DeepSeek".
-        "deepseek" => "DeepSeek".to_string(),
-        other => {
-            let mut chars = other.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => "Agent".to_string(),
-            }
-        }
-    }
-}
+// display_agent_name moved to mcp-bridge so fleet (which sits BELOW this crate) can emit
+// telemetry with the same operator-facing names. Re-exported so existing callers, and the
+// tests that pin "Antigravity", keep working unchanged.
+pub use mcp_bridge::display_agent_name;
 
 pub fn next_heartbeat_offset(current: Duration) -> Duration {
     if current == Duration::from_secs(10) {
