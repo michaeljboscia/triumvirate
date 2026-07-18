@@ -783,6 +783,41 @@ pub fn record_maintenance(job: &str, outcome: &str, count: u64) {
     );
 }
 
+/// Emit `tv_deepseek_breaker` when the DeepSeek circuit breaker changes state.
+///
+/// The agy breaker had `tv_quota_breaker`; DeepSeek's had nothing, an asymmetry that mattered
+/// because DeepSeek is the only METERED provider. The two states worth an alert:
+///   - `hard_open_insufficient_balance`: HTTP 402, the account is OUT OF BALANCE. No automatic
+///     recovery; an operator must refill or rotate the key. Completely invisible before this.
+///   - `open_transient`: repeated 429/5xx tripped the breaker — the paid provider is throttling
+///     or erroring, so paid traffic is being shed.
+/// `to`/`from` are the state labels; both are a fixed low-cardinality set.
+///
+/// Note on recovery: `hard_open_insufficient_balance` is a PROCESS-LIFETIME LATCH — the breaker
+/// has no reset() and try_acquire returns BlockHard, so record() never runs to move it out. It
+/// clears only on a daemon restart (a fresh breaker starts Closed). So there is deliberately no
+/// "recovered from out-of-balance" transition event; recovery shows up as the next
+/// tv_daemon_started plus resumed successful deepseek $ai_generation, not here.
+///
+/// This is an EDGE trigger (fires once, on entry). If that one event drops under bus lag, a
+/// persistent out-of-balance is still not silent: while latched, every deepseek call returns
+/// BreakerOpen and emits a failing $ai_generation, continuously — a deepseek failure-rate alert
+/// is the backstop for a missed entry event (Antigravity). deepseek is single-attempt
+/// (REQ-DS-008), so a blocked call is ONE event, not a retry-loop storm.
+pub fn record_deepseek_breaker(to_state: &str, from_state: &str) {
+    capture(
+        "tv_deepseek_breaker",
+        json!({
+            "tv_agent":         "deepseek",
+            "tv_agent_display": crate::display_agent_name("deepseek"),
+            "tv_breaker_to":    to_state,
+            "tv_breaker_from":  from_state,
+            // The one an alert should fire on: the metered account ran out of money.
+            "tv_out_of_balance": to_state == "hard_open_insufficient_balance",
+        }),
+    );
+}
+
 pub fn record_ai_generation(g: &AiGeneration<'_>) {
     let is_error = g.outcome != "success" && g.outcome != "degraded_success";
 

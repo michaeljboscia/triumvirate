@@ -1042,12 +1042,16 @@ pub async fn run(
 
     // Phase 5: report the outcome to the breaker. RunawayReasoning and
     // BadFinishReason are budget/policy decisions — do NOT touch the breaker.
-    {
+    let breaker_transition = {
         let mut b = resilience
             .breaker
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
+        // Snapshot before/after so the transition can be reported to PostHog AFTER the lock
+        // releases. The Breaker itself stays a pure, clock-driven state machine (no telemetry
+        // coupling), exactly like the agy breaker's core; the emit lives at this call site.
+        let prev = b.state();
         match &result {
             Ok(_) => b.record(Outcome::Success, now),
             Err(f) => match &f.kind {
@@ -1078,9 +1082,45 @@ pub async fn run(
                 | DeepSeekFailureKind::EmptyFinalAnswer { .. } => {}
             },
         }
+        let next = b.state();
+        (prev, next)
+    };
+
+    // Emit only on a STATE CHANGE, and only for the newsworthy states — a per-request
+    // "still Closed" is not news. DeepSeek is the only METERED provider, so its breaker is
+    // arguably higher-value than agy's: HardOpenInsufficientBalance means "out of money", and
+    // the transient trip means the paid provider is 429/5xx-ing us. Emitted here, after the
+    // lock is released (capture() detaches the POST).
+    {
+        let (prev, next) = breaker_transition;
+        // Compare LABELS, not the full enum. BreakerState carries Instant + attempts, so a
+        // re-trip while already open (OpenTransient{t1,1} -> OpenTransient{t2,2}) is `prev !=
+        // next` at the enum level but the SAME logical state — emitting there would flap an
+        // "open_transient -> open_transient" storm under concurrent in-flight failures (Codex).
+        let (from, to) = (describe_breaker_state(prev), describe_breaker_state(next));
+        if from != to {
+            crate::posthog::record_deepseek_breaker(to, from);
+        }
     }
 
     result
+}
+
+/// Stable, low-cardinality label for a DeepSeek breaker state, for PostHog.
+///
+/// Note: try_acquire() also mutates state (OpenTransient->HalfOpen when a cooldown elapses to
+/// grant a probe; a stale HalfOpen->OpenTransient) and those are deliberately NOT emitted. The
+/// alertable states — the transient TRIP, the out-of-balance HardOpen, the probe outcome
+/// (HalfOpen->Closed recovery / HalfOpen->OpenTransient re-trip), all of which pass through
+/// record() — are covered here. The uncovered ones are intermediate "probe granted" visibility.
+fn describe_breaker_state(state: crate::deepseek_resilience::BreakerState) -> &'static str {
+    use crate::deepseek_resilience::BreakerState;
+    match state {
+        BreakerState::Closed => "closed",
+        BreakerState::HardOpenInsufficientBalance => "hard_open_insufficient_balance",
+        BreakerState::OpenTransient { .. } => "open_transient",
+        BreakerState::HalfOpen { .. } => "half_open",
+    }
 }
 
 async fn run_inner(
