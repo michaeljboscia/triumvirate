@@ -353,6 +353,8 @@ pub(crate) async fn execute_ask_agent(
     // on the canonical `gemini` execution key (shared worker slot + dispatch arm).
     let agent = normalize_agent_name(&req.agent);
     tel.set_agent(&agent);
+    // $ai_input: the actual prompt for this call, so PostHog's LLM trace view shows what we sent.
+    tel.set_input(&req.message);
 
     // T-015 (REQ-DS-025) anti-bulk: reject oversized payloads on the metered
     // DeepSeek path BEFORE any worker is acquired. The default ceiling (16KB)
@@ -792,6 +794,8 @@ pub(crate) async fn execute_ask_agent(
                     }
                 }
                 tel.success(parsed.token_usage.clone());
+                // $ai_output: the completion the model actually returned.
+                tel.set_output(&parsed.response_text);
                 span.record("agent.outcome", "success");
                 span.record("agent.tokens", tokens);
                 span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
@@ -1137,6 +1141,8 @@ pub(crate) async fn execute_ask_agent(
                     // analytics entirely, so "how often does gemini degrade rather than fail?"
                     // — the exact question this taxonomy exists to answer — was unanswerable.
                     tel.degraded_success(None);
+                    // $ai_output for the degraded hop's completion.
+                    tel.set_output(&parsed.response_text);
                     // REQ-053 R3: a text prefix only when a DIFFERENT agent answered
                     // (codex). A gemini-cli hop is the same agent on the legacy backend,
                     // so honesty lives in the fields/lifecycle, not an alarming prefix.

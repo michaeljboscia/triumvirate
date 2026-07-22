@@ -1114,6 +1114,60 @@ async fn prewarm_daemon_workers() {
 /// so that `dispatch_codex`/`dispatch_codex_worktree` see the same task-local
 /// state they would on the HTTP path. `list_tools` and `get_tool` are copied
 /// verbatim from the `#[tool_handler]` expansion.
+/// The MCP session id for this stdio process, minted once and stable for its lifetime.
+///
+/// PostHog's MCP Analytics is per-session; stdio has one client connection per process, so a
+/// stable per-process `ses_<hex>` IS the session (the rotate-after-idle logic the SDK uses is
+/// an HTTP/SSE concern that does not apply to a single stdio connection).
+fn mcp_session_id() -> &'static str {
+    static SID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SID.get_or_init(|| format!("ses_{}", Uuid::new_v4().simple()))
+}
+
+/// Client name/version from the MCP initialize handshake, for the `$mcp_client_*` properties.
+/// `None` if the peer has not completed initialize (should not happen for a tool call, but the
+/// telemetry must never assume).
+fn mcp_client_identity(
+    context: &RequestContext<RoleServer>,
+) -> (Option<String>, Option<String>) {
+    match context.peer.peer_info() {
+        Some(info) => (
+            // Cap both: a buggy client sending a timestamp/build-hash as its version would be an
+            // unbounded property (Antigravity). Client name/version are short in practice.
+            Some(info.client_info.name.chars().take(64).collect()),
+            Some(info.client_info.version.chars().take(64).collect()),
+        ),
+        None => (None, None),
+    }
+}
+
+/// Emit `$mcp_initialize` exactly once per process (stdio = one session per process), the first
+/// time we see a tool call. rmcp handles the initialize handshake internally, so there is no
+/// ServerHandler hook for it; this is the faithful stand-in.
+fn emit_mcp_initialize_once(session_id: &str, client_name: Option<&str>, client_version: Option<&str>) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    mcp_bridge::posthog::record_mcp_initialize(
+        session_id,
+        client_name.unwrap_or("unknown"),
+        client_version.unwrap_or("unknown"),
+    );
+}
+
+/// Map a JSON-RPC error code to PostHog's `$mcp_error_type` enum. Triumvirate's tool failures
+/// mostly surface as invalid-params (validation) or server errors (internal); anything
+/// unrecognized is "internal" rather than an invented category.
+fn classify_mcp_error(code: i32) -> &'static str {
+    match code {
+        -32602 => "validation",            // invalid params
+        -32601 => "validation",            // method/tool not found
+        -32700 | -32600 => "validation",   // parse / invalid request
+        _ => "internal",
+    }
+}
+
 impl ServerHandler for McpBridge {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1134,9 +1188,55 @@ impl ServerHandler for McpBridge {
         // through as absent lineage on the emitted WorkerLifecycle events.
         let scope_value = extract_pantheon_scope_from_meta(&request);
 
+        // MCP Analytics: capture identity BEFORE `request`/`context` are moved into the tool
+        // context. This one choke point covers all 54 tools. Params are Rung-1 sanitized inside
+        // posthog.rs (truncated preview, key-name + token-prefix redaction, paths basenamed).
+        let sid = mcp_session_id();
+        let tool_name = request.name.to_string();
+        let params = request
+            .arguments
+            .as_ref()
+            .map(|a| serde_json::Value::Object(a.clone()));
+        let (client_name, client_version) = mcp_client_identity(&context);
+        emit_mcp_initialize_once(sid, client_name.as_deref(), client_version.as_deref());
+        let started = std::time::Instant::now();
+
         let tcc = ToolCallContext::new(self, request, context);
         let fut = self.tool_router.call(tcc);
-        daemon_core::PANTHEON_SESSION.scope(scope_value, fut).await
+        let result = daemon_core::PANTHEON_SESSION.scope(scope_value, fut).await;
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        // A tool "error" is EITHER a transport-level Err OR an Ok result flagged is_error (MCP
+        // lets a tool return a successful envelope that marks itself failed). No $mcp_error_status:
+        // JSON-RPC codes are not HTTP statuses (Codex); $mcp_error_type carries the class.
+        let (is_error, error_type, response_json) = match &result {
+            Ok(r) => {
+                let is_err = r.is_error.unwrap_or(false);
+                let et = if is_err { Some("internal") } else { None };
+                (is_err, et, serde_json::to_value(r).ok())
+            }
+            Err(e) => (true, Some(classify_mcp_error(e.code.0)), None),
+        };
+        // Bound $mcp_tool_name: a hallucinated tool name fails with method-not-found (-32601),
+        // and emitting the raw hallucinated string would let a misbehaving agent mint unbounded
+        // property values and pollute PostHog's dictionary (Antigravity). A real tool is always
+        // one of the registered set; collapse the unknown case to a single label.
+        let emitted_tool = match &result {
+            Err(e) if e.code.0 == -32601 => "unknown",
+            _ => tool_name.as_str(),
+        };
+        mcp_bridge::posthog::record_mcp_tool_call(
+            sid,
+            emitted_tool,
+            duration_ms,
+            is_error,
+            error_type,
+            client_name.as_deref(),
+            client_version.as_deref(),
+            params.as_ref(),
+            response_json.as_ref(),
+        );
+        result
     }
 
     async fn list_tools(
@@ -1144,8 +1244,19 @@ impl ServerHandler for McpBridge {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let tools = self.tool_router.list_all();
+        // The advertised-vs-called signal: emit the full tool inventory so PostHog can show
+        // which of the 54 tools agents actually use.
+        let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+        let (client_name, client_version) = mcp_client_identity(&_context);
+        mcp_bridge::posthog::record_mcp_tools_list(
+            mcp_session_id(),
+            &names,
+            client_name.as_deref(),
+            client_version.as_deref(),
+        );
         Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools,
             meta: None,
             next_cursor: None,
         })
@@ -6316,6 +6427,9 @@ mod pantheon_rest_tests {
                 None,
                 parent.map(ToString::to_string),
                 root.map(ToString::to_string),
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
     }
@@ -6757,6 +6871,9 @@ mod pantheon_ws_replay_tests {
                 None,
                 Some("pantheon-parent".to_string()),
                 Some("pantheon-root".to_string()),
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
         let child_b = tokio::process::Command::new("sh")
@@ -6773,6 +6890,9 @@ mod pantheon_ws_replay_tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
 

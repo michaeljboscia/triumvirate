@@ -62,6 +62,9 @@ pub struct AiGeneration<'a> {
     /// number of projects, is readable in a chart (unlike a hash), and answers the actual
     /// question: which project is burning the quota?
     pub repo: Option<&'a str>,
+    /// The actual prompt and completion. See CallTelemetry::input/output.
+    pub input: Option<&'a str>,
+    pub output: Option<&'a str>,
 }
 
 /// Reduce an absolute repo path to its bounded, readable name. Anything that is already a
@@ -103,6 +106,11 @@ pub struct CallTelemetry {
     /// spent 1, even though gemini-cli's schedule holds 4. Counting the schedule would
     /// report a 4x quota burn that never happened.
     attempts: u32,
+    /// The actual prompt sent to the model and the completion it returned. This is the CONTENT
+    /// of AI observability: token counts tell you a call happened, these tell you WHAT. Scrubbed
+    /// (credentials/PII masked) and capped in record_ai_generation before they leave the process.
+    input: Option<String>,
+    output: Option<String>,
 }
 
 impl CallTelemetry {
@@ -118,7 +126,19 @@ impl CallTelemetry {
             backend: None,
             repo: None,
             attempts: 0,
+            input: None,
+            output: None,
         }
+    }
+
+    /// The prompt sent to the model, for `$ai_input`. Set at dispatch time.
+    pub fn set_input(&mut self, input: &str) {
+        self.input = Some(input.to_string());
+    }
+
+    /// The completion the model returned, for `$ai_output`. Set on success/degraded-success.
+    pub fn set_output(&mut self, output: &str) {
+        self.output = Some(output.to_string());
     }
 
     /// Record which backend actually served this call. Set as soon as the dispatcher
@@ -207,6 +227,8 @@ impl Drop for CallTelemetry {
             backend: self.backend,
             attempts: self.attempts,
             repo: self.repo.as_deref(),
+            input: self.input.as_deref(),
+            output: self.output.as_deref(),
         });
 
         // A failure is also an issue in error tracking. Only on a real failure, a
@@ -325,7 +347,16 @@ fn provider_for(agent: &str) -> &'static str {
 /// Emit a `$ai_generation` event. No-op unless POSTHOG_HOST and POSTHOG_API_KEY are both set.
 /// POST one event to PostHog. Fire-and-forget; every error is swallowed, because a
 /// telemetry failure must never be able to fail an agent call.
+/// System-telemetry capture: all the `tv_*` / `$ai_generation` events belong to the daemon as
+/// one actor, so they share a single stable distinct_id.
 fn capture(event: &str, properties: serde_json::Value) {
+    capture_as("triumvirate-daemon", event, properties);
+}
+
+/// Capture under a caller-supplied distinct_id. The MCP-analytics `$mcp_*` events use the MCP
+/// SESSION id (not the daemon id), because PostHog's MCP Analytics dashboard is per-session:
+/// it groups a client's tool calls into one session, which a shared daemon id would collapse.
+fn capture_as(distinct_id: &str, event: &str, properties: serde_json::Value) {
     let (Ok(host), Ok(key)) = (
         std::env::var("POSTHOG_HOST"),
         std::env::var("POSTHOG_API_KEY"),
@@ -337,7 +368,7 @@ fn capture(event: &str, properties: serde_json::Value) {
     let body = json!({
         "api_key": key,
         "event": event,
-        "distinct_id": "triumvirate-daemon",
+        "distinct_id": distinct_id,
         "properties": properties,
     });
 
@@ -818,12 +849,335 @@ pub fn record_deepseek_breaker(to_state: &str, from_state: &str) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// MCP Analytics ($mcp_* events)
+//
+// Mirrors PostHog's @posthog/mcp-analytics TypeScript SDK, which we cannot use because it
+// wraps a JS/TS MCP server and Triumvirate's is Rust. The event names and property KEYS below
+// are copied verbatim from PostHog's MCP Analytics events reference, because their purpose-built
+// MCP Analytics dashboard queries these exact strings; a typo means the dashboard stays empty
+// while the events 200-OK into the void. Triumvirate serves tools only (no resources/prompts),
+// so only the tool-call / tools-list / initialize events apply.
+// ---------------------------------------------------------------------------
+
+/// The `$mcp_source` the dashboard filters on. Verbatim; do not "improve" it.
+const MCP_SOURCE: &str = "posthog_mcp_analytics";
+const MCP_SERVER_NAME: &str = "triumvirate";
+/// Content capture, not a preview: the point of AI observability is seeing what was actually
+/// sent. Per-string cap is generous (normal prompts/responses pass whole); it only bounds a
+/// pathological single blob so one field can't dominate the event, with the byte cap as backstop.
+/// Credentials are still masked (hygiene: never log a live key, Cloud or not).
+const MCP_PREVIEW_MAX_CHARS: usize = 16_384;
+
+/// PATTERN pass over free text (prompts/completions/tool args), for secrets and PII that the
+/// token-wise mask misses because AI content is PROSE, not JSON: `password: hunter2` (secret
+/// split across tokens), SSNs, phone numbers (Codex). Runs before the token-wise mask. Compiled
+/// once. regex-lite has no lookaround, so patterns are written to work without it.
+fn scrub_text_patterns(s: &str) -> String {
+    use regex_lite::Regex;
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            // PEM / begin-end key blocks (multi-line): mask the whole block. The base64 body
+            // lines are mostly caught by the high-entropy token mask too, but a dedicated block
+            // pattern makes it definitive (DeepSeek).
+            r"-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----",
+            // Inline `sensitive_key : value` / `= value`, value = rest of the token run.
+            // Case-insensitive. The optional `["']?` around the separator tolerates JSON
+            // (`"api_key": "sk-.."`), where a quote sits between the key name and the colon and
+            // before the value, which a bare `[:=]` would miss (Antigravity).
+            r#"(?i)\b(password|passwd|secret|token|api[_-]?key|apikey|authorization|auth|bearer|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|credential)s?["']?\s*[:=]\s*["']?\s*\S+"#,
+            // US SSN.
+            r"\b\d{3}-\d{2}-\d{4}\b",
+            // Phone (US-ish, with separators; conservative to limit false positives).
+            r"\b\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b",
+            // Long digit runs (card/account numbers), 13-19 digits with optional separators.
+            r"\b(?:\d[ -]?){13,19}\b",
+        ]
+        .iter()
+        .filter_map(|p| Regex::new(p).ok())
+        .collect()
+    });
+    let mut out = s.to_string();
+    for re in patterns {
+        out = re.replace_all(&out, "***").into_owned();
+    }
+    out
+}
+
+/// The full content scrubber: pattern pass (prose secrets/PII) THEN token-wise mask (key
+/// prefixes, emails, high-entropy). Used for BOTH $mcp_parameters/$mcp_response string values and
+/// the $ai_input/$ai_output prompt/completion text, so both paths get the same floor.
+fn scrub_secrets(s: &str) -> String {
+    mask_credentials(&scrub_text_patterns(s))
+}
+
+/// Credential/PII mask applied to every string value AND to captured prompts/completions before
+/// they leave the process. Content capture is the point, so this must be aggressive enough that
+/// sending the content to Cloud is SAFE: it errs toward over-masking (a masked SHA is fine; a
+/// leaked key is not). Catches known key prefixes, emails, inline `secret=...`, and any opaque
+/// high-entropy token (the catch-all for keys with no recognizable prefix).
+fn mask_credentials(s: &str) -> String {
+    s.split_inclusive(char::is_whitespace)
+        .map(|piece| {
+            let tok = piece.trim();
+            if !tok.is_empty() && looks_like_secret(tok) {
+                piece.replacen(tok, "***", 1)
+            } else {
+                piece.to_string()
+            }
+        })
+        .collect()
+}
+
+/// True if a single whitespace-delimited token should be masked.
+fn looks_like_secret(tok: &str) -> bool {
+    // Strip surrounding quotes/punctuation before the prefix, email, and entropy tests. A quoted
+    // or trailing-punctuated secret (`"sk-abc"`, `sk-abc,`) otherwise hides its prefix (it starts
+    // with `"`, not `sk-`) AND fails the credential-charset check (the `"` is not in the charset),
+    // so it would slip through both nets (Antigravity). Only leading/trailing non-alphanumerics
+    // are trimmed, so internal `@`/`.`/`-`/`_` in emails and keys survive.
+    let core = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let low = core.to_ascii_lowercase();
+    // Known provider key prefixes.
+    const PREFIXES: &[&str] = &[
+        "phc_", "phx_", "sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_",
+        "github_pat_", "glpat-", "xoxb-", "xoxp-", "xoxa-", "akia", "asia", "aiza", "ya29.",
+        "eyj", "hf_", "r8_", "dop_v1_", "shpat_", "sq0", "aki",
+    ];
+    if core.len() >= 8 && PREFIXES.iter().any(|p| low.starts_with(p)) {
+        return true;
+    }
+    // Email (PII).
+    if core.contains('@') && core.contains('.') && !core.contains('/') && core.len() >= 6 {
+        return true;
+    }
+    // Inline `key=value` / `key: value` where the KEY names a secret. Runs on the RAW token: it
+    // needs the `=`/`:` separator, which the core-trim would keep but the split handles directly.
+    if let Some((k, val)) = tok.split_once(['=', ':']) {
+        if !val.trim().is_empty() && is_sensitive_key(k.trim()) {
+            return true;
+        }
+    }
+    // Opaque high-entropy token: long, credential-charset, mixes letters and digits. Catches
+    // keys with no recognizable prefix (the leak the prefix list alone misses).
+    if core.len() >= 24 && is_high_entropy_token(core) {
+        return true;
+    }
+    false
+}
+
+/// A token that is long, made only of credential characters, and mixes letters with digits, i.e.
+/// looks like a key/hash rather than prose. Over-matches hashes/UUIDs on purpose (safe direction).
+fn is_high_entropy_token(tok: &str) -> bool {
+    let ok_charset = tok
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '='));
+    ok_charset
+        && tok.chars().any(|c| c.is_ascii_digit())
+        && tok.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// If the WHOLE string is an absolute path, reduce it to its basename (consistency with
+/// `tv_repo`: never ship an operator's home directory). Mid-prose paths are left to truncation.
+fn basename_if_abs_path(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.len() > 1 && t.starts_with('/') && !t.contains(char::is_whitespace) {
+        return Some(
+            std::path::Path::new(t)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| t.to_string()),
+        );
+    }
+    None
+}
+
+/// Rung 1 preview of one string value: basename a whole-path, else credential-mask + truncate.
+fn mcp_preview(s: &str) -> String {
+    if let Some(base) = basename_if_abs_path(s) {
+        return base;
+    }
+    let masked = scrub_secrets(s);
+    let mut out: String = masked.chars().take(MCP_PREVIEW_MAX_CHARS).collect();
+    if masked.chars().count() > MCP_PREVIEW_MAX_CHARS {
+        out.push_str("...");
+    }
+    out
+}
+
+/// A JSON KEY whose value is redacted wholesale regardless of content: a secret does not have
+/// to match a token prefix if the field NAME says it is one (`{"password":"hunter2"}`,
+/// `{"authorization":"Bearer opaque"}`) — the value-only mask would leak those (Codex).
+fn is_sensitive_key(k: &str) -> bool {
+    let low = k.to_ascii_lowercase();
+    const EXACT: &[&str] = &[
+        "authorization", "cookie", "token", "password", "passwd", "secret", "auth", "bearer",
+        "apikey", "api_key", "credentials", "session", "sessiontoken",
+    ];
+    if EXACT.contains(&low.as_str()) {
+        return true;
+    }
+    const SUFFIX: &[&str] = &[
+        "_key", "_token", "_secret", "_password", "_apikey", "_auth", "access_token",
+        "refresh_token", "client_secret", "private_key",
+    ];
+    SUFFIX.iter().any(|suf| low.ends_with(suf))
+}
+
+/// Bound the sanitized payload so `$mcp_parameters`/`$mcp_response` can never balloon: even with
+/// every string capped at 160, a deep/wide structure can exceed PostHog's 1MB event limit (and
+/// get silently dropped) or ship a lot of small sensitive fragments (Codex).
+const MCP_MAX_DEPTH: usize = 6;
+const MCP_MAX_ENTRIES: usize = 40;
+
+fn sanitize_mcp_json(v: &serde_json::Value) -> serde_json::Value {
+    let sanitized = sanitize_mcp_json_inner(v, 0);
+    // Total-byte cap on top of the structural caps: depth=6 x breadth=40 still admits a payload
+    // far over PostHog's 1MB event limit, and oversize events are DROPPED SILENTLY (DeepSeek).
+    // Keep each of params/response well under 1MB so the whole event always ingests.
+    const MCP_MAX_BYTES: usize = 256 * 1024;
+    let size = serde_json::to_string(&sanitized).map(|s| s.len()).unwrap_or(0);
+    if size > MCP_MAX_BYTES {
+        return serde_json::json!({ "<oversize_bytes>": size });
+    }
+    sanitized
+}
+
+fn sanitize_mcp_json_inner(v: &serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth >= MCP_MAX_DEPTH {
+        return serde_json::Value::String("<truncated: max depth>".to_string());
+    }
+    match v {
+        serde_json::Value::String(s) => serde_json::Value::String(mcp_preview(s)),
+        serde_json::Value::Array(a) => {
+            let mut out: Vec<serde_json::Value> = a
+                .iter()
+                .take(MCP_MAX_ENTRIES)
+                .map(|x| sanitize_mcp_json_inner(x, depth + 1))
+                .collect();
+            if a.len() > MCP_MAX_ENTRIES {
+                out.push(serde_json::Value::String(format!(
+                    "<+{} more>",
+                    a.len() - MCP_MAX_ENTRIES
+                )));
+            }
+            serde_json::Value::Array(out)
+        }
+        serde_json::Value::Object(o) => {
+            let mut m = serde_json::Map::new();
+            for (k, val) in o.iter().take(MCP_MAX_ENTRIES) {
+                if is_sensitive_key(k) {
+                    // Redact by KEY NAME, whatever the value is.
+                    m.insert(k.clone(), serde_json::Value::String("***".to_string()));
+                } else {
+                    m.insert(k.clone(), sanitize_mcp_json_inner(val, depth + 1));
+                }
+            }
+            if o.len() > MCP_MAX_ENTRIES {
+                m.insert(
+                    "<truncated>".to_string(),
+                    serde_json::json!(o.len() - MCP_MAX_ENTRIES),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Emit `$mcp_tool_call` for one MCP tool invocation (all 54 tools, from the single call_tool
+/// choke point). distinct_id is the MCP session id, per PostHog's per-session dashboard model.
+#[allow(clippy::too_many_arguments)]
+pub fn record_mcp_tool_call(
+    session_id: &str,
+    tool_name: &str,
+    duration_ms: u64,
+    is_error: bool,
+    error_type: Option<&str>,
+    client_name: Option<&str>,
+    client_version: Option<&str>,
+    parameters: Option<&serde_json::Value>,
+    response: Option<&serde_json::Value>,
+) {
+    // $mcp_error_status is deliberately ABSENT: PostHog defines it as an upstream HTTP status
+    // (429/500...), and a JSON-RPC error code is not one — putting the JSON-RPC code there was a
+    // typed-field lie (Codex). $mcp_error_type carries the classification instead.
+    capture_as(
+        session_id,
+        "$mcp_tool_call",
+        json!({
+            "$session_id":              session_id,
+            // Session-scoped telemetry, not a human user: keep it personless so a busy client
+            // does not mint one anonymous PostHog person per MCP session (Codex / posthog-core).
+            "$process_person_profile":  false,
+            "$mcp_source":              MCP_SOURCE,
+            "$mcp_server_name":         MCP_SERVER_NAME,
+            "$mcp_server_version":      env!("CARGO_PKG_VERSION"),
+            "$mcp_client_name":         client_name,
+            "$mcp_client_version":      client_version,
+            "$mcp_tool_name":           tool_name,
+            "$mcp_duration_ms":         duration_ms,
+            "$mcp_is_error":            is_error,
+            "$mcp_error_type":          error_type,
+            "$mcp_parameters":          parameters.map(sanitize_mcp_json),
+            "$mcp_response":            response.map(sanitize_mcp_json),
+        }),
+    );
+}
+
+/// Emit `$mcp_tools_list` (the advertised-vs-called signal: which of the 54 tools exist).
+pub fn record_mcp_tools_list(
+    session_id: &str,
+    tool_names: &[String],
+    client_name: Option<&str>,
+    client_version: Option<&str>,
+) {
+    capture_as(
+        session_id,
+        "$mcp_tools_list",
+        json!({
+            "$session_id":              session_id,
+            "$process_person_profile":  false,
+            "$mcp_source":              MCP_SOURCE,
+            "$mcp_server_name":         MCP_SERVER_NAME,
+            "$mcp_server_version":      env!("CARGO_PKG_VERSION"),
+            "$mcp_client_name":         client_name,
+            "$mcp_client_version":      client_version,
+            "$mcp_listed_tool_names":   tool_names,
+        }),
+    );
+}
+
+/// Emit `$mcp_initialize` for a client/server handshake (once per session).
+pub fn record_mcp_initialize(session_id: &str, client_name: &str, client_version: &str) {
+    capture_as(
+        session_id,
+        "$mcp_initialize",
+        json!({
+            "$session_id":              session_id,
+            "$process_person_profile":  false,
+            "$mcp_source":              MCP_SOURCE,
+            "$mcp_server_name":         MCP_SERVER_NAME,
+            "$mcp_server_version":      env!("CARGO_PKG_VERSION"),
+            "$mcp_client_name":         client_name,
+            "$mcp_client_version":      client_version,
+        }),
+    );
+}
+
 pub fn record_ai_generation(g: &AiGeneration<'_>) {
+    capture("$ai_generation", ai_generation_props(g));
+}
+
+/// Build the `$ai_generation` property bag. Split out from `record_ai_generation` so the exact
+/// property shape (especially the structured `$ai_input`/`$ai_output_choices` the LLM UI keys on)
+/// is unit-testable without a live PostHog.
+fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
     let is_error = g.outcome != "success" && g.outcome != "degraded_success";
 
-    capture(
-        "$ai_generation",
-        json!({
+    json!({
             // --- PostHog's LLM analytics schema ---
             "$ai_trace_id":       g.trace_id,
             "$ai_provider":       provider_for(g.agent),
@@ -875,8 +1229,42 @@ pub fn record_ai_generation(g: &AiGeneration<'_>) {
             "tv_primary_attempts": g.attempts,
             // Which project burned this. Name only, never the absolute path.
             "tv_repo":             g.repo,
-        }),
-    );
+            // The CONTENT of the call: the actual prompt and completion, which is the whole point
+            // of AI observability (token counts say a call happened; these say WHAT). Scrubbed
+            // (credentials/PII masked) and capped so a huge completion cannot push the event past
+            // PostHog's 1MB drop limit.
+            //
+            // These MUST be structured message/choice arrays, not flat strings. PostHog's LLM
+            // trace UI keys on the {role, content} shape; a flat string ingests fine but the chat
+            // bubbles never render, so you get a valid-but-invisible event, exactly the failure the
+            // whole content-capture effort exists to avoid (Antigravity). $ai_input is a message
+            // array; the completion goes in $ai_output_choices (NOT $ai_output).
+            "$ai_input":           g.input.map(|s| json!([{ "role": "user", "content": mask_and_cap_content(s) }])),
+            "$ai_output_choices":  g.output.map(|s| json!([{ "role": "assistant", "content": mask_and_cap_content(s) }])),
+        })
+}
+
+/// Prepare captured prompt/completion text for PostHog: scrub credentials/PII, then cap by BYTES
+/// (not chars) so multibyte content cannot silently blow the event past PostHog's 1MB drop limit
+/// (Codex: 200k 4-byte chars x input+output can hit ~1.6MB). 100KB each keeps input+output+the
+/// rest of the event well under 1MB.
+fn mask_and_cap_content(s: &str) -> String {
+    // 60KB keeps each field under PostHog's per-string-property limit (DeepSeek) and the event
+    // comfortably under 1MB. Cap AFTER scrubbing so truncation can never split a secret and
+    // expose half of it.
+    const AI_CONTENT_MAX_BYTES: usize = 60 * 1024;
+    let scrubbed = scrub_secrets(s);
+    if scrubbed.len() <= AI_CONTENT_MAX_BYTES {
+        return scrubbed;
+    }
+    // Truncate on a char boundary so we never split a UTF-8 sequence.
+    let mut end = AI_CONTENT_MAX_BYTES;
+    while end > 0 && !scrubbed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = scrubbed[..end].to_string();
+    out.push_str("...<truncated>");
+    out
 }
 
 #[cfg(test)]
@@ -928,6 +1316,122 @@ mod tests {
         // Degenerate input must never panic or invent a value.
         assert_eq!(repo_name("/"), "/");
         assert_eq!(repo_name(""), "");
+    }
+
+    /// Rung 1 sanitization is the privacy/security floor for $mcp_parameters. It must mask
+    /// live credentials (a key in the first 160 chars would otherwise ship to a SaaS), basename
+    /// absolute paths, and truncate long free-text, while preserving structure.
+    #[test]
+    fn mcp_sanitizer_masks_credentials_paths_and_truncates() {
+        // Credential in prose is masked, surrounding words survive.
+        let masked = mcp_preview("use key phc_abcdef0123456789 now");
+        assert!(masked.contains("***"), "credential must be masked: {masked}");
+        assert!(!masked.contains("phc_abcdef0123456789"), "raw key must not survive");
+        assert!(masked.contains("use key") && masked.contains("now"), "prose survives");
+
+        // JWT / bearer-shaped token is masked.
+        assert!(mcp_preview("eyJhbGciOiJIUzI1Niw858585858").contains("***"));
+
+        // A whole absolute path collapses to its basename (no home dir leak).
+        assert_eq!(mcp_preview("/Users/mike/projects/triumvirate/daemon"), "daemon");
+
+        // Content is CAPTURED, not previewed: a normal-length string passes through whole (the
+        // point of AI observability), only a pathological blob is capped.
+        let normal = "x".repeat(500);
+        assert_eq!(mcp_preview(&normal), normal, "normal content is not truncated");
+        let huge = "x".repeat(MCP_PREVIEW_MAX_CHARS + 1000);
+        let capped = mcp_preview(&huge);
+        assert!(capped.chars().count() <= MCP_PREVIEW_MAX_CHARS + 3, "pathological blob capped");
+        assert!(capped.ends_with("..."), "cap marked");
+
+        // Opaque high-entropy token (a key with no known prefix) is masked (the catch-all).
+        assert!(mcp_preview("AKIAIOSFODNN7EXAMPLE").contains("***") || mcp_preview("aB3xK9mQ7pL2wR8nT5vY1cZ4").contains("***"));
+
+        // Structure preserved: object keys stay, string values previewed, numbers pass.
+        let v = serde_json::json!({"agent":"gemini","message":"/etc/passwd","n":3});
+        let s = sanitize_mcp_json(&v);
+        assert_eq!(s["agent"], serde_json::json!("gemini"));
+        assert_eq!(s["message"], serde_json::json!("passwd")); // whole-path basenamed
+        assert_eq!(s["n"], serde_json::json!(3));
+
+        // Key-NAME redaction: a sensitive field is redacted whatever its value (Codex). The
+        // value-only prefix mask would leak these.
+        let sensitive = serde_json::json!({
+            "password": "hunter2",
+            "authorization": "Bearer opaque-not-a-jwt",
+            "api_key": "AIzaOpaqueGoogleKey",
+            "access_token": "opaque",
+            "cwd": "/Users/mike/x",   // not sensitive by name, basenamed by value
+        });
+        let r = sanitize_mcp_json(&sensitive);
+        assert_eq!(r["password"], serde_json::json!("***"));
+        assert_eq!(r["authorization"], serde_json::json!("***"));
+        assert_eq!(r["api_key"], serde_json::json!("***"));
+        assert_eq!(r["access_token"], serde_json::json!("***"));
+        assert_eq!(r["cwd"], serde_json::json!("x"));
+
+        // A non-secret key is not over-redacted.
+        let ok = serde_json::json!({"monkey":"banana","keyboard":"qwerty"});
+        let ro = sanitize_mcp_json(&ok);
+        assert_eq!(ro["monkey"], serde_json::json!("banana"));
+        assert_eq!(ro["keyboard"], serde_json::json!("qwerty"));
+
+        // PROSE secrets/PII in flat content (Codex): the pattern pass catches what the token mask
+        // misses. This is the $ai_input/$ai_output safety floor for Cloud.
+        let content = scrub_secrets("my password: hunter2 and ssn 123-45-6789 ok");
+        assert!(!content.contains("hunter2"), "prose password masked: {content}");
+        assert!(!content.contains("123-45-6789"), "SSN masked: {content}");
+        assert!(content.contains("my") && content.contains("ok"), "prose survives");
+        // Normal prose is untouched.
+        assert_eq!(scrub_secrets("please review the plan and find bugs"),
+                   "please review the plan and find bugs");
+
+        // QUOTED secrets (Antigravity): a key wrapped in quotes or trailing punctuation must not
+        // slip past the prefix + entropy nets. Bare, single-quoted, double-quoted, JSON-value, and
+        // trailing-comma forms all masked.
+        for probe in [
+            "sk-abcdefghijklmnop0123",
+            "\"sk-abcdefghijklmnop0123\"",
+            "'sk-abcdefghijklmnop0123'",
+            "sk-abcdefghijklmnop0123,",
+        ] {
+            let out = scrub_secrets(probe);
+            assert!(!out.contains("sk-abcdefghijklmnop0123"), "quoted secret leaked: {out}");
+        }
+        // JSON `"api_key": "sk-.."` (quote between key and colon) is caught by the prose pattern
+        // and/or the token mask.
+        let jsonish = scrub_secrets(r#"{"api_key": "sk-livedeadbeef0123456789"}"#);
+        assert!(!jsonish.contains("sk-livedeadbeef0123456789"), "json-value secret leaked: {jsonish}");
+
+        // Content is captured as PostHog's structured LLM shape, not flat strings, or the trace UI
+        // renders nothing (Antigravity). $ai_input is a message array, completion is
+        // $ai_output_choices, both scrubbed.
+        let g = AiGeneration {
+            agent: "gemini",
+            model: None,
+            outcome: "success",
+            trace_id: "t1",
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cached_tokens: None,
+            thinking_tokens: None,
+            tool_calls: None,
+            duration_ms: 10,
+            cost_usd: None,
+            billing: "subscription",
+            backend: None,
+            attempts: 1,
+            repo: None,
+            input: Some("my api_key: sk-livedeadbeef0123456789"),
+            output: Some("done"),
+        };
+        let ev = ai_generation_props(&g);
+        assert_eq!(ev["$ai_input"][0]["role"], serde_json::json!("user"));
+        assert!(ev["$ai_input"][0]["content"].as_str().unwrap().contains("***"),
+                "captured input must be scrubbed: {}", ev["$ai_input"]);
+        assert_eq!(ev["$ai_output_choices"][0]["role"], serde_json::json!("assistant"));
+        assert_eq!(ev["$ai_output_choices"][0]["content"], serde_json::json!("done"));
+        assert!(ev.get("$ai_output").is_none(), "flat $ai_output must not be emitted");
     }
 
     /// An unknown model must emit NO cost. A wrong number is worse than a missing one.

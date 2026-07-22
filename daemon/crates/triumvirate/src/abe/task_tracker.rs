@@ -739,6 +739,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
     }
@@ -894,6 +897,9 @@ mod tests {
                 Some(wt.clone()),
                 None,
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
 
@@ -930,6 +936,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
 
@@ -1041,6 +1050,9 @@ mod tests {
                 None,
                 Some(parent_id.clone()),
                 Some(root_id.clone()),
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
         let _ = tracker
@@ -1064,6 +1076,9 @@ mod tests {
                 None,
                 Some(parent_id.clone()),
                 Some(root_id.clone()),
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
         let _ = tracker
@@ -1161,6 +1176,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
         let _ = tracker
@@ -1211,6 +1229,9 @@ mod tests {
                 None,
                 Some("pantheon-parent-A".to_string()),
                 Some("pantheon-root-A".to_string()),
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
 
@@ -1223,6 +1244,9 @@ mod tests {
                 None,
                 None, // legacy non-Pantheon caller
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
 
@@ -1267,6 +1291,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
         let _ = tracker
@@ -1313,6 +1340,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                std::time::Instant::now(),
             )
             .await;
 
