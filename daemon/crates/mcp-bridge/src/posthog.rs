@@ -1090,6 +1090,7 @@ fn sanitize_mcp_json_inner(v: &serde_json::Value, depth: usize) -> serde_json::V
 /// Emit `$mcp_tool_call` for one MCP tool invocation (all 54 tools, from the single call_tool
 /// choke point). distinct_id is the MCP session id, per PostHog's per-session dashboard model.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn record_mcp_tool_call(
     session_id: &str,
     tool_name: &str,
@@ -1100,6 +1101,12 @@ pub fn record_mcp_tool_call(
     client_version: Option<&str>,
     parameters: Option<&serde_json::Value>,
     response: Option<&serde_json::Value>,
+    // Why the agent called this tool. `$mcp_intent_source` says where it came from:
+    // "context_parameter" (the agent authored it via the injected `context` arg) or "inferred"
+    // (our server-side fallback). Matches PostHog's MCP Analytics agent-intent schema so the
+    // intent panels populate. Absent (both None) only if we chose to emit nothing.
+    intent: Option<&str>,
+    intent_source: Option<&str>,
 ) {
     // $mcp_error_status is deliberately ABSENT: PostHog defines it as an upstream HTTP status
     // (429/500...), and a JSON-RPC error code is not one — putting the JSON-RPC code there was a
@@ -1121,6 +1128,11 @@ pub fn record_mcp_tool_call(
             "$mcp_duration_ms":         duration_ms,
             "$mcp_is_error":            is_error,
             "$mcp_error_type":          error_type,
+            // Agent intent (the closest thing to agent reasoning in the telemetry). Scrubbed like
+            // any free text before it leaves for Cloud. `$mcp_intent_source` distinguishes an
+            // agent-authored intent from our inferred fallback so a dashboard can weight them.
+            "$mcp_intent":              intent.map(scrub_secrets),
+            "$mcp_intent_source":       intent_source,
             "$mcp_parameters":          parameters.map(sanitize_mcp_json),
             "$mcp_response":            response.map(sanitize_mcp_json),
         }),

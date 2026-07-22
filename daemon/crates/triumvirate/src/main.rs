@@ -1168,6 +1168,77 @@ fn classify_mcp_error(code: i32) -> &'static str {
     }
 }
 
+/// Server-side fallback intent for a tool call when the agent did not author a `context` string.
+/// Mirrors @posthog/mcp's `intentFallback`: a short, human-readable "why" derived from the tool and
+/// the SHAPE of its arguments. Deliberately never echoes raw argument VALUES (a prompt/message):
+/// those are the caller's content, already handled (scrubbed) by `$mcp_parameters`. Only structural
+/// hints like the target agent name are used, so an inferred intent cannot leak a prompt.
+fn infer_mcp_intent(tool_name: &str, params: Option<&serde_json::Value>) -> String {
+    let arg = |k: &str| -> Option<String> {
+        params
+            .and_then(|p| p.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    match tool_name {
+        "ask_agent" => match arg("agent") {
+            Some(a) => format!("Consulting the {a} sibling for analysis or review via ask_agent"),
+            None => "Consulting a sibling agent via ask_agent".to_string(),
+        },
+        "ask_daemon" | "ask_session" => {
+            "Continuing a multi-turn exchange with a sibling agent".to_string()
+        }
+        "dispatch_codex" | "dispatch_codex_worktree" => {
+            "Dispatching Codex to write code in a repo".to_string()
+        }
+        "query_gemini" | "query_antigravity" => {
+            "Querying Antigravity for analysis".to_string()
+        }
+        "query_gemini_review" | "query_antigravity_review" | "code_review"
+        | "review_request" | "review_submit" => {
+            "Requesting or submitting a code review".to_string()
+        }
+        "spawn_daemon" | "spawn_session" => {
+            "Spawning a persistent sibling worker for a longer exchange".to_string()
+        }
+        n if n.starts_with("fleet_") => "Coordinating the parallel worker fleet".to_string(),
+        n if n.starts_with("ledger_") => "Recording or querying the build ledger".to_string(),
+        n if n.starts_with("memory_") || n.starts_with("scratchpad_") => {
+            "Reading or writing shared agent memory".to_string()
+        }
+        "ping" | "daemon_health" | "get_status" | "get_token_summary" => {
+            "Health, status, or usage probe".to_string()
+        }
+        other => format!("Calling the {other} MCP tool"),
+    }
+}
+
+/// Inject the optional `context` argument into a tool's advertised input schema so an agent can
+/// author an intent string (captured as `$mcp_intent`, source `context_parameter`). Added to
+/// `properties` ONLY, never to `required`, and `call_tool` STRIPS it from the arguments before
+/// dispatch, so a handler that never declared it is unaffected. Mirrors @posthog/mcp's default
+/// `context: true` behavior. A malformed (non-object) schema is left untouched rather than risking
+/// a broken advertisement.
+fn inject_intent_arg(mut tool: Tool) -> Tool {
+    let mut schema = tool.input_schema.as_ref().clone();
+    let props = schema
+        .entry("properties")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(props) = props.as_object_mut() {
+        props.insert(
+            "context".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "description": "Optional. In one sentence, why you are calling this tool right now \
+                    (the task or goal it serves). Recorded for observability; it does not change \
+                    the tool's behavior."
+            }),
+        );
+        tool.input_schema = std::sync::Arc::new(schema);
+    }
+    tool
+}
+
 impl ServerHandler for McpBridge {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1179,7 +1250,7 @@ impl ServerHandler for McpBridge {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         // FEAT-014 (REQ-010, REQ-033) T-004 stdio half: pull Pantheon
@@ -1193,10 +1264,28 @@ impl ServerHandler for McpBridge {
         // posthog.rs (truncated preview, key-name + token-prefix redaction, paths basenamed).
         let sid = mcp_session_id();
         let tool_name = request.name.to_string();
+        // MCP Analytics agent intent. The agent may author a `context` string (list_tools injects
+        // that arg into every tool schema). Pull it out and STRIP it from the arguments before
+        // dispatch, so the tool handler never receives an arg it did not declare. If the agent did
+        // not supply one, fall back to an inferred intent derived from the tool + its args.
+        let client_intent = request
+            .arguments
+            .as_ref()
+            .and_then(|a| a.get("context"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+        if let Some(args) = request.arguments.as_mut() {
+            args.remove("context");
+        }
         let params = request
             .arguments
             .as_ref()
             .map(|a| serde_json::Value::Object(a.clone()));
+        let (intent, intent_source): (String, &'static str) = match &client_intent {
+            Some(c) => (c.clone(), "context_parameter"),
+            None => (infer_mcp_intent(&tool_name, params.as_ref()), "inferred"),
+        };
         let (client_name, client_version) = mcp_client_identity(&context);
         emit_mcp_initialize_once(sid, client_name.as_deref(), client_version.as_deref());
         let started = std::time::Instant::now();
@@ -1235,6 +1324,8 @@ impl ServerHandler for McpBridge {
             client_version.as_deref(),
             params.as_ref(),
             response_json.as_ref(),
+            Some(intent.as_str()),
+            Some(intent_source),
         );
         result
     }
@@ -1244,7 +1335,15 @@ impl ServerHandler for McpBridge {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = self.tool_router.list_all();
+        // Advertise every tool with the injected optional `context` arg (agent-intent capture),
+        // then emit the inventory. The injection only touches the advertised schema; dispatch is
+        // unchanged because call_tool strips `context` back out before running the handler.
+        let tools: Vec<Tool> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(inject_intent_arg)
+            .collect();
         // The advertised-vs-called signal: emit the full tool inventory so PostHog can show
         // which of the 54 tools agents actually use.
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
@@ -1488,6 +1587,53 @@ async fn run_status() -> anyhow::Result<()> {
 /// These tests live in a dedicated module so they run cleanly regardless of
 /// the state of the larger legacy `tests` module (which has several stale
 /// tests disabled via `#[cfg(any())]` pending issue #24).
+#[cfg(test)]
+mod mcp_intent_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn inferred_intent_is_tool_specific_and_never_echoes_values() {
+        // ask_agent uses the agent NAME (a structural hint), never the message VALUE.
+        let p = json!({ "agent": "codex", "message": "SECRET PROMPT do not leak" });
+        let intent = infer_mcp_intent("ask_agent", Some(&p));
+        assert!(intent.contains("codex"), "names the target agent: {intent}");
+        assert!(!intent.contains("SECRET PROMPT"), "must not echo the prompt: {intent}");
+
+        // Family prefixes collapse to one readable label.
+        assert!(infer_mcp_intent("fleet_spawn", None).contains("fleet"));
+        assert!(infer_mcp_intent("memory_write", None).contains("memory"));
+        // Unknown tool still yields a bounded, readable fallback.
+        assert_eq!(infer_mcp_intent("some_new_tool", None), "Calling the some_new_tool MCP tool");
+    }
+
+    #[test]
+    fn inject_intent_arg_adds_optional_context_without_requiring_it() {
+        let schema = serde_json::Map::from_iter([
+            ("type".to_string(), json!("object")),
+            ("properties".to_string(), json!({ "message": { "type": "string" } })),
+            ("required".to_string(), json!(["message"])),
+        ]);
+        let tool = Tool::new(
+            std::borrow::Cow::Borrowed("ask_agent"),
+            std::borrow::Cow::Borrowed("desc"),
+            std::sync::Arc::new(schema),
+        );
+        let injected = inject_intent_arg(tool);
+        let s = injected.input_schema.as_ref();
+        // context is present in properties...
+        assert!(
+            s["properties"].get("context").is_some(),
+            "context injected into properties"
+        );
+        assert_eq!(s["properties"]["context"]["type"], json!("string"));
+        // ...but NOT added to required (agents may omit it).
+        assert_eq!(s["required"], json!(["message"]), "context stays optional");
+        // The tool's own arg is untouched.
+        assert!(s["properties"].get("message").is_some(), "original arg preserved");
+    }
+}
+
 #[cfg(test)]
 mod pantheon_stdio_meta_tests {
     use super::*;
