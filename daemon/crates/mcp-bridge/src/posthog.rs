@@ -1183,6 +1183,47 @@ pub fn record_ai_generation(g: &AiGeneration<'_>) {
     capture("$ai_generation", ai_generation_props(g));
 }
 
+/// Emit a `$ai_generation` for a DISPATCHED codex worker so its "told" (the prompt/briefing it was
+/// given) and "produced" (the diff it committed + its stdout, or the failure diagnosis) become
+/// visible in PostHog's LLM Traces, the same surface `ask_agent` uses. Dispatch was previously a
+/// black box: `tv_codex_dispatch` carried only the outcome, never the content.
+///
+/// Content is scrubbed + byte-capped by `mask_and_cap_content` (via `record_ai_generation`). MUST be
+/// called ONLY by the winner of the terminal transition (caller gates on the `mark_*` bool), so a
+/// cancel race cannot produce a second, contradictory trace. `surface` (dispatch_codex |
+/// dispatch_codex_worktree) rides in `$ai_backend`/tv_backend to distinguish this from an ask_agent
+/// generation. `trace_id` should be the Pantheon root/parent session id when present so the trace
+/// nests under the parent agent, falling back to the task id.
+pub fn record_dispatch_generation(
+    trace_id: &str,
+    surface: &'static str,
+    repo: Option<&str>,
+    told: &str,
+    produced: &str,
+    is_error: bool,
+    duration_ms: u64,
+) {
+    record_ai_generation(&AiGeneration {
+        agent: "codex",
+        model: None,
+        outcome: if is_error { "failure" } else { "success" },
+        trace_id,
+        input_tokens: None,
+        output_tokens: None,
+        cached_tokens: None,
+        thinking_tokens: None,
+        tool_calls: None,
+        duration_ms,
+        cost_usd: None,
+        billing: "subscription",
+        backend: Some(surface),
+        attempts: 0,
+        repo,
+        input: Some(told),
+        output: Some(produced),
+    });
+}
+
 /// Build the `$ai_generation` property bag. Split out from `record_ai_generation` so the exact
 /// property shape (especially the structured `$ai_input`/`$ai_output_choices` the LLM UI keys on)
 /// is unit-testable without a live PostHog.

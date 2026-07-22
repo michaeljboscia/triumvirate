@@ -405,10 +405,10 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
         stdout: String,
         validation_log: Option<String>,
         test_output: Option<String>,
-    ) -> mcp_tools::abe::BoxFuture<()> {
+    ) -> mcp_tools::abe::BoxFuture<bool> {
         let tracker = self.clone();
         Box::pin(async move {
-            let _ = tracker
+            tracker
                 .mark_completed(
                     &task_id,
                     commit_sha,
@@ -417,7 +417,8 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
                     validation_log,
                     test_output,
                 )
-                .await;
+                .await
+                == abe::task_tracker::TransitionOutcome::Transitioned
         })
     }
 
@@ -426,24 +427,27 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
         task_id: String,
         exit_code: Option<i32>,
         error_message: String,
-    ) -> mcp_tools::abe::BoxFuture<()> {
+    ) -> mcp_tools::abe::BoxFuture<bool> {
         let tracker = self.clone();
         Box::pin(async move {
-            let _ = tracker.mark_failed(&task_id, exit_code, error_message).await;
+            tracker.mark_failed(&task_id, exit_code, error_message).await
+                == abe::task_tracker::TransitionOutcome::Transitioned
         })
     }
 
-    fn mark_timeout(&self, task_id: String) -> mcp_tools::abe::BoxFuture<()> {
+    fn mark_timeout(&self, task_id: String) -> mcp_tools::abe::BoxFuture<bool> {
         let tracker = self.clone();
         Box::pin(async move {
-            let _ = tracker.mark_timeout(&task_id).await;
+            tracker.mark_timeout(&task_id).await
+                == abe::task_tracker::TransitionOutcome::Transitioned
         })
     }
 
-    fn mark_stuck(&self, task_id: String, error_message: String) -> mcp_tools::abe::BoxFuture<()> {
+    fn mark_stuck(&self, task_id: String, error_message: String) -> mcp_tools::abe::BoxFuture<bool> {
         let tracker = self.clone();
         Box::pin(async move {
-            let _ = tracker.mark_stuck(&task_id, error_message).await;
+            tracker.mark_stuck(&task_id, error_message).await
+                == abe::task_tracker::TransitionOutcome::Transitioned
         })
     }
 

@@ -53,6 +53,10 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
         dispatch_started_at: Instant,
     ) -> BoxFuture<()>;
 
+    // mark_* return `true` iff THIS call won the terminal transition (the record went from
+    // Working -> terminal here, not "already terminal because someone else, e.g. cancel, won
+    // first"). The dispatch monitor gates its $ai_generation content emit on this bool so a
+    // cancel race cannot produce a second, contradictory trace. Callers that don't care ignore it.
     fn mark_completed(
         &self,
         task_id: String,
@@ -61,18 +65,18 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
         stdout: String,
         validation_log: Option<String>,
         test_output: Option<String>,
-    ) -> BoxFuture<()>;
+    ) -> BoxFuture<bool>;
 
     fn mark_failed(
         &self,
         task_id: String,
         exit_code: Option<i32>,
         error_message: String,
-    ) -> BoxFuture<()>;
+    ) -> BoxFuture<bool>;
 
-    fn mark_timeout(&self, task_id: String) -> BoxFuture<()>;
+    fn mark_timeout(&self, task_id: String) -> BoxFuture<bool>;
 
-    fn mark_stuck(&self, task_id: String, error_message: String) -> BoxFuture<()>;
+    fn mark_stuck(&self, task_id: String, error_message: String) -> BoxFuture<bool>;
 
     fn register_setup_failed(&self, task_id: String, error_message: String) -> BoxFuture<()>;
 
@@ -489,6 +493,111 @@ pub(crate) fn append_codex_exec_mcp_compat_args(args: &mut Vec<String>) {
 }
 
 
+/// Per-component byte cap for a dispatch's "produced" text. Each component (diff, stdout) is capped
+/// INDEPENDENTLY at this size BEFORE they are joined, so a huge stdout cannot starve the diff (or
+/// vice versa) under posthog.rs's 60KB whole-field cap (Antigravity). Two ~28KB components + labels
+/// stay under 60KB.
+const DISPATCH_COMPONENT_CAP: usize = 28 * 1024;
+
+/// Cap `s` to `max` bytes on a char boundary, marking truncation.
+fn cap_component(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n...<truncated>");
+    out
+}
+
+/// Read a worker's captured stdout (written by `spawn_background` when `output_log_dir` is set),
+/// trimmed and independently capped. `None` when absent/empty (e.g. the worker printed nothing).
+fn read_stdout_log(log_dir: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(log_dir.join("stdout.log")).ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(cap_component(t, DISPATCH_COMPONENT_CAP))
+    }
+}
+
+/// `git show` the committed diff, bounded at the PROCESS level: we read at most CAP+1 bytes from
+/// git's stdout pipe then kill it, so a worker that commits a 10MB generated blob can never spike
+/// the daemon's memory (Antigravity). `--no-ext-diff --no-color` for stable, scrub-friendly text.
+fn git_show_bounded(cwd: &std::path::Path, sha: &str) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["show", "--stat", "-p", "--no-ext-diff", "--no-color", sha])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut buf = Vec::with_capacity(DISPATCH_COMPONENT_CAP + 1);
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out
+            .by_ref()
+            .take(DISPATCH_COMPONENT_CAP as u64 + 1)
+            .read_to_end(&mut buf);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let s = String::from_utf8_lossy(&buf);
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(cap_component(t, DISPATCH_COMPONENT_CAP))
+    }
+}
+
+/// Assemble a dispatched worker's "produced" text from whichever signals the outcome yields:
+/// commit + files + diff (success), diagnosis (no_commit), exit/error (failure/timeout), plus the
+/// worker's stdout when captured. Labeled sections so a reader can tell effect (diff) from reasoning
+/// (stdout). Components are already capped; this only joins them.
+#[allow(clippy::too_many_arguments)]
+fn build_dispatch_produced(
+    outcome: &str,
+    commit_sha: Option<&str>,
+    files: &[String],
+    diff: Option<&str>,
+    diagnosis: Option<&str>,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+    stdout: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = vec![format!("[outcome] {outcome}")];
+    if let Some(sha) = commit_sha.filter(|s| !s.is_empty()) {
+        parts.push(format!("[commit] {sha}"));
+    }
+    if !files.is_empty() {
+        let mut f = files.to_vec();
+        f.truncate(50);
+        parts.push(format!("[files] {}", f.join(", ")));
+    }
+    if let Some(code) = exit_code {
+        parts.push(format!("[exit_code] {code}"));
+    }
+    if let Some(e) = error.filter(|s| !s.is_empty()) {
+        parts.push(format!("[error]\n{e}"));
+    }
+    if let Some(d) = diagnosis.filter(|s| !s.is_empty()) {
+        parts.push(format!("[diagnosis]\n{d}"));
+    }
+    if let Some(d) = diff {
+        parts.push(format!("[diff]\n{d}"));
+    }
+    if let Some(o) = stdout {
+        parts.push(format!("[stdout]\n{o}"));
+    }
+    parts.join("\n\n")
+}
+
 pub async fn dispatch_codex<T: AbeTaskTracker>(
     tracker: T,
     req: DispatchCodexRequest,
@@ -539,6 +648,12 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .unwrap_or_default();
 
+    // Capture the worker's stdout/stderr so the dispatch $ai_generation can show what codex
+    // actually SAID (its reasoning), not only the diff it committed. A temp dir keyed by task_id
+    // keeps these logs out of the user's repo (unlike worktree dispatch, which logs inside its
+    // isolated worktree).
+    let log_dir = std::env::temp_dir().join(format!("tv-dispatch-{task_id}"));
+
     // A spawn failure returns before the monitor task exists, so nothing downstream can
     // report it: we were blind to every "codex would not even start". Emit here, the only
     // place that knows.
@@ -547,7 +662,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         args,
         cwd: cwd.clone(),
         envs: HashMap::new(),
-        output_log_dir: None,
+        output_log_dir: Some(log_dir.clone()),
     })
     .await
     {
@@ -574,6 +689,16 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     let parent_session_id = pantheon_ctx.as_ref().map(|c| c.parent_session_id.clone());
     let root_session_id = pantheon_ctx.as_ref().map(|c| c.root_session_id.clone());
 
+    // Content-trace correlation: nest the dispatch $ai_generation under the Pantheon parent (root,
+    // else parent) so it renders INSIDE the parent agent's LLM trace rather than as an orphan; fall
+    // back to the task id. Computed before register() moves the lineage Options.
+    let dispatch_trace_id = root_session_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| parent_session_id.clone().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| task_id.clone());
+    let told = req.prompt.clone();
+
     tracker
         .register(
             task_id.clone(),
@@ -591,6 +716,12 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     let tracker_for_monitor = tracker.clone();
     let callbacks_for_monitor = callbacks.clone();
     let task_id_for_monitor = task_id.clone();
+    // Captured into the monitor so it can emit the dispatch content $ai_generation (told + produced)
+    // on the terminal transition it WINS. See the emit calls in each branch below.
+    let told_for_monitor = told;
+    let trace_id_for_monitor = dispatch_trace_id;
+    let log_dir_for_monitor = log_dir;
+    let repo_for_monitor = cwd.clone();
     // Supervisor clones: reach the tracker if the monitor dies before any transition.
     let tracker_for_sup = tracker.clone();
     let task_id_for_sup = task_id.clone();
@@ -617,20 +748,46 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
             }
         };
 
+        // Emit the dispatch content trace ($ai_input=told, $ai_output_choices=produced) ONLY when
+        // this monitor WON the terminal transition (mark_* returned true). If cancel won first the
+        // mark_* returns false and we stay silent, so there is exactly one content trace per task.
+        let dur_ms = || task_started_at.elapsed().as_millis() as u64;
         let exit = match exit_outcome {
             Some(Ok(status)) => status,
             Some(Err(err)) => {
-                tracker_for_monitor
+                let won = tracker_for_monitor
                     .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
                     .await;
+                if won {
+                    let stdout = read_stdout_log(&log_dir_for_monitor);
+                    let produced = build_dispatch_produced(
+                        "failed", None, &[], None, None, None, Some(&err.to_string()),
+                        stdout.as_deref(),
+                    );
+                    mcp_bridge::posthog::record_dispatch_generation(
+                        &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
+                        &told_for_monitor, &produced, true, dur_ms(),
+                    );
+                }
                 return;
             }
             None => {
                 terminate_worker(child.clone()).await;
                 observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
-                tracker_for_monitor
+                let won = tracker_for_monitor
                     .mark_timeout(task_id_for_monitor.clone())
                     .await;
+                if won {
+                    let stdout = read_stdout_log(&log_dir_for_monitor);
+                    let produced = build_dispatch_produced(
+                        "timeout", None, &[], None, None, None,
+                        Some("worker exceeded its timeout and was terminated"), stdout.as_deref(),
+                    );
+                    mcp_bridge::posthog::record_dispatch_generation(
+                        &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
+                        &told_for_monitor, &produced, true, dur_ms(),
+                    );
+                }
                 return;
             }
         };
@@ -644,17 +801,32 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 // valuable event here, because it is the one a human only discovers by going
                 // to look for a commit that was never made.
                 let diag = diagnose_no_commit(&cwd_path, None);
-                tracker_for_monitor
-                    .mark_failed(
-                        task_id_for_monitor.clone(),
-                        exit.code(),
-                        no_commit_error_message(diag),
-                    )
+                let msg = no_commit_error_message(diag);
+                let won = tracker_for_monitor
+                    .mark_failed(task_id_for_monitor.clone(), exit.code(), msg.clone())
                     .await;
+                if won {
+                    let stdout = read_stdout_log(&log_dir_for_monitor);
+                    let produced = build_dispatch_produced(
+                        "no_commit", None, &[], None, Some(&msg), exit.code(), None,
+                        stdout.as_deref(),
+                    );
+                    mcp_bridge::posthog::record_dispatch_generation(
+                        &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
+                        &told_for_monitor, &produced, true, dur_ms(),
+                    );
+                }
                 return;
             }
             observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
-            tracker_for_monitor
+            // Build produced BEFORE mark_completed moves commit_sha/files.
+            let diff = git_show_bounded(&cwd_path, &commit_sha);
+            let stdout = read_stdout_log(&log_dir_for_monitor);
+            let produced = build_dispatch_produced(
+                "completed", Some(&commit_sha), &files, diff.as_deref(), None, None, None,
+                stdout.as_deref(),
+            );
+            let won = tracker_for_monitor
                 .mark_completed(
                     task_id_for_monitor.clone(),
                     commit_sha,
@@ -664,15 +836,32 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                     None,
                 )
                 .await;
+            if won {
+                mcp_bridge::posthog::record_dispatch_generation(
+                    &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
+                    &told_for_monitor, &produced, false, dur_ms(),
+                );
+            }
         } else {
             observe_task_duration(&callbacks_for_monitor.metrics, wave_label, task_started_at);
-            tracker_for_monitor
+            let won = tracker_for_monitor
                 .mark_failed(
                     task_id_for_monitor.clone(),
                     exit.code(),
                     "codex process failed".to_string(),
                 )
                 .await;
+            if won {
+                let stdout = read_stdout_log(&log_dir_for_monitor);
+                let produced = build_dispatch_produced(
+                    "failed", None, &[], None, None, exit.code(), Some("codex process failed"),
+                    stdout.as_deref(),
+                );
+                mcp_bridge::posthog::record_dispatch_generation(
+                    &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
+                    &told_for_monitor, &produced, true, dur_ms(),
+                );
+            }
         }
     });
 
@@ -1196,6 +1385,54 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         worktree_path: setup.worktree_path.display().to_string(),
         status: "dispatched".to_string(),
     })
+}
+
+#[cfg(test)]
+mod dispatch_produced_tests {
+    use super::*;
+
+    #[test]
+    fn cap_component_truncates_on_char_boundary_and_marks() {
+        let short = "hello";
+        assert_eq!(cap_component(short, 100), "hello");
+        // Multibyte content near the cap must not split a UTF-8 sequence.
+        let multi = "é".repeat(100); // 2 bytes each = 200 bytes
+        let capped = cap_component(&multi, 51);
+        assert!(capped.ends_with("...<truncated>"), "truncation marked: {capped}");
+        assert!(capped.len() <= 51 + "\n...<truncated>".len() + 1);
+        // The kept prefix is valid UTF-8 (no panic constructing it) and contains only 'é'.
+        assert!(capped.trim_end_matches("\n...<truncated>").chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn build_produced_labels_and_orders_available_signals() {
+        // Success: commit + files + diff, no error/diagnosis.
+        let files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let p = build_dispatch_produced(
+            "completed", Some("abc123"), &files, Some("--- diff body ---"), None, None, None,
+            Some("codex said hi"),
+        );
+        assert!(p.contains("[outcome] completed"));
+        assert!(p.contains("[commit] abc123"));
+        assert!(p.contains("[files] a.rs, b.rs"));
+        assert!(p.contains("[diff]\n--- diff body ---"));
+        assert!(p.contains("[stdout]\ncodex said hi"));
+        assert!(!p.contains("[error]") && !p.contains("[diagnosis]"), "no empty sections: {p}");
+
+        // Failure with no commit: exit + error + stdout, no diff/commit section.
+        let none: Vec<String> = vec![];
+        let f = build_dispatch_produced(
+            "failed", None, &none, None, None, Some(1), Some("boom"), Some("trace..."),
+        );
+        assert!(f.contains("[outcome] failed") && f.contains("[exit_code] 1"));
+        assert!(f.contains("[error]\nboom") && f.contains("[stdout]\ntrace..."));
+        assert!(!f.contains("[commit]") && !f.contains("[diff]"), "no commit/diff on failure: {f}");
+
+        // Empty commit sha is treated as absent (no [commit] line).
+        let e = build_dispatch_produced("no_commit", Some(""), &none, None, Some("nothing changed"), Some(0), None, None);
+        assert!(!e.contains("[commit]"));
+        assert!(e.contains("[diagnosis]\nnothing changed"));
+    }
 }
 
 #[cfg(test)]
