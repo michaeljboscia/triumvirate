@@ -140,6 +140,13 @@ fn enforce_version_pin() -> anyhow::Result<()> {
             tracing::warn!(
                 "agy version {v} != expected {expected}; proceeding (set TRIUMVIRATE_AGY_STRICT_VERSION=true to refuse)"
             );
+            // Also surface the drift as a first-class PostHog defect (not just a log): emit ONCE per
+            // process so the dashboard counts drifted daemons, not the per-dispatch warning noise.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static EMITTED: AtomicBool = AtomicBool::new(false);
+            if !EMITTED.swap(true, Ordering::Relaxed) {
+                mcp_bridge::posthog::record_agy_version_mismatch(v, &expected);
+            }
             Ok(())
         }
         Err(e) => {

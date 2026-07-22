@@ -655,6 +655,24 @@ pub fn record_session_invalidated(agent: &str, backend: Option<&str>, repo: Opti
 /// often does codex silently produce nothing, and in which repo?"); the local tracker stays
 /// the place to inspect one dispatch.
 
+/// Emit `tv_agy_version_mismatch` when the daemon dispatches against an agy binary whose version
+/// differs from the pinned expected version. Drift proceeds warn-only (unless strict), which is
+/// easy to lose in logs — PostHog once found 70+ such warnings in 3h. This turns it into a
+/// first-class, dashboard-able DEFECT signal. Bounded properties (both are version strings). The
+/// caller emits it ONCE per process, so the tile counts "daemons booted with drifted agy", not the
+/// per-dispatch warning noise.
+pub fn record_agy_version_mismatch(installed: &str, expected: &str) {
+    capture(
+        "tv_agy_version_mismatch",
+        json!({
+            "tv_agent":                  "gemini",
+            "tv_agent_display":          "Antigravity",
+            "tv_agy_installed_version":  installed,
+            "tv_agy_expected_version":   expected,
+        }),
+    );
+}
+
 pub fn record_codex_dispatch(
     surface: &str,
     outcome: &str,
