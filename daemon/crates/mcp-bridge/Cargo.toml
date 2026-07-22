@@ -21,9 +21,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 futures-util = "0.3"
 tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt", "net", "io-util"] }
 tracing.workspace = true
-# Content scrubber: PII/prose-secret patterns for prompts/completions before they leave for
-# PostHog Cloud (inline `secret: value`, SSN, phone). regex-lite matches mcp-tools' choice.
-regex-lite = "0.1"
 
 [dev-dependencies]
 # T-009 test-only: real cost calculation against the seeded price table to

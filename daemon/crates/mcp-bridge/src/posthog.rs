@@ -863,172 +863,27 @@ pub fn record_deepseek_breaker(to_state: &str, from_state: &str) {
 /// The `$mcp_source` the dashboard filters on. Verbatim; do not "improve" it.
 const MCP_SOURCE: &str = "posthog_mcp_analytics";
 const MCP_SERVER_NAME: &str = "triumvirate";
-/// Content capture, not a preview: the point of AI observability is seeing what was actually
-/// sent. Per-string cap is generous (normal prompts/responses pass whole); it only bounds a
+/// Content capture, not a preview: the point of AI observability is seeing what was actually sent.
+/// Per-string cap is generous (normal prompts/responses/args pass whole); it only bounds a
 /// pathological single blob so one field can't dominate the event, with the byte cap as backstop.
-/// Credentials are still masked (hygiene: never log a live key, Cloud or not).
+/// NOTHING is masked (operator's explicit choice: everything raw and unmasked).
 const MCP_PREVIEW_MAX_CHARS: usize = 16_384;
 
-/// PATTERN pass over free text (prompts/completions/tool args), for secrets and PII that the
-/// token-wise mask misses because AI content is PROSE, not JSON: `password: hunter2` (secret
-/// split across tokens), SSNs, phone numbers (Codex). Runs before the token-wise mask. Compiled
-/// once. regex-lite has no lookaround, so patterns are written to work without it.
-fn scrub_text_patterns(s: &str) -> String {
-    use regex_lite::Regex;
-    use std::sync::OnceLock;
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        [
-            // PEM / begin-end key blocks (multi-line): mask the whole block. The base64 body
-            // lines are mostly caught by the high-entropy token mask too, but a dedicated block
-            // pattern makes it definitive (DeepSeek).
-            r"-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----",
-            // Inline `sensitive_key : value` / `= value`, value = rest of the token run.
-            // Case-insensitive. The optional `["']?` around the separator tolerates JSON
-            // (`"api_key": "sk-.."`), where a quote sits between the key name and the colon and
-            // before the value, which a bare `[:=]` would miss (Antigravity).
-            r#"(?i)\b(password|passwd|secret|token|api[_-]?key|apikey|authorization|auth|bearer|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|credential)s?["']?\s*[:=]\s*["']?\s*\S+"#,
-            // US SSN.
-            r"\b\d{3}-\d{2}-\d{4}\b",
-            // Phone (US-ish, with separators; conservative to limit false positives).
-            r"\b\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b",
-            // Long digit runs (card/account numbers), 13-19 digits with optional separators.
-            r"\b(?:\d[ -]?){13,19}\b",
-        ]
-        .iter()
-        .filter_map(|p| Regex::new(p).ok())
-        .collect()
-    });
-    let mut out = s.to_string();
-    for re in patterns {
-        out = re.replace_all(&out, "***").into_owned();
-    }
-    out
-}
-
-/// The full content scrubber: pattern pass (prose secrets/PII) THEN token-wise mask (key
-/// prefixes, emails, high-entropy). Used for BOTH $mcp_parameters/$mcp_response string values and
-/// the $ai_input/$ai_output prompt/completion text, so both paths get the same floor.
-fn scrub_secrets(s: &str) -> String {
-    mask_credentials(&scrub_text_patterns(s))
-}
-
-/// Credential/PII mask applied to every string value AND to captured prompts/completions before
-/// they leave the process. Content capture is the point, so this must be aggressive enough that
-/// sending the content to Cloud is SAFE: it errs toward over-masking (a masked SHA is fine; a
-/// leaked key is not). Catches known key prefixes, emails, inline `secret=...`, and any opaque
-/// high-entropy token (the catch-all for keys with no recognizable prefix).
-fn mask_credentials(s: &str) -> String {
-    s.split_inclusive(char::is_whitespace)
-        .map(|piece| {
-            let tok = piece.trim();
-            if !tok.is_empty() && looks_like_secret(tok) {
-                piece.replacen(tok, "***", 1)
-            } else {
-                piece.to_string()
-            }
-        })
-        .collect()
-}
-
-/// True if a single whitespace-delimited token should be masked.
-fn looks_like_secret(tok: &str) -> bool {
-    // Strip surrounding quotes/punctuation before the prefix, email, and entropy tests. A quoted
-    // or trailing-punctuated secret (`"sk-abc"`, `sk-abc,`) otherwise hides its prefix (it starts
-    // with `"`, not `sk-`) AND fails the credential-charset check (the `"` is not in the charset),
-    // so it would slip through both nets (Antigravity). Only leading/trailing non-alphanumerics
-    // are trimmed, so internal `@`/`.`/`-`/`_` in emails and keys survive.
-    let core = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-    let low = core.to_ascii_lowercase();
-    // Known provider key prefixes.
-    const PREFIXES: &[&str] = &[
-        "phc_", "phx_", "sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_",
-        "github_pat_", "glpat-", "xoxb-", "xoxp-", "xoxa-", "akia", "asia", "aiza", "ya29.",
-        "eyj", "hf_", "r8_", "dop_v1_", "shpat_", "sq0", "aki",
-    ];
-    if core.len() >= 8 && PREFIXES.iter().any(|p| low.starts_with(p)) {
-        return true;
-    }
-    // Email (PII).
-    if core.contains('@') && core.contains('.') && !core.contains('/') && core.len() >= 6 {
-        return true;
-    }
-    // Inline `key=value` / `key: value` where the KEY names a secret. Runs on the RAW token: it
-    // needs the `=`/`:` separator, which the core-trim would keep but the split handles directly.
-    if let Some((k, val)) = tok.split_once(['=', ':']) {
-        if !val.trim().is_empty() && is_sensitive_key(k.trim()) {
-            return true;
-        }
-    }
-    // Opaque high-entropy token: long, credential-charset, mixes letters and digits. Catches
-    // keys with no recognizable prefix (the leak the prefix list alone misses).
-    if core.len() >= 24 && is_high_entropy_token(core) {
-        return true;
-    }
-    false
-}
-
-/// A token that is long, made only of credential characters, and mixes letters with digits, i.e.
-/// looks like a key/hash rather than prose. Over-matches hashes/UUIDs on purpose (safe direction).
-fn is_high_entropy_token(tok: &str) -> bool {
-    let ok_charset = tok
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '='));
-    ok_charset
-        && tok.chars().any(|c| c.is_ascii_digit())
-        && tok.chars().any(|c| c.is_ascii_alphabetic())
-}
-
-/// If the WHOLE string is an absolute path, reduce it to its basename (consistency with
-/// `tv_repo`: never ship an operator's home directory). Mid-prose paths are left to truncation.
-fn basename_if_abs_path(s: &str) -> Option<String> {
-    let t = s.trim();
-    if t.len() > 1 && t.starts_with('/') && !t.contains(char::is_whitespace) {
-        return Some(
-            std::path::Path::new(t)
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| t.to_string()),
-        );
-    }
-    None
-}
-
-/// Rung 1 preview of one string value: basename a whole-path, else credential-mask + truncate.
+/// One string value from `$mcp_parameters`/`$mcp_response`: RAW, only size-capped. No credential/PII
+/// masking, no path-basenaming — the operator wants the literal args every tool was called with.
+/// The cap only stops one pathological blob from dominating the event.
 fn mcp_preview(s: &str) -> String {
-    if let Some(base) = basename_if_abs_path(s) {
-        return base;
-    }
-    let masked = scrub_secrets(s);
-    let mut out: String = masked.chars().take(MCP_PREVIEW_MAX_CHARS).collect();
-    if masked.chars().count() > MCP_PREVIEW_MAX_CHARS {
+    let mut out: String = s.chars().take(MCP_PREVIEW_MAX_CHARS).collect();
+    if s.chars().count() > MCP_PREVIEW_MAX_CHARS {
         out.push_str("...");
     }
     out
 }
 
-/// A JSON KEY whose value is redacted wholesale regardless of content: a secret does not have
-/// to match a token prefix if the field NAME says it is one (`{"password":"hunter2"}`,
-/// `{"authorization":"Bearer opaque"}`) — the value-only mask would leak those (Codex).
-fn is_sensitive_key(k: &str) -> bool {
-    let low = k.to_ascii_lowercase();
-    const EXACT: &[&str] = &[
-        "authorization", "cookie", "token", "password", "passwd", "secret", "auth", "bearer",
-        "apikey", "api_key", "credentials", "session", "sessiontoken",
-    ];
-    if EXACT.contains(&low.as_str()) {
-        return true;
-    }
-    const SUFFIX: &[&str] = &[
-        "_key", "_token", "_secret", "_password", "_apikey", "_auth", "access_token",
-        "refresh_token", "client_secret", "private_key",
-    ];
-    SUFFIX.iter().any(|suf| low.ends_with(suf))
-}
-
 /// Bound the sanitized payload so `$mcp_parameters`/`$mcp_response` can never balloon: even with
-/// every string capped at 160, a deep/wide structure can exceed PostHog's 1MB event limit (and
-/// get silently dropped) or ship a lot of small sensitive fragments (Codex).
+/// every string capped, a deep/wide structure can exceed PostHog's 1MB event limit and get
+/// silently dropped (Codex/DeepSeek). This is the ONLY thing the sanitizer still does — structural
+/// size limiting to prevent data-loss, never masking.
 const MCP_MAX_DEPTH: usize = 6;
 const MCP_MAX_ENTRIES: usize = 40;
 
@@ -1068,12 +923,9 @@ fn sanitize_mcp_json_inner(v: &serde_json::Value, depth: usize) -> serde_json::V
         serde_json::Value::Object(o) => {
             let mut m = serde_json::Map::new();
             for (k, val) in o.iter().take(MCP_MAX_ENTRIES) {
-                if is_sensitive_key(k) {
-                    // Redact by KEY NAME, whatever the value is.
-                    m.insert(k.clone(), serde_json::Value::String("***".to_string()));
-                } else {
-                    m.insert(k.clone(), sanitize_mcp_json_inner(val, depth + 1));
-                }
+                // Raw: keep every key and value verbatim (only structural depth/breadth/size
+                // limiting applies). No key-name redaction — operator wants everything unmasked.
+                m.insert(k.clone(), sanitize_mcp_json_inner(val, depth + 1));
             }
             if o.len() > MCP_MAX_ENTRIES {
                 m.insert(
@@ -1128,10 +980,10 @@ pub fn record_mcp_tool_call(
             "$mcp_duration_ms":         duration_ms,
             "$mcp_is_error":            is_error,
             "$mcp_error_type":          error_type,
-            // Agent intent (the closest thing to agent reasoning in the telemetry). Scrubbed like
-            // any free text before it leaves for Cloud. `$mcp_intent_source` distinguishes an
-            // agent-authored intent from our inferred fallback so a dashboard can weight them.
-            "$mcp_intent":              intent.map(scrub_secrets),
+            // Agent intent (the closest thing to agent reasoning in the telemetry), RAW like the
+            // rest of the content. `$mcp_intent_source` distinguishes an agent-authored intent from
+            // our inferred fallback so a dashboard can weight them.
+            "$mcp_intent":              intent,
             "$mcp_intent_source":       intent_source,
             "$mcp_parameters":          parameters.map(sanitize_mcp_json),
             "$mcp_response":            response.map(sanitize_mcp_json),
@@ -1390,21 +1242,20 @@ mod tests {
     /// live credentials (a key in the first 160 chars would otherwise ship to a SaaS), basename
     /// absolute paths, and truncate long free-text, while preserving structure.
     #[test]
-    fn mcp_sanitizer_masks_credentials_paths_and_truncates() {
-        // Credential in prose is masked, surrounding words survive.
-        let masked = mcp_preview("use key phc_abcdef0123456789 now");
-        assert!(masked.contains("***"), "credential must be masked: {masked}");
-        assert!(!masked.contains("phc_abcdef0123456789"), "raw key must not survive");
-        assert!(masked.contains("use key") && masked.contains("now"), "prose survives");
-
-        // JWT / bearer-shaped token is masked.
-        assert!(mcp_preview("eyJhbGciOiJIUzI1Niw858585858").contains("***"));
-
-        // A whole absolute path collapses to its basename (no home dir leak).
-        assert_eq!(mcp_preview("/Users/mike/projects/triumvirate/daemon"), "daemon");
-
-        // Content is CAPTURED, not previewed: a normal-length string passes through whole (the
-        // point of AI observability), only a pathological blob is capped.
+    fn mcp_sanitizer_is_raw_and_only_size_caps() {
+        // Nothing is masked: the literal string passes through verbatim, only size-capped
+        // (operator's explicit choice — everything raw and unmasked).
+        assert_eq!(
+            mcp_preview("use key phc_abcdef0123456789 now"),
+            "use key phc_abcdef0123456789 now",
+            "content is raw, unmasked"
+        );
+        // Absolute paths are kept verbatim (no basenaming anymore).
+        assert_eq!(
+            mcp_preview("/Users/mike/projects/triumvirate/daemon"),
+            "/Users/mike/projects/triumvirate/daemon"
+        );
+        // Normal-length content passes whole; only a pathological blob is capped.
         let normal = "x".repeat(500);
         assert_eq!(mcp_preview(&normal), normal, "normal content is not truncated");
         let huge = "x".repeat(MCP_PREVIEW_MAX_CHARS + 1000);
@@ -1412,68 +1263,27 @@ mod tests {
         assert!(capped.chars().count() <= MCP_PREVIEW_MAX_CHARS + 3, "pathological blob capped");
         assert!(capped.ends_with("..."), "cap marked");
 
-        // Opaque high-entropy token (a key with no known prefix) is masked (the catch-all).
-        assert!(mcp_preview("AKIAIOSFODNN7EXAMPLE").contains("***") || mcp_preview("aB3xK9mQ7pL2wR8nT5vY1cZ4").contains("***"));
-
-        // Structure preserved: object keys stay, string values previewed, numbers pass.
+        // Structure AND values preserved verbatim; only structural limiting applies.
         let v = serde_json::json!({"agent":"gemini","message":"/etc/passwd","n":3});
         let s = sanitize_mcp_json(&v);
         assert_eq!(s["agent"], serde_json::json!("gemini"));
-        assert_eq!(s["message"], serde_json::json!("passwd")); // whole-path basenamed
+        assert_eq!(s["message"], serde_json::json!("/etc/passwd"), "path kept raw");
         assert_eq!(s["n"], serde_json::json!(3));
 
-        // Key-NAME redaction: a sensitive field is redacted whatever its value (Codex). The
-        // value-only prefix mask would leak these.
+        // Sensitive-NAMED keys are NO LONGER redacted: values kept raw.
         let sensitive = serde_json::json!({
             "password": "hunter2",
-            "authorization": "Bearer opaque-not-a-jwt",
-            "api_key": "AIzaOpaqueGoogleKey",
-            "access_token": "opaque",
-            "cwd": "/Users/mike/x",   // not sensitive by name, basenamed by value
+            "authorization": "Bearer opaque",
+            "api_key": "AIzaKey",
         });
         let r = sanitize_mcp_json(&sensitive);
-        assert_eq!(r["password"], serde_json::json!("***"));
-        assert_eq!(r["authorization"], serde_json::json!("***"));
-        assert_eq!(r["api_key"], serde_json::json!("***"));
-        assert_eq!(r["access_token"], serde_json::json!("***"));
-        assert_eq!(r["cwd"], serde_json::json!("x"));
-
-        // A non-secret key is not over-redacted.
-        let ok = serde_json::json!({"monkey":"banana","keyboard":"qwerty"});
-        let ro = sanitize_mcp_json(&ok);
-        assert_eq!(ro["monkey"], serde_json::json!("banana"));
-        assert_eq!(ro["keyboard"], serde_json::json!("qwerty"));
-
-        // PROSE secrets/PII in flat content (Codex): the pattern pass catches what the token mask
-        // misses. This is the $ai_input/$ai_output safety floor for Cloud.
-        let content = scrub_secrets("my password: hunter2 and ssn 123-45-6789 ok");
-        assert!(!content.contains("hunter2"), "prose password masked: {content}");
-        assert!(!content.contains("123-45-6789"), "SSN masked: {content}");
-        assert!(content.contains("my") && content.contains("ok"), "prose survives");
-        // Normal prose is untouched.
-        assert_eq!(scrub_secrets("please review the plan and find bugs"),
-                   "please review the plan and find bugs");
-
-        // QUOTED secrets (Antigravity): a key wrapped in quotes or trailing punctuation must not
-        // slip past the prefix + entropy nets. Bare, single-quoted, double-quoted, JSON-value, and
-        // trailing-comma forms all masked.
-        for probe in [
-            "sk-abcdefghijklmnop0123",
-            "\"sk-abcdefghijklmnop0123\"",
-            "'sk-abcdefghijklmnop0123'",
-            "sk-abcdefghijklmnop0123,",
-        ] {
-            let out = scrub_secrets(probe);
-            assert!(!out.contains("sk-abcdefghijklmnop0123"), "quoted secret leaked: {out}");
-        }
-        // JSON `"api_key": "sk-.."` (quote between key and colon) is caught by the prose pattern
-        // and/or the token mask.
-        let jsonish = scrub_secrets(r#"{"api_key": "sk-livedeadbeef0123456789"}"#);
-        assert!(!jsonish.contains("sk-livedeadbeef0123456789"), "json-value secret leaked: {jsonish}");
+        assert_eq!(r["password"], serde_json::json!("hunter2"));
+        assert_eq!(r["authorization"], serde_json::json!("Bearer opaque"));
+        assert_eq!(r["api_key"], serde_json::json!("AIzaKey"));
 
         // Content is captured as PostHog's structured LLM shape, not flat strings, or the trace UI
         // renders nothing (Antigravity). $ai_input is a message array, completion is
-        // $ai_output_choices, both scrubbed.
+        // $ai_output_choices; both RAW (no scrubbing).
         let g = AiGeneration {
             agent: "gemini",
             model: None,
