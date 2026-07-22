@@ -89,7 +89,10 @@ impl CodexExecParser {
                     input: usage.get("input_tokens").and_then(|v| v.as_u64()),
                     output: usage.get("output_tokens").and_then(|v| v.as_u64()),
                     cached: usage.get("cached_input_tokens").and_then(|v| v.as_u64()),
-                    thinking_tokens: None,
+                    // 0.145 reports reasoning tokens separately as `reasoning_output_tokens`;
+                    // map to thinking_tokens (already emitted as tv_thinking_tokens). Previously
+                    // dropped, so codex reasoning volume went uncounted.
+                    thinking_tokens: usage.get("reasoning_output_tokens").and_then(|v| v.as_u64()),
                     latency_ms: None,
                     tool_calls: None,
                     total: None,

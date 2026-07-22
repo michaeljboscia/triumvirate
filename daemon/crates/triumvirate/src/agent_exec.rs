@@ -2293,12 +2293,19 @@ async fn run_codex_cli_process_with_session(
     // sandbox policy flag. The authoritative list lives on the probed
     // `CodexCapabilities` so it can evolve with the upstream CLI without a
     // scattered-grep refactor.
+    //
+    // 0.145 DEPRECATED `--full-auto` (it warns per call and a future release removes it). Inject
+    // the explicit equivalent it resolves to instead — workspace-write sandbox + no approval
+    // prompts — which is stable across the deprecation. Same gate: a user-supplied policy flag wins.
     let explicit_approval_policy = caps.args_include_explicit_policy(&final_args);
     if should_use_full_auto
-        && !has_any_arg(&final_args, &["--full-auto"])
+        && !has_any_arg(&final_args, &["--full-auto", "--sandbox"])
         && !explicit_approval_policy
     {
-        final_args.push("--full-auto".to_string());
+        final_args.push("--sandbox".to_string());
+        final_args.push("workspace-write".to_string());
+        final_args.push("--ask-for-approval".to_string());
+        final_args.push("never".to_string());
     }
 
     if !is_git_worktree(cwd) && !has_any_arg(&final_args, &["--skip-git-repo-check"]) {

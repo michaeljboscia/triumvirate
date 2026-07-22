@@ -3568,7 +3568,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             std::env::set_var("TRIUMVIRATE_CODEX_BIN", script_path.as_os_str());
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
             std::env::set_var("TRIUMVIRATE_CODEX_AUTO_APPROVE", "1");
-            // Exercise the legacy --full-auto path: yolo (default) suppresses it.
+            // Exercise the workspace-write policy path: yolo (default) suppresses it.
             std::env::set_var("TRIUMVIRATE_CODEX_SANDBOX", "1");
             std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
         }
@@ -3583,13 +3583,18 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         };
         let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
         let captured = fs::read_to_string(&args_file)?;
-        assert!(captured.lines().any(|line| line == "--full-auto"));
+        // 0.145: inject the explicit workspace-write policy, not the deprecated --full-auto.
+        assert!(captured.lines().any(|line| line == "--sandbox"), "sandbox flag injected");
+        assert!(captured.lines().any(|line| line == "workspace-write"));
+        assert!(captured.lines().any(|line| line == "--ask-for-approval"));
+        assert!(captured.lines().any(|line| line == "never"));
+        assert!(!captured.lines().any(|line| line == "--full-auto"), "no deprecated flag");
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE") };
         let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
         let captured_without = fs::read_to_string(&args_file)?;
-        assert!(!captured_without.lines().any(|line| line == "--full-auto"));
+        assert!(!captured_without.lines().any(|line| line == "--sandbox"));
 
         // Yolo (default — sandbox off): codex gets the no-sandbox bypass flag, and
         // --full-auto is suppressed (codex rejects it alongside another policy flag).
@@ -3603,7 +3608,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 .any(|line| line == "--dangerously-bypass-approvals-and-sandbox"),
             "yolo default passes the no-sandbox bypass flag"
         );
-        assert!(!captured_yolo.lines().any(|line| line == "--full-auto"));
+        assert!(!captured_yolo.lines().any(|line| line == "--sandbox"));
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {

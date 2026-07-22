@@ -696,7 +696,12 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
 
     let (cmd, mut args) = (callbacks.codex_command)();
     args.push("exec".to_string());
-    args.push("--full-auto".to_string());
+    // 0.145 deprecated `--full-auto`; use the explicit equivalent it resolves to (workspace-write
+    // sandbox + no approval prompts), stable across the deprecation.
+    args.push("--sandbox".to_string());
+    args.push("workspace-write".to_string());
+    args.push("--ask-for-approval".to_string());
+    args.push("never".to_string());
     append_codex_exec_mcp_compat_args(&mut args);
     args.push("--skip-git-repo-check".to_string());
     args.push(req.prompt.clone());
