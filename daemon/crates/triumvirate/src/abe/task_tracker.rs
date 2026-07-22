@@ -52,6 +52,11 @@ struct TaskRecord {
     /// Repo the dispatch ran against, for the PostHog `tv_repo` slice. Stored so the tracker
     /// (which is the arbiter and therefore the emitter) can report it at terminal time.
     dispatch_repo: Option<String>,
+    /// OS pid of the worker, captured at register time. `cancel()` signals the worker through
+    /// THIS pid rather than the `Mutex<Child>`, because the monitor holds that mutex for the
+    /// entire `wait()`; locking it in cancel would block until the worker exited on its own,
+    /// which defeated cancellation entirely. `None` for tasks with no live child (setup-failed).
+    pid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +219,11 @@ impl TaskTracker {
         dispatch_repo: Option<String>,
         dispatch_started_at: Instant,
     ) {
+        // Capture the pid BEFORE the child is stored and before the monitor task starts waiting
+        // on it: cancel() signals via this pid so it never has to contend for the Child mutex the
+        // monitor holds across wait(). Safe to lock here because register is awaited before the
+        // monitor is spawned, so there is no contention yet.
+        let pid = child.lock().await.id();
         let mut guard = self.inner.lock().await;
         // Use the caller's dispatch clock, not now(): the dispatch (cwd resolution, spawn,
         // worktree setup) began before register, and the reported duration must cover it.
@@ -234,6 +244,7 @@ impl TaskTracker {
                 root_session_id: root_session_id.clone(),
                 dispatch_surface,
                 dispatch_repo,
+                pid,
             },
         );
         self.emit_task_state(&task_id, wave, "dispatched", 0, None);
@@ -498,64 +509,64 @@ impl TaskTracker {
 
     #[instrument(skip_all, fields(task_id = %task_id, status = "cancelled"))]
     pub async fn cancel(&self, task_id: &str) -> Option<CancelTaskResponse> {
-        let (child, worktree_path, already_terminal) = {
-            let guard = self.inner.lock().await;
-            let task = guard.get(task_id)?;
+        // Phase 1: CLAIM the cancellation atomically under the records lock. Writing Cancelled
+        // here — while the task is still Working — is what makes cancel win the race against the
+        // monitor. When the monitor's wait() later reaps the worker we are about to signal, its
+        // mark_failed/mark_timeout see an already-terminal task and no-op (they guard on
+        // is_terminal), so the outcome cannot flip from "cancelled" to "failed".
+        //
+        // We must NOT touch the `Mutex<Child>` at all: the monitor holds it for the entire
+        // wait(), so locking it here would block until the worker exited on its own — the exact
+        // bug this replaces (cancel was serialized behind the worker's full runtime, then reported
+        // the monitor's "no commit -> failed" as "already-failed"). We signal by the pid captured
+        // at register time instead, and hand reaping to the monitor.
+        let (pid, worktree_path, worktree_display, wave, duration_ms, surface, repo) = {
+            let mut guard = self.inner.lock().await;
+            let task = guard.get_mut(task_id)?;
+            if is_terminal(&task.status) {
+                // Genuinely already finished (completed/failed/timed out) before we arrived.
+                return Some(CancelTaskResponse {
+                    task_id: task_id.to_string(),
+                    status: format!("already-{}", status_label(&task.status)),
+                    worktree_path: task.worktree_path.as_ref().map(|p| p.display().to_string()),
+                });
+            }
+            task.status = TaskStatus::Cancelled;
+            // Drop the tracker's Child handle; the monitor still holds its own clone and will reap
+            // the exit our signal triggers.
+            task.child = None;
             (
-                task.child.as_ref().cloned(),
+                task.pid,
                 task.worktree_path.clone(),
-                is_terminal(&task.status),
+                task.worktree_path.as_ref().map(|p| p.display().to_string()),
+                task.wave,
+                task.started_at.elapsed().as_millis(),
+                task.dispatch_surface,
+                task.dispatch_repo.clone(),
             )
         };
-        if already_terminal {
-            let guard = self.inner.lock().await;
-            let task = guard.get(task_id)?;
-            return Some(CancelTaskResponse {
-                task_id: task_id.to_string(),
-                status: "already-terminal".to_string(),
-                worktree_path: task.worktree_path.as_ref().map(|p| p.display().to_string()),
-            });
-        }
-        if let Some(child) = child {
-            let mut child = child.lock().await;
-            if child.try_wait().ok().flatten().is_none() {
-                if let Some(pid) = child.id() {
-                    let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                }
+
+        // Phase 2: signal the worker by pid (never blocks — no Child mutex involved). SIGTERM asks
+        // it to stop; the monitor reaps the exit. A detached escalation force-kills only if the
+        // worker is still the SAME live process after a grace, guarded by kill(pid, 0) to avoid
+        // signalling a recycled pid. If SIGTERM is ignored past that, the monitor's own timeout is
+        // the final backstop.
+        if let Some(pid) = pid {
+            let pid_i = pid as i32;
+            let _ = unsafe { libc::kill(pid_i, libc::SIGTERM) };
+            tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                if child.try_wait().ok().flatten().is_none() {
-                    let _ = child.kill().await;
+                if unsafe { libc::kill(pid_i, 0) } == 0 {
+                    let _ = unsafe { libc::kill(pid_i, libc::SIGKILL) };
                 }
-            }
+            });
         }
         if let Some(worktree_path) = worktree_path.as_ref() {
             cleanup_git_locks(worktree_path);
         }
 
-        let mut guard = self.inner.lock().await;
-        let task = guard.get_mut(task_id)?;
-        // Re-check terminality AFTER the kill window. The old code wrote Cancelled
-        // unconditionally, so a completion that won during the ~10s SIGTERM grace was
-        // silently overwritten — a real correctness bug (a done task flips to cancelled),
-        // flagged by all three siblings, not just a telemetry issue. If it already finished,
-        // report its true terminal status and emit nothing (that transition already did).
-        if is_terminal(&task.status) {
-            let status = task.status.clone();
-            return Some(CancelTaskResponse {
-                task_id: task_id.to_string(),
-                status: format!("already-{}", status_label(&status)),
-                worktree_path: task.worktree_path.as_ref().map(|p| p.display().to_string()),
-            });
-        }
-        task.status = TaskStatus::Cancelled;
-        let duration_ms = task.started_at.elapsed().as_millis();
-        task.child = None;
         self.inc_dispatch_status("cancelled");
-        self.emit_task_state(task_id, task.wave, "cancelled", duration_ms, task.commit_sha.as_deref());
-        let surface = task.dispatch_surface;
-        let repo = task.dispatch_repo.clone();
-        let worktree_display = task.worktree_path.as_ref().map(|p| p.display().to_string());
-        drop(guard);
+        self.emit_task_state(task_id, wave, "cancelled", duration_ms, None);
         Self::emit_terminal(surface, repo.as_deref(), "cancelled", duration_ms as u64, None, None);
 
         Some(CancelTaskResponse {
@@ -599,6 +610,7 @@ impl TaskTracker {
                 // call site reports setup_failed directly instead.
                 dispatch_surface: None,
                 dispatch_repo: None,
+                pid: None,
             },
         );
         self.emit_task_state(&task_id, 0, "failed", 0, None);
