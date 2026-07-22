@@ -1177,7 +1177,7 @@ pub fn record_ai_generation(g: &AiGeneration<'_>) {
 fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
     let is_error = g.outcome != "success" && g.outcome != "degraded_success";
 
-    json!({
+    let mut props = json!({
             // --- PostHog's LLM analytics schema ---
             "$ai_trace_id":       g.trace_id,
             "$ai_provider":       provider_for(g.agent),
@@ -1238,10 +1238,21 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
             // trace UI keys on the {role, content} shape; a flat string ingests fine but the chat
             // bubbles never render, so you get a valid-but-invisible event, exactly the failure the
             // whole content-capture effort exists to avoid (Antigravity). $ai_input is a message
-            // array; the completion goes in $ai_output_choices (NOT $ai_output).
-            "$ai_input":           g.input.map(|s| json!([{ "role": "user", "content": mask_and_cap_content(s) }])),
-            "$ai_output_choices":  g.output.map(|s| json!([{ "role": "assistant", "content": mask_and_cap_content(s) }])),
-        })
+            // array; the completion goes in $ai_output_choices (NOT $ai_output). See below: these
+            // two are inserted AFTER the literal, not here.
+        });
+    // Content goes in as explicit object keys. Doing `g.input.map(|s| json!([...]))` inside the
+    // json! literal above yields an Option<Value> in value position, and json! DROPS that key from
+    // the object entirely when it is Some(Value) (verified live: set_input ran, the tel held the
+    // input at Drop, yet $ai_input never reached PostHog). Inserting into the Value::Object is
+    // unambiguous: the key is present exactly when we have content.
+    if let Some(s) = g.input {
+        props["$ai_input"] = json!([{ "role": "user", "content": mask_and_cap_content(s) }]);
+    }
+    if let Some(s) = g.output {
+        props["$ai_output_choices"] = json!([{ "role": "assistant", "content": mask_and_cap_content(s) }]);
+    }
+    props
 }
 
 /// Prepare captured prompt/completion text for PostHog: scrub credentials/PII, then cap by BYTES
