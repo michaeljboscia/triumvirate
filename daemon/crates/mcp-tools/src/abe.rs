@@ -514,9 +514,18 @@ fn cap_component(s: &str, max: usize) -> String {
 }
 
 /// Read a worker's captured stdout (written by `spawn_background` when `output_log_dir` is set),
-/// trimmed and independently capped. `None` when absent/empty (e.g. the worker printed nothing).
+/// trimmed and capped. Reads at most CAP+1 bytes off disk (spawn_background writes stdout.log with
+/// an unbounded copy, so a noisy worker could leave a huge file); bounding the read keeps the
+/// terminal emission from pulling megabytes into memory (Codex review), matching git_show_bounded.
 fn read_stdout_log(log_dir: &std::path::Path) -> Option<String> {
-    let s = std::fs::read_to_string(log_dir.join("stdout.log")).ok()?;
+    use std::io::Read;
+    let mut f = std::fs::File::open(log_dir.join("stdout.log")).ok()?;
+    let mut buf = Vec::with_capacity(DISPATCH_COMPONENT_CAP + 1);
+    f.by_ref()
+        .take(DISPATCH_COMPONENT_CAP as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let s = String::from_utf8_lossy(&buf);
     let t = s.trim();
     if t.is_empty() {
         None
@@ -1445,9 +1454,12 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 let won = tracker_for_monitor
                     .mark_failed(task_id_for_monitor.clone(), None, msg.clone())
                     .await;
+                // Pass the committed sha + files: validation runs AFTER a real commit, so the diff
+                // that FAILED validation is exactly what you want to see (Codex review).
                 emit_worktree_content(
                     won, "validation_failed", &worktree_path, &wt_told, &wt_trace_id, &wt_repo,
-                    None, &[], Some(&msg), task_started_at.elapsed().as_millis() as u64,
+                    Some(&commit_sha), &files, Some(&msg),
+                    task_started_at.elapsed().as_millis() as u64,
                 )
                 .await;
                 cleanup_failed_worktree(

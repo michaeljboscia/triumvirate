@@ -1311,25 +1311,26 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
     props
 }
 
-/// Prepare captured prompt/completion text for PostHog: scrub credentials/PII, then cap by BYTES
-/// (not chars) so multibyte content cannot silently blow the event past PostHog's 1MB drop limit
-/// (Codex: 200k 4-byte chars x input+output can hit ~1.6MB). 100KB each keeps input+output+the
-/// rest of the event well under 1MB.
+/// Prepare captured prompt/completion text for PostHog: cap by BYTES only, NO scrubbing. The
+/// operator's explicit choice (2026-07-22): they want to SEE the literal text of the call — the
+/// whole point of AI observability — and the credential/PII masking was destroying exactly that
+/// (it masked commit SHAs and authors in diffs as `***`). This is a private, single-operator
+/// PostHog Cloud project; the raw text is the deliverable. The only guardrail kept is the size cap,
+/// because PostHog HARD-DROPS events over 1MB (that's data loss, not privacy). Byte cap (not char)
+/// so multibyte content cannot silently blow past the limit.
 fn mask_and_cap_content(s: &str) -> String {
-    // 60KB keeps each field under PostHog's per-string-property limit (DeepSeek) and the event
-    // comfortably under 1MB. Cap AFTER scrubbing so truncation can never split a secret and
-    // expose half of it.
+    // 60KB keeps each field under PostHog's per-string-property limit and the event comfortably
+    // under 1MB (input + output + the rest of the event).
     const AI_CONTENT_MAX_BYTES: usize = 60 * 1024;
-    let scrubbed = scrub_secrets(s);
-    if scrubbed.len() <= AI_CONTENT_MAX_BYTES {
-        return scrubbed;
+    if s.len() <= AI_CONTENT_MAX_BYTES {
+        return s.to_string();
     }
     // Truncate on a char boundary so we never split a UTF-8 sequence.
     let mut end = AI_CONTENT_MAX_BYTES;
-    while end > 0 && !scrubbed.is_char_boundary(end) {
+    while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    let mut out = scrubbed[..end].to_string();
+    let mut out = s[..end].to_string();
     out.push_str("...<truncated>");
     out
 }
@@ -1494,8 +1495,11 @@ mod tests {
         };
         let ev = ai_generation_props(&g);
         assert_eq!(ev["$ai_input"][0]["role"], serde_json::json!("user"));
-        assert!(ev["$ai_input"][0]["content"].as_str().unwrap().contains("***"),
-                "captured input must be scrubbed: {}", ev["$ai_input"]);
+        // Content is captured RAW (operator's explicit choice): the literal text of the call, no
+        // masking. Only the size cap remains. See mask_and_cap_content.
+        assert_eq!(ev["$ai_input"][0]["content"],
+                   serde_json::json!("my api_key: sk-livedeadbeef0123456789"),
+                   "captured input must be the literal text, unscrubbed: {}", ev["$ai_input"]);
         assert_eq!(ev["$ai_output_choices"][0]["role"], serde_json::json!("assistant"));
         assert_eq!(ev["$ai_output_choices"][0]["content"], serde_json::json!("done"));
         assert!(ev.get("$ai_output").is_none(), "flat $ai_output must not be emitted");
