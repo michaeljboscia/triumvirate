@@ -1203,6 +1203,9 @@ pub fn record_dispatch_generation(
     is_error: bool,
     duration_ms: u64,
 ) {
+    // Basename the repo so tv_repo matches tv_codex_dispatch (bounded, readable, no home-dir leak),
+    // whether the caller passed a name or a full path.
+    let repo_basename = repo.map(repo_name);
     record_ai_generation(&AiGeneration {
         agent: "codex",
         model: None,
@@ -1218,7 +1221,7 @@ pub fn record_dispatch_generation(
         billing: "subscription",
         backend: Some(surface),
         attempts: 0,
-        repo,
+        repo: repo_basename.as_deref(),
         input: Some(told),
         output: Some(produced),
     });

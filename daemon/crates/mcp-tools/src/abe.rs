@@ -598,6 +598,59 @@ fn build_dispatch_produced(
     parts.join("\n\n")
 }
 
+/// Build + emit a worktree dispatch's told/produced content trace, gated on `won`. Shared by every
+/// terminal site (the 4 racing watchers + the main path) so each is a one-liner. The `won` gate is
+/// what makes the race safe: only the watcher that WON the terminal transition emits, so the losers
+/// (whose mark_* return AlreadyTerminal -> false) stay silent and there is exactly one content
+/// trace. Reads stdout from the worktree's own log dir and the committed diff when a commit exists.
+#[allow(clippy::too_many_arguments)]
+async fn emit_worktree_content(
+    won: bool,
+    outcome: &str,
+    worktree_path: &std::path::Path,
+    told: &str,
+    trace_id: &str,
+    repo: &str,
+    commit_sha: Option<&str>,
+    files: &[String],
+    error_or_diagnosis: Option<&str>,
+    duration_ms: u64,
+) {
+    if !won {
+        return;
+    }
+    let stdout = read_stdout_log(&worktree_path.join(".triumvirate").join("logs"));
+    let diff = commit_sha
+        .filter(|s| !s.is_empty())
+        .and_then(|s| git_show_bounded(worktree_path, s));
+    // no_commit carries a diagnosis; the other failures carry an error string. Same field, routed
+    // to the right labeled section.
+    let (diagnosis, error) = if outcome == "no_commit" {
+        (error_or_diagnosis, None)
+    } else {
+        (None, error_or_diagnosis)
+    };
+    let produced = build_dispatch_produced(
+        outcome,
+        commit_sha,
+        files,
+        diff.as_deref(),
+        diagnosis,
+        None,
+        error,
+        stdout.as_deref(),
+    );
+    mcp_bridge::posthog::record_dispatch_generation(
+        trace_id,
+        "dispatch_codex_worktree",
+        Some(repo),
+        told,
+        &produced,
+        outcome != "completed",
+        duration_ms,
+    );
+}
+
 pub async fn dispatch_codex<T: AbeTaskTracker>(
     tracker: T,
     req: DispatchCodexRequest,
@@ -1062,6 +1115,17 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     let parent_session_id = pantheon_ctx.as_ref().map(|c| c.parent_session_id.clone());
     let root_session_id = pantheon_ctx.as_ref().map(|c| c.root_session_id.clone());
 
+    // Content-trace inputs for the dispatch $ai_generation (told/produced), computed before
+    // register() moves the lineage Options. trace_id nests under the Pantheon parent when present,
+    // else the task id. `told` is the briefing the worktree worker was given.
+    let wt_told = req.briefing_content.clone();
+    let wt_trace_id = root_session_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| parent_session_id.clone().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| task_id.clone());
+    let wt_repo = project_root.display().to_string();
+
     tracker
         .register(
             task_id.clone(),
@@ -1105,6 +1169,9 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let timeout_project_root = project_root_for_cleanup.clone();
         let timeout_cleanup_worktree = worktree_path.clone();
         let timeout_keep_failed = keep_failed;
+        let timeout_told = wt_told.clone();
+        let timeout_trace_id = wt_trace_id.clone();
+        let timeout_repo = wt_repo.clone();
         tokio::spawn(async move {
             let enforce_timeout = timeout_callbacks.enforce_timeout.clone();
             let timed_out = (enforce_timeout)(timeout_child, timeout_sec, timeout_worktree)
@@ -1112,7 +1179,14 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 .unwrap_or(false);
             if timed_out {
                 observe_task_duration(&timeout_metrics, &timeout_wave_label, task_started_at);
-                timeout_tracker.mark_timeout(timeout_task_id).await;
+                let won = timeout_tracker.mark_timeout(timeout_task_id).await;
+                // Emit BEFORE cleanup deletes the worktree (logs + any commit).
+                emit_worktree_content(
+                    won, "timeout", &timeout_cleanup_worktree, &timeout_told, &timeout_trace_id,
+                    &timeout_repo, None, &[], Some("worker exceeded its timeout and was terminated"),
+                    task_started_at.elapsed().as_millis() as u64,
+                )
+                .await;
                 cleanup_failed_worktree(
                     &timeout_callbacks,
                     timeout_keep_failed,
@@ -1130,6 +1204,9 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let resolve_commit_outputs = callbacks_for_monitor.resolve_commit_outputs.clone();
         let sentinel_wave_label = wave_label.clone();
         let sentinel_metrics = callbacks_for_monitor.metrics.clone();
+        let sentinel_told = wt_told.clone();
+        let sentinel_trace_id = wt_trace_id.clone();
+        let sentinel_repo = wt_repo.clone();
         tokio::spawn(async move {
             let sentinel_path = sentinel_worktree.join(".triumvirate").join("TASK_COMPLETE.json");
             loop {
@@ -1160,16 +1237,22 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 if commit_sha.is_empty() {
                     continue;
                 }
-                sentinel_tracker
+                let won = sentinel_tracker
                     .mark_completed(
                         sentinel_task_id.clone(),
-                        commit_sha,
-                        files,
+                        commit_sha.clone(),
+                        files.clone(),
                         String::new(),
                         None,
                         None,
                     )
                     .await;
+                emit_worktree_content(
+                    won, "completed", &sentinel_worktree, &sentinel_told, &sentinel_trace_id,
+                    &sentinel_repo, Some(&commit_sha), &files, None,
+                    task_started_at.elapsed().as_millis() as u64,
+                )
+                .await;
                 observe_task_duration(&sentinel_metrics, &sentinel_wave_label, task_started_at);
                 terminate_worker(sentinel_child).await;
                 break;
@@ -1185,6 +1268,9 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let resolve_commit_outputs = callbacks_for_monitor.resolve_commit_outputs.clone();
         let head_wave_label = wave_label.clone();
         let head_metrics = callbacks_for_monitor.metrics.clone();
+        let head_told = wt_told.clone();
+        let head_trace_id = wt_trace_id.clone();
+        let head_repo = wt_repo.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1211,9 +1297,14 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 if commit_sha.is_empty() {
                     continue;
                 }
-                head_tracker
-                    .mark_completed(head_task_id.clone(), commit_sha, files, String::new(), None, None)
+                let won = head_tracker
+                    .mark_completed(head_task_id.clone(), commit_sha.clone(), files.clone(), String::new(), None, None)
                     .await;
+                emit_worktree_content(
+                    won, "completed", &head_worktree, &head_told, &head_trace_id, &head_repo,
+                    Some(&commit_sha), &files, None, task_started_at.elapsed().as_millis() as u64,
+                )
+                .await;
                 observe_task_duration(&head_metrics, &head_wave_label, task_started_at);
                 terminate_worker(head_child).await;
                 break;
@@ -1230,6 +1321,9 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         let stuck_project_root = project_root_for_cleanup.clone();
         let stuck_cleanup_worktree = worktree_path.clone();
         let stuck_keep_failed = keep_failed;
+        let stuck_told = wt_told.clone();
+        let stuck_trace_id = wt_trace_id.clone();
+        let stuck_repo = wt_repo.clone();
         tokio::spawn(async move {
             let mut last_touch = latest_worktree_touch(&stuck_worktree).or_else(|| Some(SystemTime::now()));
             loop {
@@ -1255,12 +1349,18 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                 if idle_for.as_secs() < 180 {
                     continue;
                 }
-                stuck_tracker
+                let won = stuck_tracker
                     .mark_stuck(
                         stuck_task_id.clone(),
                         "worker marked STUCK after 180s without filesystem activity".to_string(),
                     )
                     .await;
+                emit_worktree_content(
+                    won, "stuck", &stuck_cleanup_worktree, &stuck_told, &stuck_trace_id, &stuck_repo,
+                    None, &[], Some("worker marked STUCK after 180s without filesystem activity"),
+                    task_started_at.elapsed().as_millis() as u64,
+                )
+                .await;
                 observe_task_duration(&stuck_metrics, &stuck_wave_label, task_started_at);
                 terminate_worker(stuck_child).await;
                 cleanup_failed_worktree(
@@ -1280,9 +1380,15 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                     Ok(Some(status)) => break status,
                     Ok(None) => {}
                     Err(err) => {
-                        tracker_for_monitor
+                        let won = tracker_for_monitor
                             .mark_failed(task_id_for_monitor.clone(), None, err.to_string())
                             .await;
+                        emit_worktree_content(
+                            won, "failed", &worktree_path, &wt_told, &wt_trace_id, &wt_repo,
+                            None, &[], Some(&err.to_string()),
+                            task_started_at.elapsed().as_millis() as u64,
+                        )
+                        .await;
                         cleanup_failed_worktree(
                             &callbacks_for_monitor,
                             keep_failed,
@@ -1312,13 +1418,15 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
                     &worktree_path,
                     Some(&contract_for_validation.allowed_files),
                 );
-                tracker_for_monitor
-                    .mark_failed(
-                        task_id_for_monitor.clone(),
-                        exit.code(),
-                        no_commit_error_message(diag),
-                    )
+                let msg = no_commit_error_message(diag);
+                let won = tracker_for_monitor
+                    .mark_failed(task_id_for_monitor.clone(), exit.code(), msg.clone())
                     .await;
+                emit_worktree_content(
+                    won, "no_commit", &worktree_path, &wt_told, &wt_trace_id, &wt_repo,
+                    None, &[], Some(&msg), task_started_at.elapsed().as_millis() as u64,
+                )
+                .await;
                 cleanup_failed_worktree(
                     &callbacks_for_monitor,
                     keep_failed,
@@ -1333,13 +1441,15 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             if !validation.passed {
                 let violation_summary = validation.violations.join("; ");
                 observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
-                tracker_for_monitor
-                    .mark_failed(
-                        task_id_for_monitor.clone(),
-                        None,
-                        format!("DAEMON_VALIDATION_FAILED: {violation_summary}"),
-                    )
+                let msg = format!("DAEMON_VALIDATION_FAILED: {violation_summary}");
+                let won = tracker_for_monitor
+                    .mark_failed(task_id_for_monitor.clone(), None, msg.clone())
                     .await;
+                emit_worktree_content(
+                    won, "validation_failed", &worktree_path, &wt_told, &wt_trace_id, &wt_repo,
+                    None, &[], Some(&msg), task_started_at.elapsed().as_millis() as u64,
+                )
+                .await;
                 cleanup_failed_worktree(
                     &callbacks_for_monitor,
                     keep_failed,
@@ -1351,26 +1461,37 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
 
             let validation_log =
                 fs::read_to_string(worktree_path.join(".triumvirate").join("VALIDATION_LOG.md")).ok();
-            tracker_for_monitor
+            let won = tracker_for_monitor
                 .mark_completed(
                     task_id_for_monitor.clone(),
-                    commit_sha,
-                    files,
+                    commit_sha.clone(),
+                    files.clone(),
                     String::new(),
                     validation_log,
                     None,
                 )
                 .await;
+            emit_worktree_content(
+                won, "completed", &worktree_path, &wt_told, &wt_trace_id, &wt_repo,
+                Some(&commit_sha), &files, None, task_started_at.elapsed().as_millis() as u64,
+            )
+            .await;
             observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
         } else {
             observe_task_duration(&callbacks_for_monitor.metrics, &wave_label, task_started_at);
-            tracker_for_monitor
+            let won = tracker_for_monitor
                 .mark_failed(
                     task_id_for_monitor.clone(),
                     exit.code(),
                     "codex process failed".to_string(),
                 )
                 .await;
+            emit_worktree_content(
+                won, "failed", &worktree_path, &wt_told, &wt_trace_id, &wt_repo,
+                None, &[], Some("codex process failed"),
+                task_started_at.elapsed().as_millis() as u64,
+            )
+            .await;
             cleanup_failed_worktree(
                 &callbacks_for_monitor,
                 keep_failed,
