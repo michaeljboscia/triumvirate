@@ -17,12 +17,28 @@ set -euo pipefail
 
 CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.claude.json}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$REPO_ROOT/daemon/target/release/triumvirate"
+# IRON LAW (2026-07-23): production NEVER runs out of daemon/target/. That is Cargo's
+# DISPOSABLE build directory — `cargo clean`, a toolchain change, or any disk cleaner (they
+# all target it, it's routinely tens of GB) deletes it. On 2026-07-23 exactly that happened:
+# target/ vanished, and since ~/.claude.json pointed the MCP server at target/release/
+# triumvirate, EVERY new MCP session died with ENOENT in every repo. Only already-running
+# processes survived (Unix keeps a deleted binary alive for an open fd), which made it look
+# like "broken everywhere except here". Production runs the INSTALLED binary; target/ is
+# build scratch and nothing more. Update it with scripts/install.sh.
+BIN="${TRIUMVIRATE_BIN:-$HOME/.local/bin/triumvirate}"
+BUILT="$REPO_ROOT/daemon/target/release/triumvirate"
 # Must match daemon-http::open_daemon_log() EXACTLY: TRIUMVIRATE_DAEMON_LOG, else
 # $TRIUMVIRATE_HOME/daemon.log, else $HOME/.triumvirate/daemon.log. If these two disagree,
 # a hand-started and an autostarted daemon write to different files and half the history
 # vanishes depending on who booted it. TRIUMVIRATE_HOME is read from the MCP block below.
-[[ -x "$BIN" ]] || { echo "no daemon binary at $BIN (cargo build --release -p triumvirate)" >&2; exit 1; }
+[[ -x "$BIN" ]] || { echo "no INSTALLED daemon binary at $BIN — run scripts/install.sh" >&2; exit 1; }
+# Staleness guard. Pinning production to an installed path trades the wipe risk for the OTHER
+# failure mode: building new code and serving old, believing it shipped. That bug cost hours
+# on 2026-07-23 (a daemon ran a binary from 00:03 while every "restart" only respawned the
+# bridge). If the repo build is newer than what's installed, say so LOUDLY.
+if [[ -x "$BUILT" && "$BUILT" -nt "$BIN" ]]; then
+  echo "WARNING: $BUILT is NEWER than installed $BIN — you are about to serve STALE code. Run scripts/install.sh." >&2
+fi
 [[ -f "$CLAUDE_JSON" ]] || { echo "no $CLAUDE_JSON to read env from" >&2; exit 1; }
 
 # Pull the triumvirate MCP server's env block verbatim. Fail loud if it or the backend key
