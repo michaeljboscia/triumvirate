@@ -3,4 +3,4 @@ description: Pressure-test a design spec through design-specific interrogation, 
 argument-hint: "[path to design spec, or omit to auto-detect]"
 ---
 
-Invoke the `design-goatrodeo` skill. Read `/Users/mikeboscia/.claude/skills/design-goatrodeo.md` and follow its full instructions.
+Invoke the `design-goatrodeo` skill. Read `/Users/you/.claude/skills/design-goatrodeo.md` and follow its full instructions.

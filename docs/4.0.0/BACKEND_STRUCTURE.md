@@ -60,7 +60,7 @@ Returns all ABE-dispatched workers (sourced exclusively from `TaskTracker::snaps
       "parent_session_id": "sess-main-1",
       "root_session_id": "sess-main-1",
       "pantheon_session_id": "uuid-from-pantheon",
-      "cwd": "/Users/mikeboscia/projects/triumvirate",
+      "cwd": "/Users/you/projects/triumvirate",
       "started_at": "2026-04-11T22:00:00Z",
       "elapsed_ms": 45000
     }

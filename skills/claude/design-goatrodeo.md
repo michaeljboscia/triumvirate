@@ -6,7 +6,7 @@
 
 **Philosophy:** The clankers do the work, the executive makes the calls. Same engine as `/goatrodeo`, different domain knowledge.
 
-**Pipeline Reference:** This skill implements Steps 3, 4.5, and 8 of the Agnostic Web Design Pipeline (v3). See `/Users/mikeboscia/projects/peritia/specs/design-pipeline-spec-v3.md` for the full pipeline context.
+**Pipeline Reference:** This skill implements Steps 3, 4.5, and 8 of the Agnostic Web Design Pipeline (v3). See `/Users/you/projects/peritia/specs/design-pipeline-spec-v3.md` for the full pipeline context.
 
 ---
 

@@ -1,6 +1,6 @@
 # Triumvirate Daemon — Gemini Implementation Instructions
 
-**Working Directory:** /Users/mikeboscia/projects/triumvirate/daemon
+**Working Directory:** /Users/you/projects/triumvirate/daemon
 **Language:** Rust (edition 2024, Rust 1.93+)
 
 ## Your Role
@@ -19,7 +19,7 @@ Gemini is primarily assigned to:
 
 ## Canonical Docs
 
-All at `/Users/mikeboscia/projects/triumvirate/docs/v2/`:
+All at `/Users/you/projects/triumvirate/docs/v2/`:
 - SPEC.md (root) — architecture, REQs, Goat Rodeo decisions
 - PRD.md — feature specs
 - BACKEND_STRUCTURE.md — schemas, APIs, protocols

@@ -224,10 +224,10 @@ All three must pass. The second is your new test module. The third is the regres
 
 ## How to start
 
-1. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/triumvirate/src/main.rs` lines 1395-1445 to see the existing `health`/`status` handlers — copy their auth pattern exactly.
-2. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/shared-types/src/api.rs` to see the exact response shapes.
-3. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/triumvirate/src/abe/task_tracker.rs` lines around `snapshot_workers` (find via grep) to see how a Vec<WorkerInfo> gets built.
-4. Read `/Users/mikeboscia/projects/triumvirate/daemon/crates/shared-types/src/lib.rs` for the SessionState struct fields.
+1. Read `/Users/you/projects/triumvirate/daemon/crates/triumvirate/src/main.rs` lines 1395-1445 to see the existing `health`/`status` handlers — copy their auth pattern exactly.
+2. Read `/Users/you/projects/triumvirate/daemon/crates/shared-types/src/api.rs` to see the exact response shapes.
+3. Read `/Users/you/projects/triumvirate/daemon/crates/triumvirate/src/abe/task_tracker.rs` lines around `snapshot_workers` (find via grep) to see how a Vec<WorkerInfo> gets built.
+4. Read `/Users/you/projects/triumvirate/daemon/crates/shared-types/src/lib.rs` for the SessionState struct fields.
 5. Implement the three handlers.
 6. Add the routes to the chain in `run_daemon` next to the existing `/api/tokens/*` routes (use `get(handler)` not `get_service` since these handlers take `State<DaemonRuntimeState>` not `State<DaemonHttpState>`).
 7. Write the test module.

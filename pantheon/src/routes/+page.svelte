@@ -19,7 +19,7 @@
   // with a directory picker + recent projects list. The path must be
   // absolute and must exist; portable-pty's cwd is passed straight to
   // execve-like spawn.
-  const INITIAL_CWD = "/Users/mikeboscia/projects/triumvirate";
+  const INITIAL_CWD = "/Users/you/projects/triumvirate";
 
   let sidebarOpen = $state(true);
   let statusOpen = $state(true);

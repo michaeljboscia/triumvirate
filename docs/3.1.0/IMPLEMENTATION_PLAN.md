@@ -420,8 +420,8 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <files></files>
   <scope_out>Do not change skill behavior or purpose. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — all by the orchestrator in the main Claude session</tools>
-  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md && ! grep -qE "send_message|get_response" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md</verify>
-  <reality_test>After orchestrator runs the edit: (1) grep "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-codex/SKILL.md returns zero matches; (2) grep "mcp__triumvirate__ask_session" returns at least one match; (3) grep "send_message\|get_response" returns zero matches in the skill body (the two-step async pattern is eliminated). Additionally, a human invoking /send-to-codex with a small test prompt gets a direct response (no job_id in the flow).</reality_test>
+  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/you/.claude/skills/send-to-codex/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/you/.claude/skills/send-to-codex/SKILL.md && ! grep -qE "send_message|get_response" /Users/you/.claude/skills/send-to-codex/SKILL.md</verify>
+  <reality_test>After orchestrator runs the edit: (1) grep "mcp__inter-agent" /Users/you/.claude/skills/send-to-codex/SKILL.md returns zero matches; (2) grep "mcp__triumvirate__ask_session" returns at least one match; (3) grep "send_message\|get_response" returns zero matches in the skill body (the two-step async pattern is eliminated). Additionally, a human invoking /send-to-codex with a small test prompt gets a direct response (no job_id in the flow).</reality_test>
   <done_when>Skill file references mcp__triumvirate__ask_session. No references to mcp__inter-agent or send_message/get_response. Orchestrator reports the verification grep output.</done_when>
 </task>
 
@@ -430,7 +430,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <files></files>
   <scope_out>Same as T-012. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
-  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md && ! grep -qE "send_message|get_response" /Users/mikeboscia/.claude/skills/send-to-gemini/SKILL.md</verify>
+  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/you/.claude/skills/send-to-gemini/SKILL.md) -gt 0 && ! grep -q "mcp__inter-agent" /Users/you/.claude/skills/send-to-gemini/SKILL.md && ! grep -qE "send_message|get_response" /Users/you/.claude/skills/send-to-gemini/SKILL.md</verify>
   <reality_test>After orchestrator runs the edit: grep "mcp__inter-agent" returns zero; grep "mcp__triumvirate__ask_session" returns positive; grep "send_message\|get_response" returns zero in the skill body. Manual test: /send-to-gemini with a small prompt returns a direct response.</reality_test>
   <done_when>Skill references mcp__triumvirate__ask_session. No inter-agent references. No async pattern.</done_when>
 </task>
@@ -440,7 +440,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <files></files>
   <scope_out>Same as T-012. Do not edit any Triumvirate repo files.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
-  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md) -ge 2 && ! grep -q "mcp__inter-agent" /Users/mikeboscia/.claude/skills/send-to-siblings/SKILL.md</verify>
+  <verify>test $(grep -c "mcp__triumvirate__ask_session" /Users/you/.claude/skills/send-to-siblings/SKILL.md) -ge 2 && ! grep -q "mcp__inter-agent" /Users/you/.claude/skills/send-to-siblings/SKILL.md</verify>
   <reality_test>After orchestrator runs the edit: grep "mcp__inter-agent" returns zero; grep "mcp__triumvirate__ask_session" returns at least 2. Manual test: /send-to-siblings with a small prompt returns direct responses from BOTH agents.</reality_test>
   <done_when>Skill references mcp__triumvirate__ask_session for both agents. No inter-agent references.</done_when>
 </task>
@@ -450,7 +450,7 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
   <files></files>
   <scope_out>Do not change skill logic or purpose. Only update MCP tool name references from mcp__inter-agent__* to mcp__triumvirate__*. Do not touch goatrodeo.md's platform rule or audit gates added 2026-04-09.</scope_out>
   <tools>Read, Edit, Grep — orchestrator in main session</tools>
-  <verify>! grep -rq "mcp__inter-agent" /Users/mikeboscia/.claude/skills/ && test $(grep -rc "mcp__triumvirate__" /Users/mikeboscia/.claude/skills/inter-agent-protocol/SKILL.md /Users/mikeboscia/.claude/skills/goatrodeo.md /Users/mikeboscia/.claude/skills/design-goatrodeo.md /Users/mikeboscia/.claude/skills/crystallize/factory/phase-2-diagnose.md | grep -vc ':0') -eq 4</verify>
+  <verify>! grep -rq "mcp__inter-agent" /Users/you/.claude/skills/ && test $(grep -rc "mcp__triumvirate__" /Users/you/.claude/skills/inter-agent-protocol/SKILL.md /Users/you/.claude/skills/goatrodeo.md /Users/you/.claude/skills/design-goatrodeo.md /Users/you/.claude/skills/crystallize/factory/phase-2-diagnose.md | grep -vc ':0') -eq 4</verify>
   <reality_test>After orchestrator runs the edits: (1) grep -r "mcp__inter-agent" ~/.claude/skills/ exits with no matches; (2) each of the 4 skill files contains at least one "mcp__triumvirate__" reference; (3) the goatrodeo.md Platform Rule at line 9 is unchanged (grep "Platform Rule" returns the same line); (4) Phase 4.4 and Phase 5.3 sections still exist (grep "Canonical Doc Audit\|Dispatch Audit" returns matches).</reality_test>
   <done_when>Zero references to mcp__inter-agent across all skill files. All 4 target skills updated. Platform Rule and audit phases preserved.</done_when>
 </task>
@@ -462,10 +462,10 @@ All tasks in this wave extract existing code from main.rs into mcp-tools modules
 <task id="T-016" req="REQ-F1,REQ-F2,REQ-F3,REQ-F4" wave="4" depends="T-011,T-015" lane="orchestrator">
   <description>Verify all tools work through the Rust daemon, then remove inter-agent entry from ~/.claude.json (orchestrator-executed, requires explicit user approval before file change)</description>
   <files></files>
-  <scope_out>Do not modify the Rust daemon. Do not delete the file — only remove the inter-agent entry. Keep a backup at /Users/mikeboscia/.claude.json.bak.3.1.0 before modification. Require explicit user approval before touching ~/.claude.json — this is a destructive config change.</scope_out>
+  <scope_out>Do not modify the Rust daemon. Do not delete the file — only remove the inter-agent entry. Keep a backup at /Users/you/.claude.json.bak.3.1.0 before modification. Require explicit user approval before touching ~/.claude.json — this is a destructive config change.</scope_out>
   <tools>Read, Bash (for cp backup and jq validation), Edit — orchestrator in main session</tools>
-  <verify>test -f /Users/mikeboscia/.claude.json.bak.3.1.0 && ! grep -q '"inter-agent"' /Users/mikeboscia/.claude.json</verify>
-  <reality_test>After orchestrator runs the edit and user approves: (1) /Users/mikeboscia/.claude.json.bak.3.1.0 exists as a complete backup; (2) jq '.mcpServers | has("inter-agent")' /Users/mikeboscia/.claude.json returns false; (3) jq '.mcpServers | has("triumvirate")' returns true; (4) calling mcp__triumvirate__spawn_daemon (alias from T-011) succeeds in a test Claude session; (5) calling mcp__triumvirate__spawn_session (canonical) succeeds; (6) calling mcp__triumvirate__dispatch_codex_worktree succeeds; (7) pgrep -f "inter-agent/start-unified" returns no PIDs (the TS node process is not running).</reality_test>
+  <verify>test -f /Users/you/.claude.json.bak.3.1.0 && ! grep -q '"inter-agent"' /Users/you/.claude.json</verify>
+  <reality_test>After orchestrator runs the edit and user approves: (1) /Users/you/.claude.json.bak.3.1.0 exists as a complete backup; (2) jq '.mcpServers | has("inter-agent")' /Users/you/.claude.json returns false; (3) jq '.mcpServers | has("triumvirate")' returns true; (4) calling mcp__triumvirate__spawn_daemon (alias from T-011) succeeds in a test Claude session; (5) calling mcp__triumvirate__spawn_session (canonical) succeeds; (6) calling mcp__triumvirate__dispatch_codex_worktree succeeds; (7) pgrep -f "inter-agent/start-unified" returns no PIDs (the TS node process is not running).</reality_test>
   <done_when>~/.claude.json has no inter-agent entry. Backup exists. All 40+ tools accessible via mcp__triumvirate__*. No Node.js MCP process running. User has explicitly approved the config change.</done_when>
 </task>
 

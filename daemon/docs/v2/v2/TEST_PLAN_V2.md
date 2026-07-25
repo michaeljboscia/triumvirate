@@ -130,7 +130,7 @@ PASS: single agent responds with lifecycle
 ### T-009: ask_agent context passing
 ```
 SETUP: daemon running with mock CLI that echoes received context
-ACTION: Claude calls ask_agent("gemini", "question", cwd="/Users/mikeboscia/projects/triumvirate", repo="triumvirate", branch="feat/mcp-first")
+ACTION: Claude calls ask_agent("gemini", "question", cwd="/Users/you/projects/triumvirate", repo="triumvirate", branch="feat/mcp-first")
 EXPECT:
   - Agent receives project context matching passed parameters
   - Outbox log contains cwd, repo, branch

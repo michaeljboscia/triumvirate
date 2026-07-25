@@ -44,13 +44,13 @@ spawn_session(session_name: "<task>-oracle", cwd: "<project-dir>")
 30 seconds. Then you know instead of guess.
 
 ### Rule 2: Search all locations — HARD STOP
-Code lives in: current worktree, other worktrees, main branch, other branches, the homebox. All five must be checked before declaring code missing or nonexistent. This is a gate. You cannot say "doesn't exist" until all five are searched.
+Code lives in: current worktree, other worktrees, main branch, other branches, the server. All five must be checked before declaring code missing or nonexistent. This is a gate. You cannot say "doesn't exist" until all five are searched.
 
 **You will be tempted to:** "I searched the repo and didn't find it — it doesn't exist."
 **Why that fails:** This environment has 17+ feature branches and 5+ worktrees. Searching one is searching ~6% of the codebase. Absence in one location proves nothing.
 
 **You will also be tempted to:** "If it existed, it would be in main — branches don't count."
-**Why that fails:** Feature branches are where work happens. `feature/shared-product-inventory` had 15 commits and was deployed to production on the homebox while main knew nothing about it. Branches are production code in this environment.
+**Why that fails:** Feature branches are where work happens. `feature/shared-product-inventory` had 15 commits and was deployed to production on the server while main knew nothing about it. Branches are production code in this environment.
 
 **The right way:**
 ```bash
@@ -60,8 +60,8 @@ find ~/gtm-machine-infrastructure-worktrees -name "<file>" 2>/dev/null
 find ~/gtm-machine-infrastructure -name "<file>" 2>/dev/null
 # All branches
 git -C ~/gtm-machine-infrastructure branch -a | grep <keyword>
-# Homebox
-ssh user@REDACTED_HOST "find /home/mboscia -maxdepth 5 -name '<file>'"
+# Server
+ssh user@REDACTED_HOST "find /home/user -maxdepth 5 -name '<file>'"
 ```
 Run ALL FOUR. Not one. Not two. All four. Then tell the oracle what you found and ask it to reconcile.
 
@@ -141,7 +141,7 @@ Don't dismiss the Gemini oracle after planning. Keep it alive through execution 
 Loading context is necessary but not sufficient. You must load the RIGHT context — all affected directories, deployment paths, and external systems. Wrong scope = false confidence.
 
 **You will be tempted to:** "I loaded all the files in `wanderer/src/` — that's the affected code."
-**Why that fails:** The affected code also includes `shared/tech_detector/`, `journey-sensor/src/journey_executor.py`, `search-breaker/shared_inventory.py`, and the Prefect flows on the homebox. Loading one directory when the blast radius spans four is context-complete but scope-incomplete. You'll satisfy the checklist and still miss the failure.
+**Why that fails:** The affected code also includes `shared/tech_detector/`, `journey-sensor/src/journey_executor.py`, `search-breaker/shared_inventory.py`, and the Prefect flows on the server. Loading one directory when the blast radius spans four is context-complete but scope-incomplete. You'll satisfy the checklist and still miss the failure.
 
 **The right way:** Before loading, ask yourself: "What other code imports from, depends on, or is affected by what I'm changing?" Trace outward from the change to every consumer, every deployment path, every test file. Load all of them.
 
@@ -150,10 +150,10 @@ Loading context is necessary but not sufficient. You must load the RIGHT context
 Run BEFORE executing any plan. Every box must be checked. No exceptions.
 - [ ] Gemini oracle spawned and loaded with ALL affected code (not just the directory you're changing)
 - [ ] Scope verified: all consumers, deployment paths, and test files identified and loaded
-- [ ] All 4 location searches run (worktrees, main repo, branches, homebox)
+- [ ] All 4 location searches run (worktrees, main repo, branches, server)
 - [ ] Import resolution verified empirically via `python3 -c "import X; print(X.__file__)"`
 - [ ] Production entry point traced (Prefect flow, Docker entrypoint, not just `main()`)
-- [ ] Deployed state verified: branch/version on homebox matches code loaded into oracle; env vars confirmed set
+- [ ] Deployed state verified: branch/version on server matches code loaded into oracle; env vars confirmed set
 - [ ] /ruthless-interrogator run against draft plan — every objection addressed
 - [ ] Revised plan sent to both Gemini and Codex for twin validation
 - [ ] Twin feedback incorporated into final plan
@@ -163,7 +163,7 @@ Run BEFORE executing any plan. Every box must be checked. No exceptions.
 
 ### 2026-03-19: The Wanderer Incident
 - Declared Wanderer→Search Breaker pipeline "never built" after searching one worktree
-- Code existed on `feature/shared-product-inventory`: 15 commits, 702-line product_extractor.py, deployed to homebox
+- Code existed on `feature/shared-product-inventory`: 15 commits, 702-line product_extractor.py, deployed to server
 - User fought through 4 rounds ("keep fucking looking") before code was found
 - Cost: ~45 minutes, significant trust damage
 - Root cause: Searched 6% of the codebase and declared 100% certainty

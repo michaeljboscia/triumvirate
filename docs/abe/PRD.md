@@ -1,6 +1,6 @@
 # Autonomous Build Enforcement — Product Requirements Document
 
-**Spec:** `/Users/mikeboscia/projects/triumvirate/specs/AUTONOMOUS_BUILD_ENFORCEMENT.md`
+**Spec:** `/Users/you/projects/triumvirate/specs/AUTONOMOUS_BUILD_ENFORCEMENT.md`
 **Date:** 2026-04-07
 **Goat Rodeo:** 8 rounds, Phase 3 CLEAN
 

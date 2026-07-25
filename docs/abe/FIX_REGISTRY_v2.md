@@ -1,7 +1,7 @@
 # ABE v3.0 — Fix Registry v2 (Smoke Test Failures)
 
 **Source:** Smoke test against production daemon (Apr 8)
-**Root Cause:** `dispatch_codex` and `dispatch_codex_worktree` handlers use `std::env::current_dir()` for project_root. The daemon's cwd is `/Users/mikeboscia` (home dir), not a git repo. All existing tools (fleet, peer review, ledger) have a `project_root` field in their request structs with fallback to `current_dir()`. The ABE tools don't follow this pattern.
+**Root Cause:** `dispatch_codex` and `dispatch_codex_worktree` handlers use `std::env::current_dir()` for project_root. The daemon's cwd is `/Users/you` (home dir), not a git repo. All existing tools (fleet, peer review, ledger) have a `project_root` field in their request structs with fallback to `current_dir()`. The ABE tools don't follow this pattern.
 
 ---
 
@@ -16,7 +16,7 @@ let project_root = std::env::current_dir()
     .map_err(|e| format!("failed to resolve project_root: {e}"))?;
 ```
 
-The daemon runs from `/Users/mikeboscia`. This is not a git repo. `git worktree add` fails because there's no `.git` in the home directory. Manual `git worktree add` from the correct directory succeeds.
+The daemon runs from `/Users/you`. This is not a git repo. `git worktree add` fails because there's no `.git` in the home directory. Manual `git worktree add` from the correct directory succeeds.
 
 **Fix:** Follow the existing pattern used by fleet/peer-review tools (lines 1112-1115):
 1. Add `project_root: Option<String>` to `DispatchCodexWorktreeRequest` in shared-types
@@ -28,7 +28,7 @@ let project_root = req.project_root
     .ok_or_else(|| "no project_root provided and current_dir failed".to_string())?;
 ```
 
-**Test:** Call `dispatch_codex_worktree` with `project_root: "/Users/mikeboscia/projects/triumvirate"` — worktree creation succeeds.
+**Test:** Call `dispatch_codex_worktree` with `project_root: "/Users/you/projects/triumvirate"` — worktree creation succeeds.
 
 ---
 
@@ -41,7 +41,7 @@ let project_root = req.project_root
 
 **Fix:** Ensure the handler uses `req.cwd` (if provided) as the subprocess working directory. If `req.cwd` is None, fall back to `current_dir()`. Verify the Codex subprocess is spawned with `current_dir(req.cwd)`.
 
-**Test:** Call `dispatch_codex` with `cwd: "/Users/mikeboscia/projects/triumvirate"` and a simple prompt — task completes successfully.
+**Test:** Call `dispatch_codex` with `cwd: "/Users/you/projects/triumvirate"` and a simple prompt — task completes successfully.
 
 ---
 

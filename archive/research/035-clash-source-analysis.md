@@ -2,9 +2,9 @@
 
 **Date:** 2026-04-05  
 **Repo:** `https://github.com/clash-sh/clash`  
-**Local clone:** `/Users/mikeboscia/projects/triumvirate/.phase0_sources/clash`  
+**Local clone:** `/Users/you/projects/triumvirate/.phase0_sources/clash`  
 **Commit analyzed:** `2ac931c`  
-**License:** MIT (`/Users/mikeboscia/projects/triumvirate/.phase0_sources/clash/LICENSE`)  
+**License:** MIT (`/Users/you/projects/triumvirate/.phase0_sources/clash/LICENSE`)  
 **FEAT targets:** FEAT-019
 
 ---
@@ -13,10 +13,10 @@
 Clash is directly relevant to Triumvirate fleet collision prevention: worktree discovery, pairwise conflict detection, pre-write checks, and realtime watch updates.
 
 ## Key Source Files Reviewed
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/clash/src/worktree/manager.rs`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/clash/src/worktree/conflict.rs`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/clash/src/check.rs`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/clash/src/watch/watcher.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/clash/src/worktree/manager.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/clash/src/worktree/conflict.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/clash/src/check.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/clash/src/watch/watcher.rs`
 
 ## Patterns Worth Borrowing
 1. Worktree discovery from arbitrary path

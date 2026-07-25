@@ -2,9 +2,9 @@
 
 **Date:** 2026-04-05  
 **Repo:** `https://github.com/The-Swarm-Corporation/swarms-rs`  
-**Local clone:** `/Users/mikeboscia/projects/triumvirate/.phase0_sources/swarms-rs`  
+**Local clone:** `/Users/you/projects/triumvirate/.phase0_sources/swarms-rs`  
 **Commit analyzed:** `9d22ba9`  
-**License:** Apache-2.0 (`/Users/mikeboscia/projects/triumvirate/.phase0_sources/swarms-rs/LICENSE`)  
+**License:** Apache-2.0 (`/Users/you/projects/triumvirate/.phase0_sources/swarms-rs/LICENSE`)  
 **FEAT targets:** FEAT-001, FEAT-023
 
 ---
@@ -13,10 +13,10 @@
 swarms-rs is relevant for lifecycle and orchestration mechanics in Rust: builder-driven agent config, loop/retry semantics, state persistence, and concurrent/sequential swarm workflows.
 
 ## Key Source Files Reviewed
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/agent/swarms_agent.rs`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/structs/concurrent_workflow.rs`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/structs/sequential_workflow.rs`
-- `/Users/mikeboscia/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/structs/rearrange.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/agent/swarms_agent.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/structs/concurrent_workflow.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/structs/sequential_workflow.rs`
+- `/Users/you/projects/triumvirate/.phase0_sources/swarms-rs/swarms-rs/src/structs/rearrange.rs`
 
 ## Patterns Worth Borrowing
 1. Builder-first lifecycle configuration

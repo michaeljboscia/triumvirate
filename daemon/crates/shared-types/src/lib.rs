@@ -540,7 +540,7 @@ mod tests {
 
         let state = SessionState {
             agent: "claude".to_string(),
-            cwd: Some("/Users/mikeboscia/projects/triumvirate".to_string()),
+            cwd: Some("/Users/you/projects/triumvirate".to_string()),
             history: vec!["initialize".to_string()],
             parent_session_id: Some("sess-pantheon-panel-1".to_string()),
             root_session_id: Some("sess-pantheon-panel-1".to_string()),

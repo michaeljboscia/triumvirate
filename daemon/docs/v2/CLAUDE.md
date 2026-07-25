@@ -2,7 +2,7 @@
 
 **Project:** triumvirate-agentd
 **Language:** Rust (edition 2024)
-**Working directory:** /Users/mikeboscia/projects/triumvirate/daemon
+**Working directory:** /Users/you/projects/triumvirate/daemon
 
 ---
 

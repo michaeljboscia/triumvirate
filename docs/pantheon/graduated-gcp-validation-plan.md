@@ -3,10 +3,10 @@
 **Purpose:** Validate the PANTHEON AI Software Factory architecture on GCP before committing $20K to local hardware. Six escalating tiers ($0.13/hr → $4.60/hr) that prove increasingly ambitious claims using real code (Go, Rust, Python) and real project deliverables (YellingToad + Tellus LandOS). No Kubernetes on GCP — plain VMs + Docker Compose. Each tier's infrastructure carries forward; nothing gets torn down.
 
 **Created:** 2026-04-16
-**Architecture reference:** `/Users/mikeboscia/PANTHEON_ARCHITECTURE.md`
-**Hardware specs:** `/Users/mikeboscia/projects/triumvirate/docs/vulcan-1-build-spec.md`
-**YellingToad Go rewrite:** `/Users/mikeboscia/gtm-machine-infrastructure/yelling-toad/go/`
-**Triumvirate Rust daemon:** `/Users/mikeboscia/projects/triumvirate/daemon/`
+**Architecture reference:** `/Users/you/PANTHEON_ARCHITECTURE.md`
+**Hardware specs:** `/Users/you/projects/triumvirate/docs/vulcan-1-build-spec.md`
+**YellingToad Go rewrite:** `/Users/you/gtm-machine-infrastructure/yelling-toad/go/`
+**Triumvirate Rust daemon:** `/Users/you/projects/triumvirate/daemon/`
 
 ---
 
@@ -37,7 +37,7 @@
            │ HTTP :11434
            │
 ┌──────────▼──────────────────┐
-│  Homebox / Orchestrator     │
+│  Server / Orchestrator     │
 │  Triumvirate daemon (Rust)  │
 │  Pythia SQLite + embeddings │
 │  Docker (no k3s)            │
@@ -70,7 +70,7 @@
 | **Zeus** (Mac Studio) | Native ollama/llama.cpp on Metal | macOS — k3s doesn't run natively. Container layer costs memory bandwidth. 405B needs direct Metal access to 512GB unified memory. |
 | **Athena** (2× DGX Spark) | **k3s** (server on DGX-1, agent on DGX-2) | Multi-node GPU scheduling, NVIDIA device plugin enforces allocation, pod health checks, rolling model updates, `kubectl scale` for worker count. k3s overhead: ~512MB RAM, negligible CPU. |
 | **Vulcan** (RTX 3090 workstation) | Docker Compose | Single machine, 2 GPUs, 2-3 containers max. Compose is 30 lines. k3s adds control plane overhead for zero benefit on a single node. |
-| **Homebox** (orchestrator) | Docker Compose | Triumvirate + Pythia + support services. Single machine, no GPU. |
+| **Server** (orchestrator) | Docker Compose | Triumvirate + Pythia + support services. Single machine, no GPU. |
 
 ### GCP validation uses Docker Compose everywhere
 
@@ -424,7 +424,7 @@ Factors to evaluate per role:
 ## Relationship to other plans
 
 - **Supersedes:** `docs/plans/pantheon-gcp-validation-plan.md` (earlier version without Tier 0 / YellingToad / k3s-topology / compose-over-k8s decisions)
-- **References:** `/Users/mikeboscia/PANTHEON_ARCHITECTURE.md` (the $20K hardware blueprint this validates)
+- **References:** `/Users/you/PANTHEON_ARCHITECTURE.md` (the $20K hardware blueprint this validates)
 - **Feeds into:** `docs/plans/pantheon-model-selection.md` (TBD — model choices per role)
 - **Parallel workstream:** `docs/plans/nc-dd-data-layer-acquisition.md` (Tellus DD — some of whose tasks become Tier 3/5 test payloads)
 

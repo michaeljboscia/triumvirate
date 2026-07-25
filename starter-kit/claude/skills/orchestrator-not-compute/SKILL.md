@@ -1,6 +1,6 @@
 ---
 name: orchestrator-not-compute
-description: Use when about to use Playwright browser_snapshot, browser_wait_for, or any browser MCP tool on a data-heavy page (ArcGIS, government GIS portals, SharePoint), or when writing a new script for a task that existing homebox infrastructure already handles (Prefect flows, Municipal Bloodhound, Docker containers).
+description: Use when about to use Playwright browser_snapshot, browser_wait_for, or any browser MCP tool on a data-heavy page (ArcGIS, government GIS portals, SharePoint), or when writing a new script for a task that existing server infrastructure already handles (Prefect flows, Municipal Bloodhound, Docker containers).
 ---
 
 # Orchestrator, Not Compute
@@ -69,10 +69,10 @@ Full patterns: `reference/data-source-patterns.md`
 
 ## Rule 2: Check for Existing Infrastructure Before Building
 
-Before writing ANY new script, browser workflow, or data pipeline, check whether existing homebox infrastructure already handles the task.
+Before writing ANY new script, browser workflow, or data pipeline, check whether existing server infrastructure already handles the task.
 
 **You will be tempted to:** "It's faster to write it myself than to find the existing tool."
-**Why that fails:** On 2026-03-12, a throwaway CrUX refresh script hit a generated-column error, then a PostgREST conflict — 3 failures, 30 minutes wasted. The existing Prefect flow completed in 9 seconds. On 2026-03-21, manual Playwright browsing of GIS portals crashed the session when `discover_water_sewer_gis.py` (built the day before) does the same work headlessly on homebox Docker.
+**Why that fails:** On 2026-03-12, a throwaway CrUX refresh script hit a generated-column error, then a PostgREST conflict — 3 failures, 30 minutes wasted. The existing Prefect flow completed in 9 seconds. On 2026-03-21, manual Playwright browsing of GIS portals crashed the session when `discover_water_sewer_gis.py` (built the day before) does the same work headlessly on server Docker.
 
 **The right way — check these locations in order:**
 
@@ -82,7 +82,7 @@ Before writing ANY new script, browser workflow, or data pipeline, check whether
    - `discover_pdf_urls.py` — PDF source discovery
    - Pattern: Playwright + Gemini Flash in Docker, results to `/output/*.json`
 
-2. **Prefect flows** on homebox Docker:
+2. **Prefect flows** on server Docker:
    ```bash
    # Discover existing flows first:
    ssh user@REDACTED_HOST 'docker exec scripting-host-prefect-worker-1 ls -la /app/flows/'
@@ -94,7 +94,7 @@ Before writing ANY new script, browser workflow, or data pipeline, check whether
 
 3. **Existing scripts** in the project's `scripts/` or `infrastructure/` directories
 
-If nothing exists, build the new tool ON homebox (as a proper script in the infrastructure directory), not as a throwaway in `/tmp`.
+If nothing exists, build the new tool ON server (as a proper script in the infrastructure directory), not as a throwaway in `/tmp`.
 
 ---
 
@@ -115,7 +115,7 @@ ssh user@REDACTED_HOST "docker exec scripting-host-prefect-browser-worker-1 \
   python3 /app/src/discover_water_sewer_gis.py"
 
 # Pull results back
-rsync -av user@REDACTED_HOST:/home/mboscia/zoning_discovery/*.json /tmp/results/
+rsync -av user@REDACTED_HOST:/home/user/zoning_discovery/*.json /tmp/results/
 ```
 
 The container outputs clean JSON. Your context window only sees the synthesized results.
@@ -139,7 +139,7 @@ Most "JS-rendered" pages have underlying API endpoints. Try the API first. Brows
 4. **Hub API v3 export** — `api/v3/datasets/{ID}/downloads/data?format=shp` for direct shapefile download
 5. **`curl` / `WebFetch`** — hit the URL directly (always use `-L` for redirects)
 6. **`browser_evaluate` with targeted JS** — only if 1-5 fail, extract specific elements only
-7. **Municipal Bloodhound on homebox** — for complex multi-page navigation requiring a real browser. This IS browser automation — it runs Playwright + Gemini Flash inside Docker on REDACTED_HOST. The browser runs THERE, not here. Your context window only sees the output JSON.
+7. **Municipal Bloodhound on server** — for complex multi-page navigation requiring a real browser. This IS browser automation — it runs Playwright + Gemini Flash inside Docker on REDACTED_HOST. The browser runs THERE, not here. Your context window only sees the output JSON.
 8. **`browser_snapshot` in-context** — BANNED for data-heavy pages. Only for simple text-only pages as absolute last resort. If you need a browser, use step 7 — that's what it's for.
 
 ---
@@ -169,8 +169,8 @@ Run BEFORE any browser tool call or new script creation:
 
 - [ ] Is this page ArcGIS, OpenData, GIS viewer, or map-heavy? → **Do NOT snapshot. Use REST API.**
 - [ ] Did I check `infrastructure/municipal-bloodhound/src/` for an existing script? → **Check before building.**
-- [ ] Did I check Prefect flows on homebox for an existing pipeline? → **Check before building.**
-- [ ] Am I doing this for >3 entities? → **Delegate to homebox infrastructure.**
+- [ ] Did I check Prefect flows on server for an existing pipeline? → **Check before building.**
+- [ ] Am I doing this for >3 entities? → **Delegate to server infrastructure.**
 - [ ] Did I try Gemini search and direct curl before reaching for the browser? → **API-direct first.**
 - [ ] If I must use the browser in-context, am I using `browser_evaluate` with targeted JS (no innerHTML/outerHTML/document.body)? → **Never snapshot, never dump DOM.**
 - [ ] For NC data: did I check the bloodhound manifests/targets first? → **Read before building.**
@@ -197,7 +197,7 @@ Run BEFORE any browser tool call or new script creation:
 
 **Convergent diagnosis:** The agent defaults to direct observation and in-context execution instead of delegating to existing infrastructure. The context window is treated as a data processing pipeline when it should be a control plane.
 
-### Key Infrastructure (Homebox REDACTED_HOST)
+### Key Infrastructure (Server REDACTED_HOST)
 
 | System | What It Does | How to Trigger |
 |--------|-------------|----------------|

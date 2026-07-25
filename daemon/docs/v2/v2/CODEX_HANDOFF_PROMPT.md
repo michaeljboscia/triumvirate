@@ -17,16 +17,16 @@ Build the Triumvirate v2 multi-agent fleet daemon in Rust. This is the first cro
 Before writing any code, read these files IN ORDER:
 
 ```
-1.  /Users/mikeboscia/projects/triumvirate/daemon/AGENTS.md
-2.  /Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt
-3.  /Users/mikeboscia/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md
-4.  /Users/mikeboscia/projects/triumvirate/docs/v2/LESSONS.md
-5.  /Users/mikeboscia/projects/triumvirate/docs/v2/PRD.md
-6.  /Users/mikeboscia/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md
-7.  /Users/mikeboscia/projects/triumvirate/docs/v2/TECH_STACK.md
-8.  /Users/mikeboscia/projects/triumvirate/docs/v2/TEST_PLAN.md
-9.  /Users/mikeboscia/projects/triumvirate/docs/v2/APP_FLOW.md
-10. /Users/mikeboscia/projects/triumvirate/SPEC.md
+1.  /Users/you/projects/triumvirate/daemon/AGENTS.md
+2.  /Users/you/projects/triumvirate/docs/v2/progress.txt
+3.  /Users/you/projects/triumvirate/docs/v2/IMPLEMENTATION_PLAN.md
+4.  /Users/you/projects/triumvirate/docs/v2/LESSONS.md
+5.  /Users/you/projects/triumvirate/docs/v2/PRD.md
+6.  /Users/you/projects/triumvirate/docs/v2/BACKEND_STRUCTURE.md
+7.  /Users/you/projects/triumvirate/docs/v2/TECH_STACK.md
+8.  /Users/you/projects/triumvirate/docs/v2/TEST_PLAN.md
+9.  /Users/you/projects/triumvirate/docs/v2/APP_FLOW.md
+10. /Users/you/projects/triumvirate/SPEC.md
 ```
 
 ---
@@ -37,16 +37,16 @@ Before writing any code, read these files IN ORDER:
 
 | Skill | Full Path | When to read |
 |-------|-----------|-------------|
-| mx-rust-core | `/Users/mikeboscia/.claude/skills/mx-rust-core/SKILL.md` | EVERY phase — ownership, error handling, traits, modules |
-| mx-rust-async | `/Users/mikeboscia/.claude/skills/mx-rust-async/SKILL.md` | Phase 1-4 — tokio::spawn, channels, JoinSet, CancellationToken |
-| mx-rust-data | `/Users/mikeboscia/.claude/skills/mx-rust-data/SKILL.md` | Phase 3 — serde, rusqlite, config, JSON streaming |
-| mx-rust-network | `/Users/mikeboscia/.claude/skills/mx-rust-network/SKILL.md` | Phase 1, 5 — axum, WebSocket, SSE |
-| mx-rust-services | `/Users/mikeboscia/.claude/skills/mx-rust-services/SKILL.md` | Phase 3, 6 — Cedar, rust-embed, workflow patterns |
-| mx-rust-systems | `/Users/mikeboscia/.claude/skills/mx-rust-systems/SKILL.md` | Phase 1-2, 7 — subprocesses, signals, process groups, graceful shutdown |
-| mx-rust-testing | `/Users/mikeboscia/.claude/skills/mx-rust-testing/SKILL.md` | ALL phases — tokio::test, proptest, insta, criterion benchmarks |
-| mx-rust-project | `/Users/mikeboscia/.claude/skills/mx-rust-project/SKILL.md` | Phase 0, 8 — Cargo workspaces, clippy, build optimization |
-| mx-rust-observability | `/Users/mikeboscia/.claude/skills/mx-rust-observability/SKILL.md` | Phase 7 — tracing, OpenTelemetry, Prometheus, health checks |
-| mx-rust-perf | `/Users/mikeboscia/.claude/skills/mx-rust-perf/SKILL.md` | Phase 7-8 — profiling, benchmarking, zero-copy, SIMD JSON, build speed |
+| mx-rust-core | `/Users/you/.claude/skills/mx-rust-core/SKILL.md` | EVERY phase — ownership, error handling, traits, modules |
+| mx-rust-async | `/Users/you/.claude/skills/mx-rust-async/SKILL.md` | Phase 1-4 — tokio::spawn, channels, JoinSet, CancellationToken |
+| mx-rust-data | `/Users/you/.claude/skills/mx-rust-data/SKILL.md` | Phase 3 — serde, rusqlite, config, JSON streaming |
+| mx-rust-network | `/Users/you/.claude/skills/mx-rust-network/SKILL.md` | Phase 1, 5 — axum, WebSocket, SSE |
+| mx-rust-services | `/Users/you/.claude/skills/mx-rust-services/SKILL.md` | Phase 3, 6 — Cedar, rust-embed, workflow patterns |
+| mx-rust-systems | `/Users/you/.claude/skills/mx-rust-systems/SKILL.md` | Phase 1-2, 7 — subprocesses, signals, process groups, graceful shutdown |
+| mx-rust-testing | `/Users/you/.claude/skills/mx-rust-testing/SKILL.md` | ALL phases — tokio::test, proptest, insta, criterion benchmarks |
+| mx-rust-project | `/Users/you/.claude/skills/mx-rust-project/SKILL.md` | Phase 0, 8 — Cargo workspaces, clippy, build optimization |
+| mx-rust-observability | `/Users/you/.claude/skills/mx-rust-observability/SKILL.md` | Phase 7 — tracing, OpenTelemetry, Prometheus, health checks |
+| mx-rust-perf | `/Users/you/.claude/skills/mx-rust-perf/SKILL.md` | Phase 7-8 — profiling, benchmarking, zero-copy, SIMD JSON, build speed |
 
 **Per-phase skill loading:**
 - Phase 0: Read mx-rust-project (study prior art repos)
@@ -64,7 +64,7 @@ Before writing any code, read these files IN ORDER:
 ## Working Directory
 
 ```
-/Users/mikeboscia/projects/triumvirate/daemon
+/Users/you/projects/triumvirate/daemon
 ```
 
 The Cargo workspace is initialized. Two crates exist (`agentd`, `proto`). `cargo build` passes. `cargo run` boots the daemon at :8080 with a POC HTML dashboard.
@@ -75,7 +75,7 @@ The Cargo workspace is initialized. Two crates exist (`agentd`, `proto`). `cargo
 
 **Phase 0 is next.** Study Ruflo, Clash, swarms-rs, Temporal source code. Write research docs. Then move to Phase 1 (POC 2 — live Claude agent).
 
-Read `/Users/mikeboscia/projects/triumvirate/docs/v2/progress.txt` for exact current state.
+Read `/Users/you/projects/triumvirate/docs/v2/progress.txt` for exact current state.
 
 ---
 

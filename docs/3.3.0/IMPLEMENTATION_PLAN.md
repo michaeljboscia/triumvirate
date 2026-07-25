@@ -1,7 +1,7 @@
 # IMPLEMENTATION_PLAN — v3.3.0 Live Agent Streaming
 
 **Version:** 3.3.0
-**Working Directory:** /Users/mikeboscia/projects/triumvirate
+**Working Directory:** /Users/you/projects/triumvirate
 **Git Branch:** v3.3.0 (branch from main after Wave 0 commit)
 **Spec:** docs/3.3.0/SPEC.md
 **PRD:** docs/3.3.0/PRD.md

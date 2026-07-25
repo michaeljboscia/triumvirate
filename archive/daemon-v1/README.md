@@ -13,7 +13,7 @@ Rust daemon coordinating Claude, Gemini, and Codex in one shared orchestration r
 ## Run
 
 ```bash
-cd /Users/mikeboscia/projects/triumvirate/daemon
+cd /Users/you/projects/triumvirate/daemon
 cd frontend && npm install && cd ..
 cargo run
 ```
@@ -27,7 +27,7 @@ Set `TRIUMVIRATE_SKIP_FRONTEND_BUILD=1` to skip this in constrained environments
 Use the helper scripts in `daemon/scripts/` for day-to-day usage:
 
 ```bash
-cd /Users/mikeboscia/projects/triumvirate
+cd /Users/you/projects/triumvirate
 ./daemon/scripts/triumvirate-cli.sh health
 ./daemon/scripts/triumvirate-cli.sh ask "what changed in auth?"
 ./daemon/scripts/ask-the-twins "review this migration plan"
@@ -45,7 +45,7 @@ Notes:
 For reliable background operation, install the launchd service:
 
 ```bash
-cd /Users/mikeboscia/projects/triumvirate/daemon
+cd /Users/you/projects/triumvirate/daemon
 ./scripts/triumvirate-service.sh install
 ./scripts/triumvirate-service.sh status
 ./scripts/triumvirate-service.sh logs

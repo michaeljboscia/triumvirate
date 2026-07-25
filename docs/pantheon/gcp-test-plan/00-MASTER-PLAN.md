@@ -178,7 +178,7 @@ Lock these BEFORE running tests. Evidence-based decisions require pre-committed 
 ## Directory structure
 
 ```
-/Users/mikeboscia/projects/triumvirate/docs/pantheon/gcp-test-plan/
+/Users/you/projects/triumvirate/docs/pantheon/gcp-test-plan/
 ├── 00-MASTER-PLAN.md              ← this file
 ├── 10-PREFLIGHT.md                ← GCP setup, pre-bake, storage
 ├── 20-EVIDENCE-BUNDLE-SPEC.md     ← what every run emits

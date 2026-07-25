@@ -66,7 +66,7 @@ Every `run_agent_process` call in production hits the real CLI with the real inv
 
 Codex refuses to run outside a trusted git directory. The daemon's Codex connector must pass `--skip-git-repo-check` to avoid failures when cwd is ~ or a non-git path.
 
-Alternatively, the daemon can validate that cwd is a git repo before invoking Codex and return a clear error if not: "Codex requires a git repository as working directory. Current cwd /Users/mikeboscia is not a git repo."
+Alternatively, the daemon can validate that cwd is a git repo before invoking Codex and return a clear error if not: "Codex requires a git repository as working directory. Current cwd /Users/you is not a git repo."
 
 ---
 

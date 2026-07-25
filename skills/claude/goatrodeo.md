@@ -1,12 +1,12 @@
-# Goat Rodeo — Industrialized Spec Review Machine
+# Goat Rodeo: Industrialized Spec Review Machine
 
 **Skill:** `/goatrodeo`
 
-**Purpose:** Pressure-test a spec through multiple rounds of interrogation, live research, and twin review. Auto-resolve what the AIs agree on. Surface only what needs human judgment. Produce a battle-tested spec with traceable REQ-IDs.
+**Purpose:** Pressure-test a spec through multiple rounds of interrogation, live research, and twin review. Auto-resolve what the AIs agree on. Surface only what needs human judgment. Ship a battle-tested spec with traceable REQ-IDs.
 
-**Philosophy:** The clankers do the work, the executive makes the calls.
+**Philosophy:** The clankers do the work. The executive makes the calls.
 
-**The Rule That Was Missing:** Specs that describe systems without describing how the human reaches them will always build the wrong thing. This skill now enforces user-path tracing BEFORE architecture review.
+**The rule that was missing:** a spec that describes a system without describing how the human reaches it will build the wrong thing, confidently. Phase 0 now enforces user-path tracing before any architecture review.
 
 ---
 
