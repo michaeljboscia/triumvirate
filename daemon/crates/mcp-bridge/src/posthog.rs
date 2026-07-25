@@ -12,8 +12,8 @@
 //! `reqwest`, which this crate already carries.
 //!
 //! Opt-in via env, exactly like the existing OTEL exporter in `tracing_setup.rs`:
-//!   POSTHOG_HOST     e.g. https://posthog.e5btools.com   (unset -> this module is a no-op)
-//!   POSTHOG_API_KEY  e.g. phc_...                        (unset -> no-op)
+//!   POSTHOG_HOST     e.g. https://us.i.posthog.com or your self-hosted host (unset -> no-op)
+//!   POSTHOG_API_KEY  your project's phc_ ingest key                        (unset -> no-op)
 //!
 //! Fire-and-forget by construction: the POST is spawned onto the runtime and every error
 //! is swallowed. Telemetry must never be able to fail an agent call.
