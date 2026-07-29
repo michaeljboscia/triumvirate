@@ -5,6 +5,7 @@ use daemon_core::{
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
 use daemon_http::{
+    DaemonRequestError, DaemonRequestFailure, daemon_ask_timeout_secs,
     fetch_daemon_ask_agent, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
     fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
     fetch_daemon_status_snapshot,
@@ -38,6 +39,28 @@ pub type ExecuteAskAgentFn = for<'a> fn(
     Option<ProgressEmitter>,
 ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>>;
 
+/// Describes an `ask_agent` failure without asserting a cause we have not checked.
+///
+/// The old text appended "start it with: triumvirate daemon" to EVERY failure. On
+/// 2026-07-28 that sent the operator hunting for a dead daemon that had been running
+/// continuously for four days: the real cause was the 180s client ceiling on a dispatch
+/// that needed 424s. An unverified remediation is worse than none, because it reads like a
+/// diagnosis and closes the investigation.
+fn describe_ask_agent_failure(err: &anyhow::Error) -> String {
+    let detail = format!("ask_agent failed: {err:#}");
+    match err.downcast_ref::<DaemonRequestError>().map(|e| e.failure) {
+        Some(DaemonRequestFailure::Unreachable) => {
+            format!("{detail}\nstart it with: triumvirate daemon")
+        }
+        Some(DaemonRequestFailure::Timeout) => format!(
+            "{detail}\nthe daemon is running and may still be finishing this request; raise \
+             TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS (currently {}s) if the model needs longer",
+            daemon_ask_timeout_secs()
+        ),
+        _ => detail,
+    }
+}
+
 pub async fn ask_agent(
     req: &AskAgentRequest,
     context: &RequestContext<RoleServer>,
@@ -69,11 +92,8 @@ pub async fn ask_agent(
                             return Ok(Json(response));
                         }
                         Err(err) => {
-                            emitter.emit(format!("→ {display}: FAILED ✗ ({err})")).await;
-                            return Err(format!(
-                                "ask_agent requires triumvirate daemon; daemon request failed: {err}. \\
-start it with: triumvirate daemon"
-                            ));
+                            emitter.emit(format!("→ {display}: FAILED ✗ ({err:#})")).await;
+                            return Err(describe_ask_agent_failure(&err));
                         }
                     }
                 }
@@ -309,4 +329,52 @@ pub async fn daemon_health() -> Result<Json<DaemonHealthResponse>, String> {
         .await
         .map(Json)
         .map_err(|e| format!("daemon health query failed: {e}"))
+}
+
+#[cfg(test)]
+mod ask_agent_failure_message_tests {
+    use super::*;
+
+    fn daemon_error(failure: DaemonRequestFailure) -> anyhow::Error {
+        anyhow::Error::new(DaemonRequestError {
+            failure,
+            url: "http://127.0.0.1:8080/ask-agent".to_string(),
+            detail: "error sending request: operation timed out".to_string(),
+            waited: (failure == DaemonRequestFailure::Timeout)
+                .then_some(std::time::Duration::from_secs(180)),
+        })
+    }
+
+    #[test]
+    fn timeout_does_not_tell_the_user_to_start_a_running_daemon() {
+        let message = describe_ask_agent_failure(&daemon_error(DaemonRequestFailure::Timeout));
+        assert!(
+            !message.contains("start it with"),
+            "the daemon was never down; this line is what sent the operator hunting a corpse: {message}"
+        );
+        assert!(message.contains("may still be finishing"), "{message}");
+        assert!(message.contains("TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS"), "{message}");
+    }
+
+    #[test]
+    fn unreachable_still_gets_the_start_instruction() {
+        let message = describe_ask_agent_failure(&daemon_error(DaemonRequestFailure::Unreachable));
+        assert!(message.contains("start it with: triumvirate daemon"), "{message}");
+        assert!(!message.contains("may still be finishing"), "{message}");
+    }
+
+    #[test]
+    fn an_unclassified_failure_prescribes_nothing() {
+        let message = describe_ask_agent_failure(&anyhow::anyhow!("something else entirely"));
+        assert_eq!(message, "ask_agent failed: something else entirely");
+    }
+
+    #[test]
+    fn the_message_carries_the_source_chain() {
+        let message = describe_ask_agent_failure(&daemon_error(DaemonRequestFailure::Timeout));
+        // `{err}` alone would print only the outermost frame, which is identical for a
+        // refused connection and a timeout. `{err:#}` plus the preserved detail is the fix.
+        assert!(message.contains("operation timed out"), "{message}");
+        assert!(!message.contains(r"\"), "stray backslash from the old literal: {message}");
+    }
 }

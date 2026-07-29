@@ -74,6 +74,111 @@ static DAEMON_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 const DEFAULT_DAEMON_HTTP_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_DAEMON_ASK_TIMEOUT_SECS: u64 = 180;
 
+/// Why a request to the daemon failed.
+///
+/// reqwest renders EVERY `Kind::Request` failure with the same sentence:
+/// `error sending request for url (...)`. A refused connection and an elapsed `.timeout()`
+/// are indistinguishable in `Display`; the only discriminator lives in the `source` chain,
+/// and `bail!("...: {e}")` throws that chain away. That is how, on 2026-07-28, a daemon
+/// that had been up continuously for four days got reported as "not running": an agy
+/// dispatch needed 424s, the client ceiling is 180s, and the resulting message named the
+/// wrong component and prescribed a fix for a process that was already healthy.
+/// Classify once, here, so no caller has to guess the cause from a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonRequestFailure {
+    /// The connection was established and the daemon owns the request. WE gave up first,
+    /// so the daemon is very likely still working. Never report this as "daemon is down".
+    Timeout,
+    /// Nothing accepted the connection: not listening, refused, DNS, or TLS.
+    Unreachable,
+    /// Anything else (body decode, redirect policy, ...).
+    Other,
+}
+
+/// A daemon request failure that keeps both its classification and its full source chain.
+#[derive(Debug)]
+pub struct DaemonRequestError {
+    pub failure: DaemonRequestFailure,
+    pub url: String,
+    /// The error and every `source` beneath it, colon-joined.
+    pub detail: String,
+    /// How long we were willing to wait, when a timeout is what ended the request.
+    pub waited: Option<Duration>,
+}
+
+impl std::fmt::Display for DaemonRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.failure {
+            DaemonRequestFailure::Timeout => {
+                let waited = self
+                    .waited
+                    .map(|d| format!(" within {}s", d.as_secs()))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "daemon did not respond{waited} to {} (the request was accepted; the daemon may still be working on it): {}",
+                    self.url, self.detail
+                )
+            }
+            DaemonRequestFailure::Unreachable => {
+                write!(f, "daemon unreachable at {}: {}", self.url, self.detail)
+            }
+            DaemonRequestFailure::Other => {
+                write!(f, "daemon request failed for {}: {}", self.url, self.detail)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DaemonRequestError {}
+
+/// Renders an error together with every `source` beneath it.
+///
+/// Without this the caller sees `error sending request for url (...)` and nothing else,
+/// which is exactly as informative for a timeout as it is for a refused connection.
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cursor = err.source();
+    while let Some(current) = cursor {
+        let rendered = current.to_string();
+        // reqwest repeats the outer message in some inner frames; keep the chain readable.
+        if !rendered.is_empty() && parts.last().map(|last| last != &rendered).unwrap_or(true) {
+            parts.push(rendered);
+        }
+        cursor = current.source();
+    }
+    parts.join(": ")
+}
+
+/// Order matters: a CONNECT that timed out reports true for both predicates, and the
+/// honest answer there is "unreachable" (nothing ever accepted the request), which is also
+/// the only case where restarting the daemon is a sane response.
+fn classify_reqwest_error(e: &reqwest::Error) -> DaemonRequestFailure {
+    if e.is_connect() {
+        DaemonRequestFailure::Unreachable
+    } else if e.is_timeout() {
+        DaemonRequestFailure::Timeout
+    } else {
+        DaemonRequestFailure::Other
+    }
+}
+
+fn daemon_request_error(url: &str, e: &reqwest::Error, waited: Duration) -> DaemonRequestError {
+    let failure = classify_reqwest_error(e);
+    DaemonRequestError {
+        failure,
+        url: url.to_string(),
+        detail: error_chain(e),
+        waited: matches!(failure, DaemonRequestFailure::Timeout).then_some(waited),
+    }
+}
+
+/// The client-side ceiling on `ask_agent`, in seconds, so callers can name it in the
+/// message instead of telling the user to restart a daemon that never stopped.
+pub fn daemon_ask_timeout_secs() -> u64 {
+    daemon_ask_timeout().as_secs()
+}
+
 pub fn reset_daemon_autostart_flag_for_tests() {
     DAEMON_AUTOSTART_ATTEMPTED.store(false, Ordering::SeqCst);
 }
@@ -164,9 +269,15 @@ async fn daemon_get_json<T: serde::de::DeserializeOwned>(url: String) -> anyhow:
             Ok(response.json::<T>().await?)
         }
         Err(e) => {
-            if attempt_daemon_autostart_once().unwrap_or(false) {
+            let failure = daemon_request_error(&url, &e, timeout);
+            if failure.failure == DaemonRequestFailure::Unreachable
+                && attempt_daemon_autostart_once().unwrap_or(false)
+            {
                 sleep(Duration::from_millis(300)).await;
-                let retry = client.get(&url).bearer_auth(token).timeout(timeout).send().await?;
+                let retry = match client.get(&url).bearer_auth(token).timeout(timeout).send().await {
+                    Ok(retry) => retry,
+                    Err(e) => anyhow::bail!(daemon_request_error(&url, &e, timeout)),
+                };
                 if !retry.status().is_success() {
                     let status = retry.status();
                     let body = retry.text().await.unwrap_or_default();
@@ -178,7 +289,7 @@ async fn daemon_get_json<T: serde::de::DeserializeOwned>(url: String) -> anyhow:
                 }
                 return Ok(retry.json::<T>().await?);
             }
-            anyhow::bail!("daemon request failed: {e}")
+            anyhow::bail!(failure)
         }
     }
 }
@@ -276,16 +387,28 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
             Ok(response.json::<TResp>().await?)
         }
         Err(e) => {
-            if attempt_daemon_autostart_once().unwrap_or(false) {
+            let failure = daemon_request_error(&url, &e, timeout);
+            // Only a daemon we could not REACH is worth (re)starting. Retrying a timeout
+            // re-sends a request the daemon already accepted: it spawns a second, duplicate,
+            // paid dispatch on top of one that is still running, and the extra daemon process
+            // loses the race to bind 8080 and dies. Observed 2026-07-28: a 424s agy dispatch
+            // tripped the 180s ceiling and this branch launched an identical one 300ms later.
+            if failure.failure == DaemonRequestFailure::Unreachable
+                && attempt_daemon_autostart_once().unwrap_or(false)
+            {
                 sleep(Duration::from_millis(300)).await;
-                let retry = client
+                let retry = match client
                     .post(&url)
                     .bearer_auth(token)
                     .headers(trace_headers())
                     .json(payload)
                     .timeout(timeout)
                     .send()
-                    .await?;
+                    .await
+                {
+                    Ok(retry) => retry,
+                    Err(e) => anyhow::bail!(daemon_request_error(&url, &e, timeout)),
+                };
                 if !retry.status().is_success() {
                     let status = retry.status();
                     let body = retry.text().await.unwrap_or_default();
@@ -297,7 +420,7 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
                 }
                 return Ok(retry.json::<TResp>().await?);
             }
-            anyhow::bail!("daemon request failed: {e}")
+            anyhow::bail!(failure)
         }
     }
 }
@@ -1557,4 +1680,167 @@ pub async fn fallback_gc_route(
         )
     })?;
     Ok(AxumJson(FallbackGcResponse { removed }))
+}
+
+#[cfg(test)]
+mod daemon_request_failure_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug)]
+    struct Layered(&'static str, Option<Box<Layered>>);
+
+    impl std::fmt::Display for Layered {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layered {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_ref().map(|inner| inner.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn error_chain_includes_every_source() {
+        let err = Layered(
+            "error sending request for url (http://127.0.0.1:8080/ask-agent)",
+            Some(Box::new(Layered("operation timed out", None))),
+        );
+        // The second frame is the ONLY thing that separates a timeout from a refusal.
+        // `{e}` alone renders just the first frame, which is the whole defect.
+        assert_eq!(
+            error_chain(&err),
+            "error sending request for url (http://127.0.0.1:8080/ask-agent): operation timed out"
+        );
+        assert_eq!(err.to_string(), "error sending request for url (http://127.0.0.1:8080/ask-agent)");
+    }
+
+    #[test]
+    fn error_chain_collapses_repeated_frames() {
+        let err = Layered("same", Some(Box::new(Layered("same", None))));
+        assert_eq!(error_chain(&err), "same");
+    }
+
+    #[test]
+    fn timeout_and_unreachable_do_not_render_the_same_sentence() {
+        let timeout = DaemonRequestError {
+            failure: DaemonRequestFailure::Timeout,
+            url: "http://127.0.0.1:8080/ask-agent".to_string(),
+            detail: "error sending request: operation timed out".to_string(),
+            waited: Some(Duration::from_secs(180)),
+        };
+        let unreachable = DaemonRequestError {
+            failure: DaemonRequestFailure::Unreachable,
+            url: "http://127.0.0.1:8080/ask-agent".to_string(),
+            detail: "error sending request: Connection refused".to_string(),
+            waited: None,
+        };
+
+        let timeout_text = timeout.to_string();
+        assert!(timeout_text.contains("within 180s"), "{timeout_text}");
+        assert!(timeout_text.contains("may still be working"), "{timeout_text}");
+        assert!(!timeout_text.contains("unreachable"), "{timeout_text}");
+
+        let unreachable_text = unreachable.to_string();
+        assert!(unreachable_text.contains("unreachable"), "{unreachable_text}");
+        assert!(!unreachable_text.contains("may still be working"), "{unreachable_text}");
+
+        assert_ne!(timeout_text, unreachable_text);
+    }
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    /// One test, three phases, because the env and the autostart latch are process-global
+    /// and parallel test threads would race them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn classifies_live_failures_and_only_autostarts_when_unreachable() {
+        let home = std::env::temp_dir().join(format!("tv-daemon-http-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create test home");
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &home);
+            // Report autostart as "done" without spawning a real daemon from a test.
+            std::env::set_var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN", "1");
+            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART");
+        }
+
+        // --- phase 1: a daemon that accepts the request and takes too long ---
+        let app = axum::Router::new().route(
+            "/slow",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                AxumJson(serde_json::json!({}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        reset_daemon_autostart_flag_for_tests();
+        let err = daemon_post_json_with_timeout::<_, serde_json::Value>(
+            format!("http://{addr}/slow"),
+            &serde_json::json!({}),
+            Duration::from_millis(400),
+        )
+        .await
+        .expect_err("a 400ms ceiling against a 30s handler must fail");
+
+        let classified = err
+            .downcast_ref::<DaemonRequestError>()
+            .expect("failure must survive as a typed error, not a flattened string");
+        assert_eq!(classified.failure, DaemonRequestFailure::Timeout);
+        assert_eq!(classified.waited, Some(Duration::from_millis(400)));
+        // The source chain is what proves it was a timeout and not a refusal.
+        assert!(
+            classified.detail.contains("error sending request"),
+            "detail lost the reqwest frame: {}",
+            classified.detail
+        );
+        assert!(
+            classified.detail.len() > "error sending request".len(),
+            "detail is the bare Display string, source chain was dropped: {}",
+            classified.detail
+        );
+        // The regression that started all of this: a timeout used to relaunch the daemon
+        // and re-send a request the daemon had already accepted.
+        assert!(
+            !DAEMON_AUTOSTART_ATTEMPTED.load(Ordering::SeqCst),
+            "a timeout must never trigger autostart"
+        );
+
+        server.abort();
+
+        // --- phase 2: nothing listening at all ---
+        reset_daemon_autostart_flag_for_tests();
+        let dead = format!("http://127.0.0.1:{}/ask-agent", free_port());
+        let err = daemon_post_json_with_timeout::<_, serde_json::Value>(
+            dead.clone(),
+            &serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a closed port must fail");
+
+        let classified = err
+            .downcast_ref::<DaemonRequestError>()
+            .expect("failure must survive as a typed error");
+        assert_eq!(classified.failure, DaemonRequestFailure::Unreachable);
+        assert_eq!(classified.waited, None);
+        assert!(classified.to_string().contains("unreachable"), "{classified}");
+        assert!(
+            DAEMON_AUTOSTART_ATTEMPTED.load(Ordering::SeqCst),
+            "an unreachable daemon should still attempt autostart"
+        );
+
+        // --- phase 3: the two failures must not read alike ---
+        assert!(!classified.to_string().contains("may still be working"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
