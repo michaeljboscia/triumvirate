@@ -1,5 +1,18 @@
 # BUG REPORT — triumvirate daemon: `/session/ask` intermittent failure
 
+**STATUS: PARTIALLY RESOLVED 2026-07-28** — hypothesis #2 below ("error-wrapping swallows
+the cause", called out here as "*the* first patch") was correct and went unapplied for two
+months. It is now fixed: `daemon-http` classifies the failure and preserves the full source
+chain, so `error sending request for url (...)` can no longer hide a timeout, a refusal, and
+a decode error behind one sentence. See
+`2026-07-28-timeout-misreported-as-dead-daemon.md`, where the same string caused a healthy
+daemon to be declared dead.
+
+Hypotheses #1, #3, #4, #5 were never tested and remain open as D-008 in `OPEN.md`. It is
+possible the original symptom was entirely a timeout misread as a transport failure, which
+the fix makes impossible to repeat. Treat that as untested, not confirmed: the next
+occurrence will name its own cause.
+
 **Date observed:** 2026-05-25, throughout a multi-hour `/goatrodeo` ceremony.
 **Daemon version:** `triumvirate-daemon-v2 3.9.0` (per `daemon_health`).
 **Bind addr:** `127.0.0.1:18180`.
