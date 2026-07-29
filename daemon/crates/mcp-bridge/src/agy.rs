@@ -235,10 +235,9 @@ pub fn sweep_stale_temp_files() {
         }
         if let Ok(modified) = entry.metadata().and_then(|m| m.modified())
             && modified < cutoff
+            && std::fs::remove_file(entry.path()).is_ok()
         {
-            if std::fs::remove_file(entry.path()).is_ok() {
-                reaped += 1;
-            }
+            reaped += 1;
         }
     }
     // Only report when we actually reaped something: a clean sweep is not news, but a steady
