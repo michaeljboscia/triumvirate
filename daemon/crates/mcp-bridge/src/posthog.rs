@@ -628,33 +628,6 @@ pub fn record_session_invalidated(agent: &str, backend: Option<&str>, repo: Opti
     );
 }
 
-/// Emit `tv_codex_dispatch` for a completed ABE codex dispatch (`dispatch_codex` and
-/// `dispatch_codex_worktree`).
-///
-/// This path was fully dark. It does not go through `execute_ask_agent`: ABE spawns codex
-/// itself and returns a task id immediately, so `CallTelemetry` never sees it. That made the
-/// one surface where an agent WRITES TO THE REPO the least observable thing in the system,
-/// while `ask_agent` (which only ever returns text) was fully instrumented.
-///
-/// Not an `$ai_generation`: ABE reads an exit status and a git sha, never tokens or a model.
-/// Zeroed tokens would let a chart sum fabricated data into real totals.
-///
-/// `outcome` is the taxonomy that matters here, and it is NOT just pass/fail:
-///   completed  - exited 0 AND produced a commit
-///   cancelled  - an external cancel_task won the terminal transition
-///   stuck      - the watchdog saw no filesystem activity
-///   setup_failed / spawn_failed - never got as far as running
-///   no_commit  - exited 0 and produced NOTHING. The silent one. Codex reported success and
-///                the repo is unchanged; without this it is indistinguishable from a real
-///                success on every surface except a human going to look for the commit.
-///   failed     - non-zero exit
-///   timeout    - killed at the deadline
-///   wait_error - we lost track of the child
-///
-/// No task_id and no prompt: both unbounded. This event is for counting and grouping ("how
-/// often does codex silently produce nothing, and in which repo?"); the local tracker stays
-/// the place to inspect one dispatch.
-
 /// Emit `tv_agy_version_mismatch` when the daemon dispatches against an agy binary whose version
 /// differs from the pinned expected version. Drift proceeds warn-only (unless strict), which is
 /// easy to lose in logs — PostHog once found 70+ such warnings in 3h. This turns it into a
@@ -673,6 +646,33 @@ pub fn record_agy_version_mismatch(installed: &str, expected: &str) {
     );
 }
 
+/// Emit `tv_codex_dispatch` for a completed ABE codex dispatch (`dispatch_codex` and
+/// `dispatch_codex_worktree`).
+///
+/// This path was fully dark. It does not go through `execute_ask_agent`: ABE spawns codex
+/// itself and returns a task id immediately, so `CallTelemetry` never sees it. That made the
+/// one surface where an agent WRITES TO THE REPO the least observable thing in the system,
+/// while `ask_agent` (which only ever returns text) was fully instrumented.
+///
+/// Not an `$ai_generation`: ABE reads an exit status and a git sha, never tokens or a model.
+/// Zeroed tokens would let a chart sum fabricated data into real totals.
+///
+/// `outcome` is the taxonomy that matters here, and it is NOT just pass/fail:
+///
+///   - completed  - exited 0 AND produced a commit
+///   - cancelled  - an external cancel_task won the terminal transition
+///   - stuck      - the watchdog saw no filesystem activity
+///   - setup_failed / spawn_failed - never got as far as running
+///   - no_commit  - exited 0 and produced NOTHING. The silent one. Codex reported success and
+///     the repo is unchanged; without this it is indistinguishable from a real success on
+///     every surface except a human going to look for the commit.
+///   - failed     - non-zero exit
+///   - timeout    - killed at the deadline
+///   - wait_error - we lost track of the child
+///
+/// No task_id and no prompt: both unbounded. This event is for counting and grouping ("how
+/// often does codex silently produce nothing, and in which repo?"); the local tracker stays
+/// the place to inspect one dispatch.
 pub fn record_codex_dispatch(
     surface: &str,
     outcome: &str,
@@ -840,6 +840,7 @@ pub fn record_maintenance(job: &str, outcome: &str, count: u64) {
 ///     recovery; an operator must refill or rotate the key. Completely invisible before this.
 ///   - `open_transient`: repeated 429/5xx tripped the breaker — the paid provider is throttling
 ///     or erroring, so paid traffic is being shed.
+///
 /// `to`/`from` are the state labels; both are a fixed low-cardinality set.
 ///
 /// Note on recovery: `hard_open_insufficient_balance` is a PROCESS-LIFETIME LATCH — the breaker
@@ -959,7 +960,6 @@ fn sanitize_mcp_json_inner(v: &serde_json::Value, depth: usize) -> serde_json::V
 
 /// Emit `$mcp_tool_call` for one MCP tool invocation (all 54 tools, from the single call_tool
 /// choke point). distinct_id is the MCP session id, per PostHog's per-session dashboard model.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn record_mcp_tool_call(
     session_id: &str,

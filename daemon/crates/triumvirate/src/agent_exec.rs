@@ -2571,8 +2571,10 @@ async fn run_claude_cli_process_with_session(
         anyhow::bail!("claude connector failed: exited with status {status}");
     }
 
-    let mut parsed = ParsedAgentResult::default();
-    parsed.response_text = raw_output.trim().to_string();
+    let mut parsed = ParsedAgentResult {
+        response_text: raw_output.trim().to_string(),
+        ..Default::default()
+    };
     if parsed.session_id.is_none() {
         parsed.session_id = session_id.map(ToString::to_string);
     }
