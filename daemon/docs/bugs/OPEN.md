@@ -97,14 +97,21 @@ occurs, this is untested rather than fixed.
 
 ### D-009 — No detection for a guard that is installed but inert
 **Found:** 2026-07-28 · **Severity:** MEDIUM
-**Evidence:** both git hooks were symlinks to `/Users/mikeboscia/...` (a username that does
-not exist on this machine) from 2026-05-10 to 2026-07-28. `ls -la` showed hooks present. Git
-stats a dangling symlink, finds nothing, and silently runs no hook. Clippy went red on main
-and no local gate objected.
-**Why it matters:** this is the same failure class as everything above, applied to our own
-tooling: a control that reports presence and does nothing. Nothing currently detects it.
-**Check:** a startup or CI step that executes each configured guard and fails if one is
-missing, unreadable, or non-executable.
+**Evidence:** git hooks were dead on this machine from 2026-05-10 to 2026-07-29 in **two
+independent ways**, and fixing the first did not fix the hooks:
+1. Both symlinks in `.git/hooks/` pointed at `/Users/mikeboscia/...`, a username that does
+   not exist here. `ls -la` showed hooks present; `head` on them said No such file or
+   directory. Repointed 2026-07-28.
+2. `core.hooksPath` in `.git/config` was ALSO set to `/Users/mikeboscia/projects/triumvirate/.git/hooks`.
+   When that config is set, git uses it **exclusively** and never looks in `.git/hooks/`, so
+   repointing the symlinks changed nothing. Unset 2026-07-29.
+**Why it matters:** the same failure class as everything above, applied to our own tooling.
+It also shows the verification trap: on 2026-07-28 the fix was "verified" by executing the
+hook script by hand, which proves the script works and says nothing about whether git calls
+it. Only a real `git push` distinguishes those.
+**Check:** a startup or CI step that pushes a throwaway ref (or otherwise triggers each
+guard through its real entry point) and fails if the guard produces no output. Verifying the
+artifact is not verifying the path.
 
 ---
 
@@ -115,9 +122,12 @@ Error source chain discarded, unconditional restart advice, and autostart firing
 (one call, two paid dispatches). Fixed in `daemon-http` and `mcp-tools`, 8 tests, negative
 control confirmed. See `2026-07-28-timeout-misreported-as-dead-daemon.md`.
 
-### 2026-07-28 — both git hooks dangling since 2026-05-10
-Repointed via `scripts/install-git-hooks.sh`; both now execute and exit 0. The absence of
-detection for this class remains open as D-009.
+### 2026-07-29 — git hooks inert since 2026-05-10 (two causes, not one)
+Symlinks in `.git/hooks/` repointed via `scripts/install-git-hooks.sh` on 2026-07-28, and
+`core.hooksPath` unset on 2026-07-29. The first fix alone did nothing: with `core.hooksPath`
+set, git never reads `.git/hooks/`. Proven fixed by pushing a throwaway branch and watching
+`pre-push: ✓ check + clippy passed` appear on a real push, not by running the script by
+hand. The absence of detection for this class remains open as D-009.
 
 ### 2026-07-28 — clippy red on main, blocking CI
 Four errors in `mcp-bridge` (orphaned doc block, doc list continuation, duplicated
@@ -134,4 +144,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-07-28
+**Last reviewed:** 2026-07-29
