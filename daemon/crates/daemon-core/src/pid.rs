@@ -139,14 +139,23 @@ impl Drop for PidFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// The timestamp alone is NOT unique: macOS reports this clock at microsecond
+    /// granularity, so two tests starting in the same thread-scheduling slice get the same
+    /// root and then fight over one `daemon.pid`. That is how `rejects_garbage` flaked in a
+    /// full `cargo test --workspace` run while passing 6/6 in isolation: a sibling had
+    /// already overwritten the garbage with a valid pid. The counter makes the path unique
+    /// no matter what the clock reports.
     fn unique_test_root() -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("triumvirate-pid-test-{nanos}"));
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("triumvirate-pid-test-{nanos}-{seq}"));
         std::fs::create_dir_all(&root).unwrap();
         root
     }
