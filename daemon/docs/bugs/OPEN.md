@@ -58,15 +58,25 @@ taxonomy.
 timeout happens to be a constant.
 **Check:** a failed generation in PostHog carries a cause string.
 
-### D-005 — Five instrumentation streams have gone silent, cause unknown
-**Found:** 2026-07-28 · **Severity:** MEDIUM
+### D-005 — Instrumentation streams gone silent, cause unknown
+**Found:** 2026-07-28 · **Severity:** LOW (was MEDIUM) · **Partially resolved 2026-08-02**
 **Evidence:** hours since last event as of 2026-07-28: `tv_review_verdict` 167,
 `tv_fleet_spawn` 167, `tv_review_requested` 167, `tv_codex_dispatch` 165, `tv_maintenance` 122.
-**Why it matters:** unknown whether those code paths stopped running or their emitters broke.
-Two dashboard tiles chart `tv_codex_dispatch` and have been flat zero for six days, which
-reads as "no defects."
-**Check:** for each stream, either exercise the path and see the event land, or confirm the
-path genuinely has not run.
+
+**RESOLVED for `tv_codex_dispatch` (2026-08-02):** the emitter is healthy. Over 30 days there
+were 4 `dispatch_codex` plus 2 `dispatch_codex_worktree` MCP calls, and exactly 6
+`tv_codex_dispatch` events. 1:1, nothing dropped. The stream is quiet because the path has
+not been invoked since 2026-07-22, not because it broke. Recent project work
+(`deliverability-control-plane`, 2026-07-30) was research and design, not code: 40
+`gemini-search`, 12 `gemini-check-research`, 10 `gemini-deep-research`, 0 dispatches.
+
+**Still open:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`, `tv_maintenance`.
+The same cross-check is available for these — compare event counts against the corresponding
+`$mcp_tool_call` counts — but review and fleet calls are too sparse (1-2 in 30 days) for the
+comparison to prove anything yet.
+**Why it matters:** a stream at zero is ambiguous between "path idle" and "emitter broken",
+and the two demand opposite responses.
+**Check:** for each remaining stream, exercise the path once and confirm the event lands.
 **Tile:** "Instrumentation freshness — dead signal or quiet one?" (dashboard 1886865).
 
 ### D-006 — agy health probe has never exercised its failure branch
@@ -144,4 +154,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-07-29
+**Last reviewed:** 2026-08-02
