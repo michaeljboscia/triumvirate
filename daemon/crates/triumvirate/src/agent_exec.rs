@@ -379,6 +379,17 @@ pub(crate) async fn execute_ask_agent(
         }
     }
 
+    // Every synchronous validation gate (unsupported agent, oversized DeepSeek payload) is now
+    // behind us and classifies itself before returning. From here on we begin the real dispatch:
+    // acquire a worker, talk to the provider, run peer review. Arm the telemetry so that if this
+    // future is CANCELLED mid-await — the caller's client-side `ask_agent` timeout fires at 180s,
+    // or the client disconnects — the guard emits `tv_outcome = "cancelled"` instead of the
+    // `unreported` sentinel. The metered DeepSeek path is the one that routinely runs long enough
+    // (thinking mode, absolute SLA of 1800s) to be killed by the 180s ceiling before any
+    // classify() arm runs, which is exactly how three terminal errors went missing from
+    // outcome-based monitoring.
+    tel.begin_dispatch();
+
     // REQ-001: resolve the gemini backend once, up front — it drives both the attempt
     // schedule (agy is single-attempt, REQ-013) and the degraded route (REQ-053).
     let gemini_backend_selected = if agent == "gemini" {

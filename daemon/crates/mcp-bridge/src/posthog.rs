@@ -111,6 +111,18 @@ pub struct CallTelemetry {
     /// (credentials/PII masked) and capped in record_ai_generation before they leave the process.
     input: Option<String>,
     output: Option<String>,
+    /// True once the dispatch has actually begun talking to the provider (past every
+    /// synchronous validation gate). It exists to tell two "no outcome was recorded" cases
+    /// apart at Drop:
+    ///   - `in_flight == true`  → the future was CANCELLED mid-await (the caller's client-side
+    ///     `ask_agent` timeout fired, or the client disconnected) after we committed to the
+    ///     call. That is a real terminal outcome — the metered DeepSeek path routinely runs
+    ///     past the 180s client ceiling — so it emits `tv_outcome = "cancelled"`, not the
+    ///     `unreported` sentinel, and stays visible to outcome-based dispatch monitoring.
+    ///   - `in_flight == false` → a synchronous exit returned without classifying itself. That
+    ///     is the original canary the `unreported` default was built to catch, so it is left
+    ///     untouched.
+    in_flight: bool,
 }
 
 impl CallTelemetry {
@@ -128,6 +140,30 @@ impl CallTelemetry {
             attempts: 0,
             input: None,
             output: None,
+            in_flight: false,
+        }
+    }
+
+    /// Mark the call as in-flight: we have cleared every synchronous validation gate and are
+    /// about to (or already) talk to the provider. From here on, a Drop that finds no recorded
+    /// outcome means the future was cancelled mid-await (client timeout / disconnect), which is
+    /// classified as `"cancelled"` rather than left as the `unreported` sentinel. Idempotent.
+    pub fn begin_dispatch(&mut self) {
+        self.in_flight = true;
+    }
+
+    /// The `tv_outcome` string this call will actually emit on Drop. Split out so the
+    /// cancelled-vs-unreported resolution is unit-testable without a live PostHog.
+    ///
+    /// `success` / `degraded_success` / `failure` always win — an explicitly recorded outcome
+    /// is never overridden. Only the untouched `unreported` default is promoted, and only when
+    /// the dispatch had begun (see `in_flight`): an in-flight drop is a cancellation; a
+    /// not-yet-in-flight drop stays the `unreported` canary for a forgotten synchronous exit.
+    pub(crate) fn effective_outcome(&self) -> &'static str {
+        if self.outcome == "unreported" && self.in_flight {
+            "cancelled"
+        } else {
+            self.outcome
         }
     }
 
@@ -211,10 +247,16 @@ impl Drop for CallTelemetry {
         let input_tokens = raw_input.map(|_| total_prompt);
         let cached_tokens = raw_cached.map(|_| hit);
 
+        // Promote an in-flight drop with no recorded outcome to "cancelled" (see
+        // effective_outcome). This is the fix for the DeepSeek dispatches that surfaced as
+        // `unreported`: a metered call whose future the caller abandoned at the 180s client
+        // ceiling never reached any classify() arm, so the guard used to emit the sentinel.
+        let outcome = self.effective_outcome();
+
         record_ai_generation(&AiGeneration {
             agent: &self.agent,
             model: self.model.as_deref(),
-            outcome: self.outcome,
+            outcome,
             trace_id: &self.trace_id,
             input_tokens,
             output_tokens: output,
@@ -1339,5 +1381,71 @@ mod tests {
         let (usd, billing) = cost_usd("deepseek", Some("deepseek-v9-unreleased"), 10, 10, Some(10));
         assert_eq!(billing, "unknown");
         assert_eq!(usd, None);
+    }
+
+    /// Regression for the three DeepSeek dispatches that reached PostHog as `tv_outcome =
+    /// "unreported"` (180s / 68s errors, model=unknown, one primary attempt, metered). Their
+    /// futures were cancelled by the caller's 180s `ask_agent` ceiling before any classify()
+    /// arm ran, so they fell outside outcome-based dispatch monitoring. Once a dispatch is
+    /// in-flight, an unrecorded drop must resolve to the terminal `"cancelled"`, not the
+    /// sentinel.
+    #[test]
+    fn cancelled_deepseek_dispatch_emits_terminal_outcome_not_unreported() {
+        // A metered DeepSeek call with no model resolved yet — exactly the shape observed:
+        // agent=deepseek, $ai_model=unknown. We reproduce the cancellation by arming the
+        // dispatch and then dropping without ever calling success/degraded_success/failure.
+        let mut tel = CallTelemetry::new("deepseek", "trace-cancelled", None);
+        tel.record_attempt();
+        tel.begin_dispatch();
+        assert_eq!(
+            tel.effective_outcome(),
+            "cancelled",
+            "an in-flight drop with no recorded outcome is a cancellation, not `unreported`"
+        );
+
+        // And a cancellation IS an error, so it lands in error/outcome-based monitoring.
+        let g = AiGeneration {
+            agent: "deepseek",
+            model: None,
+            outcome: tel.effective_outcome(),
+            trace_id: "trace-cancelled",
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            thinking_tokens: None,
+            tool_calls: None,
+            duration_ms: 180_001,
+            cost_usd: None,
+            billing: "metered",
+            backend: None,
+            attempts: 1,
+            repo: None,
+            input: None,
+            output: None,
+        };
+        let ev = ai_generation_props(&g);
+        assert_eq!(ev["tv_outcome"], serde_json::json!("cancelled"));
+        assert_eq!(ev["$ai_is_error"], serde_json::json!(true));
+        assert_eq!(ev["$ai_model"], serde_json::json!("unknown"));
+    }
+
+    /// An explicitly recorded outcome is never overridden by the cancellation promotion:
+    /// a DeepSeek call that fails typed (timeout, hard provider, ...) still reads `"failure"`.
+    #[test]
+    fn recorded_failure_wins_over_cancellation_promotion() {
+        let mut tel = CallTelemetry::new("deepseek", "trace-failed", None);
+        tel.begin_dispatch();
+        tel.failure("deepseek absolute SLA timeout exceeded");
+        assert_eq!(tel.effective_outcome(), "failure");
+    }
+
+    /// The `unreported` canary is preserved: a drop that never reached `begin_dispatch` (a
+    /// synchronous exit that forgot to classify itself) must still surface as `unreported` so
+    /// the dashboard tells on a genuinely new unclassified code path — the reason the sentinel
+    /// exists at all.
+    #[test]
+    fn synchronous_unclassified_exit_stays_unreported_canary() {
+        let tel = CallTelemetry::new("deepseek", "trace-sync", None);
+        assert_eq!(tel.effective_outcome(), "unreported");
     }
 }

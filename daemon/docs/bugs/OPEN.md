@@ -49,13 +49,22 @@ render identically, which makes every "nothing happened" conclusion unsound.
 rather than simply empty.
 
 ### D-004 — Failed generations carry no error text
-**Found:** 2026-07-28 · **Severity:** MEDIUM
+**Found:** 2026-07-28 · **Severity:** MEDIUM · **Partially resolved 2026-08-07**
 **Evidence:** the three failed `$ai_generation` events of 2026-07-28 carry
 `tv_outcome = "unreported"` and nothing else. `$ai_error` does not exist in this project's
-taxonomy.
-**Why it matters:** we can see that a generation failed and for how long, never why. The
-180.002s duration is currently the only diagnostic, and it only works because a client
-timeout happens to be a constant.
+taxonomy. Recurred 2026-08-06: three more DeepSeek dispatches (`180.001s`, `68.083s`,
+`180.0s`; `model=unknown`, one primary attempt, metered) landed as `unreported`.
+
+**RESOLVED (the outcome half, 2026-08-07):** those drops were the caller's client-side
+`ask_agent` ceiling (180s) cancelling the daemon's `execute_ask_agent` future before any
+classify() arm ran, so `CallTelemetry` emitted its `unreported` default. `CallTelemetry` now
+arms on dispatch (`begin_dispatch`) and, on a drop with no recorded outcome while in-flight,
+emits `tv_outcome = "cancelled"` (an error outcome, visible to outcome-based monitoring). The
+`unreported` sentinel is retained for a genuinely unclassified *synchronous* exit. DeepSeek is
+the prone path: its absolute SLA is 1800s, far past the 180s client ceiling.
+
+**Still open (the cause-string half):** a `cancelled`/`failure` generation still carries no
+provider cause string — `$ai_error` does not exist in the taxonomy.
 **Check:** a failed generation in PostHog carries a cause string.
 
 ### D-005 — Instrumentation streams gone silent, cause unknown
@@ -154,4 +163,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-08-02
+**Last reviewed:** 2026-08-07
