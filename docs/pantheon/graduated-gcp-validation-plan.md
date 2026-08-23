@@ -8,6 +8,15 @@
 **YellingToad Go rewrite:** `/Users/you/gtm-machine-infrastructure/yelling-toad/go/`
 **Triumvirate Rust daemon:** `/Users/you/projects/triumvirate/daemon/`
 
+> **Hardware premise retired (2026-08-23).** The "$20K to local hardware" framing below reflects April 2026 pricing and a
+> purchase that is no longer planned. The DRAM/GDDR7 shortage repriced every path (512GB M3 Ultra Studio: a $23-26K
+> used-market item Apple no longer sells; 2x RTX PRO 6000: $36-43K, not $30K), and measured throughput did not justify
+> either box regardless of price. Standing policy is rent first, always, with owned metal only as a customer-funded
+> terminal step. See `docs/pantheon/local-inference-buy-vs-rent.md`, section 6 for the policy.
+>
+> The tiers and methodology below still stand. Read them as a catalog of rentable configurations for client pilots and as
+> evidence generation for sovereign-build quotes, not as a runway to a purchase.
+
 ---
 
 ## Design principles

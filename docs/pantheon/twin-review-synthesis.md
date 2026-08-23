@@ -4,6 +4,11 @@
 **Documents reviewed:** PANTHEON_ARCHITECTURE.md, graduated-gcp-validation-plan.md, model-selection.md + 10-item blind-spots analysis
 **Both reviews received:** 2026-04-16 ~19:00 EDT
 
+> **Follow-up (2026-08-23).** The twins' #1 finding, that the $20K budget was a lie, has been settled empirically rather
+> than argued. `docs/pantheon/local-inference-buy-vs-rent.md` prices every path at current market and concludes: rent
+> frontier models per token, own the context layer, defer the hardware. The phased $3K/$6K/$12K ladder proposed below is
+> superseded by that conclusion, not by a cheaper ladder.
+
 ---
 
 ## Verdict: 2/10 from both twins (unanimous)

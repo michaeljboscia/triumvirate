@@ -5,6 +5,22 @@
 **Created:** 2026-04-18
 **Purpose:** The single source of truth for how Pantheon gets tested, validated, and sized on GCP before any local hardware is purchased.
 
+> **Repurposed (2026-08-23). The gates no longer de-risk a purchase.** Standing policy is rent first, always: there is no
+> economic model for buying GPUs for our own use, and owned metal happens only as a customer-funded terminal step after a
+> rented pilot and a signed term. See `docs/pantheon/local-inference-buy-vs-rent.md` section 6.
+>
+> The gates survive with a different job. Read every "purchase decision rule" below as one of these instead:
+>
+> - **Quotable evidence** for sovereign-build proposals. The bundle spec in `20-EVIDENCE-BUNDLE-SPEC.md` is the artifact a
+>   prospect is shown, not an internal buying memo.
+> - **Pilot substrate.** Gates 1 through 5 are the catalog of rented configurations we can stand up for a client pilot,
+>   and what each costs per hour.
+> - **Gate 6 is promoted.** Air-gap sanity was a late nice-to-have. For a sovereign engagement it is the entire product
+>   claim and the one result a client will ask to see.
+>
+> Gate 2's ★ DECISIVE marking refers to a 3090 purchase that is not happening. Its measurements still matter; the verdict
+> it was built to deliver does not.
+
 ---
 
 ## What this document is
