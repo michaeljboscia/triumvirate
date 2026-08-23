@@ -247,6 +247,10 @@ A handful of retainer clients chatting occasionally will never reach the crossov
 
 **Build the context layer. Rent the intelligence.**
 
+> The detail behind "rent" is in `docs/advisory/claude-deployment-options.md`: which delivery path keeps the model vendor out
+> of the request path, what that costs in API surface, and why Zero Data Retention is often the wrong goal for a regulated
+> client. `docs/advisory/ria-compliance-intake.md` is the first worked example of this section applied to a real prospect.
+
 ### Critique of the Retainer Model
 
 The model is sound. Three problems to solve before selling it.
@@ -344,6 +348,11 @@ depend on resolving the hardware question.
 
 So it gets built now, against rented inference, and every sovereign engagement that later materializes is that layer plus
 a hardware pass-through.
+
+**First worked example.** A small financial planning office, reached through both an IC and the owner. The answer for that
+client is seats, not metal, not even an API integration. See `docs/advisory/ria-compliance-intake.md`. It is the
+control-motivated segment above behaving exactly as predicted, and it is evidence for the rent-first policy rather than
+against it.
 
 ---
 
