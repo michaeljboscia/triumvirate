@@ -3,7 +3,7 @@
 **A buy-versus-rent analysis, and a product critique**
 
 **Created:** 2026-08-23
-**Status:** canonical for hardware-purchase decisions. Supersedes the $20K hardware premise in `graduated-gcp-validation-plan.md`, `model-selection.md`, and `twin-review-synthesis.md`.
+**Status:** canonical for hardware-purchase decisions. Standing policy is rent first (section 6). Supersedes the $20K hardware premise in `graduated-gcp-validation-plan.md`, `model-selection.md`, and `twin-review-synthesis.md`.
 **Companion docs:**
 - `docs/pantheon/gcp-test-plan/00-MASTER-PLAN.md` - the executable test plan whose Gates 1/2/3 exist to settle these purchase decisions
 - `docs/pantheon/model-selection.md` - April 2026 model landscape, now stale on both models and VRAM math
@@ -278,13 +278,86 @@ Meter token spend or cap it. On a flat retainer, one client's ops team falling i
 
 ---
 
-## 6. Summary of Recommendations
+## 6. Rent First. Always.
+
+The preceding sections priced a purchase. This section states the policy that comes out of them, which is narrower than
+"defer" and broader than "not yet."
+
+**There is no economic model for buying GPUs for our own use.** Not at this pricing, not at our utilization. That is
+settled and it is not revisited on a price dip. The only path to owned metal runs through a customer who wants sovereign
+AI and does not want to operate it themselves.
+
+And that path still starts rented.
+
+### The order of operations is the whole discipline
+
+Buying before selling takes inventory risk and customer-acquisition risk simultaneously, at a peak shortage premium.
+The sequence is fixed:
+
+1. **Sell the outcome**, not the hardware. The client is buying a maintained model of their business with an interface
+   on it. That is true whether inference runs in us-east4 or in their basement.
+2. **Pilot on rented GPUs.** Their real workload, our GCP config, evidence bundle as the deliverable. They watch it work
+   before anyone spends capital.
+3. **Sign a term** long enough to amortize whatever comes next.
+4. **Only then, metal, on their balance sheet.** They buy the cards. We architect, build, integrate, and maintain. The
+   shortage premium is passed through at cost, never carried.
+
+If step 4 never arrives, nothing was lost. That is the point of running the steps in this order.
+
+### Never our capex
+
+Owned hardware on our books converts a services business into an asset-financing business with a depreciation schedule
+set by a commodity market we do not understand and cannot hedge. If GDDR7 supply normalizes in 2027, the buyer of that
+inventory eats the correction. It will not be us. If a client churns, we are not holding $40K of metal built to their
+spec.
+
+### Who the buyer actually is
+
+The three self-hosting justifications in section 5 sort into populations that behave very differently:
+
+| Segment | Wants sovereignty because | Realistic outcome |
+|---|---|---|
+| Compliance-driven (healthcare, financial, legal) | Data residency, PHI, privilege | Mostly lost to Bedrock or Vertex in their own VPC. The compliance officer signs off on a cheaper answer. |
+| True air-gap (defense, SCADA/OT, some pharma R&D) | Genuine network isolation | Real need, real metal. Procurement cycles, clearances, insurance, and SLAs that a small shop absorbs badly. |
+| Control-motivated (founders, family offices, closely held firms) | Will not put their data in someone else's inference, as a matter of preference | The realistic near-term buyer. Faster close, no procurement gauntlet, smaller deal. |
+
+Aim at the third deliberately. The first is a losing bid against a hyperscaler and the second is a business we are not
+staffed to serve yet.
+
+### What this does to the GCP gates
+
+The gates were written to de-risk a purchase we are no longer making. They survive the pivot with a different job:
+
+- **Quotable evidence.** "A 2x RTX PRO 6000 build sustains X tok/s on a workload like yours at Y concurrency, and here is
+  the evidence bundle" is a materially different pitch from a vendor spec sheet. The bundle format in
+  `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` is already the right artifact for this.
+- **Pilot substrate.** Rented GPU configs are where client pilots run. Gates 1 through 5 are the catalog of
+  configurations we know how to stand up and what each one costs per hour.
+- **Gate 6 gets promoted.** Air-gap sanity was a late nice-to-have. For a sovereign engagement it is the entire product
+  claim, and it is the one gate whose result a client will actually ask to see.
+
+### The layer that is worth building either way
+
+The context layer is substrate-agnostic. The same knowledge graph and retrieval stack sits on rented API inference for a
+standard retainer client and on local vLLM for a sovereign one. It is the asset in both cases, and its value does not
+depend on resolving the hardware question.
+
+So it gets built now, against rented inference, and every sovereign engagement that later materializes is that layer plus
+a hardware pass-through.
+
+---
+
+## 7. Summary of Recommendations
 
 | Decision | Recommendation |
 |---|---|
+| **Standing policy** | **Rent first, always. Owned metal only as a customer-funded terminal step after a rented pilot and a signed term.** |
 | $34,000 Mac Studio | Pass. Throughput does not justify it at any price near the ask. |
-| RTX PRO 6000 build | Defer. Budget is $36-43k, not $30k, at 87% shortage premium. |
-| Local inference generally | Rent and profile before buying. Every path is priced at peak. |
+| RTX PRO 6000 build | Not ours to buy. $36-43k at an 87% shortage premium, and no utilization model justifies it. |
+| Local inference generally | Rent and profile. Every path is priced at peak, and the premium is passed through, never carried. |
+| Sovereign engagements | Sell the outcome, pilot on rented GPUs, client buys the hardware on their balance sheet. |
+| Target buyer | Control-motivated firms. Compliance buyers are lost to VPC-hosted frontier models; air-gap buyers need a bigger shop. |
+| GCP gates | Repurposed as quotable evidence and pilot substrate. Gate 6 (air-gap) is promoted to the headline claim. |
 | Retainer product architecture | Rent frontier models via API. Own the context layer. |
 | Retainer positioning | Sell maintained business context, not chatbot access. |
 | Retainer economics | Meter or cap tokens. Price against context maintenance. |
@@ -295,6 +368,7 @@ Meter token spend or cap it. On a flat retainer, one client's ops team falling i
 
 | Version | Date / Time | Notes |
 |---|---|---|
+| v2 | 2026-08-23 | Added section 6, "Rent First. Always." Records the standing policy: no economic model exists for buying GPUs for our own use, the only path to owned metal is customer-funded and starts rented, and the GCP gates are repurposed as sales evidence and pilot substrate rather than purchase de-risking. |
 | v1 | 2026-08-23 13:31 EDT | Original creation. Consolidated from conversational analysis covering Mac Studio valuation, open-weight model benchmarks, Apple Silicon throughput, NVIDIA RTX PRO 6000 pricing, and cloud-hosted retainer product critique. |
 
 ---
