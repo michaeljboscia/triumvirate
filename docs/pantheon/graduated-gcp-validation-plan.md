@@ -8,6 +8,12 @@
 **YellingToad Go rewrite:** `/Users/you/gtm-machine-infrastructure/yelling-toad/go/`
 **Triumvirate Rust daemon:** `/Users/you/projects/triumvirate/daemon/`
 
+> **Hardware premise superseded (2026-08-23).** The "$20K to local hardware" framing below reflects April 2026 pricing. The
+> DRAM/GDDR7 shortage has since repriced every path: a 512GB M3 Ultra Studio is a $23-26K used-market item Apple no longer
+> sells, and a 2x RTX PRO 6000 build now costs $36-43K rather than $30K. See
+> `docs/pantheon/local-inference-buy-vs-rent.md` for current pricing, measured Apple Silicon throughput, and the
+> rent-don't-buy conclusion. The tiers and methodology below still stand; the purchase target they de-risk does not.
+
 ---
 
 ## Design principles

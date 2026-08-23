@@ -5,6 +5,12 @@
 **Created:** 2026-04-18
 **Purpose:** The single source of truth for how Pantheon gets tested, validated, and sized on GCP before any local hardware is purchased.
 
+> **Purchase-decision context (2026-08-23).** The OPEX-first philosophy below has been reinforced, not weakened, by
+> current hardware pricing. `docs/pantheon/local-inference-buy-vs-rent.md` finds every local-inference path priced at a
+> peak shortage premium and recommends deferring the buy entirely. The gates remain worth executing to size and profile
+> the workload; treat their hardware-purchase decision rules as informing a rent-versus-buy crossover, not a scheduled
+> purchase.
+
 ---
 
 ## What this document is

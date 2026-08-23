@@ -9,6 +9,13 @@
 
 **Key benchmark context:** HumanEval is considered saturated/contaminated in 2026. The industry gold standards are now **SWE-bench Verified** (single-file patches, 500 human-curated tasks) and **SWE-bench Pro** (multi-file, avg 4.1 files per task). **LiveCodeBench v6** is the primary speed+quality composite for local models.
 
+> **Superseded on models and VRAM math (2026-08-23).** This inventory is search-verified as of April 16, 2026 and has been
+> overtaken: GLM-5.2, Kimi K2.6/K2.7/K3, and DeepSeek V4-Pro all shipped after it. Kimi K2.6 at native INT4 is roughly
+> 594GB and does not fit 512GB; the GLM-5.2 oQ4 build is 418GB and does not fit 4x RTX PRO 6000. See
+> `docs/pantheon/local-inference-buy-vs-rent.md` section 2 for the current landscape and section 3 for measured
+> throughput. Note also the arXiv GH200 result cited there: SWE-bench rank did not predict per-task outcomes, so treat
+> the tables below as screening data, not selection criteria.
+
 ---
 
 ## The complete landscape (search-verified April 2026)
