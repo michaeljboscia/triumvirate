@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 2 (lines 186-272) — COMPLETE, all three peers logged
-**Next action:** review Phase 3 (Docker image pre-bake, lines 273-371) with all three peers.
+**Current section:** Phase 3 (lines 273-371) — COMPLETE, all three peers logged
+**Next action:** review Phase 4 (Model weights cached to GCS, lines 372-476) with all three peers.
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 2 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 3 of 11 sections reviewed | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -54,7 +54,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 |---|---|---|
 | Phase 1 — Project + billing + quota | 11-185 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 2 — Network + storage | 186-272 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 3 — Docker image pre-bake | 273-371 | no |
+| Phase 3 — Docker image pre-bake | 273-371 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 4 — Model weights cached to GCS | 372-476 | no |
 | Phase 5 — PD snapshots | 477-544 | no |
 | Phase 6 — Custom VM images | 545-642 | no |
@@ -67,6 +67,95 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` Phase 3 (lines 273-371)
+
+Raw output: `review-raw/10-PREFLIGHT-phase-3.md`. All three peers.
+
+**Verdict: Phase 3 does not execute as written.** Step 3.1 is partly valid, step 3.2 is blocked by missing files, and
+step 3.3 is entirely fictional.
+
+#### CRITICAL
+
+**P3-C1. `vllm/vllm-openai:v0.6.5-cpu` does not exist upstream.**
+Line 288. Codex checked the Docker Hub tag API: `404`. vLLM publishes CPU images under a separate repo
+(`vllm/vllm-openai-cpu`), not as a `-cpu` tag, and `vllm/vllm-openai-cpu:v0.6.5` is also `404`. The GPU image
+(line 283) and `nats:2.10-alpine` (line 293) both resolve `200`. *(Codex)*
+
+**P3-C2. Step 3.3 has five independent build failures.**
+- Line 366: `-f harness/Dockerfile` — file does not exist.
+- Line 340: `COPY requirements.txt .` resolves to `gcp-test-plan/requirements.txt`, but line 349 documents it at
+  `harness/requirements.txt`. Neither exists.
+- Line 343: `COPY harness/ ./harness/` copies a directory that is not a Python package.
+- Line 344: `COPY fixtures/ ./fixtures/` — never existed.
+- Line 346: `ENTRYPOINT ["python3", "-m", "harness.runner"]` — module does not exist.
+*(Codex)*
+
+**P3-C3. Step 3.2 Cloud Build references three missing files and a broken substitution.**
+`cloudbuild.yaml` does not exist at the repo root or in `gcp-test-plan/`. `daemon/Dockerfile` does not exist
+(line 308). And line 318 uses `${DEFAULT_REGION}` as if it were a Cloud Build substitution; it is a shell variable and
+Cloud Build will not expand it. `SHORT_SHA` (lines 310, 315) is not reliably populated for `gcloud builds submit` from
+a local source upload, and unavailable substitutions are replaced with empty strings, producing invalid tags. *(Codex)*
+
+**P3-C4. vLLM v0.6.5 is a late-2024 pin being used to test 2026 hardware.**
+Lines 283-284. It predates roughly two years of FlashAttention, continuous batching, and FP8/AWQ quantization work, and
+lacks optimization (possibly support) for the local Ada Lovelace sm_89 card and for GCP's Blackwell G4. Testing current
+silicon on that runtime yields broken builds or throughput that says nothing about the hardware. *(Gemini, with Codex
+concurring that the pin is indefensible unless deliberately targeting a historical runtime)*
+
+#### HIGH
+
+**P3-H1. Build-time supply chain defeats the isolation claim. TWO-PEER CONVERGENCE.**
+Lines 283, 288, 293 pull mutable public tags with no digest pinning, no signature verification, no SBOM, and no
+provenance. DeepSeek's point is the sharp one: the runtime egress test is *structurally incapable* of detecting what is
+inside those images. Dormant or time-triggered callbacks, pre-positioned exfiltration code, vulnerable dependencies,
+and internal pivot tooling all survive a clean packet capture, because the measurement window never covers build and a
+payload can simply wait out the test.
+
+Minimum remedy both peers named: pin by `@sha256:` digest, verify signatures at pull (cosign/Notary), generate and scan
+an SBOM, scan for known vulnerabilities, and record build provenance (command, source commit, dependency tree per
+layer). The egress test then remains one control among several rather than the whole proof.
+
+**This survives the owner's terminology correction.** Even defining air-gap as "not on the public internet," a dormant
+callback baked in at build time is a real hole.
+
+**P3-H2. Cost claim is materially incomplete.**
+Header says "~$2-5 in Cloud Build." Cloud Build itself is plausibly cheap on default pools with a free tier, but the
+line ignores Artifact Registry storage entirely, and vLLM GPU images run roughly 8-10 GB compressed. *(Codex)*
+
+#### MEDIUM
+
+**P3-M1. The Python runner duplicates the shell runner that already exists.**
+Line 346's `harness.runner` would need `__init__.py`, `runner.py`, and a CLI matching the runbooks' gate/config
+semantics. But `harness/runner-wrapper.sh` already owns provision, run, capture, destroy, evidence upload, and gate
+config loading. Codex's recommendation: containerize the wrapper rather than invent a parallel Python runner without a
+deliberate migration plan. His minimal working Dockerfile is in the raw file. *(Codex)*
+
+**P3-M2. Environment variables assumed to persist across steps.**
+Line 280 assumes `DEFAULT_REGION` and `PROJECT_ID` are exported; line 366 depends on `${REGISTRY}` still being set from
+step 3.1. A fresh shell produces malformed tags rather than a clear error. *(Codex)*
+
+**P3-M3. `options: logging: CLOUD_LOGGING_ONLY` (line 320) is defensible but unexplained.**
+Required only when using a user-specified service account, which must set `logsBucket`, `CLOUD_LOGGING_ONLY`, or
+`NONE`. Not inherently required otherwise. *(Codex)*
+
+#### STRATEGIC (whole-phase)
+
+**P3-S1. Registry topology is backwards now that Track A is local.**
+Pushing images to GCP Artifact Registry only to pull them back down to the Lenovo adds latency and egress cost for no
+benefit. Build and retain locally; defer Artifact Registry until GCP actually runs something. *(Gemini)*
+
+**P3-S2. Images must be loaded from disk, not pulled, for any isolation test.**
+If the stack pulls from a registry at runtime, that is a network path, and it is precisely the PGA path the Phase 2
+finding describes. Load from a local OCI tarball (`docker load`) or a strictly local registry before the network is
+severed, so the test has no pull path at all. *(Gemini)*
+
+**P3-S3. Gemini's cut list.** Cut the vLLM CPU image (lines 287-290; pointless with a local Ada GPU). Cut the Cloud
+Build step (lines 300-326; build locally). Cut the containerized test harness (lines 328-369; run via `uv` or a venv).
+Defer all `docker push` (lines 285, 290, 295, 367). Only **vLLM GPU** and **NATS** earn their place for Track A, both
+pinned by digest.
+
+---
 
 ### `10-PREFLIGHT.md` Phase 2 (lines 186-272)
 
@@ -86,8 +175,30 @@ DeepSeek's wording of the strongest honest claim, reusable verbatim in the gate-
 > ranges via Private Google Access, and during the test window after applying deny-all-egress, fewer than 5 outbound
 > packets were observed."
 
-**Consequence:** the sovereign-proof network must be a separate VPC with PGA disabled, or the proof must move to the
-local box entirely. This is the strongest argument yet for running Track A on the Lenovo.
+**OWNER CORRECTION (Mike, 2026-08-25), read this before acting on the above.** Air-gap here does not have to mean
+literal physical isolation, especially for testing and experimentation. The working definition is **not connected to
+the outside world, meaning the public internet**. Private Google Access reaches Google APIs over Google's private
+backbone, not the public internet, so **PGA does not automatically fail that definition and does not need to be
+ripped out.**
+
+**So the finding is a terminology problem, not an architecture problem.** Both readings are correct in their own
+context and the rewrite must hold them apart:
+
+- **For our own testing:** PGA-enabled with default-deny egress genuinely satisfies "not on the public internet." Keep
+  it. It is what makes evidence upload possible without a public IP.
+- **For a client-facing sovereignty claim:** a security team WILL make the distinction, because data written to GCS
+  over PGA is retrievable from the public internet by anyone holding credentials. That is an exfiltration path in the
+  strict sense, and calling it "air-gapped" in a proposal is the kind of claim that ends an engagement.
+
+**The fix is precise language, not network surgery.** Do not label the GCP test "air-gap proof." Use DeepSeek's wording
+or something close to it, which is accurate under both readings:
+
+> "The workload has no public IP and no general internet egress. Outbound traffic is blocked except to Google API
+> ranges via Private Google Access, and during the test window after applying deny-all-egress, fewer than 5 outbound
+> packets were observed."
+
+The local box remains the stronger demonstrator for a client who demands literal isolation, because it can be
+physically unplugged. That is an option to offer, not a requirement to impose on our own test rig.
 
 **P2-C2. The Phase 1 service account cannot run most of Phase 2.**
 Phase 2 never says who executes these commands. If it is `pantheon-validator`, nearly everything fails:
