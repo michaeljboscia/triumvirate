@@ -135,14 +135,32 @@ a client, since it carries operator notes and subjective ratings.
 
 ### `manifest.json`
 
-**Required:** `schema_version`, `run_id`, `gate`, `started_at`, `ended_at`, `generator` (name, version, git commit,
-clean/dirty), `objects` (path plus hash for every file), `schema_valid`, `completeness`, `signature`.
+**Required fields.** Every one of these is either machine-derivable or the bundle is explicitly incomplete. The
+original required none of the integrity fields and required a cost figure that cannot exist yet.
+
+| Field | Contents | Why required |
+|---|---|---|
+| `schema_version` | this spec's version | consumers must know the shape |
+| `run_id`, `gate` | identity | |
+| `started_at`, `ended_at` | timestamps | |
+| `generator` | tool name, version, git commit, **clean or dirty working tree** | a result from a dirty tree is not attributable to a commit |
+| `objects` | every file path with its **content hash** | the basis of tamper evidence |
+| `capture_policy` | duration, snap length, payloads, rotation, and whether truncation occurred | a capture is uninterpretable without it |
+| `schema_valid` | did this manifest validate against `schema_version` | a bundle that failed validation must say so |
+| `completeness` | which required artifacts are present, absent, or truncated | goal 5: explicitly incomplete beats silently partial |
+| `cost_status` | `pending_billing_export`, `estimated`, or `final` | never a bare number of unstated provenance |
+| `signature` | signature over the object list, key identity, external anchor reference | the checkable part |
+
+`total_cost_usd` may appear **only** alongside a `cost_status` that is not `pending_billing_export`.
 
 **Notably NOT required: `total_cost_usd`.** The original required it and populated the example with `0.86`. Cost
-attribution depends on the GCP billing export, which is written throughout the day rather than in real time and can
-backfill for up to five days. **Authoritative cost is unknown when the bundle seals.** Emit
-`cost_status: pending_billing_export` and fill it in later as a separate record, or state it as an estimate and label
-it as one. Never invent it.
+attribution depends on the GCP billing export, which is written **throughout the day rather than in real time**, so
+recent usage typically appears within hours rather than at once. (A separate, larger delay applies only to the
+**initial retroactive backfill** when an export is first enabled; that is a one-time condition, not the steady state.)
+
+Either way, **authoritative cost is not available at the moment the bundle seals.** Emit
+`cost_status: pending_billing_export` and fill it in later as a separate write-once record, or state a figure as an
+estimate and label it as one. Never invent it.
 
 ### Decision records
 
@@ -202,6 +220,28 @@ Two conflicts, both unresolved in the original:
 **Resolution required before the isolation gate runs.** State the capture duration, the snap length, whether payloads
 are captured, the rotation and compression policy, and what happens when the cap is hit. **A capture that was silently
 truncated is worse than no capture, because it looks complete.** NOT BUILT.
+
+### Requirements that settle both conflicts
+
+1. **The isolation gate MUST fail if `raw/` is empty or missing.** It is not optional output. A gate that passes with
+   no capture is asserting isolation from summarized metrics, which is the distinction the whole claim turns on. This
+   is a hard gate condition, not a convention.
+2. **The size bound applies per artifact class, not per bundle.** Metadata, metrics, logs, and summaries stay small.
+   Captures are bounded by an explicit **capture policy** (duration, snap length, payload on/off, rotation), and the
+   resulting size is whatever that policy produces. **The policy is the constraint; the byte count is the
+   consequence.** The original had it backwards, setting a byte target and leaving the capture unspecified.
+3. **Truncation must be recorded in the manifest**, with the reason and the point at which it occurred. A capture that
+   hit its cap is still usable evidence when it says so, and worthless when it does not.
+
+### GPU telemetry sampling
+
+The original sampled `nvidia-smi` at 30 seconds. That is adequate for coarse utilization, memory residency, thermal
+drift, and broad power shape. **It is blind to** short stalls, bursty saturation, allocation spikes, power-throttling
+transients, PCIe and NVLink transfer bursts, and per-process attribution.
+
+**For a performance claim, 30 seconds is too coarse.** Record per-process GPU usage, driver and CUDA versions, and
+either finer sampling or DCGM metrics, plus correlation IDs tying telemetry to specific test windows. **For the
+isolation claim it is irrelevant**, so this need not block Track A.
 
 ---
 

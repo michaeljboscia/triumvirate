@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 2 of 9 (`20-EVIDENCE-BUNDLE-SPEC.md`)
-**Current section:** queue item 2 REVIEWED and REWRITTEN. Verification pass next.
-**Next action:** one narrow verification pass on the rewritten `20-EVIDENCE-BUNDLE-SPEC.md` (check the findings were addressed, do NOT open a new hunt), then queue item 3 (`30-DECISION-RULES.md`).
+**Current section:** queue item 2 COMPLETE (reviewed, rewritten, verified). Codex found one genuine new error in my rewrite (overstated GCP billing latency); fixed.
+**Next action:** queue item 3, `30-DECISION-RULES.md`. Known going in: delete rules 1, 2, 3, 6, 10 (pure CapEx triggers), keep 4, 5, 7, 8 (validate software, substrate agnostic). Rule 10 auto-converts OPEX to CAPEX at $1000/mo for 2 months. APPLY THE STANDING RULE: record what each deleted rule was for.
 
 **Unit plan for queue item 2 (4 units):**
 | Unit | Lines | Contents | Status |
@@ -47,7 +47,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
-| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **REVIEWED + REWRITTEN** (4 units, 3 peers) | see below |
+| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
