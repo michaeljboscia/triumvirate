@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 1 (lines 11-185) — COMPLETE, all three peers logged
-**Next action:** review Phase 2 (Network + storage, lines 186-272) with all three peers.
+**Current section:** Phase 2 (lines 186-272) — COMPLETE, all three peers logged
+**Next action:** review Phase 3 (Docker image pre-bake, lines 273-371) with all three peers.
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — Phase 1 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 2 of 11 sections reviewed | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -53,7 +53,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | Section | Lines | Reviewed |
 |---|---|---|
 | Phase 1 — Project + billing + quota | 11-185 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 2 — Network + storage | 186-272 | no |
+| Phase 2 — Network + storage | 186-272 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 3 — Docker image pre-bake | 273-371 | no |
 | Phase 4 — Model weights cached to GCS | 372-476 | no |
 | Phase 5 — PD snapshots | 477-544 | no |
@@ -67,6 +67,90 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` Phase 2 (lines 186-272)
+
+Raw output: `review-raw/10-PREFLIGHT-phase-2.md`. All three peers.
+
+#### CRITICAL
+
+**P2-C1. Private Google Access in the baseline subnet pre-invalidates the air-gap claim. THREE-PEER CONVERGENCE.**
+Line 201 enables `--enable-private-ip-google-access`. That gives every instance without an external IP a live route to
+Google's public API endpoints. Gate 6 later claims to prove air-gap while explicitly permitting the Google API ranges,
+so the "deny-all" rule is really default-deny with an allowlist, and GCS is a writable destination reachable by anyone
+with the right access. Codex reached this from firewall mechanics, Gemini from architecture, DeepSeek from claim logic.
+
+DeepSeek's wording of the strongest honest claim, reusable verbatim in the gate-6 rewrite:
+
+> "The workload has no public IP and no general internet egress. Outbound traffic is blocked except to Google API
+> ranges via Private Google Access, and during the test window after applying deny-all-egress, fewer than 5 outbound
+> packets were observed."
+
+**Consequence:** the sovereign-proof network must be a separate VPC with PGA disabled, or the proof must move to the
+local box entirely. This is the strongest argument yet for running Track A on the Lenovo.
+
+**P2-C2. The Phase 1 service account cannot run most of Phase 2.**
+Phase 2 never says who executes these commands. If it is `pantheon-validator`, nearly everything fails:
+`compute.instanceAdmin.v1` grants no `compute.networks.create`, `compute.subnetworks.create`, or
+`compute.firewalls.create` (lines 192-194, 197-201, 204-209, 213-218). `storage.objectAdmin` is object-level and grants
+no `storage.buckets.create`, so all five bucket creates fail (lines 229-256). `artifactregistry.reader` is read-only, so
+the repo create fails (lines 262-265). `gcloud auth configure-docker` (line 268) configures the local user's Docker
+helper, not the runtime SA. *(Codex)*
+
+#### HIGH
+
+**P2-H1. `curl -s ifconfig.me` is a fragile way to build a firewall rule.**
+Line 212. Can return empty, HTML error text, or IPv6. Empty expands line 218 to `--source-ranges=/32`. IPv6 with `/32`
+is invalid CIDR. CGNAT, VPN, hotspot, or a changing ISP address makes the rule useless or misleading. Better baseline:
+no public SSH ingress at all. Use IAP TCP forwarding allowing `35.235.240.0/20` to TCP 22, or OS Login with IAP-only
+admin access. *(Codex)*
+
+**P2-H2. The egress comment describes a rule that is never created.**
+Lines 220-222 claim egress is "allowed to GCS + Artifact Registry + Google APIs only." No rule exists; VPC default
+egress is allow-all, which the comment then admits. Anything built between Phase 2 and Gate 6 has unrestricted egress.
+Same disease as the rest of the corpus: the document describes the intended end state in the present tense. *(Codex)*
+
+**P2-H3. The evidence bucket has no immutability, only access control.**
+Lines 235-238 set uniform bucket-level access and public access prevention. Neither is immutability. No
+`--retention-period`, no bucket lock, no object versioning, no lifecycle policy, no explicit `--soft-delete-duration`
+(default 7 days is recoverability, not WORM). The system generating the evidence holds the same IAM rights to overwrite
+or delete it, which is worthless to an auditor. Needs a retention policy plus bucket lock, and ideally a separate
+project where the test system has append-only rights. *(Codex and Gemini, converging)*
+
+#### MEDIUM
+
+**P2-M1. Generic globally-unique bucket names will collide.**
+Lines 229, 235, 241, 247, 253. `pantheon-models`, `pantheon-evidence`, `pantheon-fixtures`, `pantheon-runners`,
+`pantheon-pythia-corpus` are all plausible names someone else already took. Creation fails with a conflict. Add a
+project or environment suffix. *(Codex)*
+
+**P2-M2. The flat internal firewall is fine solo, dangerous shared.**
+Lines 204-209 allow all tcp/udp/icmp across the entire `/20`. Acceptable for a disposable rig, a lateral-movement risk
+the moment a Track C client pilot shares the subnet. *(Gemini)*
+
+**P2-M3. MTU 1500 is a deliberate non-default and is unexplained.**
+Lines 192-194. GCP's VPC default is 1460, valid range 1300-8896. 1500 is defensible but the doc should say why, since
+GKE dataplane behavior can inherit VPC MTU. *(Codex)*
+
+#### STRATEGIC (whole-phase)
+
+**P2-S1. Four of five buckets are dead weight.**
+Cut `pantheon-models` (250GB cache for demoted gates), `pantheon-fixtures` (corpora confirmed never to have existed),
+and `pantheon-runners` (GCP VM startup scripts, useless if Track A is local). Defer `pantheon-pythia-corpus` unless the
+local box pulls from it. Keep `pantheon-evidence`, rebuilt with immutability controls. *(Gemini)*
+
+**P2-S2. The only GCP resources needed right now are Artifact Registry and a hardened evidence bucket.**
+With Track A local, the VPC, subnet, firewall rules, and SSH ingress (lines 188-223) serve no immediate purpose.
+Artifact Registry serves container images to the local hardware; the evidence bucket receives proofs. Everything else
+waits. *(Gemini)*
+
+**P2-S3. Track C cannot share this project.**
+It was built as a disposable rig, and Phase 1's kill-switch deletes every VM in the project with no label filter. A
+client pilot needs stable uptime, tenant isolation, IAP, and destruction logging. Gemini's position: a dedicated
+project per client. At minimum the kill-switch must filter by label before any pilot shares the project. *(Gemini,
+reinforcing P1-H2)*
+
+---
 
 ### `10-PREFLIGHT.md` Phase 1 (lines 11-185)
 
