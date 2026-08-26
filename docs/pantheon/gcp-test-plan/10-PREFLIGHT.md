@@ -1,778 +1,405 @@
-# Pantheon GCP Preflight — Before the First GPU Burns
+# Pantheon Preflight
 
-**Purpose:** Every step required to stand up the Pantheon GCP test environment before executing any gate. Complete this document fully before running Gate 0. All steps here are $0 GPU spend.
+**Status:** rewritten 2026-08-26 against a full three-peer review of the 2026-04-18 original
+**Review record:** `REVIEW-PROGRESS.md` (113 findings across 11 sections) and `review-raw/10-PREFLIGHT-*.md`
+**Purpose:** Get to a first real executed run at the lowest possible cost and risk, and make every claim in this document falsifiable.
 
-**Expected duration:** 12-15 hours of focused work across 2-4 days
-**Expected spend:** $6-12 one-time + ~$15/mo storage ongoing
-**Prerequisite:** GCP account, billing enabled, Gemini Ultra subscription credit applied
+> **This is a rewrite, not an edit.** The original was reviewed section by section by Codex, Gemini, and DeepSeek. It
+> was found to be unexecutable: the hard-kill Cloud Function had no source, its test could not fail, four checklist
+> items referenced artifacts that had never existed, and two entire phases optimized a problem that no longer exists.
+> The original is in git at `5c7e89c:docs/pantheon/gcp-test-plan/10-PREFLIGHT.md`.
 
 ---
 
-## Phase 1 — Project + billing + quota (2-3 hours, $0)
+## 0. The two rules this document now obeys
 
-### Step 1.1 — Create GCP project
+Both came out of the review, and both are corpus-wide.
+
+**Rule 1: inputs before infrastructure.** The original was built as a forward dependency graph that nothing ever
+walked backwards. Later phases assumed fixtures that had never been authored, and because nothing was ever executed,
+the missing inputs stayed invisible for four months. **Before any gate is committed, its canonical fixtures must
+already exist and pass a validation check.**
+
+**Rule 2: verification, not attestation.** A human-ticked checkbox converts a question about the world ("does this
+work?") into a question about a person's confidence. Before irreversible spending, that is the one thing you cannot
+trust. **Every gate in this document is a command whose failure is observable, and every check is first run against a
+broken world to prove it can fail.** A test that cannot fail is not a gate, it is an ornament.
+
+A corollary that applies to every destructive step below: **treat it as untrusted until verified, and never chain a
+destroy to an unverified create.**
+
+---
+
+## Part 1: Local preflight (do this first, costs nothing)
+
+Track A (plumbing, then isolation proof) runs on local hardware. This is not a compromise, it is the better test: a
+box you can physically unplug is stronger isolation evidence than a cloud VM that always has a hypervisor, a metadata
+server, and Private Google Access routes.
+
+**Target machine:** host alias `lenovo` (`newlenovo`), NVIDIA RTX 4000 Ada Generation Laptop GPU, 12GB VRAM, compute
+capability 8.9, 24 cores, 31GB RAM. Ada Lovelace means native bf16, FP8, working FlashAttention 2, and current vLLM
+support. It is the same AD104 die family as the GCP L4, so it is a faithful rehearsal rig for that class.
+
+### 1.1 Verify the machine
 
 ```bash
+ssh lenovo 'nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv'
+ssh lenovo 'docker info >/dev/null 2>&1 && echo "docker OK" || echo "docker MISSING"'
+ssh lenovo 'docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi >/dev/null && echo "gpu-in-container OK"'
+```
+
+All three must succeed before proceeding. The third is the one that actually matters and the one most likely to fail,
+because it needs NVIDIA Container Toolkit rather than just a driver.
+
+### 1.2 What runs locally
+
+Everything Track A needs: Docker Compose, NATS, the Triumvirate daemon, a small model for smoke tests, and the
+isolation proof. **Nothing here needs GCP.** No Artifact Registry, no custom images, no PD snapshots.
+
+Images are built locally and kept locally. The isolation test loads images from disk (`docker load` from an OCI
+tarball) rather than pulling at runtime, so the test has no pull path to explain away.
+
+### 1.3 Models that fit 12GB
+
+Only three of the original eight are usable here, and only these should be downloaded now:
+
+| Model | Purpose | Fits 12GB |
+|---|---|---|
+| TinyLlama 1.1B Chat (or a current small equivalent) | plumbing smoke test | yes, trivially |
+| BGE-large-en-v1.5 (or BGE-M3 / Nomic-Embed v2, verify current) | embeddings | yes, ~1.5GB |
+| Whisper large v3 | audio | yes |
+
+Cut for now: Qwen2.5-Coder-32B-AWQ (~18GB), Qwen2.5-72B-AWQ (~40GB), Phi-4 14B and DeepSeek-Coder-V2-Lite-16B
+(unquantized, 25-30GB), Llama-3.1-405B-AWQ-INT4 (~209GB, multi-GPU). Download those only when a rented sizing sweep
+actually needs them, on the rented node itself.
+
+**Model selection above is April 2026 vintage and needs a current check before use.** The landscape has moved; verify
+what the right small, coding, embedding, and reasoning models are today rather than trusting these names.
+
+### 1.4 Pin everything by digest and revision
+
+Non-negotiable, and it is the fix for three separate findings.
+
+```bash
+# Container images: pin by digest, never by mutable tag
+docker pull vllm/vllm-openai@sha256:<digest>
+docker pull nats@sha256:<digest>
+
+# Model weights: pin by commit, and record repo + commit + file hashes together
+hf download <repo-id> --revision <full-git-commit-sha> --local-dir <dir>
+```
+
+A checksum of what you downloaded proves **integrity** (the bytes have not changed since). It does not prove
+**provenance** (that they are the authoritative release). Only the revision pin does that. Record `repo + commit SHA +
+per-file SHA256` in one manifest, or the sovereignty claim is false as stated.
+
+Note `vllm/vllm-openai:v0.6.5-cpu` **does not exist** (Docker Hub returns 404; CPU images live in a separate repo).
+And `v0.6.5` is a late-2024 pin that predates roughly two years of FlashAttention, batching, and FP8 work, and lacks
+proper support for Ada and Blackwell. **Pick a current vLLM release and pin its digest.**
+
+---
+
+## Part 2: Fixtures (author these before any gate is written)
+
+This is Rule 1 in practice. The original uploaded a `fixtures/` directory that never existed, and every gate silently
+depended on it.
+
+**Fixtures live in git, not in a bucket.** They are text. Putting canonical test inputs in object storage creates
+opaque detached state and breaks reproducibility.
+
+Author under `docs/pantheon/gcp-test-plan/fixtures/`:
+
+| Fixture | Contents | Status |
+|---|---|---|
+| `agent-tasks/` | canonical code-generation tasks with expected properties, per language | NOT WRITTEN |
+| `eval-scorers/` | scoring rubric per task type, plus the scorer implementation | NOT WRITTEN |
+| `embed-corpus/` | the corpus used for embedding-throughput tests, or a pinned pointer to it | NOT WRITTEN |
+
+Cut: the LoRA training corpus. It existed to serve fine-tuning gates for hardware that is not being bought.
+
+**Naming was inconsistent across three documents in the original** (`test-tasks-*` in the master plan,
+`agent-tasks-*` in preflight, other names in the runbooks). The names above are canonical; reconcile the other
+documents to them during their rewrites.
+
+**This is real authoring work, not an upload.** The original budgeted "1-2 hours, $0" for what is actually the design
+of an evaluation methodology. Treat the estimate as unknown until the rubrics exist.
+
+### Validation gate for fixtures
+
+```bash
+# Must exit non-zero if any fixture is missing or malformed.
+test -d fixtures/agent-tasks && test -d fixtures/eval-scorers || { echo "FIXTURES MISSING"; exit 1; }
+```
+
+No gate may be committed until this passes.
+
+---
+
+## Part 3: GCP preflight (deferred until GCP actually runs something)
+
+**Do not do this yet.** Track A is local. This part exists for when the sizing sweep needs rented hardware, and it is
+deliberately much smaller than the original.
+
+Only two GCP resources have any near-term justification, and only if the local box proves insufficient:
+
+1. An **evidence bucket** with real immutability, if evidence must live off the local machine.
+2. **Artifact Registry**, only if something in GCP needs to pull images.
+
+Everything else waits.
+
+### 3.1 Project, billing, APIs
+
+```bash
+set -euo pipefail
 export PROJECT_ID="pantheon-validation-v1"
-export BILLING_ACCOUNT="YOUR_BILLING_ACCOUNT_ID"   # from gcloud billing accounts list
+export BILLING_ACCOUNT="01F713-7EFFD2-83E164"   # verify with: gcloud billing accounts list
 export DEFAULT_REGION="us-central1"
 export DEFAULT_ZONE="us-central1-a"
 
-gcloud projects create $PROJECT_ID --name="Pantheon Validation v1"
-gcloud config set project $PROJECT_ID
-gcloud beta billing projects link $PROJECT_ID --billing-account=$BILLING_ACCOUNT
-gcloud config set compute/region $DEFAULT_REGION
-gcloud config set compute/zone $DEFAULT_ZONE
+gcloud projects create "$PROJECT_ID" --name="Pantheon Validation v1"
+gcloud config set project "$PROJECT_ID"
+gcloud billing projects link "$PROJECT_ID" --billing-account="$BILLING_ACCOUNT"   # 'beta' no longer needed
+gcloud config set compute/region "$DEFAULT_REGION"
+gcloud config set compute/zone "$DEFAULT_ZONE"
 ```
 
-### Step 1.2 — Enable required APIs
+A dedicated project is what makes a project-wide kill switch safe. Do not share it with anything else, and never with
+a client pilot.
+
+APIs, including the ones Gen2 Cloud Functions actually require (the original omitted `run` and `eventarc`, so the
+function deploy would have failed):
 
 ```bash
 gcloud services enable \
-  compute.googleapis.com \
-  artifactregistry.googleapis.com \
-  storage.googleapis.com \
-  cloudbuild.googleapis.com \
-  logging.googleapis.com \
-  monitoring.googleapis.com \
-  pubsub.googleapis.com \
-  billingbudgets.googleapis.com \
-  cloudfunctions.googleapis.com \
-  iam.googleapis.com
+  compute.googleapis.com artifactregistry.googleapis.com storage.googleapis.com \
+  cloudbuild.googleapis.com logging.googleapis.com monitoring.googleapis.com \
+  pubsub.googleapis.com billingbudgets.googleapis.com cloudfunctions.googleapis.com \
+  run.googleapis.com eventarc.googleapis.com iam.googleapis.com
 ```
 
-### Step 1.3 — Request GPU quota increases (FILE TODAY — 1-3 day approval)
+### 3.2 Quota
 
-**Critical:** GCP quota approval takes 1-3 business days. File on Day 1 so approval happens in parallel with preflight work.
+New projects start at **zero** GPU quota and need **both** a per-model regional quota **and** the global
+`GPUs (all regions)` quota. The original omitted the global one, so VM creation would still have failed after regional
+approval.
 
-Navigate to Cloud Console → IAM & Admin → Quotas. Request increases for `us-central1`:
+**Ask small.** The original requested 8x A100 while stating a $100/month budget, which reads to a reviewer as either a
+compromised account or someone who does not understand the pricing, and invites denial. It also contradicts policy:
+RunPod runs A100 80GB at $1.19-1.60/hr against GCP's roughly $5.03 on-demand, so heavy GPU work does not belong here
+at all.
 
-| Quota | Request | Why |
+Request only what GCP-specific validation needs: **1 to 2 L4**, plus the matching `GPUs (all regions)`. Route
+everything larger to a cheaper provider.
+
+Quota display names in the console are not stable CLI metric identifiers. Verify the metric name against Cloud Quotas
+before scripting against it.
+
+### 3.3 Service account and access
+
+The original granted a set labelled "minimum required" that was both too broad and incomplete. `compute.instanceAdmin.v1`
+grants no network permissions (so it cannot create the VPC or firewall rules), `storage.objectAdmin` is object-level
+(so it cannot create buckets), `artifactregistry.reader` is read-only (so it cannot create the repo), and
+`iam.serviceAccountUser` at project scope lets the account act as any service account in the project.
+
+**Decide and document who runs what.** Setup commands run as you. The runtime service account gets only what the
+runtime needs, and network permissions are granted temporarily with a stated removal point.
+
+**Do not export a JSON service account key.** Google's current guidance treats user-managed keys as a risk because the
+private key is exposed in clear text on creation. Use local ADC with `--impersonate-service-account`, an attached VM
+service account, or Workload Identity Federation.
+
+### 3.4 Network, only if needed
+
+If a GCP VM is required, note that **Private Google Access changes what you can claim.** See Part 5.
+
+Do not create public SSH ingress from a shell-captured IP. `curl -s ifconfig.me` can return empty (making the rule
+`--source-ranges=/32`), HTML, or an IPv6 address that is invalid with `/32`, and it breaks on CGNAT, VPN, or any
+address change. Use **IAP TCP forwarding**, allowing `35.235.240.0/20` to TCP 22, or OS Login with IAP-only access.
+
+If you write an egress restriction, write the rule. The original had a comment claiming egress was limited to Google
+APIs while leaving VPC default allow-all in place, and then admitted it in the next line.
+
+### 3.5 Buckets, if any
+
+Bucket names are globally unique and `pantheon-evidence` is a name someone else may hold. Suffix with the project.
+
+**An evidence bucket needs immutability, which uniform access and public-access-prevention do not provide.** Those are
+access controls. Add a retention policy and bucket lock. And note the independence problem: evidence assembled by the
+system under test, stored in a bucket that same system can overwrite, is worth little to an auditor. Ideally the
+bucket lives in a separate project where the test system has append-only rights.
+
+Cut from the original: `pantheon-models` (cross-provider egress makes a GCS weight cache a bill paid twice; pull from
+HuggingFace to the rented node instead), `pantheon-fixtures` (fixtures belong in git), `pantheon-runners` (no purpose
+once Track A is local), and defer `pantheon-pythia-corpus`.
+
+---
+
+## Part 4: The kill switch, done properly
+
+The original's spend controls were advertised as six layers. Three were not real: the Pub/Sub kill function had no
+deployable source, the `timeout` wrapper referenced a `runner.py` that does not exist, and gate-0's self-delete was
+placed after `exit` so it never ran. **Claiming six layers while operating four is the dangerous kind of wrong.**
+
+Build this only when GCP is actually being used, and build it correctly.
+
+### 4.1 The function must be Gen2-shaped
+
+The original was Gen1 background-function code (`def hard_kill(event, context)`) deployed with `--gen2`. Gen2 uses
+CloudEvents, and the payload sits at `cloud_event.data["message"]["data"]`. The deploy would have succeeded while the
+handler never fired correctly.
+
+It also needs real files on disk at a real path, including `requirements.txt` declaring `google-cloud-compute`. Put
+them in `harness/functions/hard-kill/`.
+
+### 4.2 It must fail loudly
+
+The original swallowed every exception with a bare `continue`, hiding missing permissions, disabled APIs, auth
+failures, and throttling. Then it printed `"Hard-kill completed"` unconditionally at the end, so it could report
+success having deleted nothing. It also referenced `cost_amount` outside the block that bound it, raising `NameError`
+on any delivery without `data`.
+
+Requirements for the rewrite:
+
+- Enumerate real zones from the API rather than guessing suffixes `a` through `d`.
+- Catch only the specific exceptions you intend to tolerate, and log every other one as a failure.
+- Wait for the delete operations, since `client.delete()` returns a long-running operation.
+- Report counts: instances found, deletes issued, deletes confirmed, errors. **Never print a success string that is
+  not conditional on those numbers.**
+- Handle disks, snapshots, and images too, or state plainly that it only kills instances so nobody believes otherwise.
+
+Budget notifications arrive multiple times per day with current status, not only at threshold crossings, so the
+`cost/budget` guard is load-bearing rather than belt-and-braces. Guard the zero denominator.
+
+### 4.3 It must be tested against a world where it can fail
+
+This is the finding all three peers converged on. The original test published a synthetic message and asserted that no
+VMs remained, while its own comment explained the list was empty because the smoke test had already deleted its VM
+itself. It passed whether the function worked, was broken, or was absent.
+
+The correct test:
+
+1. Create a disposable VM that **does not** self-delete, and confirm it exists.
+2. Publish an **under**-threshold message. Assert the VM still exists. (Proves no false positives.)
+3. Publish an **over**-threshold message. Poll until the VM is actually gone, or fail on timeout.
+4. Assert the function's reported delete count matches what you created.
+
+**If you break the kill switch, this test must fail.** Verify that by breaking it deliberately once and watching it go
+red. An untested kill switch is not a control, it is a plan for a control.
+
+---
+
+## Part 5: What you can honestly claim about isolation
+
+Terminology matters here because it ends up in front of clients.
+
+**For our own testing,** air-gap means not connected to the public internet. Private Google Access rides Google's
+private backbone, so a PGA-enabled subnet with default-deny egress satisfies that, and PGA is what makes evidence
+upload possible without a public IP. Keep it.
+
+**For a client-facing claim, that is not an air gap,** and a security team will say so: data written to GCS over PGA
+is retrievable from the public internet by anyone with credentials. The strongest claim a firewalled GCP VM supports:
+
+> "The workload has no public IP and no general internet egress. Outbound traffic is blocked except to Google API
+> ranges via Private Google Access, and during the test window after applying deny-all-egress, fewer than N outbound
+> packets were observed."
+
+Call the GCP test **cloud restricted-egress validation**. Reserve "air-gap proof" for the local box, which can be
+physically disconnected.
+
+Two things no runtime egress test can establish, both of which need separate evidence:
+
+- **Build-time behavior.** Anything fetched or phoning home during image build is outside the measurement window
+  entirely. This is why Part 1.4 pins digests and why images are loaded from disk rather than pulled.
+- **Dormant callbacks.** A payload that beacons on a schedule longer than the test simply waits it out. Coverage,
+  window adequacy, instrumentation trust, and non-perturbation all have to be argued, not assumed.
+
+---
+
+## Part 6: The gate before spending (commands, not checkboxes)
+
+The original ended in twenty human-ticked boxes, four of which referenced artifacts that could not exist, and one of
+which claimed a "nuclear backstop verified" by a test that could not fail. Note its own wording: *"triggered deletion
+behavior"* rather than *"deleted a VM."* The first asserts a function ran. The second asserts the world changed.
+
+Replace it with a script that **fails closed** and writes its output as evidence. Each check is a command with an
+expected result, and each check has itself been run against a broken world to confirm it goes red.
+
+| Check | Command shape | Passes when |
 |---|---|---|
-| `NVIDIA A100 80GB GPUs` | 8 | Gates 4, 5 need 4-8× A100 80GB |
-| `NVIDIA L4 GPUs` | 4 | Gates 1, 2 need 1-2× L4 |
-| `NVIDIA RTX PRO 6000 Virtual Workstation GPUs` | 16 (already confirmed available) | Gate 3 |
-| `CPUs (G2)` | 48 | For 2× L4 VM instances (g2-standard-24) |
-| `CPUs (A2)` | 96 | For 8× A100 VM instances (a2-ultragpu-8g) |
-| `CPUs (G4)` | 192 | For G4 Blackwell instances |
+| Local GPU usable in a container | `ssh lenovo docker run --gpus all ... nvidia-smi` | exit 0 |
+| Fixtures exist and validate | fixture validation script | exit 0 |
+| Images pinned by digest | grep the compose/manifest for `@sha256:` on every image | no unpinned tags |
+| Model provenance recorded | manifest contains repo + commit SHA + file hashes | all three present |
+| No unexpected billable state | `gcloud compute instances list`, disks, snapshots, images | matches expected inventory |
+| Kill switch actually kills | the four-step test in Part 4.3 | VM confirmed deleted, and confirmed surviving under threshold |
+| Budget alerts configured | `gcloud billing budgets list` | thresholds present |
 
-Quota request form message: *"Building validation infrastructure for Pantheon, an AI code-generation architecture. Need graduated compute access for tiered testing. Max concurrent spend capped at $50/run, all VMs use --max-run-duration with auto-delete. Budget $100/month total."*
-
-### Step 1.4 — Create service accounts and IAM
-
-```bash
-gcloud iam service-accounts create pantheon-validator \
-  --display-name="Pantheon Test Validator" \
-  --description="Service account for test VMs; provisions, runs, captures, destroys"
-
-export SA_EMAIL="pantheon-validator@${PROJECT_ID}.iam.gserviceaccount.com"
-
-# Grant minimum required roles
-for role in \
-  "roles/compute.instanceAdmin.v1" \
-  "roles/storage.objectAdmin" \
-  "roles/artifactregistry.reader" \
-  "roles/logging.logWriter" \
-  "roles/monitoring.metricWriter" \
-  "roles/iam.serviceAccountUser"; do
-  gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="$role"
-done
-
-# Create a local key for scripts (guard this file, do not commit)
-gcloud iam service-accounts keys create ~/.config/gcloud/pantheon-sa-key.json \
-  --iam-account=$SA_EMAIL
-chmod 600 ~/.config/gcloud/pantheon-sa-key.json
-```
-
-### Step 1.5 — Budget alerts and hard kill-switch
-
-```bash
-# Create PubSub topic for billing alerts
-gcloud pubsub topics create pantheon-billing-alerts
-
-# Create the hard-kill Cloud Function (code in step 1.6)
-# Placeholder here; function code is deployed in Phase 4
-```
-
-Budget creation (via Cloud Console since `gcloud beta billing budgets create` has limitations on threshold-rule complexity):
-
-1. Console → Billing → Budgets & alerts → CREATE BUDGET
-2. Name: `pantheon-validation-v1-budget`
-3. Time range: Monthly
-4. Amount: `$100`
-5. Thresholds:
-   - `10%` ($10) → email alert
-   - `30%` ($30) → email alert + SMS (if configured)
-   - `50%` ($50) → email alert + SMS + PubSub topic `pantheon-billing-alerts`
-6. Notifications: route 50% threshold to `pantheon-billing-alerts`
-
-### Step 1.6 — Hard-kill Cloud Function (nuclear backstop)
-
-`functions/hard-kill/main.py`:
-
-```python
-# When invoked via PubSub, forcibly deletes ALL Pantheon VMs across all regions
-import base64
-import json
-import subprocess
-from google.cloud import compute_v1
-
-PROJECT_ID = "pantheon-validation-v1"
-REGIONS_TO_CHECK = [
-    "us-central1", "us-east1", "us-east4", "us-east5",
-    "us-west1", "us-west2", "us-west3", "us-west4",
-    "us-south1", "australia-southeast1", "australia-southeast2"
-]
-
-def hard_kill(event, context):
-    """Entry point when PubSub message arrives on billing-alerts topic at 50% threshold."""
-    if 'data' in event:
-        payload = json.loads(base64.b64decode(event['data']).decode('utf-8'))
-        cost_amount = payload.get('costAmount', 0)
-        budget_amount = payload.get('budgetAmount', 100)
-
-        if cost_amount / budget_amount < 0.5:
-            print(f"Cost {cost_amount} below 50% threshold; skipping.")
-            return
-
-    client = compute_v1.InstancesClient()
-
-    for region in REGIONS_TO_CHECK:
-        for zone_suffix in ['a', 'b', 'c', 'd']:
-            zone = f"{region}-{zone_suffix}"
-            try:
-                instances = client.list(project=PROJECT_ID, zone=zone)
-                for inst in instances:
-                    print(f"KILLING: {inst.name} in {zone}")
-                    client.delete(project=PROJECT_ID, zone=zone, instance=inst.name)
-            except Exception as e:
-                continue   # Zone may not exist; ignore
-
-    print(f"Hard-kill completed. Budget: ${cost_amount}/${budget_amount}")
-```
-
-Deploy:
-
-```bash
-cd ~/projects/triumvirate/docs/pantheon/gcp-test-plan/harness/functions/hard-kill
-
-gcloud functions deploy pantheon-hard-kill \
-  --gen2 \
-  --runtime=python311 \
-  --region=$DEFAULT_REGION \
-  --source=. \
-  --entry-point=hard_kill \
-  --trigger-topic=pantheon-billing-alerts \
-  --service-account=$SA_EMAIL \
-  --memory=512Mi \
-  --timeout=540s
-```
-
-**Test the kill function** (critical — do not skip):
-
-```bash
-# Publish a synthetic 51% threshold event
-gcloud pubsub topics publish pantheon-billing-alerts \
-  --message='{"costAmount": 51, "budgetAmount": 100}'
-
-# Check function logs — should show "Hard-kill completed."
-gcloud functions logs read pantheon-hard-kill --limit=10
-```
+**No green script, no spending.** Human sign-off is for judgement, not for facts a command can settle.
 
 ---
 
-## Phase 2 — Network + storage (1-2 hours, $0)
+## Part 7: Cost accounting (honest version)
 
-### Step 2.1 — VPC + subnet + firewall
+The original claimed $6-13 one-time and $15-20/month ongoing, then concluded "effective cost to Mike: $0." Every part
+of that needs correcting.
 
-```bash
-# Create dedicated VPC for Pantheon (isolated from default)
-gcloud compute networks create pantheon-net \
-  --subnet-mode=custom \
-  --mtu=1500
+**Local Track A: $0.** No cloud resources. This is the entire argument for doing it first.
 
-# Single subnet in us-central1 (expand to other regions if needed)
-gcloud compute networks subnets create pantheon-subnet \
-  --network=pantheon-net \
-  --region=$DEFAULT_REGION \
-  --range=10.128.0.0/20 \
-  --enable-private-ip-google-access
+**Deferred GCP costs, when incurred,** must count what the original omitted entirely: Artifact Registry storage for
+multi-GB images, Cloud Storage across whatever buckets survive, custom image storage, **per-gate persistent disks**
+(the original provisioned a 500GB pd-ssd per gate VM at roughly $0.116/hour and never put it in any table), snapshot
+storage at corrected pricing, failed and retried builds, logging and monitoring, Pub/Sub and Function invocations, and
+network egress. The Phase 5 snapshot alone was closer to $18/month than the $15 claimed for everything.
 
-# Firewall: allow internal between Pantheon VMs
-gcloud compute firewall-rules create pantheon-allow-internal \
-  --network=pantheon-net \
-  --direction=INGRESS \
-  --action=ALLOW \
-  --rules=tcp,udp,icmp \
-  --source-ranges=10.128.0.0/20
+**On the Gemini Ultra credit.** Google AI Ultra can include monthly Google Cloud credits through the Google Developer
+Program, so the original claim was not fiction. But it is a **bounded benefit, not a blank cheque**, and it is
+falsified by credit exhaustion, an ineligible billing account or project, expired or unclaimed credits, or SKUs and
+regions outside the promo terms.
 
-# Firewall: allow SSH from Mike's IP only
-export MIKE_IP=$(curl -s ifconfig.me)
-gcloud compute firewall-rules create pantheon-allow-ssh-mike \
-  --network=pantheon-net \
-  --direction=INGRESS \
-  --action=ALLOW \
-  --rules=tcp:22 \
-  --source-ranges=${MIKE_IP}/32
-
-# Firewall: egress allowed to GCS + Artifact Registry + Google APIs only
-# (For Gate 6 air-gap sanity, this gets replaced with a zero-egress rule)
-# Default egress is allow-all; restrictive egress configured during Gate 6.
-```
-
-### Step 2.2 — GCS buckets
-
-```bash
-# Model weights cache (~250GB)
-gcloud storage buckets create gs://pantheon-models \
-  --location=$DEFAULT_REGION \
-  --uniform-bucket-level-access \
-  --public-access-prevention
-
-# Evidence bundles (grows with every run)
-gcloud storage buckets create gs://pantheon-evidence \
-  --location=$DEFAULT_REGION \
-  --uniform-bucket-level-access \
-  --public-access-prevention
-
-# Pythia corpus (SQLite + embeddings, ~5GB)
-gcloud storage buckets create gs://pantheon-pythia-corpus \
-  --location=$DEFAULT_REGION \
-  --uniform-bucket-level-access \
-  --public-access-prevention
-
-# Test fixtures (test tasks, scoring rubrics)
-gcloud storage buckets create gs://pantheon-fixtures \
-  --location=$DEFAULT_REGION \
-  --uniform-bucket-level-access \
-  --public-access-prevention
-
-# Daemon / container startup scripts
-gcloud storage buckets create gs://pantheon-runners \
-  --location=$DEFAULT_REGION \
-  --uniform-bucket-level-access \
-  --public-access-prevention
-```
-
-### Step 2.3 — Artifact Registry
-
-```bash
-gcloud artifacts repositories create pantheon-images \
-  --repository-format=docker \
-  --location=$DEFAULT_REGION \
-  --description="Pantheon Docker images: vllm, triumvirate, yellingtoad, test-harness"
-
-# Authenticate local Docker to Artifact Registry
-gcloud auth configure-docker ${DEFAULT_REGION}-docker.pkg.dev
-```
+**Verify the live credit balance on the billing account before spending. Do not infer it from the subscription.**
+Designing a budget around an entitlement rather than a balance, while the kill switch is also unproven, is how a
+capped experiment becomes an uncapped liability.
 
 ---
 
-## Phase 3 — Docker image pre-bake (3-5 hours, ~$2-5 in Cloud Build)
+## Part 8: What comes next
 
-### Step 3.1 — Base images
+Run something small, locally, and let reality falsify what review cannot.
 
-Pull upstream images, retag, and push to your internal Artifact Registry for fast same-region pulls:
+1. Author the fixtures (Part 2). Nothing downstream is real until they exist.
+2. Verify the local box (Part 1.1).
+3. Run the plumbing test locally: Docker Compose, NATS, Triumvirate daemon, small model. Cost: $0.
+4. Run the isolation test locally, with the network physically disconnected and images pre-loaded from disk.
+5. Only then decide whether anything needs GCP, and only then work Part 3.
 
-```bash
-export REGISTRY="${DEFAULT_REGION}-docker.pkg.dev/${PROJECT_ID}/pantheon-images"
-
-# vLLM GPU image
-docker pull vllm/vllm-openai:v0.6.5
-docker tag vllm/vllm-openai:v0.6.5 ${REGISTRY}/pantheon-vllm-gpu:v0.6.5
-docker push ${REGISTRY}/pantheon-vllm-gpu:v0.6.5
-
-# vLLM CPU image (for Gate 0/1 plumbing tests without GPU)
-docker pull vllm/vllm-openai:v0.6.5-cpu
-docker tag vllm/vllm-openai:v0.6.5-cpu ${REGISTRY}/pantheon-vllm-cpu:v0.6.5
-docker push ${REGISTRY}/pantheon-vllm-cpu:v0.6.5
-
-# NATS broker
-docker pull nats:2.10-alpine
-docker tag nats:2.10-alpine ${REGISTRY}/pantheon-nats:2.10
-docker push ${REGISTRY}/pantheon-nats:2.10
-```
-
-### Step 3.2 — Triumvirate image
-
-Build from source with Cloud Build for reproducibility. `triumvirate/cloudbuild.yaml`:
-
-```yaml
-steps:
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'build'
-      - '-f'
-      - 'daemon/Dockerfile'
-      - '-t'
-      - '${_REGISTRY}/pantheon-triumvirate:${SHORT_SHA}'
-      - '-t'
-      - '${_REGISTRY}/pantheon-triumvirate:main'
-      - '.'
-images:
-  - '${_REGISTRY}/pantheon-triumvirate:${SHORT_SHA}'
-  - '${_REGISTRY}/pantheon-triumvirate:main'
-substitutions:
-  _REGISTRY: '${DEFAULT_REGION}-docker.pkg.dev/${PROJECT_ID}/pantheon-images'
-options:
-  logging: CLOUD_LOGGING_ONLY
-```
-
-```bash
-cd ~/projects/triumvirate
-gcloud builds submit --config=cloudbuild.yaml
-```
-
-### Step 3.3 — Test harness image
-
-`harness/Dockerfile`:
-
-```dockerfile
-FROM python:3.12-slim
-
-RUN apt-get update && apt-get install -y \
-    curl git jq \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY harness/ ./harness/
-COPY fixtures/ ./fixtures/
-
-ENTRYPOINT ["python3", "-m", "harness.runner"]
-```
-
-`harness/requirements.txt`:
-
-```
-openai>=1.50.0
-httpx>=0.27.0
-google-cloud-storage>=2.18.0
-google-cloud-logging>=3.11.0
-pytest>=8.3.0
-pydantic>=2.9.0
-tiktoken>=0.8.0
-rich>=13.9.0
-```
-
-Build:
-
-```bash
-cd ~/projects/triumvirate/docs/pantheon/gcp-test-plan
-docker build -f harness/Dockerfile -t ${REGISTRY}/pantheon-test-harness:main .
-docker push ${REGISTRY}/pantheon-test-harness:main
-```
+The root cause of everything in the review record was that nothing was ever executed, so every wrong claim survived
+four months unchallenged. **More review is the same disease. Run it.**
 
 ---
 
-## Phase 4 — Model weights cached to GCS (6-10 hours unattended, ~$2-4)
+## Appendix: What was deleted from the original, and why
 
-Model downloads happen on a cheap CPU-only VM (not a GPU VM!) to avoid burning GPU dollars on downloads.
+Kept here so nobody restores it without reading the reasoning.
 
-### Step 4.1 — Spin up download VM
+**Phase 5, PD snapshots for fast model mount.** Deleted. It staged from a GCS model cache that is itself being cut; it
+spent $18+/month to save 3-4 minutes of startup worth about $0.05, needing roughly 300 gate runs a month to break even
+against a plan describing a handful; it created GCP-only lock-in that cannot travel to RunPod; its `mkfs.ext4` ran
+against an unverified device path that could have formatted the boot disk; and the cold-start problem it solved does
+not exist on a workstation that stays on.
 
-```bash
-gcloud compute instances create pantheon-model-downloader \
-  --zone=$DEFAULT_ZONE \
-  --machine-type=e2-standard-4 \
-  --network=pantheon-net \
-  --subnet=pantheon-subnet \
-  --image-family=debian-12 \
-  --image-project=debian-cloud \
-  --boot-disk-size=500GB \
-  --boot-disk-type=pd-balanced \
-  --service-account=$SA_EMAIL \
-  --scopes=cloud-platform \
-  --metadata=enable-oslogin=TRUE \
-  --max-run-duration=12h \
-  --instance-termination-action=DELETE
-```
+**Phase 6, custom VM images.** Deleted. The image family `common-cu126` no longer exists (current is
+`common-cu129-ubuntu-2204-nvidia-580`); `${REGISTRY}` was unset on the baker VMs so every pull was an invalid
+reference; Spot plus `termination-action=DELETE` would destroy the very disk being prepared; baking on an L4 bakes Ada
+drivers into an image claimed to be A100 and RTX PRO 6000 compatible; and the whole artifact encodes "Docker is
+installed and three images are pulled," which is a couple of minutes of runtime work. Pull containers at runtime.
 
-### Step 4.2 — Download models to GCS
+**`gs://pantheon-models`.** Cut. Cross-provider egress at roughly $0.08-0.12/GB means a rented non-GCP node pays to
+pull weights that HuggingFace serves free. The 405B model alone would have cost over $20 in egress per node boot.
 
-SSH in and run:
+**The 405B download.** Cut. Roughly 209GB for a gate demoted to a pricing-sweep row that may never run.
 
-```bash
-gcloud compute ssh pantheon-model-downloader --zone=$DEFAULT_ZONE
+**The LoRA training corpus.** Cut. It served fine-tuning gates for hardware that is not being purchased.
 
-# On the VM:
-sudo apt-get update && sudo apt-get install -y python3-pip
-pip install huggingface_hub 'huggingface_hub[cli]'
-huggingface-cli login   # paste your HF token
-
-mkdir -p /tmp/models
-
-# TinyLlama (Gate 0/1 plumbing tests)
-huggingface-cli download TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --local-dir /tmp/models/tinyllama-1.1b
-
-# Qwen 2.5 Coder 32B AWQ (4-bit)
-huggingface-cli download Qwen/Qwen2.5-Coder-32B-Instruct-AWQ \
-  --local-dir /tmp/models/qwen2.5-coder-32b-awq
-
-# Qwen 2.5 72B AWQ (Zeus role)
-huggingface-cli download Qwen/Qwen2.5-72B-Instruct-AWQ \
-  --local-dir /tmp/models/qwen2.5-72b-awq
-
-# DeepSeek-Coder-V2-Lite-16B Instruct AWQ
-huggingface-cli download deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \
-  --local-dir /tmp/models/deepseek-coder-v2-lite-16b
-
-# BGE-Large-en-v1.5 (embeddings)
-huggingface-cli download BAAI/bge-large-en-v1.5 \
-  --local-dir /tmp/models/bge-large-en-v1.5
-
-# Phi-4 14B
-huggingface-cli download microsoft/phi-4 \
-  --local-dir /tmp/models/phi-4-14b
-
-# Whisper Large v3
-huggingface-cli download openai/whisper-large-v3 \
-  --local-dir /tmp/models/whisper-large-v3
-
-# Llama 3.1 405B Q4 (for Gate 5 — ~200GB, takes hours)
-huggingface-cli download hugging-quants/Meta-Llama-3.1-405B-Instruct-AWQ-INT4 \
-  --local-dir /tmp/models/llama-3.1-405b-awq
-
-# Copy everything to GCS
-for dir in /tmp/models/*/; do
-  model_name=$(basename "$dir")
-  gsutil -m cp -r "$dir" "gs://pantheon-models/${model_name}/"
-done
-
-# Compute + store checksums
-for dir in /tmp/models/*/; do
-  model_name=$(basename "$dir")
-  (cd "$dir" && find . -type f -name '*.safetensors' -o -name '*.bin' -o -name '*.gguf' | \
-    xargs sha256sum > /tmp/${model_name}.sha256)
-  gsutil cp /tmp/${model_name}.sha256 gs://pantheon-models/${model_name}/MANIFEST.sha256
-done
-
-# Verify sizes in GCS
-gsutil du -sh gs://pantheon-models/*
-```
-
-### Step 4.3 — Delete the download VM
-
-```bash
-gcloud compute instances delete pantheon-model-downloader --zone=$DEFAULT_ZONE --quiet
-```
-
-### Step 4.4 — Cost verification
-
-```bash
-# Estimated storage cost
-echo "GCS standard storage: ~\$0.020/GB/mo"
-gsutil du -sh gs://pantheon-models/ | awk '{print "Storage cost: ~$" $1*0.020 "/month"}'
-```
-
-Expected: ~$5-8/month for all models in standard storage.
-
----
-
-## Phase 5 — PD snapshots for fast model mount (1-2 hours, $15/mo ongoing)
-
-Model weights on persistent-disk snapshots mount to a VM in ~20 seconds vs 3-5 minutes via `gsutil cp`. Worth the $15/mo.
-
-### Step 5.1 — Stage models to a disk
-
-```bash
-# Create a disk large enough for all models
-gcloud compute disks create pantheon-model-staging \
-  --zone=$DEFAULT_ZONE \
-  --size=500GB \
-  --type=pd-ssd
-
-# Spin up temporary VM, attach disk
-gcloud compute instances create pantheon-model-stager \
-  --zone=$DEFAULT_ZONE \
-  --machine-type=e2-standard-4 \
-  --disk=name=pantheon-model-staging,mode=rw \
-  --service-account=$SA_EMAIL \
-  --scopes=cloud-platform \
-  --max-run-duration=4h \
-  --instance-termination-action=DELETE
-
-gcloud compute ssh pantheon-model-stager --zone=$DEFAULT_ZONE
-
-# On the VM:
-sudo mkfs.ext4 /dev/disk/by-id/google-persistent-disk-1
-sudo mkdir /mnt/models
-sudo mount /dev/disk/by-id/google-persistent-disk-1 /mnt/models
-sudo chown -R $USER /mnt/models
-
-# Pull models from GCS to the disk
-gsutil -m cp -r gs://pantheon-models/* /mnt/models/
-```
-
-### Step 5.2 — Snapshot
-
-```bash
-# Log out of VM, then:
-gcloud compute disks snapshot pantheon-model-staging \
-  --zone=$DEFAULT_ZONE \
-  --snapshot-names=pantheon-models-v1 \
-  --description="All Pantheon model weights, v1, 2026-04-18"
-
-# Delete the staging VM + disk
-gcloud compute instances delete pantheon-model-stager --zone=$DEFAULT_ZONE --quiet
-gcloud compute disks delete pantheon-model-staging --zone=$DEFAULT_ZONE --quiet
-
-# Verify snapshot
-gcloud compute snapshots list --filter="name:pantheon-models-v1"
-```
-
-### Step 5.3 — Usage pattern in future gates
-
-Every gate VM creates a fresh disk from this snapshot at startup:
-
-```bash
-gcloud compute instances create my-gate-vm \
-  --zone=$DEFAULT_ZONE \
-  --machine-type=g2-standard-4 \
-  --create-disk=name=models-$RUN_ID,size=500GB,type=pd-ssd,source-snapshot=pantheon-models-v1,auto-delete=yes,device-name=models \
-  ...
-```
-
-The disk is created from snapshot (fast, ~30 sec), attached to the VM, auto-deleted when VM dies.
-
----
-
-## Phase 6 — Custom VM images (2-3 hours, ~$1-2)
-
-VMs boot faster from custom images that have CUDA + Docker + pre-pulled images already baked in.
-
-### Step 6.1 — Base orchestrator image
-
-```bash
-# Spin up a debian-12 VM, install docker + gcloud tooling + pre-pull images
-gcloud compute instances create pantheon-baker-orchestrator \
-  --zone=$DEFAULT_ZONE \
-  --machine-type=e2-standard-2 \
-  --image-family=debian-12 \
-  --image-project=debian-cloud \
-  --service-account=$SA_EMAIL \
-  --scopes=cloud-platform \
-  --max-run-duration=3h \
-  --instance-termination-action=DELETE
-
-gcloud compute ssh pantheon-baker-orchestrator --zone=$DEFAULT_ZONE
-
-# On VM:
-sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-plugin jq curl git
-sudo usermod -aG docker $USER
-newgrp docker
-
-# Pre-pull Pantheon images
-gcloud auth configure-docker ${DEFAULT_REGION}-docker.pkg.dev
-for img in \
-  "pantheon-triumvirate:main" \
-  "pantheon-test-harness:main" \
-  "pantheon-nats:2.10" \
-  "pantheon-vllm-cpu:v0.6.5"; do
-  docker pull ${REGISTRY}/${img}
-done
-
-# Stop SSH, back on laptop: snapshot this VM as a custom image
-```
-
-```bash
-# On laptop (not VM):
-gcloud compute instances stop pantheon-baker-orchestrator --zone=$DEFAULT_ZONE
-
-gcloud compute images create pantheon-orchestrator-v1 \
-  --source-disk=pantheon-baker-orchestrator \
-  --source-disk-zone=$DEFAULT_ZONE \
-  --family=pantheon-orchestrator \
-  --description="Debian 12 + Docker + Pantheon images pre-pulled, v1"
-
-gcloud compute instances delete pantheon-baker-orchestrator --zone=$DEFAULT_ZONE --quiet
-```
-
-### Step 6.2 — GPU image (L4 + A100 + RTX Pro 6000 compatible)
-
-```bash
-# Spin a VM from GCP's Deep Learning image — has CUDA 12.6 + drivers baked
-gcloud compute instances create pantheon-baker-gpu \
-  --zone=$DEFAULT_ZONE \
-  --machine-type=g2-standard-4 \
-  --accelerator=type=nvidia-l4,count=1 \
-  --provisioning-model=SPOT \
-  --image-family=common-cu126 \
-  --image-project=deeplearning-platform-release \
-  --boot-disk-size=100GB \
-  --service-account=$SA_EMAIL \
-  --scopes=cloud-platform \
-  --max-run-duration=3h \
-  --instance-termination-action=DELETE \
-  --metadata=install-nvidia-driver=True
-
-# SSH in, pre-pull GPU-specific images
-gcloud compute ssh pantheon-baker-gpu --zone=$DEFAULT_ZONE
-
-# On VM:
-gcloud auth configure-docker ${DEFAULT_REGION}-docker.pkg.dev
-docker pull ${REGISTRY}/pantheon-vllm-gpu:v0.6.5
-docker pull ${REGISTRY}/pantheon-triumvirate:main
-
-# Verify CUDA + GPU access
-nvidia-smi
-docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi
-```
-
-```bash
-# On laptop:
-gcloud compute instances stop pantheon-baker-gpu --zone=$DEFAULT_ZONE
-
-gcloud compute images create pantheon-gpu-v1 \
-  --source-disk=pantheon-baker-gpu \
-  --source-disk-zone=$DEFAULT_ZONE \
-  --family=pantheon-gpu \
-  --description="Deep Learning VM + Pantheon GPU images pre-pulled, v1"
-
-gcloud compute instances delete pantheon-baker-gpu --zone=$DEFAULT_ZONE --quiet
-```
-
----
-
-## Phase 7 — Fixtures + Pythia seed (1-2 hours, $0)
-
-### Step 7.1 — Export Pythia corpus from Server
-
-```bash
-# On Server:
-cd ~/projects/triumvirate
-sqlite3 data/pythia.db ".backup /tmp/pythia-snapshot-v1.db"
-tar czf /tmp/pythia-corpus-v1.tar.gz -C /tmp pythia-snapshot-v1.db
-
-# Upload to GCS
-gsutil cp /tmp/pythia-corpus-v1.tar.gz gs://pantheon-pythia-corpus/
-```
-
-### Step 7.2 — Test task fixtures
-
-Upload canonical test tasks to `gs://pantheon-fixtures/`:
-
-```bash
-# Structure:
-#   gs://pantheon-fixtures/
-#     test-corpus-triumvirate/       ← 50KLOC Triumvirate repo for embedding tests
-#     agent-tasks-rust/              ← 4 canonical Rust code-gen tasks
-#     agent-tasks-python/            ← 4 canonical Python tasks
-#     agent-tasks-sql/               ← 4 canonical SQL tasks
-#     lora-training-corpus-v1/       ← curated fine-tune dataset
-#     eval-scorers/                  ← scoring rubrics per task type
-
-cd ~/projects/triumvirate/docs/pantheon/gcp-test-plan/fixtures
-gsutil -m cp -r * gs://pantheon-fixtures/
-```
-
----
-
-## Phase 8 — Tooling validation (30 min, ~$0.15)
-
-### Step 8.1 — Dry-run orchestrator-only smoke test
-
-```bash
-export RUN_ID="preflight-smoke-$(date +%Y%m%d-%H%M%S)"
-
-gcloud compute instances create pantheon-preflight-smoke-$RUN_ID \
-  --zone=$DEFAULT_ZONE \
-  --machine-type=e2-standard-4 \
-  --image-family=pantheon-orchestrator \
-  --image-project=$PROJECT_ID \
-  --network=pantheon-net \
-  --subnet=pantheon-subnet \
-  --service-account=$SA_EMAIL \
-  --scopes=cloud-platform \
-  --max-run-duration=30m \
-  --instance-termination-action=DELETE \
-  --metadata=RUN_ID=$RUN_ID,startup-script='#!/bin/bash
-    set -e
-    docker run --rm \
-      -e RUN_ID=$RUN_ID \
-      '${REGISTRY}'/pantheon-test-harness:main --mode=smoke-test
-    gsutil cp /tmp/smoke-result.json gs://pantheon-evidence/preflight/
-    gcloud compute instances delete $(hostname) --zone='$DEFAULT_ZONE' --quiet
-  '
-
-# Wait for completion (~5 min)
-sleep 300
-
-# Verify result
-gsutil ls gs://pantheon-evidence/preflight/
-gsutil cat gs://pantheon-evidence/preflight/smoke-result.json
-```
-
-### Step 8.2 — Verify hard-kill function
-
-```bash
-# Publish a synthetic 60% threshold to trigger hard-kill
-gcloud pubsub topics publish pantheon-billing-alerts \
-  --message='{"costAmount": 60, "budgetAmount": 100}'
-
-# Check that any live VMs get killed (should be zero since smoke-test cleaned up)
-sleep 30
-gcloud compute instances list --format="table(name,zone,status)"
-# Expected: empty list
-```
-
----
-
-## Preflight completion checklist
-
-Before proceeding to Gate 0, verify ALL of these:
-
-- [ ] GCP project created, billing linked, Gemini Ultra credit active
-- [ ] All required APIs enabled
-- [ ] GPU quota increases requested (wait for approval email)
-- [ ] `pantheon-validator` service account created with minimum IAM
-- [ ] Budget alert configured at `$10 / $30 / $50` thresholds
-- [ ] PubSub topic `pantheon-billing-alerts` created
-- [ ] Cloud Function `pantheon-hard-kill` deployed AND TESTED (nuclear backstop verified)
-- [ ] VPC `pantheon-net` + subnet `pantheon-subnet` created
-- [ ] Firewall rules for internal + SSH from Mike's IP created
-- [ ] GCS buckets: pantheon-models, pantheon-evidence, pantheon-pythia-corpus, pantheon-fixtures, pantheon-runners
-- [ ] Artifact Registry `pantheon-images` created
-- [ ] Docker images built + pushed: pantheon-vllm-gpu, pantheon-vllm-cpu, pantheon-triumvirate, pantheon-test-harness, pantheon-nats
-- [ ] Model weights cached to `gs://pantheon-models/` for all 8 models
-- [ ] Model checksums stored in `MANIFEST.sha256` per model
-- [ ] PD snapshot `pantheon-models-v1` created
-- [ ] Custom VM images created: `pantheon-orchestrator-v1`, `pantheon-gpu-v1`
-- [ ] Pythia corpus backup uploaded to `gs://pantheon-pythia-corpus/`
-- [ ] Test fixtures uploaded to `gs://pantheon-fixtures/`
-- [ ] Preflight smoke test passed (evidence bundle landed in GCS)
-- [ ] Hard-kill function verified (synthetic PubSub test triggered deletion behavior)
-
-**When every box is checked, proceed to `runbooks/gate-0-plumbing.md`.**
-
----
-
-## Cost accounting for preflight
-
-| Phase | Spend |
-|---|---|
-| Phase 1-2 (accounts, network, storage) | $0 |
-| Phase 3 (Cloud Build) | $2-5 |
-| Phase 4 (model downloads on e2-standard-4) | $2-4 |
-| Phase 5 (PD snapshot staging) | $1-2 |
-| Phase 6 (custom VM image baking) | $1-2 |
-| Phase 7 (fixture upload) | $0 |
-| Phase 8 (smoke test) | ~$0.15 |
-| **Total one-time** | **$6-13** |
-| **Ongoing storage (monthly)** | **$15-20** |
-
-All within Gemini Ultra GCP credit. Effective cost to Mike: $0.
-
----
-
-## What comes next
-
-With preflight complete, proceed to:
-
-**`runbooks/gate-0-plumbing.md`** — first test run, CPU-only, $0.50 spend, ~45 min. Validates Docker Compose + NATS + Triumvirate daemon + mock vLLM work together end-to-end. Zero GPU risk. Evidence bundle lands, Obsidian note auto-generates, your first Pantheon run is immortalized.
+**"Your first Pantheon run is immortalized."** Cut, along with the rest of the hype register. Engineering documents
+describe deterministic behavior. Watch for the same voice elsewhere in the corpus ("knowledge moat", "nuclear
+backstop") and cut it there too.

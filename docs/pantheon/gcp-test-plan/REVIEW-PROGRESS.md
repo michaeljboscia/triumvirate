@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** ALL 11 SECTIONS REVIEWED. Review of queue item 1 is COMPLETE.
-**Next action:** REWRITE `10-PREFLIGHT.md` against the findings below, keeping its structure, then one narrow verification pass, then move to queue item 2.
+**Current section:** REVIEW COMPLETE and REWRITE COMMITTED for queue item 1.
+**Next action:** one narrow verification pass on the rewritten `10-PREFLIGHT.md` (check the 113 findings were addressed, do NOT open a new hunt), then move to queue item 2 (`20-EVIDENCE-BUNDLE-SPEC.md`).
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — **ALL 11 SECTIONS REVIEWED** — ready to rewrite | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
