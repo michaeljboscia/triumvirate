@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 3 (lines 273-371) — COMPLETE, all three peers logged
-**Next action:** review Phase 4 (Model weights cached to GCS, lines 372-476) with all three peers.
+**Current section:** Phase 4 (lines 372-476) — COMPLETE, all three peers logged
+**Next action:** review Phase 5 (PD snapshots, lines 477-544) with all three peers.
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 3 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 4 of 11 sections reviewed | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -55,7 +55,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | Phase 1 — Project + billing + quota | 11-185 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 2 — Network + storage | 186-272 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 3 — Docker image pre-bake | 273-371 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 4 — Model weights cached to GCS | 372-476 | no |
+| Phase 4 — Model weights cached to GCS | 372-476 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 5 — PD snapshots | 477-544 | no |
 | Phase 6 — Custom VM images | 545-642 | no |
 | Phase 7 — Fixtures + Pythia seed | 643-676 | no |
@@ -67,6 +67,90 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` Phase 4 (lines 372-476)
+
+Raw output: `review-raw/10-PREFLIGHT-phase-4.md`. All three peers.
+
+#### CRITICAL
+
+**P4-C1. Caching weights in GCS is an anti-pattern under a multi-provider rent-first policy.**
+Line 444. Every pull from `gs://pantheon-models` to a non-GCP node (RunPod, Lambda) incurs GCP internet egress at
+roughly $0.08-0.12/GB. The 405B model alone would cost **over $20 in egress every time a node boots**. Downloading
+directly from HuggingFace to the rented node is free. Gemini's conclusion: cut the `gs://pantheon-models` bucket
+entirely. This reinforces the Phase 2 cut list. *(Gemini)*
+
+**P4-C2. `pip install` fails on Debian 12 before a single byte downloads.**
+Lines 403-404. PEP 668 externally-managed-environment blocks system-Python installs. The whole phase halts at the first
+command. Fix is a venv (`python3-full python3-venv`, then `/opt/hf/bin/pip install -U "huggingface_hub[cli]"`). *(Codex)*
+
+**P4-C3. The 12h cap can permanently destroy partial work.**
+Line 391, `--max-run-duration=12h` with `--instance-termination-action=DELETE`, against a claimed 6-10 hour download of
+361GB. Anything not yet copied to GCS is lost with the boot disk when the VM is deleted. There is no checkpointing and
+no incremental upload: the copy loop (line 442) runs only after all eight downloads finish. *(Codex)*
+
+#### HIGH
+
+**P4-H1. Checksums establish integrity, never provenance. TWO-PEER CONVERGENCE.**
+Lines 410-439 download by repo name with no `--revision` pin, and lines 448-453 then hash whatever arrived. DeepSeek's
+framing: the manifest records *what arrived*, not *what was supposed to arrive*. A repo can be updated, retagged,
+force-pushed, or hijacked between runs and the manifest would faithfully record the substitute. So "we know exactly
+what weights are in the box" is false as stated: you know the bytes, not that they are the authoritative release.
+
+Minimum fix both peers named: pin `--revision <full-git-commit-sha>` and store `repo + commit SHA + file SHA256s`
+together. Sign the manifest and attach the publisher's attestation for stronger provenance. Same shape as P3-H1.
+
+**P4-H2. The `find` in the checksum block is misparsed and the manifest is partial.**
+Lines 448-453. Without parentheses it evaluates as `( -type f AND -name '*.safetensors' ) OR -name '*.bin' OR -name
+'*.gguf'`, so `-type f` guards only the first pattern and directories could reach `sha256sum`. It also excludes
+tokenizer, config, and model-index files, so it is not a repo integrity manifest. Paths are relative to each model
+root, so verification must run from the same directory. Corrected expression is in the raw file. *(Codex)*
+
+**P4-H3. The cost-verification one-liner reports a falsely reassuring number as the bill grows.**
+Line 470. `gsutil du -sh | awk '{print $1*0.020}'` coerces the human-readable size, so `350G` becomes `350` and yields
+a correct-looking `$7`. But at `1.2T` awk computes `1.2 * 0.020` and prints **`$0.024/month`**. The check gets more
+wrong precisely as the cost gets larger. *(Gemini and Codex, converging)*
+
+#### MEDIUM
+
+**P4-M1. `huggingface-cli` is renamed to `hf`.** Lines 405, 410-438. Current form is `hf download` and `hf auth login`.
+*(Codex)*
+
+**P4-M2. Interactive login is wrong for an unattended run.** Line 405 requires pasting a token on a disposable VM, and
+the 6-10 hour job then depends on an SSH session staying alive. Use `HF_TOKEN` from Secret Manager plus `tmux`,
+`systemd-run`, or a startup script. *(Codex)*
+
+**P4-M3. `gsutil` is legacy.** Lines 444, 452, 456, 470 should use `gcloud storage`. *(Codex)*
+
+**P4-M4. Disk margin is thin and the failure mode is misdiagnosed.** Line 386's 500GB against Codex's measured 361.3GB
+of actual repo content leaves little room for cache metadata, partial files, and retries. `/tmp` on Debian 12 is on the
+root filesystem, not tmpfs. A separate attached disk mounted at `/models` is the safer design. *(Codex)*
+
+**P4-M5. Line 421's comment is wrong.** It says AWQ; `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` is the unquantized
+variant. *(Codex)*
+
+**P4-M6. No license or acceptable-use logging.** Nothing records model licenses. If a client pilot serves these
+weights, terms compliance (for example Meta's MAU limits) is unmanaged. *(Gemini)*
+
+#### STRATEGIC
+
+**P4-S1. Five of eight models cannot run on the 12GB local box and should be cut from this phase.**
+Keep TinyLlama (plumbing), BGE-large (embeddings, ~1.5GB), Whisper-large-v3. Cut Qwen2.5-Coder-32B-AWQ (~18GB),
+Qwen2.5-72B-AWQ (~40GB), Phi-4 14B and DeepSeek-Coder-V2-Lite-16B (unquantized, 25-30GB), and Llama-3.1-405B
+(multi-GPU). Defer until a rented sizing sweep actually needs them. *(Gemini)*
+
+**P4-S2. The 405B download is indefensible right now.** ~200GB for a Gate 5 that was demoted to a pricing-sweep row
+that may never run, burning download hours against the 12h cap and paying storage forever. *(Gemini)*
+
+**P4-S3. Model selection is four months stale.** Gemini's take: TinyLlama is workable but dated for a smoke test;
+Qwen2.5-Coder and DeepSeek-Coder-V2-Lite are stale for coding; BGE-large-en-v1.5 should be BGE-M3 or Nomic-Embed-Text
+v2; and Llama-3.1-405B is a poor reasoning-to-weight choice now. **Verify current model landscape independently before
+acting on specific replacement names.** *(Gemini)*
+
+**P4-S4. All eight repo IDs currently resolve and none are gated.** Codex checked HF metadata for all eight. Good news
+worth recording: no license-acceptance blocker stands in the way. *(Codex)*
+
+---
 
 ### `10-PREFLIGHT.md` Phase 3 (lines 273-371)
 
