@@ -375,9 +375,45 @@ theme in the rewrite, not as three separate patches.
 
 Raw output: `review-raw/10-PREFLIGHT-phase-5.md`. All three peers.
 
-**VERDICT: DELETE THIS PHASE.** Both file-reading peers reached that independently. It is downstream dead weight (it
+**VERDICT CORRECTED 2026-08-26 BY OWNER. The delete verdict below was too broad and partly rests on a bad number.**
+
+The peers priced this against `gsutil cp` from a **same-region GCS bucket** (the document's own 3-5 minute figure at
+line 479). That is not the real alternative once the model cache is also cut. **The real alternative is a cold
+download from HuggingFace, which for a large model is closer to 30 minutes.** The economics argument ("saves 3-4
+minutes worth $0.05") silently substituted the cheap comparison for the expensive one, and I accepted it.
+
+**And for a client pilot or a live demo, a 30-minute cold start is not a cost-optimization question. It is
+disqualifying.** Track C explicitly needs stable, responsive infrastructure.
+
+**The correct answer is conditional on where the node runs, not a blanket delete:**
+
+| Node location | Weight source | Cold start | Verdict |
+|---|---|---|---|
+| Local Lenovo | download once to local disk | zero after the first time | no caching problem exists |
+| GCP | **Hyperdisk ML, read-only-many** (Codex's P5-M4) or a same-region GCS cache | seconds to minutes | keep a fast-mount path |
+| RunPod / other | HuggingFace direct (GCS would cost egress) | the 30-minute case | needs its own answer |
+
+**Codex named the right replacement and I filed it away wrongly.** P5-M4 records Hyperdisk ML in read-only-many mode
+as the current 2026 primitive for shared read-only model mounts (up to 2,500 instances at <=512 GiB, G2 supported),
+and I annotated it "relevant only if this phase survives, which it should not." That dismissed the correct answer
+because the verdict had already been accepted. **Hyperdisk ML is the replacement for the PD-snapshot pattern, not a
+footnote to its deletion.**
+
+**What actually stands from the peer review of this phase:** the safety bugs (`mkfs.ext4` on an unverified device
+path, snapshot-from-partial-copy then delete-source), the corrected pricing, the pd-ssd incompatibility with G4, the
+GCP-only portability limit, and the missing lifecycle story. Those are all real and must be fixed in whatever
+replaces it.
+
+**What does NOT stand:** "delete this and replace it with nothing." The capability is needed. The mechanism should be
+Hyperdisk ML on GCP, local disk locally, and a decided answer for third-party providers.
+
+---
+
+*Original verdict, superseded, kept for provenance:*
+
+~~**VERDICT: DELETE THIS PHASE.** Both file-reading peers reached that independently. It is downstream dead weight (it
 stages from the `gs://pantheon-models` bucket that Phase 4's review recommends cutting), its economics are inverted,
-and the problem it solves does not exist on a persistent local workstation.
+and the problem it solves does not exist on a persistent local workstation.~~
 
 #### CRITICAL
 

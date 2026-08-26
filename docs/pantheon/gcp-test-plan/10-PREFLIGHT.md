@@ -388,11 +388,31 @@ four months unchallenged. **More review is the same disease. Run it.**
 
 Kept here so nobody restores it without reading the reasoning.
 
-**Phase 5, PD snapshots for fast model mount.** Deleted. It staged from a GCS model cache that is itself being cut; it
-spent $18+/month to save 3-4 minutes of startup worth about $0.05, needing roughly 300 gate runs a month to break even
-against a plan describing a handful; it created GCP-only lock-in that cannot travel to RunPod; its `mkfs.ext4` ran
-against an unverified device path that could have formatted the boot disk; and the cold-start problem it solved does
-not exist on a workstation that stays on.
+**Phase 5, PD snapshots for fast model mount. The MECHANISM is replaced, the CAPABILITY is kept.**
+
+The original had real defects: `mkfs.ext4` ran against an unverified device path that could have formatted the boot
+disk; the snapshot could capture a partial copy after which both VM and source disk were deleted with nothing
+verified; the cost was understated (roughly $18/month for the snapshot, plus an unbudgeted 500GB pd-ssd per gate VM at
+about $0.116/hour); `pd-ssd` cannot attach to G4 at all; and there was no lifecycle or update story.
+
+**But do not delete this and replace it with nothing.** The peer review priced the snapshot against `gsutil cp` from a
+same-region bucket, which is the document's own 3-5 minute figure. **That is the wrong comparison once the GCS model
+cache is also cut. The real alternative is a cold HuggingFace download, which for a large model is closer to 30
+minutes.** For a client pilot or a live demo, a 30-minute cold start is disqualifying, not a rounding error.
+
+The answer is conditional on where the node runs:
+
+| Node location | Weight source | Cold start |
+|---|---|---|
+| Local Lenovo | download once to local disk | zero after the first time, so no problem to solve |
+| GCP | **Hyperdisk ML in read-only-many mode**, the current 2026 primitive for shared read-only model mounts (up to 2,500 instances at <=512 GiB) | seconds |
+| RunPod or other third party | HuggingFace direct, since GCS would charge egress | still the slow case, and it needs a decided answer |
+
+Hyperdisk ML replaces the PD-snapshot pattern. It is not a footnote to its deletion.
+
+**Phase 4, the `gs://pantheon-models` cache, follows the same conditional logic.** Cutting it is right for
+cross-provider work, where egress means paying to pull weights HuggingFace serves free. It is wrong as a blanket rule
+for GCP-resident nodes, where a same-region cache costs no egress and turns a 30-minute cold start into minutes.
 
 **Phase 6, custom VM images.** Deleted. The image family `common-cu126` no longer exists (current is
 `common-cu129-ubuntu-2204-nvidia-580`); `${REGISTRY}` was unset on the baker VMs so every pull was an invalid
