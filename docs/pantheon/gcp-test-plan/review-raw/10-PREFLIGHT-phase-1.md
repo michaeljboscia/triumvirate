@@ -1,10 +1,10 @@
-# Raw peer output — 10-PREFLIGHT.md Phase 1 (lines 11-185)
+# Raw peer output: 10-PREFLIGHT.md Phase 1 (lines 11-185)
 
 Verbatim agent responses. Preserved because synthesis loses detail and context does not survive compaction.
 Synthesized findings live in `../REVIEW-PROGRESS.md`.
 
 **Date:** 2026-08-25
-**Peers:** Codex (engineering), Gemini (strategic), DeepSeek (adversarial logic — TIMED OUT, see bottom)
+**Peers:** Codex (engineering), Gemini (strategic), DeepSeek (adversarial logic, TIMED OUT, see bottom)
 
 ---
 

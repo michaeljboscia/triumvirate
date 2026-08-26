@@ -1,4 +1,4 @@
-# Raw peer output — 10-PREFLIGHT.md Phase 4 (lines 372-476)
+# Raw peer output: 10-PREFLIGHT.md Phase 4 (lines 372-476)
 
 Verbatim agent responses. Synthesized findings in `../REVIEW-PROGRESS.md`.
 

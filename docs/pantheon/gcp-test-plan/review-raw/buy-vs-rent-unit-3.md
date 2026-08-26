@@ -106,5 +106,5 @@ Asked whether *"not revisited on a price dip"* is legitimate pre-commitment or i
 **This is the cleanest resolution available, and it reconciles Gemini's two halves.** "Always" is correct *as a
 policy*; what makes it insulation rather than commitment is the absence of any named reopening condition. **Adding
 one threshold sentence converts the document from a stance into a pre-commitment without weakening the bright line at
-all** — and a pre-commitment with a stated trigger is exactly the discipline `30-DECISION-RULES.md` demands
+all**, and a pre-commitment with a stated trigger is exactly the discipline `30-DECISION-RULES.md` demands
 everywhere else in this corpus.

@@ -1,4 +1,4 @@
-# Raw peer output — 10-PREFLIGHT.md tail sections (lines 727-779)
+# Raw peer output: 10-PREFLIGHT.md tail sections (lines 727-779)
 
 Checklist, cost accounting, and what-comes-next.
 

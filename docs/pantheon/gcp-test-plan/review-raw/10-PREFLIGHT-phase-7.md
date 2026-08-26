@@ -1,4 +1,4 @@
-# Raw peer output — 10-PREFLIGHT.md Phase 7 (lines 643-676)
+# Raw peer output: 10-PREFLIGHT.md Phase 7 (lines 643-676)
 
 **Date:** 2026-08-26 · **Peers:** Codex (engineering), Gemini (strategic), DeepSeek (adversarial logic)
 
