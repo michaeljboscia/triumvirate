@@ -11,9 +11,17 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** REVIEW COMPLETE and REWRITE COMMITTED for queue item 1.
-**Next action:** queue item 2, `20-EVIDENCE-BUNDLE-SPEC.md`. Queue item 1 is COMPLETE (reviewed, rewritten, verified 35/36 addressed, no new errors).
+**Current queue item:** 2 of 9 (`20-EVIDENCE-BUNDLE-SPEC.md`)
+**Current section:** unit 1 of 4 (lines 1-47) COMPLETE, all three peers logged.
+**Next action:** unit 2 of 4, `20-EVIDENCE-BUNDLE-SPEC.md` lines 48-321 (Required file schemas: manifest.json, summary.md, cost-report.json, obsidian-note.md, metrics).
+
+**Unit plan for queue item 2 (4 units):**
+| Unit | Lines | Contents | Status |
+|---|---|---|---|
+| 1 | 1-47 | header, design goals, directory structure | **DONE** |
+| 2 | 48-321 | required file schemas | next |
+| 3 | 322-390 | lifecycle, downstream consumers | pending |
+| 4 | 391-end | storage economics, retention, versioning, what this enables | pending |
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -39,7 +47,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
-| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
+| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **IN PROGRESS**, 1 of 4 units | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
@@ -67,6 +75,75 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `20-EVIDENCE-BUNDLE-SPEC.md` unit 1 (lines 1-47): design goals, directory structure
+
+Raw output: `review-raw/20-EVIDENCE-SPEC-unit-1.md`. All three peers.
+
+#### CRITICAL
+
+**E1-C1. The one property a client-facing evidence artifact must have is absent from the design goals entirely.
+THREE-PEER CONVERGENCE, reached three different ways.**
+Lines 13-19 list seven goals: immutable, self-describing, tool-agnostic, structurally queryable, semantically
+queryable, human-readable, cheap. Codex: the missing one is **verifiability / tamper evidence**. Gemini:
+**cryptographic verifiability (non-repudiation)**. DeepSeek: **an external append-only anchor outside the writer's
+control**.
+
+Gemini's diagnosis of why: *"It is a data engineering brief, not a security brief."* The list is optimized for
+Supabase ingestion and developer ergonomics. A skeptical client does not care that the data is cheap to store or
+tool-agnostic. They care whether it is true.
+
+**Actionable synthesis:** split the mutable run-state record from the immutable published bundle; make bundle objects
+write-once and content-addressed; sign the manifest with a key the tested system never holds; anchor the signature in
+an external append-only log. Bucket-level WORM is the second layer, not the first.
+
+**E1-C2. Design goal 1 is contradicted by the spec's own lifecycle section. All three peers caught it.**
+Line 13 says "Immutable. Once written, never modified." The lifecycle section (line 322 onward) creates
+`manifest.json` at T+0 with `status="running"` and then UPDATES it with verdicts and `ended_at`. That is a mutation.
+**The lifecycle should give, not the goal:** keep mutable working state outside the bundle and publish a finalized
+bundle once, or make the run-state record and the verdict record separate write-once objects.
+
+#### HIGH
+
+**E1-H1. "Immutable" is declared, never enforced.**
+DeepSeek's framing: declaring immutability is a promise, enforcing it is a mechanism, and a reader relying on a
+declared-immutable artifact still has to trust whoever controls the storage. Nothing in the artifact reveals a silent
+change. The Phase 2 review already established the bucket has only uniform access and public-access-prevention, which
+are access controls rather than immutability, with no retention policy, versioning, or bucket lock. *(All three)*
+
+**E1-H2. `raw/` is load-bearing for the isolation claim and nothing requires it to be populated.**
+Line 43 describes `raw/` as "raw tcpdump / strace, gate-specific" without mandating any concrete file. **If nothing
+populates it, the isolation claim rests on summarized metrics rather than inspectable evidence,** which is exactly the
+distinction a client security team will press on. *(Codex)*
+
+**E1-H3. Design goal 7's "< 100MB per run" is incompatible with real packet capture.**
+Line 19. A tcpdump across a full gate run easily exceeds that depending on duration, traffic, snap length, and whether
+payloads are captured. The spec needs capped captures, metadata-only flow logs, rotation and compression rules, or a
+different storage target. **As written, the size goal and the evidence requirement are in direct conflict.** *(Codex)*
+
+**E1-H4. The storage root is hardcoded to GCS.**
+Lines 5 and 7: `gs://pantheon-evidence/...` and "No run is considered complete until its bundle lands in GCS." With
+Track A local, this couples run completion to cloud synchronization for no reason. Make the root transport-agnostic
+and default it to a local filesystem URI. *(Gemini)*
+
+#### STRATEGIC
+
+**E1-S1. This should be two bundles, not one.**
+Gemini's split:
+- **Client security team:** `manifest.json`, `summary.md`, possibly `artifacts/evaluations/`. Minimal, sanitized,
+  signed, verifiable.
+- **Internal debugging:** `obsidian-note.md`, hardware metrics, verbose container logs, `raw/` captures.
+
+Handing a client an `obsidian-note.md` (with its "Mike's notes" section) is unprofessional. Handing them raw `strace`
+and `tcpdump` output is an active security risk: it leaks infrastructure detail and buries the actual evidence in
+noise. **Note the tension with E1-H2:** the client bundle must still contain enough raw material to be checkable, so
+the split is between sanitized-and-signed versus everything, not between summary and evidence.
+
+**E1-S2. The independence problem is untouched.** Nothing in lines 1-47 addresses a system generating its own security
+evidence. Gemini: *"a system grading its own homework."* Requires an out-of-band observer to assemble the bundle and a
+WORM destination the tested system cannot rewrite. *(Gemini, consistent with the earlier method-level finding C-5)*
+
+---
 
 ### `10-PREFLIGHT.md` tail: checklist, cost accounting, what comes next (lines 727-779)
 
