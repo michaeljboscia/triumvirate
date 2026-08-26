@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 4 of 9 (`runbooks/gate-0-plumbing.md`)
-**Current section:** unit 2 of 3 (lines 112-245) COMPLETE, all three peers logged.
-**Next action:** unit 3 of 3, `gate-0-plumbing.md` lines 246-314 (Step 6 evidence emission, Step 7 capture logs and self-destruct, Step 8 verify and vault, cost accounting, what comes after). The `gcloud compute instances delete` at line 284 sits AFTER `exit` so self-destruct never runs.
+**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 4 is COMPLETE.
+**Next action:** REWRITE `gate-0-plumbing.md` as a LOCAL runbook. Key moves: retarget from GCP VM to `lenovo`; add H-0.4 clean teardown; Step 5 asserts the routing envelope (correlation IDs round-trip, correct stage) not completion and not mock semantics; remove the latency assertion; unconditional teardown trap plus runner timeout replacing the VM's ephemerality; sentinel-last evidence; resource accounting instead of cost; forcing function to advance. Then verification pass, then queue item 5 (`gate-6-airgap-sanity.md`).
 
 **Unit plan for queue item 4 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-111 | purpose, hypotheses, checklist, Steps 1-2 | **DONE** |
 | 2 | 112-245 | Step 3 compose stack, Steps 4-5 tests | **DONE** |
-| 3 | 246-314 | Step 6 evidence, Step 7 self-destruct, Step 8 vault, cost, what comes after | next |
+| 3 | 246-314 | Step 6 evidence, Step 7 self-destruct, Step 8 vault, cost, what comes after | **DONE** |
 
 **Carry into unit 3:** the `gcloud compute instances delete` at line 284 sits AFTER `exit`, so self-destruct never runs. Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
 
@@ -67,7 +67,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
-| 4 | `runbooks/gate-0-plumbing.md` | **IN PROGRESS**, 2 of 3 units | |
+| 4 | `runbooks/gate-0-plumbing.md` | **REVIEWED**, 3 of 3 units. Rewrite next. | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
@@ -93,6 +93,91 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `gate-0-plumbing.md` unit 3 (lines 246-314): evidence, teardown, vault, cost, next steps
+
+Raw output: `review-raw/gate-0-unit-3.md`. All three peers. **Completes the review of queue item 4.**
+
+#### THE FIRST-RUN FAILURE PREDICTION
+
+**G0-F1. It will fail at `/opt/pantheon-harness/`, immediately, with file-not-found.**
+Lines 250, 254, 273, 278 call Python scripts at that absolute path. **It is native to a custom GCP image template
+that was never built, and the local box has no such directory.** Gemini's answer to "what goes wrong first," and it is
+concrete enough to fix before running rather than discovering at 2am.
+
+Second most likely: **a hang with no timeout**, leaving ports squatted and state contaminated, since nothing bounds
+the run and Step 7 never executes (see G0-C5).
+
+#### CRITICAL
+
+**G0-C5. The self-destruct is dead code, confirmed in context.**
+Line 285 runs `exit`; line 286 never executes. **On the original GCP target the VM would simply stay alive** after the
+logs, cost report, and note were uploaded. Nothing in the block saves it; only an external TTL or manual cleanup
+would have. **This was the third of six advertised spend-control layers to be found non-functional.** *(Codex)*
+
+**G0-C6. Step 6 is named "evidence bundle emission" and is not the last writer to the bundle.**
+Lines 250-260 generate a manifest and summary and upload the directory, reading as finalization. **Then Step 7 writes
+more objects into the same bundle** (logs, cost report, note) at 269-282. No content-addressing, no sentinel, no
+finalize. Validation is `gsutil ls -r` (263), which lists objects and validates neither schema, checksums, required
+files, nor completeness.
+
+DeepSeek on what that reveals: the runbook was **written incrementally**, Step 6 authored as the terminal step and
+Step 7 appended later without revisiting Step 6's name or the end-to-end data flow. *"The name 'emission' was chosen
+from intention, not from actual behavior."*
+
+**The discipline, and it generalizes: name steps by the invariant they guarantee, not by their role in a draft
+narrative. Only the step that leaves the artifact in its terminal state may be called emission.**
+
+**This is the corpus-wide tense finding in a different grammatical category.** The tense rule governs verbs; this
+governs step names. Both are labels asserting something the procedure does not do. **Check every step name implying
+terminality (emit, finalize, complete, publish, verify) and confirm nothing after it touches what that step claims to
+finish.**
+
+#### HIGH
+
+**G0-H9. Step 8's "verify" can pass against a partial bundle.**
+Line 292 lists the prefix. Any objects existing satisfies it. **It validates presence, not completeness**, which is
+exactly the gap the sentinel exists to close. *(Codex)*
+
+**G0-H10. "What comes after" is passive documentation, which under Rule A licenses stopping.**
+Lines 312-314 state that a PASS leads to the next gate. Gemini: **to force advancement, passing must output the
+literal execution command for the next stage, or trigger it.** A sentence describing what should happen next is not a
+forcing function. Line 312 also calls the next gate the "first real GPU burn," which no longer holds locally, and
+line 314's "cheapest debug available" is unsupported rhetoric. *(Both)*
+
+**G0-H11. Cost accounting states a dollar total that is now meaningless.**
+Line 304 assumes `e2-standard-4` Spot pricing and line 306 totals `~$0.10`, for a run on a machine we own.
+
+**What it was for** (standing rule): preventing budget drain. **Does the problem persist locally?** The financial form
+does not; the **constraint** form does. **Replacement (Gemini): resource accounting.** Track local disk consumed by
+artifacts and execution time (operator waiting, process locking). Those are the scarce resources now. If anything
+still uploads to cloud storage, use `cost_status: pending_billing_export` rather than a number. *(Both)*
+
+#### THE REWRITTEN STEP 7 (both peers converge, ordered)
+
+1. **Capture telemetry first:** `docker compose ... logs > ...` before anything is destroyed.
+2. **Eradicate state:** `docker compose ... down -v --remove-orphans`. This is the missing H-0.4 teardown.
+3. **Archive evidence:** move `/tmp/evidence/$RUN_ID` to permanent local storage.
+4. **Scrub temps:** remove the staged evidence directory and the temp compose and config files.
+5. Delete both the `exit` (285) and the `gcloud compute instances delete` (286).
+
+Codex's additions: free and verify the bound ports; remove named volumes **only if test-scoped**; revoke or delete
+temporary credentials and token files. **Explicitly avoid deleting shared Docker resources or long-lived local
+credentials**, which is the failure mode a blunt cleanup introduces.
+
+**The whole teardown must run unconditionally, on any exit path**, which is the point of a trap rather than a final
+step. That plus a runner timeout is what replaces the ephemerality the VM used to provide for free.
+
+#### MEDIUM
+
+**G0-M6. The Obsidian vault step does not belong in this runbook.**
+Lines 289-296 assume `~/Documents/pantheon-vault` and therefore a specific operator machine. **What it was for:**
+integrating run metadata into a personal knowledge base for historical search. **The purpose survives; the placement
+does not.** Extract to a global post-run hook or reporting script. Gemini: *"Tying PKM git commits to a specific test
+stage creates brittle coupling."* Consistent with the evidence-spec decision to move `obsidian-note.md` to an
+internal sidecar. *(Both)*
+
+---
 
 ### `gate-0-plumbing.md` unit 2 (lines 112-245): compose stack, health check, dispatch test
 
