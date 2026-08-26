@@ -12,8 +12,17 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 6 of 9 (`local-inference-buy-vs-rent.md`)
-**Current section:** queue item 5 COMPLETE (reviewed, rewritten, verified). Codex found three genuine new errors in my rewrite; all fixed. That is four rewrites in a row where verification caught something real.
-**Next action:** queue item 6, `local-inference-buy-vs-rent.md`. This holds the standing policy in section 6 and already received the TPS floor. Needs: verification that its hardware facts survive (there is no M4 Ultra; M5 Ultra 256GB is ~$9,499 and 512GB ships late October at an unpublished price), and a check for the hype register found elsewhere in the corpus.
+**Current section:** unit 1 of 3 (lines 1-130) COMPLETE, all three peers logged.
+**Next action:** unit 2 of 3, `local-inference-buy-vs-rent.md` lines 131-284 (section 3 throughput reality on 512GB Apple Silicon, section 4 the NVIDIA alternative, section 5 the cloud pivot and retainer product).
+
+**Unit plan for queue item 6 (3 units):**
+| Unit | Lines | Contents | Status |
+|---|---|---|---|
+| 1 | 1-130 | the trigger, published benchmarks | **DONE** |
+| 2 | 131-284 | throughput reality, NVIDIA alternative, cloud pivot | next |
+| 3 | 285-455 | **section 6 THE STANDING POLICY**, recommendations, history, bibliography | pending |
+
+**Carry into unit 3:** BR1-C1 says the document has no crossover threshold and therefore cannot support its own conclusion. Section 6 is where that would have to be fixed.
 
 **Unit plan for queue item 5 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -76,7 +85,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | **COMPLETE** (3 units, 3 peers, 317 to ~250 lines, verified) | `5b85ab2` |
-| 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
+| 6 | `local-inference-buy-vs-rent.md` | **IN PROGRESS**, 1 of 3 units (TPS floor already added in `401fdde`) | |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
 | 9 | `twin-review-synthesis.md` | pending | |
@@ -100,6 +109,93 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `local-inference-buy-vs-rent.md` unit 1 (lines 1-130): the trigger, the benchmarks
+
+Raw output: `review-raw/buy-vs-rent-unit-1.md`. All three peers.
+
+**Read the reviewer note at the bottom of this section before acting on any of it.** This document holds the standing
+policy, and the finding is about the analysis, not the policy.
+
+#### CRITICAL
+
+**BR1-C1. The document contains no crossover threshold, so it cannot support its own conclusion. THREE-PEER
+CONVERGENCE.**
+
+It concludes "rent first, always" and **states no usage level, monthly spend, or utilization at which buying would
+become correct.** Nothing in it is falsifiable.
+
+DeepSeek's distinction is the useful one. **No crossover because none exists** would be a legitimate but
+extraordinary finding, requiring a derived demonstration that renting dominates across the whole plausible parameter
+space. **No crossover because it was never computed** is generalization from an anecdote. *"The absence of a
+crossover is not evidence that none exists; it is evidence the question was never asked."*
+
+**Minimum for the document to be the first rather than the second:** an explicit cost formula (capex, opex,
+depreciation, utilization, horizon, discount rate, opportunity cost), a justified parameter range, a demonstration
+that buy exceeds rent throughout it, and **a stated falsification condition of the form "if utilization exceeded X,
+or rental prices exceeded Y, buying would be preferable."**
+
+**BR1-C2. The benchmark table compares vendor-run numbers against third-party numbers.**
+Open-weight models are presented with **self-reported vendor evaluations** (lines 87, 104) while frontier models are
+measured by **independent harnesses** (127-128). That comparison is not valid in either direction, and it happens to
+flatter the side the conclusion favors. *(Gemini)*
+
+**BR1-C3. The document uses a model to justify a machine that cannot run it.**
+Kimi K2.6 supports the 512GB case, and **line 100 states the model requires 594GB.** *(Gemini)*
+
+#### HIGH
+
+**BR1-H1. The anchor is both obsolete and distorting.**
+The whole analysis is triggered by a single **$34,000 second-hand listing** (14), which is uncited and unverifiable.
+Anchoring there lets the document compute depreciation from an inflated $26-34K baseline **rather than from retail**,
+and lets it treat "buying hardware" as equivalent to "making a desperate transaction with a scalper" while ignoring
+normal procurement (56, 62).
+
+**With M5 Ultra 512GB now announced, the true capital cost is a standard MSRP, which collapses the scarcity and
+depreciation framing entirely.** *(Gemini, Codex)*
+
+**BR1-H2. Line 66 is factually wrong now.** It says M5 Ultra is "expected around October 2026." **It was announced
+2026-08-25.** Mac Studio M5 Ultra starts around $5,499; 512GB ships late October; 256GB is roughly $9,499-$10,799
+depending on configuration. Line 39's "cannot be bought new" was true of the **M3 Ultra 512GB SKU** specifically and
+should say so. *(Codex)*
+
+**BR1-H3. Numbers are stated with more precision than their sources support.**
+The `$23,000-$26,000` and `$27,000+` offer guidance (54-58) rests on scarcity that has since changed. Several
+benchmark figures cite secondary coverage rather than primary evals, and at least two claims ("Modified MIT license",
+"594GB INT4 QAT") **are not supported by the source cited for them.** *(Codex)*
+
+**BR1-H4. Multiple benchmark facts have gone stale in three days**, including the Kimi K3 weights status and the
+"open-weight leader" ranking. **A benchmark table is a dated snapshot and must be labelled as one**, with a capture
+date and per-row provenance: vendor-run, third-party harness, proprietary suite, or unknown. *(Codex)*
+
+#### THE ARGUMENT THE DOCUMENT NEVER ENGAGES
+
+**BR1-S1. Zero-marginal-cost agentic loops.**
+Gemini: a permanent rent policy enforces **perpetual per-token metering, which penalizes continuous high-volume
+agentic workflows, long-context retrieval, and speculative execution.** Local hardware removes per-token anxiety and
+network latency.
+
+**The document's exclusive focus on capital risk ignores the operational chilling effect of metered inference**: work
+you do not attempt because each attempt has a price. That is a real cost and it appears nowhere in the analysis.
+
+**This is also the strongest argument for the owner's own stated instinct** about wanting a large local machine, and
+the document currently gives him no way to evaluate it.
+
+#### REVIEWER NOTE, read before acting on any of the above
+
+**None of this means rent-first is wrong.** The owner has independently affirmed the policy on his own reasoning: no
+purchase until a customer needs the iron, the qualifying buyer is vanishingly rare, and renting is likely the primary
+consumption model indefinitely. **That judgment stands on its own and does not depend on this document.**
+
+**The finding is narrower.** The document cannot *support* the policy as an economic result, and therefore **cannot
+tell you when to revisit it.** That gap became concrete tonight: asked whether to lease a 512GB machine, the document
+offered no framework to answer, because it has no crossover, no cost model, and no falsification condition.
+
+**The fix is not to change the conclusion. It is to supply the missing economics so the conclusion becomes
+checkable**, and to separate the policy (a decision the owner has made and can make on any grounds he likes) from the
+analysis (which currently does not carry it).
+
+---
 
 ### `gate-6-airgap-sanity.md` unit 3 (lines 241-317): upload, teardown, decision rule, claims
 
