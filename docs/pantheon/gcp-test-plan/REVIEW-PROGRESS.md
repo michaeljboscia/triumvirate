@@ -12,15 +12,17 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 6 of 9 (`local-inference-buy-vs-rent.md`)
-**Current section:** unit 2 of 3 (lines 131-284) COMPLETE, all three peers logged.
-**Next action:** unit 3 of 3, `local-inference-buy-vs-rent.md` lines 285-455 (**section 6, the standing policy**, section 7 recommendations, document history, bibliography). This is where the missing crossover threshold would have to be supplied.
+**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 6 is COMPLETE.
+**Next action:** SPLIT `local-inference-buy-vs-rent.md` per BR3-D1. Extract the policy into a standalone directive written as the owner's decision, with reopening thresholds (BR3-R2) and real triggers on the order of operations. Demote the hardware analysis to a dated appendix with its provenance problems marked.
+
+**IMPORTANT: the policy itself is not in question and must not be weakened by the split.** The owner has affirmed it independently. The split protects it from being invalidated by a price move, since it currently rests on analysis that cannot carry it.
 
 **Unit plan for queue item 6 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-130 | the trigger, published benchmarks | **DONE** |
 | 2 | 131-284 | throughput reality, NVIDIA alternative, cloud pivot | **DONE** |
-| 3 | 285-455 | **section 6 THE STANDING POLICY**, recommendations, history, bibliography | next |
+| 3 | 285-455 | **section 6 THE STANDING POLICY**, recommendations, history, bibliography | **DONE** |
 
 **Carry into unit 3:** BR1-C1 says the document has no crossover threshold and therefore cannot support its own conclusion. Section 6 is where that would have to be fixed.
 
@@ -85,7 +87,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | **COMPLETE** (3 units, 3 peers, 317 to ~250 lines, verified) | `5b85ab2` |
-| 6 | `local-inference-buy-vs-rent.md` | **IN PROGRESS**, 2 of 3 units | |
+| 6 | `local-inference-buy-vs-rent.md` | **REVIEWED**, 3 of 3 units. Split next. | |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
 | 9 | `twin-review-synthesis.md` | pending | |
@@ -109,6 +111,101 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `local-inference-buy-vs-rent.md` unit 3 (lines 285-455): THE STANDING POLICY
+
+Raw output: `review-raw/buy-vs-rent-unit-3.md`. All three peers. **Completes the review of queue item 6.**
+
+#### THE RESOLUTION (all three peers, and it decides what to do with this document)
+
+**BR3-R1. "Always" is the right word for a policy and the wrong word for a finding. The document is written as the
+latter, which is what makes it fragile.**
+
+Gemini: *"Because the analysis lacks a crossover point and relies on inflated data, presenting the policy as a
+mathematical outcome makes it fragile. **A strategic business decision holds regardless of hardware market
+fluctuations; a mathematically forced one collapses when prices drop.**"*
+
+Codex confirms the ambiguity is in the text: section 6 says *"There is no economic model... That is settled"* (290-291)
+while section 7 states it as a decision rule (381). **It is framed as both, which raises the burden to whichever is
+higher: it needs an economic model if it wants the conclusion, or plainer policy language if it only wants a rule.**
+
+**The policy is not in question. Its presentation is.** Written as the owner's structural decision it is durable.
+Written as a derived economic result it invites exactly the challenge that a price drop would bring, and it cannot
+survive that challenge because no model underlies it.
+
+**BR3-R2. "Not revisited on a price dip" is evidence insulation, and one sentence fixes it.**
+
+DeepSeek's test: *"A pre-commitment is legitimate iff it names, in advance, what evidence WOULD reopen the decision
+and at what threshold. If the set of reopening conditions is empty, or if it specifically carves out the single most
+probable disconfirming observation, it is evidence insulation dressed as discipline."*
+
+**Verdict: insulation.** Line 291 *"targets exactly the datum that would test the claim and declares it inadmissible,
+while naming no circumstance that would reopen the question."*
+
+**The minimal fix keeps the bright line intact:**
+
+> "There is no economic model for buying this hardware at this pricing or this utilization, and this is not revisited
+> on a transient price dip, **only on a sustained structural change (price down at least X% for Y consecutive
+> quarters, or utilization at least Z).**"
+
+**This converts a stance into a pre-commitment without weakening it at all**, and a pre-commitment with a stated
+trigger is precisely the discipline `30-DECISION-RULES.md` demands everywhere else. **Fill in X, Y, Z and this
+document's central defect is closed.**
+
+#### HIGH
+
+**BR3-H1. Section 7 is stronger than the body it summarizes.**
+- *"No utilization model justifies it"* (383): section 6 says **no model exists** (290), not that one was run and
+  failed. **Those are different claims and the summary states the stronger one.**
+- *"Compliance buyers are lost to VPC-hosted frontier models"* (386) is categorical, while section 6 says **"mostly
+  lost"** (324).
+- *"Throughput does not justify it at any price near the ask"* (382) and *"every path is priced at peak"* (384) both
+  exceed what the analysis demonstrates.
+*(Codex)*
+
+**BR3-H2. Gemini's row-by-row audit of section 7: almost nothing rests on the analysis.**
+Of ten recommendation rows, **two are supported by neither the analysis nor judgment** (the $34K Mac Studio verdict,
+built on an inflated listing; the RTX PRO 6000 verdict, built as a strawman at peak pricing). **The remaining eight
+are the owner's judgment**, which is legitimate but should be labelled as such rather than presented as analytical
+output.
+
+**BR3-H3. The order of operations has no triggers.**
+Lines 301-307. "Sell the outcome" has no qualification criterion; "pilot on rented GPUs" has no pass/fail; "sign a
+term long enough to amortize whatever comes next" (305) **contains no amortization math.** The only termination
+condition is rhetorical: *"If step 4 never arrives, nothing was lost"* (309). *(Codex)*
+
+**BR3-H4. The TPS floor sits awkwardly and is orphaned.**
+It is **the only falsification-like criterion in the section** (367-369), but it arrives late as rescued archival
+material (359-360) **after the policy has already been declared settled** (290-294), and nothing else in the document
+references it. It is also a **performance disqualifier, not an economic crossover**, so it does not fill the gap
+BR1-C1 identified. *(Codex)*
+
+#### MEDIUM
+
+**BR3-M1. The bibliography cites forums and aggregators where primary sources exist**, particularly for Apple pricing
+and specs and NVIDIA MSRP. Model benchmarks are entirely secondary or tertiary. *(Codex)*
+
+**BR3-M2. Document History shows consolidation, not revision.** v2 "records the standing policy"; v1 consolidated
+prior analysis. **Nothing records a conclusion changing in response to evidence**, which is consistent with the
+motivated-reasoning finding from unit 1 rather than exculpatory of it. *(Codex)*
+
+#### THE DISPOSITION (Gemini's recommendation, and I agree)
+
+**BR3-D1. Split the document.** It binds **a permanent, sound business policy** (rent first, own the context layer)
+to **a flawed point-in-time hardware analysis** built on an inflated listing, mismatched benchmarks, and a rigged
+capacity test.
+
+- **Extract the policy into a standalone operational directive**, written as the owner's decision, with the reopening
+  thresholds from BR3-R2 filled in, and the order of operations given real triggers.
+- **Demote the hardware analysis** to a dated appendix, labelled as an August 2026 snapshot, with its provenance
+  problems marked and its conclusions restated at the strength the evidence actually supports.
+
+**Why splitting matters more than correcting:** every other document in this corpus was rewritten tonight against
+this policy. **If the policy stays welded to analysis that cannot carry it, a single price move appears to invalidate
+the whole corpus.** Separated, the policy stands on the owner's judgment (where it always actually stood) and the
+analysis can be corrected, aged out, or replaced without touching it.
+
+---
 
 ### `local-inference-buy-vs-rent.md` unit 2 (lines 131-284): throughput, NVIDIA, the retainer
 
