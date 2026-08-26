@@ -1,4 +1,4 @@
-# Review Progress — corpus remediation state
+# Review Progress: corpus remediation state
 
 **THIS FILE EXISTS TO SURVIVE COMPACTION.** If you are a session that just lost context, read this file and
 `/Users/michaelboscia/projects/triumvirate/docs/pantheon/GOAL-corpus-remediation.md`, then resume at the position marked
@@ -37,7 +37,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 
 | # | Document | Status | Commit |
 |---|---|---|---|
-| 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
+| 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
@@ -52,14 +52,14 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 
 | Section | Lines | Reviewed |
 |---|---|---|
-| Phase 1 — Project + billing + quota | 11-185 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 2 — Network + storage | 186-272 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 3 — Docker image pre-bake | 273-371 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 4 — Model weights cached to GCS | 372-476 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 5 — PD snapshots | 477-544 | **DONE** (Codex, Gemini, DeepSeek) — VERDICT: DELETE PHASE |
-| Phase 6 — Custom VM images | 545-642 | **DONE** — VERDICT: DELETE PHASE |
-| Phase 7 — Fixtures + Pythia seed | 643-676 | **DONE** — see THE CENTRAL FINDING |
-| Phase 8 — Tooling validation | 677-726 | **DONE** — validates nothing, see P8-C1 |
+| Phase 1: Project + billing + quota | 11-185 | **DONE** (Codex, Gemini, DeepSeek) |
+| Phase 2: Network + storage | 186-272 | **DONE** (Codex, Gemini, DeepSeek) |
+| Phase 3: Docker image pre-bake | 273-371 | **DONE** (Codex, Gemini, DeepSeek) |
+| Phase 4: Model weights cached to GCS | 372-476 | **DONE** (Codex, Gemini, DeepSeek) |
+| Phase 5: PD snapshots | 477-544 | **DONE** (Codex, Gemini, DeepSeek). VERDICT CORRECTED, see findings |
+| Phase 6: Custom VM images | 545-642 | **DONE**. VERDICT: DELETE PHASE |
+| Phase 7: Fixtures + Pythia seed | 643-676 | **DONE**. See THE CENTRAL FINDING |
+| Phase 8: Tooling validation | 677-726 | **DONE**. Validates nothing, see P8-C1 |
 | Preflight completion checklist | 727-755 | **DONE** |
 | Cost accounting | 756-773 | **DONE** |
 | What comes next | 774-end | **DONE** |
@@ -598,12 +598,12 @@ Line 288. Codex checked the Docker Hub tag API: `404`. vLLM publishes CPU images
 (line 283) and `nats:2.10-alpine` (line 293) both resolve `200`. *(Codex)*
 
 **P3-C2. Step 3.3 has five independent build failures.**
-- Line 366: `-f harness/Dockerfile` — file does not exist.
+- Line 366: `-f harness/Dockerfile`: file does not exist.
 - Line 340: `COPY requirements.txt .` resolves to `gcp-test-plan/requirements.txt`, but line 349 documents it at
   `harness/requirements.txt`. Neither exists.
 - Line 343: `COPY harness/ ./harness/` copies a directory that is not a Python package.
-- Line 344: `COPY fixtures/ ./fixtures/` — never existed.
-- Line 346: `ENTRYPOINT ["python3", "-m", "harness.runner"]` — module does not exist.
+- Line 344: `COPY fixtures/ ./fixtures/`: never existed.
+- Line 346: `ENTRYPOINT ["python3", "-m", "harness.runner"]`: module does not exist.
 *(Codex)*
 
 **P3-C3. Step 3.2 Cloud Build references three missing files and a broken substitution.**
