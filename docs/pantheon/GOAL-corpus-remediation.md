@@ -40,6 +40,24 @@ record of what actually happened.
   complete, and wasted roughly 500k tokens producing nothing. Three direct `ask_agent` calls per section is correct.
 - **Do not use the Workflow tool for this.** It is a loop over a list.
 
+### STANDING RULE: never delete and hand-wave. It was there for a reason.
+
+**Owner instruction, 2026-08-26, and it is not optional.** When a peer recommends deleting something, the review is
+not finished until you have answered, in writing, in `REVIEW-PROGRESS.md`:
+
+1. **What was this for?** What problem did the original author put it there to solve?
+2. **Does that problem still exist?** If yes, deleting it creates a gap.
+3. **What replaces the capability?** Name the replacement, or say plainly that the capability is being dropped and
+   why that is acceptable.
+
+Peers are good at spotting that something is wrong and bad at noticing what it was load-bearing for. Two things have
+already been wrongly deleted this way: the PD snapshot (which was the only answer to a 30-minute cold start) and,
+nearly, the pre-registered hypothesis structure (which is the only thing in the corpus preventing post-hoc
+rationalization of results). **Separate the content from the structure. Usually the content is dead and the structure
+is the good part.**
+
+Record your own dissent from a peer when you have one. Agreement is not the goal, correctness is.
+
 ### Two corrections already made, do not re-introduce them
 
 - **"Air-gap" does not have to mean literal isolation.** The working definition is not connected to the public

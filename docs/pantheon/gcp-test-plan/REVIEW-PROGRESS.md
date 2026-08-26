@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 2 of 9 (`20-EVIDENCE-BUNDLE-SPEC.md`)
-**Current section:** unit 1 of 4 (lines 1-47) COMPLETE, all three peers logged.
-**Next action:** unit 2 of 4, `20-EVIDENCE-BUNDLE-SPEC.md` lines 48-321 (Required file schemas: manifest.json, summary.md, cost-report.json, obsidian-note.md, metrics).
+**Current section:** unit 2 of 4 (lines 48-321) COMPLETE, all three peers logged.
+**Next action:** unit 3 of 4, `20-EVIDENCE-BUNDLE-SPEC.md` lines 322-390 (Lifecycle, Downstream consumers). The downstream section claims six automations trigger; check how many exist.
 
 **Unit plan for queue item 2 (4 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-47 | header, design goals, directory structure | **DONE** |
-| 2 | 48-321 | required file schemas | next |
-| 3 | 322-390 | lifecycle, downstream consumers | pending |
+| 2 | 48-321 | required file schemas | **DONE** |
+| 3 | 322-390 | lifecycle, downstream consumers | next |
 | 4 | 391-end | storage economics, retention, versioning, what this enables | pending |
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
@@ -47,7 +47,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
-| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **IN PROGRESS**, 1 of 4 units | |
+| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **IN PROGRESS**, 2 of 4 units | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
@@ -75,6 +75,94 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `20-EVIDENCE-BUNDLE-SPEC.md` unit 2 (lines 48-321): required file schemas
+
+Raw output: `review-raw/20-EVIDENCE-SPEC-unit-2.md`. All three peers.
+
+#### CRITICAL
+
+**E2-C1. The canonical metrics example teaches a PASS that fails standing policy, in two different ways.**
+Lines 263-303. The example records `tokens_per_second_per_stream_median: 12.4` at `concurrency: 1` against
+`targets.tokens_per_second_per_stream_min: 10`, and marks it `"verdict": "PASS"`.
+
+Standing policy (rescued from the archived `HARDWARE_DECISION.md`, now in `local-inference-buy-vs-rent.md` section 6)
+requires **15 tok/s/stream under 4-way batched load.**
+
+Codex found both defects by reading the file; DeepSeek found both from the numbers alone and added the ranking that
+matters:
+
+> "A wrong threshold is a visible numeric error; a wrong load condition invalidates the entire measurement while still
+> producing a plausible-looking PASS. People copying the template will repeat the same structurally meaningless test
+> setup without noticing."
+
+**The concurrency mismatch is the more dangerous of the two.** 12.4 versus 15 gets caught eventually because it is a
+visible number. `concurrency: 1` in a template that everyone copies silently reproduces an experiment that does not
+test the thing policy is about, forever, while looking fine. **Fix the threshold, but fix the load condition first.**
+
+**E2-C2. `confidence: 0.85` is fabricated.**
+Line 87, inside `decision_rule_outcomes`. Nothing anywhere defines a scoring model, inputs, or calibration. Gemini:
+*"pseudo-scientific padding. Submitting baseless confidence scores to a security team will immediately destroy the
+credibility of every actual metric in the bundle."* One invented number contaminates every real one beside it.
+
+#### HIGH
+
+**E2-H1. `total_cost_usd` cannot be a required field at finalization.**
+Lines 91, 102, 185, 188. The stated attribution method is a label-based query on the GCP billing export, but that
+export is written throughout the day rather than in real time, and initial backfill can take up to five days.
+**Authoritative cost is necessarily unknown when the bundle is sealed.** The harness was just fixed to refuse to
+invent costs, so the schema must accommodate that: emit `cost_status: pending_billing_export` rather than a number.
+*(Codex)*
+
+**E2-H2. The schema is saturated with the cancelled purchase.**
+`"verdict": "buy 2x 3090 NVLink"` (87), gate-2 hardcoded through the manifest example (57-59), `rtx-3090-proxy` tag
+(223), and hypotheses about 70B local inference, concurrent multi-model hosting, and 32B LoRA training (238-245).
+A schema specification teaches by example, so it is currently teaching a dead decision as the shape of truth. *(Both)*
+
+**E2-H3. Required-field list is wrong at both ends.**
+Line 102. Requires `total_cost_usd` (see E2-H1). Missing for a client-facing artifact: artifact hash/digest, generator
+identity and version, git clean/dirty state, schema validation status, evidence completeness status, cost provenance,
+per-metric-file checksums, rule and threshold versions, and a signed finalization marker. *(Codex)*
+
+#### MEDIUM
+
+**E2-M1. `nvidia-smi.csv` at a 30-second interval misses most of what matters.** Lines 306-318. Fine for coarse
+utilization and thermal drift. Blind to short stalls, bursty saturation, allocation spikes, throttling transients, and
+per-process attribution. A reviewer would want per-process usage, driver and CUDA versions, DCGM metrics or finer
+sampling, and correlation IDs tying telemetry to specific test windows. *(Codex)*
+
+**E2-M2. Several manifest fields are unpopulatable as specified:** `experimenter` as identity evidence,
+`triumvirate_version`/`git_commit` unless captured from the running artifact, `prior_runs_referenced` unless lineage
+is enforced, `evidence_bundle_size_mb` unless computed after writing. *(Codex)*
+
+#### DELETION CANDIDATES, EACH WITH ITS PURPOSE RECORDED
+
+Per the standing rule (never delete and hand-wave; it was there for a reason). **In every case here the content is
+dead and the structure is the good part.**
+
+**E2-D1. The pre-registered hypothesis structure. KEEP THE STRUCTURE. I dissent from Gemini on this.**
+Gemini recommended cutting the "academic hypotheses tested format" (lines 121-130).
+- **What it was for:** pre-registering a prediction and a threshold *before* the test runs, so a result cannot be
+  rationalized afterward.
+- **Does the problem still exist?** Yes, acutely. Post-hoc rationalization is the disease that produced this entire
+  review. This is the single most epistemically sound thing in the original corpus.
+- **Replacement:** none needed. Replace the *content* (H-2.1 "70B-Q4 local inference is usable") and keep the
+  *structure*. Gemini's own suggested replacements are themselves hypotheses, which makes the point.
+
+**E2-D2. `decision_rule_outcomes`. KEEP THE AUDIT TRAIL, CUT THE INVENTED NUMBER.**
+- **What it was for:** tracing a verdict back to the evidence that produced it.
+- **Does the problem still exist?** Yes. A client asking "why does this say PASS" needs an answer.
+- **Replacement:** rule id, rule version, threshold value, measured value, resulting pass/fail. Traceable rather than
+  invented. Delete only the `confidence` float.
+
+**E2-D3. `obsidian-note.md`. MOVE IT, DO NOT DELETE IT.**
+- **What it was for:** knowledge capture, so runs compound into a searchable vault instead of evaporating.
+- **Does the problem still exist?** Yes, and it is the "knowledge moat" the master plan cares about.
+- **Replacement:** generate it as an internal sidecar outside the client bundle. `significance: 3` and
+  `## Mike's notes` are fine in an internal artifact and disqualifying in a client one. This is the two-bundle split
+  from E1-S1, applied.
+
+---
 
 ### `20-EVIDENCE-BUNDLE-SPEC.md` unit 1 (lines 1-47): design goals, directory structure
 
