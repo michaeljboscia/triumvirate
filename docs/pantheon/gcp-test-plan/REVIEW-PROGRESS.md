@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 8 (lines 677-726) — COMPLETE, all three peers logged
-**Next action:** review the final three short sections together or in turn: Preflight completion checklist (727-755), Cost accounting (756-773), What comes next (774-end).
+**Current section:** ALL 11 SECTIONS REVIEWED. Review of queue item 1 is COMPLETE.
+**Next action:** REWRITE `10-PREFLIGHT.md` against the findings below, keeping its structure, then one narrow verification pass, then move to queue item 2.
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 8 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — **ALL 11 SECTIONS REVIEWED** — ready to rewrite | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -60,13 +60,91 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | Phase 6 — Custom VM images | 545-642 | **DONE** — VERDICT: DELETE PHASE |
 | Phase 7 — Fixtures + Pythia seed | 643-676 | **DONE** — see THE CENTRAL FINDING |
 | Phase 8 — Tooling validation | 677-726 | **DONE** — validates nothing, see P8-C1 |
-| Preflight completion checklist | 727-755 | no |
-| Cost accounting | 756-773 | no |
-| What comes next | 774-end | no |
+| Preflight completion checklist | 727-755 | **DONE** |
+| Cost accounting | 756-773 | **DONE** |
+| What comes next | 774-end | **DONE** |
 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` tail: checklist, cost accounting, what comes next (lines 727-779)
+
+Raw output: `review-raw/10-PREFLIGHT-tail.md`. All three peers. **This completes the review of queue item 1.**
+
+#### CRITICAL
+
+**T-C1. The checklist is an attestation layer masquerading as a verification layer. THREE-PEER CONVERGENCE.**
+DeepSeek's framing: a human-ticked box converts a question about the world ("does this artifact exist and work?") into
+a question about a person's confidence, and confidence is the one thing you cannot afford to trust before irreversible
+spending. **A gate whose test cannot fail is not a gate, it is an ornament.**
+
+Note the exact wording at line 750: *"synthetic PubSub test triggered deletion behavior."* **"Deletion behavior" is not
+"deleted a VM."** The first asserts a function ran; the second asserts the world changed. A checkbox cannot tell them
+apart, and the underlying test could not fail anyway (see P8-C1).
+
+All three peers independently rejected the human-ticked form itself, not merely its contents. The replacement they
+converge on: **an automated outcome-based gate that fails closed and writes an evidence bundle.** Each item becomes a
+machine check against live state, each check is itself tested against a broken world first to prove it can fail, raw
+API output is captured as evidence, and human sign-off is reserved for judgement rather than facts.
+
+**T-C2. Four checklist items reference artifacts that cannot exist.**
+Lines 737 (hard-kill deployed AND TESTED), 742 (`pantheon-triumvirate`, `pantheon-test-harness`, `pantheon-vllm-cpu`),
+747 (`data/pythia.db`), 748 (`fixtures/`). Counting named artifacts inside those items, at least six. Twenty boxes, and
+a fifth of them are unachievable as written. *(Codex)*
+
+#### HIGH
+
+**T-H1. The cost table is not defensible in either row.**
+Line 767's "$6-13 one-time" omits the per-gate 500GB pd-ssd at roughly $0.116/hour and undercounts Phase 5. Line 768's
+"$15-20/month ongoing" is exceeded by the Phase 5 snapshot alone (~$18) before counting 361GB of models, bucket
+storage, per-gate disks, custom images, and Artifact Registry storage of multi-GB images. **Missing from the table
+entirely:** Artifact Registry, Cloud Storage across five buckets, custom image storage, per-gate disks, corrected
+snapshot pricing, failed and retried builds, logging/monitoring, Pub/Sub and Function costs, and egress. *(Codex)*
+
+**T-H2. The Gemini Ultra credit claim is partly real and wholly unsafe to budget against.**
+Line 770: "All within Gemini Ultra GCP credit. Effective cost to Mike: $0." Codex checked current Google sources:
+**Google AI Ultra can include monthly Google Cloud credits via the Google Developer Program, so the claim is not
+fiction. But it is a bounded benefit, not a blank cheque.** It is falsified by credit exhaustion, an ineligible billing
+account or project, expired or unclaimed credits, or services and regions outside the promo terms.
+
+The plan designs its budget around a subscription entitlement rather than the actual billing-account credit balance,
+SKU eligibility, and hard caps. Gemini's point lands: with the kill-switch validation also broken, an error here means
+uncontrolled personal liability. **Verify the live credit balance before spending, do not infer it from the
+subscription.** *(Codex, resolving an assumption flagged three times in this review)*
+
+**T-H3. "What comes next" (line 778) is unsupported in every particular.**
+It claims gate-0 costs $0.50, takes ~45 minutes, validates the stack end to end, lands an evidence bundle, and
+auto-generates an Obsidian note. Gate-0 cannot run: images missing, harness missing, self-delete unreachable. The only
+true statement in the paragraph is that `runbooks/gate-0-plumbing.md` is the next document. *(Codex)*
+
+#### STRATEGIC
+
+**T-S1. The checklist's shape is the tell.** Gemini: exhaustive checklists for unexecuted plans are a psychological
+crutch. Twenty granular checkboxes create an illusion of rigor and momentum, letting the author feel work is being
+accomplished by documenting a hypothetical state. **This is the same disease the Phase 7 finding named, expressed as a
+document artifact rather than as a missing directory.**
+
+**T-S2. Purge the hype register from the corpus.** Line 778's "your first Pantheon run is immortalized" is narrative
+payoff, not system state. Gemini's rule for the rewrite: any language that evokes emotion rather than describing
+deterministic behavior gets cut. Watch for it elsewhere (the corpus also contains "knowledge moat" and "nuclear
+backstop"). *(Gemini)*
+
+**T-S3. What the rewritten tail should contain.** Not a cost table and not a GCP gate-0 preamble. Just: the exact
+command that starts the local Track A run on the RTX 4000 Ada, the local path where the evidence bundle is written,
+and the specific log output that constitutes success. *(Gemini)*
+
+#### SURVIVING CHECKLIST ITEMS (for the rewrite)
+
+- **Die with the deleted phases:** lines 745 (PD snapshot), 746 (custom VM images), and most of 731-741 in their
+  current GCP-first form.
+- **Rewrite for local:** 742 (build images locally, drop Artifact Registry), 743-744 (cache weights and checksums to
+  local disk), 748 (local fixture paths, after the fixtures are actually authored), 749 (evidence bundle to a local
+  directory).
+- **Keep but convert to machine checks:** 732 (APIs), 735-736 (budget alert, topic), 738-739 (VPC, firewall), 741
+  (Artifact Registry), if and when GCP is actually used.
+
+---
 
 ### `10-PREFLIGHT.md` Phase 8 (lines 677-726)
 
