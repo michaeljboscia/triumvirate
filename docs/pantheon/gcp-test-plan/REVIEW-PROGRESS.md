@@ -11,9 +11,18 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 2 of 9 (`20-EVIDENCE-BUNDLE-SPEC.md`)
-**Current section:** queue item 2 COMPLETE (reviewed, rewritten, verified). Codex found one genuine new error in my rewrite (overstated GCP billing latency); fixed.
-**Next action:** queue item 3, `30-DECISION-RULES.md`. Known going in: delete rules 1, 2, 3, 6, 10 (pure CapEx triggers), keep 4, 5, 7, 8 (validate software, substrate agnostic). Rule 10 auto-converts OPEX to CAPEX at $1000/mo for 2 months. APPLY THE STANDING RULE: record what each deleted rule was for.
+**Current queue item:** 3 of 9 (`30-DECISION-RULES.md`)
+**Current section:** unit 1 of 3 (lines 1-127, framing + Decisions 1-3) COMPLETE, all three peers logged.
+**Next action:** unit 2 of 3, `30-DECISION-RULES.md` lines 128-246 (Decisions 4, 5, 6, 7, 8). These are the mixed set: 4, 5, 7, 8 validate software and are substrate-agnostic (likely keep); 6 is a CapEx trigger (Pantheon Rack tier).
+
+**Unit plan for queue item 3 (3 units):**
+| Unit | Lines | Contents | Status |
+|---|---|---|---|
+| 1 | 1-127 | framing, Decisions 1-3 (CapEx triggers) | **DONE** |
+| 2 | 128-246 | Decisions 4, 5, 6, 7, 8 | next |
+| 3 | 247-350 | Decisions 9, 10, rule application log, amendment protocol | pending |
+
+**Carry into unit 3:** Decision 10 is the auto OPEX-to-CAPEX trigger at $1000/mo for 2 months and was called the most dangerous line in the corpus.
 
 **Unit plan for queue item 2 (4 units):**
 | Unit | Lines | Contents | Status |
@@ -48,7 +57,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
-| 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
+| 3 | `gcp-test-plan/30-DECISION-RULES.md` | **IN PROGRESS**, 1 of 3 units | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
@@ -75,6 +84,101 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `30-DECISION-RULES.md` unit 1 (lines 1-127): framing, Decisions 1-3
+
+Raw output: `review-raw/30-DECISION-RULES-unit-1.md`. All three peers.
+
+**Headline, and all three reached it independently: the machinery is the asset, the subject matter is the liability.**
+Keep the structure, replace the content. This is the same shape as the hypothesis finding in the evidence spec.
+
+#### KEEP (with the reason, per the standing rule)
+
+**D1-K1. The framing at lines 8-28 is sound and must survive intact.**
+It separates pre-commitment, mechanical application, an ambiguity fallback, and amendment-instead-of-reinterpretation
+(10-12), and the per-rule template cleanly separates Trigger, Evidence source, Rule, Fallback, Amendment log (18-24).
+
+Gemini: *"This is not ceremony. You built this framework to stop yourself from lying to yourself about evidence."*
+
+DeepSeek's enumeration of what carries into any other decision domain: a threshold committed **before** evidence,
+mechanical application with no judgement at decision time, an **explicit inconclusive branch**, and an **open
+amendment log** where you revise the rule rather than the interpretation.
+
+**D1-K2. The amendment log is the piece most likely to be dropped, and it is the accountability mechanism.**
+DeepSeek: *"People keep the threshold and the mechanical trigger, but when the rule produces an uncomfortable outcome
+they silently reinterpret the threshold instead of openly amending it. The accountability mechanism is the first thing
+to go."* Gemini agrees on why it works: it cannot physically prevent goalpost-moving, but **the friction of having to
+write down a bad excuse in a dated log is what breaks the motivated-reasoning cycle.**
+
+**Do not drop the amendment log in the rewrite.** Both peers flagged it unprompted.
+
+**D1-K3. The explicit inconclusive-evidence branch (lines 55-59, 89-91) is good design.**
+It forces one rerun, then defaults to the more reversible path. Keep the pattern.
+
+#### CRITICAL
+
+**D1-C1. Line 39 sets `>= 5 tok/s per stream` under 4-way batched load. Standing policy requires 15.**
+Third instance of the same defect (see E2-C1 and the preflight review). **A number three times too low, in a
+pre-committed rule, in the document that exists to be applied mechanically.** *(Codex)*
+
+**D1-C2. Decision 3's rule threshold is weaker than its own trigger.**
+The trigger fires at utilization `> 80% sustained for 4+ weeks` (line 104), but the rule then only requires `> 70% for
+30+ days` (line 112). **A rule that is easier to satisfy than the condition that invokes it is not a gate.** *(Codex)*
+
+#### THE QUESTION THAT MATTERS MOST
+
+**D1-Q1. What temptation do these rules guard against now?**
+They were written to stop the author rationalizing a $15K purchase he wanted to make. That temptation is gone.
+Gemini names the replacement, and it is correct:
+
+> "Without a $15K upfront price tag to give you pause, it is dangerously easy to rationalize leaving a heavy GCP
+> instance running overnight so I don't have to wait 5 minutes tomorrow, or to stay in Track B forever tweaking rented
+> setups because the hourly cost feels negligible."
+
+**The two new failure modes are zombie infrastructure and failure to advance.** Cheap and reversible decisions do not
+trigger the deliberation that expensive irreversible ones do, so the bleed is continuous and nothing ever forces a
+stop. **The rewritten rules must guard against those, not against purchases.**
+
+#### MAPPING: Decisions 1-3 are dead, but not for the reason I expected
+
+Gemini: the mapping onto rent-first **fails**, and forcing it would be worse than dropping it. *"Applying 4-week
+friction logs (42) and multi-week bottleneck tracking (71) to a $3/hour highly-reversible rental decision is
+bureaucratic theater."* The ceremony was proportionate to a $15K irreversible commitment. It is absurd for a decision
+you can reverse by pressing stop.
+
+**Codex disagrees in part and is also right:** the underlying *measurements* remain worth taking (throughput,
+contention, LoRA completion without OOM, utilization time series, scheduling conflicts). **So: keep the measurements,
+drop the ceremony around them.** The measurements belong in the Track B sizing sweep, not in a purchase gate.
+
+#### REPLACEMENT RULES PROPOSED (Gemini, to be refined in the rewrite)
+
+- **Track A exit.** Trigger: local loop configured. Threshold: canonical 8-task swarm >= 6/8 offline. Rule: stop
+  tinkering with local infrastructure, advance to Track B. *(Guards against failure to advance.)*
+- **Track B baseline lock.** Trigger: sweep data collected. Threshold: cheapest tier sustaining the production floor.
+  Rule: that tier becomes the default; renting larger requires a new explicit rule. *(Guards against budget bleed.)*
+- **Track C pilot conversion.** Trigger: pilot reaches 30 days or a spend cap. Threshold: client executes a paid
+  contract. Rule: convert or terminate. **No perpetual free trials.** *(Guards against zombie infrastructure.)*
+
+**Note the threshold in Track B needs correcting before adoption:** Gemini wrote `>= 50 tok/s for 72B`, borrowing
+Decision 2's single-stream number. The standing floor is **15 tok/s/stream at 4-way batch**, which is the condition
+policy actually cares about.
+
+#### SALVAGE LIST (extract before removing the rules)
+
+Codex quoted the thresholds worth preserving: contention factors `< 2.0` (40) and `< 1.5x` (80); `32B LoRA <= 3 hrs
+without OOM` (41) and `<= 2 hrs` (81); `>= 5 events/week where the 48GB tier specifically mattered` (42); GCP spend
+`>$1000/mo for 2 consecutive months on consistent workload` (69); `72B single-stream >= 50 tok/s` (79); `canonical
+8-task agent swarm >= 6/8 pass` (82); utilization `> 80% sustained for 4+ weeks` (104) and `> 70% for 30+ days` (112).
+
+Line 39's `>= 5 tok/s per stream` is preserved **only** as a record that it was superseded by 15, so nobody
+reintroduces it.
+
+#### MEDIUM
+
+**D1-M1. Line 119 is mislabelled `Fallback`** where the others say `Fallback (INCONCLUSIVE evidence)`, and it handles
+negative evidence rather than ambiguous evidence. Two different branches with one name. *(Codex)*
+
+---
 
 ### `20-EVIDENCE-BUNDLE-SPEC.md` unit 4 (lines 391-end): storage, retention, versioning, claims
 
