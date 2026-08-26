@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 3 of 9 (`30-DECISION-RULES.md`)
-**Current section:** unit 2 of 3 (lines 128-246, Decisions 4-8) COMPLETE, all three peers logged.
-**Next action:** unit 3 of 3, `30-DECISION-RULES.md` lines 247-350 (Decisions 9 and 10, rule application log, amendment protocol, what this enables). Decision 10 is the auto OPEX-to-CAPEX trigger and was called the most dangerous line in the corpus. Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
+**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 3 is COMPLETE.
+**Next action:** REWRITE `30-DECISION-RULES.md`. Key moves: invert Decision 10 into the budget-bleed guard; cut Decisions 1, 2, 3, 6 with purpose recorded; keep 4, 5, 7, 8 with edits; strengthen Decision 7 with a connected-baseline parity check; add a forcing function against failure-to-advance; make the amendment protocol binding rather than documentary (post-change scope only, cooldown, peer review). Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
 
 **Unit plan for queue item 3 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-127 | framing, Decisions 1-3 (CapEx triggers) | **DONE** |
 | 2 | 128-246 | Decisions 4, 5, 6, 7, 8 | **DONE** |
-| 3 | 247-350 | Decisions 9, 10, rule application log, amendment protocol | next |
+| 3 | 247-350 | Decisions 9, 10, rule application log, amendment protocol | **DONE** |
 
 **Carry into unit 3:** Decision 10 is the auto OPEX-to-CAPEX trigger at $1000/mo for 2 months and was called the most dangerous line in the corpus.
 
@@ -57,7 +57,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
-| 3 | `gcp-test-plan/30-DECISION-RULES.md` | **IN PROGRESS**, 2 of 3 units | |
+| 3 | `gcp-test-plan/30-DECISION-RULES.md` | **REVIEWED**, 3 of 3 units. Rewrite next. | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
@@ -84,6 +84,91 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `30-DECISION-RULES.md` unit 3 (lines 247-350): Decisions 9-10, logs, amendment protocol
+
+Raw output: `review-raw/30-DECISION-RULES-unit-3.md`. All three peers. **Completes the review of queue item 3.**
+
+#### THE BEST FINDING IN THIS DOCUMENT
+
+**D3-B1. Decision 10 is the budget-bleed guard wearing the wrong clothes. Invert it.**
+
+Unit 2 found that nothing in the corpus guards against budget bleed. Decision 10 already contains exactly the
+machinery that gap needs: a spend threshold (`> $1000/mo for 2 consecutive months`, line 288), a
+sustained-not-bursty condition (289), and break-even utilization hours by card class (291-293).
+
+It just points the wrong way. As written it says *spend crossed the threshold, therefore buy hardware*, which uses
+high rent as an argument for CapEx and directly subverts rent-first.
+
+**Inverted, it becomes the missing rule:** *spend crossed the threshold, therefore STOP and justify continuing.* The
+justification options are optimize the architecture, commit to a reserved instance, or shut the workload down.
+Gemini: *"The inversion works perfectly and is not too clever. Renting is the destination."*
+
+**This is the cleanest outcome of the whole review: the most dangerous line in the corpus, rotated 180 degrees,
+becomes the control the corpus was missing.**
+
+Codex's caveat on the break-even numbers: they assume purchase price, usable life, utilization, cloud hourly rate,
+power/support/ops overhead, and workload equivalence, **none of which are stated, so the thresholds are not auditable
+as written.** They survive translation only if rewritten around the **reserved-instance commitment delta**: on-demand
+cost at observed hours versus reserved cost plus lock-in risk. Recompute before adopting the hour figures.
+
+#### CRITICAL
+
+**D3-C1. Decision 10 can force a purchase with no performance gate whatsoever.**
+Codex: the only real conflict with the production floor in this range is that **Decision 10's trigger is purely
+financial.** Nothing requires the hardware to clear 15 tok/s/stream at 4-way batch before money is committed. A
+spend threshold alone can authorize buying something that cannot do the job. *(Codex)*
+
+#### HIGH
+
+**D3-H1. The amendment protocol is documentary, not binding. Gemini reversed her own unit-1 position, and DeepSeek
+explains why both versions were partly right.**
+
+Unit 1 (Gemini): the friction of writing down a bad excuse breaks the motivated-reasoning cycle.
+Unit 3 (Gemini): *"Journaling a rationalization does not stop motivated reasoning; it just records it."*
+
+DeepSeek resolves it: the first version *"works for people with enough integrity that seeing a bad excuse in writing
+shames them into honesty, but that is a personality trait, not a mechanism."* The second holds **whenever the same
+person controls the threshold, the reasoning, and the application, and faces no external cost.** That is exactly the
+situation here. **A log records drift; it does not stop it. Only a veto from outside the motivated mind can.**
+
+**Practical fix for a solo operator**, who cannot supply his own external veto:
+1. **Amendments apply only to evidence collected after the change** (DeepSeek's minimum), never retroactively.
+2. **A cooldown before an amendment takes effect** (Gemini proposed 72 hours).
+3. **Peer review as the actual separation of powers.** The one genuinely external reviewer already available is the
+   twin agents. An amendment reviewed by Codex or Gemini before taking effect is real, and costs almost nothing.
+
+Codex adds what the protocol is missing structurally: immutable before/after text, amendment author, evidence IDs,
+an explicit replacement rule, and a required statement of what the old rule was for and what replaces it. **That last
+item is the owner's standing rule, and it belongs in the protocol itself rather than only in this review.**
+
+**D3-H2. The rule application log is empty after four months, and that is the finding.**
+Lines 310-325 are a sample object, not a real application. Gemini: *"An empty log after four months proves the
+mechanism was a bureaucratic fantasy. If the tool is too heavy to pick up, it gets bypassed entirely."* Replace the
+hand-written JSON requirement with something light enough to actually use: a ledger entry or a git commit.
+
+**D3-H3. "What this document enables" (342-350) overclaims, same as every other closing section in this corpus.**
+Line 344 is false because the log is unpopulated. Line 346's "auditable decision trail" does not exist. **Line 348 is
+worse than aspirational: it cites an RTX Pro 6000 CapEx trigger as evidence of "clean business defensibility," and
+that trigger is being cut for violating policy.** *(Codex and Gemini)*
+
+#### DECISION 9, AND A NOTE THAT THE MACHINERY WORKED
+
+**D3-D1. Applied mechanically, Decision 9 says DO NOT BUY, and that is the correct answer.**
+Worth recording because it is the only place in this review where a pre-committed rule was applied as designed and
+produced the right result. A 512GB M5 Ultra was announced 2026-08-25, which might look like a trigger. But the 256GB
+purchase requires **all four** predicates at lines 256-259 (including a paid engagement and a friction log), and the
+512GB path requires either sovereign/405B justification or 256GB being unavailable (261). Since 256GB exists, **the
+fallback at 270-272 is now obsolete and the rule correctly declines to fire.** *(Codex)*
+
+The stale `~$12K` figure for 512GB should be removed; Apple has not published that price.
+
+**Replacement (Gemini):** rented Apple metal exists (AWS `mac-m3ultra.metal`, 256GB today). Replace the acquisition
+triggers at 255-264 with **a mandate to rent first**, unlocking CapEx only if rental proves structurally unviable for
+a named reason such as latency or an MLX-specific bottleneck. This matches the treatment already given to the same
+question in `fast-vm-startup-strategies.md`.
+
+---
 
 ### `30-DECISION-RULES.md` unit 2 (lines 128-246): Decisions 4, 5, 6, 7, 8
 
