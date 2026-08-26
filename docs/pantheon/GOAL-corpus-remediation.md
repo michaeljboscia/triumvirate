@@ -1,6 +1,52 @@
-# /goal — Pantheon corpus remediation
+# /goal: Pantheon corpus remediation
 
 Paste this to start or resume the work. It is written so a session with no prior context can execute it.
+
+---
+
+## READ THESE TWO FILES FIRST (compaction survival)
+
+**If you have just lost context, this file alone is not enough. Live state lives in two other places:**
+
+1. **`docs/pantheon/gcp-test-plan/REVIEW-PROGRESS.md`** is the authoritative state file. It carries the RESUME HERE
+   pointer (which queue item, which section, what to do next), the queue status table, the per-document section lists,
+   and every synthesized finding. **Read it before doing anything. Trust its RESUME HERE pointer over anything below,
+   because this file is not updated after every section and that one is.**
+2. **`docs/pantheon/gcp-test-plan/review-raw/`** holds every peer's verbatim output, one file per document-section.
+   Synthesis loses detail; that directory does not. Consult it before re-asking a peer anything.
+
+**Never re-review a section already marked DONE in `REVIEW-PROGRESS.md`. Never start over.**
+
+Everything is committed and pushed after each section, so `git log --oneline docs/pantheon/` is a third independent
+record of what actually happened.
+
+### Status as of 2026-08-26
+
+- **Queue item 0 (`HARDWARE_DECISION.md`): COMPLETE.** Archived to `docs/pantheon/archive/`, `Status: ACCEPTED`
+  stripped, TPS floor (15 tok/s/stream at 4-way batch) extracted into `local-inference-buy-vs-rent.md` section 6.
+- **Queue item 1 (`10-PREFLIGHT.md`): COMPLETE.** All 11 sections reviewed by three peers, 113 findings logged,
+  rewritten 778 lines to 405, verification pass returned 35 of 36 addressed with no new errors.
+- **Queue item 2 (`20-EVIDENCE-BUNDLE-SPEC.md`): IN PROGRESS,** unit 1 of 4 done.
+- **Side deliverable produced on request:** `docs/pantheon/fast-vm-startup-strategies.md`, cold-start strategies with
+  precomputed cost tradeoffs.
+
+### Operating constraints learned the expensive way, obey them
+
+- **DeepSeek cannot read files** through `ask_agent` and will correctly refuse rather than fabricate citations. Paste
+  the section text to it, and give it ONE focused question at `reasoning_effort: low`.
+- **The MCP bridge times out at 180 seconds.** Two long DeepSeek prompts were lost to this. The env var is read
+  client-side, so it cannot be raised without restarting the session. Keep peer calls to roughly one section.
+- **There are about 3 twin worker slots.** Do not fan out wider. A 10-agent Workflow was tried, stalled at 0 of 10
+  complete, and wasted roughly 500k tokens producing nothing. Three direct `ask_agent` calls per section is correct.
+- **Do not use the Workflow tool for this.** It is a loop over a list.
+
+### Two corrections already made, do not re-introduce them
+
+- **"Air-gap" does not have to mean literal isolation.** The working definition is not connected to the public
+  internet, and Private Google Access rides Google's private backbone, so **PGA does not need to be removed**. The
+  problem is terminology: never call the GCP test an air-gap proof in anything a client reads.
+- **A "delete this phase" verdict is incomplete until you ask what replaces the capability.** The PD-snapshot delete
+  verdict was accepted on a bad comparison and had to be corrected. See the Phase 5 entry in `REVIEW-PROGRESS.md`.
 
 ---
 
@@ -38,9 +84,9 @@ In priority order. Priority reflects the rebuilt plan, where Track A (gate-0 the
 
 | # | Document | Status |
 |---|---|---|
-| 0 | `HARDWARE_DECISION.md` + `_provenance.md` | **Not a review. An archive action.** Extract the TPS floor first, then move to `archive/` and strip `Status: ACCEPTED`. Do this before anything else: it currently instructs a $160K purchase the policy forbids. |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | Next. 11 sections (Phases 1-8, checklist, cost accounting, what comes next). |
-| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | Client-facing artifact spec. Independence problem is unconfirmed against the real file. |
+| 0 | `HARDWARE_DECISION.md` + `_provenance.md` | **COMPLETE 2026-08-26** (commit `401fdde`). Archived, ACCEPTED stripped, TPS floor extracted. |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **COMPLETE 2026-08-26.** 11 sections, 113 findings, rewritten 778 to 405 lines, verified 35/36. |
+| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **IN PROGRESS**, unit 1 of 4 done. Client-facing artifact spec. 4 units: 1-47, 48-321, 322-390, 391-end. |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | Delete rules 1, 2, 3, 6, 10 (pure CapEx triggers). Keep 4, 5, 7, 8 (validate software, substrate agnostic). Rule 10 is the auto OPEX-to-CAPEX trigger and is the most dangerous line in the corpus. |
 | 4 | `runbooks/gate-0-plumbing.md` | Track A. Known broken: delete command sits after `exit` (line 284) so self-destruct never runs; compose step is a literal placeholder. |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | Track A, and the product claim. Known broken: says "ZERO outbound" in purpose, passes at "<= 5 packets" in decision rule; permits Private Google Access so it is restricted-egress not air-gap; no IPv6; `g4-standard-32` is not a real machine type. |
