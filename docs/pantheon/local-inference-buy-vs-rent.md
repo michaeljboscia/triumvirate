@@ -354,6 +354,24 @@ client is seats, not metal, not even an API integration. See `docs/advisory/ria-
 control-motivated segment above behaving exactly as predicted, and it is evidence for the rent-first policy rather than
 against it.
 
+### The production floor still applies to rented hardware
+
+Rescued from `archive/HARDWARE_DECISION.md` before that document was archived on 2026-08-25. It was written as a
+purchase criterion, but the criterion is substrate-agnostic and survives the policy change intact:
+
+> **Production floor: at least 15 tokens per second per stream under 4-way batched concurrent agent load.**
+
+Below that, the verification gates cannot consume agent output as fast as the agents produce it. Backpressure inverts,
+the audit chain backlogs, and the substrate stops being real-time. That failure mode does not care who owns the silicon.
+
+The consequence for renting is direct: a rented configuration that misses this floor is not cheap, it is useless, and
+cost per hour is the wrong axis to select on alone. Every row in the sizing sweep must report tokens per second per
+stream at 4-way concurrency alongside its hourly price, and any row under 15 is disqualified regardless of what it costs.
+
+For calibration, the same source recorded a 2x L4 configuration measuring a median of 12.4, p95 of 10.1, and p99 of 8.6
+under that load. That is below the floor. It was the empirical basis for rejecting the original build, and it is equally
+a warning against renting the same class of card and expecting fleet throughput.
+
 ---
 
 ## 7. Summary of Recommendations
