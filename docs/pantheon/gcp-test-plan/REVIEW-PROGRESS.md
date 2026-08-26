@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 7 (lines 643-676) — COMPLETE, all three peers logged
-**Next action:** review Phase 8 (Tooling validation, lines 677-726) with all three peers.
+**Current section:** Phase 8 (lines 677-726) — COMPLETE, all three peers logged
+**Next action:** review the final three short sections together or in turn: Preflight completion checklist (727-755), Cost accounting (756-773), What comes next (774-end).
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 7 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 8 of 11 sections reviewed | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -59,7 +59,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | Phase 5 — PD snapshots | 477-544 | **DONE** (Codex, Gemini, DeepSeek) — VERDICT: DELETE PHASE |
 | Phase 6 — Custom VM images | 545-642 | **DONE** — VERDICT: DELETE PHASE |
 | Phase 7 — Fixtures + Pythia seed | 643-676 | **DONE** — see THE CENTRAL FINDING |
-| Phase 8 — Tooling validation | 677-726 | no |
+| Phase 8 — Tooling validation | 677-726 | **DONE** — validates nothing, see P8-C1 |
 | Preflight completion checklist | 727-755 | no |
 | Cost accounting | 756-773 | no |
 | What comes next | 774-end | no |
@@ -67,6 +67,80 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` Phase 8 (lines 677-726)
+
+Raw output: `review-raw/10-PREFLIGHT-phase-8.md`. All three peers.
+
+**Phase 8 is the gate that stands between this plan and real money. It validates nothing.**
+
+#### CRITICAL
+
+**P8-C1. The only test of the nuclear spend backstop in the entire corpus proves nothing. THREE-PEER CONVERGENCE.**
+Step 8.2 (lines 714-722) publishes a synthetic over-budget message, waits 30 seconds, then asserts
+`gcloud compute instances list` is empty. **The document's own comment on line 719 explains the list is empty because
+the smoke test already cleaned up** by a completely different mechanism: the VM deleted itself at line 701. So the
+assertion is "no VMs remain after the smoke-test cleanup path," not "the kill function killed anything." It passes
+identically whether the function works perfectly, is broken, or was never deployed.
+
+DeepSeek names it **The Free Ride**: a vacuous assertion riding on a hidden test dependency. Gemini names it
+**tautological testing / validation theater**. Codex reached it by tracing control flow. All three independently.
+
+**The rule (DeepSeek):** couple the assertion to the mechanism under test so it is falsifiable by that mechanism alone.
+Verify the precondition, isolate every other actor that could change the observed state, trigger only the mechanism,
+then assert. **If you break the kill switch, the test must fail.**
+
+**The correct test (Gemini):** create a persistent VM that does NOT self-delete. Fire an under-threshold alert and
+assert it survives. Then fire an over-threshold alert and poll until it is destroyed.
+
+**What a green Phase 8 licenses you to believe (Gemini): that a VM can run a startup script and delete itself. Nothing
+about detecting or halting rogue spend.**
+
+**P8-C2. Failure leaves a billable VM running, precisely when things go wrong.**
+Line 696's `set -e` means a failed `docker run` (697-699) exits before `gsutil cp` (700) and before self-delete (701).
+Same if the container runs but writes no result file. The VM then survives to the 30m cap. So the failure path is
+exactly the path that costs money and leaves debris. *(Codex)*
+
+#### HIGH
+
+**P8-H1. The startup-script quoting is broken in three different ways.**
+Lines 695-702 mix laptop-side and VM-side interpolation via quote-breaking:
+- `$RUN_ID` (line 698) is NOT expanded locally and NOT initialized on the VM, so the container gets `-e RUN_ID=`.
+- `'${REGISTRY}'` (line 699) expands on the laptop; unset means the image reference is `/pantheon-test-harness:main`.
+- `'$DEFAULT_ZONE'` (line 701) expands on the laptop; unset means `--zone=` with no value.
+- `$(hostname)` (line 701) is the only thing that correctly evaluates on the VM.
+*(Codex)*
+
+**P8-H2. Self-delete depends on unproven permission and a weak identifier.**
+Line 701 uses `$(hostname)` when the real instance name was already known at line 684 and could have been passed in.
+And nothing establishes that `pantheon-validator` holds `compute.instances.delete`. *(Codex)*
+
+**P8-H3. `sleep 300` then read is not validation.**
+Lines 705-709 wait a fixed interval and then try to `gsutil cat` the result. A failed run surfaces as a confusing
+storage error rather than a smoke-test failure. Nothing polls instance status, startup-script exit code, serial
+console, or object existence. *(Codex)*
+
+**P8-H4. A non-empty VM list at line 721 is ambiguous and undiagnosable.**
+It could mean the startup script failed, the delete permission failed, the kill function failed, or the function never
+deployed. The phase provides no discriminator between four very different problems. *(Codex)*
+
+#### CORRECT AS WRITTEN
+
+**P8-OK1.** Image family references at lines 687-688 match Phase 6's `pantheon-orchestrator` family. The
+`pantheon-orchestrator-v1` image name is not a mismatch; name and family are separate fields. Recorded so nobody
+"fixes" it. *(Codex)*
+
+#### STRATEGIC
+
+**P8-S1. The phase does not survive the rebuild.** With Track A local, the custom images deleted, and the kill function
+rewritten or removed, there is no GCP infrastructure left to preflight here. *(Gemini)*
+
+**P8-S2. The same tautology appears inside the thing being tested.** The kill function prints its success string
+unconditionally and swallows every exception, so it too "passes" without doing the work. **Validation theater at two
+levels: a test that cannot fail, exercising a function that cannot report failure.** *(Gemini, converging with the
+Phase 1 finding P1-C4/P1-A1)*
+
+---
 
 ### `10-PREFLIGHT.md` Phase 7 (lines 643-676)
 
