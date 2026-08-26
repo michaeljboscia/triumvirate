@@ -11,9 +11,18 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 9 of 9 (`twin-review-synthesis.md`), the last one
-**Current section:** queue item 8 COMPLETE. Six runbooks archived; `SIZING-SWEEP-METHOD.md` created as Track B.
-**Next action:** queue item 9, `twin-review-synthesis.md`, the last item. It is the historical twin review that first called the $20K budget a lie. Likely archive, but apply the standing rule: what was it for, does the problem persist, what replaces it. Then a final consistency pass over the whole corpus.
+**Current queue item:** ALL 9 COMPLETE
+**Current section:** **THE QUEUE IS DONE.** All nine items reviewed by three peers and rewritten, split, or archived with extraction.
+
+**FIVE UNRECOVERED FINDINGS remain open**, caught by the April 2026 twin review, not fixed then, and NOT re-found by this review either. They are recorded in `../twin-review-synthesis.md` and are not covered anywhere in the rewritten corpus:
+1. Human-in-the-loop operating protocol (what is the operator's control surface?)
+2. Continuous model evaluation and quality regression detection
+3. Source-of-truth under concurrent edits
+4. **Customer discovery as a gate BEFORE building** (nothing gates building on demand existing)
+5. Security and compliance for client codebases across their whole lifecycle
+**Next action:** the corpus is rewritten but **nothing has been executed**, which is the exact failure mode this review exists to end. April 2026 produced a correct critique nobody acted on; August has produced a correct corpus nobody has acted on. Both are paper.
+
+**Run Track A on the local box.** It costs nothing. Everything else is secondary to that.
 
 **Unit plan for queue item 6 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -88,7 +97,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 6 | `local-inference-buy-vs-rent.md` | **COMPLETE** (3 units, 3 peers, split into `POLICY-rent-first.md` + demoted analysis) | `608d8a9` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | **COMPLETE**, both archived with extraction to `EXTRACTED-from-archive.md` | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | **COMPLETE**, six archived, replaced by `SIZING-SWEEP-METHOD.md` | |
-| 9 | `twin-review-synthesis.md` | pending | |
+| 9 | `twin-review-synthesis.md` | **COMPLETE**, rewritten as an archival index carrying the five unrecovered findings | |
 
 **Section list for queue item 1 (`10-PREFLIGHT.md`), 11 sections:**
 
