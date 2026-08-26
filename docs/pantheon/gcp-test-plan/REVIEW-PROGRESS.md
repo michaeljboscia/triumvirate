@@ -11,9 +11,9 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 5 of 9 (`runbooks/gate-6-airgap-sanity.md`)
-**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 5 is COMPLETE.
-**Next action:** REWRITE `gate-6-airgap-sanity.md`. Organizing principle from Gemini's distillation: three claims a client can check (zero-unclassified-packet capture, cryptographic attestation of runtime and bundle, write-only pipeline to a CLIENT-CONTROLLED sink), with operational detail demoted to an appendix. Split cloud restricted-egress validation from literal local air-gap. Move capture and adjudication outside the guest via an inline egress gateway, not a passive tap. Replace the packet tolerance with an allowlist at zero unclassified.
+**Current queue item:** 6 of 9 (`local-inference-buy-vs-rent.md`)
+**Current section:** queue item 5 COMPLETE (reviewed, rewritten, verified). Codex found three genuine new errors in my rewrite; all fixed. That is four rewrites in a row where verification caught something real.
+**Next action:** queue item 6, `local-inference-buy-vs-rent.md`. This holds the standing policy in section 6 and already received the TPS floor. Needs: verification that its hardware facts survive (there is no M4 Ultra; M5 Ultra 256GB is ~$9,499 and 512GB ships late October at an unpublished price), and a check for the hype register found elsewhere in the corpus.
 
 **Unit plan for queue item 5 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -75,7 +75,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
-| 5 | `runbooks/gate-6-airgap-sanity.md` | **REVIEWED**, 3 of 3 units. Rewrite next. | |
+| 5 | `runbooks/gate-6-airgap-sanity.md` | **COMPLETE** (3 units, 3 peers, 317 to ~250 lines, verified) | `5b85ab2` |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |

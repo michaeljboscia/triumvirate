@@ -49,7 +49,21 @@ Each is stated below as a claim, a method, and what the client can verify indepe
 
 ### The threshold, and why it is not a number
 
-**Pass condition: zero packets that are not attributable to an enumerated, permitted flow.** Not a count.
+**Pass condition: zero unauthorized packets that successfully left. Not a count, and not the same as zero
+unauthorized packets.**
+
+That distinction is load-bearing once the enforcement point is an inline gateway. **The gateway will log unauthorized
+attempts that it blocked, and those are not failures. They are the evidence the control works**, and they are the
+half of the picture a passive tap cannot show at all. So:
+
+| Observed | Meaning | Verdict |
+|---|---|---|
+| Attributable to an enumerated permitted flow | expected | pass |
+| Unauthorized, blocked by the gateway | **the control working, and worth reporting** | pass, and record it |
+| Unauthorized, successfully egressed | a leak | **fail, at one packet** |
+
+Blocked attempts still get adjudicated rather than waved through: each is classified, and a *pattern* of them is a
+finding in its own right even though none escaped.
 
 > **The original passed at fewer than five outbound packets, "allowing for incidental retry noise."** At a 1500-byte
 > MTU a packet carries roughly 1460 bytes, so **four packets is about 6 KB. An SSH or TLS private key is under 2 KB.**
@@ -103,8 +117,16 @@ added latency, a new single point of failure, and the external observer itself n
 was three container images, the task fixtures, and the retrieval corpus.
 
 That is a practical necessity unless everything is pre-baked, **but it must be stated rather than left implicit.**
-Bound the trusted pre-provisioning window explicitly, and pin every artifact that enters during it by digest, so what
-was loaded is at least identifiable even though it was not observed leaving.
+Bound the trusted pre-provisioning window explicitly, and **pin every artifact that enters during it by digest,** so
+that what came in is identifiable even though the ingress itself happened before the measurement started.
+
+Two different exposures live in that window and they need separating:
+
+- **Ingress:** what entered the machine. Digest pinning addresses this, because it makes the inputs identifiable and
+  reproducible even though nothing observed them arriving.
+- **Egress:** anything that left *during* preparation. **Digest pinning does nothing for this.** Only starting the
+  capture before preparation begins would, which is the stronger option and should be preferred where the images can
+  be staged from local media rather than pulled.
 
 **Build-time behavior is likewise outside this window.** A dormant callback compiled into a base image will not fire
 during a short test. Say so.
@@ -139,8 +161,14 @@ boundary, so a symlink inside the evidence tree would have been followed.
 Requirements:
 
 1. **The sink is a client-controlled bucket**, not ours, with a policy permitting only object creation under a fixed
-   evidence prefix. **This inverts who holds the evidence and removes us from the trust path**, which is the single
-   highest-leverage change in this document.
+   evidence prefix. **This inverts custody of the evidence**, which is the single highest-leverage change in this
+   document.
+
+   **It does not remove us from the trust path, and claiming otherwise would repeat the overclaiming this rewrite
+   exists to fix.** We remain trusted for the uploader's code, for manifest generation, for attestation, and above
+   all for **what gets selected for upload in the first place.** Client-controlled custody means they can see what
+   arrived and that we cannot alter it afterwards. **It says nothing about what we chose to send.** That gap is what
+   requirements 2 through 4 exist to close, and it is why attestation is not optional decoration.
 2. **A least-privilege uploader identity** that can read only the evidence directory and nothing else: not weights,
    not databases, not source, not client data.
 3. **An allowlist of expected filenames, types, and sizes**, aborting on anything unexpected, with symlinks not
@@ -168,6 +196,10 @@ comparing two broken runs and finding them equal.
 
 Evaluations must be constructed so they **cannot pass without local retrieval and inference actually succeeding.**
 
+**The evaluation result must be parsed and enforced, not printed.** The original emitted a summary file and then never
+read it, so the pass condition was in practice a human glancing at output. **A result nothing asserts on is not a
+result.** The verdict below consumes that file programmatically or the run is inconclusive.
+
 ---
 
 ## 4. Verdict
@@ -176,12 +208,12 @@ Evaluations must be constructed so they **cannot pass without local retrieval an
 
 | Condition | Pass |
 |---|---|
-| Unauthorized packets | zero, every permitted flow enumerated and attributed |
+| Unauthorized successful egress | zero. Blocked attempts logged and classified separately, not counted against this |
 | Coverage stated | both address families, named interfaces, exclusions justified |
 | Observer independence | capture and adjudication outside the tested machine |
 | Attestation | manifest signed with an externally held key, anchored externally |
 | Upload channel | write-only, least-privilege, client-controlled sink |
-| Functional equivalence | matches a pre-established, independently verified baseline |
+| Functional equivalence | matches a pre-established, independently verified baseline, asserted programmatically |
 
 **INCONCLUSIVE** is a real outcome and has a branch: if coverage cannot be established, or the baseline's correctness
 is unverified, or the external observer was unavailable, **the result is inconclusive and the claim is not made.**
