@@ -24,47 +24,10 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 **Run Track A on the local box.** It costs nothing. Everything else is secondary to that.
 
-**Unit plan for queue item 6 (3 units):**
-| Unit | Lines | Contents | Status |
-|---|---|---|---|
-| 1 | 1-130 | the trigger, published benchmarks | **DONE** |
-| 2 | 131-284 | throughput reality, NVIDIA alternative, cloud pivot | **DONE** |
-| 3 | 285-455 | **section 6 THE STANDING POLICY**, recommendations, history, bibliography | **DONE** |
 
-**Carry into unit 3:** BR1-C1 says the document has no crossover threshold and therefore cannot support its own conclusion. Section 6 is where that would have to be fixed.
 
-**Unit plan for queue item 5 (3 units):**
-| Unit | Lines | Contents | Status |
-|---|---|---|---|
-| 1 | 1-107 | purpose, hypotheses, checklist, Step 1 | **DONE** |
-| 2 | 108-240 | Steps 2-6, lockdown and capture analysis | **DONE** |
-| 3 | 241-317 | Step 7 PGA upload, Step 8 teardown, decision rules, cost, next | **DONE** |
 
-**Unit plan for queue item 4 (3 units):**
-| Unit | Lines | Contents | Status |
-|---|---|---|---|
-| 1 | 1-111 | purpose, hypotheses, checklist, Steps 1-2 | **DONE** |
-| 2 | 112-245 | Step 3 compose stack, Steps 4-5 tests | **DONE** |
-| 3 | 246-314 | Step 6 evidence, Step 7 self-destruct, Step 8 vault, cost, what comes after | **DONE** |
 
-**Carry into unit 3:** the `gcloud compute instances delete` at line 284 sits AFTER `exit`, so self-destruct never runs. Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
-
-**Unit plan for queue item 3 (3 units):**
-| Unit | Lines | Contents | Status |
-|---|---|---|---|
-| 1 | 1-127 | framing, Decisions 1-3 (CapEx triggers) | **DONE** |
-| 2 | 128-246 | Decisions 4, 5, 6, 7, 8 | **DONE** |
-| 3 | 247-350 | Decisions 9, 10, rule application log, amendment protocol | **DONE** |
-
-**Carry into unit 3:** Decision 10 is the auto OPEX-to-CAPEX trigger at $1000/mo for 2 months and was called the most dangerous line in the corpus.
-
-**Unit plan for queue item 2 (4 units):**
-| Unit | Lines | Contents | Status |
-|---|---|---|---|
-| 1 | 1-47 | header, design goals, directory structure | **DONE** |
-| 2 | 48-321 | required file schemas | **DONE** |
-| 3 | 322-390 | lifecycle, downstream consumers | **DONE** |
-| 4 | 391-end | storage economics, retention, versioning, what this enables | **DONE** |
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 

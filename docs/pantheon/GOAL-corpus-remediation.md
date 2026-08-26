@@ -20,15 +20,43 @@ Paste this to start or resume the work. It is written so a session with no prior
 Everything is committed and pushed after each section, so `git log --oneline docs/pantheon/` is a third independent
 record of what actually happened.
 
-### Status as of 2026-08-26
+### STATUS: THE QUEUE IS COMPLETE (2026-08-26)
 
-- **Queue item 0 (`HARDWARE_DECISION.md`): COMPLETE.** Archived to `docs/pantheon/archive/`, `Status: ACCEPTED`
-  stripped, TPS floor (15 tok/s/stream at 4-way batch) extracted into `local-inference-buy-vs-rent.md` section 6.
-- **Queue item 1 (`10-PREFLIGHT.md`): COMPLETE.** All 11 sections reviewed by three peers, 113 findings logged,
-  rewritten 778 lines to 405, verification pass returned 35 of 36 addressed with no new errors.
-- **Queue item 2 (`20-EVIDENCE-BUNDLE-SPEC.md`): IN PROGRESS,** unit 1 of 4 done.
-- **Side deliverable produced on request:** `docs/pantheon/fast-vm-startup-strategies.md`, cold-start strategies with
-  precomputed cost tradeoffs.
+**All nine items done.** 54 commits, 281 findings, 26 verbatim peer records. Every document reviewed section by
+section by three peers, then rewritten, split, or archived with its purpose recorded.
+
+| Outcome | Documents |
+|---|---|
+| Rewritten | `00-MASTER-PLAN.md`, `10-PREFLIGHT.md`, `20-EVIDENCE-BUNDLE-SPEC.md`, `30-DECISION-RULES.md`, `runbooks/gate-0-plumbing.md`, `runbooks/gate-6-airgap-sanity.md`, `twin-review-synthesis.md` |
+| Split | `local-inference-buy-vs-rent.md` became `POLICY-rent-first.md` (the policy) plus a demoted analysis |
+| Archived with extraction | hardware decision + provenance, model selection, graduated plan, six gate runbooks |
+| Created | `SIZING-SWEEP-METHOD.md`, `EXTRACTED-from-archive.md`, `fast-vm-startup-strategies.md`, `POLICY-rent-first.md` |
+
+**Do not re-run this queue.** It is finished. Two things remain, and neither is more reviewing.
+
+### WHAT IS ACTUALLY NEXT
+
+**1. Execute something.** The corpus is correct on paper and **nothing has ever been run.** April 2026 produced a
+correct critique nobody acted on; this produced a correct corpus nobody has acted on. Both are paper, and the second
+is not better than the first until something executes. **Run Track A on the local Lenovo. It costs nothing.**
+
+Blockers named in `10-PREFLIGHT.md`: the fixtures do not exist, the container images are not built, and the harness
+scripts are called at `/opt/pantheon-harness/`, a path from a GCP image that was never built. **That last one is the
+predicted first-run failure.**
+
+**2. Five findings are open that this review missed.** They were caught by the April 2026 twin review, never fixed,
+and **not re-found here either.** They are recorded in `twin-review-synthesis.md` and are covered nowhere in the
+rewritten corpus:
+
+1. Human-in-the-loop operating protocol: what is the operator's control surface during an autonomous run?
+2. Continuous model evaluation and quality regression detection.
+3. Source-of-truth reconciliation under concurrent edits.
+4. **Customer discovery as a gate before building.** Nothing anywhere gates building on demand existing.
+5. Security and compliance for client codebases across their whole lifecycle.
+
+**Also unfinished:** `POLICY-rent-first.md` carries reopening thresholds marked **NOT SET** on purpose. Fill them from
+measured rental spend and utilization once the sizing sweep produces real numbers. Inventing a plausible figure
+instead would repeat the defect that document exists to correct.
 
 ### Operating constraints learned the expensive way, obey them
 
