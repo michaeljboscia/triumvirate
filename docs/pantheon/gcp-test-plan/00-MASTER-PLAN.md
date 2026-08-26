@@ -1,305 +1,176 @@
-# Pantheon GCP Test Plan — Master Document
+# Pantheon Rented-Compute Validation Plan
 
-**Status:** canonical · actively maintained
+**Status:** canonical · rebuilt 2026-08-25 (supersedes the 2026-04-18 plan)
 **Owner:** Mike Boscia
-**Created:** 2026-04-18
-**Purpose:** The single source of truth for how Pantheon gets tested, validated, and sized on GCP before any local hardware is purchased.
+**Purpose:** Prove the sovereign product claim on rented hardware, and produce a priced catalog of pilot configurations we can stand up for a client.
 
-> **Repurposed (2026-08-23). The gates no longer de-risk a purchase.** Standing policy is rent first, always: there is no
-> economic model for buying GPUs for our own use, and owned metal happens only as a customer-funded terminal step after a
-> rented pilot and a signed term. See `docs/pantheon/local-inference-buy-vs-rent.md` section 6.
->
-> The gates survive with a different job. Read every "purchase decision rule" below as one of these instead:
->
-> - **Quotable evidence** for sovereign-build proposals. The bundle spec in `20-EVIDENCE-BUNDLE-SPEC.md` is the artifact a
->   prospect is shown, not an internal buying memo.
-> - **Pilot substrate.** Gates 1 through 5 are the catalog of rented configurations we can stand up for a client pilot,
->   and what each costs per hour.
-> - **Gate 6 is promoted.** Air-gap sanity was a late nice-to-have. For a sovereign engagement it is the entire product
->   claim and the one result a client will ask to see.
->
-> Gate 2's ★ DECISIVE marking refers to a 3090 purchase that is not happening. Its measurements still matter; the verdict
-> it was built to deliver does not.
+> **This is a rewrite, not a revision.** The 2026-04-18 plan existed to de-risk a personal GPU purchase (1x vs 2x RTX 3090). That purchase is cancelled permanently. On 2026-08-23 a banner was bolted to the top of the old document telling the reader to mentally reinterpret every purchase rule as something else. That did not work: the body still ranked gates by a decision that no longer exists. The old version is in git at `6d48e6f:docs/pantheon/gcp-test-plan/00-MASTER-PLAN.md` if provenance is needed.
 
 ---
 
-## What this document is
+## 1. What changed, and why the old plan could not be patched
 
-An **executable test plan** — not a design sketch, not a research summary. Every gate in this document has:
+Standing policy is **rent first, always** (`docs/pantheon/local-inference-buy-vs-rent.md` section 6). Owned metal happens only as a customer-funded terminal step: sell the outcome, pilot on rented GPUs, sign a term, and only then metal on the client's balance sheet. Never our capex.
 
-- A hypothesis with pre-committed decision rules
-- A concrete GCP configuration (exact machine type, region, image)
-- A runbook with literal `gcloud` commands
-- A measurement harness (scripted, deterministic)
-- Hard-capped duration + budget with kill-switches
-- An evidence bundle spec (what lands in GCS)
-- A verdict protocol (PASS / FAIL / INCONCLUSIVE)
+The old plan's spine was incompatible with that:
 
-If you can execute every gate here and produce evidence bundles for all of them, Pantheon is validated end-to-end on real hardware, and the hardware-purchase decisions are de-risked with data instead of vibes.
-
----
-
-## Philosophy
-
-### 1. OPEX-first
-
-We rent GCP compute until usage crosses $1000/mo sustained for 2 consecutive months. We do NOT buy local hardware speculatively. Every test is metered, time-boxed, and self-destructs.
-
-### 2. Evidence-based decisions
-
-Every hardware purchase (3090 single vs pair, RTX Pro 6000, Mac Studio, etc.) has a pre-committed decision rule defined BEFORE the test runs. No post-hoc rationalization.
-
-### 3. Self-destructing VMs
-
-Every gate's runner ends with `gcloud compute instances delete --quiet`. Every VM is created with `--max-run-duration=Nm --instance-termination-action=DELETE` as a hard backstop. No VM runs longer than its budgeted duration, ever.
-
-### 4. Evidence bundles are mandatory output
-
-Every gate produces exactly one bundle at `gs://pantheon-evidence/{gate_id}/{run_id}/` containing manifest, logs, metrics, artifacts, cost report, summary. Nothing is ever lost.
-
-### 5. Knowledge compounds via capture
-
-Every run auto-populates an Obsidian note from template via Supabase sync. Promoted lessons become durable wisdom. Every subsequent run has access to every prior run via Pythia semantic search.
-
----
-
-## Gate progression at a glance
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ PHASE 0 — Preflight (no GPU burn)                                    │
-│   GCP project setup, quota verification, pre-baked images,           │
-│   model weights cached, evidence bundle infrastructure.              │
-│   Cost: ~$6-12 one-time + ~$15/mo ongoing storage                    │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 0 — Plumbing (CPU-only, $0.50)                                  │
-│   Docker Compose + NATS + Triumvirate daemon + mock vLLM.            │
-│   Proves orchestration layer independent of inference.                │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 1 — Single L4 baseline (1× L4 24GB, $3-5)  [3090-single proxy]  │
-│   Pythia embeddings + small-model inference + 14B LoRA.              │
-│   Answers: "Is 24GB sufficient for daily dev baseline?"              │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 2 — Dual L4 (2× L4 48GB, $4-6)  [3090-pair proxy]  ★ DECISIVE   │
-│   70B-Q4 local inference + concurrent multi-model hosting +          │
-│   32B LoRA training + sovereign demo dry-run.                        │
-│   Answers: "Single 3090 or 2× 3090 NVLink?" — THE purchase decision. │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 3 — RTX Pro 6000 Hardware Twin (1× G4, $3-6)                    │
-│   Target hardware for Phase 3 purchase. Measures actual              │
-│   target-card behavior on our workload.                              │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 4 — Athena-scale worker pool (4× A100 80GB, $15-30)             │
-│   Parallel worker swarm at production capacity.                      │
-│   Validates "original intent" at real speeds.                        │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 5 — Full trinity (8× A100 + 4× A100 + 2× L4, $20-40)            │
-│   Zeus + Athena + Vulcan as spec'd, end-to-end load.                 │
-│   Empirical data for Pantheon Closet / Rack tier purchase decision.  │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 6 — Air-gap sanity (any tier + firewall lockdown, $2-5)         │
-│   Prove 100% sovereign — no outbound traffic, no leaks.              │
-│   Required before any customer sovereign demo.                       │
-├──────────────────────────────────────────────────────────────────────┤
-│ GATE 7 — Soak + stress (repeated runs, ~$50-100)                     │
-│   Long-session KV drift, schema-validity decay, retry storms.        │
-│   Validates operational stability under sustained load.              │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## The 3090 decision — where this plan pays off immediately
-
-The near-term reason to execute this plan is the **1× 3090 vs 2× 3090 NVLink** local hardware decision (~3-6 weeks out).
-
-**GCP L4 is a faithful 3090 proxy:**
-
-| Local option | GCP equivalent | VRAM | Spot $/hr |
-|---|---|---|---|
-| 1× RTX 3090 24GB | g2-standard-4 (1× L4 24GB) | 24GB | ~$0.28 |
-| 2× RTX 3090 NVLink 48GB | g2-standard-24 (2× L4 48GB, PCIe) | 48GB | ~$0.42 |
-
-**Differences that transfer:** tok/s per card, VRAM footprint, concurrent-model behavior, training time for LoRAs, Pythia embedding throughput, inference quality.
-
-**Differences that don't transfer:** NVLink intra-card bandwidth (L4 pairs go over PCIe, 3090 NVLink is direct). Only matters for tensor-parallel inference on a single model split across cards. ~10-20% performance delta, doesn't affect most workloads.
-
-**After Gates 1 + 2, you know which config to buy** with ~$10 in total GCP spend.
-
----
-
-## Budget envelope
-
-### One-time investment
-| Item | Cost |
+| Old plan assumed | Actually true now |
 |---|---|
-| Preflight setup (storage, PD snapshots, image baking) | $6-12 |
-| Full gate sequence (Gates 0-5) | $50-100 |
-| **Total** | **$56-112** |
+| Gates 1+2 are DECISIVE because they settle the 3090 buy | Nothing is bought. Those gates settle nothing. |
+| Gate 3 simulates an RTX Pro 6000 we intend to purchase | We do not intend to purchase one. |
+| Gate 6 (air-gap) is a late nice-to-have | Air-gap **is** the product claim. It runs early or the rest is moot. |
+| Evidence bundles justify an internal purchase | Evidence bundles are shown to a **prospect**. Different artifact entirely. |
+| VMs should self-destruct aggressively | A client pilot cannot self-destruct mid-demo. |
 
-### Ongoing (monthly, during active testing)
-| Item | Cost |
-|---|---|
-| GCS storage (model weights, evidence bundles) | $5-8 |
-| Artifact Registry (Docker images) | $1-2 |
-| PD snapshots (model caches) | $10-15 |
-| Repeated test runs as Pantheon develops | $30-100 |
-| **Total** | **~$50-125/mo** |
-
-**Entirely absorbed by Gemini Ultra GCP credit ($100/mo).** Effective cost to Mike: $0-25/mo.
+**Cut outright** (do not annotate, delete): the "3090 decision" section, the L4-as-3090-proxy table, decision rules 1 through 3 in `30-DECISION-RULES.md`, and the DAY 1 / DAY 5-7 execution order that sequenced work around collecting 3090 data.
 
 ---
 
-## Pre-committed decision rules
+## 2. Ground truth as of 2026-08-25
 
-Lock these BEFORE running tests. Evidence-based decisions require pre-committed rules.
+Verified, not assumed:
 
-### Decision 1 — Single 3090 vs 2× 3090 NVLink
-*(Triggered by completion of Gates 1 + 2)*
+- **Nothing has ever been executed.** No `pantheon-validation-v1` project exists. `gcloud projects list` shows nine unrelated projects. Preflight step 1.1 was never run.
+- **`fixtures/` does not exist.** The old plan's directory listing claimed four canonical test corpora. None are on disk. Every gate claiming "a measurement harness (scripted, deterministic)" has no inputs.
+- **Spend-control layer 6 is fiction.** The old plan claimed a Pub/Sub billing alert firing a Cloud Function that deletes instances across all regions. The function exists only as a pasted snippet inside `10-PREFLIGHT.md`. There is no deployable source anywhere in the repo.
+- **Spend-control layer 4 is fiction.** It referenced `timeout Nm python3 runner.py`. No `runner.py` exists, and `runner-wrapper.sh` does not wrap the remote gate script in a timeout.
+- **`runner-wrapper.sh` fails on the normal first run.** Line 192 uses `local now=$(date +%s)` outside any function. Bash errors the first time the SSH readiness probe misses, which is the expected path.
+- **`request-quotas.sh` targets the wrong project** (`aerial-jigsaw-467620-m8`, line 15).
+- **Cost reporting is fake-precise.** `finalize-evidence.py` hardcodes duration to 1.0 hour (line 247). `cost-tracker.py` falls back to `e2-standard-4` at 1.0 hour when metadata is absent (line 219), which understates a GPU run by an order of magnitude.
+- **Fixture names disagree across three documents.** Master plan, preflight, and the runbooks each name a different set.
 
-**Buy 2× 3090 NVLink if ALL:**
-- Gate 2 shows 70B-Q4 local inference at ≥10 tok/s per stream
-- Gate 2 shows concurrent multi-model hosting works without contention
-- Gate 2 shows 32B LoRA completes training in ≤4 hours
-- Friction log shows ≥5 events/week where 48GB matters
-
-**Buy single 3090 only if:**
-- Gate 1 shows 24GB is comfortable for Pythia + small model inference
-- Gate 2 shows 70B-local is too slow to be useful (<5 tok/s per stream)
-- 7-14B LoRA base is sufficient for your moat-building needs
-
-**Skip local hardware entirely if:**
-- Friction log shows <3 events/week where ANY local GPU helps
-- Pre-bake tooling makes GCP spin-up feel frictionless (<90s perception)
-
-### Decision 2 — RTX Pro 6000 Blackwell purchase
-*(Triggered by usage data over 2+ months of operation)*
-
-**Buy RTX Pro 6000 if ANY:**
-- GCP spend >$1000/mo on consistent workload for 2 consecutive months (OPEX crossover)
-- Signed customer engagement with line-item hardware in contract
-- Training workload demonstrably bottlenecked by 3090 pair for 3+ consecutive weeks
-- Enterprise/sovereign demo requires 70B-at-production-speed on premise
-
-### Decision 3 — 2nd RTX Pro 6000 / scale-out
-*(Triggered by operational evidence post-RTX-Pro-6000-purchase)*
-
-**Buy 2nd RTX Pro 6000 if ANY:**
-- Training blocks production serving for 3+ consecutive weeks
-- Multiple paying customers cause scheduling contention
-- Enterprise deal funds the purchase as line-item
+Treat the harness as a skeleton with a few useful safety primitives, not as working software.
 
 ---
 
-## Directory structure
+## 3. Corrected hardware landscape
 
-```
-/Users/you/projects/triumvirate/docs/pantheon/gcp-test-plan/
-├── 00-MASTER-PLAN.md              ← this file
-├── 10-PREFLIGHT.md                ← GCP setup, pre-bake, storage
-├── 20-EVIDENCE-BUNDLE-SPEC.md     ← what every run emits
-├── 30-DECISION-RULES.md           ← pre-committed gates + rules
-├── runbooks/
-│   ├── gate-0-plumbing.md         ← CPU-only Docker + Triumvirate
-│   ├── gate-1-single-l4.md        ← 3090-single proxy
-│   ├── gate-2-dual-l4.md          ← 3090-pair proxy ★ DECISIVE
-│   ├── gate-3-rtx-pro-6000.md     ← RTX Pro 6000 hardware twin
-│   ├── gate-4-athena-swarm.md     ← 4× A100 parallel workers
-│   ├── gate-5-full-trinity.md     ← 8×A100 + 4×A100 + 2×L4
-│   ├── gate-6-airgap-sanity.md    ← sovereign validation
-│   └── gate-7-soak-stress.md      ← long-session stability
-├── fixtures/
-│   ├── test-tasks-pythia-embed/   ← canonical embedding test corpus
-│   ├── test-tasks-agent-swarm/    ← 8 canonical agent tasks
-│   ├── test-tasks-lora-train/     ← LoRA training datasets
-│   └── eval-scorers/              ← scoring rubrics + harness
-├── harness/
-│   ├── runner-wrapper.sh          ← provision → run → capture → destroy
-│   ├── cost-tracker.py            ← GCP billing API → cost report
-│   ├── evidence-bundler.sh        ← log + metric → GCS bundle
-│   ├── kill-switch.sh             ← emergency VM teardown (all regions)
-│   └── metric-collectors/         ← per-workload measurement scripts
-└── evidence-templates/
-    ├── manifest.json.template     ← per-run metadata schema
-    ├── summary.md.template        ← human-readable run summary
-    ├── cost-report.json.template  ← GCP spend breakdown
-    └── obsidian-note.md.template  ← auto-generated Obsidian vault note
-```
+The old plan's pricing is four months stale and some of it was never right. Current figures, with the caveat that GPU and DRAM pricing is moving fast in the 2026 shortage.
 
----
+### 3.1 Rented GPU, per hour
 
-## Execution order for first-time setup
+| Config | VRAM | GCP on-demand | GCP spot | RunPod |
+|---|---|---|---|---|
+| 1x L4 (`g2-standard-4`) | 24GB | ~$0.71 | ~$0.42-0.62 | $0.45-0.60 |
+| 1x A100 80GB (`a2-ultragpu-1g`) | 80GB | ~$5.03 | ~$2.51 | **$1.19-1.60** |
+| 1x RTX PRO 6000 Blackwell (`g4-standard-6`) | 96GB | ~$0.65 | ~$0.26 | n/a |
+| 1x H100 PCIe | 80GB | n/a in this table | n/a | $1.99-2.99 |
+| 8x B200 (`a4-highgpu-8g`) | 1.4TB | ~$90.22 | ~$39.63 | n/a |
 
-```
-DAY 1 (4-6 hours, $0 GPU):
-  [ ] Complete 10-PREFLIGHT.md sections 1-3 (GCP project, quota, IAM)
-  [ ] GCP quota increase request filed for A100s
-  [ ] Artifact Registry + GCS buckets created
-  [ ] Gemini Ultra credit applied and verified
+**RunPod is 2-4x cheaper than GCP on-demand for A100 class.** For pilot economics that is decisive, and it is the single biggest cost finding in this rebuild. GCP earns its premium only where the client requires it (their own VPC, their compliance boundary, IAP, VPC Service Controls). Pick the provider from the client's constraint, not from habit.
 
-DAY 2-3 (6-8 hours, ~$6-12 GCP):
-  [ ] Complete 10-PREFLIGHT.md sections 4-7 (pre-baked images, model cache, PD snapshots)
-  [ ] Evidence bundle tooling deployed
-  [ ] Cost tracker verified
-  [ ] harness/runner-wrapper.sh tested on a dummy run
+New since April: the G4 series (RTX PRO 6000 Blackwell Server Edition, 96GB GDDR7) is GA and is **cheap on spot**. Fractional G4 (1/2, 1/4, 1/8 of a card) now exists and lowers the floor for light inference. Valid G4 machine types are `g4-standard-6/12/24/48/96/192/384`. The old `cost-tracker.py` references `g4-standard-32`, which is not a real type.
 
-DAY 4 ($0.50 GPU, 1-2 hours):
-  [ ] Execute Gate 0 (plumbing)
-  [ ] Evidence bundle lands in GCS
-  [ ] Obsidian note auto-generated
+### 3.2 The V100 idea does not survive contact
 
-DAY 5-7 ($3-6 GPU, 4-8 hours):
-  [ ] Execute Gate 1 (single L4)
-  [ ] Execute Gate 2 (dual L4) ← 3090 DECISION data collected
-  [ ] Apply pre-committed decision rule
+An 8x V100 32GB box gives 256GB of VRAM for very little money, which is why it keeps looking attractive. It is a trap in 2026:
 
-WEEK 2 ($15-30 GPU, 4-8 hours):
-  [ ] Execute Gate 3 (RTX Pro 6000 twin)
-  [ ] Execute Gate 4 (Athena-scale)
-  [ ] Evidence suite complete for Pantheon Desk purchase decisions
+- **vLLM dropped Volta (sm_70) in 0.20+.** Prebuilt wheels ship no sm_70 kernels. You get "no kernel image is available" and must run a community fork or build from source against CUDA 12.6. CUDA 12.8+ is phasing Volta out entirely.
+- **FlashAttention 2 requires Ampere (sm_80) or newer.** This is a hardware constraint, not a software gap. V100 falls back to xFormers or Triton attention, costing roughly 30-50% throughput in long-context work.
+- **No bf16.** Modern models are trained in bf16. On V100 you downcast to fp16, which can overflow in specific layers and destabilize the model. No fp8 either.
+- **It is not even cheap on GCP.** ~$2.67-3.20/hr on-demand, against ~$0.71 for an L4 that is faster and more stable. P100 hit end of support 2026-09-15 and V100 is listed as approaching it. NVIDIA removed V100 from AI Enterprise Infra 8.0+.
 
-WEEK 3-4 ($20-40 GPU, as needed):
-  [ ] Execute Gate 5 (full trinity) — optional, informs Pantheon Closet/Rack tier
-  [ ] Execute Gate 6 (air-gap) — required before any sovereign customer demo
-  [ ] Execute Gate 7 (soak/stress) — required for production confidence
-```
+**Verdict: do not build a track around V100.** If the goal is "lots of VRAM, cheaply," the current answer is spot G4 (96GB per card, ~$0.26/hr spot) or RunPod A100 80GB at $1.19/hr. Both have a working software stack.
+
+### 3.3 Apple Silicon, corrected
+
+There is **no M4 Ultra**. Apple skipped it: the M4 architecture lacked the interconnect to bridge two Max dies. The current high-end desktop part is the **M5 Ultra**, announced 2026-08-25.
+
+- Mac Studio M5 Ultra base (96GB): **$5,499**, ships 2026-09-22.
+- 256GB configuration: **~$9,499** (the +$4,000 memory upgrade), not $12K.
+- **512GB configuration: announced 2026-08-25, ships late October 2026, price not published.** The ~$13K figure circulating is an analyst extrapolation. Do not put it in a client quote as a price.
+- High-memory configs carry roughly a 30% premium over 2024 levels because of the DRAM shortage.
+
+This is cheaper and more available than the superseded assumption (a 512GB M3 Ultra as a $23-26K scarce used-market item). **It does not reopen the buy decision for us.** The rent-first policy rests on utilization, not just sticker price, and a cheaper box does not create utilization we do not have. What it does change is the **client-side bill of materials**: a sovereign build we quote to a customer just got materially cheaper and comes new and in warranty. That helps the proposal, not our capex.
+
+### 3.4 Rented Apple metal exists
+
+Confirmed. This was not in the old plan at all.
+
+- **AWS EC2 Mac:** `mac-m3ultra.metal` and `mac-m4max.metal`, roughly $1.08/hr entry to $3.50+/hr for Ultra tier. Largest rentable unified memory today is **256GB (M3 Ultra)**.
+- **MacStadium:** enterprise monthly. Mac Studio M2 Ultra 128GB around $449/month.
+- **Scaleway:** Mac mini M4 from about €0.11/hr or €75/month.
+- **Hard constraint:** Apple licensing imposes a **24-hour minimum allocation**. Per-second billing habits from GPU clouds do not transfer. Budget Mac experiments in whole days.
+- 512GB M5 Ultra is expected on rental racks late October 2026.
+
+**Consequence:** the "sovereign appliance on Apple Silicon" story can be piloted on rented metal before anyone buys anything, which is exactly the order of operations the policy demands.
 
 ---
 
-## Kill-switches — how this CAN'T run up an unexpected bill
+## 4. The three tracks
 
-Six layers of spend control, in order of defense:
+Seven gates and ten pre-committed purchase rules were a control structure for a $15K personal spending decision. With exposure now at a few dollars an hour, that scaffolding is overhead. Both twins independently recommended drastic collapse. Three tracks replace it.
 
-1. **`--max-run-duration=Nm` on every VM create** — GCP forcibly deletes VM after duration
-2. **`--instance-termination-action=DELETE`** — no "stopped but billable" state possible
-3. **`trap 'gcloud ... delete' EXIT` in runner** — VM self-deletes on script exit
-4. **`timeout Nm python3 runner.py`** — test process killed at hard deadline
-5. **Pre-flight inventory check** — can't start a gate if other VMs are live
-6. **Billing alerts at $10, $30, $50 with PubSub auto-kill at $50**
+### Track A. Sovereign Proof (the product claim)
 
-The nuclear backstop (layer 6) fires a Cloud Function that runs `gcloud compute instances list | xargs delete` across all regions if total billing hits $50 unexpectedly. Setup documented in `10-PREFLIGHT.md`.
+**This runs first. Everything else is subordinate to it.** A control-motivated prospect does not care about tok/s if the system phones home. If the orchestration layer cannot run in a vacuum, there is no product.
+
+1. **A0. Plumbing, CPU-only, ~$0.50.** Docker Compose, NATS, Triumvirate daemon, mock vLLM. Proves orchestration independent of inference.
+2. **A1. Air-gap proof, ~$2-5.** Formerly Gate 6. Full egress lockdown, then run the agent swarm and prove zero outbound traffic.
+
+Deliverable is the artifact a prospect asks to see:
+- **Packet capture or VPC firewall drop logs** showing zero egress, timestamped and signed.
+- The exact firewall and VPC Service Controls configuration that produced it, reproducible by the client's own security team.
+- A named failure list: what the stack *tried* to reach and was denied (telemetry endpoints, model registries, package mirrors). Prospects trust a document that names its own leaks more than one claiming perfection.
+
+### Track B. Sizing Matrix (the scale steps)
+
+Not five bespoke gates. **One parameterized sweep** across the rented catalog, producing a priced performance table. The scale steps survive as rows in that table rather than as ceremonies with their own runbooks.
+
+Rows to sweep, cheapest first: 1x L4 · fractional G4 · 1x G4 (96GB) · 1x A100 80GB (RunPod first, GCP only if the client needs GCP) · multi-GPU worker pool · rented Apple Silicon (M3 Ultra 256GB today, M5 Ultra 512GB after late October).
+
+Per row, measure what a buyer actually asks about:
+- **P50/P95/P99 latency under concurrency**, not single-stream hero numbers. Ten simultaneous analysts is the realistic question.
+- Tokens/sec per stream and aggregate, at a stated quantization and context length.
+- VRAM headroom at target concurrency.
+- **Cost per 1M tokens** at that config, which is the number that goes in a proposal.
+
+### Track C. Pilot Operations (entirely missing before)
+
+The old plan was a benchmarking suite with no ability to host a client. Required before any pilot touches client data:
+
+- **Ingestion and destruction.** How client data enters, and how we *prove* disks were wiped and weights purged at termination. A certificate of destruction is a deliverable.
+- **Access.** IAP or dedicated VPN. Not SSH and local port forwards.
+- **Lifecycle.** Track A and B VMs self-destruct. A pilot must stay up during business hours. These are opposite lifecycle policies and need separate tooling.
+- **Tenancy and exit.** Isolation between pilots, and a portability story: what the client keeps if they walk.
 
 ---
 
-## What success looks like at the end of this plan
+## 5. Blockers: what must be built before anything runs
 
-After executing all 7 gates, you have:
+Ordered by whether it costs real money or loses real data if executed as written.
 
-1. **Empirical validation** that Pantheon's architecture works on each target hardware tier from "consumer" to "enterprise"
-2. **Evidence bundles** for every gate in `gs://pantheon-evidence/` — immutable, queryable
-3. **Pre-committed decision rules applied** — each hardware purchase is supported by concrete measurements
-4. **First LoRA adapters** trained and scored (moat construction underway)
-5. **Pythia corpus seeded** with initial codebases + evaluation rubrics
-6. **Obsidian vault populated** with run notes, lessons, decisions, hypotheses
-7. **Operational tooling hardened** — `runner-wrapper.sh`, kill-switches, cost tracker all battle-tested
-8. **The $15K RTX Pro 6000 purchase** (if triggered) is de-risked at 1:1 hardware parity
-9. **Sovereign demo capability** is provably air-gap-clean
-10. **A permanent knowledge archive** of what every tier of GPU spend actually delivers
+1. **Build the layer-6 kill function, or delete the claim.** No source exists. A runaway VM is currently stopped only by `--max-run-duration`. Claiming six layers when four are real is the dangerous kind of wrong.
+2. **Implement the remote timeout (layer 4).** A hung gate script currently runs until VM max duration.
+3. **Fix `runner-wrapper.sh:192`** (`local` outside a function). It fires on the first run.
+4. **Create `configs/`** and the per-track `.env` files the runner requires but which do not exist.
+5. **Write the actual workload scripts.** The runner expects `/tmp/gate-test.sh` or `gs://pantheon-runners/gate-N-test.sh`. No local source exists for either.
+6. **Fix cost accounting.** Remove the `e2-standard-4` / 1.0-hour fallbacks in `cost-tracker.py:219` and `finalize-evidence.py:247`. A cost report that silently invents a cheap machine type is worse than no cost report, and it is client-facing.
+7. **Fix `request-quotas.sh:15`** to target the real project.
+8. **Reconcile fixture names** across the three documents, then build the corpora. Or scope Track A to need none, which is the faster path.
+9. **Correct machine types.** `g4-standard-32` does not exist. Verify accelerator flags per machine series: G2, G4, and A2 bundle GPUs by machine type, so blanket `--accelerator` handling copied from N1 is wrong.
+10. **Scope `kill-switch.sh --nuclear`.** It deletes all VMs in the project. Safe in a dedicated project, destructive in a shared one, which is an argument for the dedicated project.
+
+**Note on spend controls:** `--max-run-duration` and `--instance-termination-action=DELETE` are still valid and still work, but they delete *instances*. They do not touch disks, snapshots, images, Artifact Registry, or buckets. Orphaned disks bill quietly. The preflight inventory check only looks for `status:RUNNING`, so it misses exactly those.
 
 ---
 
-## What comes next
+## 6. Where to start
 
-This document is the index. The details live in per-gate runbooks in `runbooks/`. Start with `10-PREFLIGHT.md` before touching any GPU, then proceed gate-by-gate.
+The correct first move is not a GPU. It is Track A0 plus the blocker list, because a $0.50 CPU run exercises the entire harness and every claim in section 5 fails cheaply there rather than expensively on an A100.
 
-**Next file to read: `10-PREFLIGHT.md`.**
+1. Create the dedicated project and link billing (`gcloud billing accounts list` shows `01F713-7EFFD2-83E164`, open). A dedicated project is what makes the nuclear kill-switch safe.
+2. File GPU quota requests immediately, since approval is not instant and gates nothing else. Note that all new projects start at **zero** GPU quota and need both a regional quota and a matching `GPUS_ALL_REGIONS`.
+3. Work the blocker list against Track A0 on CPU only.
+4. Run Track A1 (air-gap) on the cheapest capable instance. **This is the deliverable that matters.** Everything in Track B is a pricing exercise; Track A1 is the product.
+
+Open question worth settling before Track B: the old plan assumed the whole budget was absorbed by a $100/month Gemini Ultra GCP credit. That assumption is unverified and four months old. Confirm it before planning around it.
+
+---
+
+## 7. Related documents
+
+- `docs/pantheon/local-inference-buy-vs-rent.md` (section 6 is the standing policy)
+- `docs/advisory/claude-deployment-options.md` (which door a privacy-sensitive client goes through)
+- `docs/advisory/ria-compliance-intake.md` (first worked client example)
+- `10-PREFLIGHT.md`, `20-EVIDENCE-BUNDLE-SPEC.md`, `30-DECISION-RULES.md` in this directory. **All three still carry the purchase-era spine and need the same treatment as this file.**
