@@ -11,9 +11,9 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 8 of 9 (`runbooks/gate-1` through `gate-5`, `gate-7`)
-**Current section:** queue item 7 COMPLETE (both documents archived with extraction).
-**Next action:** queue item 8, the six remaining runbooks (`gate-1` through `gate-5`, `gate-7`). These were demoted to rows in the priced sizing sweep. **Consider collapsing rather than rewriting each**, per the original queue note. Apply the standing rule: what were they for, does the problem persist, what replaces it. Known: `g4-standard-32` appears in several and is not a valid machine type.
+**Current queue item:** 9 of 9 (`twin-review-synthesis.md`), the last one
+**Current section:** queue item 8 COMPLETE. Six runbooks archived; `SIZING-SWEEP-METHOD.md` created as Track B.
+**Next action:** queue item 9, `twin-review-synthesis.md`, the last item. It is the historical twin review that first called the $20K budget a lie. Likely archive, but apply the standing rule: what was it for, does the problem persist, what replaces it. Then a final consistency pass over the whole corpus.
 
 **Unit plan for queue item 6 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -87,7 +87,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 5 | `runbooks/gate-6-airgap-sanity.md` | **COMPLETE** (3 units, 3 peers, 317 to ~250 lines, verified) | `5b85ab2` |
 | 6 | `local-inference-buy-vs-rent.md` | **COMPLETE** (3 units, 3 peers, split into `POLICY-rent-first.md` + demoted analysis) | `608d8a9` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | **COMPLETE**, both archived with extraction to `EXTRACTED-from-archive.md` | |
-| 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
+| 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | **COMPLETE**, six archived, replaced by `SIZING-SWEEP-METHOD.md` | |
 | 9 | `twin-review-synthesis.md` | pending | |
 
 **Section list for queue item 1 (`10-PREFLIGHT.md`), 11 sections:**

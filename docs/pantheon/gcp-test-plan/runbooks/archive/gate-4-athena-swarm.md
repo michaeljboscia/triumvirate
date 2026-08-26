@@ -1,5 +1,20 @@
 # Gate 4 — Athena-Scale Parallel Worker Swarm
 
+> **ARCHIVED 2026-08-26.** This runbook served a hardware purchase that is permanently cancelled. Standing policy is
+> `../../POLICY-rent-first.md`.
+>
+> **Its measurement method may have survived. Its purchase verdict did not.** See `../../SIZING-SWEEP-METHOD.md`,
+> which records per runbook what it was for, whether that problem persists, and what replaced it.
+>
+> Known defects across this set: `g4-standard-32` is not a valid machine type; harness scripts are called at
+> `/opt/pantheon-harness/`, a path from a GCP image that was never built; and **only two of the six measured at 4-way
+> concurrency**, which is the condition the production floor is stated in, so the floor could never have been
+> evaluated from most of them as written.
+>
+> Consult for method and for the fault-injection scenarios. Do not execute.
+
+---
+
 **Purpose:** Validate Pantheon's "parallel worker pool" thesis at production scale. This is the **core architectural test** — can multiple AI workers produce valid, mergeable code in parallel against real project tasks?
 
 **GCP config:** `a2-ultragpu-4g` (4× A100 80GB, 320GB total VRAM)

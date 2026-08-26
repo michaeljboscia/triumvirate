@@ -1,5 +1,20 @@
 # Gate 7 — Soak + Stress (Long-Session Stability)
 
+> **ARCHIVED 2026-08-26.** This runbook served a hardware purchase that is permanently cancelled. Standing policy is
+> `../../POLICY-rent-first.md`.
+>
+> **Its measurement method may have survived. Its purchase verdict did not.** See `../../SIZING-SWEEP-METHOD.md`,
+> which records per runbook what it was for, whether that problem persists, and what replaced it.
+>
+> Known defects across this set: `g4-standard-32` is not a valid machine type; harness scripts are called at
+> `/opt/pantheon-harness/`, a path from a GCP image that was never built; and **only two of the six measured at 4-way
+> concurrency**, which is the condition the production floor is stated in, so the floor could never have been
+> evaluated from most of them as written.
+>
+> Consult for method and for the fault-injection scenarios. Do not execute.
+
+---
+
 **Purpose:** Validate Pantheon's operational stability under sustained load. Short bursts (Gates 1-5) prove capability; Gate 7 proves durability. Catches KV cache drift, schema-validity decay, retry storms, memory leaks, and other failure modes that only emerge after hours of continuous operation.
 
 **GCP config:** Reuses Gate 5's full trinity composition OR a smaller single-VM setup depending on what's being soaked
