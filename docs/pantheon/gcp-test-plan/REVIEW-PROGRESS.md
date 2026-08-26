@@ -12,8 +12,24 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 1 (lines 11-185) — peer reviews complete for Codex and Gemini, DeepSeek pending
-**Next action:** collect DeepSeek's Phase 1 review, log it below, then review Phase 2 (Network + storage, lines 186-272) with all three peers.
+**Current section:** Phase 1 (lines 11-185) — COMPLETE, all three peers logged
+**Next action:** review Phase 2 (Network + storage, lines 186-272) with all three peers.
+
+### OPERATING CONSTRAINT discovered 2026-08-25, obey it
+
+**DeepSeek times out at the bridge's 180s ceiling on long prompts.** `TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS` is read
+client-side in `daemon-http` (lib.rs:437) by the MCP bridge process, so it cannot be raised without restarting the
+session. Two long DeepSeek prompts failed; a short single-question prompt at `reasoning_effort: low` returned
+immediately.
+
+**Working pattern per section:**
+1. Codex and Gemini get the full section by absolute path plus line range. They read from disk. Fire both in one message.
+2. DeepSeek gets ONE focused question, `reasoning_effort: low` or `medium`, minimal pasted context. It cannot read files.
+3. Append every peer's verbatim output to `review-raw/<doc>-<section>.md` immediately.
+4. Update this file.
+5. Commit.
+
+Do not send DeepSeek a six-part question with a large pasted body. It will time out and the work is lost.
 
 ---
 
@@ -36,7 +52,7 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 | Section | Lines | Reviewed |
 |---|---|---|
-| Phase 1 — Project + billing + quota | 11-185 | Codex yes, Gemini yes, DeepSeek pending |
+| Phase 1 — Project + billing + quota | 11-185 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 2 — Network + storage | 186-272 | no |
 | Phase 3 — Docker image pre-bake | 273-371 | no |
 | Phase 4 — Model weights cached to GCS | 372-476 | no |
@@ -157,6 +173,24 @@ function deployment, and a synthetic invocation are all proven. *(Codex)*
 - `gcloud functions deploy --gen2` flag surface shown is broadly valid (line 161). *(Codex)*
 - `gcloud pubsub topics publish --message=` is fine for the synthetic payload (line 177), but proves nothing until the
   handler is converted to CloudEvent format. *(Codex)*
+
+#### ADVERSARIAL LOGIC (DeepSeek)
+
+**P1-A1. The kill-switch test proves logging, not killing. Independent confirmation of P1-C4.**
+The test greps for `"Hard-kill completed"`, which prints unconditionally at the end. Because every Compute call sits
+inside `try/except: continue`, that line runs even if every `list` and `delete` failed or no instances existed.
+
+The minimum test that would actually prove the switch works:
+1. Inject known state: create one test VM per zone, or mock `InstancesClient` so `list()` returns fixed fake instances
+   across the 11 regions x 4 zones.
+2. Send a synthetic event where `costAmount / budgetAmount >= 0.5`.
+3. Run `hard_kill`.
+4. Assert `client.delete` was called once per instance returned by `list`, with correct project, zone, and instance. On
+   real GCP, poll until those instances are gone or the delete operations complete.
+5. Send a second event under the threshold and assert zero `delete` calls and no state change.
+
+Two peers reached "it can report success having done nothing" from different directions: Codex by reading the exception
+handling, DeepSeek by reasoning about what the assertion tests. Treat that as confirmed, not suspected.
 
 #### STRATEGIC (whole-phase)
 

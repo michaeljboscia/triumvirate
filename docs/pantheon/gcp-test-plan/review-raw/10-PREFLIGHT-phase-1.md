@@ -94,7 +94,37 @@ The justification text (line 59) actively hurts your chances of approval.
 
 ## DEEPSEEK (adversarial logic angle)
 
-**STATUS: FAILED — daemon timeout at 180s, twice.**
+**STATUS: PARTIAL.** Two long prompts timed out at the bridge's 180s ceiling. A SHORT, single-question prompt at
+`reasoning_effort: low` returned immediately. **That is the working pattern for DeepSeek: one focused question, low
+effort, no large pasted context.** Its answer to the crux question is below; the remaining questions are preserved
+under "Not yet answered" for retry.
+
+### Answered: what does a passing kill-switch test prove?
+
+> A passing test only proves that the function printed the literal string `"Hard-kill completed"` for a synthetic event
+> where `costAmount / budgetAmount >= 0.5`. Because all Compute Engine calls are wrapped in `try/except: continue`, the
+> final print runs even if every `list`/`delete` failed or no instances existed. So it proves logging behavior, not kill
+> behavior.
+>
+> Minimum test design that would genuinely prove the kill switch works:
+>
+> 1. Inject known test state: either use the real Compute API to create one test VM per zone, or mock `InstancesClient`
+>    so `list(project=P, zone=zone)` returns a fixed set of fake instances for each of the 11 regions x 4 zones.
+> 2. Publish/send a synthetic Pub/Sub event where `costAmount / budgetAmount >= 0.5`.
+> 3. Run `hard_kill`.
+> 4. Assert that `client.delete` was called once for every instance returned by `list` with the correct `project`,
+>    `zone`, and `instance` values. If using real GCP, additionally poll until those instances no longer exist (or
+>    delete operations complete).
+> 5. Send a second event with `costAmount / budgetAmount < 0.5` and assert zero `delete` calls and that no instance
+>    state changed.
+>
+> That verifies both that the over-budget path actually kills instances and that the under-budget path safely returns.
+
+**This is independent confirmation of Codex's P1-C4.** Two peers reached "it can report success having done nothing"
+from different directions: Codex from reading the exception handling, DeepSeek from reasoning about what the assertion
+tests.
+
+### Not yet answered (retry with short prompts)
 
 Task IDs `khfs3uynt` (earlier, different section) and `k89n0o224` (this section) both exceeded the
 `TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS=180` ceiling. DeepSeek is consistently slower than that on substantial prompts
