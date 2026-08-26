@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 6 (lines 545-642) — COMPLETE, all three peers logged
-**Next action:** review Phase 7 (Fixtures + Pythia seed, lines 643-676) with all three peers.
+**Current section:** Phase 7 (lines 643-676) — COMPLETE, all three peers logged
+**Next action:** review Phase 8 (Tooling validation, lines 677-726) with all three peers.
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 6 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 7 of 11 sections reviewed | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -58,7 +58,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | Phase 4 — Model weights cached to GCS | 372-476 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 5 — PD snapshots | 477-544 | **DONE** (Codex, Gemini, DeepSeek) — VERDICT: DELETE PHASE |
 | Phase 6 — Custom VM images | 545-642 | **DONE** — VERDICT: DELETE PHASE |
-| Phase 7 — Fixtures + Pythia seed | 643-676 | no |
+| Phase 7 — Fixtures + Pythia seed | 643-676 | **DONE** — see THE CENTRAL FINDING |
 | Phase 8 — Tooling validation | 677-726 | no |
 | Preflight completion checklist | 727-755 | no |
 | Cost accounting | 756-773 | no |
@@ -67,6 +67,75 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` Phase 7 (lines 643-676)
+
+Raw output: `review-raw/10-PREFLIGHT-phase-7.md`. All three peers.
+
+**This is the most important section reviewed so far**, not because of its commands but because of what its emptiness
+proves about the whole corpus.
+
+#### CRITICAL
+
+**P7-C1. `cd` to a missing directory, then a glob, can upload the repo root to a public-ish bucket.**
+Lines 671-672. `cd .../fixtures` fails loudly, but with no `set -e` the next line still runs **from the previous
+working directory**, where `*` expands to whatever is there. In this repo that means `gsutil -m cp -r *` could upload
+repo-root contents to `gs://pantheon-fixtures/`. A clean failure would be far better than this. *(Codex)*
+
+**P7-C2. `data/pythia.db` does not exist.** Line 650. Codex verified. Step 7.1 cannot run at all. *(Codex)*
+
+#### HIGH
+
+**P7-H1. "1-2 hours, $0" (line 643) prices the upload and ignores the authoring.**
+The phase's real content is a curated LoRA training corpus, 12 canonical agent tasks across three languages, scoring
+rubrics per task type, and a 50KLOC embedding corpus. None exist. Gemini: the estimate "treats the hardest part of
+evaluation as a zero-cost assumption." Codex independently called it a substantial authoring project, not a few JSON
+files. *(Both)*
+
+**P7-H2. "Server" is undefined.** Lines 645, 648. Nothing in the corpus defines this capital-S machine. Codex checked:
+other docs define `zeus`, `athena`, `vulcan`, `orch`, and Homebox hardware, but not this. An operator cannot know where
+to run step 7.1. *(Codex)*
+
+#### MEDIUM
+
+**P7-M1. SQLite `.backup` is the right primitive** (line 650) and should be kept, but the step sets no `busy_timeout`,
+checks no exit status, and verifies the resulting DB not at all. *(Codex)*
+
+**P7-M2. `tar czf` around a single `.db`** (line 651) is packaging, not compression. Use `gzip`, or add a checksum if
+integrity is the actual goal. *(Codex)*
+
+#### STRATEGIC
+
+**P7-S1. Fixtures belong in git, not in a bucket.**
+Canonical test inputs are text. Putting them in `gs://pantheon-fixtures/` creates opaque detached state and breaks
+reproducibility, and with Track A local it is pure indirection. `gs://pantheon-fixtures` was already on the Phase 2 cut
+list. *(Gemini)*
+
+**P7-S2. The LoRA corpus dies with the cancelled purchase.** The agent tasks, rubrics, and embedding corpus survive
+conceptually for local Track A and the pricing sweep, but every one of them still has to be written. *(Gemini)*
+
+**P7-S3. The Pythia export to GCS is another dead-strategy artifact.** Bouncing a local SQLite DB into the cloud only
+to pull it down elsewhere serves nothing once Track A is local. *(Gemini)*
+
+#### THE CENTRAL FINDING (two-peer convergence, and it reframes the whole review)
+
+Gemini: *"The total absence of these fixtures proves the plan was an architectural hallucination. The gates were never
+going to run because the inputs to run them did not exist."*
+
+DeepSeek, asked only about sequencing and with no knowledge of Gemini's answer: *"The plan was built as a
+forward-looking dependency graph rather than a backward-verified chain: later gates were allowed to assume fixtures
+that had never been checked into existence, and since no gate was ever run, the missing inputs stayed invisible."*
+
+**The rule both derive, adopt it in the rewrite:** before committing any gate, its canonical fixtures must already
+exist and pass a validation check, so downstream work can never depend on unbuilt inputs. Define, author, and version
+the inputs in git *before* designing any execution infrastructure.
+
+This explains the entire corpus. Six advertised spend layers with three unimplemented, a Cloud Function that exists
+only as pasted prose, a Dockerfile that copies a directory that never existed, golden images with no build manifest,
+and a test harness entrypoint pointing at a module nobody wrote. Every one is the same failure: **the document
+described a forward dependency graph that nothing ever walked backwards to verify.**
+
+---
 
 ### `10-PREFLIGHT.md` Phase 6 (lines 545-642)
 
