@@ -12,16 +12,16 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 2 of 9 (`20-EVIDENCE-BUNDLE-SPEC.md`)
-**Current section:** unit 2 of 4 (lines 48-321) COMPLETE, all three peers logged.
-**Next action:** unit 3 of 4, `20-EVIDENCE-BUNDLE-SPEC.md` lines 322-390 (Lifecycle, Downstream consumers). The downstream section claims six automations trigger; check how many exist.
+**Current section:** unit 3 of 4 (lines 322-390) COMPLETE, all three peers logged.
+**Next action:** unit 4 of 4, `20-EVIDENCE-BUNDLE-SPEC.md` lines 391-end (Storage economics, Retention policy, Schema versioning, What this spec enables). Then rewrite the document.
 
 **Unit plan for queue item 2 (4 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-47 | header, design goals, directory structure | **DONE** |
 | 2 | 48-321 | required file schemas | **DONE** |
-| 3 | 322-390 | lifecycle, downstream consumers | next |
-| 4 | 391-end | storage economics, retention, versioning, what this enables | pending |
+| 3 | 322-390 | lifecycle, downstream consumers | **DONE** |
+| 4 | 391-end | storage economics, retention, versioning, what this enables | next |
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -47,7 +47,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
-| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **IN PROGRESS**, 2 of 4 units | |
+| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **IN PROGRESS**, 3 of 4 units | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
@@ -75,6 +75,92 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `20-EVIDENCE-BUNDLE-SPEC.md` unit 3 (lines 322-390): lifecycle, downstream consumers
+
+Raw output: `review-raw/20-EVIDENCE-SPEC-unit-3.md`. All three peers.
+
+#### THE ROOT-CAUSE RULE FOR THE WHOLE CORPUS (adopt in every rewrite)
+
+DeepSeek, asked why unbuilt consumers get written in the present tense with stated latencies:
+
+> "It lets the author present an aspirational design as operational fact, making the specification sound authoritative
+> and complete **without confronting the uncomfortable truth that nothing is built.** The one editorial rule that would
+> have prevented it: **never use the present tense for behavior that is not implemented and verified; use 'will' or
+> 'should' for intended behavior, or mark it explicitly as 'planned / not implemented.'**"
+
+**Every major finding in this review reduces to this.** Six spend layers of which three were prose. A Cloud Function
+pasted into a runbook. A Dockerfile copying a directory that never existed. Golden images with no build manifest. A
+harness entrypoint pointing at a missing module. And now six automations of which zero are deployed. **In every case
+the tense did the lying**, and the specificity is what makes it persuasive: "within 60 sec" reads as evidence of
+implementation.
+
+**Rule: present tense is reserved for what has been executed and verified. Everything else is `will`, `should`, or an
+explicit `NOT BUILT` marker.**
+
+#### CRITICAL
+
+**E3-C1. Of six claimed automations, ZERO are deployed. Codex audited each against the repo.**
+Line 352 says "six automations trigger."
+- **Supabase extraction (356-361): DOES NOT EXIST.** No function source, no schema for `pantheon_runs` /
+  `run_hypotheses` / `run_metrics` / `run_costs`, no deploy config.
+- **Pythia embedding (363-367): PARTIAL.** `.pythia/` index state exists and `lcs_investigate` is referenced in
+  skills, but there is no bundle-ingestion pipeline that watches storage, embeds, tags, or inserts.
+- **Obsidian sync (369-372): PROSE ONLY.** A template exists and runbooks contain `cp` lines. No automation.
+- **Dashboard refresh (374-377): PARTIAL, claimed integration absent.** `dashboard/` exists but reads local daemon
+  routes. No Grafana, no Streamlit, no Supabase-backed trend refresh.
+- **Hypothesis tracker (379-382): DOES NOT EXIST.** `open-hypotheses.md` and `lessons/candidates.md` not found.
+- **Alert on failure (384-387): DOES NOT EXIST.** No subscription, function, or notification config.
+
+The stated latencies are aspirations. **Nothing defines a trigger, queue, retry, SLI, log, or health check, so no
+observable contract exists that could prove any of them.**
+
+**E3-C2. The bundle upload is not atomic, and the trigger fires on the wrong object.**
+Lines 336-342. Object storage makes uploads visible one object at a time, so a watcher can see `manifest.json` before
+`summary.md`, `cost-report.json`, or `metrics/*.json` exist. **The line 356 trigger fires on `manifest.json` write, so
+it can fire against an incomplete bundle** and insert partial rows or fail nondeterministically.
+
+**Fix (Codex's minimal correct lifecycle):** stage everything locally, write final artifacts once, upload
+non-sentinel files first, **upload a completion sentinel LAST**, and have consumers trigger only on the sentinel after
+validating the manifest-declared object set.
+
+#### HIGH
+
+**E3-H1. The bundle can be destroyed by the cleanup that follows it.**
+Line 342 uploads, line 345 deletes the VM. A preemption or hard kill between those steps leaves the bundle partial or
+absent. `trap` does not reliably survive hard preemption, and `--max-run-duration` deletion can interrupt
+finalization. **Upload must be resumable, or finalization must happen off the VM.** *(Codex)*
+
+**E3-H2. The whole pipeline is cloud-triggered for work that is now local.**
+Every consumer hangs off a GCS landing event (line 352). With Track A on the Lenovo, that is indirection for its own
+sake. Drive it synchronously from the runner's own finalization step. *(Gemini)*
+
+#### DELETION CANDIDATES, WITH PURPOSE RECORDED (standing rule)
+
+**What the pipeline was for, read charitably:** compute cycles normally produce ephemeral shell output rather than
+durable intelligence. Writing results simultaneously to relational storage, vector storage, and readable Markdown was
+an attempt to make "test history IS the moat" into queryable data instead of a slogan. **That problem is real and the
+thesis is sound.** Gemini's verdict on why it failed is the useful part:
+
+> "You build a moat by digging a hole (writing tests). The author instead built an elaborate, event-driven, six-stage
+> water filtration plant for a hole they hadn't dug yet. The core thesis, that retained evidence compounds over time,
+> remains structurally sound. It simply starved to death waiting for data."
+
+| Consumer | Verdict | What it was for | Replacement |
+|---|---|---|---|
+| Supabase extraction | DROP | aggregate tracking of cloud runs and costs | the static `manifest.json` in the bundle |
+| Pythia embedding | **KEEP, MOVE** | historical runs semantically queryable | local post-run script, not a Cloud Function |
+| Obsidian sync | **KEEP, MOVE** | readable reports into a knowledge base | a local copy step |
+| Dashboard refresh | DROP | cost-per-insight charts for cloud spend | per-run `summary.md` |
+| Hypothesis tracker | **KEEP** | forces human synthesis of raw data | stays a mandatory manual step |
+| Alert on failure | DROP | paging when an unattended remote VM failed | non-zero exit code, since execution is local |
+
+**E3-D1. The manual step at 379-382 is correct design and only mislabelled.**
+Listing a human review under a heading that claims six automations is careless writing, but the step itself is right.
+**Automation cannot synthesize a strategic lesson.** The pipeline should dump formatted evidence and halt, forcing a
+human to review before the master belief state changes. Fix the label, keep the gate. *(Gemini, and I agree)*
+
+---
 
 ### `20-EVIDENCE-BUNDLE-SPEC.md` unit 2 (lines 48-321): required file schemas
 
