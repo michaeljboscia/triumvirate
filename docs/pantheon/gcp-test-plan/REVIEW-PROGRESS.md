@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 2 of 9 (`20-EVIDENCE-BUNDLE-SPEC.md`)
-**Current section:** unit 3 of 4 (lines 322-390) COMPLETE, all three peers logged.
-**Next action:** unit 4 of 4, `20-EVIDENCE-BUNDLE-SPEC.md` lines 391-end (Storage economics, Retention policy, Schema versioning, What this spec enables). Then rewrite the document.
+**Current section:** ALL 4 UNITS REVIEWED. Review of queue item 2 is COMPLETE.
+**Next action:** REWRITE `20-EVIDENCE-BUNDLE-SPEC.md` against the findings below, then one narrow verification pass, then queue item 3 (`30-DECISION-RULES.md`).
 
 **Unit plan for queue item 2 (4 units):**
 | Unit | Lines | Contents | Status |
@@ -21,7 +21,7 @@ conversation context are lost at compaction. If it is not written here, it did n
 | 1 | 1-47 | header, design goals, directory structure | **DONE** |
 | 2 | 48-321 | required file schemas | **DONE** |
 | 3 | 322-390 | lifecycle, downstream consumers | **DONE** |
-| 4 | 391-end | storage economics, retention, versioning, what this enables | next |
+| 4 | 391-end | storage economics, retention, versioning, what this enables | **DONE** |
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -47,7 +47,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
-| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **IN PROGRESS**, 3 of 4 units | |
+| 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **REVIEWED**, 4 of 4 units. Rewrite next. | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
@@ -75,6 +75,91 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `20-EVIDENCE-BUNDLE-SPEC.md` unit 4 (lines 391-end): storage, retention, versioning, claims
+
+Raw output: `review-raw/20-EVIDENCE-SPEC-unit-4.md`. All three peers. **Completes the review of queue item 2.**
+
+#### CRITICAL
+
+**E4-C1. "Retain forever" and "provably destroy client data" cannot both be true. THREE-PEER CONVERGENCE, and it is
+structural.**
+Lines 412-414 state as policy: *"All bundles retained forever"* and *"NEVER delete bundles."* Those bundles will
+contain client pilot artifacts. The product claim is sovereignty with provable destruction on request.
+
+DeepSeek: *"Policy cannot resolve this. It IS the contradiction. Treating history as a moat is just a rationale, not a
+reconciliation."* Gemini: *"You cannot promise clients privacy while hoarding their adjacent pilot data in
+perpetuity."* Codex adds the compliance angle: it also conflicts with legal hold release, privacy deletion,
+contractual retention limits, and regulated data minimization.
+
+**Minimum structural fix, and it resolves the two-bundle question from unit 1:** split by **data ownership**, not by
+audience. Evidence bundles contain only **non-client** data (metadata, hashes, compute logs, anonymized metrics) and
+may be immutable and retained. **Client pilot artifacts live in a separately encrypted, deletion-capable store** with
+a TTL and a destruction certificate, so erasure never touches the evidence archive.
+
+**Note this upgrades E1-S1.** Unit 1 proposed the split on presentation grounds (do not hand a client your
+`Mike's notes`). It is actually a requirement: the sovereignty product cannot ship without it.
+
+**What "never delete" was FOR** (standing rule): overcompensation to justify the moat narrative and to prove compute
+spend was not wasted, per line 414's own words, "represent paid compute." **Replacement:** TTL plus a provable
+destruction protocol for client data; genuine retention for non-client evidence only.
+
+#### HIGH
+
+**E4-H1. The storage math is wrong by more than 13x.**
+Line 406 concludes *"100 runs/year = ~5GB of bundles = $1.20/year. Effectively free forever."* Codex totalled the
+table's own per-gate sizes at **~672 MB per full Gate 0-7 run**, so 100 runs is **~67 GB/year and about $16/year**.
+The $1.20 figure only works for ~5 GB. **The document contradicts its own table two lines later.**
+
+**E4-H2. The size table contradicts design goal 7 and cannot accommodate the isolation evidence.**
+Goal 7 caps a bundle at 100 MB; line 402 claims 500 MB for gate 7. And the 10-20 MB early-gate figures are not
+credible for any bundle carrying raw packet captures, which unit 1 established are load-bearing for the isolation
+claim. **The size budget and the evidence requirement are in direct conflict and neither is specified.** *(Codex)*
+
+**E4-H3. Four of the seven "What this spec enables" claims are false as written.**
+- Semantic search (436): FALSE, no Pythia ingestion is deployed.
+- Structured queries (437): FALSE, no Supabase tables, ingestion, or consumers exist.
+- Cost accountability (440): FALSE unless the bundle captures real billing data per run.
+- Knowledge moat (442): marketing, not a delivered property.
+- Reproducibility (439): OVERSTATED. *"See exactly what config produced what result" is auditability, not
+  reproducibility.* That distinction is worth keeping in the rewrite.
+- Decision audit trail (441): OVERSTATED, and its example is *"why did we buy the RTX Pro 6000?"*, a purchase that was
+  cancelled.
+- Human-readable archive (438): PARTIAL, the files are readable but the Obsidian integration is not delivered.
+*(Codex, with Gemini concurring on 441 and 442)*
+
+**E4-H4. Nearline transition is underspecified.** Line 413 promotes bundles to nearline after 90 days but ignores
+nearline's 30-day minimum storage duration and retrieval fees, and does not state how a lifecycle transition
+interacts with the retention policy or bucket lock that real immutability requires. *(Codex)*
+
+#### MEDIUM
+
+**E4-M1. `harness/migrations/` (line 425) does not exist.** Another present-tense reference to an unbuilt path.
+*(Codex)*
+
+**E4-M2. "Downstream consumers must handle both schemas" (424) is unenforceable** with zero consumers deployed. There
+is no compatibility contract yet. *(Codex)*
+
+**E4-M3. "Effectively free forever" (406) omits real charges:** Class A/B operations, retrieval charges outside
+Standard, egress, lifecycle and rewrite operations, early-deletion charges, and versioned-object storage if
+versioning is used for immutability. *(Codex)*
+
+**E4-M4. "Guard them like production data" (444) is decorative.** With no signing, no immutability enforcement, and
+local disk as the destination, the sentence carries no engineering constraint. Gemini: *"You cannot guard a mutable
+local JSON file with adjectives."*
+
+#### STRATEGIC
+
+**E4-S1. The hype register runs through the tail and must go.** "Effectively free forever" (406), "NEVER delete"
+(414), "your test history IS the moat" (442). Required tone for a document a client security team reads is clinical
+and legally unambiguous: compliance boundaries, retention limits, data handling. Not a manifesto. **Same finding as
+T-S2 in the preflight review, so it is a corpus-wide edit, not a local one.** *(Gemini)*
+
+**E4-S2. What the rewritten tail should contain.** Replace "Storage economics" with local disk quota and rotation
+policy (Track A writes locally). Replace "Retention policy" with the provable-destruction mechanism for client data
+plus honest retention for non-client evidence. State the artifact schism explicitly. *(Gemini)*
+
+---
 
 ### `20-EVIDENCE-BUNDLE-SPEC.md` unit 3 (lines 322-390): lifecycle, downstream consumers
 
