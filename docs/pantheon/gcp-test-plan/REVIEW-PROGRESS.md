@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 4 of 9 (`runbooks/gate-0-plumbing.md`)
-**Current section:** unit 1 of 3 (lines 1-111) COMPLETE, all three peers logged.
-**Next action:** unit 2 of 3, `gate-0-plumbing.md` lines 112-245 (Step 3 docker-compose stack, Step 4 H-0.1 health check, Step 5 H-0.2 dispatch test). Step 3 contains the literal `# [paste content from above]` placeholder.
+**Current section:** unit 2 of 3 (lines 112-245) COMPLETE, all three peers logged.
+**Next action:** unit 3 of 3, `gate-0-plumbing.md` lines 246-314 (Step 6 evidence emission, Step 7 capture logs and self-destruct, Step 8 verify and vault, cost accounting, what comes after). The `gcloud compute instances delete` at line 284 sits AFTER `exit` so self-destruct never runs.
 
 **Unit plan for queue item 4 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-111 | purpose, hypotheses, checklist, Steps 1-2 | **DONE** |
-| 2 | 112-245 | Step 3 compose stack, Steps 4-5 tests | next |
-| 3 | 246-314 | Step 6 evidence, Step 7 self-destruct, Step 8 vault, cost, what comes after | pending |
+| 2 | 112-245 | Step 3 compose stack, Steps 4-5 tests | **DONE** |
+| 3 | 246-314 | Step 6 evidence, Step 7 self-destruct, Step 8 vault, cost, what comes after | next |
 
 **Carry into unit 3:** the `gcloud compute instances delete` at line 284 sits AFTER `exit`, so self-destruct never runs. Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
 
@@ -67,7 +67,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
-| 4 | `runbooks/gate-0-plumbing.md` | **IN PROGRESS**, 1 of 3 units | |
+| 4 | `runbooks/gate-0-plumbing.md` | **IN PROGRESS**, 2 of 3 units | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
@@ -93,6 +93,91 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `gate-0-plumbing.md` unit 2 (lines 112-245): compose stack, health check, dispatch test
+
+Raw output: `review-raw/gate-0-unit-2.md`. All three peers.
+
+#### THE RESOLVED DISAGREEMENT (this one changes the test design)
+
+**G0-R1. Codex and Gemini contradicted each other on what the dispatch test should assert. DeepSeek drew the boundary
+and both turn out right about different things.**
+
+- **Codex:** `tasks_completed: 5, tasks_errored: 0` (239-242) is too weak; an empty or malformed result counts as
+  completed. Assert output correctness.
+- **Gemini:** a plumbing test *"must explicitly avoid asserting latency or output semantics"*, because the inference
+  is mocked and asserting on mock output tests the mock.
+
+**DeepSeek's rule:** assert that each task's **routing envelope** (identity, headers, source, destination, trace
+context, deterministic control fields) arrives intact and lands at the right stage; **do not** assert the semantics of
+the mock's output payload.
+
+- **In scope:** task `#3` entered the mocked inference stage with request ID `req-3`, and the orchestrator routed the
+  response back with the same correlation ID, **regardless of whether the body is `{"ok":true}` or `"malformed"`**.
+- **Out of scope:** asserting the mock returned a correct answer, which tests the mock's hardcoded behavior.
+
+**So the correct assertion is neither "5 completed" nor "the answer was right." It is: every correlation ID
+round-tripped, each task reached the stage it should have, and the envelope was not corrupted.** Strictly stronger
+than the current test, strictly narrower than checking answers. **This is the design for the rewritten Step 5.**
+
+**G0-R2. Line 241 asserts `round_trip_median_ms: 45`, a performance claim inside a plumbing test.**
+Gemini caught it. A latency assertion against a mock measures the mock and the local machine's load at that moment.
+**Remove it.** Latency belongs in the sizing sweep, where it is measured against real inference. *(Gemini)*
+
+#### CRITICAL
+
+**G0-C3. Step 3 cannot run: both compose files are `# [paste content from above]` placeholders.**
+Lines 175-182. `docker compose up` at 185 starts nothing. Previously flagged; confirmed here in context. *(Codex)*
+
+**G0-C4. Fixed host ports with no collision guard, on a machine that stays up.**
+Ports `4222`, `8222`, `8000`, `7788` bound at 123, 133, 147, with **no compose project name, no preflight port check,
+and no cleanup.** On a persistent box these can already be held by NATS, an Ollama-style service, a dev server, or a
+previous Triumvirate run. **This is the concrete form of the ephemerality loss from G0-C1.** *(Codex)*
+
+#### HIGH
+
+**G0-H5. Three state-contamination sites, enumerated.** *(Gemini)*
+- `/tmp/docker-compose.gate-0.yml` and `/tmp/config/gate-0.toml` persist (175-182).
+- `docker compose up -d` leaves containers, networks, and port mappings running indefinitely (185).
+- `/tmp/evidence/$RUN_ID` persists permanently, and **if `RUN_ID` generation fails or collides, evidence is
+  contaminated by a prior run** (211, 227-229).
+
+**There is no teardown step anywhere in the runbook.** Without one, state contamination is guaranteed rather than
+possible.
+
+**G0-H6. The time bound must survive the move to local, for a different reason than it existed.**
+It was billing protection on GCP. Locally it stops **a hung process indefinitely squatting ports 4222, 7788, and 8000
+and blocking every future run.** Replace with a strict runner timeout plus an unconditional teardown hook that fires
+regardless of exit code. *(Gemini, extending G0-C1)*
+
+**G0-H7. H-0.1 defines "healthy" as an HTTP 200 and nothing more.**
+Lines 196-202 and evidence at 208-210 record only OK/FAIL from curls against host ports. **A service can answer HTTP
+while being unable to reach NATS or dispatch anything.** *(Codex)*
+
+**G0-H8. Nothing bounds the dispatch.** Healthchecks have bounded probes, but orchestration uses a blind `sleep 15`
+(188) rather than waiting deterministically, and the dispatch at 218-227 **has no timeout at all, so a blocked harness
+hangs the run.** *(Codex)*
+
+#### MEDIUM
+
+**G0-M3. Healthchecks assume tools that may not be in the images:** `wget` in the NATS image, `curl` in the harness
+and Triumvirate images (125, 135, 152). **A healthcheck can fail for a reason unrelated to health.** *(Codex)*
+
+**G0-M4. `depends_on` (148-150) waits on container healthchecks, not application readiness**, and is undermined
+anyway by the `sleep 15`. *(Codex)*
+
+**G0-M5. Image references still point at Artifact Registry** (121, 131, 141, 223). Local execution needs local tags
+or a registry mapping. *(Codex)*
+
+#### WHAT A PASSING GATE 0 LICENSES
+
+Worth stating explicitly in the rewrite, because the corpus has a habit of overclaiming. Gemini: it proves **Docker
+networking, NATS messaging, and Triumvirate configuration communicate.** It licenses **zero** confidence in GPU
+allocation, CUDA drivers, model loading, or real vLLM stability. **Mocking is the right call for this gate** (it is
+what isolates the variable), but it necessarily hides model loading, GPU/runtime compatibility, request schema
+differences, streaming, memory pressure, and real inference failure, which are the things most likely to break next.
+
+---
 
 ### `gate-0-plumbing.md` unit 1 (lines 1-111): purpose, hypotheses, checklist, Steps 1-2
 
