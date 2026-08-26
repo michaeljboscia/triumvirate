@@ -1,5 +1,21 @@
 # Graduated GCP Validation Plan — PANTHEON + YellingToad
 
+> **ARCHIVED 2026-08-26. Do not act on this document.** It is 442 lines gating a hardware purchase that is
+> permanently cancelled. Standing policy is `../POLICY-rent-first.md`.
+>
+> A three-peer review found: its PASS branch asserts the purchase is "de-risked" and assumes owned metal will be
+> faster and cheaper; its FAIL branch **binds software integration bugs to hardware viability**, concluding that if
+> parallel git worktrees fail to merge you should not buy hardware, which is affirming the consequent compounded by a
+> category error; and its budget section infers available spend from a consumer subscription rather than a verified
+> billing balance.
+>
+> **What was extracted before archiving, and it is the reason this was not simply deleted:** the validation tiers are
+> a **software integration test plan**, and that value survives the cancelled purchase entirely. A priced sizing
+> sweep measures cost and performance; these tiers measure whether the orchestrator can dispatch over HTTP, manage
+> parallel worktrees without collision, and complete a review-and-fix loop. See `../EXTRACTED-from-archive.md`.
+
+---
+
 **Purpose:** Validate the PANTHEON AI Software Factory architecture on GCP before committing $20K to local hardware. Six escalating tiers ($0.13/hr → $4.60/hr) that prove increasingly ambitious claims using real code (Go, Rust, Python) and real project deliverables (YellingToad + Tellus LandOS). No Kubernetes on GCP — plain VMs + Docker Compose. Each tier's infrastructure carries forward; nothing gets torn down.
 
 **Created:** 2026-04-16

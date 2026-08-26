@@ -1,5 +1,20 @@
 # PANTHEON Model Selection — April 2026
 
+> **ARCHIVED 2026-08-26. Do not act on this document.** It is an April 2026 model-landscape snapshot serving a
+> hardware purchase that is permanently cancelled. Standing policy is `../POLICY-rent-first.md`.
+>
+> A three-peer review found: the model table is stale in deployment-relevant ways (a mixture-of-experts model
+> described as dense, a context window since doubled, a licence listed as unknown that has been published); the VRAM
+> budgets contain **real technical errors**, not just dead premises, because active parameters in a sparse model do
+> not mean only active weights need to be resident, and one FP8 figure is off by roughly half; and the "all clean for
+> commercial use" licence heading is contradicted by an entry in its own table.
+>
+> **What was extracted before archiving:** capability-aware endpoint routing, the caveat that search-derived model
+> data must be checked against primary model cards, and the framing that model selection is a tuning knob rather than
+> an architectural commitment. See `../EXTRACTED-from-archive.md`.
+
+---
+
 **Purpose:** Comprehensive model inventory for the three PANTHEON roles (Zeus/Athena/Vulcan), grounded in Gemini quicksearch results from April 16, 2026. All benchmark numbers, context windows, and licensing terms are search-verified, not from training data.
 
 **Created:** 2026-04-16

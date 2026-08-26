@@ -11,9 +11,9 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 7 of 9 (`model-selection.md`, `graduated-gcp-validation-plan.md`)
-**Current section:** queue item 6 COMPLETE (reviewed, split). Policy extracted to `POLICY-rent-first.md`; analysis demoted with an accurate standing banner.
-**Next action:** queue item 7, `model-selection.md` and `graduated-gcp-validation-plan.md`. Both are April 2026 vintage and stale on models, VRAM math, and the GCP GPU lineup. Expect the same defects: purchase-era premises, unsourced benchmark tables, and present-tense claims about unbuilt things.
+**Current queue item:** 8 of 9 (`runbooks/gate-1` through `gate-5`, `gate-7`)
+**Current section:** queue item 7 COMPLETE (both documents archived with extraction).
+**Next action:** queue item 8, the six remaining runbooks (`gate-1` through `gate-5`, `gate-7`). These were demoted to rows in the priced sizing sweep. **Consider collapsing rather than rewriting each**, per the original queue note. Apply the standing rule: what were they for, does the problem persist, what replaces it. Known: `g4-standard-32` appears in several and is not a valid machine type.
 
 **Unit plan for queue item 6 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -86,7 +86,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | **COMPLETE** (3 units, 3 peers, 317 to ~250 lines, verified) | `5b85ab2` |
 | 6 | `local-inference-buy-vs-rent.md` | **COMPLETE** (3 units, 3 peers, split into `POLICY-rent-first.md` + demoted analysis) | `608d8a9` |
-| 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
+| 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | **COMPLETE**, both archived with extraction to `EXTRACTED-from-archive.md` | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
 | 9 | `twin-review-synthesis.md` | pending | |
 
