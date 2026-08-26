@@ -11,9 +11,9 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 4 of 9 (`runbooks/gate-0-plumbing.md`)
-**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 4 is COMPLETE.
-**Next action:** REWRITE `gate-0-plumbing.md` as a LOCAL runbook. Key moves: retarget from GCP VM to `lenovo`; add H-0.4 clean teardown; Step 5 asserts the routing envelope (correlation IDs round-trip, correct stage) not completion and not mock semantics; remove the latency assertion; unconditional teardown trap plus runner timeout replacing the VM's ephemerality; sentinel-last evidence; resource accounting instead of cost; forcing function to advance. Then verification pass, then queue item 5 (`gate-6-airgap-sanity.md`).
+**Current queue item:** 5 of 9 (`runbooks/gate-6-airgap-sanity.md`)
+**Current section:** queue item 4 COMPLETE (reviewed, rewritten, verified). Codex found two more genuine new errors in my rewrite; both fixed.
+**Next action:** queue item 5, `runbooks/gate-6-airgap-sanity.md`. **This is the product claim and the most important document left.** Known broken going in: it says ZERO outbound in its purpose but passes at <= 5 packets in its decision rule; it permits Private Google Access so it tests restricted egress rather than air gap; no IPv6 coverage; `g4-standard-32` is not a real machine type; and the rewritten Rule B in 30-DECISION-RULES.md now requires a connected-baseline parity check it does not have.
 
 **Unit plan for queue item 4 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -67,7 +67,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
-| 4 | `runbooks/gate-0-plumbing.md` | **REVIEWED**, 3 of 3 units. Rewrite next. | |
+| 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |

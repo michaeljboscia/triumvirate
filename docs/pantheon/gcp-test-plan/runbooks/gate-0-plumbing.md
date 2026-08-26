@@ -54,6 +54,16 @@ connected to NATS.
 **Threshold:** for every task, the correlation ID that entered is the correlation ID that returns, each task is
 observed at each stage it should pass through, and the routing envelope is uncorrupted.
 
+> **This threshold requires instrumentation the stack may not currently expose.** Observing a task "at each stage"
+> needs per-stage logging with the correlation ID, a NATS subscription tap, or equivalent. **Confirm that
+> instrumentation exists before committing to this threshold**, because a pre-registered threshold you cannot measure
+> is worse than a weaker one you can: it either gets quietly reinterpreted at run time, which is precisely the
+> goalpost-moving the decision rules forbid, or it blocks the gate indefinitely.
+>
+> **Fallback if per-stage observation is not available on first run:** assert correlation-ID round-trip and envelope
+> integrity only, and record explicitly that stage-level routing was not observed. That is a weaker claim honestly
+> stated, which beats a stronger one silently unmeasured.
+
 > **This is the finding that changed the test.** The original asserted `tasks_completed: 5, tasks_errored: 0`, which
 > an empty or malformed result satisfies. Two reviewers then disagreed about the fix, one arguing for output
 > correctness and one arguing a plumbing test must never assert output semantics. Both were right about different
@@ -138,15 +148,42 @@ The 45-minute bound survives the move to local, **for a different reason than it
 capped billing. Here it stops a hung process from indefinitely squatting ports 4222, 8222, 8000, and 7788 and
 blocking every future run.
 
-`run-gate-0.sh` must install a teardown trap **before** starting anything:
+`run-gate-0.sh` must define its run identity and install a teardown trap **before** starting anything:
 
 ```bash
 set -euo pipefail
-trap teardown EXIT INT TERM
+
+# RUN_ID must exist before anything references it. Under `set -u` an unset
+# RUN_ID aborts the script at the first expansion, which is the correct
+# behavior but only if it is set here rather than assumed.
+RUN_ID="${RUN_ID:-gate0-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+export RUN_ID
+
+_torn_down=0
+teardown() {
+  local rc=$?
+  [ "$_torn_down" -eq 1 ] && return          # idempotent: EXIT fires after INT/TERM
+  _torn_down=1
+  # ... ordered teardown, see Step 5 ...
+  return "$rc"                                # preserve the original exit status
+}
+trap teardown EXIT
+trap 'teardown; exit 130' INT
+trap 'teardown; exit 143' TERM
 ```
 
 **The trap is the point.** Teardown must run on success, on failure, on timeout, and on interrupt. The original put
 cleanup at the end of a linear script, and even that never executed because it sat after an `exit`.
+
+Three details that are easy to get wrong and were wrong in my first draft of this rewrite:
+
+- **Guard against double-running.** `EXIT` fires after an `INT` or `TERM` handler completes, so an unguarded trap runs
+  teardown twice.
+- **Preserve the exit status.** A naive handler returns the status of the last cleanup command, turning a failed run
+  into a reported success. That is the silent-success failure mode this whole review exists to eliminate.
+- **`timeout` sends `TERM`**, so the `TERM` trap is what covers the 45-minute cap. It only fires if the wrapper shell
+  itself receives the signal and is not subsequently `KILL`ed, so do not rely on it as the sole cleanup: the
+  pre-run port and leftover checks in section 4 are the backstop when a teardown genuinely did not happen.
 
 ### Step 1: start the stack
 
@@ -191,12 +228,25 @@ sentinel last.**
 
 Ordered, and running unconditionally from the trap:
 
-1. **Capture logs first**, before anything is destroyed.
+1. **Capture logs first**, before anything is destroyed. **Logs are bundle content, so this happens BEFORE the
+   sentinel is written in Step 4, not here.** Step 5 only copies what already exists.
 2. `docker compose -p gate0-${RUN_ID} down -v --remove-orphans`
-3. Archive staged evidence to permanent local storage.
+3. **Move the sealed bundle** to permanent local storage. **Moving is not writing:** the bundle's bytes and its
+   manifest hashes do not change, so the seal holds. If archiving would add or alter any object inside the bundle,
+   that object belonged before the sentinel and the ordering is wrong.
 4. Remove temp compose and config files, and the staging directory.
 5. Verify the four ports are free again and no labelled containers remain. **Assert this, do not assume it.** That
    assertion is H-0.4.
+
+> **Ordering constraint, stated because I got it wrong in the first draft of this rewrite.** Step 4 declares the
+> bundle sealed by writing `COMPLETE` last. Anything a later step needs to record must therefore be written *before*
+> that point, or live in a sidecar outside the bundle. Log capture in particular is bundle content and belongs in
+> Step 4's write set, not in the teardown.
+
+**What H-0.4 can and cannot assert.** Containers, network, volumes, ports, and temp files are directly checkable, so
+those are the threshold. **"The machine is in the state it was before" is not fully verifiable** and neither is
+credential hygiene, so treat those as the intent behind the rule rather than as the test. State the checkable subset
+as the pass condition and do not claim more.
 
 **Do not** remove shared Docker resources, images other runs depend on, or long-lived local credentials. Scope every
 removal to this run via the project name and the label. A blunt cleanup that takes out a neighbour's state is worse
