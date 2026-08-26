@@ -12,7 +12,14 @@
 
 ## CRITICAL
 
+> **All five closed 2026-08-26.** Each carries its resolving commit below. This list was written before the
+> section-by-section review; the deeper findings that review produced are in `REVIEW-PROGRESS.md`.
+
+
 ### C-1. Gate 6 contradicts itself, and it is the product claim
+
+**RESOLVED `5b85ab2`.** Rewritten. The threshold is no longer a count at all: zero unauthorized egress that succeeded, with blocked attempts logged separately as evidence the control works. The review later found the contradiction ran deeper than this entry knew, with **four** mutually inconsistent thresholds rather than two (`G6-C2`, `G6-C6`).
+
 `runbooks/gate-6-airgap-sanity.md`
 
 The purpose section (lines 3, 45-48) states "ZERO outbound traffic" and "Any packet leaving the VM = fail." The decision rule (lines 278-280) passes the gate with `outbound packets <= 5`. Those cannot both be true. The document that gets shown to a prospect asserts a standard in its opening and applies a weaker one in its verdict.
@@ -20,6 +27,9 @@ The purpose section (lines 3, 45-48) states "ZERO outbound traffic" and "Any pac
 *Caught by: Codex.*
 
 ### C-2. Gate 6 is not an air-gap test, it is a restricted-egress test
+
+**RESOLVED `5b85ab2`.** The rewrite splits the two claims explicitly: cloud restricted-egress validation on a VM, air-gap reserved for the physically disconnectable local box. Note the owner's ruling refined this: PGA rides Google's private backbone and does not need removing, so the defect was terminology rather than architecture.
+
 `runbooks/gate-6-airgap-sanity.md` lines 150-158, 258-259
 
 The runbook explicitly permits Private Google Access to `199.36.153.8/30` and `199.36.153.4/30`. The honest description of what it proves is "no egress except Google private API endpoints." Calling that air-gap in front of a client security team is the kind of claim that ends an engagement.
@@ -29,6 +39,9 @@ Codex's recommended fix, which is correct: rename the GCP version to **cloud res
 *Caught by: Codex.*
 
 ### C-3. Gate 0's self-destruct is unreachable
+
+**RESOLVED `e675e92`, `95b337a`.** Rewritten as a trap firing on every exit path, with the double-run guard and exit-status preservation that a naive trap gets wrong. The review also found this mechanism had a second, undocumented job: enforcing ephemerality, which survives the move to a persistent local box and is now hypothesis H-0.4 (`G0-C1`).
+
 `runbooks/gate-0-plumbing.md` line 284
 
 The `gcloud compute instances delete` command is placed *after* `exit` in the SSH session. As written it never runs. The VM survives until `--max-run-duration` or manual cleanup. This is layer 3 of the six advertised spend controls, and it is the third of those layers found to be non-functional (layers 4 and 6 have no implementation at all).
@@ -36,6 +49,9 @@ The `gcloud compute instances delete` command is placed *after* `exit` in the SS
 *Caught by: Codex.*
 
 ### C-4. An ACCEPTED document tells the reader to spend $160K
+
+**RESOLVED `401fdde`.** Archived to `archive/`, status changed to ARCHIVED, with a do-not-act banner. The TPS floor was extracted first and now lives in `POLICY-rent-first.md`.
+
 `HARDWARE_DECISION.md`
 
 Still marked **Status: ACCEPTED**. States that the OPEX-first principle is a runway whose "first on-prem CapEx must clear the production floor," and charts a path to $160K of Tier 3 enterprise hardware. This directly contradicts `local-inference-buy-vs-rent.md` section 6 ("Never our capex").
@@ -45,6 +61,9 @@ Compounding it: `30-DECISION-RULES.md` Decision 10 sets an automatic trigger to 
 *Caught by: Gemini.*
 
 ### C-5. The evidence bundle has no independence
+
+**RESOLVED `76a219d`, `533393c`, partially DEFERRED.** The spec rewrite splits artifacts by data ownership and specifies content-addressed objects, a manifest signed with a key the tested environment never holds, and an external append-only anchor. **The mechanism itself is marked NOT BUILT and is deliberately deferred**, because building it before anything has executed would repeat the corpus's founding error. The review found the same defect one level deeper in the isolation gate, where the capture is produced, stored and adjudicated by the machine under test (`G6-C5`).
+
 `20-EVIDENCE-BUNDLE-SPEC.md` (method-level finding)
 
 The system under test deploys itself, runs the gate, assembles the evidence, hashes it, and narrates it, with no root of trust outside the tested environment. A compromised or leaking system produces a byte-identical bundle to a clean one. That is the operational definition of evidence that discriminates nothing.
