@@ -12,8 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 5 of 9 (`runbooks/gate-6-airgap-sanity.md`)
-**Current section:** queue item 4 COMPLETE (reviewed, rewritten, verified). Codex found two more genuine new errors in my rewrite; both fixed.
-**Next action:** queue item 5, `runbooks/gate-6-airgap-sanity.md`. **This is the product claim and the most important document left.** Known broken going in: it says ZERO outbound in its purpose but passes at <= 5 packets in its decision rule; it permits Private Google Access so it tests restricted egress rather than air gap; no IPv6 coverage; `g4-standard-32` is not a real machine type; and the rewritten Rule B in 30-DECISION-RULES.md now requires a connected-baseline parity check it does not have.
+**Current section:** unit 1 of 3 (lines 1-107) COMPLETE, all three peers logged.
+**Next action:** unit 2 of 3, `gate-6-airgap-sanity.md` lines 108-240 (Step 2 prepare stack before lockdown, Step 3 apply zero-egress firewall, Step 4 H-6.1 under lockdown, Step 5 agent swarm air-gapped, Step 6 stop tcpdump and analyze). **The `<= 5 packets` threshold lives in this range.**
+
+**Unit plan for queue item 5 (3 units):**
+| Unit | Lines | Contents | Status |
+|---|---|---|---|
+| 1 | 1-107 | purpose, hypotheses, checklist, Step 1 | **DONE** |
+| 2 | 108-240 | Steps 2-6, lockdown and capture analysis | next |
+| 3 | 241-317 | Step 7 PGA upload, Step 8 teardown, decision rules, cost, next | pending |
 
 **Unit plan for queue item 4 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -68,7 +75,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
-| 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
+| 5 | `runbooks/gate-6-airgap-sanity.md` | **IN PROGRESS**, 1 of 3 units | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
@@ -93,6 +100,111 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `gate-6-airgap-sanity.md` unit 1 (lines 1-107): purpose, hypotheses, checklist, Step 1
+
+Raw output: `review-raw/gate-6-unit-1.md`. All three peers. **This document is the product claim.**
+
+#### THE MOST CONSEQUENTIAL FINDING IN THE ENTIRE REVIEW
+
+**G6-C1. The gate's evidence channel is an exfiltration channel, by design, and the document never acknowledges it.**
+
+Gemini, reading as a client CISO:
+
+> "You intentionally punched a hole for Private Google Access to upload evidence bundles. **How do you
+> cryptographically or programmatically guarantee that those payloads sent to GCS do not exfiltrate our proprietary
+> context, weights, or PII through that allowed channel?**"
+
+The gate proves isolation by denying egress, then deliberately keeps one egress path open to upload the proof. **The
+proof channel is the hole.** Nothing in the document constrains what flows through it.
+
+DeepSeek: **answerable, but fatal if the answer is "trust us."** The fix is to make the allowed path a
+**constrained, auditable, write-only pipe:**
+
+1. **Point it at a CLIENT-CONTROLLED bucket**, not ours, with a policy permitting only `PutObject` to a fixed evidence
+   prefix. **This inverts who holds the evidence and removes the vendor from the trust path**, which is the single
+   highest-leverage change available here.
+2. **Least-privilege uploader:** a separate identity that can read only the evidence directory, never weights,
+   databases, source, or client data, enforcing an allowlist of expected filenames, types, and sizes, aborting on
+   anything unexpected.
+3. **Manifest and hashes computed before upload**, so smuggled data shows up as an unexpected object and breaks the
+   manifest.
+4. **Remote attestation** binding the uploader to a reviewed image.
+
+**Client-verifiable rather than vendor-asserted:** the network path and bucket policy (client audits flow logs), the
+uploaded object list against the manifest (client checks their own bucket), and the attestation report.
+
+**The one thing that cannot be asserted is that the uploader has no access to sensitive data.** That needs code or
+image review, or attestation. **Put this in the rewrite as an explicit section; a security team will ask it first.**
+
+#### CRITICAL
+
+**G6-C2. The document contains THREE mutually inconsistent thresholds for the same claim.**
+- Line 3: *"Any packet leaving the VM = fail"* and *"ZERO outbound traffic."*
+- Line 45: *"Zero -> PASS, 1-10 attempts -> investigate, > 10 -> fundamental architectural leak."*
+- Elsewhere (unit 2 range): passes at `outbound packets <= 5`.
+
+**Codex: the load-bearing number in this range is zero, and the diluted band at line 45 contradicts it.** A gate with
+three thresholds has none. It also measures *"attempts that reach the firewall"* (43) rather than all packets, which
+is a narrower thing than either claim.
+
+**G6-C3. Step 1 applies no firewall rules at all.**
+Lines 92-105 provision with `--no-address` and **create no deny or allow egress rules whatsoever.** The gate's central
+mechanism is absent from the step that claims to establish it. Default VPC egress may remain open unless rules exist
+outside this range. *(Codex)*
+
+**G6-C4. Four egress paths are unaddressed:** IPv6 (no `::/0` denial), the metadata server at `169.254.169.254`
+(neither blocked nor monitored), DNS resolution, and NTP. *(Codex)*
+
+#### HIGH
+
+**G6-H1. The opening claim is false on the document's own terms.**
+Line 14 says Pantheon *"does not attempt any outbound network connection"* while lines 59-60 and 71 test outbound
+GCS uploads via PGA. **A prospect who reads the whole document finds the contradiction themselves.**
+
+Gemini's replacement, which is both compelling and true: *"When deployed in a sovereign environment, Pantheon operates
+completely isolated from the public internet, restricting all egress exclusively to customer-authorized private
+endpoints."*
+
+**G6-H2. H-6.2 checks completion, not correctness. Fourth instance.**
+Lines 52-56 assert tasks complete and pass eval without defining the eval's rigor. Gemini's wording: *"All tasks pass
+evals that strictly require local retrieval and inference to succeed, proving the system did not silently fall back,
+skip steps, or return validly-shaped empty results."* **Rule B in the rewritten decision rules also now requires a
+connected-baseline parity check, which this hypothesis does not have.**
+
+**G6-H3. The capture would miss most of what matters.**
+tcpdump appears only in a prediction (43), the firewall is applied *"after stack is up"* (91), and **no interface is
+specified.** It therefore misses provisioning and startup traffic before lockdown, anything on an uncaptured
+interface, metadata/DNS/NTP paths, and PGA traffic unless filters explicitly include it. **Start capture before
+lockdown, name the interfaces, and cover both address families.** *(Codex)*
+
+**G6-H4. The exclusion list omits exactly what the claim depends on.**
+"What it does NOT validate" (31-35) excludes hardware representativeness and drift, **but not IPv6 coverage, metadata
+server access, DNS and NTP paths, packet-capture scope, or output correctness.** Those are the real limits, and a
+client security team will find them whether or not the document names them. *(Codex)*
+
+#### THE `<= 5 PACKETS` ALLOWANCE (standing rule applied)
+
+**What it was for:** unavoidable OS-level noise, DHCP, ARP, NTP, metadata lookups, or telemetry firing before the
+firewall clamps down. **Does the problem persist?** Yes; OS defaults still generate it.
+
+**But a bare tolerance number is indefensible to an auditor,** since it says only "some packets left and we decided
+that was fine." **Replacement: an explicit protocol and destination allowlist. Zero unclassified packets. Named
+exceptions only, each accounted for by destination and protocol.** That is strictly stronger and easier to defend
+than a count. *(Gemini)*
+
+#### STRUCTURAL
+
+**G6-S1. Split into two documents rather than one with two modes.**
+Under the owner's terminology ruling, the GCP test is honestly **cloud restricted-egress validation** and only the
+physically disconnectable local box supports a literal **air-gap** claim. Gemini: a runbook must be a linear
+executable script, and combining modes forces branching between gcloud provisioning and local scripts, and between
+PGA rule verification and physical isolation. **One document with two modes introduces execution drift and dilutes
+the audit trail.**
+
+**G6-S2. `g4-standard-32` (line 93) is not a valid machine type.** Third document containing this error. *(Codex)*
+
+---
 
 ### `gate-0-plumbing.md` unit 3 (lines 246-314): evidence, teardown, vault, cost, next steps
 
