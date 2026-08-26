@@ -12,7 +12,7 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 3 of 9 (`30-DECISION-RULES.md`)
-**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 3 is COMPLETE.
+**Current section:** queue item 3 REVIEWED and REWRITTEN. Verification pass next.
 **Next action:** REWRITE `30-DECISION-RULES.md`. Key moves: invert Decision 10 into the budget-bleed guard; cut Decisions 1, 2, 3, 6 with purpose recorded; keep 4, 5, 7, 8 with edits; strengthen Decision 7 with a connected-baseline parity check; add a forcing function against failure-to-advance; make the amendment protocol binding rather than documentary (post-change scope only, cooldown, peer review). Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
 
 **Unit plan for queue item 3 (3 units):**
@@ -57,7 +57,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
-| 3 | `gcp-test-plan/30-DECISION-RULES.md` | **REVIEWED**, 3 of 3 units. Rewrite next. | |
+| 3 | `gcp-test-plan/30-DECISION-RULES.md` | **REVIEWED + REWRITTEN** (3 units, 3 peers) | see below |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
