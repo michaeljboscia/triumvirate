@@ -37,7 +37,8 @@ tested an outbound upload. **A prospect who reads to the end finds that contradi
 If this gate is the product, three claims carry it. Everything else in this document is operational detail that
 exists for us, not for them, and lives in the appendix.
 
-1. **Zero unauthorized packets**, with every permitted flow enumerated and inspected.
+1. **Zero unauthorized egress that succeeded**, with every permitted flow enumerated and inspected, and every blocked
+   attempt logged rather than tolerated.
 2. **Cryptographic attestation** of the runtime and the evidence bundle.
 3. **A write-only pipeline to a client-controlled sink.**
 
