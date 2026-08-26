@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 5 (lines 477-544) — COMPLETE, all three peers logged
-**Next action:** review Phase 6 (Custom VM images, lines 545-642) with all three peers.
+**Current section:** Phase 6 (lines 545-642) — COMPLETE, all three peers logged
+**Next action:** review Phase 7 (Fixtures + Pythia seed, lines 643-676) with all three peers.
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 5 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 6 of 11 sections reviewed | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -57,7 +57,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | Phase 3 — Docker image pre-bake | 273-371 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 4 — Model weights cached to GCS | 372-476 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 5 — PD snapshots | 477-544 | **DONE** (Codex, Gemini, DeepSeek) — VERDICT: DELETE PHASE |
-| Phase 6 — Custom VM images | 545-642 | no |
+| Phase 6 — Custom VM images | 545-642 | **DONE** — VERDICT: DELETE PHASE |
 | Phase 7 — Fixtures + Pythia seed | 643-676 | no |
 | Phase 8 — Tooling validation | 677-726 | no |
 | Preflight completion checklist | 727-755 | no |
@@ -67,6 +67,88 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` Phase 6 (lines 545-642)
+
+Raw output: `review-raw/10-PREFLIGHT-phase-6.md`. All three peers.
+
+**VERDICT: DELETE THIS PHASE TOO.** Both file-reading peers again reached that independently. Gemini's summary is
+exact: the "baking" here consists of installing Docker and running `docker pull`, so the portable equivalent is to not
+use custom VM images at all and just pull containers at runtime.
+
+#### CRITICAL
+
+**P6-C1. The image family does not exist any more.**
+Lines 606-607 use `common-cu126` from `deeplearning-platform-release`. Current DLVM families are
+`common-cu129-ubuntu-2404-nvidia-580` and `common-cu129-ubuntu-2204-nvidia-580`, and even CUDA 12.8 was deprecated on
+2026-04-13. The naming scheme itself changed to encode CUDA, Ubuntu, and driver version. The command fails outright.
+*(Codex, against Google docs updated 2026-08-11)*
+
+**P6-C2. `${REGISTRY}` is unset on both baker VMs, so every pull fails.**
+Lines 573-579 and 619-621. `REGISTRY` was exported in Phase 3 in a different shell on a different machine.
+`docker pull ${REGISTRY}/${img}` expands to `docker pull /pantheon-triumvirate:main`, and a Docker reference cannot
+begin with `/`. This fails as an invalid reference before any network call. *(Codex)*
+
+**P6-C3. Spot plus DELETE destroys the artifact being built.**
+Lines 605, 611-612. If the baker is preempted mid-bake, `--instance-termination-action=DELETE` deletes the VM and its
+partially prepared boot disk, so there is nothing left to image. Spot suits idempotent restartable work; this is an
+interactive SSH bake. Use a standard VM, or at minimum `STOP`. *(Codex)*
+
+#### HIGH
+
+**P6-H1. The "L4 + A100 + RTX Pro 6000 compatible" claim at line 597 is likely false.**
+Line 604 bakes on an L4, and line 613's `install-nvidia-driver=True` installs drivers for the *attached* hardware.
+Snapshotting after that bakes Ada L4 drivers into the image. Booting it on Ampere A100 or Blackwell RTX PRO 6000 risks
+driver mismatch, CUDA failure, or silent performance degradation. *(Gemini)*
+
+**P6-H2. `--metadata=install-nvidia-driver=True` contradicts the comment beside it.**
+Line 600 says the Deep Learning image has drivers baked; line 613 then asks Google to install them on first boot with a
+reboot. Current DLVM families ship driver 580 pre-installed, so the flag should be omitted. *(Codex)*
+
+**P6-H3. No update story, so the images are stale on the next commit.**
+Lines 588, 632 hardcode `-v1` names; lines 574-577, 620-621 hardcode `triumvirate:main`. Any push to `main` makes the
+baked image stale, and keeping the fast-boot benefit means re-running a multi-hour bake on every code change. Same
+lifecycle hole as Phase 5's snapshot. *(Gemini)*
+
+#### MEDIUM
+
+**P6-M1. `newgrp docker` is unreliable in a scripted SSH block.** Lines 568-569; the subsequent `docker pull` at line
+578 may not run as expected. Use `sudo docker pull` or reconnect. *(Codex)*
+
+**P6-M2. No guest cleanup before imaging.** Lines 586-592, 629-635. Imaging a booted machine without clearing SSH host
+keys and machine identity duplicates them across every VM created from the image. *(Codex)*
+
+**P6-M3. Cost/duration claim "2-3 hours, ~$1-2" (line 545) is not defensible** once the L4 baker, the boot disks, image
+storage, and any retries are counted. *(Codex)*
+
+**P6-M4. `nvidia/cuda:12.6.0-base-ubuntu22.04` (line 625) does exist,** but `--gpus all` needs NVIDIA Container Toolkit;
+verify `docker info | grep -i nvidia` rather than assuming the DLVM provides it. *(Codex)*
+
+**P6-M5. Imaging from a stopped instance is structurally correct** (lines 586-592). `--force` is not needed. Recorded
+so nobody "fixes" a working thing. *(Codex)*
+
+#### STRATEGIC
+
+**P6-S1. Same GCP lock-in as Phase 5, for less benefit.** A GCE custom image cannot travel to RunPod or AWS, and what
+it encodes is "Docker is installed and three images are pulled," which is 2-3 minutes of work at runtime. Spending
+2-3 hours plus ongoing image storage to save that, before a single gate has run, is premature optimization. *(Gemini)*
+
+**P6-S2. A GCP image proves nothing to a client pilot.** If the pilot must run on the client's own infrastructure, a
+GCE-specific artifact is worthless; the isolation story depends on portable orchestration. *(Gemini)*
+
+#### CORPUS-WIDE PATTERN (third sighting)
+
+DeepSeek: **a snapshot records state, not cause.** A golden image loses which package versions apt resolved, which
+image digests were pulled, the base image and kernel, and any audit trail permitting rebuild or verification. Two runs
+from the same image name can use different content, invisibly, so "reproducible" becomes unfalsifiable rather than
+merely unverified. Minimum fix: a version-controlled declarative build manifest (Dockerfile or Packer) with pinned
+package versions and image digests, rebuilt from source rather than snapshotted.
+
+**This is the same defect as P3-H1 (unpinned container tags) and P4-H1 (unpinned model revisions).** Three phases,
+one root cause: the corpus consistently captures what happened instead of specifying what should happen. Fix it as one
+theme in the rewrite, not as three separate patches.
+
+---
 
 ### `10-PREFLIGHT.md` Phase 5 (lines 477-544)
 
