@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 5 of 9 (`runbooks/gate-6-airgap-sanity.md`)
-**Current section:** unit 2 of 3 (lines 108-240) COMPLETE, all three peers logged.
-**Next action:** unit 3 of 3, `gate-6-airgap-sanity.md` lines 241-317 (Step 7 evidence upload through PGA, Step 8 teardown, Decision rule application, cost accounting, what comes after). **Step 7 is the exfiltration-channel question made concrete.**
+**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 5 is COMPLETE.
+**Next action:** REWRITE `gate-6-airgap-sanity.md`. Organizing principle from Gemini's distillation: three claims a client can check (zero-unclassified-packet capture, cryptographic attestation of runtime and bundle, write-only pipeline to a CLIENT-CONTROLLED sink), with operational detail demoted to an appendix. Split cloud restricted-egress validation from literal local air-gap. Move capture and adjudication outside the guest via an inline egress gateway, not a passive tap. Replace the packet tolerance with an allowlist at zero unclassified.
 
 **Unit plan for queue item 5 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-107 | purpose, hypotheses, checklist, Step 1 | **DONE** |
 | 2 | 108-240 | Steps 2-6, lockdown and capture analysis | **DONE** |
-| 3 | 241-317 | Step 7 PGA upload, Step 8 teardown, decision rules, cost, next | next |
+| 3 | 241-317 | Step 7 PGA upload, Step 8 teardown, decision rules, cost, next | **DONE** |
 
 **Unit plan for queue item 4 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -75,7 +75,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
-| 5 | `runbooks/gate-6-airgap-sanity.md` | **IN PROGRESS**, 2 of 3 units | |
+| 5 | `runbooks/gate-6-airgap-sanity.md` | **REVIEWED**, 3 of 3 units. Rewrite next. | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
@@ -100,6 +100,91 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `gate-6-airgap-sanity.md` unit 3 (lines 241-317): upload, teardown, decision rule, claims
+
+Raw output: `review-raw/gate-6-unit-3.md`. All three peers. **Completes the review of queue item 5.**
+
+#### THE FINDING THAT ENDS THE THRESHOLD ARGUMENT
+
+**G6-C8. The passing threshold leaves room to exfiltrate a private key, and the rationale for it is unfalsifiable.**
+
+Line 279 passes at `outbound packets <= 5`, rationale *"allowing for incidental retry noise."*
+
+DeepSeek quantified it: at a 1500-byte MTU a packet carries roughly 1460 bytes of payload, so **four packets is about
+6 KB. An SSH or TLS private key is under 2 KB.** Also within budget: a password-vault export, API tokens, a seed
+phrase, a small encrypted archive.
+
+Gemini as the client's CISO: **"'Incidental retry noise' is a loophole, not a contract clause. A vendor could easily
+exfiltrate keys within 5 packets and claim it was an accident."**
+
+**The general principle, which is why the fix is not a smaller number:** a packet count is **orthogonal to intent.**
+It models noise as a quantity, so an attacker simply chooses content that fits the budget, and the threshold
+**legitimizes arbitrary data as incidental.** Noise stays unfalsifiable unless every packet is attributable to an
+approved purpose.
+
+**The right shape of control:** default-deny egress with allowlisted destinations, protocols, and application-layer
+semantics. **Every packet is traceable to a known permitted flow, or it is blocked and logged. Zero unauthorized
+packets, with exceptions enumerated, constrained, and inspected rather than counted.**
+
+#### CRITICAL
+
+**G6-C9. Step 7 is a plain recursive copy from inside the VM, using the VM's own credentials, to OUR bucket.**
+Lines 244-260. The uploading identity is the VM's attached service account. **No least-privilege scoping, no
+client-controlled sink, no hash or manifest completeness check before or after, and no size check.**
+
+Codex on the boundary: the command names only the evidence directory, **but a symlink or planted content inside that
+tree would be followed, because no validation boundary exists.**
+
+Gemini as CISO: *"No attestation, no manifest hash, no proof of a client-controlled sink."* This is the unit-1
+objection made concrete, **and Step 7 does not answer it in any respect.**
+
+**G6-C10. "Sovereign claim validated. Ready to ship" and "audit-defensible" are unsupported by this evidence model.**
+Lines 283 and 315. PGA upload is unexamined exfiltration, evidence is self-attested, IPv6 is absent, and the pass
+threshold contradicts the document's own air-gap claim. **These are the two sentences a prospect would quote back.**
+
+#### HIGH
+
+**G6-H9. Teardown is not transactional.** Lines 266-271. **Good news first: unlike gate-0, the instance delete is not
+stranded after an `exit` and does run.** But a failure between the two firewall-rule deletions leaves the VM running
+with one rule removed, and a failure after both leaves the VM with neither the deny nor the PGA rule in place.
+**Neither intermediate state is safe, and nothing detects them.** *(Codex)*
+
+**G6-H10. The PASS condition has no inconclusive branch** and does not match the rewritten Rule B: **no independent
+packet-capture requirement, no stated IPv6 coverage, no connected-baseline equivalence.** The gate that adjudicates
+the product claim is weaker than the rule that governs the claim. *(Codex)*
+
+**G6-H11. `g4-standard-32` appears again**, in both the manifest and the cost table (249, 305). Codex notes
+`g2-standard-32` does exist, **so this is likely a G2/G4 mix-up** rather than an invented name. Fourth document
+containing it. *(Codex)*
+
+#### THE DISTILLATION (this decides the rewrite's shape)
+
+Asked what three things actually convince a security team if this gate is the whole product, Gemini:
+
+1. **A strict zero-unclassified-packet capture** proving isolation.
+2. **Cryptographic attestation** of the runtime and the evidence bundle.
+3. **A verifiable, least-privilege, write-only pipeline to a client-controlled audit sink.**
+
+**Everything else, including the cost accounting and the software firewall teardown, is internal QA noise.** That is
+the right organizing principle for the rewrite: **three claims a client can check, and an appendix of operational
+detail that exists for us rather than for them.**
+
+#### WHAT THE SELF-DESTRUCT WAS FOR (standing rule)
+
+Lines 264-272. **What it was for:** tearing down the software firewall rules and preventing billing for an orphaned
+VM. **Does the problem persist?** On a local box that can be physically unplugged, **the billing and cloud-orphaning
+half disappears.** What replaces it is a physical disconnect or a wipe. **Note this differs from gate-0**, where the
+same mechanism was also providing ephemerality that had to be reconstructed locally; here the firewall rules are
+cloud objects that simply do not exist in the local variant. *(Gemini)*
+
+#### WHAT SHOULD HAPPEN ON A PASS
+
+Not "proceed to soak testing" (317). Gemini: **passing the product claim should force cryptographic sealing of the
+release artifact and generation of the compliance attestation the client audits.** Under Rule A the gate must push
+forward into producing the client-facing artifact, not into more internal testing.
+
+---
 
 ### `gate-6-airgap-sanity.md` unit 2 (lines 108-240): lockdown, execution, capture analysis
 
