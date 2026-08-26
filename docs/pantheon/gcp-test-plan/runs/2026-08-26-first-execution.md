@@ -55,10 +55,39 @@ deliberately deployed, up 27 days, compose file at `/home/mikeboscia/infinity/do
 **It was also not stuck.** `GET localhost:7997/models` returned `queue_absolute: 0`, `results_pending: 0`. Healthy and
 idle. A reranker holds its weights resident by design; that is the service working, not failing.
 
-Before stopping it I checked for consumers: **no live code reference anywhere in `~/projects` on either machine**
-(searched `.py .ts .js .json .yaml .yml .env* .toml .sh` for `:7997`, `bge-reranker`, `RERANK`). The only hits were
-Claude session transcripts from ContentFactory, meaning it was used interactively at some point, not wired into
-anything running.
+Before stopping it I checked for consumers and **got the wrong answer**. I searched `~/projects` on the Mac and on
+lenovo for `:7997`, `bge-reranker`, `RERANK` across `.py .ts .js .json .yaml .yml .env* .toml .sh`, found only Claude
+session transcripts, and concluded it was unused.
+
+**It has a live consumer.** Graphiti (`bosciamem`), container `docker-graphiti-mcp-1` on **homebox (192.168.2.110)**,
+uses it as its cross-encoder reranker:
+
+```
+LOCAL_RERANK_URL=http://192.168.2.112:7997
+LOCAL_RERANK_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_MIN_SCORE=0.02
+```
+
+The search failed for two independent reasons, and both are methodological:
+
+1. **The consumer is a container environment variable, not source code.** Grepping source files cannot see
+   `docker inspect` env. The dependency was configured, never coded.
+2. **The consumer is on a third machine.** I searched "both machines" and homebox was neither of them.
+
+**The answer was in the service's own access log the whole time**, and I had already run `docker logs` against it:
+
+```
+$ docker logs infinity | grep -oE '"(GET|POST) [^ ]+ HTTP' | sort | uniq -c | sort -rn
+  75699 "GET /metrics HTTP
+   3520 "POST /rerank HTTP        <-- 3520 real requests
+$ docker logs infinity | grep -oE '^INFO: +[0-9.]+:' | sort -u
+INFO:     192.168.2.110:          <-- the caller, printed on every one of them
+```
+
+**Standing rule: before stopping any long-running service, enumerate its callers from its own access log, not from a
+source grep.** The server knows who calls it. Source code answers "who was written to call this," which is weaker and
+blind to env vars, containers, and other hosts. Also: `queue_absolute: 0` means *not busy right now*, not *unused*.
+Cumulative request count is the question; instantaneous queue depth is not.
 
 Stopped it:
 
@@ -79,6 +108,38 @@ ssh lenovo 'docker start infinity'      # or: cd ~/infinity && docker compose up
 
 Its restart policy is `unless-stopped`, so an explicit `docker stop` keeps it down across reboots. It will not come
 back on its own and quietly re-take the 2.6GB mid-sweep.
+
+### Outage impact: none, and only because Graphiti's fallback was built correctly
+
+Container stopped ~11:47, restarted ~11:57. Graphiti's log for the window:
+
+```
+11:47:48 fallback_reranker WARNING reranker tier BAAI/bge-reranker-v2-m3: non-transient error,
+                                   falling down: All connection attempts failed
+11:47:48 fallback_reranker WARNING reranker: served by tier 1 (gemini-2.5-flash-lite) on attempt 1
+```
+
+Two rerank calls hit the dead endpoint. Both **fell down a tier and were served**. No dropped work, nothing surfaced
+to the user. Verified restored end to end on the exact failing path:
+
+```
+homebox $ curl -X POST http://192.168.2.112:7997/rerank ...
+HTTP_STATUS=200 TIME=0.036038s
+```
+
+ContentFactory is **not** a consumer; its only appearances were Claude session transcripts. `docker-graphiti-mcp-1` is
+the sole container on homebox referencing port 7997.
+
+**The design lesson cuts both ways.** The tiered fallback turned an outage into two WARNING lines, which is exactly
+right for availability. It also means a silent, indefinite run on a slower and paid fallback tier is possible without
+anyone noticing. **Alert on sustained tier-0 absence**, or the fallback becomes the steady state.
+
+### Consequence for Track A: this GPU is not exclusively ours
+
+`lenovo` is not a dedicated test rig. It hosts a live dependency of the memory system, and 2.6GB of its 12GB is
+legitimately spoken for. Any sizing sweep must either budget against **~9.3GB with the reranker running**, or stop it
+deliberately for the duration and restore it afterward, with the fallback tier absorbing recall in the meantime. This
+is a real constraint that no document in the corpus records, and it exists because the box has a second job.
 
 **The lesson, which is the actual finding.** I reported a hardware limit when the truth was a running service, and I
 did it by reasoning from a container's PID namespace instead of running one command on the host. Had that gone
