@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # runner-wrapper.sh
-# The universal provision → run → capture → destroy wrapper for every Pantheon gate.
+# The universal provision, run, capture, destroy wrapper for every Pantheon gate.
 #
 # Usage:
 #   ./runner-wrapper.sh --gate=2 --config=./configs/gate-2-dual-l4.env
@@ -63,7 +63,7 @@ VM_NAME="pantheon-${RUN_ID}"
 RUN_START=$(date +%s)
 
 echo "================================================================"
-echo "Pantheon Gate ${GATE} — Runner Wrapper"
+echo "Pantheon Gate ${GATE}: Runner Wrapper"
 echo "================================================================"
 echo "  RUN_ID:           ${RUN_ID}"
 echo "  VM_NAME:          ${VM_NAME}"
@@ -106,7 +106,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 
 # ============================================================================
-# Exit trap — always destroy VM, always upload whatever evidence exists
+# Exit trap: always destroy VM, always upload whatever evidence exists
 # ============================================================================
 
 cleanup() {
@@ -189,7 +189,7 @@ while true; do
     break
   fi
 
-  local now=$(date +%s)
+  now=$(date +%s)
   if (( now - WAIT_START > READY_TIMEOUT_SEC )); then
     echo "[wait] TIMEOUT after ${READY_TIMEOUT_SEC}s. VM not responding."
     exit 2

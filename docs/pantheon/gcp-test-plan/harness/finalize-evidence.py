@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-finalize-evidence.py — Render all required evidence bundle files at run end.
+finalize-evidence.py: Render all required evidence bundle files at run end.
 
 Runs on the VM as the last step before upload. Produces:
   - manifest.json       (finalized from start-of-run template + verdicts)
@@ -97,7 +97,7 @@ def render_summary(
 ) -> str:
     """Render summary.md from manifest + metrics."""
     lines = []
-    lines.append(f"# Run {manifest['run_id']} — Gate {manifest['gate']}")
+    lines.append(f"# Run {manifest['run_id']}: Gate {manifest['gate']}")
     lines.append("")
     lines.append(f"**Date:** {manifest.get('started_at', 'unknown')}")
     lines.append(f"**Duration:** {manifest.get('ended_at', '')} (end)")
@@ -166,7 +166,7 @@ def render_obsidian_note(
     fm_yaml = yaml.safe_dump(frontmatter, default_flow_style=False, sort_keys=False)
 
     body = [
-        f"# Run {manifest['run_id']} — Gate {manifest['gate']}",
+        f"# Run {manifest['run_id']}: Gate {manifest['gate']}",
         "",
         f"**Verdict:** {manifest.get('overall_verdict', 'UNKNOWN')}",
         "",
@@ -195,7 +195,7 @@ def render_obsidian_note(
 
 
 def generate_cost_report(
-    run_id: str, evidence_dir: Path, machine_type: str, duration_hours: float
+    run_id: str, evidence_dir: Path, machine_type: str | None, duration_hours: float | None
 ):
     """Subprocess to cost-tracker.py."""
     cost_script = Path("/opt/pantheon-harness/cost-tracker.py")
@@ -204,20 +204,52 @@ def generate_cost_report(
         cost_script = Path(__file__).parent / "cost-tracker.py"
 
     output = evidence_dir / "cost-report.json"
+    cmd = [
+        "python3",
+        str(cost_script),
+        f"--run-id={run_id}",
+        f"--output={output}",
+    ]
+    if machine_type is not None:
+        cmd.append(f"--machine-type={machine_type}")
+    if duration_hours is not None:
+        cmd.append(f"--duration-hours={duration_hours}")
+
     try:
-        subprocess.run(
-            [
-                "python3",
-                str(cost_script),
-                f"--run-id={run_id}",
-                f"--output={output}",
-                f"--machine-type={machine_type}",
-                f"--duration-hours={duration_hours}",
-            ],
-            check=True,
-        )
+        subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Cost report generation failed: {e}", file=sys.stderr)
+
+
+def parse_timestamp(value: Any) -> dt.datetime | None:
+    """Parse manifest timestamps emitted with a trailing Z."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def duration_hours_from_manifest(manifest: dict[str, Any]) -> float | None:
+    started_at = parse_timestamp(manifest.get("started_at"))
+    ended_at = parse_timestamp(manifest.get("ended_at"))
+    if started_at is None or ended_at is None:
+        return None
+
+    seconds = (ended_at - started_at).total_seconds()
+    if seconds <= 0:
+        return None
+    return seconds / 3600
+
+
+def machine_type_from_manifest(manifest: dict[str, Any]) -> str | None:
+    machine_types = manifest.get("gcp_machine_types")
+    if isinstance(machine_types, list) and machine_types:
+        machine_type = machine_types[0]
+        if isinstance(machine_type, str) and machine_type:
+            return machine_type
+    return None
 
 
 def main() -> int:
@@ -242,9 +274,19 @@ def main() -> int:
     obsidian_md = render_obsidian_note(manifest, metrics)
     (evidence_dir / "obsidian-note.md").write_text(obsidian_md)
 
-    # Cost report — best-effort
-    machine_type = manifest.get("gcp_machine_types", ["e2-standard-4"])[0]
-    duration_hours = 1.0  # default; could compute from start/end timestamps
+    # Cost report is best-effort, but missing inputs must be visible.
+    machine_type = machine_type_from_manifest(manifest)
+    duration_hours = duration_hours_from_manifest(manifest)
+    if machine_type is None:
+        print(
+            "WARN: cost report incomplete: manifest has no gcp_machine_types value",
+            file=sys.stderr,
+        )
+    if duration_hours is None:
+        print(
+            "WARN: cost report incomplete: cannot compute duration from started_at and ended_at",
+            file=sys.stderr,
+        )
     generate_cost_report(args.run_id, evidence_dir, machine_type, duration_hours)
 
     print(f"Finalized evidence bundle at {evidence_dir}")
