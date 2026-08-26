@@ -68,7 +68,9 @@ Amendment log:   dated changes, never silent edits
 - **Trigger:** the local plumbing and isolation runs have both completed on the Lenovo.
 - **Evidence source:** the evidence bundle from each run.
 - **Rule:** ADVANCE to the priced sizing sweep when the canonical task suite reaches its defined pass rate offline
-  **and** the isolation run satisfies Rule B. Once both hold, **further local iteration requires a written reason.**
+  **and** the isolation run satisfies Rule B. Once both hold, **further local iteration requires a written reason
+  logged in the rule application log and sent to a peer for review**, on the same terms as an amendment. An unlogged
+  or unreviewed reason does not count, and the default is to advance.
 - **Fallback (inconclusive):** one rerun. If still ambiguous, advance anyway and record the ambiguity, because
   lingering is the failure mode this rule exists to prevent.
 
@@ -91,8 +93,10 @@ here.
   1. **Packet-capture evidence**, not merely firewall configuration, shows no disallowed egress during the window.
      Every permitted packet is individually accounted for by destination and protocol.
   2. The capture's coverage is stated: which interfaces, which address families (**including IPv6**), what window.
-  3. **The disconnected run's output is functionally equivalent to a connected baseline captured and hashed
-     beforehand.**
+  3. **The disconnected run's output is functionally equivalent to a connected baseline**, where that baseline was
+     captured and hashed beforehand **and its own correctness was independently established** (its outputs checked
+     against expected results or semantic invariants, not merely observed to complete). **A baseline whose
+     correctness is unverified fails this condition**, because comparing two degraded runs proves nothing.
   4. The claim's wording matches what was actually measured. See the wording rule below.
 - **Fallback (inconclusive):** the claim is not made. There is no partial credit on this one.
 
@@ -123,7 +127,9 @@ Call that **cloud restricted-egress validation**. Reserve "air-gap proof" for a 
 - **Rule:** when spend on a workload class exceeds **$1000/month for two consecutive months** and the workload is
   sustained rather than a one-time burst, **work on that class STOPS until one of the following is chosen in
   writing:**
-  1. **Optimize.** A named change expected to move the cost, with the expected magnitude stated.
+  1. **Optimize.** A named change, with the expected magnitude stated **and a date at which actual spend is compared
+     against that expectation.** If the actual does not move as predicted, option 1 is spent: choose 2 or 3.
+     **Option 1 may be chosen at most twice in a row for the same workload class.**
   2. **Commit.** Move to a reserved or committed-use instance, **only if** the on-demand cost at observed hours
      exceeds the reserved cost plus a stated allowance for lock-in risk.
   3. **Stop.** Shut the workload down.
@@ -200,11 +206,14 @@ because you dislike the answer it just produced.
 
 1. **The amended rule applies only to evidence collected after the amendment date.** Never retroactively. This is the
    minimum structural constraint and it is not optional.
-2. **A cooldown between proposing an amendment and it taking effect.** The point is to separate the amendment from
-   the disappointment that prompted it.
-3. **Peer review before it takes effect.** Send the proposed change to Codex or Gemini and record the response.
-4. **The log entry states:** the date, the exact before and after text, **what the old rule was for**, whether that
-   problem still exists, and what replaces the capability if it does.
+2. **A 72-hour cooldown between proposing an amendment and it taking effect.** Stated as a number because this
+   document's own second property requires mechanical application, and "a cooldown" is not mechanically checkable.
+   The point is to separate the amendment from the disappointment that prompted it.
+3. **Peer review before it takes effect.** Send the proposed change to Codex or Gemini and record the response
+   verbatim, including a response that disagrees.
+4. **The log entry states:** the date, **the amendment's author**, the exact before and after text, **the evidence
+   IDs that prompted the change**, **what the old rule was for**, whether that problem still exists, and what
+   replaces the capability if it does.
 
 > **Why requirement 3 exists.** Gemini argued in one review unit that the friction of writing down a bad excuse
 > breaks the motivated-reasoning cycle, then argued in another that journaling a rationalization merely records it.
