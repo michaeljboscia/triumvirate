@@ -12,8 +12,17 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 4 of 9 (`runbooks/gate-0-plumbing.md`)
-**Current section:** queue item 3 COMPLETE (reviewed, rewritten, verified). Codex found two genuine new errors in my rewrite; both fixed.
-**Next action:** queue item 4, `runbooks/gate-0-plumbing.md`. Known broken going in: the delete command sits after `exit` (line 284) so self-destruct never runs; the compose creation step is a literal placeholder; ~30 dependencies do not exist. This is Track A and the first thing that will actually run, now on the local Lenovo rather than GCP. Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
+**Current section:** unit 1 of 3 (lines 1-111) COMPLETE, all three peers logged.
+**Next action:** unit 2 of 3, `gate-0-plumbing.md` lines 112-245 (Step 3 docker-compose stack, Step 4 H-0.1 health check, Step 5 H-0.2 dispatch test). Step 3 contains the literal `# [paste content from above]` placeholder.
+
+**Unit plan for queue item 4 (3 units):**
+| Unit | Lines | Contents | Status |
+|---|---|---|---|
+| 1 | 1-111 | purpose, hypotheses, checklist, Steps 1-2 | **DONE** |
+| 2 | 112-245 | Step 3 compose stack, Steps 4-5 tests | next |
+| 3 | 246-314 | Step 6 evidence, Step 7 self-destruct, Step 8 vault, cost, what comes after | pending |
+
+**Carry into unit 3:** the `gcloud compute instances delete` at line 284 sits AFTER `exit`, so self-destruct never runs. Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
 
 **Unit plan for queue item 3 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -58,7 +67,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
-| 4 | `runbooks/gate-0-plumbing.md` | pending | |
+| 4 | `runbooks/gate-0-plumbing.md` | **IN PROGRESS**, 1 of 3 units | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
@@ -84,6 +93,98 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `gate-0-plumbing.md` unit 1 (lines 1-111): purpose, hypotheses, checklist, Steps 1-2
+
+Raw output: `review-raw/gate-0-unit-1.md`. All three peers.
+
+#### THE FINDING THAT VALIDATES THE STANDING RULE
+
+**G0-C1. The VM self-destruct was doing two jobs. Only one was written down, and only that one dies with the move to
+local. TWO-PEER CONVERGENCE.**
+
+Lines 84-85 set `--max-run-duration=45m` and `--instance-termination-action=DELETE`, documented as cost control. Move
+to a box you own and the cost rationale evaporates, so the mechanism looks obviously removable.
+
+**It was also enforcing ephemerality**, and that job survives the move intact. Gemini named the local symptoms: hung
+processes, port collisions, dangling Docker volumes, disk exhaustion, all of which **contaminate the next gate**
+because the machine no longer disappears between runs. DeepSeek added a third purpose neither of us had:
+**credential and secret hygiene.** A long-lived local box accumulates auth state a disposable VM discards.
+
+DeepSeek's general case, which is the owner's standing rule derived independently:
+
+> "Unwritten secondary purposes accumulate because mechanisms solve whatever problem existed at the time, but only the
+> headline reason gets documented. When the headline rationale disappears, people assume the mechanism is obsolete.
+> **The unwritten job only becomes visible at removal time.** Treat removal as a design decision, not a cleanup task."
+
+**Replacement:** a local timeout wrapper (`timeout 45m ./run-gate-0.sh`) with a teardown trap
+(`docker compose down -v`) that fires **regardless of exit code**, plus explicit credential hygiene between runs.
+
+**G0-C2. H-0.2 checks completion, not correctness. Third instance of this defect.**
+Lines 43-45: "5/5 tasks complete round-trip." Codex: *"'complete' can pass bad output unless structured result
+correctness is defined."* Same shape as the isolation gate (D2-C1) and the metrics template (E2-C1). **A canned task
+that returns an empty-but-well-formed result passes.**
+
+#### HIGH
+
+**G0-H1. Missing hypothesis: H-0.4, clean teardown.**
+The three hypotheses cover startup, execution, and evidence emission. **On a persistent machine, tearing down cleanly
+is a testable property and nothing tests it.** Gemini: on a VM the machine disappears, so this was free; locally it
+is not. *(Gemini)*
+
+**G0-H2. The exit condition licenses stopping rather than forcing advance.**
+Currently a PASS means "it worked." Under the rebuilt Rule A the exit condition should require a successful teardown
+**and** mandate proceeding, since failure-to-advance is the mode this gate historically enabled. *(Gemini,
+consistent with D2-H2)*
+
+**G0-H3. Step 2 verifies almost nothing.**
+Lines 100-111. `docker ps` (107) checks daemon access, not the required images, compose file, NATS, Triumvirate, mock
+vLLM, ports, or GPU. `mkdir -p /tmp/evidence/$RUN_ID` (109) is **effectively non-failing** and proves no evidence
+contract. `gcloud auth configure-docker` (108) is registry setup, not verification. **A verification step composed of
+checks that cannot fail is the checklist problem in miniature.** *(Codex)*
+
+**G0-H4. The scope boundary excludes something the gate's own claim depends on.**
+"What it does NOT test" (24-32) reasonably excludes real inference, worker pools, and GPU scheduling. **But it also
+leaves out output correctness and evidence completion semantics, while the gate claims end-to-end dispatch and
+evidence validity (3, 22).** The exclusion list and the claim contradict each other. *(Codex)*
+
+#### THE PURPOSE QUESTION (standing rule applied to the whole gate)
+
+**What is this gate FOR now that the substrate is a machine we own?** The original rationale was proving orchestration
+works before spending GPU dollars, and that rationale is gone.
+
+Gemini's answer, which is correct and should open the rewritten document: **isolating variables.** Go straight to
+real models and a timeout is ambiguous between a NATS failure and a vLLM OOM. The gate exists so that when the next
+stage breaks, the plumbing is already known good. **That purpose is substrate-independent, which is why the gate
+survives the move while most of its steps do not.**
+
+#### CHECKLIST AUDIT (lines 55-64)
+
+| Item | Status |
+|---|---|
+| `10-PREFLIGHT.md` complete | EXISTS as a document; never executed |
+| `pantheon-orchestrator-v1` VM image | DOES NOT EXIST, GCP-only concept |
+| `pantheon-triumvirate:main` | DOES NOT EXIST |
+| `pantheon-test-harness:main` | DOES NOT EXIST |
+| `pantheon-nats:2.10` | DOES NOT EXIST |
+| `pantheon-vllm-cpu:v0.6.5` | DOES NOT EXIST (and the upstream base returns 404) |
+| "No other Pantheon VMs live" | obsolete locally |
+| GCS evidence bucket writable | DOES NOT EXIST, obsolete if evidence is local-first |
+| **The Lenovo itself** | **EXISTS and is not mentioned anywhere in the checklist** |
+
+**Five of eight items reference artifacts that do not exist, and the one machine that does exist is absent.** *(Codex)*
+
+#### MEDIUM
+
+**G0-M1. Step 1 is almost entirely GCP ceremony.** Only `RUN_ID` naming (72) and the image-source concept (73)
+survive translation. Everything from 70-94 is provisioning that has no local analogue. **What a local run needs and
+this does not provide:** verification of `ssh lenovo`, Docker, GPU identity and compute capability, VRAM, cores, RAM,
+disk space, image availability, a cleanup guard, and a run cap. *(Codex)*
+
+**G0-M2. H-0.3's threshold is by reference only** to the evidence spec (51), and does not require the `COMPLETE`
+sentinel that the rewritten spec now mandates be written last. Update the reference. *(Codex)*
+
+---
 
 ### `30-DECISION-RULES.md` unit 3 (lines 247-350): Decisions 9-10, logs, amendment protocol
 
