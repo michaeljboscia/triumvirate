@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 5 of 9 (`runbooks/gate-6-airgap-sanity.md`)
-**Current section:** unit 1 of 3 (lines 1-107) COMPLETE, all three peers logged.
-**Next action:** unit 2 of 3, `gate-6-airgap-sanity.md` lines 108-240 (Step 2 prepare stack before lockdown, Step 3 apply zero-egress firewall, Step 4 H-6.1 under lockdown, Step 5 agent swarm air-gapped, Step 6 stop tcpdump and analyze). **The `<= 5 packets` threshold lives in this range.**
+**Current section:** unit 2 of 3 (lines 108-240) COMPLETE, all three peers logged.
+**Next action:** unit 3 of 3, `gate-6-airgap-sanity.md` lines 241-317 (Step 7 evidence upload through PGA, Step 8 teardown, Decision rule application, cost accounting, what comes after). **Step 7 is the exfiltration-channel question made concrete.**
 
 **Unit plan for queue item 5 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-107 | purpose, hypotheses, checklist, Step 1 | **DONE** |
-| 2 | 108-240 | Steps 2-6, lockdown and capture analysis | next |
-| 3 | 241-317 | Step 7 PGA upload, Step 8 teardown, decision rules, cost, next | pending |
+| 2 | 108-240 | Steps 2-6, lockdown and capture analysis | **DONE** |
+| 3 | 241-317 | Step 7 PGA upload, Step 8 teardown, decision rules, cost, next | next |
 
 **Unit plan for queue item 4 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -75,7 +75,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
-| 5 | `runbooks/gate-6-airgap-sanity.md` | **IN PROGRESS**, 1 of 3 units | |
+| 5 | `runbooks/gate-6-airgap-sanity.md` | **IN PROGRESS**, 2 of 3 units | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
@@ -100,6 +100,98 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `gate-6-airgap-sanity.md` unit 2 (lines 108-240): lockdown, execution, capture analysis
+
+Raw output: `review-raw/gate-6-unit-2.md`. All three peers.
+
+#### THE STRUCTURAL FINDING (three-peer convergence, and it decides the rewrite)
+
+**G6-C5. The system captures, stores, and adjudicates the evidence of its own isolation. All four roles are the same
+machine.**
+
+`tcpdump` runs inside the VM (129), writes to the VM's own disk, and Step 6 reads that same file back inside the VM
+and writes the verdict (221-233). **Observer, observed, evidence store, and adjudicator are one entity.**
+
+Gemini: *"a malicious payload in Step 4/5 could simply kill the capture, exfiltrate data, and forge the pcap before
+Step 6 ever runs."*
+
+DeepSeek states the class precisely: **this is self-attestation, or trusted-host audit, not independent proof.** It
+holds under a threat model where the OS, kernel, firewall, tcpdump, disk, and verdict code are all trusted and **only
+the workload is potentially malicious.** It fails entirely if the host itself may be compromised. *"The evidence has
+no independent witness. This is like a defendant writing and signing their own alibi."*
+
+**This is the same defect as the evidence-bundle independence problem (E1-S2), one level deeper: the capture that
+adjudicates the product claim is produced by the thing it evaluates.**
+
+**Fix, and the nuance matters more than the headline.** Move the observer outside the trust boundary. **But a passive
+tap or mirror is not enough:** it only sees packets that reached the wire, so **blocked attempts are invisible to it,
+and blocked attempts are the most persuasive half of the evidence.** The external component must be an **inline
+egress gateway that is itself the deny-all enforcement point**, so it can log what it refused as well as prove nothing
+escaped.
+
+**Cost, stated honestly:** extra infrastructure, a topology change, confirming no alternate egress path exists, added
+latency, a new single point of failure, and the external observer itself needs securing and auditing.
+
+#### CRITICAL
+
+**G6-C6. The threshold is `-lt 5`, and it counts the wrong thing.**
+Line 233: `"verdict": "$([ $OUTBOUND_COUNT -lt 5 ] && echo PASS || echo FAIL)"`. So it passes at four or fewer, a
+fourth distinct number in a document that elsewhere says zero. Worse:
+- **It counts decoded lines, not verified egress** (221-224).
+- **It does not distinguish blocked attempts from successful traffic**, which is the entire distinction the claim
+  rests on.
+- Line 227 calls traffic outside the PGA endpoints a leak, **but the count includes allowed PGA traffic, with no
+  destination-based adjudication at all.**
+*(Codex)*
+
+**G6-C7. IPv6 is unprotected and uninspected.**
+The deny rule covers `0.0.0.0/0` only (141-148), so **IPv6 egress is not denied**, and the capture filter is
+IPv4-oriented so it is not observed either. **An entire address family is outside both the control and the
+measurement.** *(Codex)*
+
+#### HIGH
+
+**G6-H5. The capture starts after the stack is prepared, so the preload window is invisible by construction.**
+Codex enumerated what enters the machine before capture begins (108-125): three container images, the canonical task
+fixtures from GCS, and the Pythia corpus, plus Artifact Registry auth.
+
+Gemini: preparing before lockdown is **a practical necessity** unless everything is pre-baked, **but it destroys a
+literal air-gap claim.** The honest response is to **rename the claim to runtime isolation and explicitly bound the
+trusted pre-provisioning window** rather than leave the gap unmentioned.
+
+**G6-H6. tcpdump may truncate payloads and its exclusions are unjustified.**
+`sudo tcpdump -i any -w ... 'not (dst net 10.128.0.0/20 or dst net 127.0.0.0/8)'` (129-130). **No `-s 0`**, so the
+default snap length may truncate. Interface `any`, none named or validated. **Neither excluded range is justified
+anywhere in the document**, and an unexplained exclusion in an evidence artifact is exactly what an auditor probes.
+*(Codex)*
+
+**G6-H7. Two readiness loops can hang forever.**
+`until curl ...; do sleep ...; done` at 181 and 189, with no deadline. Step 5 has `--timeout-per-task=300` but no
+overall bound. **A hang here consumes the run without producing a verdict.** *(Codex)*
+
+**G6-H8. The swarm summary is printed and never enforced.**
+Step 5 prints `swarm-summary.json` (210) and the runbook never parses it, so **the pass condition is a human glancing
+at output.** Gemini: it must assert the swarm's metrics match a non-air-gapped baseline and produce the evaluated task
+outputs, not merely that nothing crashed. *(Both, consistent with Rule B)*
+
+#### THE FIREWALL, WHICH IS CORRECT AS FAR AS IT GOES
+
+Recorded because it is one of the few mechanisms in this corpus that works as intended. Deny egress `0.0.0.0/0` at
+priority 100, allow PGA `199.36.153.8/30,199.36.153.4/30` tcp:443 at priority 50. **Priority ordering does what the
+author intended** and the implicit allow-egress is correctly overridden for IPv4. The gap is IPv6 (G6-C7), not the
+logic. *(Codex)*
+
+#### THE ALLOWANCE, REPLACED (standing rule)
+
+**What `<= 5` was for:** unavoidable OS-level noise, DHCP, ARP, NTP, metadata lookups, or telemetry firing before the
+firewall clamps.
+
+**Replacement:** an explicit protocol and destination allowlist, **zero unclassified packets**, each named exception
+accounted for by destination and protocol. Gemini as auditor: *"a bare packet count is indefensible."* It says only
+"some packets left and we decided that was fine."
+
+---
 
 ### `gate-6-airgap-sanity.md` unit 1 (lines 1-107): purpose, hypotheses, checklist, Step 1
 
