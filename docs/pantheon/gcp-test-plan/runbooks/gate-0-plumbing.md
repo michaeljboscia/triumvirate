@@ -1,314 +1,238 @@
-# Gate 0 — Plumbing (CPU-only Orchestration Sanity)
+# Gate 0: Plumbing
 
-**Purpose:** First execution after preflight. Validates that Docker Compose + NATS + Triumvirate daemon + a mock vLLM endpoint work together end-to-end. Zero GPU risk. Zero inference validation — this gate is pure orchestration plumbing.
+**Status:** rewritten 2026-08-26 against a three-unit, three-peer review of the 2026-04-18 original
+**Target:** the local box, host alias `lenovo` (`newlenovo`), not a cloud VM
+**Review record:** `../REVIEW-PROGRESS.md` and `../review-raw/gate-0-unit-*.md`
+**Original:** git at `8b2fae7:docs/pantheon/gcp-test-plan/runbooks/gate-0-plumbing.md`
 
-**GCP config:** `e2-standard-4` (4 vCPU, 16GB RAM, no GPU)
-**Cost:** ~$0.13/hr Spot × 45 min = **~$0.10 per session**
-**Duration:** 45 min hard cap
-**Pre-committed decision rule:** see `30-DECISION-RULES.md` → Decision 4
-
----
-
-## Why this gate exists
-
-Every expensive GPU gate that follows assumes the orchestration layer works. If Triumvirate can't dispatch to a mock vLLM, it can't dispatch to a real one — and finding that out on a $12/hr A100 is a waste. This gate debugs orchestration at $0.13/hr.
-
-**Specifically validates:**
-- Docker Compose starts NATS + Triumvirate + mock vLLM without errors
-- Triumvirate successfully reads config, registers endpoints, starts HTTP server
-- NATS JetStream accepts task dispatches
-- Mock vLLM responds to OpenAI-compat requests
-- Triumvirate's OpenAI-compat HTTP client parses responses correctly
-- Evidence bundle format lands in GCS
-
-## What it does NOT test
-
-- Real model inference
-- Real worker pool behavior
-- Real protocol quirks (those are Gates 1+)
-- Real GPU scheduling
+> **This is the first thing that will actually run.** Nothing in this corpus has ever been executed, and every finding
+> in the review record exists because reading was the only check available. That ends here.
 
 ---
 
-## Hypotheses being tested
+## 1. What this gate is for
 
-### H-0.1 — Orchestration layer starts cleanly
+**Isolating variables.** If you go straight to real models, a timeout is ambiguous: it could be a NATS failure, a
+container that never became ready, a config error, or a vLLM out-of-memory. This gate makes the plumbing known-good
+first, so that when the next stage breaks you already know where it did not break.
 
-**Prediction:** `docker compose up -d` brings up NATS + Triumvirate + mock vLLM in <60 sec. All three report healthy on their status endpoints.
+That purpose is substrate-independent, which is why the gate survives the move from a metered cloud VM to a machine
+we own, even though almost none of its original steps do. The original rationale ("prove orchestration works before
+spending GPU dollars") is gone. This one replaces it.
 
-**Decision rule:** All three healthy within 60 sec → PASS. Anything fails → debug before Gate 1.
+## 2. What a PASS licenses you to believe, and what it does not
 
-### H-0.2 — End-to-end task dispatch works
+**Licensed:** Docker networking, NATS messaging, and Triumvirate configuration communicate. Tasks route through the
+pipeline and come back correlated. The environment tears down cleanly.
 
-**Prediction:** Test harness sends 5 canned tasks via Triumvirate's HTTP API. All 5 are dispatched to mock vLLM, responses flow back, harness receives structured results.
+**Not licensed:** anything about GPU allocation, CUDA drivers, model loading, real vLLM stability, request schema
+differences, streaming, memory pressure under real inference, or latency.
 
-**Decision rule:** 5/5 tasks complete round-trip → PASS. Any hang or error → debug.
+**Inference is deliberately mocked, and mocking is the right call here** because it is what isolates the variable.
+But be clear-eyed that it hides exactly the components most likely to fail next. A green Gate 0 is a statement about
+plumbing and nothing else.
 
-### H-0.3 — Evidence bundle emission works
+## 3. Hypotheses
 
-**Prediction:** Runner script produces standard evidence bundle at `gs://pantheon-evidence/gate-0/{run_id}/` with manifest, logs, metrics, summary.
+Each is a pre-registered prediction with a threshold, committed before the run.
 
-**Decision rule:** Bundle structure matches `20-EVIDENCE-BUNDLE-SPEC.md` → PASS.
+### H-0.1: the orchestration layer starts cleanly
 
----
+**Prediction:** all three services reach *functional* readiness within 60 seconds of `compose up`.
 
-## Pre-run checklist
+**Threshold:** NATS accepts a connection, the mock inference endpoint answers, and Triumvirate reports it has
+connected to NATS.
 
-- [ ] Preflight complete per `10-PREFLIGHT.md`
-- [ ] `pantheon-orchestrator-v1` custom VM image exists
-- [ ] `pantheon-triumvirate:main`, `pantheon-test-harness:main`, `pantheon-nats:2.10`, `pantheon-vllm-cpu:v0.6.5` images pushed
-- [ ] No other Pantheon VMs live
-- [ ] GCS evidence bucket writable
+> **Readiness is not an HTTP 200.** The original defined healthy as a successful curl against a host port, which a
+> service can satisfy while being unable to reach NATS or dispatch anything. Each check must exercise the dependency
+> the service actually needs.
 
----
+### H-0.2: tasks route end to end with their envelope intact
 
-## Runbook
+**Prediction:** 5 canned tasks traverse the full path and return correlated.
 
-### Step 1 — Provision CPU-only VM (2-3 min)
+**Threshold:** for every task, the correlation ID that entered is the correlation ID that returns, each task is
+observed at each stage it should pass through, and the routing envelope is uncorrupted.
 
-```bash
-export PROJECT_ID="pantheon-validation-v1"
-export ZONE="us-central1-a"
-export RUN_ID="gate0-plumbing-$(date +%Y%m%d-%H%M%S)"
-export REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/pantheon-images"
+> **This is the finding that changed the test.** The original asserted `tasks_completed: 5, tasks_errored: 0`, which
+> an empty or malformed result satisfies. Two reviewers then disagreed about the fix, one arguing for output
+> correctness and one arguing a plumbing test must never assert output semantics. Both were right about different
+> things, and the boundary is the envelope:
+>
+> - **Assert:** task `#3` entered the mocked stage carrying `req-3` and its response returned on the right topic with
+>   the same correlation ID, **regardless of whether the body is `{"ok":true}` or `"malformed"`**.
+> - **Do not assert:** that the mock returned a semantically correct answer. That tests the mock's hardcoded
+>   behavior, not the pipeline.
+>
+> **Do not assert latency either.** The original recorded a round-trip median in milliseconds, which against a mock
+> measures the mock and whatever else the machine was doing. Latency belongs in the sizing sweep, against real
+> inference.
 
-# Pre-flight inventory check
-RUNNING=$(gcloud compute instances list --filter="status=RUNNING" --format="value(name)")
-[ -n "$RUNNING" ] && { echo "ABORT: $RUNNING still running"; exit 1; }
+### H-0.3: the evidence bundle is emitted correctly
 
-gcloud compute instances create pantheon-$RUN_ID \
-  --zone=$ZONE \
-  --project=$PROJECT_ID \
-  --machine-type=e2-standard-4 \
-  --provisioning-model=SPOT \
-  --instance-termination-action=DELETE \
-  --max-run-duration=45m \
-  --network=pantheon-net \
-  --subnet=pantheon-subnet \
-  --service-account=pantheon-validator@${PROJECT_ID}.iam.gserviceaccount.com \
-  --scopes=cloud-platform \
-  --image-family=pantheon-orchestrator \
-  --image-project=$PROJECT_ID \
-  --boot-disk-size=50GB \
-  --metadata=RUN_ID=$RUN_ID,GATE=0 \
-  --no-address
-```
+**Prediction:** a bundle is produced that satisfies `../20-EVIDENCE-BUNDLE-SPEC.md`.
 
-### Step 2 — SSH and verify environment
+**Threshold:** every required object is present with its content hash recorded in the manifest, and the `COMPLETE`
+sentinel is the **last** object written.
 
-```bash
-until gcloud compute ssh pantheon-$RUN_ID --zone=$ZONE --command="docker ps" 2>/dev/null; do
-  sleep 10
-done
+### H-0.4: the environment tears down cleanly
 
-gcloud compute ssh pantheon-$RUN_ID --zone=$ZONE
+**Prediction:** after teardown, the machine is in the state it was in before the run.
 
-# On VM:
-docker ps
-gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
-mkdir -p /tmp/evidence/$RUN_ID
-```
+**Threshold:** no Gate 0 containers running, the compose network removed, test-scoped volumes removed, all four bound
+ports free, and no temp config or staged evidence left behind.
 
-### Step 3 — Launch docker-compose stack
-
-Pull the compose file shipped with the Triumvirate image:
-
-```yaml
-# docker-compose.gate-0.yml
-version: '3.8'
-services:
-  nats:
-    image: us-central1-docker.pkg.dev/pantheon-validation-v1/pantheon-images/pantheon-nats:2.10
-    command: ["-js", "-m", "8222"]
-    ports: ["4222:4222", "8222:8222"]
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  mock-vllm:
-    image: us-central1-docker.pkg.dev/pantheon-validation-v1/pantheon-images/pantheon-test-harness:main
-    command: ["--mode=mock-vllm-server"]
-    ports: ["8000:8000"]
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/v1/models"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  triumvirate:
-    image: us-central1-docker.pkg.dev/pantheon-validation-v1/pantheon-images/pantheon-triumvirate:main
-    environment:
-      RUST_LOG: info
-      TRIUMVIRATE_CONFIG: /etc/triumvirate/gate-0.toml
-    volumes:
-      - ./config:/etc/triumvirate:ro
-    ports: ["7788:7788"]
-    depends_on:
-      nats: {condition: service_healthy}
-      mock-vllm: {condition: service_healthy}
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:7788/status"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-```
-
-Triumvirate config (`config/gate-0.toml`):
-
-```toml
-[nats]
-url = "nats://nats:4222"
-
-[inference.endpoints.mock]
-url = "http://mock-vllm:8000/v1"
-model = "mock-model-v1"
-
-[dispatch.rules]
-default_endpoint = "mock"
-```
-
-Launch:
-
-```bash
-cat > /tmp/docker-compose.gate-0.yml <<'EOF'
-# [paste content from above]
-EOF
-
-mkdir -p /tmp/config
-cat > /tmp/config/gate-0.toml <<'EOF'
-# [paste content from above]
-EOF
-
-cd /tmp
-docker compose -f docker-compose.gate-0.yml up -d
-
-# Wait for all three healthy
-sleep 15
-docker compose -f docker-compose.gate-0.yml ps
-```
-
-### Step 4 — H-0.1 test: health check all three
-
-```bash
-# NATS
-curl -sf http://localhost:8222/healthz && echo "NATS: OK"
-
-# Mock vLLM
-curl -sf http://localhost:8000/v1/models | jq . && echo "Mock vLLM: OK"
-
-# Triumvirate
-curl -sf http://localhost:7788/status | jq . && echo "Triumvirate: OK"
-
-# Record into evidence
-{
-  echo "H-0.1: orchestration layer health check"
-  echo "Timestamp: $(date -Iseconds)"
-  echo "NATS: $(curl -sf http://localhost:8222/healthz && echo OK || echo FAIL)"
-  echo "Mock vLLM: $(curl -sf http://localhost:8000/v1/models >/dev/null && echo OK || echo FAIL)"
-  echo "Triumvirate: $(curl -sf http://localhost:7788/status >/dev/null && echo OK || echo FAIL)"
-} > /tmp/evidence/$RUN_ID/h-0.1.txt
-```
-
-### Step 5 — H-0.2 test: end-to-end task dispatch
-
-```bash
-# Fire 5 canned tasks via Triumvirate HTTP API
-docker run --rm \
-  --network host \
-  -e RUN_ID=$RUN_ID \
-  -e GATE=0 \
-  -e TEST=h-0.2-dispatch \
-  $REGISTRY/pantheon-test-harness:main \
-  --mode=task-dispatch-smoke \
-  --triumvirate-url=http://localhost:7788 \
-  --num-tasks=5 \
-  --output-dir=/tmp/evidence/$RUN_ID/h-0.2
-
-cat /tmp/evidence/$RUN_ID/h-0.2/metrics.json
-```
-
-**Expected output:**
-
-```json
-{
-  "test_id": "h-0.2-dispatch",
-  "run_id": "gate0-plumbing-...",
-  "tasks_dispatched": 5,
-  "tasks_completed": 5,
-  "tasks_errored": 0,
-  "round_trip_median_ms": 45,
-  "verdict": "PASS"
-}
-```
-
-### Step 6 — H-0.3 test: evidence bundle emission
-
-```bash
-# Generate manifest + summary via shared harness
-python3 /opt/pantheon-harness/generate-manifest.py \
-  --run-id=$RUN_ID --gate=0 \
-  --output=/tmp/evidence/$RUN_ID/manifest.json
-
-python3 /opt/pantheon-harness/generate-summary.py \
-  --run-id=$RUN_ID --gate=0 \
-  --evidence-dir=/tmp/evidence/$RUN_ID \
-  --output=/tmp/evidence/$RUN_ID/summary.md
-
-# Upload to GCS
-gsutil -m cp -r /tmp/evidence/$RUN_ID gs://pantheon-evidence/gate-0/
-
-# Verify structure matches spec
-gsutil ls -r gs://pantheon-evidence/gate-0/$RUN_ID/
-```
-
-### Step 7 — Capture logs and self-destruct
-
-```bash
-docker compose -f /tmp/docker-compose.gate-0.yml logs > /tmp/evidence/$RUN_ID/docker-compose.log 2>&1
-gsutil cp /tmp/evidence/$RUN_ID/docker-compose.log gs://pantheon-evidence/gate-0/$RUN_ID/
-
-# Generate cost report
-python3 /opt/pantheon-harness/cost-tracker.py \
-  --run-id=$RUN_ID --output=/tmp/evidence/$RUN_ID/cost-report.json
-gsutil cp /tmp/evidence/$RUN_ID/cost-report.json gs://pantheon-evidence/gate-0/$RUN_ID/
-
-# Auto-generate Obsidian note
-python3 /opt/pantheon-harness/generate-obsidian-note.py \
-  --run-id=$RUN_ID --gate=0 \
-  --summary=/tmp/evidence/$RUN_ID/summary.md \
-  --output=/tmp/evidence/$RUN_ID/obsidian-note.md
-gsutil cp /tmp/evidence/$RUN_ID/obsidian-note.md gs://pantheon-evidence/gate-0/$RUN_ID/
-
-# Self-destruct
-exit
-gcloud compute instances delete pantheon-$RUN_ID --zone=$ZONE --quiet
-```
-
-### Step 8 — Verify + drop note into vault
-
-```bash
-gsutil ls -r gs://pantheon-evidence/gate-0/$RUN_ID/
-gsutil cp gs://pantheon-evidence/gate-0/$RUN_ID/obsidian-note.md \
-  ~/Documents/pantheon-vault/runs/$RUN_ID.md
-cd ~/Documents/pantheon-vault && git add runs/$RUN_ID.md && git commit -m "gate-0 run $RUN_ID"
-```
+> **H-0.4 is new, and it exists because the machine is now persistent.** On a disposable VM this was free: the machine
+> vanished. The VM auto-delete was documented as cost control, but it was also enforcing ephemerality, and only the
+> cost half died with the move. Lingering containers, held ports, dangling volumes, and stale temp files contaminate
+> the next run. A third purpose the peers surfaced: **credential hygiene**, since a long-lived box accumulates auth
+> state a disposable one discards.
 
 ---
 
-## Cost accounting
+## 4. Pre-run checks
 
-| Line item | Cost |
-|---|---|
-| e2-standard-4 Spot, 45 min max | ~$0.10 |
-| GCS evidence write | negligible |
-| **Total per session** | **~$0.10** |
+Every item is a command whose failure is visible. The original checklist listed eight items of which five referenced
+artifacts that do not exist, and omitted the one machine that does.
+
+```bash
+set -euo pipefail
+
+# The machine
+ssh lenovo 'hostname && nproc && free -g | head -2'
+ssh lenovo 'docker info >/dev/null && echo "docker OK"'
+ssh lenovo 'df -h /var/lib/docker | tail -1'          # disk headroom for images and volumes
+
+# Ports must be FREE before we start. This is the check whose absence causes
+# the most confusing failure mode on a machine that stays up.
+ssh lenovo 'for p in 4222 8222 8000 7788; do
+  if lsof -i :$p >/dev/null 2>&1; then echo "PORT $p IN USE"; exit 1; fi
+done; echo "ports OK"'
+
+# No leftovers from a previous run
+ssh lenovo 'docker ps -a --filter label=pantheon.gate=0 --format "{{.Names}}"'   # must be empty
+```
+
+**NOT BUILT, and required before this gate can run:**
+
+- The container images. `pantheon-triumvirate`, `pantheon-nats`, and a mock inference image must be built locally and
+  **pinned by digest**. Note `vllm/vllm-openai:v0.6.5-cpu` **does not exist upstream** (404); the CPU images live in a
+  separate repository.
+- The harness scripts. The original called them at `/opt/pantheon-harness/`, an absolute path native to a GCP custom
+  image that was never built. **On the local box that directory does not exist and every call fails immediately with
+  file-not-found. This is the single most likely first-run failure.** Decide the local path and use it consistently.
+- The canonical task fixtures. See the fixtures section of `../10-PREFLIGHT.md`. **No gate may be committed until its
+  fixtures exist and validate**, so this gate is not runnable until they do.
 
 ---
 
-## What comes after
+## 5. Running it
 
-Gate 0 PASS → Gate 1 (single L4 baseline) — first real GPU burn, validates inference plumbing. Runbook: `runbooks/gate-1-single-l4.md`.
+### The wrapper, which is not optional
 
-Gate 0 FAIL → fix the broken component BEFORE touching GPU hardware. Cheapest debug available.
+```bash
+timeout 45m ./run-gate-0.sh
+```
+
+The 45-minute bound survives the move to local, **for a different reason than it originally existed.** On GCP it
+capped billing. Here it stops a hung process from indefinitely squatting ports 4222, 8222, 8000, and 7788 and
+blocking every future run.
+
+`run-gate-0.sh` must install a teardown trap **before** starting anything:
+
+```bash
+set -euo pipefail
+trap teardown EXIT INT TERM
+```
+
+**The trap is the point.** Teardown must run on success, on failure, on timeout, and on interrupt. The original put
+cleanup at the end of a linear script, and even that never executed because it sat after an `exit`.
+
+### Step 1: start the stack
+
+Compose file, config, and a **project name** so resources are namespaced and can be found later:
+
+```bash
+docker compose -p gate0-${RUN_ID} -f compose.gate-0.yml up -d
+```
+
+Label every service `pantheon.gate=0` so teardown and the pre-run leftover check can find them by label rather than
+by guessing names.
+
+**Health checks must exercise real dependencies**, and must not assume a tool exists inside an image. The original's
+checks called `wget` in the NATS image and `curl` in the harness images, either of which can fail for reasons
+unrelated to health.
+
+**Wait deterministically, do not sleep.** The original used a blind `sleep 15`, which is both slower than necessary
+when things are fine and silently insufficient when they are not. Poll for readiness with a bounded deadline and fail
+loudly at the deadline.
+
+### Step 2: H-0.1, functional readiness
+
+Assert the three conditions from H-0.1. Record which one failed if any did, not just that the set failed.
+
+### Step 3: H-0.2, envelope routing
+
+Dispatch the 5 canned tasks with distinct correlation IDs. For each, assert the ID round-tripped and the task was
+observed at each expected stage. **Bound this step with its own timeout**; the original had none, so a blocked
+harness hangs the whole run until the outer 45 minutes expire.
+
+### Step 4: H-0.3, evidence
+
+Write the bundle per `../20-EVIDENCE-BUNDLE-SPEC.md`: objects first, content hashes in the manifest, **`COMPLETE`
+sentinel last.**
+
+> **Nothing may write to the bundle after this step.** The original named a step "evidence bundle emission" and then
+> wrote logs, a cost report, and a note into the same bundle afterwards. A step name is a claim about an invariant.
+> Only the step that leaves the artifact in its terminal state may be called emission. Anything a later step needs to
+> record goes in a separate object written *before* the sentinel, or in a sidecar outside the bundle.
+
+### Step 5: teardown, H-0.4
+
+Ordered, and running unconditionally from the trap:
+
+1. **Capture logs first**, before anything is destroyed.
+2. `docker compose -p gate0-${RUN_ID} down -v --remove-orphans`
+3. Archive staged evidence to permanent local storage.
+4. Remove temp compose and config files, and the staging directory.
+5. Verify the four ports are free again and no labelled containers remain. **Assert this, do not assume it.** That
+   assertion is H-0.4.
+
+**Do not** remove shared Docker resources, images other runs depend on, or long-lived local credentials. Scope every
+removal to this run via the project name and the label. A blunt cleanup that takes out a neighbour's state is worse
+than the contamination it was preventing.
+
+---
+
+## 6. Resource accounting
+
+The original reported a dollar figure for a Spot VM. On a machine we own that number is meaningless.
+
+**What the cost section was for:** preventing budget drain. **That problem does not exist locally. A constraint
+problem still does**, so track the resources that are actually scarce here:
+
+- **Disk consumed** by images, volumes, and archived evidence, with a stated ceiling.
+- **Wall-clock duration** of the run, since operator waiting time and port locking are the real costs.
+
+If anything in a future variant uploads to cloud storage, record `cost_status: pending_billing_export` rather than a
+number. Billing export is not real-time, so an authoritative figure does not exist when the bundle seals.
+
+## 7. On a PASS
+
+**Passing this gate must move you forward, not license you to stop.**
+
+The original said a PASS leads to the next gate, which is a passive statement of fact. Under Rule A of
+`../30-DECISION-RULES.md`, further local iteration after a PASS requires a written reason, logged and peer-reviewed on
+the same terms as a rule amendment. **The default is to advance.**
+
+So this section ends with the literal command for the next stage rather than a description of it. An unlogged,
+unreviewed reason to keep tinkering does not count.
+
+## 8. On a FAIL
+
+Record which hypothesis failed and at which stage. A failure here is the cheapest possible failure and the entire
+reason the gate exists: it is far better to find a broken message path with a mock than to find it while also
+debugging CUDA.
+
+**Do not** proceed to the next stage on a partial pass. H-0.4 in particular must pass, because a contaminated
+environment makes the next run's result untrustworthy in a way that is very hard to notice.
