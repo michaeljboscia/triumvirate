@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 6 of 9 (`local-inference-buy-vs-rent.md`)
-**Current section:** unit 1 of 3 (lines 1-130) COMPLETE, all three peers logged.
-**Next action:** unit 2 of 3, `local-inference-buy-vs-rent.md` lines 131-284 (section 3 throughput reality on 512GB Apple Silicon, section 4 the NVIDIA alternative, section 5 the cloud pivot and retainer product).
+**Current section:** unit 2 of 3 (lines 131-284) COMPLETE, all three peers logged.
+**Next action:** unit 3 of 3, `local-inference-buy-vs-rent.md` lines 285-455 (**section 6, the standing policy**, section 7 recommendations, document history, bibliography). This is where the missing crossover threshold would have to be supplied.
 
 **Unit plan for queue item 6 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-130 | the trigger, published benchmarks | **DONE** |
-| 2 | 131-284 | throughput reality, NVIDIA alternative, cloud pivot | next |
-| 3 | 285-455 | **section 6 THE STANDING POLICY**, recommendations, history, bibliography | pending |
+| 2 | 131-284 | throughput reality, NVIDIA alternative, cloud pivot | **DONE** |
+| 3 | 285-455 | **section 6 THE STANDING POLICY**, recommendations, history, bibliography | next |
 
 **Carry into unit 3:** BR1-C1 says the document has no crossover threshold and therefore cannot support its own conclusion. Section 6 is where that would have to be fixed.
 
@@ -85,7 +85,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | **COMPLETE** (3 units, 3 peers, 317 to ~250 lines, verified) | `5b85ab2` |
-| 6 | `local-inference-buy-vs-rent.md` | **IN PROGRESS**, 1 of 3 units (TPS floor already added in `401fdde`) | |
+| 6 | `local-inference-buy-vs-rent.md` | **IN PROGRESS**, 2 of 3 units | |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
 | 9 | `twin-review-synthesis.md` | pending | |
@@ -109,6 +109,91 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `local-inference-buy-vs-rent.md` unit 2 (lines 131-284): throughput, NVIDIA, the retainer
+
+Raw output: `review-raw/buy-vs-rent-unit-2.md`. All three peers.
+
+**Confirmed: there is no cost model anywhere in this range either.** Codex checked specifically. What exists is
+throughput anecdotes, parts pricing, electrical feasibility notes, and qualitative retainer logic. **BR1-C1 stands
+for the whole document, not just its opening.**
+
+#### CRITICAL
+
+**BR2-C1. The throughput number that anchors the "inadequate" verdict is a capacity-limit datapoint being read as a
+representative benchmark.**
+
+Section 3 benchmarks a **418.1GB model on a 512GB machine** (135-139), leaving almost no headroom, and reports
+**14.5 tok/s decode** (138), concluding the machine is "frustrating" for interactive use (154).
+
+DeepSeek's rule makes the objection precise: *"A maximum-capacity test answers 'what is the boundary performance when
+running the largest model that fits?' It does not answer 'how well does this machine handle normal local
+inference?'"* It becomes misleading exactly when you *"pick the largest model that technically fits, get a poor number
+caused by memory pressure, and generalize to the machine's overall adequacy."* **Leaving headroom for KV cache,
+batching, and OS overhead often improves throughput dramatically.**
+
+**The number is not wrong. The inference drawn from it is.** Fix is cheap: keep the datapoint, **label it as a
+capacity limit**, and add a properly-sized measurement (70B-class) to answer the question the document actually asks.
+
+**BR2-C2. That 14.5 tok/s figure cannot be compared to the production floor at all.**
+It states quantization and context length **but not batch size or concurrency** (135-140). The standing floor is
+**15 tok/s/stream under 4-way batched load.** A single-stream number and a 4-way-batched threshold are different
+measurements. **The document extracts the floor into itself and then never tests any hardware against it.** *(Codex)*
+
+#### HIGH
+
+**BR2-H1. Section 4 is built to be rejected.**
+It anchors on enterprise RTX PRO 6000 cards **at peak shortage pricing**, invokes the 240V circuit constraint, then
+observes that the oversized model still would not fit (208). **The consumer multi-GPU rigs practitioners actually use
+(4090/5090 class) are not evaluated at all.** *(Gemini)*
+
+**BR2-H2. The NVIDIA pricing is internally inconsistent and partly stale.**
+The table mixes sources: $16,000 is cited from one, while **the Thunder Compute source it also cites currently says
+$13,250**, with PNY around $11,360 and Newegg around $12,099. Using the highest figure while citing a source that
+disagrees is the kind of thing an adversarial reader checks first. *(Codex)*
+
+**BR2-H3. The build cost is a parts budget, not an economic model.**
+It omits power, cooling, the 240V install it separately mentions (193-198), depreciation, resale, utilization, and any
+cloud comparison. **"At $25,000, it does not pencil" (154) has no arithmetic behind it.** *(Codex)*
+
+**BR2-H4. "NVIDIA wins by an order of magnitude" (208) is unsourced**, and no hardware anywhere in the document is
+measured against the production floor. *(Codex)*
+
+**BR2-H5. The retainer product has no unit economics.**
+Section 5 asserts pricing qualitatively (232) with **no cost per client per month, no token budget per client, no API
+cost, no gross margin, no break-even client count.** The constructive half of the document is as unquantified as the
+half that rejects hardware. *(Codex)*
+
+#### THE STRUCTURAL CRITIQUE OF THE RETAINER
+
+**BR2-S1. Section 5 may be unscalable consulting described as recurring SaaS.**
+It claims the context layer is the real asset (238), **then concedes under "Context Rot" (263) that keeping it
+current is bespoke manual labor.** Gemini: rebranding that as "we maintain a living model of your operations" (266)
+does not change what it is.
+
+**This is worth taking seriously rather than dismissing**, because the whole rebuilt strategy rests on "rent the
+intelligence, own the context layer." If the context layer is manual labor per client, **the business is a services
+firm with a technology story, and it should be priced and staffed as one.** The replacement Gemini asks for is a
+product definition that does not require infinite manual maintenance, and that is a real open question, not a
+wording problem.
+
+**BR2-S2. Where the chilling-effect argument belongs: section 5, attacking line 244.**
+The document treats the crossover as **bulk token volume** ("spend exceeds infrastructure cost"). Gemini's
+correction: **the real crossover is the operational chilling effect.** Metered inference suppresses zero-marginal-cost
+high-iteration agentic loops because every failed attempt costs money. **Work you never attempt does not show up in a
+token bill**, so a volume-based crossover cannot see it.
+
+**This is the missing crossover from BR1-C1, in its correct form.** The threshold the document lacks is not only
+"$X per month"; it is also "the point at which metering changes what work you are willing to try."
+
+#### KEEP
+
+**BR2-K1. Lines 148-151, "Benchmarks Do Not Predict Task Outcomes."**
+The observation that models fail at **integration and specification-reading, not code generation** is sharp and
+accurate, and it is the best paragraph in the document. **It must survive any rewrite.** It also quietly undercuts
+the document's own section 2, which leans on benchmark tables. *(Gemini)*
+
+---
 
 ### `local-inference-buy-vs-rent.md` unit 1 (lines 1-130): the trigger, the benchmarks
 
