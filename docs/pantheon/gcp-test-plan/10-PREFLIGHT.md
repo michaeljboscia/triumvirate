@@ -61,6 +61,11 @@ tarball) rather than pulling at runtime, so the test has no pull path to explain
 
 ### 1.3 Models that fit 12GB
 
+> **EXECUTED 2026-08-26, and the headline number is wrong.** `nvidia-smi` in-container reports 2598 MiB already
+> allocated to the desktop session, so **usable VRAM is ~9.7GB, not 12GB**. Size against 9.7GB or run the box
+> headless. TinyLlama and BGE-large still fit; the margin cases do not. See `runs/2026-08-26-first-execution.md`
+> finding R-1.
+
 Only three of the original eight are usable here, and only these should be downloaded now:
 
 | Model | Purpose | Fits 12GB |
@@ -159,6 +164,10 @@ export DEFAULT_ZONE="us-central1-a"
 gcloud projects create "$PROJECT_ID" --name="Pantheon Validation v1"
 gcloud config set project "$PROJECT_ID"
 gcloud billing projects link "$PROJECT_ID" --billing-account="$BILLING_ACCOUNT"   # 'beta' no longer needed
+# NOTE: if the local gcloud has a quota project pinned to some other project, billing/quota/serviceusage
+# calls fail with USER_PROJECT_DENIED naming that unrelated project. Pass --billing-project explicitly:
+#   gcloud billing budgets create ... --billing-project="$PROJECT_ID"
+# Observed 2026-08-26 against projects/e5bravo-workspace-cli. See runs/ finding R-2.
 gcloud config set compute/region "$DEFAULT_REGION"
 gcloud config set compute/zone "$DEFAULT_ZONE"
 ```
@@ -179,9 +188,18 @@ gcloud services enable \
 
 ### 3.2 Quota
 
-New projects start at **zero** GPU quota and need **both** a per-model regional quota **and** the global
-`GPUs (all regions)` quota. The original omitted the global one, so VM creation would still have failed after regional
-approval.
+> **EXECUTED 2026-08-26. The zero-quota claim below is FALSE on this account.** `pantheon-validation-v1`, minutes
+> after creation, already had **L4 16, A100 40GB 16, T4 8, V100 8** in `us-central1`. Only A100 **80GB** was zero.
+> The global `GPUs (all regions)` metric is no longer exposed by `gcloud compute project-info describe` and the
+> Cloud Quotas API needs the uninstalled `alpha` component, so **that half remains unverified in either direction**.
+>
+> This is not good news. It means there is **no zero-quota backstop against accidental GPU spend**, and the budget
+> on this project only sends email (finding R-3). Build a real spend stop before the first GPU VM. See
+> `runs/2026-08-26-first-execution.md` findings R-3 and R-4.
+
+New projects are widely documented to start at **zero** GPU quota, needing **both** a per-model regional quota **and**
+the global `GPUs (all regions)` quota. The original omitted the global one. **Verify per account rather than assuming
+either way**, because the assumption failed here.
 
 **Ask small.** The original requested 8x A100 while stating a $100/month budget, which reads to a reviewer as either a
 compromised account or someone who does not understand the pricing, and invites denial. It also contradicts policy:
