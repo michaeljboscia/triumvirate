@@ -9,10 +9,10 @@
 #   ./request-quotas.sh --confirm --scope=all        # Everything (default)
 
 set -uo pipefail
-# Intentionally NOT using `set -e` — a single failed quota submission (e.g. duplicate)
+# Intentionally NOT using `set -e`: a single failed quota submission (e.g. duplicate)
 # should not kill the loop. Each submission's success/failure is tracked explicitly.
 
-PROJECT_ID="${PROJECT_ID:-aerial-jigsaw-467620-m8}"
+PROJECT_ID="${PROJECT_ID:-}"
 CONTACT_EMAIL="${CONTACT_EMAIL:-REDACTED@example.com}"
 SERVICE="compute.googleapis.com"
 
@@ -28,7 +28,12 @@ for arg in "$@"; do
   esac
 done
 
-JUSTIFICATION="Building Pantheon, an AI code-generation infrastructure validation platform. Graduated GPU testing across L4, A100 80GB, H100, H200, B200, RTX Pro 6000 hardware tiers. All workloads run with --provisioning-model=SPOT, --max-run-duration=120m, and --instance-termination-action=DELETE as hard budget controls. Monthly spend budget-capped at \$100 with automated billing alerts + Cloud Function kill-switch at 50% threshold. Individual sessions 1-2 hours max. No production serving; AI inference + fine-tuning experimentation only. Multi-region allocations requested for Spot pool resilience."
+if [[ -z "$PROJECT_ID" ]]; then
+  echo "ERROR: PROJECT_ID is required. Set PROJECT_ID or pass --project=<project-id>." >&2
+  exit 1
+fi
+
+JUSTIFICATION="Building Pantheon, an AI code-generation infrastructure validation platform. Graduated GPU testing across L4, A100 80GB, H100, H200, B200, RTX Pro 6000 hardware tiers. All workloads run with --provisioning-model=SPOT, --max-run-duration=120m, and --instance-termination-action=DELETE as hard budget controls. Monthly spend budget-capped at \$100 with automated billing alerts + Cloud Function kill-switch at 50% threshold. No production serving; AI inference + fine-tuning experimentation only. Multi-region allocations requested for Spot pool resilience."
 
 # ============================================================================
 # Quota request matrix
@@ -109,13 +114,13 @@ while IFS= read -r quota || [[ -n "$quota" ]]; do
   IFS='|' read -r qid region value priority <<< "$quota" || true
   COUNTER=$((COUNTER + 1))
 
-  # Generate a unique preference ID — required by API
+  # Generate a unique preference ID: required by API
   pref_id="pantheon-$(date +%Y%m%d)-${region}-${qid//preemptible-nvidia-/}-${value}"
   pref_id="${pref_id//-per-project-region/}"
   # Trim to 63 char max, lowercase, only [a-z0-9-]
   pref_id=$(echo "$pref_id" | tr '[:upper:]' '[:lower:]' | cut -c1-63)
 
-  printf "%2d. [%-8s] %-55s %s → %d\n" "$COUNTER" "$priority" "$qid" "$region" "$value"
+  printf "%2d. [%-8s] %-55s %s -> %d\n" "$COUNTER" "$priority" "$qid" "$region" "$value"
 
   CMD=(
     gcloud alpha quotas preferences create
@@ -132,9 +137,9 @@ while IFS= read -r quota || [[ -n "$quota" ]]; do
   if [[ "$CONFIRM" == "true" ]]; then
     echo "    submitting..."
     if "${CMD[@]}" 2>&1 | sed 's/^/      /'; then
-      echo "    ✅ submitted"
+      echo "    submitted"
     else
-      echo "    ⚠️  failed (may be duplicate / already requested)"
+      echo "    failed (may be duplicate / already requested)"
     fi
     echo ""
   else
@@ -165,9 +170,7 @@ else
   echo "Check status anytime with:"
   echo "  gcloud alpha quotas preferences list --project=$PROJECT_ID --service=$SERVICE"
   echo ""
-  echo "Approval timelines vary:"
-  echo "  - Simple bumps (L4 1→16, A100 Spot 0→32): 1-3 business days"
-  echo "  - New SKU access (H100, H200, B200 where current is 0): 3-7 days"
-  echo "  - You'll receive email notifications as each is approved"
+  echo "Approval depends on requested SKU, region capacity, quota history, and account eligibility."
+  echo "You'll receive email notifications as each request is reviewed."
 fi
 echo "================================================================"
