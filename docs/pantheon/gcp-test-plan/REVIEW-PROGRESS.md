@@ -12,15 +12,15 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 3 of 9 (`30-DECISION-RULES.md`)
-**Current section:** unit 1 of 3 (lines 1-127, framing + Decisions 1-3) COMPLETE, all three peers logged.
-**Next action:** unit 2 of 3, `30-DECISION-RULES.md` lines 128-246 (Decisions 4, 5, 6, 7, 8). These are the mixed set: 4, 5, 7, 8 validate software and are substrate-agnostic (likely keep); 6 is a CapEx trigger (Pantheon Rack tier).
+**Current section:** unit 2 of 3 (lines 128-246, Decisions 4-8) COMPLETE, all three peers logged.
+**Next action:** unit 3 of 3, `30-DECISION-RULES.md` lines 247-350 (Decisions 9 and 10, rule application log, amendment protocol, what this enables). Decision 10 is the auto OPEX-to-CAPEX trigger and was called the most dangerous line in the corpus. Decision 9 is the Mac Studio purchase tied to a WWDC expectation that has since been overtaken by the M5 Ultra announcement.
 
 **Unit plan for queue item 3 (3 units):**
 | Unit | Lines | Contents | Status |
 |---|---|---|---|
 | 1 | 1-127 | framing, Decisions 1-3 (CapEx triggers) | **DONE** |
-| 2 | 128-246 | Decisions 4, 5, 6, 7, 8 | next |
-| 3 | 247-350 | Decisions 9, 10, rule application log, amendment protocol | pending |
+| 2 | 128-246 | Decisions 4, 5, 6, 7, 8 | **DONE** |
+| 3 | 247-350 | Decisions 9, 10, rule application log, amendment protocol | next |
 
 **Carry into unit 3:** Decision 10 is the auto OPEX-to-CAPEX trigger at $1000/mo for 2 months and was called the most dangerous line in the corpus.
 
@@ -57,7 +57,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE**, archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
 | 1 | `gcp-test-plan/10-PREFLIGHT.md` | **REVIEWED + REWRITTEN** (11 sections, 113 findings) | see below |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | **COMPLETE** (4 units, 3 peers, rewritten 444 to ~340 lines, verified) | `76a219d` |
-| 3 | `gcp-test-plan/30-DECISION-RULES.md` | **IN PROGRESS**, 1 of 3 units | |
+| 3 | `gcp-test-plan/30-DECISION-RULES.md` | **IN PROGRESS**, 2 of 3 units | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | pending | |
 | 6 | `local-inference-buy-vs-rent.md` | partially touched (TPS floor added) | `401fdde` |
@@ -84,6 +84,105 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `30-DECISION-RULES.md` unit 2 (lines 128-246): Decisions 4, 5, 6, 7, 8
+
+Raw output: `review-raw/30-DECISION-RULES-unit-2.md`. All three peers.
+
+**Verdicts:** Decision 4 KEEP-WITH-EDITS, Decision 5 KEEP-WITH-EDITS, **Decision 6 CUT**, Decision 7
+KEEP-WITH-EDITS (and strengthen substantially), Decision 8 KEEP-WITH-EDITS.
+
+#### CRITICAL
+
+**D2-C1. The isolation gate proves the system was disconnected, not that it still worked. TWO-PEER CONVERGENCE.**
+Decision 7 (lines 200-223) passes on: zero unexpected outbound traffic (209), the canonical swarm ran **to
+completion** while disconnected (210), and an evidence bundle exists (211).
+
+**It never checks that the disconnected output was correct.** Gemini: *"What if agent tools silently fail or fall back
+to useless defaults when the internet is unreachable?"* DeepSeek names it: **silent functional degradation**, where
+the agent reports nominal success while tool failures are masked by cached defaults, skipped retrieval steps, or
+empty-but-valid-shaped results the surrounding code accepts.
+
+**So a disconnected run can complete cleanly, produce worthless output, and pass the gate that tells a client the
+system works in isolation.**
+
+**Fix, proposed independently by both:** an **artifact parity check against a connected baseline run.** The
+disconnected output must be functionally equivalent, not merely complete.
+
+**DeepSeek's catch on that fix, which Gemini did not raise:** the baseline itself can be contaminated if it was
+produced with the same degraded fallbacks, and semantic thresholds can be loose enough to admit worthless results.
+**The connected baseline must be captured and hashed BEFORE the isolation test, with its own correctness established
+separately**, or the parity check compares two degraded runs and proves nothing.
+
+**D2-C2. Decision 7 does not distinguish a configuration claim from an evidence claim.**
+Codex: as written it can read as *"the firewall says egress is blocked"* rather than *"packet capture shows nothing
+crossed the wire."* The `<= 5 incidental packets` allowance (209-212) is meaningless unless the capture proves each
+packet's destination, protocol, and expected path. **Require pcap/flow artifacts, capture interface names, the time
+window, a hash of the evidence bundle, and explicit accounting for every allowed packet.**
+
+This is the third time this distinction has come up (gate-6 and the evidence spec were the others). **It is the single
+most repeated defect in the corpus.**
+
+#### HIGH
+
+**D2-H1. THE GAP: no rule anywhere guards against budget bleed.**
+Gemini's answer to which of the three new failure modes is unguarded, and it is the most useful finding in this unit:
+
+> "Decision 6 used to be the hard stop because it required writing a massive check. Under rent-first you could burn
+> $150K across a year of 'promising' iterative GCP runs and nothing in this document would stop you."
+
+**The old CapEx trigger was doing double duty**: it gated a purchase, and by requiring a large visible cheque it also
+functioned as an involuntary stop-and-think. Removing it removes the brake without replacing it. **The rewrite needs a
+cumulative OpEx burn limit that forces a pivot or shutdown if crossed without revenue.**
+
+**D2-H2. Decision 4 actively enables lingering.**
+Line 136's *"No further Gate 0 runs required unless..."* grants permission to declare the cheap test done and delay
+the expensive one indefinitely. **It guards against wasting money on broken code and provides no forcing function to
+advance.** Directly instantiates the failure-to-advance mode identified in unit 1. *(Gemini)*
+
+**D2-H3. Decision 8 has no throughput floor.**
+Lines 224-240 gate production readiness on soak, concurrency, and fault behavior but never on tokens per second.
+**Add `>= 15 tok/s/stream under 4-way batched load`,** the standing production floor. A system can pass every current
+condition in Decision 8 and still be too slow for the verification gates to keep up. *(Codex)*
+
+#### DELETION, WITH PURPOSE RECORDED
+
+**D2-D1. Decision 6 (Pantheon Rack tier, lines 176-199): CUT the trigger, keep the question in a new form.**
+- **What it was for:** deciding whether to buy an $80K-$500K enterprise GPU rack.
+- **Does the problem persist?** The purchase does not. **Capacity planning does**, and so does the commitment
+  decision, in a different currency.
+- **Replacement (Gemini):** an **Instance Reservation / Committed Use Discount trigger.** The question is no longer
+  "do we buy metal" but *"at what sustained utilization do we lock into a one-year contract instead of paying
+  on-demand."* Same shape, same discipline, reversible currency.
+- Codex adds: retain the validation prerequisites embedded in it; drop only the purchase trigger.
+
+#### KEEP-WITH-EDITS DETAIL
+
+**D2-E1. Decisions 5 and 8 hang off gate numbers that no longer mean anything.**
+Both reference gates demoted to pricing-sweep rows. **Rehang them on named validation artifacts:** Decision 5 on a
+"core thesis validation run" (worktree creation, merge cleanliness, generated-code validity), Decision 8 on a
+"release-candidate production readiness bundle" (soak, concurrency, fault injection, throughput floor). *(Codex)*
+
+**D2-E2. Both also change character under the rebuild.** *(Gemini)* Decision 5 becomes a **unit economics baseline**
+rather than a binary thesis check, since its time limits now inform pricing. Decision 8 becomes an **OpEx stress
+test**: "no memory leaks" is no longer only about stability, it is about whether long-running tasks force
+over-provisioning on rented nodes.
+
+**D2-E3. Decision 4 works locally with only wording changes.** NATS, containers, mock vLLM, and dispatch are
+substrate-neutral. Only the "GPU dollars" / "GPU gate" framing (138, 144) assumes cloud. *(Codex)*
+
+#### MEDIUM
+
+**D2-M1. Unresolved dependencies:** gate bundle paths that may be stale (152, 180, 204, 228); "full 4-task canonical
+swarm" with no canonical fixture defined (210); "Gate 0 bundle metrics" with no concrete local artifact names (132);
+"evidence bundle lands via PGA" with no schema or hash checklist (211). **The canonical swarm is the same missing
+fixture the preflight review found.** *(Codex)*
+
+**D2-M2. Decision 5's thresholds are internally coherent:** `>= 80%` validity validates, `< 50%` falsifies, and
+50-79% falls to the inconclusive branch. Recorded because it is one of the few places the corpus handles ambiguity
+correctly. *(Codex)*
+
+---
 
 ### `30-DECISION-RULES.md` unit 1 (lines 1-127): framing, Decisions 1-3
 
