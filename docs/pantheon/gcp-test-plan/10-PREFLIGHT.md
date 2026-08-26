@@ -61,10 +61,14 @@ tarball) rather than pulling at runtime, so the test has no pull path to explain
 
 ### 1.3 Models that fit 12GB
 
-> **EXECUTED 2026-08-26, and the headline number is wrong.** `nvidia-smi` in-container reports 2598 MiB already
-> allocated to the desktop session, so **usable VRAM is ~9.7GB, not 12GB**. Size against 9.7GB or run the box
-> headless. TinyLlama and BGE-large still fit; the margin cases do not. See `runs/2026-08-26-first-execution.md`
-> finding R-1.
+> **EXECUTED 2026-08-26. Usable VRAM is ~11.6GB and this section stands.** An earlier note here claimed 9.7GB and
+> blamed a desktop session. That was wrong on both counts: the box is headless, and the 2598 MiB was the `infinity`
+> reranker container (`BAAI/bge-reranker-v2-m3`) holding weights resident. It was stopped, leaving 11876 MiB free.
+> Restore with `ssh lenovo 'docker start infinity'`.
+>
+> **Before any GPU run on `lenovo`, check `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`
+> on the host.** A resident process is a service to identify, not a hardware limit to accept. See
+> `runs/2026-08-26-first-execution.md` finding R-1.
 
 Only three of the original eight are usable here, and only these should be downloaded now:
 

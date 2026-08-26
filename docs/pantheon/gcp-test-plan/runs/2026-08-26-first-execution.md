@@ -29,19 +29,66 @@ No running processes found
 The third check is the one the preflight document called most likely to fail, because it needs NVIDIA Container
 Toolkit rather than just a driver. It passed. **The container runtime GPU path on `lenovo` works today.**
 
-### Finding R-1: usable VRAM is ~9.7GB, not 12GB (NEW, no document accounts for this)
+### Finding R-1: RETRACTED AND CORRECTED. It was a live service, not the desktop, and the card is now clear.
 
-`nvidia-smi` inside the container reports **2598 MiB already allocated** while simultaneously reporting *"No running
-processes found."* Those are not in conflict: the container has its own PID namespace and cannot see the host
-processes holding that memory. It is the desktop session and display stack on a laptop GPU.
+**My first diagnosis was wrong.** I claimed the 2598 MiB was a desktop/display session, reasoning from the fact that
+the container could not see host PIDs. That inference was lazy: I never checked the host, and one command would have
+settled it.
 
-Consequence: **the model-sizing budget is roughly 9.7GB, not 12GB**, unless the box is run headless. Section 1.3 of
-`10-PREFLIGHT.md` sizes models against "12GB" and is therefore optimistic by about 20%. This does not change the
-verdict for TinyLlama or BGE-large, both of which still fit comfortably. It matters at the margin, and it is exactly
-the class of fact that only appears once something is run.
+Checked from the host on 2026-08-26:
 
-**Action:** either run `lenovo` headless for sizing work, or size against 9.7GB. Decide before the sizing sweep, not
-during it.
+```
+$ nvidia-smi -q | grep -i "Display Active"
+    Display Active                                     : Disabled          <-- headless, so NOT a desktop
+
+$ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+2767213, /app/.venv/bin/python, 2588 MiB
+
+$ ps -o lstart,etime,args -p 2767213
+Thu Jul 30 02:57:42 2026   27-08:45:30   /app/.venv/bin/infinity_emb v2 \
+    --model-id BAAI/bge-reranker-v2-m3 --dtype auto --batch-size 32 --port 7997 --host 0.0.0.0
+```
+
+It was the **`infinity` container**, an Infinity embeddings/rerank server holding `BAAI/bge-reranker-v2-m3` resident,
+deliberately deployed, up 27 days, compose file at `/home/mikeboscia/infinity/docker-compose.yml`.
+
+**It was also not stuck.** `GET localhost:7997/models` returned `queue_absolute: 0`, `results_pending: 0`. Healthy and
+idle. A reranker holds its weights resident by design; that is the service working, not failing.
+
+Before stopping it I checked for consumers: **no live code reference anywhere in `~/projects` on either machine**
+(searched `.py .ts .js .json .yaml .yml .env* .toml .sh` for `:7997`, `bge-reranker`, `RERANK`). The only hits were
+Claude session transcripts from ContentFactory, meaning it was used interactively at some point, not wired into
+anything running.
+
+Stopped it:
+
+```
+$ docker stop infinity
+$ nvidia-smi --query-gpu=memory.used,memory.total,memory.free --format=csv
+2 MiB, 12282 MiB, 11876 MiB
+```
+
+**Corrected number: ~11.6GB usable (11876 MiB free), not 9.7GB and not a flat 12GB.** The ~400 MiB gap between total
+and free is driver and context reserve, which is normal and unavoidable. Section 1.3's model sizing stands.
+
+**Restore when the reranker is wanted again:**
+
+```bash
+ssh lenovo 'docker start infinity'      # or: cd ~/infinity && docker compose up -d
+```
+
+Its restart policy is `unless-stopped`, so an explicit `docker stop` keeps it down across reboots. It will not come
+back on its own and quietly re-take the 2.6GB mid-sweep.
+
+**The lesson, which is the actual finding.** I reported a hardware limit when the truth was a running service, and I
+did it by reasoning from a container's PID namespace instead of running one command on the host. Had that gone
+uncorrected, every future sizing decision would have been made against a 9.7GB budget that was never real, and the
+2.6GB would have been written off permanently as a property of the machine. **A number reported without checking its
+cause is not evidence, it is a guess with a unit attached.** This is the same defect class the corpus review kept
+finding, produced by me, one day after documenting it.
+
+**Standing rule for GPU work on `lenovo`: check `nvidia-smi --query-compute-apps` on the host before every run, and
+treat any resident process as a service to be identified rather than a limit to be accepted.**
 
 ---
 
@@ -141,11 +188,13 @@ claim that a global quota is also required remains unverified in either directio
 
 | Document | Change required |
 |---|---|
-| `10-PREFLIGHT.md` §1.3 | Size against ~9.7GB usable, or specify headless operation (R-1) |
+| `10-PREFLIGHT.md` §1.3 | No change needed. ~11.6GB usable once the card is clear (R-1, corrected) |
 | `10-PREFLIGHT.md` §3.2 | The zero-quota claim is false on this account; correct it and mark the global quota unverified (R-4) |
 | `10-PREFLIGHT.md` §3.1 | Add the `--billing-project` requirement (R-2) |
 | `30-DECISION-RULES.md` | The budget is an alert; no automated stop exists (R-3) |
 | `POLICY-rent-first.md` | Utilization thresholds still NOT SET, but L4 quota exists now, so a sweep can start |
+
+**Card state as of this run:** clear. 2 MiB used, 11876 MiB free, no compute processes.
 
 **Highest-priority follow-on:** build a real spend stop before launching a GPU VM in this project. R-3 and R-4
 compound: launchable GPUs plus notification-only budget equals no enforced ceiling.
