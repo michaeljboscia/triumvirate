@@ -12,8 +12,8 @@ conversation context are lost at compaction. If it is not written here, it did n
 ## RESUME HERE
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
-**Current section:** Phase 4 (lines 372-476) — COMPLETE, all three peers logged
-**Next action:** review Phase 5 (PD snapshots, lines 477-544) with all three peers.
+**Current section:** Phase 5 (lines 477-544) — COMPLETE, all three peers logged
+**Next action:** review Phase 6 (Custom VM images, lines 545-642) with all three peers.
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 
@@ -38,7 +38,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | # | Document | Status | Commit |
 |---|---|---|---|
 | 0 | `HARDWARE_DECISION.md` + provenance | **DONE** — archived, TPS floor extracted into buy-vs-rent section 6 | `401fdde` |
-| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 4 of 11 sections reviewed | |
+| 1 | `gcp-test-plan/10-PREFLIGHT.md` | **IN PROGRESS** — 5 of 11 sections reviewed | |
 | 2 | `gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md` | pending | |
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | pending | |
 | 4 | `runbooks/gate-0-plumbing.md` | pending | |
@@ -56,7 +56,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | Phase 2 — Network + storage | 186-272 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 3 — Docker image pre-bake | 273-371 | **DONE** (Codex, Gemini, DeepSeek) |
 | Phase 4 — Model weights cached to GCS | 372-476 | **DONE** (Codex, Gemini, DeepSeek) |
-| Phase 5 — PD snapshots | 477-544 | no |
+| Phase 5 — PD snapshots | 477-544 | **DONE** (Codex, Gemini, DeepSeek) — VERDICT: DELETE PHASE |
 | Phase 6 — Custom VM images | 545-642 | no |
 | Phase 7 — Fixtures + Pythia seed | 643-676 | no |
 | Phase 8 — Tooling validation | 677-726 | no |
@@ -67,6 +67,98 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 ---
 
 ## FINDINGS LOG
+
+### `10-PREFLIGHT.md` Phase 5 (lines 477-544)
+
+Raw output: `review-raw/10-PREFLIGHT-phase-5.md`. All three peers.
+
+**VERDICT: DELETE THIS PHASE.** Both file-reading peers reached that independently. It is downstream dead weight (it
+stages from the `gs://pantheon-models` bucket that Phase 4's review recommends cutting), its economics are inverted,
+and the problem it solves does not exist on a persistent local workstation.
+
+#### CRITICAL
+
+**P5-C1. `mkfs.ext4` on an unverified device path can destroy the boot disk.**
+Lines 494, 503. The disk is attached without `device-name`, so `/dev/disk/by-id/google-persistent-disk-1` is an
+attach-order assumption, not a contract. If it resolves to the wrong disk, line 503 formats it. There is no `lsblk`,
+no `readlink -f`, no `set -euo pipefail`, and no confirmation. This is the most dangerous single line reviewed so far.
+*(Codex)*
+
+**P5-C2. The snapshot can capture a partially populated filesystem, and the source is then deleted.**
+Lines 497, 509, 516, 522-523. The stager has `--max-run-duration=4h` with `--instance-termination-action=DELETE`
+against a ~361GB copy. If the copy does not finish, the VM is deleted mid-transfer, line 516 snapshots whatever landed,
+and lines 522-523 delete both VM and source disk. Nothing verifies byte count, file count, or hashes before the
+destroy. *(Codex, converging with DeepSeek's pattern 3)*
+
+#### HIGH
+
+**P5-H1. Cost claim is wrong in both directions.**
+Line 477 claims "$15/mo ongoing." Codex prices ~361GB of snapshot at roughly **$18.05/month** (snapshots bill on
+compressed incremental bytes, not the 500GB provisioned size, and model weights compress poorly). Worse, line 537
+creates a **500GB pd-ssd per gate VM**, roughly **$0.116/hour per running gate**, about $85/month if one is left up.
+That per-VM disk cost appears in no budget anywhere. *(Codex)*
+
+**P5-H2. The optimization loses money by a factor of hundreds.**
+It spends $15+/month to save 3-4 minutes of `g2-standard-4` startup, which is worth about $0.05 per run.
+**Break-even is roughly 300 gate runs per month.** The plan describes a handful of runs total. *(Gemini)*
+
+**P5-H3. pd-ssd breaks on the machine families the plan most wants to test.**
+Lines 488, 536-537. G2 still supports Persistent Disk, but G4 cannot use zonal or regional PD at all and requires
+Hyperdisk. A4/A4X/A3 Ultra and N4 families are similarly Hyperdisk-only. So the snapshot-to-pd-ssd pattern fails on
+exactly the Blackwell hardware the sizing sweep would target. *(Codex, consistent with the same finding in gate-6)*
+
+#### MEDIUM
+
+**P5-M1. `sudo chown -R $USER` is expanded by the caller's shell, not root.** Line 506. Works if the login user is a
+normal Linux account, but OS Login can transform the username. Use `"$(id -u):$(id -g)"`. *(Codex)*
+
+**P5-M2. Snapshotting a mounted disk.** Line 515-516 snapshots while the filesystem may still be mounted and dirty.
+The clean sequence is `sync`, unmount, detach or stop, then snapshot. *(Codex)*
+
+**P5-M3. `--snapshot-names` is still valid.** Line 516 is not using a removed flag. Recorded so nobody "fixes" it.
+*(Codex)*
+
+**P5-M4. A better 2026 primitive exists.** For shared read-only model mounts, Hyperdisk ML in read-only-many mode is
+the current recommendation (up to 2,500 instances at <=512 GiB, and G2 supports it). Per-VM disks from snapshot is the
+dated pattern. Relevant only if this phase survives, which it should not. *(Codex)*
+
+#### STRATEGIC
+
+**P5-S1. It is a dependent artifact of a dead strategy.** Line 509 copies from `gs://pantheon-models`. Phase 4's review
+recommends deleting that bucket because pulling weights to a non-GCP node costs egress while pulling from HuggingFace
+is free. Remove the bucket and this phase cannot run at all. *(Gemini)*
+
+**P5-S2. It creates GCP lock-in that biases future provider choice.** A PD snapshot is a GCP-only primitive and cannot
+travel to RunPod. Building it quietly penalizes the multi-provider mobility the rent-first policy depends on. *(Gemini)*
+
+**P5-S3. The snapshot is opaque and irreproducible from birth.** `pantheon-models-v1` is hardcoded (line 518) with a
+date-stamped description (line 519), no lifecycle, and no upgrade path. Updating one model means manually rebuilding a
+v2, hand-editing the reference at line 537, and garbage-collecting v1. Because Phase 4 does not revision-pin
+downloads, nobody can say what is inside it. *(Gemini)*
+
+**P5-S4. Track A does not have the problem this solves.** The local box has persistent storage. Download once,
+bind-mount into containers. Cold start is not a thing on a workstation that stays on. *(Gemini)*
+
+**P5-S5. A shared snapshot is incompatible with per-client isolation.** Sharing one snapshot across client projects
+needs cross-project IAM, which breaks the tenancy boundary; respecting the boundary means rebuilding it inside every
+client project. *(Gemini)*
+
+#### REUSABLE PRINCIPLE (DeepSeek)
+
+For any irreversible step a tired human copy-pastes: **treat every destructive step as untrusted until verified, and
+make the wrong action impossible rather than unlikely by embedding verification and abort into the command itself.**
+
+1. **Resolve before you wreck.** Stable identifiers plus a hard mismatch check before formatting, e.g.
+   `[ "$(readlink -f /dev/disk/by-id/...)" = "/dev/sdb" ] || exit 1`.
+2. **Make the shell refuse to continue.** `set -euo pipefail`, plus preconditions: target not mounted, not `/` or
+   `/boot`, required confirmation variables set.
+3. **Never chain destroy to untested create.** Verify the snapshot independently (size, mountable, checksum, file
+   count) before deleting the source, and put the delete behind a separate explicit command rather than
+   `snapshot && delete`.
+
+**This principle applies corpus-wide, not just to Phase 5.** Apply it when rewriting every runbook in the queue.
+
+---
 
 ### `10-PREFLIGHT.md` Phase 4 (lines 372-476)
 
