@@ -1,444 +1,300 @@
-# Pantheon Evidence Bundle Specification
+# Evidence Bundle Specification
 
-**Status:** canonical
-**Applies to:** every gate run, preflight smoke test, any Pantheon GCP burn
-**Storage root:** `gs://pantheon-evidence/{gate_id}/{run_id}/`
+**Status:** rewritten 2026-08-26 against a four-unit, three-peer review of the 2026-04-18 original
+**Review record:** `REVIEW-PROGRESS.md` and `review-raw/20-EVIDENCE-SPEC-unit-*.md`
+**Original:** git at `129c3b5:docs/pantheon/gcp-test-plan/20-EVIDENCE-BUNDLE-SPEC.md`
 
-An **evidence bundle** is the durable, immutable, machine-readable artifact every Pantheon run MUST produce. No run is considered complete until its bundle lands in GCS. This spec defines the format, so any tool (harness, Obsidian sync, Supabase extractor, Pythia embedder, dashboard) can consume bundles consistently.
-
----
-
-## Design goals
-
-1. **Immutable.** Once written, never modified. New runs produce new bundles; corrections happen in downstream layers.
-2. **Self-describing.** Manifest + schema version lets future tooling consume old bundles.
-3. **Tool-agnostic.** Plain JSON + markdown + CSV + logs. No proprietary format.
-4. **Queryable structurally.** Metrics in JSON with a stable schema → Supabase extraction is trivial.
-5. **Queryable semantically.** Summary in markdown → Pythia embedding → semantic search forever.
-6. **Human-readable.** You can `gsutil cat` any bundle and understand the run.
-7. **Cheap to store.** Total size per run target: < 100MB.
+> **Tense rule, applied throughout and adopted corpus-wide.** Present tense is reserved for behavior that has been
+> executed and verified. Everything else says `will`, `should`, or carries an explicit **NOT BUILT** marker. The
+> original's defining failure was describing an unbuilt pipeline in the present tense with confident latencies
+> ("within 60 sec"), which reads as evidence of implementation. Six automations were described that way. Zero were
+> deployed.
 
 ---
 
-## Bundle directory structure
+## 1. What changed and why
+
+The original was designed as an internal artifact justifying a GPU purchase. That purchase is cancelled. These bundles
+are now shown to a prospect's security team as evidence for an isolation claim, which is a different job with a
+different reader.
+
+Three findings drove the rewrite:
+
+1. **The design goals omitted the only property that matters to a hostile reader.** They listed immutable,
+   self-describing, tool-agnostic, structurally queryable, semantically queryable, human-readable, and cheap. All
+   three peers independently named the same absence: **verifiability**. Gemini's diagnosis was that this is "a data
+   engineering brief, not a security brief."
+2. **"Immutable" was declared, never enforced,** and the lifecycle contradicted it by updating the manifest mid-run.
+3. **"Retain forever" and "provably destroy client data" cannot both be true.** This is structural, not editorial.
+
+---
+
+## 2. The split: two artifacts, divided by data ownership
+
+**This is the load-bearing change.** The original produced one bundle for every purpose.
+
+| | **Evidence bundle** | **Client data store** |
+|---|---|---|
+| Contains | metadata, hashes, compute logs, anonymized metrics, isolation captures | client pilot inputs, outputs, and derived artifacts |
+| Mutability | write-once, content-addressed | normal, deletion-capable |
+| Retention | retained | TTL, then destroyed |
+| Deletion | not expected | **must be provable, with a certificate** |
+| Signing | signed with a key the tested system never holds | not applicable |
+
+**Why the split is required rather than merely tidy.** The sovereignty product promises a client their data can be
+destroyed on request. The original also promised bundles are never deleted. Those are mutually exclusive while client
+data sits inside the evidence archive. No wording resolves it. Separating by **data ownership** does: erasure of
+client data never touches the evidence archive, and the evidence archive never contains anything a client can demand
+be erased.
+
+A secondary benefit falls out of it. Internal material (operator notes, subjective significance ratings, raw `strace`
+output) stays out of anything a client reads, where it would either look unprofessional or leak infrastructure detail.
+
+---
+
+## 3. Design goals (revised)
+
+1. **Verifiable.** Tamper-evident by construction. This is first because it was missing entirely and it is the only
+   goal a skeptical reader cares about.
+2. **Write-once and content-addressed.** Objects are never rewritten. Superseding state is a new object.
+3. **Self-describing.** Schema version and generator identity travel with the artifact.
+4. **Tool-agnostic.** Plain JSON, Markdown, CSV, and standard capture formats.
+5. **Complete or explicitly incomplete.** A bundle states what it could not produce rather than omitting it silently.
+6. **Human-readable.**
+7. **Bounded in size,** with a stated policy for what happens when raw captures exceed the bound.
+
+Goals 4 and 6 survive unchanged from the original. Goals 1, 2, and 5 are new. **Structural queryability and semantic
+queryability were dropped as goals, not as capabilities:** they described downstream consumers that do not exist, so
+they belong in a consumer roadmap rather than in the artifact's design brief.
+
+---
+
+## 4. Verifiability (new section, the one that was missing)
+
+A bundle assembled by the system under test, stored where that system can rewrite it, is a system grading its own
+homework. Declaring immutability is a promise; enforcing it is a mechanism.
+
+**Minimum a skeptic can check:**
+
+- Every object is **content-addressed**, and the manifest lists each object with its hash.
+- The manifest is **signed with a key the tested environment never holds.**
+- The signature is **anchored in an append-only log outside the writer's control** (a transparency log or a separate
+  ledger). **This is the checkable part.** Bucket-level WORM is a useful second layer, not the first.
+- The bundle records the **capture topology**: where the tap point sat relative to every egress path, and the exact
+  versions of capture and validation tooling.
+
+**NOT BUILT.** None of the above exists today. Until it does, a bundle supports the claim "these are the artifacts
+this run produced" and not "these artifacts have not been altered."
+
+---
+
+## 5. Lifecycle (corrected)
+
+The original created `manifest.json` at T+0 with `status="running"` and updated it at the end. That is a mutation, and
+it contradicted the immutability goal directly.
+
+**Corrected sequence:**
+
+1. All working state is written to a **staging path outside the bundle.** Mutate freely here.
+2. At finalization, final artifacts are written **once**.
+3. Non-sentinel objects upload first.
+4. **A completion sentinel uploads LAST.**
+5. Consumers trigger **only on the sentinel**, and validate the manifest-declared object set before acting.
+
+**Why the sentinel matters.** Object storage makes uploads visible one object at a time. The original triggered on
+`manifest.json`, which was written first, so any consumer could fire against an incomplete bundle and insert partial
+rows or fail nondeterministically.
+
+**Preemption hazard.** The original uploaded the bundle and then deleted the VM. A hard kill between those steps
+leaves the bundle partial or absent, and `trap` does not reliably survive preemption. **Upload must be resumable, or
+finalization must run off the machine being torn down.**
+
+The run-state record and the final verdict record are **separate write-once objects**. Neither is edited.
+
+---
+
+## 6. Required files
 
 ```
-gs://pantheon-evidence/gate-{N}/{run_id}/
-├── manifest.json                  ← REQUIRED — metadata, hypotheses, verdicts
-├── summary.md                     ← REQUIRED — human-readable narrative
-├── cost-report.json               ← REQUIRED — GCP spend attribution
-├── obsidian-note.md               ← REQUIRED — vault-ready markdown
+{storage_root}/{gate_id}/{run_id}/
+├── manifest.json           REQUIRED, final, signed
+├── run-state.json          REQUIRED, written at start, never edited
+├── summary.md              REQUIRED
 ├── metrics/
-│   ├── h-{N}-{test_id}.json       ← per-hypothesis metrics, one file each
-│   └── nvidia-smi.csv             ← GPU time-series samples
+│   ├── h-{id}.json         one per hypothesis
+│   └── gpu-telemetry.csv
 ├── logs/
-│   ├── triumvirate.log
-│   ├── vllm-{role}.log            ← one per vLLM container
-│   ├── docker-compose.log         ← if compose used
-│   └── startup-script.log
 ├── artifacts/
-│   ├── generated-code/            ← outputs from agent tasks
-│   ├── evaluations/               ← eval scores per task
-│   └── checkpoints/               ← LoRA adapters / training state (when applicable)
-└── raw/                           ← raw tcpdump / strace / etc. (gate-specific)
+├── raw/                    isolation captures, see section 8
+└── COMPLETE                the sentinel, written last
 ```
 
----
-
-## Required file schemas
+`obsidian-note.md` moves out of the bundle to an internal sidecar. **What it was for:** knowledge capture, so runs
+compound into a searchable vault instead of evaporating. That purpose is real and survives. It simply must not ship to
+a client, since it carries operator notes and subjective ratings.
 
 ### `manifest.json`
 
-Written at run start, finalized at run end. Must conform to schema version.
+**Required:** `schema_version`, `run_id`, `gate`, `started_at`, `ended_at`, `generator` (name, version, git commit,
+clean/dirty), `objects` (path plus hash for every file), `schema_valid`, `completeness`, `signature`.
 
-```json
-{
-  "schema_version": "1.0",
-  "run_id": "gate2-dual-l4-20260418-153022-a7f3",
-  "gate": 2,
-  "gate_name": "Dual L4 (3090 Pair Proxy)",
-  "experimenter": "mike-boscia",
-  "triumvirate_version": "0.3.2",
-  "git_commit": "abc1234de",
-  "started_at": "2026-04-18T15:30:22Z",
-  "ended_at": "2026-04-18T17:28:44Z",
-  "duration_sec": 7102,
-  "gcp_project": "pantheon-validation-v1",
-  "gcp_region": "us-central1",
-  "gcp_zone": "us-central1-a",
-  "gcp_machine_types": ["g2-standard-24"],
-  "gcp_accelerators": ["2x nvidia-l4"],
-  "gcp_provisioning_model": "SPOT",
-  "models_used": [
-    {"role": "zeus", "model": "qwen2.5-72b-instruct-awq", "quantization": "awq_marlin"},
-    {"role": "coder", "model": "qwen2.5-coder-32b-instruct-awq", "quantization": "awq_marlin"}
-  ],
-  "hypotheses_tested": ["H-2.1", "H-2.2", "H-2.3"],
-  "verdicts": {
-    "H-2.1": "PASS",
-    "H-2.2": "PASS",
-    "H-2.3": "INCONCLUSIVE"
-  },
-  "prior_runs_referenced": ["gate1-single-l4-20260417-..."],
-  "decision_rules_applied": ["Decision-1"],
-  "decision_rule_outcomes": {
-    "Decision-1": {
-      "verdict": "buy 2x 3090 NVLink",
-      "confidence": 0.85,
-      "supporting_hypotheses": ["H-2.1", "H-2.2"]
-    }
-  },
-  "total_cost_usd": 0.86,
-  "evidence_bundle_size_mb": 14.2,
-  "links": {
-    "summary": "gs://pantheon-evidence/gate-2/{run_id}/summary.md",
-    "cost_report": "gs://pantheon-evidence/gate-2/{run_id}/cost-report.json",
-    "obsidian_note": "gs://pantheon-evidence/gate-2/{run_id}/obsidian-note.md",
-    "prior_run_chain": ["gs://pantheon-evidence/gate-1/..."]
-  }
-}
-```
+**Notably NOT required: `total_cost_usd`.** The original required it and populated the example with `0.86`. Cost
+attribution depends on the GCP billing export, which is written throughout the day rather than in real time and can
+backfill for up to five days. **Authoritative cost is unknown when the bundle seals.** Emit
+`cost_status: pending_billing_export` and fill it in later as a separate record, or state it as an estimate and label
+it as one. Never invent it.
 
-**Fields MUST include:** schema_version, run_id, gate, started_at, ended_at, gcp_machine_types, hypotheses_tested, verdicts, total_cost_usd.
+### Decision records
 
-### `summary.md`
+**What they were for:** tracing a verdict back to the evidence that produced it. That is worth keeping; a client
+asking "why does this say PASS" needs an answer.
 
-Human-readable, markdown, auto-generated from manifest + metrics + logs. Template defines the shape.
+**What was wrong:** the original carried `"confidence": 0.85`, an invented float with no scoring model, no inputs, and
+no calibration, alongside a verdict of `"buy 2x 3090 NVLink"`. One baseless number contaminates every real number
+beside it.
 
-```markdown
-# Run {run_id} — {gate_name}
+**Corrected shape:** `rule_id`, `rule_version`, `threshold_value`, `measured_value`, `passed`. Traceable, not invented.
+No confidence field until something computes one.
 
-**Date:** {started_at}  
-**Duration:** {duration_sec}s ({duration_hm})  
-**Cost:** ${total_cost_usd}  
-**Verdict:** {overall_verdict}
+---
 
-## Setup
-- Machine: {gcp_machine_types}
-- Models: {models_used}
-- Triumvirate version: {triumvirate_version} ({git_commit})
+## 7. Hypotheses and thresholds
 
-## Hypotheses tested
+**Keep the pre-registered hypothesis structure.** One peer recommended cutting it as an academic formality. I dissent,
+and the record shows why: pre-registering a prediction and a threshold *before* a test runs is the only thing in this
+corpus that prevents rationalizing a result afterward, and the absence of that discipline produced every other finding
+in this review. **Replace the content, keep the structure.** The old hypotheses were about local inference on hardware
+nobody is buying; the new ones are about isolation and pilot economics.
 
-### {hypothesis_id} — {hypothesis_description}
-**Prediction:** {prediction_text}
-**Result:** {verdict}
+### The threshold bug, and why it is worse than it looks
 
-| Metric | Target | Actual | Verdict |
+The original's canonical metrics example recorded `tokens_per_second_per_stream_median: 12.4` at `concurrency: 1`
+against `targets.tokens_per_second_per_stream_min: 10`, marked `PASS`.
+
+Standing policy requires **15 tok/s/stream under 4-way batched load** (`local-inference-buy-vs-rent.md` section 6).
+
+So the example is wrong twice, and the two are different in kind:
+
+- **The threshold is wrong** (10 against a policy of 15), so 12.4 passes when it should fail.
+- **The measurement condition is wrong** (`concurrency: 1` against a policy of 4-way batched), so the number does not
+  measure the thing the policy is about.
+
+**The concurrency error is the more dangerous one in a template.** A wrong number is visible and gets caught. A wrong
+experimental condition propagates silently into every run that copies the template, and still produces a
+plausible-looking PASS. **Fix the threshold. Fix the load condition first.**
+
+Every metrics record must state its concurrency, and any comparison against the production floor must be at 4-way
+batched load or explicitly marked as not testing the floor.
+
+---
+
+## 8. Raw captures and the size bound
+
+The original set a bundle target under 100 MB, then listed per-gate sizes up to 500 MB, and separately relied on
+`raw/` for tcpdump and strace without requiring any file to exist there.
+
+Two conflicts, both unresolved in the original:
+
+1. **`raw/` is load-bearing for the isolation claim.** If nothing populates it, the claim rests on summarized metrics
+   rather than inspectable evidence, which is exactly the distinction a security team will press on.
+2. **A tcpdump-bearing bundle can exceed 100 MB easily**, so the size goal and the evidence requirement fight.
+
+**Resolution required before the isolation gate runs.** State the capture duration, the snap length, whether payloads
+are captured, the rotation and compression policy, and what happens when the cap is hit. **A capture that was silently
+truncated is worse than no capture, because it looks complete.** NOT BUILT.
+
+---
+
+## 9. Retention and destruction
+
+**Non-client evidence:** retained. Transitioning to a colder storage class is reasonable for rarely-read data, but
+note nearline's 30-day minimum storage duration and its retrieval charges, and check how a lifecycle transition
+interacts with any retention policy or bucket lock before enabling one.
+
+**Client data:** TTL, then destroyed, with a **destruction certificate** as a deliverable. This is a product
+requirement, not a nicety.
+
+**The original said "All bundles retained forever" and "NEVER delete bundles."** What that was for: proving compute
+spend was not wasted, and supporting the moat narrative. **It cannot survive contact with a sovereignty product**, and
+it also conflicts with legal hold release, privacy deletion, contractual retention limits, and data minimization
+obligations. The ownership split in section 2 is what lets the useful half of that intent survive.
+
+---
+
+## 10. Storage cost
+
+The original claimed "100 runs/year = ~5GB = $1.20/year. Effectively free forever," two lines below a table whose own
+per-gate figures total roughly **672 MB per full run**. That is **~67 GB and about $16/year**, more than 13x the
+stated figure.
+
+"Effectively free" also omitted Class A and B operation charges, retrieval charges outside Standard, egress, lifecycle
+and rewrite operations, early-deletion minimums, and versioned-object storage if versioning is used for immutability.
+
+**For Track A the storage root is local disk, so the relevant policy is disk quota and rotation, not cloud pricing.**
+Size the local budget, rotate the debug artifacts, and keep the host from filling up.
+
+---
+
+## 11. Downstream consumers
+
+**The original claimed six automations fire when a bundle lands, with stated latencies. An audit found zero
+deployed.** Three had no implementation at all; three existed only as templates or unrelated code.
+
+**What the pipeline was for, read charitably:** compute cycles normally produce ephemeral shell output rather than
+durable intelligence. Writing results simultaneously to relational storage, vector storage, and readable Markdown was
+an attempt to make retained evidence compound. **That problem is real and the thesis is sound.** It was simply built
+in the wrong order: an elaborate consumer pipeline for a producer that had never produced anything, because the test
+fixtures were never authored.
+
+| Consumer | Status | What it was for | Disposition |
 |---|---|---|---|
-{metric_rows}
+| Supabase extraction | NOT BUILT | aggregate tracking of cloud runs and costs | **Drop.** The in-bundle manifest serves the need. |
+| Pythia embedding | NOT BUILT (index state exists) | historical runs semantically queryable | **Keep, move.** Local post-run script, not a cloud function. |
+| Obsidian sync | NOT BUILT (template only) | readable reports into a knowledge base | **Keep, move.** Local copy step. |
+| Dashboard refresh | NOT BUILT | cost-per-insight charts for cloud spend | **Drop.** No cloud spend on Track A. |
+| Hypothesis tracker | NOT BUILT | forces human synthesis of raw data | **Keep.** See below. |
+| Failure alert | NOT BUILT | paging when an unattended remote VM failed | **Drop.** Local execution, non-zero exit code suffices. |
 
-## Observations
-{auto_extracted_observations_from_logs_and_metrics}
+**On the hypothesis tracker:** the original listed a human review step inside a list of automations, which is careless
+labelling. But the step itself is correct and should stay. **Automation cannot synthesize a strategic lesson.** The
+pipeline should present formatted evidence and stop, requiring a human to decide what it means before any conclusion
+is recorded. Fix the label, keep the gate.
 
-## Anomalies
-{any_metric_outliers_or_error_events}
-
-## Decision rules applied
-{decision_rule_outcomes}
-
-## Next actions
-- [ ] {suggested_followups}
-
-## Links
-- Evidence bundle: `gs://pantheon-evidence/gate-{N}/{run_id}/`
-- Prior runs: {links}
-```
-
-### `cost-report.json`
-
-```json
-{
-  "schema_version": "1.0",
-  "run_id": "gate2-dual-l4-20260418-153022-a7f3",
-  "billing_account": "XXXXXX-XXXXXX-XXXXXX",
-  "line_items": [
-    {
-      "service": "Compute Engine",
-      "sku": "Spot Preemptible G2 Instance Core running in Americas",
-      "usage_amount": 0.5833,
-      "usage_unit": "hours",
-      "cost_usd": 0.23
-    },
-    {
-      "service": "Compute Engine",
-      "sku": "Spot Preemptible NVIDIA L4 GPU running in Americas",
-      "usage_amount": 1.1666,
-      "usage_unit": "hours",
-      "cost_usd": 0.48
-    },
-    {
-      "service": "Compute Engine",
-      "sku": "Spot Preemptible SSD backed PD Capacity",
-      "usage_amount": 0.58,
-      "usage_unit": "GB-hours",
-      "cost_usd": 0.04
-    },
-    {
-      "service": "Cloud Storage",
-      "sku": "Standard Storage US Multi-region",
-      "usage_amount": 0.014,
-      "usage_unit": "GB-months",
-      "cost_usd": 0.0003
-    }
-  ],
-  "total_cost_usd": 0.86,
-  "budgeted_cost_usd": 0.90,
-  "within_budget": true,
-  "attribution_method": "label-based query on billing export"
-}
-```
-
-### `obsidian-note.md`
-
-Ready-to-drop-into-vault markdown with YAML frontmatter that Dataview can query.
-
-```markdown
----
-type: pantheon-run
-run_id: gate2-dual-l4-20260418-153022-a7f3
-date: 2026-04-18
-gate: 2
-gate_name: "Dual L4 (3090 Pair Proxy)"
-gcp_machine: g2-standard-24
-region: us-central1
-duration_min: 118
-cost_usd: 0.86
-models:
-  - qwen2.5-72b-instruct-awq
-  - qwen2.5-coder-32b-instruct-awq
-hypotheses_tested:
-  - H-2.1
-  - H-2.2
-  - H-2.3
-verdicts:
-  H-2.1: PASS
-  H-2.2: PASS
-  H-2.3: INCONCLUSIVE
-overall_verdict: PASS
-tags:
-  - pantheon-run
-  - gate-2
-  - dual-l4
-  - rtx-3090-proxy
-  - concurrent-serving
-  - quantization-awq
-significance: 3
----
-
-# Run {run_id} — Gate 2 Dual L4
-
-**Verdict:** {overall_verdict}
-
-## Summary
-{summary_text_auto_generated}
-
-## Hypotheses
-
-### [[H-2.1]] — 70B-Q4 local inference is usable
-**Result:** {verdict_with_metrics}
-
-### [[H-2.2]] — Concurrent multi-model hosting works
-**Result:** {verdict_with_metrics}
-
-### [[H-2.3]] — 32B LoRA training is feasible
-**Result:** {verdict_with_metrics}
-
-## Observations
-{observations_awaiting_human_annotation}
-
-## Links
-- Evidence bundle: `gs://pantheon-evidence/gate-2/{run_id}/`
-- [[decision-1-3090-purchase]]
-- Prior run: [[gate1-single-l4-...]]
-
-## Mike's notes
-<!-- Add qualitative observations here after reviewing bundle -->
-```
-
-### `metrics/h-{N}-{test_id}.json`
-
-One file per hypothesis test, consistent schema.
-
-```json
-{
-  "schema_version": "1.0",
-  "test_id": "h-2.1-single-stream",
-  "run_id": "{run_id}",
-  "hypothesis": "H-2.1",
-  "started_at": "2026-04-18T15:42:11Z",
-  "ended_at": "2026-04-18T15:47:11Z",
-  "duration_sec": 300,
-  "harness_mode": "throughput-sustained",
-  "endpoint": "http://localhost:8000/v1",
-  "model": "qwen2.5-72b-instruct-awq",
-  "concurrency": 1,
-  "input": {
-    "prompt_set": "standard-agent-prompts-v1",
-    "num_prompts": 42,
-    "total_input_tokens": 21000
-  },
-  "output": {
-    "total_output_tokens": 12600,
-    "requests_completed": 42,
-    "completion_errors": 0
-  },
-  "metrics": {
-    "tokens_per_second_per_stream_median": 12.4,
-    "tokens_per_second_per_stream_p95": 10.1,
-    "tokens_per_second_per_stream_p99": 8.6,
-    "time_to_first_token_ms_median": 320,
-    "time_to_first_token_ms_p95": 580,
-    "wall_clock_per_completion_sec_median": 24.3,
-    "json_schema_validity_rate": 0.95,
-    "tool_call_success_rate": 0.92,
-    "retry_count_mean": 0.12
-  },
-  "targets": {
-    "tokens_per_second_per_stream_min": 10,
-    "json_schema_validity_rate_min": 0.90
-  },
-  "verdict": "PASS",
-  "decision_rule_applied": "H-2.1 → ≥10 tok/s single → PASS confirms 70B-local usable"
-}
-```
-
-### `metrics/nvidia-smi.csv`
-
-Time-series GPU utilization. Standard nvidia-smi CSV format.
-
-```csv
-timestamp,index,utilization.gpu [%],memory.used [MiB],temperature.gpu,power.draw [W]
-2026-04-18T15:30:22.000000,0,0,320,42,38.50
-2026-04-18T15:30:52.000000,0,87,18432,64,220.85
-2026-04-18T15:31:22.000000,0,91,18688,68,238.14
-...
-```
-
-Sample interval: 30 sec default, configurable per gate.
+**No latency is claimed for anything above, because nothing is deployed.** When a consumer is built, it gets a
+latency only once that latency has been measured.
 
 ---
 
-## Lifecycle — when each file is written
+## 12. Schema versioning
 
-```
-T+0   Provisioning
-      └─ manifest.json created with status="running"
-      └─ Start tcpdump/strace if required by gate
-
-T+0-2 min   VM boot + stack startup
-      └─ logs/startup-script.log appended in real time
-
-T+2-N min   Test execution
-      └─ Per hypothesis, metrics/h-{N}-*.json written at test end
-      └─ Per container, logs/vllm-{role}.log written continuously
-
-T+N min   Finalization (runner script)
-      └─ nvidia-smi --query-gpu=... captured to metrics/nvidia-smi.csv
-      └─ manifest.json updated with verdicts + ended_at
-      └─ summary.md auto-generated from template
-      └─ cost-report.json generated by cost-tracker.py
-      └─ obsidian-note.md rendered from template
-      └─ ALL files uploaded to gs://pantheon-evidence/gate-{N}/{run_id}/
-
-T+N min   Self-destruct
-      └─ VM deleted via trap or --max-run-duration
-```
-
----
-
-## Downstream consumers
-
-Once bundle lands in GCS, six automations trigger:
-
-### 1. Supabase extraction (within 60 sec of bundle landing)
-
-Cloud Function watches `gs://pantheon-evidence/` for new objects. On `manifest.json` write:
-
-- Row inserted into `pantheon_runs` (core metadata)
-- Per-hypothesis rows into `run_hypotheses`
-- Per-metric rows from `metrics/*.json` into `run_metrics`
-- Cost line items from `cost-report.json` into `run_costs`
-
-### 2. Pythia semantic embedding (within 5 min)
-
-- `summary.md` + observations extracted and embedded via BGE-Large
-- Inserted into Pythia corpus with tags from manifest (gate, models, verdict)
-- Now queryable: `lcs_investigate "gate 2 dual L4 concurrent serving"` returns this run
-
-### 3. Obsidian vault sync (within 5 min)
-
-- `obsidian-note.md` copied to `~/Documents/pantheon-vault/runs/{run_id}.md`
-- Git auto-commits the new note
-
-### 4. Dashboard refresh (on next hour)
-
-- Grafana / Streamlit reads Supabase, regenerates week/month trend charts
-- Cost-per-insight KPI recomputed
-
-### 5. Hypothesis tracker update (manual gate, weekly review)
-
-- Mike reviews the run, updates `open-hypotheses.md` confidence tracker
-- Candidate observations promoted to `lessons/candidates.md` if interesting
-
-### 6. Alert on failure
-
-- If `verdicts` contains any FAIL, PubSub alert fires
-- Slack/SMS notification to Mike
-
----
-
-## Storage economics
-
-| Gate | Bundle size (typical) | Cost per bundle |
-|---|---|---|
-| Gate 0 | ~2 MB | $0.00004 |
-| Gate 1 | ~10 MB | $0.0002 |
-| Gate 2 | ~15 MB | $0.0003 |
-| Gate 3 | ~20 MB | $0.0004 |
-| Gate 4 | ~35 MB | $0.0007 |
-| Gate 5 | ~80 MB | $0.0016 |
-| Gate 6 | ~10 MB | $0.0002 |
-| Gate 7 (4hr soak) | ~500 MB | $0.01 |
-
-All in standard storage at $0.020/GB/month.
-
-**100 runs/year = ~5GB of bundles = $1.20/year in storage.** Effectively free forever.
-
----
-
-## Retention policy
-
-- **All bundles retained forever.** They're the historical record.
-- **Promote interesting bundles to nearline** (via Lifecycle policy) after 90 days to save storage cost. Bundles rarely accessed after 90 days become $0.01/GB/mo instead of $0.020.
-- **NEVER delete bundles.** They're immutable evidence and represent paid compute.
-
----
-
-## Schema versioning
-
-When this spec changes:
-
-1. Increment `schema_version` field (currently `1.0`)
-2. Document breaking changes in this file's Changelog section
-3. Downstream consumers must handle both old + new schemas (no deletion of old)
-4. Migration scripts (if needed) live in `harness/migrations/`
+Increment `schema_version` on any breaking change and record it in the changelog below. **The original also promised
+migrations in `harness/migrations/`, which does not exist,** and required that "downstream consumers handle both old
+and new schemas," which is unenforceable while zero consumers are deployed. Both are deferred until there is a
+consumer to be compatible with.
 
 **Changelog:**
-- `1.0` — 2026-04-18 — initial spec
+- `1.0` (2026-04-18) initial spec, never executed.
+- `2.0` (2026-08-26) this rewrite. Breaking: bundle splits by data ownership; `manifest.json` is write-once and
+  signed; `run-state.json` separated; `total_cost_usd` no longer required; `COMPLETE` sentinel added; decision records
+  drop the confidence field; `obsidian-note.md` moves out of the bundle.
 
 ---
 
-## What this spec enables
+## 13. What this spec actually delivers
 
-Because every gate run produces a bundle with THIS format, you get for free:
+The original listed seven benefits. Four were false as written because they depended on consumers that do not exist,
+and two were overstated. Corrected:
 
-1. **Semantic search** across every run ever done (Pythia)
-2. **Structured queries** across every metric ever collected (Supabase)
-3. **Human-readable archive** (Obsidian vault)
-4. **Reproducibility** — anyone with a bundle can see exactly what config produced what result
-5. **Cost accountability** — every dollar traced to a specific run and hypothesis
-6. **Decision audit trail** — "why did we buy the RTX Pro 6000?" → evidence bundle from Gate 3 with verdict PASS and decision rule applied
-7. **Knowledge moat** — your test history IS the moat. Competitors would have to re-run every experiment to catch up.
+| Claim | Status |
+|---|---|
+| A defined, checkable bundle shape | **True**, this is what the spec delivers |
+| Auditability: what config produced what result | **True once populated.** Note this is auditability, **not reproducibility.** Reproducing a result needs pinned inputs, which is a different guarantee. |
+| Tamper evidence | **NOT BUILT.** Section 4 specifies it. |
+| Semantic search across runs | **NOT BUILT.** Requires the Pythia consumer. |
+| Structured queries across metrics | **NOT BUILT.** Requires a database consumer. |
+| Cost accountability | **NOT BUILT.** Requires real billing data per run. |
+| "Knowledge moat" | **Cut.** It was a story, not a property. A pile of test runs is not a moat, and a competitor needs a working implementation rather than your configuration history. The real value (evidence compounds if you keep it) is already covered by auditability, without the marketing. |
 
-**Evidence bundles are the primary artifact of Pantheon validation. Guard them like production data.**
+The original closed with "Guard them like production data." That was decorative: with no signing, no immutability
+enforcement, and no access separation, the sentence carried no engineering constraint. **Section 4 replaces the
+adjective with a mechanism.**
