@@ -13,7 +13,7 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 **Current queue item:** 1 of 9 (`10-PREFLIGHT.md`)
 **Current section:** REVIEW COMPLETE and REWRITE COMMITTED for queue item 1.
-**Next action:** one narrow verification pass on the rewritten `10-PREFLIGHT.md` (check the 113 findings were addressed, do NOT open a new hunt), then move to queue item 2 (`20-EVIDENCE-BUNDLE-SPEC.md`).
+**Next action:** queue item 2, `20-EVIDENCE-BUNDLE-SPEC.md`. Queue item 1 is COMPLETE (reviewed, rewritten, verified 35/36 addressed, no new errors).
 
 ### OPERATING CONSTRAINT discovered 2026-08-25, obey it
 

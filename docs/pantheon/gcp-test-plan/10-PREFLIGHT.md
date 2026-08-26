@@ -251,6 +251,13 @@ handler never fired correctly.
 It also needs real files on disk at a real path, including `requirements.txt` declaring `google-cloud-compute`. Put
 them in `harness/functions/hard-kill/`.
 
+> **NOT BUILT.** As of 2026-08-26 that directory does not exist. This section is a specification for work not yet
+> done, and it is labelled so deliberately: the original document's defining failure was describing an intended end
+> state in the present tense until a reader believed it was real. **No GCP spending happens until this function exists,
+> deploys, and passes the test in 4.3.** Until then the honest count of working spend-control layers is the ones you
+> can name and demonstrate, which right now is `--max-run-duration` with `--instance-termination-action=DELETE`, and
+> nothing else.
+
 ### 4.2 It must fail loudly
 
 The original swallowed every exception with a bare `continue`, hiding missing permissions, disabled APIs, auth
