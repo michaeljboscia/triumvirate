@@ -12,6 +12,10 @@
 
 Standing policy is **rent first, always** (`docs/pantheon/local-inference-buy-vs-rent.md` section 6). Owned metal happens only as a customer-funded terminal step: sell the outcome, pilot on rented GPUs, sign a term, and only then metal on the client's balance sheet. Never our capex.
 
+**Sharpened 2026-08-25: renting is the destination, not a waypoint.** The earlier framing still read as a sequence ending in a purchase. It does not. Renting is the primary consumption model for the foreseeable future, and the owned-metal step may never arrive. That is an acceptable outcome, not a failure of the plan.
+
+The buyer who justifies local iron needs privacy and compliance requirements so specific that the population is very small, and it shrinks further on contact: most compliance-driven prospects are satisfied by Bedrock or Vertex inside their own VPC, which is a door we can walk them through without owning anything. Nothing in this plan should be read as building toward a purchase, and no work here is justified by "it gets us closer to buying."
+
 The old plan's spine was incompatible with that:
 
 | Old plan assumed | Actually true now |
@@ -83,6 +87,13 @@ There is **no M4 Ultra**. Apple skipped it: the M4 architecture lacked the inter
 
 This is cheaper and more available than the superseded assumption (a 512GB M3 Ultra as a $23-26K scarce used-market item). **It does not reopen the buy decision for us.** The rent-first policy rests on utilization, not just sticker price, and a cheaper box does not create utilization we do not have. What it does change is the **client-side bill of materials**: a sovereign build we quote to a customer just got materially cheaper and comes new and in warranty. That helps the proposal, not our capex.
 
+**The lease case, kept honest.** A leased 512GB M5 Ultra is a different question from a purchased one and the policy above does not forbid it. A lease is monthly opex against a business, not capital tied up in a depreciating box, so the utilization math that kills the purchase does not automatically kill the lease. Two conditions keep it clean:
+
+1. **Name it for what it is.** "I want the box" is a legitimate reason. It stops being legitimate the moment it gets dressed up as a business case that this plan is supposed to have validated. Curiosity and flexing are real motives with real value (they are how capability gets discovered), and they are cheap as long as they are not laundered into a forecast.
+2. **Rent one before leasing one.** 256GB M3 Ultra is rentable today via AWS `mac-m3ultra.metal`, and the 512GB M5 Ultra is expected on rental racks late October, the same window as retail. A few days of rental at the 24-hour minimum answers whether 512GB of unified memory actually does what it promises on our workload, for roughly the cost of a nice dinner, before signing anything multi-year.
+
+Do not put a price in a lease conversation yet regardless: Apple has not published the 512GB figure.
+
 ### 3.4 Rented Apple metal exists
 
 Confirmed. This was not in the old plan at all.
@@ -104,6 +115,8 @@ Seven gates and ten pre-committed purchase rules were a control structure for a 
 ### Track A. Sovereign Proof (the product claim)
 
 **This runs first. Everything else is subordinate to it.** A control-motivated prospect does not care about tok/s if the system phones home. If the orchestration layer cannot run in a vacuum, there is no product.
+
+**Why this still leads even though almost nobody buys an air-gapped appliance.** The narrow-segment objection is correct and it does not demote this track, because the deliverable is not appliance marketing. Egress proof is **portable evidence**. The same packet capture that would satisfy a true air-gap buyer is what a control-motivated firm asks for when deploying into its own Bedrock or Vertex VPC, which is the realistic engagement. Proving the stack has no hidden phone-home is a claim we need in every deployment conversation, sovereign or not. It also happens to be the cheapest track to run, so the evidence with the widest reuse is also the least expensive to produce.
 
 1. **A0. Plumbing, CPU-only, ~$0.50.** Docker Compose, NATS, Triumvirate daemon, mock vLLM. Proves orchestration independent of inference.
 2. **A1. Air-gap proof, ~$2-5.** Formerly Gate 6. Full egress lockdown, then run the agent swarm and prove zero outbound traffic.
