@@ -11,11 +11,9 @@ conversation context are lost at compaction. If it is not written here, it did n
 
 ## RESUME HERE
 
-**Current queue item:** 6 of 9 (`local-inference-buy-vs-rent.md`)
-**Current section:** ALL 3 UNITS REVIEWED. Review of queue item 6 is COMPLETE.
-**Next action:** SPLIT `local-inference-buy-vs-rent.md` per BR3-D1. Extract the policy into a standalone directive written as the owner's decision, with reopening thresholds (BR3-R2) and real triggers on the order of operations. Demote the hardware analysis to a dated appendix with its provenance problems marked.
-
-**IMPORTANT: the policy itself is not in question and must not be weakened by the split.** The owner has affirmed it independently. The split protects it from being invalidated by a price move, since it currently rests on analysis that cannot carry it.
+**Current queue item:** 7 of 9 (`model-selection.md`, `graduated-gcp-validation-plan.md`)
+**Current section:** queue item 6 COMPLETE (reviewed, split). Policy extracted to `POLICY-rent-first.md`; analysis demoted with an accurate standing banner.
+**Next action:** queue item 7, `model-selection.md` and `graduated-gcp-validation-plan.md`. Both are April 2026 vintage and stale on models, VRAM math, and the GCP GPU lineup. Expect the same defects: purchase-era premises, unsourced benchmark tables, and present-tense claims about unbuilt things.
 
 **Unit plan for queue item 6 (3 units):**
 | Unit | Lines | Contents | Status |
@@ -87,7 +85,7 @@ Do not send DeepSeek a six-part question with a large pasted body. It will time 
 | 3 | `gcp-test-plan/30-DECISION-RULES.md` | **COMPLETE** (3 units, 3 peers, 350 to 285 lines, verified) | `6e20292` |
 | 4 | `runbooks/gate-0-plumbing.md` | **COMPLETE** (3 units, 3 peers, 314 to ~270 lines, verified) | `e675e92` |
 | 5 | `runbooks/gate-6-airgap-sanity.md` | **COMPLETE** (3 units, 3 peers, 317 to ~250 lines, verified) | `5b85ab2` |
-| 6 | `local-inference-buy-vs-rent.md` | **REVIEWED**, 3 of 3 units. Split next. | |
+| 6 | `local-inference-buy-vs-rent.md` | **COMPLETE** (3 units, 3 peers, split into `POLICY-rent-first.md` + demoted analysis) | `608d8a9` |
 | 7 | `model-selection.md`, `graduated-gcp-validation-plan.md` | pending | |
 | 8 | `runbooks/gate-1` through `gate-5`, `gate-7` | pending | |
 | 9 | `twin-review-synthesis.md` | pending | |

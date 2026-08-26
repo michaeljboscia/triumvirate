@@ -1,9 +1,42 @@
 # Local Inference Hardware and the Managed Context Retainer
 
+> **DEMOTED 2026-08-26. This is a dated research snapshot, not the authority for anything.**
+>
+> **The standing policy now lives in `POLICY-rent-first.md`.** This document prompted that decision; it does not
+> support it, and the policy does not depend on it.
+>
+> A three-peer review (`gcp-test-plan/REVIEW-PROGRESS.md`, entries BR1 through BR3) found:
+>
+> - **No crossover threshold, no cost model, and no falsification condition anywhere in the document.** It concludes
+>   "rent first, always" without stating any usage level, spend figure, or utilization at which buying would become
+>   correct. The absence of a crossover is not evidence that none exists; it is evidence the question was not asked.
+> - **Section 1 anchors on a single uncited second-hand listing** at a scarcity premium, which lets the analysis
+>   compute depreciation from an inflated baseline rather than retail and treat buying hardware as equivalent to
+>   transacting with a scalper.
+> - **Section 2 compares vendor-run benchmarks for open-weight models against independent third-party benchmarks for
+>   frontier models**, which is invalid in either direction, and it justifies a 512GB machine using a model that the
+>   same section says requires 594GB.
+> - **Section 3's throughput verdict comes from a capacity-limit test read as a representative benchmark.** It runs a
+>   418GB model on a 512GB machine, gets a poor number under obvious memory pressure, and generalizes to the
+>   machine's overall adequacy. The number is a valid capacity datapoint; the inference is not.
+> - **Section 4 evaluates enterprise cards at peak shortage pricing** and never considers the consumer multi-GPU
+>   configurations practitioners actually use.
+> - **Hardware facts have gone stale.** There is no M4 Ultra (Apple skipped it). The M5 Ultra was announced
+>   2026-08-25, with 512GB shipping late October, which removes the scarcity premise section 1 rests on.
+> - **The bibliography cites forums and aggregators where primary sources exist.**
+>
+> **What survives intact:** the observation in section 3 that benchmarks do not predict task outcomes, and that models
+> fail at integration and specification-reading rather than code generation. That is the best paragraph here.
+>
+> Read this for its reasoning and its sources, dated August 2026. **Do not cite its numbers without rechecking them,
+> and do not treat its conclusions as derived.**
+
+---
+
 **A buy-versus-rent analysis, and a product critique**
 
 **Created:** 2026-08-23
-**Status:** canonical for hardware-purchase decisions. Standing policy is rent first (section 6). Supersedes the $20K hardware premise in `graduated-gcp-validation-plan.md`, `model-selection.md`, and `twin-review-synthesis.md`.
+**Status:** DEMOTED, see banner above. Dated research snapshot, August 2026. **Not canonical for anything.** The standing policy is in `POLICY-rent-first.md`, not in section 6. This document does still supersede the $20K hardware premise in `graduated-gcp-validation-plan.md`, `model-selection.md`, and `twin-review-synthesis.md`.
 **Companion docs:**
 - `docs/pantheon/gcp-test-plan/00-MASTER-PLAN.md` - the executable test plan whose Gates 1/2/3 exist to settle these purchase decisions
 - `docs/pantheon/model-selection.md` - April 2026 model landscape, now stale on both models and VRAM math
