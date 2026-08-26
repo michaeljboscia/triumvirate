@@ -82,7 +82,7 @@ as building a weapons factory before having a target, and it is still ungated.
 ### 5. Security and compliance for client codebases as a whole
 
 August is strong on network isolation and evidence integrity. **April's concern was broader: handling a client's
-codebase securely across its whole lifecycle** — isolation between engagements, audit trail, retention, compliance
+codebase securely across its whole lifecycle**: isolation between engagements, audit trail, retention, compliance
 posture, and what happens to their source after a pilot ends.
 
 The evidence-bundle rewrite established provable destruction for client data, which is one piece. **The rest is not
@@ -127,7 +127,7 @@ plan it replaced, and this section should be read as a live warning rather than 
 
 ## Successors
 
-- `POLICY-rent-first.md` — the standing policy, extracted from the analysis that could not support it
-- `gcp-test-plan/REVIEW-PROGRESS.md` — the full August findings record
-- `EXTRACTED-from-archive.md` — what survived from documents that were archived
-- `gcp-test-plan/SIZING-SWEEP-METHOD.md` — Track B, replacing six demoted gates
+- `POLICY-rent-first.md`: the standing policy, extracted from the analysis that could not support it
+- `gcp-test-plan/REVIEW-PROGRESS.md`: the full August findings record
+- `EXTRACTED-from-archive.md`: what survived from documents that were archived
+- `gcp-test-plan/SIZING-SWEEP-METHOD.md`: Track B, replacing six demoted gates
