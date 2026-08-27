@@ -20,7 +20,23 @@ conversation context are lost at compaction. If it is not written here, it did n
 3. Source-of-truth under concurrent edits
 4. **Customer discovery as a gate BEFORE building** (nothing gates building on demand existing)
 5. Security and compliance for client codebases across their whole lifecycle
-**Next action:** the corpus is rewritten but **nothing has been executed**, which is the exact failure mode this review exists to end. April 2026 produced a correct critique nobody acted on; August has produced a correct corpus nobody has acted on. Both are paper.
+**Next action:** read **`../HANDOFF-2026-08-26.md`** first. It is the current checkpoint and supersedes this line.
+
+**Status changed 2026-08-26: execution has begun.** The sentence that used to sit here said the corpus was rewritten
+but nothing had been executed. That is no longer true.
+
+- Preflight Part 1 ran on `lenovo`, 3 of 3 pass including the GPU-in-container check.
+- GCP project `pantheon-validation-v1` is ACTIVE, billing linked, APIs on, zero spend, zero GPUs.
+- Four findings recorded in `runs/2026-08-26-first-execution.md`. **Three of them falsified documents written the
+  night before**, which is the strongest available argument that reviewing is not a substitute for running.
+
+**Highest-priority next build: a real spend stop.** Finding R-4 showed this account does NOT start at zero GPU quota
+(L4 16, A100 16, T4 8, V100 8), so the backstop the plan assumed does not exist, and finding R-3 showed the budget is
+an alert rather than a cap. Sixteen launchable L4s behind an email notification. Build the stop before the first GPU
+VM, not after.
+
+**Then Track A on `lenovo`.** Gate 0, then Gate 6. Note the box is not a dedicated rig: it hosts Graphiti's reranker,
+so budget ~9.3GB VRAM or stop `infinity` deliberately and restore it after.
 
 **Run Track A on the local box.** It costs nothing. Everything else is secondary to that.
 
