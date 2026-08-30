@@ -2928,6 +2928,12 @@ async fn run_agent_process_with_session(
 // process-static OnceLock cache stays untouched. The mock server is a
 // scripted TCP responder.
 // ─────────────────────────────────────────────────────────────────────────────
+// clippy::await_holding_lock fires on the env guards below. Holding them across the await is
+// DELIBERATE: these tests mutate process-global env, and the lock has to span the whole test,
+// including the awaited call, or a parallel test changes the env mid-flight. Dropping it before
+// the await would reintroduce exactly the race the lock exists to prevent. Test-only; no
+// production path holds a std Mutex across an await.
+#[allow(clippy::await_holding_lock)]
 #[cfg(test)]
 mod deepseek_dispatch_tests {
     use super::*;
@@ -3564,8 +3570,11 @@ mod deepseek_dispatch_tests {
         let bytes = src.as_bytes();
         let mut depth = 0i32;
         let mut body_end = body_start;
-        for i in body_start..bytes.len() {
-            match bytes[i] {
+        // Iterate with the index so the brace scanner can record where the body ENDS, which is
+        // the whole point; `enumerate` over a slice from body_start keeps clippy happy and keeps
+        // the index absolute.
+        for (i, b) in bytes.iter().enumerate().skip(body_start) {
+            match *b {
                 b'{' => depth += 1,
                 b'}' => {
                     depth -= 1;

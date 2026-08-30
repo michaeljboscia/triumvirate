@@ -23,10 +23,10 @@
 //!   - GET /api/workers      — WorkersResponse shape + empty-array semantics
 //!   - GET /api/fleet        — FleetResponse shape + empty-array semantics
 //!   - GET /api/fleet/{id}   — 404 on missing build, axum 0.8 path syntax
-//!   - GET /ws/v2            — subscribe-before-read handshake, envelope
-//!                             wire format, out_of_range close frame
+//!   - GET /ws/v2            — subscribe-before-read handshake, envelope wire
+//!     format, out_of_range close frame
 //!   - GET /ws               — legacy bootstrap frames unchanged
-//!                             (backwards-compat for `triumvirate watch`)
+//!     (backwards-compat for `triumvirate watch`)
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode};

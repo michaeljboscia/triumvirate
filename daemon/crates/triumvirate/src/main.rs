@@ -21,7 +21,6 @@ use daemon_core::{
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
 };
 #[cfg(test)]
-use daemon_core::unix_time_ms as core_unix_time_ms;
 #[cfg(test)]
 use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 #[cfg(test)]
@@ -6439,13 +6438,11 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let s3 = dispatch_and_expect_failed(stub_script.clone(), "T-016C".to_string()).await?;
         assert!(!matches!(s3, shared_types::TaskStatus::Completed));
 
-        let command_hook = PathBuf::from(
-            std::env::var("HOME")
-                .map(PathBuf::from)?
-                .join(".claude")
-                .join("hooks")
-                .join("enforce-command-scope.sh"),
-        );
+        let command_hook = std::env::var("HOME")
+            .map(PathBuf::from)?
+            .join(".claude")
+            .join("hooks")
+            .join("enforce-command-scope.sh");
         let contract_path = project_root.join(".triumvirate").join("contract-red-team.json");
         fs::create_dir_all(contract_path.parent().unwrap_or(&project_root))?;
         fs::write(
@@ -7356,7 +7353,7 @@ mod pantheon_ws_replay_tests {
 
         let duplicate = encode_ws_event(
             "agent_stream",
-            serde_json::to_value(&make_event(3)).unwrap(),
+            serde_json::to_value(make_event(3)).unwrap(),
         );
         let _ = state.ws_events.send(duplicate);
 

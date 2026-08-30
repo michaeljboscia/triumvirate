@@ -208,28 +208,27 @@ async fn probe_03_streaming_emits_reasoning_then_content_then_usage_then_done() 
             };
             // Capture usage from ANY chunk that carries it (DeepSeek may emit it in an
             // empty-choices chunk OR alongside the final content chunk — be resilient).
-            if let Some(u) = v.get("usage") {
-                if !u.is_null() && u.as_object().is_some_and(|m| !m.is_empty()) {
-                    usage_obj = Some(u.clone());
-                    saw_usage_chunk = true;
-                }
+            if let Some(u) = v.get("usage")
+                && !u.is_null()
+                && u.as_object().is_some_and(|m| !m.is_empty())
+            {
+                usage_obj = Some(u.clone());
+                saw_usage_chunk = true;
             }
             if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
                 for choice in choices {
                     if let Some(delta) = choice.get("delta") {
-                        if let Some(rc) =
-                            delta.get("reasoning_content").and_then(|x| x.as_str())
+                        if let Some(rc) = delta.get("reasoning_content").and_then(|x| x.as_str())
+                            && !rc.is_empty()
                         {
-                            if !rc.is_empty() {
-                                saw_reasoning_delta = true;
-                                reasoning_acc.push_str(rc);
-                            }
+                            saw_reasoning_delta = true;
+                            reasoning_acc.push_str(rc);
                         }
-                        if let Some(c) = delta.get("content").and_then(|x| x.as_str()) {
-                            if !c.is_empty() {
-                                saw_content_delta = true;
-                                content_acc.push_str(c);
-                            }
+                        if let Some(c) = delta.get("content").and_then(|x| x.as_str())
+                            && !c.is_empty()
+                        {
+                            saw_content_delta = true;
+                            content_acc.push_str(c);
                         }
                     }
                     if let Some(fr) = choice.get("finish_reason").and_then(|x| x.as_str()) {

@@ -99,7 +99,6 @@ pub async fn execute_ask_agent_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_types::AskAgentRequest;
 
     // NOTE: Full integration tests require a running daemon + agent.
     // These tests verify the adapter plumbing and channel mechanics.

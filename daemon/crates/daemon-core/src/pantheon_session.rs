@@ -163,6 +163,12 @@ mod tests {
     /// `tokio::spawn`. This test documents and enforces that behavior so
     /// nobody is surprised when they refactor dispatch code and lineage
     /// silently becomes None.
+    // clippy::async_yields_async fires because this scope's async block yields a JoinHandle,
+    // which is itself awaitable. That is DELIBERATE and load-bearing: the handle must escape the
+    // scope so it can be awaited OUTSIDE it. Awaiting inside would resolve the spawned task while
+    // the task-local is still in scope and destroy the thing under test, which is precisely that
+    // `tokio::spawn` does NOT inherit it.
+    #[allow(clippy::async_yields_async)]
     #[tokio::test]
     async fn tokio_spawn_does_not_inherit_task_local() {
         let ctx = Arc::new(PantheonSessionContext::new("pantheon-123"));
