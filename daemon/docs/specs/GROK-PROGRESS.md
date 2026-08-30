@@ -21,7 +21,16 @@ Deployed via `scripts/install.sh` (IRON LAW: never run production from `target/`
 
 **REQ-GROK-013 confirmed live:** the lifecycle read `SPAWNED, WORKING, DONE` with `on attempt 1`. No retry.
 
-### One config change was required and is NOT in the repo
+### RESOLVED in Slice M: the config change is no longer required
+
+`resolve_connector_command` now falls back to `$HOME/.local/bin/<name>` when a bare binary name is not on PATH.
+Verified by REMOVING `TRIUMVIRATE_GROK_BIN` from `~/.claude.json` entirely, reinstalling, restarting the daemon, and
+confirming grok still answers. A fresh clone works with no per-machine config.
+
+Precedence: explicit `TRIUMVIRATE_*_BIN` always wins (an operator-set path is authoritative and must never be
+second-guessed), then PATH, then the install dir, then the bare name so failure stays a normal ENOENT.
+
+### The original problem, for the record
 
 The daemon runs with `env -i` and a PATH of `/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, which does **not**
 include `~/.local/bin`. A bare `grok` therefore ENOENT'd. Fixed by adding to the triumvirate MCP env block in

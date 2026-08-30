@@ -259,8 +259,18 @@ impl GrokStreamParser {
 
             "tool_call_update" => {
                 let id = json.get("toolCallId").and_then(Value::as_str);
-                let completed =
-                    json.get("status").and_then(Value::as_str) == Some("completed");
+                // A real capture showed `tool_call_update` arriving with `"status": null` as an
+                // intermediate progress ping, BEFORE the terminal update. Treating a missing
+                // status as "not completed" marked the call FAILED on that ping. Here a later
+                // update happened to correct it, but a call whose last update carries a null
+                // status would be reported as failed outright. So: null means NO VERDICT.
+                let status = json.get("status").and_then(Value::as_str);
+                let Some(status) = status else {
+                    // Progress only. Record a display event, change no outcome.
+                    let ev = self.event(WorkingState::ToolCallStarted, "in progress");
+                    return self.record(ev);
+                };
+                let completed = status == "completed";
                 // Match on id so out-of-order updates attach to the right call.
                 // Prefer the LAST still-open call with this id. Grok should not reuse ids, but
                 // if it does, `find` would attach every update to the first one and leave the
@@ -672,6 +682,89 @@ mod tests {
         }
         // The ACP `kind` field still wins when present.
         assert_eq!(map_tool_kind(Some("read"), "totally_unknown_tool"), ToolKind::ReadFile);
+    }
+
+
+    /// A REAL tool-using capture from grok 1.0.13. The earlier fixtures invoked no tools, so
+    /// every tool assertion until now was written against the spec rather than observed bytes.
+    /// This capture immediately contradicted the spec in two places.
+    const TOOLS_FIXTURE: &str =
+        include_str!("../tests/fixtures/grok-streaming-tools-20260830.jsonl");
+
+    #[test]
+    fn u_c_20_real_tool_capture_records_one_successful_read() {
+        let mut p = GrokStreamParser::new();
+        for l in TOOLS_FIXTURE.lines() {
+            let _ = p.parse_line(l);
+        }
+        let full = p.finish_full();
+        let r = &full.parsed;
+
+        assert_eq!(r.tool_calls.len(), 1, "one read_file call in the capture");
+        let c = &r.tool_calls[0];
+        assert_eq!(c.tool, "read_file");
+        assert_eq!(c.kind, ToolKind::ReadFile);
+        assert_eq!(c.success, Some(true), "the call completed; a null-status ping must not fail it");
+        // rawInput uses `target_file`, not the `path` the vendor guide's example showed.
+        assert!(c.args_json.as_deref().unwrap_or("").contains("target_file"));
+        assert!(r.response_text.contains("ZEPHYR_MARKER_9931"), "the tool result reached the answer");
+        assert_eq!(full.termination, Termination::EndTurn);
+    }
+
+    /// The spec's example used `"status":"in_progress"`; the real binary emits `"pending"`, then a
+    /// `null`-status ping, then `"completed"`. Only the last is a verdict.
+    #[test]
+    fn u_c_21_a_null_status_update_is_progress_not_failure() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"tool_call","toolCallId":"x","toolName":"read_file","kind":"read","status":"pending"}"#);
+        p.parse_line(r#"{"type":"tool_call_update","toolCallId":"x","status":null,"locations":[{"path":"a.txt"}]}"#);
+        let mid = p.finish_full().parsed;
+        assert_eq!(mid.tool_calls[0].success, None, "a null-status ping must leave the outcome UNSET");
+
+        // And the terminal update still decides.
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"tool_call","toolCallId":"x","toolName":"read_file","kind":"read","status":"pending"}"#);
+        p.parse_line(r#"{"type":"tool_call_update","toolCallId":"x","status":null}"#);
+        p.parse_line(r#"{"type":"tool_call_update","toolCallId":"x","status":"completed"}"#);
+        assert_eq!(p.finish().tool_calls[0].success, Some(true));
+    }
+
+    /// Thoughts must contribute ZERO characters even on a long, tool-using turn. This capture
+    /// carries 46 of them.
+    ///
+    /// The invariant is exact rather than a keyword search: grok streams thoughts as tiny deltas
+    /// (the first is literally "The"), so no distinctive substring exists to look for. Instead,
+    /// response_text must equal the concatenation of `text` events and nothing else. Note grok
+    /// legitimately narrates inside `text` ("I'll read target.txt now..."), which is answer prose,
+    /// not chain of thought, so a naive "no narration" assertion would be wrong.
+    #[test]
+    fn u_c_22_thoughts_contribute_exactly_zero_characters() {
+        let mut thought_chars = 0usize;
+        let mut text_only = String::new();
+        let mut n_thoughts = 0usize;
+        for l in TOOLS_FIXTURE.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
+            match v.get("type").and_then(Value::as_str) {
+                Some("thought") => {
+                    n_thoughts += 1;
+                    thought_chars += v.get("data").and_then(Value::as_str).unwrap_or("").len();
+                }
+                Some("text") => text_only.push_str(v.get("data").and_then(Value::as_str).unwrap_or("")),
+                _ => {}
+            }
+        }
+        assert!(n_thoughts >= 40, "fixture must carry many thoughts, found {n_thoughts}");
+        assert!(thought_chars > 200, "thoughts must be substantial, found {thought_chars} chars");
+
+        let mut p = GrokStreamParser::new();
+        for l in TOOLS_FIXTURE.lines() {
+            let _ = p.parse_line(l);
+        }
+        assert_eq!(
+            p.finish().response_text,
+            text_only,
+            "response_text must be EXACTLY the text events; {thought_chars} chars of thought leaked"
+        );
     }
 
 }

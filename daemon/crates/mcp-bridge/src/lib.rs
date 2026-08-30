@@ -437,16 +437,68 @@ pub fn codex_protocol() -> String {
         .unwrap_or_else(|| "exec".to_string())
 }
 
+/// Where agent CLIs are installed when they are not on the daemon's PATH.
+///
+/// The daemon is exec'd with `env -i` and a PATH of
+/// `/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, which does NOT include `~/.local/bin`.
+/// That is where `claude`, `codex` and `grok` actually live, so a bare binary name ENOENTs with
+/// `No such file or directory (os error 2)` and the dispatch fails with no hint about why.
+///
+/// This was invisible until grok was added, because every other agent had an absolute
+/// `TRIUMVIRATE_*_BIN` hand-set in the operator's `~/.claude.json`. That is per-machine config
+/// the repo cannot carry, so a fresh clone failed and the fix was undiscoverable.
+const FALLBACK_BIN_DIRS: &[&str] = &[".local/bin"];
+
+/// Resolve a connector binary.
+///
+/// Precedence: explicit `TRIUMVIRATE_*_BIN` wins, then the bare name if it is on PATH, then a
+/// known install directory under `$HOME`. Absolute paths and anything containing a separator are
+/// returned untouched.
 fn resolve_connector_command(
     bin_env: &str,
     args_env: &str,
     default_bin: &str,
 ) -> (String, Vec<String>) {
-    let bin = std::env::var(bin_env).unwrap_or_else(|_| default_bin.to_string());
+    let configured = std::env::var(bin_env).ok().filter(|v| !v.trim().is_empty());
+    let bin = match configured {
+        // An operator-set path is authoritative. Never second-guess it: silently substituting a
+        // different binary than the one asked for is worse than failing.
+        Some(explicit) => explicit,
+        None => resolve_on_path_or_fallback(default_bin),
+    };
     let args = std::env::var(args_env)
         .map(|v| v.split_whitespace().map(ToString::to_string).collect())
         .unwrap_or_else(|_| Vec::new());
     (bin, args)
+}
+
+/// Return `name` if it resolves on PATH, otherwise the first `$HOME/<dir>/<name>` that exists.
+/// Falls back to the bare name so the failure stays a normal ENOENT rather than a silent no-op.
+fn resolve_on_path_or_fallback(name: &str) -> String {
+    if name.contains(std::path::MAIN_SEPARATOR) {
+        return name.to_string();
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join(name).is_file() {
+                return name.to_string();
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        for d in FALLBACK_BIN_DIRS {
+            let candidate = std::path::Path::new(&home).join(d).join(name);
+            if candidate.is_file() {
+                tracing::debug!(
+                    binary = name,
+                    resolved = %candidate.display(),
+                    "connector not on PATH; resolved from a known install directory"
+                );
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.to_string()
 }
 
 #[cfg(test)]
@@ -877,6 +929,81 @@ mod tests {
         let (bin, args) = super::grok_command();
         assert_eq!(bin, "grok", "there is no `supergrok` executable");
         assert!(args.is_empty());
+    }
+
+    // ---- Slice M: connector resolution. The gap that only appeared on deployment. ----
+
+    /// The daemon runs with a PATH that excludes ~/.local/bin, where claude, codex and grok
+    /// actually live, so a bare name ENOENTs. Every other agent hid this behind an absolute
+    /// TRIUMVIRATE_*_BIN hand-set in the operator's ~/.claude.json, which the repo cannot carry.
+    #[test]
+    fn u_m_01_binary_missing_from_path_resolves_from_the_install_dir() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("tv-resolve-{}", std::process::id()));
+        let bindir = home.join(".local/bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("fakeagent");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+
+        // SAFETY: guarded by env_lock.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("PATH", "/usr/bin:/bin");
+            std::env::remove_var("TRIUMVIRATE_FAKE_BIN");
+            std::env::remove_var("TRIUMVIRATE_FAKE_ARGS");
+        }
+        let (bin, _) = super::resolve_connector_command(
+            "TRIUMVIRATE_FAKE_BIN", "TRIUMVIRATE_FAKE_ARGS", "fakeagent",
+        );
+        assert_eq!(bin, fake.to_string_lossy(), "must resolve from ~/.local/bin, not ENOENT");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An operator-set path is authoritative. Silently substituting a different binary than the
+    /// one asked for is worse than failing.
+    #[test]
+    fn u_m_02_explicit_bin_env_always_wins() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_FAKE_BIN", "/opt/custom/agent") };
+        let (bin, _) = super::resolve_connector_command(
+            "TRIUMVIRATE_FAKE_BIN", "TRIUMVIRATE_FAKE_ARGS", "fakeagent",
+        );
+        assert_eq!(bin, "/opt/custom/agent");
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_FAKE_BIN") };
+    }
+
+    /// A name genuinely on PATH stays bare, so PATH order keeps working normally.
+    #[test]
+    fn u_m_03_binary_on_path_is_left_alone() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded by env_lock.
+        unsafe {
+            std::env::set_var("PATH", "/usr/bin:/bin");
+            std::env::remove_var("TRIUMVIRATE_FAKE_BIN");
+        }
+        let (bin, _) = super::resolve_connector_command(
+            "TRIUMVIRATE_FAKE_BIN", "TRIUMVIRATE_FAKE_ARGS", "env",
+        );
+        assert_eq!(bin, "env", "an on-PATH binary must not be rewritten to an absolute path");
+    }
+
+    /// Unresolvable stays bare so the failure is a normal ENOENT naming the binary, not a
+    /// confusing path the operator never configured.
+    #[test]
+    fn u_m_04_unresolvable_binary_stays_bare() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded by env_lock.
+        unsafe {
+            std::env::set_var("PATH", "/nonexistent");
+            std::env::set_var("HOME", "/nonexistent");
+            std::env::remove_var("TRIUMVIRATE_FAKE_BIN");
+        }
+        let (bin, _) = super::resolve_connector_command(
+            "TRIUMVIRATE_FAKE_BIN", "TRIUMVIRATE_FAKE_ARGS", "definitely-not-installed",
+        );
+        assert_eq!(bin, "definitely-not-installed");
     }
 
 }
