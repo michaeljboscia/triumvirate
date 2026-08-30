@@ -11,9 +11,9 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 | B invocation builder | **DONE**, 20 tests green | `68c10d3` + fixes | Codex, Antigravity (Grok hit max-turns) |
 | C parser | **DONE**, 21 tests green vs real fixtures | `4c8d8d3` + fixes | Codex (5 defects found and fixed) |
 | D spawn/dispatch + defects 2,3 | **DONE**, 179 tests green | `e41a55d` | awaiting peer review |
-| E doctor/README/aliases + defect 1 | **DONE**, 222 tests green | | |
-| F mock binary + integration | NEXT | | |
-| G peer-review panel | | | |
+| E doctor/README/aliases + defect 1 | **DONE**, 222 tests green | `cc192b2` | |
+| F mock binary + integration | **DONE**, 14 integration + 2 live-gated | | |
+| G peer-review panel | NEXT | | |
 | H fleet | | | |
 | I ABE | | | |
 | J token-economics | | | |
