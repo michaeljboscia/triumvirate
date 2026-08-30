@@ -59,6 +59,22 @@ pub fn grok_max_turns() -> u32 {
         .unwrap_or(20)
 }
 
+/// REQ-GROK-019: write containment for the consult path, the equivalent of agy's H4 rule.
+/// Verified profiles on grok 1.0.13: `workspace`, `read-only`, `strict`, `off`.
+///
+/// **An unknown profile does NOT fail.** It prints "sandbox could not be applied" to stderr and
+/// the run continues with NO containment. So the runner must treat that string as a hard error;
+/// a silently-unsandboxed consult is worse than a refused one.
+pub fn grok_sandbox_profile() -> Option<String> {
+    match std::env::var("TRIUMVIRATE_GROK_SANDBOX").ok().as_deref() {
+        Some("off") | Some("") => None,
+        Some(p) => Some(p.to_string()),
+        // Default: reads allowed, writes denied. A consult must not mutate the workspace
+        // because a tool call was hallucinated or auto-approved.
+        None => Some("read-only".to_string()),
+    }
+}
+
 pub fn grok_model() -> Option<String> {
     std::env::var("TRIUMVIRATE_GROK_MODEL").ok().filter(|s| !s.trim().is_empty())
 }
@@ -103,13 +119,69 @@ const FORBIDDEN_EXTRA_FLAGS: &[&str] = &[
     "--reasoning-effort",
     "--no-auto-update",
     "--no-alt-screen",
+    // Named by Codex from the live `grok --help`. Each one lets an operator change what the
+    // agent IS, what it may touch, or where it runs, all of which Triumvirate owns.
+    "--system-prompt",
+    "--system-prompt-override",
+    "--agent",
+    "--agents",
+    "--allow",
+    "--allowedTools",
+    "--allowed-tools",
+    "--deny",
+    "--disallowedTools",
+    "--leader-socket",
+    "--no-subagents",
+    "--no-plan",
+    "--restore-code",
+    "--rules",
+    "--verbatim",
+    "--include-partial-messages",
+    "--disable-web-search",
+    "-w",
+    "--worktree",
+    "--worktree-ref",
+    "--ref",
 ];
+
+/// Managed flags in short form. Checked separately because clustered shorts (`-rp`) and
+/// joined values (`-mfoo`) never match a whole-token comparison.
+const FORBIDDEN_SHORT_FLAGS: &[char] = &['p', 'r', 's', 'c', 'o', 'm', 'w'];
+
+/// A session id or cwd that begins with `-` is parsed by clap as the NEXT FLAG, not as the
+/// value of the one before it. `--resume -c` becomes `--resume` with no argument followed by
+/// `--continue`, which is precisely the bare-resume cross-talk this module exists to prevent.
+/// Found by Codex in review of the first draft.
+fn validate_argv_value(kind: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("grok {kind} must not be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "grok {kind} {value:?} begins with '-': clap would parse it as a flag rather than a \
+             value, silently changing the invocation"
+        ));
+    }
+    Ok(())
+}
 
 /// Reject operator extra-args that would override a Triumvirate-managed flag. Matches both the
 /// spaced form (`--model x`) and the joined form (`--model=x`); checking only one is a hole.
 fn validate_extra_args(extra: &[String]) -> Result<(), String> {
     for arg in extra {
         let flag = arg.split('=').next().unwrap_or(arg);
+        // Clustered or joined shorts: `-rp`, `-mfoo`, `-sUUID`. A whole-token match misses all
+        // of these, so inspect every character of a short-flag cluster.
+        if flag.starts_with('-')
+            && !flag.starts_with("--")
+            && flag.len() > 1
+            && let Some(c) = flag.chars().skip(1).find(|c| FORBIDDEN_SHORT_FLAGS.contains(c))
+        {
+            return Err(format!(
+                "TRIUMVIRATE_GROK_ARGS contains forbidden short flag '-{c}' inside {flag:?}: grok \
+                 session, output, approval and context flags are managed by Triumvirate"
+            ));
+        }
         if FORBIDDEN_EXTRA_FLAGS.contains(&flag) {
             return Err(format!(
                 "TRIUMVIRATE_GROK_ARGS contains forbidden flag {flag:?}: grok session, output, \
@@ -154,8 +226,12 @@ pub fn build_grok_invocation(
                     .to_string(),
             );
         }
+        validate_argv_value("resume session id", id)?;
         Some(id.to_string())
     } else {
+        if let Some(id) = session_id.filter(|s| !s.trim().is_empty()) {
+            validate_argv_value("session id", id)?;
+        }
         None
     };
 
@@ -171,6 +247,7 @@ pub fn build_grok_invocation(
     args.push(if grok_streaming_enabled() { "streaming-json" } else { "json" }.to_string());
 
     if !cwd.trim().is_empty() {
+        validate_argv_value("cwd", cwd)?;
         args.push("--cwd".to_string());
         args.push(cwd.to_string());
     }
@@ -199,6 +276,13 @@ pub fn build_grok_invocation(
 
     args.push("--max-turns".to_string());
     args.push(grok_max_turns().to_string());
+
+    // Containment before approval, so the ordering reads as the policy it is: contain first,
+    // then decide what may be approved inside that containment.
+    if let Some(profile) = grok_sandbox_profile() {
+        args.push("--sandbox".to_string());
+        args.push(profile);
+    }
 
     if grok_yolo_enabled() {
         args.push("--always-approve".to_string());
@@ -429,4 +513,96 @@ mod tests {
         assert_eq!(build(None, false).unwrap().timeout, Duration::from_secs(42));
         clear_env();
     }
+
+    // ---- Defects found in peer review of the first draft ----
+
+    /// Codex: a session id beginning with '-' is parsed by clap as the next FLAG, so
+    /// `--resume -c` becomes a bare `--resume` followed by `--continue`. That is the exact
+    /// cross-talk this module exists to prevent, reached through the flag it recommends.
+    #[test]
+    fn u_b_15_session_id_cannot_inject_a_flag() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        for hostile in ["-c", "--continue", "-p", "--always-approve", "-"] {
+            assert!(build(Some(hostile), true).is_err(), "resume id {hostile:?} must be rejected");
+            assert!(build(Some(hostile), false).is_err(), "session id {hostile:?} must be rejected");
+        }
+        // A legitimate uuid still works.
+        assert!(build(Some("CD94C2BD-530A-48E7-8EA4-91D7853CE6B0"), false).is_ok());
+    }
+
+    #[test]
+    fn u_b_16_cwd_cannot_inject_a_flag() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        assert!(build_grok_invocation("grok", &[], "hi", "--always-approve", None, false).is_err());
+        assert!(build_grok_invocation("grok", &[], "hi", "/tmp/ok", None, false).is_ok());
+    }
+
+    /// Codex: `split('=')` catches `--model=x` but never `-rp` or `-mfoo`.
+    #[test]
+    fn u_b_17_clustered_and_joined_short_flags_are_caught() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        for hostile in ["-rp", "-mfoo", "-sUUID", "-pc", "-o"] {
+            let err = build_grok_invocation("grok", &[hostile.to_string()], "hi", "/tmp", None, false)
+                .expect_err("{hostile} must be rejected");
+            assert!(err.contains("forbidden"), "{hostile}: {err}");
+        }
+        // A short flag grok owns but Triumvirate does not must still pass.
+        assert!(build_grok_invocation("grok", &["-h".to_string()], "hi", "/tmp", None, false).is_ok());
+    }
+
+    /// Antigravity: agy denies workspace writes on the consult path (its H4 rule) and grok had
+    /// no containment at all, while grok's own config sets permission_mode = "always-approve".
+    #[test]
+    fn u_b_18_consults_are_write_contained_by_default() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        assert_eq!(value_after(&build(None, false).unwrap().args, "--sandbox").as_deref(),
+            Some("read-only"), "a consult must not be able to mutate the workspace");
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "off") };
+        assert!(!build(None, false).unwrap().args.contains(&"--sandbox".to_string()),
+            "containment must be disableable, but only deliberately");
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "workspace") };
+        assert_eq!(value_after(&build(None, false).unwrap().args, "--sandbox").as_deref(), Some("workspace"));
+        clear_env();
+    }
+
+    /// Codex: `value_after` returns the FIRST match, so a duplicated managed flag would go
+    /// unnoticed. grok takes the last occurrence, so a duplicate silently wins.
+    #[test]
+    fn u_b_19_managed_flags_appear_exactly_once() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        // SAFETY: guarded by env_lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GROK_MODEL", "grok-4.6-build");
+            std::env::set_var("TRIUMVIRATE_GROK_EFFORT", "high");
+        }
+        let inv = build(Some("sess-1"), true).unwrap();
+        for flag in ["--output-format", "--cwd", "--resume", "--max-turns", "-m", "--effort", "-p", "--sandbox"] {
+            let n = inv.args.iter().filter(|a| *a == flag).count();
+            assert_eq!(n, 1, "{flag} appears {n} times; grok takes the LAST, so a duplicate silently wins");
+        }
+        assert_eq!(inv.args.iter().filter(|a| *a == "--session-id").count(), 0);
+        clear_env();
+    }
+
+    /// Every entry in the forbidden list must actually be rejected. Sampling six of them, as the
+    /// first draft did, leaves the rest asserted only by inspection.
+    #[test]
+    fn u_b_20_every_forbidden_flag_is_actually_rejected() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        for flag in FORBIDDEN_EXTRA_FLAGS {
+            let spaced = build_grok_invocation("grok", &[flag.to_string(), "v".into()], "hi", "/tmp", None, false);
+            assert!(spaced.is_err(), "{flag} (spaced) must be rejected");
+            let joined = build_grok_invocation("grok", &[format!("{flag}=v")], "hi", "/tmp", None, false);
+            assert!(joined.is_err(), "{flag}=v (joined) must be rejected");
+        }
+    }
+
 }

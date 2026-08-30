@@ -1,0 +1,25 @@
+{
+  "run_id": "smoke-longtx",
+  "profile": {
+    "name": "long-tx",
+    "hold_ms": 100
+  },
+  "workers": 30,
+  "duration_secs": 20,
+  "started_at": "2026-04-19T09:08:35.950508Z",
+  "finished_at": "2026-04-19T09:09:05.857164Z",
+  "metrics": {
+    "p50_ms": 141.823,
+    "p95_ms": 2738.175,
+    "p99_ms": 3258.367,
+    "p99_9_ms": 3364.863,
+    "busy_retries": 0,
+    "busy_rate": 0.0,
+    "successful_ops": 103,
+    "reads_completed": 0,
+    "failed_ops": 0,
+    "wal_peak_mb": 2.49896240234375,
+    "process_cpu_pct": 0.481,
+    "system_load_avg_1m": 11.707
+  }
+}

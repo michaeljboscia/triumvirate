@@ -1,0 +1,27 @@
+{
+  "trials": [
+    {
+      "trial_id": 1,
+      "pre_crash_count": 15383,
+      "post_crash_count": 15386,
+      "integrity_ok": true,
+      "wal_replay_duration_ms": 18
+    },
+    {
+      "trial_id": 2,
+      "pre_crash_count": 15357,
+      "post_crash_count": 15360,
+      "integrity_ok": true,
+      "wal_replay_duration_ms": 20
+    },
+    {
+      "trial_id": 3,
+      "pre_crash_count": 15402,
+      "post_crash_count": 15404,
+      "integrity_ok": true,
+      "wal_replay_duration_ms": 19
+    }
+  ],
+  "all_integrity_ok": true,
+  "total_trials": 3
+}

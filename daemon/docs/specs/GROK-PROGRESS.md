@@ -8,8 +8,8 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 | Slice | State | Commit | Peers reviewed |
 |---|---|---|---|
 | A identity + `supported_agent_names()` | **DONE** | `3893d27` | not reviewed (mechanical) |
-| B invocation builder | CODE DONE, 14 tests green, awaiting peer review | | |
-| C parser | | | |
+| B invocation builder | **DONE**, 20 tests green | `68c10d3` + fixes | Codex, Antigravity (Grok hit max-turns) |
+| C parser | NEXT | | |
 | D spawn/dispatch + defects 2,3 | | | |
 | E doctor/README/aliases + defect 1 | | | |
 | F mock binary + integration | | | |
@@ -44,6 +44,34 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 - `input_tokens` and `cache_read_input_tokens` are SEPARATE counters. Total context is their sum.
 - Fixtures committed: `agent-adapter/tests/fixtures/grok-streaming-{20260830,lean-20260830,isolated-20260830}.jsonl`.
 - **Fixture gap:** none contain `tool_call` events. Tool mapping is spec-derived, not observed.
+
+## Peer findings fixed in Slice B (do not reintroduce)
+
+- **Flag injection via session id / cwd** (Codex). A value starting with `-` is parsed by clap as the next FLAG, so
+  `--resume -c` becomes a bare `--resume` plus `--continue`. `validate_argv_value` rejects it. Tests u_b_15, u_b_16.
+- **Clustered short flags** (Codex). `split('=')` catches `--model=x` but never `-rp` or `-mfoo`.
+  `FORBIDDEN_SHORT_FLAGS` inspects every char of a short cluster. Test u_b_17.
+- **20 missing forbidden flags** (Codex, from live `grok --help`): `--system-prompt-override`, `--leader-socket`,
+  `--worktree`, `--agents`, `--allowedTools`, `--rules`, `--restore-code` and more.
+- **No write containment** (Antigravity). agy denies workspace writes on the consult path via sandbox-exec; grok had
+  nothing, while grok's own config sets `permission_mode = "always-approve"`. Now emits `--sandbox read-only` by
+  default. Test u_b_18.
+- **Duplicate managed flags** (Codex). `value_after` returns the first match; grok takes the LAST, so a duplicate
+  silently wins. Test u_b_19 asserts each managed flag appears exactly once.
+- **Sampled rather than exhaustive forbidden-flag coverage** (Codex). Test u_b_20 now iterates the whole list.
+
+## Verified sandbox behavior (matters for Slice D)
+
+Profiles on grok 1.0.13: `workspace`, `read-only`, `strict`, `off`. **An unknown profile does NOT fail.** It warns
+`sandbox could not be applied` on stderr and runs with NO containment. **The Slice D runner must treat that string as
+a hard error**, or a consult silently runs uncontained.
+
+## Open from peer review, not yet addressed
+
+- **Antigravity B:** validation lives in the builder; they argue the trust boundary is `agent_exec.rs`. Kept in the
+  builder as defense in depth since it is the single source of truth for argv. Revisit in Slice D.
+- **Antigravity E:** `prompt` is baked into argv, coupling the module to single-turn use. Fleet workers (Slice H) may
+  need prompt delivery via stdin. Revisit there rather than speculatively generalizing now.
 
 ## Pre-existing defects in scope
 

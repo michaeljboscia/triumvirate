@@ -1,0 +1,25 @@
+{
+  "run_id": "smoke-mixed",
+  "profile": {
+    "name": "mixed-rw",
+    "read_pct": 25
+  },
+  "workers": 30,
+  "duration_secs": 20,
+  "started_at": "2026-04-19T09:09:06.314595Z",
+  "finished_at": "2026-04-19T09:09:35.333813Z",
+  "metrics": {
+    "p50_ms": 0.775,
+    "p95_ms": 44.767,
+    "p99_ms": 96.255,
+    "p99_9_ms": 97.151,
+    "busy_retries": 0,
+    "busy_rate": 0.0,
+    "successful_ops": 107,
+    "reads_completed": 27,
+    "failed_ops": 0,
+    "wal_peak_mb": 1.9449539184570312,
+    "process_cpu_pct": 0.21125,
+    "system_load_avg_1m": 9.831
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "run_id": "break-n500-sustained",
+  "profile": {
+    "name": "sustained"
+  },
+  "workers": 500,
+  "duration_secs": 60,
+  "started_at": "2026-04-19T09:15:05.205948Z",
+  "finished_at": "2026-04-19T09:16:14.951546Z",
+  "metrics": {
+    "p50_ms": 0.738,
+    "p95_ms": 292.607,
+    "p99_ms": 1636.351,
+    "p99_9_ms": 2254.847,
+    "busy_retries": 0,
+    "busy_rate": 0.0,
+    "successful_ops": 4837,
+    "reads_completed": 0,
+    "failed_ops": 0,
+    "wal_peak_mb": 4.043113708496094,
+    "process_cpu_pct": 5.36775,
+    "system_load_avg_1m": 3.386
+  }
+}
