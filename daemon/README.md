@@ -83,6 +83,10 @@ cargo run -p triumvirate -- doctor
 
 - `TRIUMVIRATE_GEMINI_BIN`, `TRIUMVIRATE_GEMINI_ARGS`
 - `TRIUMVIRATE_CODEX_BIN`, `TRIUMVIRATE_CODEX_ARGS`
+- `TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS` (default `300`) is how long a client waits for one agent
+  turn. It is client-side patience, not a server kill: the daemon keeps working and says so. Too
+  low turns a slow success into a reported failure while still paying for the work, which is what
+  180 was doing to peer reviews that read files before answering.
 - `TRIUMVIRATE_GROK_BIN`, `TRIUMVIRATE_GROK_ARGS` (binary is `grok`; there is no `supergrok` executable)
 - `TRIUMVIRATE_GROK_MODEL`, `TRIUMVIRATE_GROK_EFFORT`
 - `TRIUMVIRATE_GROK_MAX_TURNS` (default `20`; every turn re-ships the whole system prompt, so turns are the unit of spend)

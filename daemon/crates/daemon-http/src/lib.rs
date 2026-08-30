@@ -72,7 +72,17 @@ static DAEMON_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build shared daemon HTTP client")
 });
 const DEFAULT_DAEMON_HTTP_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_DAEMON_ASK_TIMEOUT_SECS: u64 = 180;
+/// How long a client waits for the daemon to finish an `ask_agent` turn.
+///
+/// Raised from 180s to 300s on 2026-08-30. 180 was cutting off real work rather than catching
+/// hangs: a grok peer review that read several source files and probed its own binary exceeded it
+/// and was reported as a timeout while the daemon was still working normally. The same shape
+/// applies to any agent asked to read before answering.
+///
+/// This is a CLIENT-side patience limit, not a server-side kill: the daemon keeps working and the
+/// error says so. Too low is therefore worse than too high, because it turns a slow success into
+/// a reported failure while still paying for the work.
+const DEFAULT_DAEMON_ASK_TIMEOUT_SECS: u64 = 300;
 
 /// Why a request to the daemon failed.
 ///
@@ -1849,4 +1859,21 @@ mod daemon_request_failure_tests {
 
         let _ = std::fs::remove_dir_all(&home);
     }
+    /// The ask timeout is a client-side patience limit, not a server kill. It was raised to 300s
+    /// after 180s cut off a legitimate grok peer review that read source files before answering.
+    /// Asserted so a future edit is a decision rather than a drift.
+    #[test]
+    fn u_timeout_01_ask_timeout_default_is_300s_and_env_overridable() {
+        assert_eq!(
+            super::DEFAULT_DAEMON_ASK_TIMEOUT_SECS,
+            300,
+            "lowering this turns slow successes into reported failures while still paying for the work"
+        );
+        // Must be well above the plain HTTP timeout: an agent turn is not a status check.
+        assert!(
+            super::DEFAULT_DAEMON_ASK_TIMEOUT_SECS > super::DEFAULT_DAEMON_HTTP_TIMEOUT_SECS * 5,
+            "an agent turn needs far more patience than a health probe"
+        );
+    }
+
 }
