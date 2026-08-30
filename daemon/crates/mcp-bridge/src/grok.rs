@@ -212,6 +212,28 @@ pub fn build_grok_invocation(
     session_id: Option<&str>,
     resume: bool,
 ) -> Result<GrokInvocation, String> {
+    build_grok_invocation_with_sandbox(bin, extra_args, prompt, cwd, session_id, resume, None)
+}
+
+/// As `build_grok_invocation`, with an explicit containment profile.
+///
+/// Exists because an ABE worker needs a WRITABLE sandbox (it is there to produce code in its own
+/// worktree) while a consult needs `read-only`. The first version passed that by temporarily
+/// mutating `TRIUMVIRATE_GROK_SANDBOX`, which is a race in a threaded daemon and was caught by a
+/// test asserting the operator's value survived. Pass the parameter instead of touching global
+/// state.
+///
+/// `sandbox_override: None` means "use the operator's configuration".
+#[allow(clippy::too_many_arguments)]
+pub fn build_grok_invocation_with_sandbox(
+    bin: &str,
+    extra_args: &[String],
+    prompt: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    resume: bool,
+    sandbox_override: Option<&str>,
+) -> Result<GrokInvocation, String> {
     validate_extra_args(extra_args)?;
 
     // REQ-GROK-006. A bare `-r` resumes "most recent session in this cwd", which is the exact
@@ -279,7 +301,12 @@ pub fn build_grok_invocation(
 
     // Containment before approval, so the ordering reads as the policy it is: contain first,
     // then decide what may be approved inside that containment.
-    if let Some(profile) = grok_sandbox_profile() {
+    let profile = match sandbox_override {
+        Some("off") | Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None => grok_sandbox_profile(),
+    };
+    if let Some(profile) = profile {
         args.push("--sandbox".to_string());
         args.push(profile);
     }

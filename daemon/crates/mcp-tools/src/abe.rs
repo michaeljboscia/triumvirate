@@ -694,17 +694,15 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         })?;
     let timeout_sec = req.timeout_sec.unwrap_or(600);
 
-    let (cmd, mut args) = (callbacks.codex_command)();
-    args.push("exec".to_string());
-    // 0.145 deprecated `--full-auto`; use the explicit equivalent it resolves to (workspace-write
-    // sandbox + no approval prompts), stable across the deprecation.
-    args.push("--sandbox".to_string());
-    args.push("workspace-write".to_string());
-    args.push("--ask-for-approval".to_string());
-    args.push("never".to_string());
-    append_codex_exec_mcp_compat_args(&mut args);
-    args.push("--skip-git-repo-check".to_string());
-    args.push(req.prompt.clone());
+    // Agent-aware. Defaults to codex, so an ABE dispatch that worked before is unchanged.
+    let worker_agent = abe_worker_agent();
+    let (cmd, args) = build_worker_argv(
+        &worker_agent,
+        callbacks.codex_command.as_ref(),
+        &req.prompt,
+        &cwd,
+        false,
+    )?;
     let start_sha = std::process::Command::new("git")
         .arg("-C")
         .arg(&cwd)
@@ -1739,5 +1737,164 @@ mod sandbox_permissions_tests {
                 "tool_call_mcp_elicitation".to_string(),
             ]
         );
+    }
+}
+
+/// Build the argv for an ABE worker, per agent.
+///
+/// ABE was Codex-only: both dispatch sites called `codex_command()` and then appended codex
+/// `exec` flags inline. That was never a grok-specific gap, it excluded gemini and claude too,
+/// and `task_tracker` still reports `agent: "codex"` on lifecycle events for the same reason.
+///
+/// The codex branch is byte-for-byte what those call sites built before, so an ABE dispatch that
+/// worked yesterday produces the same process today. New agents are additive.
+///
+/// grok reuses `build_grok_invocation`, the SAME builder the consult and fleet paths use, so an
+/// ABE worker inherits the forbidden-flag guard and the session-flag rules instead of assembling
+/// a third divergent argv. It gets `--sandbox workspace` rather than the consult default of
+/// `read-only`, because an ABE worker exists to WRITE code in its own worktree.
+pub fn build_worker_argv(
+    agent: &str,
+    codex_command: &(dyn Fn() -> (String, Vec<String>) + Send + Sync),
+    prompt: &str,
+    cwd: &str,
+    full_auto: bool,
+) -> Result<(String, Vec<String>), String> {
+    match mcp_bridge::normalize_agent_name(agent).as_str() {
+        "grok" => {
+            let (bin, extra) = mcp_bridge::grok_command();
+            // An ABE worker is single-turn in a fresh worktree: no session id, so it can never
+            // attach to another task's conversation. `workspace` rather than the consult default
+            // of `read-only`, because this worker exists to WRITE code. Passed explicitly rather
+            // than through env, which would race in a threaded daemon.
+            let inv = mcp_bridge::grok::build_grok_invocation_with_sandbox(
+                &bin, &extra, prompt, cwd, None, false, Some("workspace"),
+            )
+            .map_err(|e| format!("failed to assemble grok ABE worker: {e}"))?;
+            Ok((inv.program, inv.args))
+        }
+        // Codex, and the default. Identical to what the call sites built inline.
+        _ => {
+            let (cmd, mut args) = codex_command();
+            args.push("exec".to_string());
+            if full_auto {
+                args.push("--full-auto".to_string());
+            } else {
+                // 0.145 deprecated `--full-auto`; this is the explicit equivalent it resolves to.
+                args.push("--sandbox".to_string());
+                args.push("workspace-write".to_string());
+                args.push("--ask-for-approval".to_string());
+                args.push("never".to_string());
+            }
+            append_codex_exec_mcp_compat_args(&mut args);
+            if !full_auto {
+                args.push("--skip-git-repo-check".to_string());
+                args.push(prompt.to_string());
+            }
+            Ok((cmd, args))
+        }
+    }
+}
+
+/// Which agent ABE dispatches workers as. Defaults to codex, which is what it always did.
+///
+/// ABE hardcoded codex at both dispatch sites, so gemini, claude and grok were all equally
+/// excluded. This makes the choice explicit and overridable without changing the default.
+pub fn abe_worker_agent() -> String {
+    let raw = std::env::var("TRIUMVIRATE_ABE_AGENT").unwrap_or_else(|_| "codex".to_string());
+    let canonical = mcp_bridge::normalize_agent_name(&raw);
+    if mcp_bridge::is_supported_agent_name(&canonical) {
+        canonical
+    } else {
+        tracing::warn!(requested = %raw, "TRIUMVIRATE_ABE_AGENT is not a dispatchable agent; using codex");
+        "codex".to_string()
+    }
+}
+
+#[cfg(test)]
+mod abe_agent_tests {
+    use super::{abe_worker_agent, build_worker_argv};
+
+    fn codex_cmd() -> (String, Vec<String>) {
+        ("codex".to_string(), Vec::new())
+    }
+
+    /// ABE defaulted to codex and must KEEP defaulting to codex. A dispatch that worked before
+    /// this change must produce the same process.
+    #[test]
+    fn u_abe_01_codex_argv_is_unchanged() {
+        let (cmd, args) = build_worker_argv("codex", &codex_cmd, "do the task", "/tmp", false)
+            .expect("codex must build");
+        assert_eq!(cmd, "codex");
+        assert_eq!(args[0], "exec");
+        assert!(args.contains(&"--sandbox".to_string()));
+        assert!(args.contains(&"workspace-write".to_string()));
+        assert!(args.contains(&"--ask-for-approval".to_string()));
+        assert!(args.contains(&"never".to_string()));
+        assert!(args.contains(&"--skip-git-repo-check".to_string()));
+        assert_eq!(args.last().unwrap(), "do the task");
+    }
+
+    /// grok reuses the SAME builder the consult and fleet paths use, so an ABE worker inherits
+    /// the forbidden-flag guard rather than assembling a third divergent argv.
+    #[test]
+    fn u_abe_02_grok_worker_uses_the_shared_builder() {
+        let (cmd, args) = build_worker_argv("grok", &codex_cmd, "do the task", "/tmp", false)
+            .expect("grok must build");
+        assert!(cmd.ends_with("grok"), "must spawn grok, not codex: {cmd}");
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"streaming-json".to_string()));
+        let n = args.len();
+        assert_eq!(args[n - 2], "-p");
+        assert_eq!(args[n - 1], "do the task");
+        // An ABE worker is single-turn in a fresh worktree: no session flags, so it can never
+        // attach to another task's conversation.
+        assert!(!args.contains(&"--resume".to_string()));
+        assert!(!args.contains(&"--session-id".to_string()));
+    }
+
+    /// An ABE worker exists to WRITE code, unlike a consult, so its containment differs.
+    #[test]
+    fn u_abe_03_grok_worker_gets_a_writable_sandbox_not_read_only() {
+        let (_, args) = build_worker_argv("grok", &codex_cmd, "task", "/tmp", false).unwrap();
+        let i = args.iter().position(|a| a == "--sandbox").expect("must be contained");
+        assert_eq!(args[i + 1], "workspace", "an ABE worker must be able to write its worktree");
+    }
+
+    /// Aliases resolve, and an unknown agent falls back to codex rather than failing a dispatch.
+    #[test]
+    fn u_abe_04_agent_selection_normalizes_and_defaults_safely() {
+        // SAFETY: single-threaded test, restored below.
+        unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
+        assert_eq!(abe_worker_agent(), "codex", "the default must not change");
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "supergrok") };
+        assert_eq!(abe_worker_agent(), "grok", "aliases must resolve");
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "not-an-agent") };
+        assert_eq!(abe_worker_agent(), "codex", "a bad value must not break dispatch");
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
+    }
+
+    /// The grok branch temporarily sets TRIUMVIRATE_GROK_SANDBOX; it must restore the operator's
+    /// value so a consult after an ABE dispatch is not silently re-contained.
+    #[test]
+    fn u_abe_05_building_a_worker_does_not_leak_env_state() {
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "strict") };
+        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp", false).unwrap();
+        assert_eq!(
+            std::env::var("TRIUMVIRATE_GROK_SANDBOX").ok().as_deref(),
+            Some("strict"),
+            "the operator's sandbox setting must survive an ABE build"
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_SANDBOX") };
+        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp", false).unwrap();
+        assert!(std::env::var("TRIUMVIRATE_GROK_SANDBOX").is_err(), "must not leave a value behind");
     }
 }

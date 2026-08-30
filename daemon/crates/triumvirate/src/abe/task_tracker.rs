@@ -185,8 +185,11 @@ impl TaskTracker {
         };
         let event = AgentStreamEvent::WorkerLifecycle {
             lifecycle,
-            agent: "codex".to_string(), // ABE currently only dispatches Codex workers
-            session_name: format!("codex-worker-{task_id}"),
+            // Reports the agent ABE is actually configured to dispatch. This was hardcoded to
+            // "codex", so a lifecycle event would have LIED about which agent ran once ABE could
+            // dispatch anything else.
+            agent: mcp_tools::abe::abe_worker_agent(),
+            session_name: format!("{}-worker-{task_id}", mcp_tools::abe::abe_worker_agent()),
             task_id: Some(task_id.to_string()),
             parent_session_id,
             root_session_id,

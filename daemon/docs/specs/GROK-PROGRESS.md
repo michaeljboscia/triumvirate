@@ -43,6 +43,13 @@ TRIUMVIRATE_GROK_BIN=/Users/michaelboscia/.local/bin/grok
 **This lives in the operator's `~/.claude.json`, not in this repo**, so a fresh machine needs it set or every grok
 dispatch fails with `No such file or directory (os error 2)`. Backup written to `~/.claude.json.bak-*`.
 
+## PEER REVIEW STATUS: 2 of 14 slices reviewed
+
+- **B** reviewed by Codex + Antigravity. 6 defects found, all real, all fixed.
+- **C** reviewed by Codex. 5 defects found, including an API trap.
+- **A, D, E, F, G, H, J, K, L, M, N: NOT REVIEWED.** That is the runner, dispatch, doctor, integration suite,
+  peer-review panel, fleet, token economics, the parity sweep, connector resolution, and ABE.
+
 ## Slice status
 
 | Slice | State | Commit | Peers reviewed |
@@ -55,10 +62,11 @@ dispatch fails with `No such file or directory (os error 2)`. Backup written to 
 | F mock binary + integration | **DONE**, 14 integration + 2 live-gated | | |
 | G peer-review panel | **DONE**, grok is a default reviewer | | |
 | H fleet | **DONE**, grok launches via the shared builder | | |
-| I ABE | **BLOCKED, not a grok gap** (see below) | | |
+| I/N ABE | **DONE**, ABE is agent-aware; codex path byte-identical | | |
 | J token-economics | **DONE** via the direct path; no offline scanner is possible | | |
 | K shared-types sweep | **DONE**, one real gate found and fixed | | |
 | L e2e | **DONE**, 2 live tests gated on `TRIUMVIRATE_LIVE_GROK=1` | | |
+| M connector resolution | **DONE**, no per-machine config needed | `24a3dd0` | |
 
 ## Rulings already made, do not relitigate
 
