@@ -301,10 +301,24 @@ pub fn build_grok_invocation_with_sandbox(
 
     // Containment before approval, so the ordering reads as the policy it is: contain first,
     // then decide what may be approved inside that containment.
-    let profile = match sandbox_override {
-        Some("off") | Some("") => None,
-        Some(p) => Some(p.to_string()),
-        None => grok_sandbox_profile(),
+    // An override is a DEFAULT for this call site, not a policy that outranks the operator.
+    //
+    // Antigravity caught this: ABE passes Some("workspace") because a worker must write its
+    // worktree. But an operator who deliberately sets TRIUMVIRATE_GROK_SANDBOX=off (say, inside
+    // a container where sandbox-exec cannot run) had that intent silently overridden, and the
+    // dispatch would then fail on a containment they explicitly disabled.
+    //
+    // So: an EXPLICIT operator setting always wins. The override only fills the gap when the
+    // operator expressed no preference.
+    let operator_set = std::env::var("TRIUMVIRATE_GROK_SANDBOX").is_ok();
+    let profile = if operator_set {
+        grok_sandbox_profile()
+    } else {
+        match sandbox_override {
+            Some("off") | Some("") => None,
+            Some(p) => Some(p.to_string()),
+            None => grok_sandbox_profile(),
+        }
     };
     if let Some(profile) = profile {
         args.push("--sandbox".to_string());
@@ -630,6 +644,37 @@ mod tests {
             let joined = build_grok_invocation("grok", &[format!("{flag}=v")], "hi", "/tmp", None, false);
             assert!(joined.is_err(), "{flag}=v (joined) must be rejected");
         }
+    }
+
+    /// An ABE worker asks for a writable sandbox, but an operator who explicitly disabled
+    /// containment must not have that silently overridden. Found by Antigravity.
+    #[test]
+    fn u_b_21_an_explicit_operator_sandbox_setting_outranks_a_call_site_override() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        // No operator preference: the call site's default applies.
+        let inv = build_grok_invocation_with_sandbox(
+            "grok", &[], "p", "/tmp", None, false, Some("workspace"),
+        ).unwrap();
+        assert_eq!(value_after(&inv.args, "--sandbox").as_deref(), Some("workspace"));
+
+        // Operator explicitly turned containment OFF. The override must not resurrect it.
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "off") };
+        let inv = build_grok_invocation_with_sandbox(
+            "grok", &[], "p", "/tmp", None, false, Some("workspace"),
+        ).unwrap();
+        assert!(!inv.args.contains(&"--sandbox".to_string()),
+            "an explicit operator `off` must outrank a call-site default");
+
+        // Operator explicitly chose a DIFFERENT profile. Theirs wins too.
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "strict") };
+        let inv = build_grok_invocation_with_sandbox(
+            "grok", &[], "p", "/tmp", None, false, Some("workspace"),
+        ).unwrap();
+        assert_eq!(value_after(&inv.args, "--sandbox").as_deref(), Some("strict"));
+        clear_env();
     }
 
 }

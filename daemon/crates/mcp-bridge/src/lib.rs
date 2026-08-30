@@ -505,10 +505,17 @@ fn resolve_on_path_or_fallback(name: &str) -> String {
         for d in FALLBACK_BIN_DIRS {
             let candidate = std::path::Path::new(&home).join(d).join(name);
             if is_executable(&candidate) {
-                tracing::debug!(
+                // WARN, not debug. Antigravity's failure mode: an operator with a fresh grok
+                // in a package-manager path and a stale one in ~/.local/bin gets the stale one
+                // silently, because the daemon's PATH is impoverished. They then debug an agent
+                // behaving like an older version with no clue why. Make the substitution visible
+                // and name the fix.
+                tracing::warn!(
                     binary = name,
                     resolved = %candidate.display(),
-                    "connector not on PATH; resolved from a known install directory"
+                    "connector not found on the daemon's PATH; falling back to a known install \
+                     directory. If this is not the binary you expect, set the explicit \
+                     TRIUMVIRATE_*_BIN for this agent."
                 );
                 return candidate.to_string_lossy().into_owned();
             }

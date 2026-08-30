@@ -696,12 +696,14 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
 
     // Agent-aware. Defaults to codex, so an ABE dispatch that worked before is unchanged.
     let worker_agent = abe_worker_agent();
-    let (cmd, args) = build_worker_argv(
-        &worker_agent,
-        callbacks.codex_command.as_ref(),
-        &req.prompt,
-        &cwd,
-    )?;
+    let resolve_command = |a: &str| -> (String, Vec<String>) {
+        match a {
+            "grok" => mcp_bridge::grok_command(),
+            // Codex keeps its injected resolver, which existing tests rely on.
+            _ => (callbacks.codex_command)(),
+        }
+    };
+    let (cmd, args) = build_worker_argv(&worker_agent, &resolve_command, &req.prompt, &cwd)?;
     let start_sha = std::process::Command::new("git")
         .arg("-C")
         .arg(&cwd)
@@ -1748,6 +1750,12 @@ mod sandbox_permissions_tests {
 /// The codex branch is byte-for-byte what the NON-worktree dispatch site built before, so an ABE
 /// dispatch that worked yesterday produces the same process today. New agents are additive.
 ///
+/// **Injection, corrected after review.** The first version took a `codex_command` closure and
+/// then had the grok arm ignore it and hard-call `mcp_bridge::grok_command()`. Antigravity called
+/// that an abstraction that lies: decoupled for one agent, tightly coupled for another, with a
+/// parameter name implying otherwise. It now takes one resolver keyed by agent, so every arm goes
+/// through the same seam and a test can substitute any of them.
+///
 /// **Scope, corrected after review.** `dispatch_codex_worktree` still builds codex inline, with
 /// `--full-auto`, sandbox-permission overrides and `--add-dir`. It is NOT routed through here.
 /// An earlier draft of this function carried a `full_auto` flag for that path, but the branch
@@ -1761,13 +1769,13 @@ mod sandbox_permissions_tests {
 /// `read-only`, because an ABE worker exists to WRITE code in its own worktree.
 pub fn build_worker_argv(
     agent: &str,
-    codex_command: &(dyn Fn() -> (String, Vec<String>) + Send + Sync),
+    command_for: &(dyn Fn(&str) -> (String, Vec<String>) + Send + Sync),
     prompt: &str,
     cwd: &str,
 ) -> Result<(String, Vec<String>), String> {
     match mcp_bridge::normalize_agent_name(agent).as_str() {
         "grok" => {
-            let (bin, extra) = mcp_bridge::grok_command();
+            let (bin, extra) = command_for("grok");
             // An ABE worker is single-turn in a fresh worktree: no session id, so it can never
             // attach to another task's conversation. `workspace` rather than the consult default
             // of `read-only`, because this worker exists to WRITE code. Passed explicitly rather
@@ -1780,7 +1788,7 @@ pub fn build_worker_argv(
         }
         // Codex, and the default. Identical to what the call sites built inline.
         _ => {
-            let (cmd, mut args) = codex_command();
+            let (cmd, mut args) = command_for("codex");
             args.push("exec".to_string());
             // 0.145 deprecated `--full-auto`; this is the explicit equivalent it resolves to.
             args.push("--sandbox".to_string());
@@ -1813,16 +1821,32 @@ pub fn abe_worker_agent() -> String {
 #[cfg(test)]
 mod abe_agent_tests {
     use super::{abe_worker_agent, build_worker_argv};
+    use std::sync::{Mutex, OnceLock};
 
-    fn codex_cmd() -> (String, Vec<String>) {
-        ("codex".to_string(), Vec::new())
+    /// These tests mutate process-global env. Cargo runs them in parallel threads in one binary,
+    /// so without a lock `u_abe_05` setting TRIUMVIRATE_GROK_SANDBOX races `u_abe_03` reading it.
+    /// That surfaced only after operator-precedence landed, because before the change the
+    /// override ignored the env entirely.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// One resolver for every agent, mirroring the real call site. The point of the seam is that
+    /// a test can substitute ANY agent's command, which the previous signature could not do.
+    fn resolver(agent: &str) -> (String, Vec<String>) {
+        match agent {
+            "grok" => mcp_bridge::grok_command(),
+            _ => ("codex".to_string(), Vec::new()),
+        }
     }
 
     /// ABE defaulted to codex and must KEEP defaulting to codex. A dispatch that worked before
     /// this change must produce the same process.
     #[test]
     fn u_abe_01_codex_argv_is_unchanged() {
-        let (cmd, args) = build_worker_argv("codex", &codex_cmd, "do the task", "/tmp")
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (cmd, args) = build_worker_argv("codex", &resolver, "do the task", "/tmp")
             .expect("codex must build");
         assert_eq!(cmd, "codex");
         assert_eq!(args[0], "exec");
@@ -1838,7 +1862,8 @@ mod abe_agent_tests {
     /// the forbidden-flag guard rather than assembling a third divergent argv.
     #[test]
     fn u_abe_02_grok_worker_uses_the_shared_builder() {
-        let (cmd, args) = build_worker_argv("grok", &codex_cmd, "do the task", "/tmp")
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (cmd, args) = build_worker_argv("grok", &resolver, "do the task", "/tmp")
             .expect("grok must build");
         assert!(cmd.ends_with("grok"), "must spawn grok, not codex: {cmd}");
         assert!(args.contains(&"--output-format".to_string()));
@@ -1855,7 +1880,10 @@ mod abe_agent_tests {
     /// An ABE worker exists to WRITE code, unlike a consult, so its containment differs.
     #[test]
     fn u_abe_03_grok_worker_gets_a_writable_sandbox_not_read_only() {
-        let (_, args) = build_worker_argv("grok", &codex_cmd, "task", "/tmp").unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded by env_lock. No operator preference, so the call-site default applies.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_SANDBOX") };
+        let (_, args) = build_worker_argv("grok", &resolver, "task", "/tmp").unwrap();
         let i = args.iter().position(|a| a == "--sandbox").expect("must be contained");
         assert_eq!(args[i + 1], "workspace", "an ABE worker must be able to write its worktree");
     }
@@ -1863,6 +1891,7 @@ mod abe_agent_tests {
     /// Aliases resolve, and an unknown agent falls back to codex rather than failing a dispatch.
     #[test]
     fn u_abe_04_agent_selection_normalizes_and_defaults_safely() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: single-threaded test, restored below.
         unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
         assert_eq!(abe_worker_agent(), "codex", "the default must not change");
@@ -1879,21 +1908,28 @@ mod abe_agent_tests {
         unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
     }
 
-    /// The grok branch temporarily sets TRIUMVIRATE_GROK_SANDBOX; it must restore the operator's
-    /// value so a consult after an ABE dispatch is not silently re-contained.
+    /// The builder must not mutate process env at all. An earlier version set
+    /// TRIUMVIRATE_GROK_SANDBOX and restored it, which races in a threaded daemon; the profile is
+    /// a parameter now. This asserts the operator's value is untouched, and that an explicit
+    /// operator setting OUTRANKS the ABE default rather than being silently overridden.
     #[test]
     fn u_abe_05_building_a_worker_does_not_leak_env_state() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: single-threaded test.
         unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "strict") };
-        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp").unwrap();
+        let _ = build_worker_argv("grok", &resolver, "task", "/tmp").unwrap();
         assert_eq!(
             std::env::var("TRIUMVIRATE_GROK_SANDBOX").ok().as_deref(),
             Some("strict"),
             "the operator's sandbox setting must survive an ABE build"
         );
+        // And it must WIN: ABE asks for `workspace`, the operator said `strict`.
+        let (_, args) = build_worker_argv("grok", &resolver, "task", "/tmp").unwrap();
+        let i = args.iter().position(|a| a == "--sandbox").expect("contained");
+        assert_eq!(args[i + 1], "strict", "an explicit operator profile outranks the ABE default");
         // SAFETY: as above.
         unsafe { std::env::remove_var("TRIUMVIRATE_GROK_SANDBOX") };
-        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp").unwrap();
+        let _ = build_worker_argv("grok", &resolver, "task", "/tmp").unwrap();
         assert!(std::env::var("TRIUMVIRATE_GROK_SANDBOX").is_err(), "must not leave a value behind");
     }
 }
