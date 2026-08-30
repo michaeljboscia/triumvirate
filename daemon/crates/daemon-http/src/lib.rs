@@ -1870,9 +1870,12 @@ mod daemon_request_failure_tests {
             "lowering this turns slow successes into reported failures while still paying for the work"
         );
         // Must be well above the plain HTTP timeout: an agent turn is not a status check.
+        // Read through locals so clippy sees a real comparison rather than two consts.
+        let ask = super::DEFAULT_DAEMON_ASK_TIMEOUT_SECS;
+        let http = super::DEFAULT_DAEMON_HTTP_TIMEOUT_SECS;
         assert!(
-            super::DEFAULT_DAEMON_ASK_TIMEOUT_SECS > super::DEFAULT_DAEMON_HTTP_TIMEOUT_SECS * 5,
-            "an agent turn needs far more patience than a health probe"
+            ask > http * 5,
+            "an agent turn needs far more patience than a health probe: ask={ask}s http={http}s"
         );
     }
 

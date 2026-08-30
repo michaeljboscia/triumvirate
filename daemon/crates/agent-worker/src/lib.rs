@@ -213,6 +213,13 @@ pub fn should_invalidate_cached_session(error_text: &str) -> bool {
 pub async fn reset_worker_registry_for_tests() {
     let mut workers = worker_registry_store().lock().await;
     workers.clear();
+
+}
+
+#[cfg(test)]
+mod worker_key_tests {
+    use super::worker_key;
+
     /// Cross-session contamination. Keyed on (agent, cwd) alone, two NAMED sessions for one agent
     /// in one directory shared a worker record and therefore a CLI session id, so each resumed
     /// the other's conversation.
@@ -222,23 +229,22 @@ pub async fn reset_worker_registry_for_tests() {
     /// affected codex and gemini identically; grok only made it visible.
     #[tokio::test]
     async fn u_wk_01_named_sessions_do_not_share_a_worker() {
-        let a = super::worker_key("grok", "/tmp", Some("alpha"));
-        let b = super::worker_key("grok", "/tmp", Some("beta"));
+        let a = worker_key("grok", "/tmp", Some("alpha"));
+        let b = worker_key("grok", "/tmp", Some("beta"));
         assert_ne!(a, b, "two named sessions in one cwd must not collapse onto one worker");
 
         // One-shot ask_agent keeps the shared record: it has no session of its own to isolate.
-        let anon1 = super::worker_key("grok", "/tmp", None);
-        let anon2 = super::worker_key("grok", "/tmp", None);
+        let anon1 = worker_key("grok", "/tmp", None);
+        let anon2 = worker_key("grok", "/tmp", None);
         assert_eq!(anon1, anon2);
         assert_ne!(anon1, a, "a named session must not reuse the anonymous worker");
 
         // Empty or whitespace names are treated as absent, not as a distinct session.
-        assert_eq!(super::worker_key("grok", "/tmp", Some("")), anon1);
-        assert_eq!(super::worker_key("grok", "/tmp", Some("   ")), anon1);
+        assert_eq!(worker_key("grok", "/tmp", Some("")), anon1);
+        assert_eq!(worker_key("grok", "/tmp", Some("   ")), anon1);
 
         // Still separated by agent and cwd.
-        assert_ne!(a, super::worker_key("codex", "/tmp", Some("alpha")));
-        assert_ne!(a, super::worker_key("grok", "/other", Some("alpha")));
+        assert_ne!(a, worker_key("codex", "/tmp", Some("alpha")));
+        assert_ne!(a, worker_key("grok", "/other", Some("alpha")));
     }
-
 }
