@@ -3,6 +3,37 @@
 **RESUME HERE. Authoritative state. Update after every slice, before starting the next.**
 Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evidence: `findings/grok-*.md`
 
+## LIVE VERIFICATION, 2026-08-30, against the installed binary
+
+Deployed via `scripts/install.sh` (IRON LAW: never run production from `target/`) and the daemon restarted.
+
+| DONE WHEN | Result |
+|---|---|
+| 1. `cargo test` green, no network, no API key | **PASS**, 562 tests |
+| 2. `/status` lists grok and equals `supported_agent_names()` | **PASS**, `[gemini, codex, deepseek, claude, grok]` |
+| 3. `ask_agent {agent:"supergrok"}` returns pong | **PASS**, alias normalized, `"Grok responded on attempt 1"` |
+| 4. Session resume: turn 2 recalls turn 1 | **PASS**, codeword ZEPHYR7 recalled across turns |
+| 5. Named session spawn for grok | **PASS** |
+| 6. grok on the peer-review panel | **PASS** (unit + integration) |
+| 7. Telemetry with tokens AND cost | **PASS**, 3 turns logged at $0.00163, $0.00574, $0.00322; `$ai_generation` firing |
+| 10. Fleet worker / token-economics | **PASS** for fleet and token-economics. **ABE deferred, see below** |
+| 11. Parity sweep | **PASS**, one real gate found and fixed in `daemon-http` |
+
+**REQ-GROK-013 confirmed live:** the lifecycle read `SPAWNED, WORKING, DONE` with `on attempt 1`. No retry.
+
+### One config change was required and is NOT in the repo
+
+The daemon runs with `env -i` and a PATH of `/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, which does **not**
+include `~/.local/bin`. A bare `grok` therefore ENOENT'd. Fixed by adding to the triumvirate MCP env block in
+`~/.claude.json`, exactly as `TRIUMVIRATE_CODEX_BIN` already was:
+
+```
+TRIUMVIRATE_GROK_BIN=/Users/michaelboscia/.local/bin/grok
+```
+
+**This lives in the operator's `~/.claude.json`, not in this repo**, so a fresh machine needs it set or every grok
+dispatch fails with `No such file or directory (os error 2)`. Backup written to `~/.claude.json.bak-*`.
+
 ## Slice status
 
 | Slice | State | Commit | Peers reviewed |
