@@ -58,35 +58,43 @@ pub struct GrokStreamParser {
     error_detail: Option<String>,
     stream_tx: Option<mpsc::Sender<AgentStreamEvent>>,
     stream_seq: u64,
+    /// Set once `end` is seen. Grok should not emit a second `end`, nor text after one, but a
+    /// parser that trusts that produces duplicate TurnCompleted events and answers appended after
+    /// a completed turn. Codex named all three in review.
+    ended: bool,
 }
 
-/// Map a Grok tool to Triumvirate's `ToolKind`. Prefers the explicit `kind` field, falling back
-/// to the tool name. Both are checked because `kind` is absent on some events.
+/// Map a Grok tool to Triumvirate's `ToolKind`.
+///
+/// EXACT matching, deliberately. The first draft used substring matching and it was wrong twice:
+/// `glob_file_search` matched Grep because it contains "search", and Codex named more collisions
+/// waiting to happen (`thread` contains "read", `rewrite` contains "write", `research` contains
+/// "search", `spreadsheet` contains "read"). `gemini.rs` uses exact names for the same reason.
+///
+/// An unrecognized tool is `Unknown`, which is honest. A wrong `ToolKind` is worse than no kind,
+/// because the runner branches on it to pick CommandCompleted vs FileEditCompleted.
 fn map_tool_kind(kind: Option<&str>, tool_name: &str) -> ToolKind {
-    let probe = kind.unwrap_or(tool_name).to_lowercase();
-    let name = tool_name.to_lowercase();
-    let has = |hay: &str, needles: &[&str]| needles.iter().any(|n| hay.contains(n));
-
-    if has(&probe, &["read"]) || has(&name, &["read_file", "read"]) {
-        ToolKind::ReadFile
-    } else if has(&name, &["write_file", "write"]) || has(&probe, &["write"]) {
-        ToolKind::WriteFile
-    } else if has(&name, &["edit", "apply_patch", "str_replace", "search_replace"])
-        || has(&probe, &["edit"])
-    {
-        ToolKind::EditFile
-    } else if has(&name, &["bash", "shell", "terminal", "command"]) || has(&probe, &["execute"]) {
-        ToolKind::Bash
-    // Glob BEFORE Grep: `glob_file_search` contains "search", so a Grep-first order
-    // misclassifies it. Caught by u_c_11c.
-    } else if has(&name, &["glob"]) {
-        ToolKind::Glob
-    } else if has(&name, &["grep", "search"]) {
-        ToolKind::Grep
-    } else if has(&name, &["ask", "request_user_input", "ask_user_question"]) {
-        ToolKind::RequestUserInput
-    } else {
-        ToolKind::Unknown
+    // The ACP `kind` field is authoritative when present.
+    if let Some(k) = kind {
+        match k.to_lowercase().as_str() {
+            "read" => return ToolKind::ReadFile,
+            "write" => return ToolKind::WriteFile,
+            "edit" => return ToolKind::EditFile,
+            "execute" => return ToolKind::Bash,
+            "search" => return ToolKind::Grep,
+            _ => {}
+        }
+    }
+    // Grok's native tool names, verified from `available_commands` in the captured fixture.
+    match tool_name.to_lowercase().as_str() {
+        "read_file" | "read" => ToolKind::ReadFile,
+        "write" | "write_file" => ToolKind::WriteFile,
+        "search_replace" | "edit" | "edit_file" | "apply_patch" | "str_replace" => ToolKind::EditFile,
+        "run_terminal_command" | "bash" | "shell" | "terminal" => ToolKind::Bash,
+        "grep" => ToolKind::Grep,
+        "glob" | "glob_file_search" | "list_dir" => ToolKind::Glob,
+        "ask_user_question" | "request_user_input" | "ask" => ToolKind::RequestUserInput,
+        _ => ToolKind::Unknown,
     }
 }
 
@@ -185,7 +193,9 @@ impl GrokStreamParser {
 
             "text" => {
                 let data = json.get("data").and_then(Value::as_str).unwrap_or_default();
-                if data.is_empty() {
+                if data.is_empty() || self.ended {
+                    // Text after `end` is protocol-invalid. Appending it would mutate an answer
+                    // the runner may already have reported.
                     return None;
                 }
                 self.response_chunks.push(data.to_string());
@@ -252,14 +262,20 @@ impl GrokStreamParser {
                 let completed =
                     json.get("status").and_then(Value::as_str) == Some("completed");
                 // Match on id so out-of-order updates attach to the right call.
-                if let Some(id) = id
-                    && let Some(rec) = self.tool_calls.iter_mut().find(|r| r.id.as_deref() == Some(id))
-                {
-                    rec.success = Some(completed);
+                // Prefer the LAST still-open call with this id. Grok should not reuse ids, but
+                // if it does, `find` would attach every update to the first one and leave the
+                // rest permanently un-completed. Codex flagged this in review.
+                let target = id.and_then(|i| {
+                    self.tool_calls
+                        .iter()
+                        .rposition(|r| r.id.as_deref() == Some(i) && r.success.is_none())
+                        .or_else(|| self.tool_calls.iter().rposition(|r| r.id.as_deref() == Some(i)))
+                });
+                if let Some(idx) = target {
+                    self.tool_calls[idx].success = Some(completed);
                 }
-                let kind = id
-                    .and_then(|i| self.tool_calls.iter().find(|r| r.id.as_deref() == Some(i)))
-                    .map(|r| r.kind.clone())
+                let kind = target
+                    .map(|i| self.tool_calls[i].kind.clone())
                     .unwrap_or(ToolKind::Unknown);
                 let state = match kind {
                     ToolKind::Bash => WorkingState::CommandCompleted,
@@ -273,7 +289,19 @@ impl GrokStreamParser {
             "usage" => {
                 let n = self.tool_calls.len() as u64;
                 if let Some(u) = json.get("usage") {
-                    self.token_usage = Some(parse_usage(u, n));
+                    let usage = parse_usage(u, n);
+                    // If `end` already fired, its TurnCompleted event is carrying stale usage.
+                    // Backfill it rather than leaving the recorded event wrong.
+                    if self.ended
+                        && let Some(ev) = self
+                            .events
+                            .iter_mut()
+                            .rev()
+                            .find(|e| e.state == WorkingState::TurnCompleted)
+                    {
+                        ev.token_usage = Some(usage.clone());
+                    }
+                    self.token_usage = Some(usage);
                 }
                 if let Some(c) = json.get("total_cost_usd").and_then(Value::as_f64) {
                     self.total_cost_usd = Some(c);
@@ -282,6 +310,11 @@ impl GrokStreamParser {
             }
 
             "end" => {
+                if self.ended {
+                    // Idempotent: a second `end` must not emit a second TurnCompleted.
+                    return None;
+                }
+                self.ended = true;
                 // REQ-GROK-007: the parser's sessionId is the source of truth, even when it
                 // differs from the id we requested.
                 if let Some(sid) = json.get("sessionId").and_then(Value::as_str) {
@@ -356,6 +389,21 @@ impl GrokStreamParser {
         }
     }
 
+    /// Everything the runner needs, in ONE value.
+    ///
+    /// The first draft exposed `termination()` / `total_cost_usd()` as getters that had to be read
+    /// BEFORE `finish` consumed the parser. Codex correctly called that a trap: `agent_exec.rs`
+    /// calls every sibling parser as a bare `let parsed = parser.finish();`, so those facts would
+    /// simply never be read. Do not require call ordering to get correct behavior.
+    pub fn finish_full(self) -> GrokParsed {
+        GrokParsed {
+            termination: self.termination,
+            total_cost_usd: self.total_cost_usd,
+            error_detail: self.error_detail.clone(),
+            parsed: self.finish(),
+        }
+    }
+
     pub fn finish(self) -> ParsedAgentResult {
         ParsedAgentResult {
             response_text: self.response_chunks.concat(),
@@ -377,19 +425,14 @@ mod tests {
     /// thought events, one text event, usage, end.
     const FIXTURE: &str = include_str!("../tests/fixtures/grok-streaming-20260830.jsonl");
 
-    fn parse_fixture(src: &str) -> (GrokStreamParser, ParsedAgentResult) {
+    fn parse_fixture(src: &str) -> (GrokParsed, ParsedAgentResult) {
         let mut p = GrokStreamParser::new();
         for line in src.lines() {
             let _ = p.parse_line(line);
         }
-        let term = p.termination();
-        let cost = p.total_cost_usd();
-        let out = p.finish();
-        // Rebuild a parser carrying the pre-finish facts so tests can assert on both.
-        let mut probe = GrokStreamParser::new();
-        probe.termination = term;
-        probe.total_cost_usd = cost;
-        (probe, out)
+        let full = p.finish_full();
+        let parsed = full.parsed.clone();
+        (full, parsed)
     }
 
     // ---- U-C-01: happy path against real bytes ----
@@ -440,7 +483,7 @@ mod tests {
     fn u_c_06_self_reported_cost_is_captured() {
         let mut p = GrokStreamParser::new();
         for l in FIXTURE.lines() { let _ = p.parse_line(l); }
-        assert_eq!(p.total_cost_usd(), Some(0.02271336));
+        assert_eq!(p.finish_full().total_cost_usd, Some(0.02271336));
     }
 
     // ---- U-C-07 / U-C-08: hostile and unknown input must not kill a turn ----
@@ -569,4 +612,80 @@ mod tests {
         assert!(!r.events.is_empty());
         assert!(r.events.iter().all(|e| e.agent == "grok"), "never \"Grok\" or \"supergrok\"");
     }
+
+    // ---- Defects Codex found in review of the first draft ----
+
+    /// Text arriving after `end` would mutate an answer the runner may already have reported.
+    #[test]
+    fn u_c_15_text_after_end_is_rejected() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"text","data":"real answer"}"#);
+        p.parse_line(r#"{"type":"end","sessionId":"s1","stopReason":"end_turn"}"#);
+        p.parse_line(r#"{"type":"text","data":" INJECTED"}"#);
+        assert_eq!(p.finish().response_text, "real answer");
+    }
+
+    /// A second `end` must not emit a second TurnCompleted.
+    #[test]
+    fn u_c_16_end_is_idempotent() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"end","sessionId":"first","stopReason":"end_turn"}"#);
+        p.parse_line(r#"{"type":"end","sessionId":"second","stopReason":"end_turn"}"#);
+        let r = p.finish();
+        assert_eq!(r.session_id.as_deref(), Some("first"), "the first end wins");
+        assert_eq!(r.events.iter().filter(|e| e.state == WorkingState::TurnCompleted).count(), 1);
+    }
+
+    /// `usage` after `end` left the recorded TurnCompleted carrying stale usage.
+    #[test]
+    fn u_c_17_usage_after_end_backfills_the_completion_event() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"end","sessionId":"s","stopReason":"end_turn"}"#);
+        p.parse_line(r#"{"type":"usage","usage":{"input_tokens":900,"output_tokens":5,"total_tokens":905}}"#);
+        let r = p.finish();
+        let done = r.events.iter().rev().find(|e| e.state == WorkingState::TurnCompleted).unwrap();
+        assert_eq!(done.token_usage.as_ref().unwrap().input, Some(900),
+            "the completion event must not report stale usage");
+        assert_eq!(r.token_usage.unwrap().total, Some(905));
+    }
+
+    /// A reused toolCallId attached every update to the FIRST call, leaving later ones
+    /// permanently un-completed.
+    #[test]
+    fn u_c_18_duplicate_tool_call_ids_do_not_starve_later_calls() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"tool_call","toolCallId":"dup","toolName":"grep"}"#);
+        p.parse_line(r#"{"type":"tool_call","toolCallId":"dup","toolName":"grep"}"#);
+        p.parse_line(r#"{"type":"tool_call_update","toolCallId":"dup","status":"completed"}"#);
+        p.parse_line(r#"{"type":"tool_call_update","toolCallId":"dup","status":"completed"}"#);
+        let r = p.finish();
+        assert!(r.tool_calls.iter().all(|c| c.success == Some(true)),
+            "both calls sharing an id must resolve, not just the first");
+    }
+
+    /// Exact matching, after substring matching was wrong twice.
+    #[test]
+    fn u_c_19_tool_names_that_merely_contain_a_keyword_are_not_miscategorized() {
+        for name in ["thread_create", "rewrite_history", "research_topic", "spreadsheet_open", "task_list"] {
+            assert_eq!(map_tool_kind(None, name), ToolKind::Unknown,
+                "{name} must not be guessed from a substring");
+        }
+        // The ACP `kind` field still wins when present.
+        assert_eq!(map_tool_kind(Some("read"), "totally_unknown_tool"), ToolKind::ReadFile);
+    }
+
+}
+
+/// Grok's parse result plus the turn facts the runner must branch on. Returned by
+/// `finish_full` so no caller can get correct behavior wrong by reading fields in the wrong
+/// order.
+#[derive(Debug, Clone)]
+pub struct GrokParsed {
+    pub parsed: ParsedAgentResult,
+    /// How the turn ended. The runner owns the policy question of whether a partial answer from
+    /// `MaxTurnsReached` is acceptable.
+    pub termination: Termination,
+    /// Grok's self-reported spend. A usage signal on a flat subscription, not a bill.
+    pub total_cost_usd: Option<f64>,
+    pub error_detail: Option<String>,
 }

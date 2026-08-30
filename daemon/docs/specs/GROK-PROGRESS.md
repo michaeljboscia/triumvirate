@@ -9,7 +9,7 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 |---|---|---|---|
 | A identity + `supported_agent_names()` | **DONE** | `3893d27` | not reviewed (mechanical) |
 | B invocation builder | **DONE**, 20 tests green | `68c10d3` + fixes | Codex, Antigravity (Grok hit max-turns) |
-| C parser | **DONE**, 16 tests green vs real fixtures | | awaiting peer review |
+| C parser | **DONE**, 21 tests green vs real fixtures | `4c8d8d3` + fixes | Codex (5 defects found and fixed) |
 | D spawn/dispatch + defects 2,3 | NEXT | | |
 | E doctor/README/aliases + defect 1 | | | |
 | F mock binary + integration | | | |
@@ -59,6 +59,20 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 - **Duplicate managed flags** (Codex). `value_after` returns the first match; grok takes the LAST, so a duplicate
   silently wins. Test u_b_19 asserts each managed flag appears exactly once.
 - **Sampled rather than exhaustive forbidden-flag coverage** (Codex). Test u_b_20 now iterates the whole list.
+
+## Peer findings fixed in Slice C
+
+- **`finish(self)` was an ordering trap** (Codex). Facts were exposed as getters that had to be read BEFORE `finish`
+  consumed the parser, but `agent_exec.rs` calls every sibling as a bare `parser.finish()`, so they would never have
+  been read. Now `finish_full() -> GrokParsed` returns everything in one value.
+- **Substring tool matching was wrong** (Codex). It had already misfired once (`glob_file_search` contains "search").
+  Codex named more waiting to happen: `thread` contains "read", `rewrite` contains "write", `research` contains
+  "search". Now exact matching, with the ACP `kind` field authoritative. Test u_c_19.
+- **Text after `end`** was appended, mutating an answer the runner may already have reported. Test u_c_15.
+- **A second `end`** emitted a second TurnCompleted. Now idempotent. Test u_c_16.
+- **`usage` after `end`** left the recorded TurnCompleted carrying stale usage. Now backfilled. Test u_c_17.
+- **Duplicate `toolCallId`** attached every update to the first call, starving later ones. Now targets the last
+  still-open call. Test u_c_18.
 
 ## Verified sandbox behavior (matters for Slice D)
 
