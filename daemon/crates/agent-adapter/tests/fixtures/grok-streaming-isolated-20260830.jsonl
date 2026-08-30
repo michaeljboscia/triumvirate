@@ -1,0 +1,33 @@
+{"type":"available_commands","tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","web_search","web_fetch","image_gen","image_edit","image_to_video","reference_to_video","write"],"commands":["compact","always-approve","context","session-info","feedback","deep-research","workflow","goal","loop","build-with-ai","code-review","create-skill","create-workflow","design","execute-plan","bundled:imagine","implement","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles"]}
+{"type":"available_commands","tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","web_search","web_fetch","image_gen","image_edit","image_to_video","reference_to_video","write"],"commands":["compact","always-approve","context","session-info","feedback","deep-research","workflow","goal","loop","build-with-ai","code-review","create-skill","create-workflow","design","execute-plan","bundled:imagine","implement","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles"]}
+{"type":"thought","data":"The"}
+{"type":"thought","data":" user"}
+{"type":"thought","data":" wants"}
+{"type":"thought","data":" me"}
+{"type":"thought","data":" to"}
+{"type":"thought","data":" reply"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" the"}
+{"type":"thought","data":" single"}
+{"type":"thought","data":" word"}
+{"type":"thought","data":" \""}
+{"type":"thought","data":"pong"}
+{"type":"thought","data":"\"."}
+{"type":"thought","data":" This"}
+{"type":"thought","data":" is"}
+{"type":"thought","data":" a"}
+{"type":"thought","data":" simple"}
+{"type":"thought","data":" request"}
+{"type":"thought","data":" -"}
+{"type":"thought","data":" I"}
+{"type":"thought","data":" should"}
+{"type":"thought","data":" just"}
+{"type":"thought","data":" reply"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" that"}
+{"type":"thought","data":" word"}
+{"type":"thought","data":"."}
+{"type":"text","data":"pong"}
+{"type":"available_commands","tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","web_search","web_fetch","image_gen","image_edit","image_to_video","reference_to_video","write"],"commands":["compact","always-approve","context","session-info","feedback","deep-research","workflow","goal","loop","build-with-ai","code-review","create-skill","create-workflow","design","execute-plan","bundled:imagine","implement","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles"]}
+{"type":"usage","usage":{"input_tokens":14386,"output_tokens":35,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_tokens":30},"signature":"GbqTfpqgAraWTFr1Kl+Q3rsiJ/c7giOh1rS90KEuqrAjQu3a1KkWhdPnOTSFoLqsRrgdtJX56NW4ZKhnUOgxOyM1wOiNVf5wdkNp0yki7AeBZHMdkiS8r/fubsRZTE2pL+1Db7HUsqJqyrdfHW1f7nIVKk2Q/4DdBj/8KSGhm2bPwia8kfYXVBgDwSyvxkLHzcM"}
+{"type":"end","stopReason":"end_turn","sessionId":"3384CC48-8401-4364-A936-9FD373C5B30F","requestId":"ae471f02-1859-4553-9c94-5f957decc94a","usage":{"input_tokens":14386,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":35,"reasoning_tokens":30,"total_tokens":14421},"num_turns":1,"total_cost_usd":0.00492694,"total_cost_usd_ticks":49269400,"modelUsage":{"grok-4.6-build":{"inputTokens":14386,"outputTokens":35,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"modelCalls":1,"costUSD":0.00492694}}}
