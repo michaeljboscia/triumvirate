@@ -2508,6 +2508,33 @@ pub(crate) fn attempt_schedule_for(
     }
 }
 
+/// Does this grok stderr line mean the run is NOT contained?
+///
+/// Found by Grok reviewing its own adapter. The first version matched one lowercase string,
+/// `"sandbox could not be applied"`. The binary's actual fail-open path emits
+/// **`"Sandbox could not be applied, continuing without sandbox"`** with a capital S, so the
+/// guard missed precisely the case it existed for: the one where grok keeps going with no
+/// containment. Every other match was a case where grok already refuses on its own.
+///
+/// Strings verified against `grok 1.0.13`. Matching is case-insensitive and substring-based
+/// because these are human-facing warnings, not a stable API.
+fn is_grok_containment_failure(line: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        // The dangerous one: grok continues, uncontained.
+        "continuing without sandbox",
+        "defaulting to no sandbox",
+        // The profile did not apply. Grok may refuse on its own, but never rely on that.
+        "sandbox could not be applied",
+        "could not apply the",
+        "sandbox initialization failed",
+        "sandbox_init returned error code",
+        // Write-deny hooks are part of containment; if they fail, writes are not denied.
+        "hook write-deny ensure failed",
+    ];
+    let lower = line.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 async fn run_grok_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -2519,9 +2546,18 @@ async fn run_grok_cli_process_with_session(
     // A session id means "resume": it is only ever populated from a previous turn's parsed
     // `end.sessionId`. The builder refuses to emit a bare `--resume`, which would silently
     // attach to the most recent session in this cwd.
+    // Turn 1 must MINT an id, not run anonymously.
+    //
+    // Grok caught this reviewing its own adapter: the runner only ever passed an id when
+    // resuming, so a first turn emitted neither `--session-id` nor `--resume`. If that turn
+    // produced text but died before its `end` event, `parsed.session_id` stayed None and the
+    // next call silently began a NEW conversation instead of resuming. Generating the id here
+    // means the session exists on disk under a known id even when the turn is cut short.
     let resume = session_id.is_some_and(|s| !s.trim().is_empty());
+    let minted = if resume { None } else { Some(Uuid::new_v4().to_string()) };
+    let effective_session = if resume { session_id } else { minted.as_deref() };
     let invocation = mcp_bridge::grok::build_grok_invocation(
-        bin, args, message, cwd, session_id, resume,
+        bin, args, message, cwd, effective_session, resume,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2545,10 +2581,11 @@ async fn run_grok_cli_process_with_session(
         .take()
         .ok_or_else(|| anyhow::anyhow!("grok stderr missing"))?;
 
-    // stderr is not just debug noise for grok. An unknown --sandbox profile does NOT fail the
-    // process: it prints "sandbox could not be applied" and runs with NO containment. A silently
-    // uncontained consult is worse than a refused one, so that line is captured and treated as
-    // fatal after the read completes.
+    // stderr is not debug noise for grok: it is where containment failure is reported. Some
+    // paths make grok refuse on its own, but at least one prints
+    // "Sandbox could not be applied, continuing without sandbox" and KEEPS GOING. A silently
+    // uncontained consult is worse than a refused one, so any such line is fatal here. See
+    // `is_grok_containment_failure` for the verified string set.
     let stderr_task = tokio::spawn(async move {
         let mut sandbox_warning: Option<String> = None;
         let mut reader = BufReader::new(stderr).lines();
@@ -2557,7 +2594,7 @@ async fn run_grok_cli_process_with_session(
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed.contains("sandbox could not be applied") {
+            if is_grok_containment_failure(trimmed) {
                 sandbox_warning.get_or_insert_with(|| trimmed.to_string());
             }
             tracing::debug!("grok stderr: {trimmed}");
@@ -2665,6 +2702,20 @@ async fn run_grok_cli_process_with_session(
                 parsed.response_text
             );
         }
+        GrokTermination::Stopped => {
+            // grok exits 0 and emits a well-formed `end` for these, so only stopReason reveals
+            // them. Reporting a refusal or a token-truncated answer as complete is the failure
+            // this branch exists to prevent.
+            let why = full.stop_reason.clone().unwrap_or_else(|| "unknown".to_string());
+            if parsed.response_text.trim().is_empty() {
+                anyhow::bail!("grok stopped early ({why}) and produced no text");
+            }
+            tracing::warn!(stop_reason = %why, agent = "grok", "grok stopped early; marking the answer");
+            parsed.response_text = format!(
+                "[INCOMPLETE: grok stopped with stopReason={why}; this answer may be truncated or refused.]\n\n{}",
+                parsed.response_text
+            );
+        }
         GrokTermination::Errored => {
             anyhow::bail!(
                 "grok reported an error: {}",
@@ -2680,8 +2731,10 @@ async fn run_grok_cli_process_with_session(
     // REQ-GROK-007: trust the parser's id. If it differs from what we asked for, the server
     // chose, and OUR record must follow or the next resume targets a session that never existed.
     if parsed.session_id.is_none() {
-        parsed.session_id = session_id.map(ToString::to_string);
-    } else if let (Some(got), Some(want)) = (parsed.session_id.as_deref(), session_id)
+        // Fall back to the id we actually passed, minted or resumed, so a turn cut short before
+        // `end` is still resumable rather than orphaned.
+        parsed.session_id = effective_session.map(ToString::to_string);
+    } else if let (Some(got), Some(want)) = (parsed.session_id.as_deref(), effective_session)
         && !want.trim().is_empty()
         && !got.eq_ignore_ascii_case(want.trim())
     {

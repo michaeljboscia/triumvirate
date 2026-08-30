@@ -41,6 +41,10 @@ pub enum Termination {
     Errored,
     /// The turn hit `--max-turns`. Whether the partial text is usable is the runner's call.
     MaxTurnsReached,
+    /// The model stopped for a reason that is NOT a completed answer: output truncated at the
+    /// token limit, a refusal, or a cancellation. Distinct from `Errored` because grok exits 0
+    /// and emits a well-formed `end`; only `stopReason` reveals it.
+    Stopped,
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +59,8 @@ pub struct GrokStreamParser {
     /// marginal dollar cost of a call is zero. Captured because quota burn is otherwise invisible.
     total_cost_usd: Option<f64>,
     termination: Termination,
+    /// Verbatim `end.stopReason`, so the runner can explain WHY without re-parsing.
+    stop_reason: Option<String>,
     error_detail: Option<String>,
     stream_tx: Option<mpsc::Sender<AgentStreamEvent>>,
     stream_seq: u64,
@@ -136,6 +142,11 @@ impl GrokStreamParser {
     /// Grok's self-reported spend for the turn, if an `end` or `usage` event carried it.
     pub fn total_cost_usd(&self) -> Option<f64> {
         self.total_cost_usd
+    }
+
+    /// Verbatim `end.stopReason`.
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
     }
 
     /// Detail from an `error` event, for operator-facing classification.
@@ -231,9 +242,14 @@ impl GrokStreamParser {
 
                 let seq = self.next_seq();
                 if kind == ToolKind::ReadFile {
-                    let path = json
-                        .get("rawInput")
-                        .and_then(|v| v.get("path"))
+                    // Real captures use `target_file`; the vendor guide's example showed `path`.
+                    // Checking only `path` left every FileRead event with an empty file path, and
+                    // the committed tool fixture proves it. Grok caught this in review.
+                    let raw = json.get("rawInput");
+                    let path = raw
+                        .and_then(|v| v.get("target_file"))
+                        .or_else(|| raw.and_then(|v| v.get("path")))
+                        .or_else(|| raw.and_then(|v| v.get("file_path")))
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
@@ -337,14 +353,23 @@ impl GrokStreamParser {
                 if let Some(c) = json.get("total_cost_usd").and_then(Value::as_f64) {
                     self.total_cost_usd = Some(c);
                 }
-                if self.termination == Termination::Incomplete {
-                    self.termination = Termination::EndTurn;
-                }
                 let detail = json
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .unwrap_or("end_turn")
                     .to_string();
+                if self.termination == Termination::Incomplete {
+                    // Grok reviewing its own adapter caught this: every stopReason was collapsed
+                    // to EndTurn, so a `refusal`, a `cancelled`, or a `max_tokens` truncation was
+                    // reported to the caller as a clean, complete answer.
+                    self.termination = match detail.as_str() {
+                        "max_turn_requests" => Termination::MaxTurnsReached,
+                        // Truncated or refused output is not a completed turn.
+                        "max_tokens" | "refusal" | "cancelled" => Termination::Stopped,
+                        _ => Termination::EndTurn,
+                    };
+                }
+                self.stop_reason = Some(detail.clone());
                 let mut ev = self.event(WorkingState::TurnCompleted, detail);
                 ev.token_usage = self.token_usage.clone();
                 self.record(ev)
@@ -408,6 +433,7 @@ impl GrokStreamParser {
     pub fn finish_full(self) -> GrokParsed {
         GrokParsed {
             termination: self.termination,
+            stop_reason: self.stop_reason.clone(),
             total_cost_usd: self.total_cost_usd,
             error_detail: self.error_detail.clone(),
             parsed: self.finish(),
@@ -767,6 +793,49 @@ mod tests {
         );
     }
 
+
+    /// Every stopReason was collapsed to EndTurn, so a refusal or a token-truncated answer was
+    /// handed to the caller as a clean complete result. grok exits 0 and emits a well-formed
+    /// `end` for all of these, so stopReason is the ONLY signal. Found by Grok.
+    #[test]
+    fn u_c_23_stop_reason_distinguishes_a_completed_turn_from_a_stopped_one() {
+        for (reason, want) in [
+            ("end_turn", Termination::EndTurn),
+            ("max_tokens", Termination::Stopped),
+            ("refusal", Termination::Stopped),
+            ("cancelled", Termination::Stopped),
+            ("max_turn_requests", Termination::MaxTurnsReached),
+        ] {
+            let mut p = GrokStreamParser::new();
+            p.parse_line(r#"{"type":"text","data":"partial"}"#);
+            p.parse_line(&format!(r#"{{"type":"end","sessionId":"s","stopReason":"{reason}"}}"#));
+            let full = p.finish_full();
+            assert_eq!(full.termination, want, "stopReason {reason}");
+            assert_eq!(full.stop_reason.as_deref(), Some(reason), "reason must be preserved verbatim");
+        }
+    }
+
+    /// FileRead stream events carried an empty path because only `rawInput.path` was checked,
+    /// while real captures use `target_file`. The committed tool fixture proves it.
+    #[test]
+    fn u_c_24_file_read_path_uses_the_field_the_binary_actually_sends() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut p = GrokStreamParser::with_stream_channel(tx);
+        for l in TOOLS_FIXTURE.lines() {
+            let _ = p.parse_line(l);
+        }
+        drop(p);
+        let mut saw_path = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let shared_types::AgentStreamEvent::FileRead { file_path, .. } = ev {
+                assert!(!file_path.is_empty(), "FileRead must carry the path, not an empty string");
+                assert!(file_path.contains("target.txt"), "got {file_path}");
+                saw_path = true;
+            }
+        }
+        assert!(saw_path, "the tool fixture must produce a FileRead event");
+    }
+
 }
 
 /// Grok's parse result plus the turn facts the runner must branch on. Returned by
@@ -778,6 +847,8 @@ pub struct GrokParsed {
     /// How the turn ended. The runner owns the policy question of whether a partial answer from
     /// `MaxTurnsReached` is acceptable.
     pub termination: Termination,
+    /// Verbatim `end.stopReason`, so a caller can explain a `Stopped` turn precisely.
+    pub stop_reason: Option<String>,
     /// Grok's self-reported spend. A usage signal on a flat subscription, not a bill.
     pub total_cost_usd: Option<f64>,
     pub error_detail: Option<String>,

@@ -142,6 +142,27 @@ const FORBIDDEN_EXTRA_FLAGS: &[&str] = &[
     "--worktree",
     "--worktree-ref",
     "--ref",
+    // ---- Hidden aliases and undocumented flags, named by Grok reviewing its own adapter
+    // against the 1.0.13 binary. None appear in `--help`. Extras are appended AFTER the managed
+    // flags and grok takes the LAST occurrence, so any one of these silently OVERRIDES
+    // Triumvirate rather than being rejected. ----
+    "--load",                  // hidden alias of --resume: last-wins resume of another session
+    "--print",                 // hidden alias of -p/--single
+    "--append-system-prompt",  // hidden alias of --rules: rewrites what the agent IS
+    "--trust",                 // folder-trust for project MCP, LSP and hooks
+    "--fs-write",              // client-side file writes
+    "--fs-read",               // client-side file reads
+    "--allow-cwd",             // cwd access in non-interactive mode
+    "--leader",                // shared leader process
+    "--no-leader",
+    "--oauth",                 // auth path, and therefore which account is billed
+    "--compaction-mode",       // changes what is persisted and the token spend
+    "--storage-mode",          // where the session lives; invalid values are silently IGNORED
+    "--no-memory",
+    "--experimental-memory",
+    "--memory-flush",          // runs a flush LLM: spend
+    "--client-identifier",
+    "--no-ask-user",
 ];
 
 /// Managed flags in short form. Checked separately because clustered shorts (`-rp`) and
@@ -675,6 +696,27 @@ mod tests {
         ).unwrap();
         assert_eq!(value_after(&inv.args, "--sandbox").as_deref(), Some("strict"));
         clear_env();
+    }
+
+    /// Hidden aliases are the dangerous case: extras are appended AFTER the managed flags and
+    /// grok takes the LAST occurrence, so an unlisted alias does not conflict, it WINS.
+    /// Named by Grok reviewing its own adapter against the 1.0.13 binary; none are in `--help`.
+    #[test]
+    fn u_b_22_hidden_flag_aliases_cannot_override_managed_flags() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        // --load is a hidden alias of --resume; --append-system-prompt of --rules.
+        for hostile in [
+            "--load", "--print", "--append-system-prompt", "--trust", "--fs-write", "--fs-read",
+            "--allow-cwd", "--leader", "--no-leader", "--oauth", "--compaction-mode",
+            "--storage-mode", "--no-memory", "--experimental-memory", "--memory-flush",
+            "--client-identifier", "--no-ask-user",
+        ] {
+            assert!(
+                build_grok_invocation("grok", &[hostile.to_string(), "v".into()], "p", "/tmp", None, false).is_err(),
+                "{hostile} is a hidden alias that would override a Triumvirate-managed flag"
+            );
+        }
     }
 
 }
