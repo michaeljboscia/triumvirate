@@ -13,6 +13,7 @@ pub use codex_capabilities::{
 };
 
 pub mod agy;
+pub mod grok;
 pub mod agy_resilience;
 /// Shared PostHog telemetry. Every crate that dispatches an agent emits through this.
 pub mod posthog;
