@@ -472,6 +472,22 @@ fn resolve_connector_command(
     (bin, args)
 }
 
+/// A regular file with an execute bit. `is_file()` alone is not enough: it happily accepts a
+/// non-executable file, so resolution would succeed and the SPAWN would fail later with a
+/// confusing error. Caught by Codex in review.
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &std::path::Path) -> bool {
+    p.is_file()
+}
+
 /// Return `name` if it resolves on PATH, otherwise the first `$HOME/<dir>/<name>` that exists.
 /// Falls back to the bare name so the failure stays a normal ENOENT rather than a silent no-op.
 fn resolve_on_path_or_fallback(name: &str) -> String {
@@ -480,7 +496,7 @@ fn resolve_on_path_or_fallback(name: &str) -> String {
     }
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
-            if dir.join(name).is_file() {
+            if is_executable(&dir.join(name)) {
                 return name.to_string();
             }
         }
@@ -488,7 +504,7 @@ fn resolve_on_path_or_fallback(name: &str) -> String {
     if let Some(home) = std::env::var_os("HOME") {
         for d in FALLBACK_BIN_DIRS {
             let candidate = std::path::Path::new(&home).join(d).join(name);
-            if candidate.is_file() {
+            if is_executable(&candidate) {
                 tracing::debug!(
                     binary = name,
                     resolved = %candidate.display(),
@@ -944,6 +960,13 @@ mod tests {
         std::fs::create_dir_all(&bindir).unwrap();
         let fake = bindir.join("fakeagent");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        // Must be EXECUTABLE. The first version of this test wrote a plain file, which the
+        // resolver accepted, so it asserted a path that could never actually spawn.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         // SAFETY: guarded by env_lock.
         unsafe {
@@ -1004,6 +1027,33 @@ mod tests {
             "TRIUMVIRATE_FAKE_BIN", "TRIUMVIRATE_FAKE_ARGS", "definitely-not-installed",
         );
         assert_eq!(bin, "definitely-not-installed");
+    }
+
+    /// A file that exists but is not executable must NOT resolve. Accepting it moves the failure
+    /// from resolution (where the message is clear) to spawn (where it is not). Codex found this.
+    #[test]
+    #[cfg(unix)]
+    fn u_m_05_a_non_executable_file_is_not_a_resolution() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("tv-resolve-noexec-{}", std::process::id()));
+        let bindir = home.join(".local/bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let f = bindir.join("notexec");
+        std::fs::write(&f, "data").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // SAFETY: guarded by env_lock.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("PATH", "/nonexistent");
+            std::env::remove_var("TRIUMVIRATE_FAKE_BIN");
+        }
+        let (bin, _) = super::resolve_connector_command(
+            "TRIUMVIRATE_FAKE_BIN", "TRIUMVIRATE_FAKE_ARGS", "notexec",
+        );
+        assert_eq!(bin, "notexec", "a non-executable file must not be blessed as the binary");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
 }

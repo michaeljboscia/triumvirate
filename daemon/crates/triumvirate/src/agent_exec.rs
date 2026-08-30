@@ -2549,9 +2549,8 @@ async fn run_grok_cli_process_with_session(
     // process: it prints "sandbox could not be applied" and runs with NO containment. A silently
     // uncontained consult is worse than a refused one, so that line is captured and treated as
     // fatal after the read completes.
-    let stderr_flags = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let stderr_sink = stderr_flags.clone();
-    tokio::spawn(async move {
+    let stderr_task = tokio::spawn(async move {
+        let mut sandbox_warning: Option<String> = None;
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             let trimmed = line.trim();
@@ -2559,12 +2558,11 @@ async fn run_grok_cli_process_with_session(
                 continue;
             }
             if trimmed.contains("sandbox could not be applied") {
-                if let Ok(mut g) = stderr_sink.lock() {
-                    g.push(trimmed.to_string());
-                }
+                sandbox_warning.get_or_insert_with(|| trimmed.to_string());
             }
             tracing::debug!("grok stderr: {trimmed}");
         }
+        sandbox_warning
     });
 
     let verbosity = mcp_bridge::agent_verbosity();
@@ -2601,9 +2599,12 @@ async fn run_grok_cli_process_with_session(
 
     // Containment check before anything else. If the sandbox did not apply, the run happened
     // with full filesystem access regardless of how well it went.
-    if let Ok(g) = stderr_flags.lock()
-        && let Some(warning) = g.first()
-    {
+    //
+    // AWAIT the drain first. The original read a shared Mutex right after `child.wait()`, but
+    // the child exiting does not mean the reader task has consumed the last stderr line, so the
+    // warning could be missed and an uncontained run reported as clean. Codex caught this.
+    let sandbox_warning = stderr_task.await.unwrap_or(None);
+    if let Some(warning) = sandbox_warning {
         anyhow::bail!(
             "grok ran WITHOUT the requested sandbox: {warning}. Refusing the result rather than \
              reporting an uncontained run as a normal consult. Set TRIUMVIRATE_GROK_SANDBOX to a \
@@ -2644,10 +2645,24 @@ async fn run_grok_cli_process_with_session(
     // Termination policy lives HERE, not in the parser, so it is testable independently.
     match full.termination {
         GrokTermination::MaxTurnsReached => {
-            anyhow::bail!(
-                "grok hit --max-turns ({}); the partial answer is being withheld rather than \
-                 reported as complete. Raise TRIUMVIRATE_GROK_MAX_TURNS or narrow the prompt",
-                mcp_bridge::grok::grok_max_turns()
+            // Return the partial answer, MARKED, rather than discarding it.
+            //
+            // The first version bailed. Codex argued the asymmetry: with a marked partial a
+            // caller can display it, persist it, retry with it as context, or reject it. With an
+            // Err the caller can only report failure, and output that was already generated and
+            // paid for is unrecoverable through this API. So mark, do not discard.
+            let turns = mcp_bridge::grok::grok_max_turns();
+            if parsed.response_text.trim().is_empty() {
+                anyhow::bail!(
+                    "grok hit --max-turns ({turns}) with no text at all. Raise \
+                     TRIUMVIRATE_GROK_MAX_TURNS or narrow the prompt"
+                );
+            }
+            tracing::warn!(turns, agent = "grok", "grok hit max-turns; returning a marked partial");
+            parsed.response_text = format!(
+                "[INCOMPLETE: grok hit --max-turns ({turns}); this answer is PARTIAL. Raise \
+                 TRIUMVIRATE_GROK_MAX_TURNS or narrow the prompt.]\n\n{}",
+                parsed.response_text
             );
         }
         GrokTermination::Errored => {

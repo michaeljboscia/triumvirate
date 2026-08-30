@@ -701,7 +701,6 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
         callbacks.codex_command.as_ref(),
         &req.prompt,
         &cwd,
-        false,
     )?;
     let start_sha = std::process::Command::new("git")
         .arg("-C")
@@ -1746,8 +1745,15 @@ mod sandbox_permissions_tests {
 /// `exec` flags inline. That was never a grok-specific gap, it excluded gemini and claude too,
 /// and `task_tracker` still reports `agent: "codex"` on lifecycle events for the same reason.
 ///
-/// The codex branch is byte-for-byte what those call sites built before, so an ABE dispatch that
-/// worked yesterday produces the same process today. New agents are additive.
+/// The codex branch is byte-for-byte what the NON-worktree dispatch site built before, so an ABE
+/// dispatch that worked yesterday produces the same process today. New agents are additive.
+///
+/// **Scope, corrected after review.** `dispatch_codex_worktree` still builds codex inline, with
+/// `--full-auto`, sandbox-permission overrides and `--add-dir`. It is NOT routed through here.
+/// An earlier draft of this function carried a `full_auto` flag for that path, but the branch
+/// omitted the prompt entirely, so any caller passing `true` would have spawned a worker with no
+/// task. A half-built branch nobody calls is worse than an absent one, so it was removed. Routing
+/// the worktree path through here is a separate change with its own regression risk.
 ///
 /// grok reuses `build_grok_invocation`, the SAME builder the consult and fleet paths use, so an
 /// ABE worker inherits the forbidden-flag guard and the session-flag rules instead of assembling
@@ -1758,7 +1764,6 @@ pub fn build_worker_argv(
     codex_command: &(dyn Fn() -> (String, Vec<String>) + Send + Sync),
     prompt: &str,
     cwd: &str,
-    full_auto: bool,
 ) -> Result<(String, Vec<String>), String> {
     match mcp_bridge::normalize_agent_name(agent).as_str() {
         "grok" => {
@@ -1777,20 +1782,14 @@ pub fn build_worker_argv(
         _ => {
             let (cmd, mut args) = codex_command();
             args.push("exec".to_string());
-            if full_auto {
-                args.push("--full-auto".to_string());
-            } else {
-                // 0.145 deprecated `--full-auto`; this is the explicit equivalent it resolves to.
-                args.push("--sandbox".to_string());
-                args.push("workspace-write".to_string());
-                args.push("--ask-for-approval".to_string());
-                args.push("never".to_string());
-            }
+            // 0.145 deprecated `--full-auto`; this is the explicit equivalent it resolves to.
+            args.push("--sandbox".to_string());
+            args.push("workspace-write".to_string());
+            args.push("--ask-for-approval".to_string());
+            args.push("never".to_string());
             append_codex_exec_mcp_compat_args(&mut args);
-            if !full_auto {
-                args.push("--skip-git-repo-check".to_string());
-                args.push(prompt.to_string());
-            }
+            args.push("--skip-git-repo-check".to_string());
+            args.push(prompt.to_string());
             Ok((cmd, args))
         }
     }
@@ -1823,7 +1822,7 @@ mod abe_agent_tests {
     /// this change must produce the same process.
     #[test]
     fn u_abe_01_codex_argv_is_unchanged() {
-        let (cmd, args) = build_worker_argv("codex", &codex_cmd, "do the task", "/tmp", false)
+        let (cmd, args) = build_worker_argv("codex", &codex_cmd, "do the task", "/tmp")
             .expect("codex must build");
         assert_eq!(cmd, "codex");
         assert_eq!(args[0], "exec");
@@ -1839,7 +1838,7 @@ mod abe_agent_tests {
     /// the forbidden-flag guard rather than assembling a third divergent argv.
     #[test]
     fn u_abe_02_grok_worker_uses_the_shared_builder() {
-        let (cmd, args) = build_worker_argv("grok", &codex_cmd, "do the task", "/tmp", false)
+        let (cmd, args) = build_worker_argv("grok", &codex_cmd, "do the task", "/tmp")
             .expect("grok must build");
         assert!(cmd.ends_with("grok"), "must spawn grok, not codex: {cmd}");
         assert!(args.contains(&"--output-format".to_string()));
@@ -1856,7 +1855,7 @@ mod abe_agent_tests {
     /// An ABE worker exists to WRITE code, unlike a consult, so its containment differs.
     #[test]
     fn u_abe_03_grok_worker_gets_a_writable_sandbox_not_read_only() {
-        let (_, args) = build_worker_argv("grok", &codex_cmd, "task", "/tmp", false).unwrap();
+        let (_, args) = build_worker_argv("grok", &codex_cmd, "task", "/tmp").unwrap();
         let i = args.iter().position(|a| a == "--sandbox").expect("must be contained");
         assert_eq!(args[i + 1], "workspace", "an ABE worker must be able to write its worktree");
     }
@@ -1886,7 +1885,7 @@ mod abe_agent_tests {
     fn u_abe_05_building_a_worker_does_not_leak_env_state() {
         // SAFETY: single-threaded test.
         unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "strict") };
-        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp", false).unwrap();
+        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp").unwrap();
         assert_eq!(
             std::env::var("TRIUMVIRATE_GROK_SANDBOX").ok().as_deref(),
             Some("strict"),
@@ -1894,7 +1893,7 @@ mod abe_agent_tests {
         );
         // SAFETY: as above.
         unsafe { std::env::remove_var("TRIUMVIRATE_GROK_SANDBOX") };
-        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp", false).unwrap();
+        let _ = build_worker_argv("grok", &codex_cmd, "task", "/tmp").unwrap();
         assert!(std::env::var("TRIUMVIRATE_GROK_SANDBOX").is_err(), "must not leave a value behind");
     }
 }
