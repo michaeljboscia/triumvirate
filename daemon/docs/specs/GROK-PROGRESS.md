@@ -9,8 +9,8 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 |---|---|---|---|
 | A identity + `supported_agent_names()` | **DONE** | `3893d27` | not reviewed (mechanical) |
 | B invocation builder | **DONE**, 20 tests green | `68c10d3` + fixes | Codex, Antigravity (Grok hit max-turns) |
-| C parser | NEXT | | |
-| D spawn/dispatch + defects 2,3 | | | |
+| C parser | **DONE**, 16 tests green vs real fixtures | | awaiting peer review |
+| D spawn/dispatch + defects 2,3 | NEXT | | |
 | E doctor/README/aliases + defect 1 | | | |
 | F mock binary + integration | | | |
 | G peer-review panel | | | |
