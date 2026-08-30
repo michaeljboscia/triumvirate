@@ -10,8 +10,8 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 | A identity + `supported_agent_names()` | **DONE** | `3893d27` | not reviewed (mechanical) |
 | B invocation builder | **DONE**, 20 tests green | `68c10d3` + fixes | Codex, Antigravity (Grok hit max-turns) |
 | C parser | **DONE**, 21 tests green vs real fixtures | `4c8d8d3` + fixes | Codex (5 defects found and fixed) |
-| D spawn/dispatch + defects 2,3 | NEXT | | |
-| E doctor/README/aliases + defect 1 | | | |
+| D spawn/dispatch + defects 2,3 | **DONE**, 179 tests green | | awaiting peer review |
+| E doctor/README/aliases + defect 1 | NEXT | | |
 | F mock binary + integration | | | |
 | G peer-review panel | | | |
 | H fleet | | | |
@@ -89,6 +89,8 @@ a hard error**, or a consult silently runs uncontained.
 
 ## Pre-existing defects in scope
 
-1. `aliases.rs:166` maps only gemini and codex, so `spawn_daemon` is broken for deepseek and claude. Slice E.
-2. `agent_exec.rs:2977` asserts against a closure it defines itself. Slice D.
-3. `agent_exec.rs:336` claims subscription calls cost $0. True for dollars, false for quota. Slice D.
+1. `aliases.rs:166` maps only gemini and codex, so `spawn_daemon` is broken for deepseek and claude. **Slice E, OPEN.**
+2. `agent_exec.rs` retry test asserted against a closure it defined itself. **FIXED in Slice D:** the schedule is now
+   `attempt_schedule_for()`, a real function, and the test calls it.
+3. `agent_exec.rs:336` claimed subscription calls cost $0. **FIXED in Slice D:** corrected to say dollars, and to
+   record that a flat plan still has finite quota burned invisibly at 14K to 67K per consult.

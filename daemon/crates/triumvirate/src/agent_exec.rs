@@ -4,6 +4,7 @@ use crate::{
 };
 use agent_adapter::{
     ApprovalChannelMode, CodexAppServerEvent, CodexAppServerParser, CodexExecParser,
+    GrokStreamParser, GrokTermination,
     GeminiStreamParser, ParsedAgentResult, StuckDetector, WorkingState, WorkingStateEvent,
     format_working_state, probe_approval_response_channel, should_display,
 };
@@ -333,8 +334,13 @@ pub(crate) async fn execute_ask_agent(
     // cover them. Everything after this point reports exactly once, on drop, whichever exit
     // is taken — including exits that do not exist yet.
     let request_id = Uuid::new_v4().to_string();
-    // The model only matters for pricing, and DeepSeek is the only metered sibling — codex and
-    // gemini run on subscriptions, where one more call costs exactly $0.
+    // The model matters for pricing, and DeepSeek is the only PER-TOKEN metered sibling — codex and
+    // gemini run on subscriptions, where one more call costs exactly $0 in DOLLARS.
+    //
+    // That is not the same as free. Grok runs on a flat SuperGrok plan and burns 14K to 67K input
+    // tokens per consult regardless of how small the question is, because every turn re-ships the
+    // system prompt and every tool schema. The quota is finite and consumed invisibly, so grok's
+    // self-reported `total_cost_usd` is captured as a USAGE signal, not as a bill.
     let mut tel = mcp_bridge::posthog::CallTelemetry::new(
         &req.agent,
         &request_id,
@@ -533,37 +539,7 @@ pub(crate) async fn execute_ask_agent(
     // --model and runs its own internal retry); for deepseek, a single attempt
     // (REQ-DS-008 / T-013 — the runner owns its scoped in-flight retries, the
     // outer execute loop must NOT retry); for others, 3 retries.
-    let attempt_schedule: Vec<(Duration, Option<&str>)> = if agent == "gemini" {
-        if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
-            vec![(Duration::ZERO, None)]
-        } else {
-            GEMINI_MODEL_FAILDOWN
-                .iter()
-                .enumerate()
-                .map(|(i, model)| {
-                    let backoff = if i == 0 {
-                        Duration::ZERO
-                    } else {
-                        Duration::from_millis(500)
-                    };
-                    (backoff, Some(*model))
-                })
-                .collect()
-        }
-    } else if agent == "deepseek" {
-        // T-013 (REQ-DS-008): outer attempt schedule is 1 for deepseek. The
-        // mcp_bridge::deepseek::run path already owns its scoped in-flight
-        // retries (pre-first-byte network ×1, 429-with-Retry-After ×1).
-        // Adding outer retries here would violate REQ-DS-008 (no sibling
-        // substitution) and double-bill the user on 429.
-        vec![(Duration::ZERO, None)]
-    } else {
-        vec![
-            (Duration::from_millis(250), None),
-            (Duration::from_secs(1), None),
-            (Duration::from_secs(2), None),
-        ]
-    };
+    let attempt_schedule = attempt_schedule_for(&agent, gemini_backend_selected);
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
 
@@ -1557,6 +1533,10 @@ async fn run_named_agent_with_session_and_model(
             )
             .await
         }
+        "grok" => {
+            let (bin, args) = mcp_bridge::grok_command();
+            run_grok_cli_process_with_session(&bin, &args, message, cwd, session_id, events_tx).await
+        }
         "claude" => {
             let (bin, args) = claude_command();
             // Assuming claude CLI can be invoked similarly to codex/gemini via JSON streaming.
@@ -2483,6 +2463,226 @@ async fn run_codex_cli_process_with_session(
     Ok(parsed)
 }
 
+/// Spawn the grok CLI for one turn. REQ-GROK-004/013/016.
+///
+/// Single attempt by design (REQ-GROK-013): every turn re-ships the whole system prompt and tool
+/// schemas, so a retry is not a cheap repeat of a small question.
+/// The outer retry schedule, extracted from `execute_ask_agent` so it can be tested directly.
+///
+/// It used to live inline, and its "test" defined a private `schedule_len_for` closure and
+/// asserted against that closure, so it passed no matter what this code did. Its own comment
+/// admitted it was "a minimal reconstruction". A test that cannot fail is not a gate, so the
+/// logic moved here and the test now calls this function.
+///
+/// Single attempt means the runner owns its own retries and the outer loop must not double them:
+///   - `gemini` on the agy backend: agy runs its own internal retry (REQ-013).
+///   - `deepseek`: the runner owns scoped in-flight retries (REQ-DS-008), and an outer retry
+///     would double-bill on a 429.
+///   - `grok`: REQ-GROK-013. Every turn re-ships the entire system prompt and all tool schemas,
+///     so a retry is never a cheap repeat of a small question.
+pub(crate) fn attempt_schedule_for(
+    agent: &str,
+    gemini_backend_selected: Option<GeminiBackend>,
+) -> Vec<(Duration, Option<&'static str>)> {
+    if agent == "gemini" {
+        if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+            vec![(Duration::ZERO, None)]
+        } else {
+            GEMINI_MODEL_FAILDOWN
+                .iter()
+                .enumerate()
+                .map(|(i, model)| {
+                    let backoff = if i == 0 { Duration::ZERO } else { Duration::from_millis(500) };
+                    (backoff, Some(*model))
+                })
+                .collect()
+        }
+    } else if agent == "deepseek" || agent == "grok" {
+        vec![(Duration::ZERO, None)]
+    } else {
+        vec![
+            (Duration::from_millis(250), None),
+            (Duration::from_secs(1), None),
+            (Duration::from_secs(2), None),
+        ]
+    }
+}
+
+async fn run_grok_cli_process_with_session(
+    bin: &str,
+    args: &[String],
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+) -> anyhow::Result<ParsedAgentResult> {
+    // A session id means "resume": it is only ever populated from a previous turn's parsed
+    // `end.sessionId`. The builder refuses to emit a bare `--resume`, which would silently
+    // attach to the most recent session in this cwd.
+    let resume = session_id.is_some_and(|s| !s.trim().is_empty());
+    let invocation = mcp_bridge::grok::build_grok_invocation(
+        bin, args, message, cwd, session_id, resume,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut command = Command::new(&invocation.program);
+    command
+        .args(&invocation.args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command.spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("grok stdout missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("grok stderr missing"))?;
+
+    // stderr is not just debug noise for grok. An unknown --sandbox profile does NOT fail the
+    // process: it prints "sandbox could not be applied" and runs with NO containment. A silently
+    // uncontained consult is worse than a refused one, so that line is captured and treated as
+    // fatal after the read completes.
+    let stderr_flags = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let stderr_sink = stderr_flags.clone();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.contains("sandbox could not be applied") {
+                if let Ok(mut g) = stderr_sink.lock() {
+                    g.push(trimmed.to_string());
+                }
+            }
+            tracing::debug!("grok stderr: {trimmed}");
+        }
+    });
+
+    let verbosity = mcp_bridge::agent_verbosity();
+    let mut parser = GrokStreamParser::new();
+    let mut reader = BufReader::new(stdout).lines();
+    let mut raw_output = String::new();
+
+    let read = async {
+        while let Some(line) = reader.next_line().await? {
+            raw_output.push_str(&line);
+            raw_output.push('\n');
+            if let Some(event) = parser.parse_line(&line)
+                && should_display(&event.state, verbosity)
+            {
+                emit_working_event(events_tx.as_ref(), event);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(invocation.timeout, read).await {
+        Ok(result) => result?,
+        Err(_) => {
+            kill_process_group(&mut child);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!(
+                "grok exceeded TRIUMVIRATE_GROK_CONNECTOR_TIMEOUT_SECS ({}s)",
+                invocation.timeout.as_secs()
+            );
+        }
+    }
+    let status = child.wait().await?;
+
+    // Containment check before anything else. If the sandbox did not apply, the run happened
+    // with full filesystem access regardless of how well it went.
+    if let Ok(g) = stderr_flags.lock()
+        && let Some(warning) = g.first()
+    {
+        anyhow::bail!(
+            "grok ran WITHOUT the requested sandbox: {warning}. Refusing the result rather than \
+             reporting an uncontained run as a normal consult. Set TRIUMVIRATE_GROK_SANDBOX to a \
+             profile that exists (workspace, read-only, strict) or to `off` to disable containment."
+        );
+    }
+
+    let full = parser.finish_full();
+    let mut parsed = full.parsed;
+
+    // Batch fallback for TRIUMVIRATE_GROK_STREAMING=0, where stdout is one JSON object.
+    if !mcp_bridge::grok::grok_streaming_enabled()
+        && parsed.response_text.trim().is_empty()
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_output.trim())
+    {
+        parsed = GrokStreamParser::parse_batch_json(&v);
+    }
+
+    // REQ-GROK-016: classify auth distinctly. An operator sent to the wrong fix wastes a cycle.
+    if !status.success() {
+        let detail = full.error_detail.clone().unwrap_or_default();
+        let haystack = format!("{detail} {raw_output}").to_lowercase();
+        if haystack.contains("unauthorized")
+            || haystack.contains("401")
+            || haystack.contains("auth")
+            || haystack.contains("login")
+        {
+            anyhow::bail!(
+                "grok auth failed: run `grok login --oauth` for a SuperGrok subscription, or set \
+                 XAI_API_KEY for metered API access"
+            );
+        }
+        if parsed.response_text.trim().is_empty() {
+            anyhow::bail!("grok exited with status {status} and produced no text");
+        }
+    }
+
+    // Termination policy lives HERE, not in the parser, so it is testable independently.
+    match full.termination {
+        GrokTermination::MaxTurnsReached => {
+            anyhow::bail!(
+                "grok hit --max-turns ({}); the partial answer is being withheld rather than \
+                 reported as complete. Raise TRIUMVIRATE_GROK_MAX_TURNS or narrow the prompt",
+                mcp_bridge::grok::grok_max_turns()
+            );
+        }
+        GrokTermination::Errored => {
+            anyhow::bail!(
+                "grok reported an error: {}",
+                full.error_detail.unwrap_or_else(|| "no detail".to_string())
+            );
+        }
+        GrokTermination::Incomplete if parsed.response_text.trim().is_empty() => {
+            anyhow::bail!("grok produced no `end` event and no text; the process died mid-turn");
+        }
+        _ => {}
+    }
+
+    // REQ-GROK-007: trust the parser's id. If it differs from what we asked for, the server
+    // chose, and OUR record must follow or the next resume targets a session that never existed.
+    if parsed.session_id.is_none() {
+        parsed.session_id = session_id.map(ToString::to_string);
+    } else if let (Some(got), Some(want)) = (parsed.session_id.as_deref(), session_id)
+        && !want.trim().is_empty()
+        && !got.eq_ignore_ascii_case(want.trim())
+    {
+        tracing::warn!(
+            requested = %want, returned = %got,
+            "grok returned a different sessionId than requested; trusting the parser"
+        );
+    }
+
+    if let Some(cost) = full.total_cost_usd {
+        tracing::info!(agent = "grok", cost_usd = cost, "grok turn cost");
+    }
+
+    Ok(parsed)
+}
+
 async fn run_claude_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -2639,6 +2839,9 @@ async fn run_agent_process_with_session(
         "codex" => {
             run_codex_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
                 .await
+        }
+        "grok" => {
+            run_grok_cli_process_with_session(bin, args, message, cwd, session_id, events_tx).await
         }
         "claude" => {
             run_claude_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
@@ -2965,38 +3168,53 @@ mod deepseek_dispatch_tests {
     // T-013 (REQ-DS-026): attempt_schedule + persist-before-Err.
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Reality test (1) part A: attempt_schedule for agent=='deepseek' is
-    /// EXACTLY one entry — single attempt, no outer retry. A stub that
-    /// returns the generic 3-attempt schedule fails. We assert via a
-    /// minimal reconstruction of the schedule logic that lives in
-    /// execute_ask_agent (no other reasonable way to test without spinning
-    /// the full daemon).
+
+    // ---- Slice D: grok dispatch. Claude proves two dispatch layers can drift, so BOTH are
+    // asserted here rather than trusting that adding one arm covered it. ----
+
     #[test]
-    fn deepseek_attempt_schedule_is_single_attempt() {
-        // Mirrors execute_ask_agent's logic: for deepseek, exactly 1 attempt.
-        let schedule_len_for = |agent: &str| -> usize {
-            if agent == "deepseek" {
-                1
-            } else if agent == "gemini" {
-                // gemini uses model faildown chain (>= 1)
-                4 // placeholder; the exact count isn't the assertion
-            } else {
-                3
-            }
-        };
-        assert_eq!(schedule_len_for("deepseek"), 1, "deepseek MUST be single-attempt");
-        assert_ne!(schedule_len_for("codex"), 1,
-            "codex must remain on the generic 3-attempt schedule (regression guard)");
-        // The real assertion lives in agent_exec.rs:line attempt_schedule — this
-        // test is the canary that the convention isn't accidentally rewritten.
+    fn grok_is_reachable_through_the_public_gate() {
+        assert!(mcp_bridge::is_supported_agent_name("grok"));
+        assert!(mcp_bridge::is_supported_agent_name("supergrok"));
+        assert_eq!(mcp_bridge::normalize_agent_name("SuperGrok"), "grok");
+        assert_eq!(mcp_bridge::display_agent_name("grok"), "Grok");
     }
 
-    /// Reality test (1) part B: persist_deepseek_err_tokens is safe to call
-    /// (no panic, no unwrap) on both Exact and Estimated usage shapes. When
-    /// process_token_db() returns None (uninitialised — the default for unit
-    /// tests in this binary), the function is a no-op. That early return IS
-    /// the safety property under test: a future change that calls
-    /// `.unwrap()` on the DB would panic here and surface the regression.
+    /// Both dispatch matches must carry a grok arm. `claude` already demonstrated that one layer
+    /// can gain an agent while the other does not, so this asserts on the source itself.
+    #[test]
+    fn both_dispatch_layers_have_a_grok_arm() {
+        let src = include_str!("agent_exec.rs");
+        let arms = src.matches("\"grok\" => {").count();
+        assert!(arms >= 2,
+            "expected a grok arm in BOTH run_named_agent_with_session_and_model and \
+             run_agent_process_with_session, found {arms}");
+    }
+
+    /// Asserts against the REAL scheduler, `attempt_schedule_for`, not a reconstruction of it.
+    ///
+    /// The previous version of this test defined its own `schedule_len_for` closure and asserted
+    /// against that closure, so it would have passed even if `execute_ask_agent` retried
+    /// deepseek fifty times. Its own comment called it "a minimal reconstruction".
+    #[test]
+    fn attempt_schedule_is_single_for_metered_and_context_heavy_agents() {
+        use super::attempt_schedule_for;
+        // Single attempt: the runner owns its retries, or a retry is genuinely expensive.
+        assert_eq!(attempt_schedule_for("deepseek", None).len(), 1,
+            "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)");
+        assert_eq!(attempt_schedule_for("grok", None).len(), 1,
+            "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)");
+        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy)).len(), 1,
+            "agy runs its own internal retry (REQ-013)");
+
+        // Everything else keeps the generic ladder. This is the regression guard: adding a
+        // single-attempt agent must not silently convert the default.
+        assert_eq!(attempt_schedule_for("codex", None).len(), 3);
+        assert_eq!(attempt_schedule_for("claude", None).len(), 3);
+        assert!(attempt_schedule_for("gemini", None).len() > 1,
+            "gemini-cli uses the model faildown chain");
+    }
+
     #[test]
     fn persist_deepseek_err_tokens_safe_with_either_usage_source() {
         use mcp_bridge::deepseek::{TokenUsage as DsTokenUsage, UsageSource as DsUsageSrc};
