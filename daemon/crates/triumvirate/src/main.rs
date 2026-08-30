@@ -2172,7 +2172,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             "daemon": "running",
             "auth": "bearer-required",
             "daemon_mode": "incremental-dev",
-            "supported_agents": ["gemini", "codex", "deepseek"],
+            "supported_agents": mcp_bridge::supported_agent_names(),
             "pending_fallbacks": pending,
             "fallback_tickets": tickets,
             "daemon_bind_addr": state.bind_addr
@@ -4055,8 +4055,22 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .map(|t| t.text.clone())
             .unwrap_or_default();
         assert!(status_text.contains("\"active_sessions\":1"));
-        // T-001 (REQ-DS-001/013/016): deepseek joins the supported-agent set as a top-level name.
-        assert!(status_text.contains("\"supported_agents\":[\"gemini\",\"codex\",\"deepseek\"]"));
+        // REQ-GROK-003: /status renders mcp_bridge::supported_agent_names() verbatim. Asserting a
+        // hand-written literal here is what let this test pin an answer two agents stale while
+        // `claude` was dispatchable and advertised nowhere. Build the expectation from the source
+        // of truth so the test cannot drift from it again.
+        let expected_agents = format!(
+            "\"supported_agents\":[{}]",
+            mcp_bridge::supported_agent_names()
+                .iter()
+                .map(|a| format!("\"{a}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(
+            status_text.contains(&expected_agents),
+            "status must advertise exactly the dispatchable set; wanted {expected_agents} in {status_text}"
+        );
         assert!(status_text.contains("\"daemon_bind_addr\":\"127.0.0.1:7777\""));
 
         client.cancel().await?;

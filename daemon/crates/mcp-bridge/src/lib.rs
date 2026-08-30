@@ -73,6 +73,9 @@ pub fn display_agent_name(agent: &str) -> String {
         // T-001: explicit arm — the generic first-letter capitaliser below would produce
         // "Deepseek" (wrong); the canonical brand spelling is "DeepSeek".
         "deepseek" => "DeepSeek".to_string(),
+        // REQ-GROK-002: explicit arm so alias inputs (grok-build/xai/supergrok) render "Grok".
+        // SuperGrok is a billing plan, never an operator-facing agent name.
+        "grok" => "Grok".to_string(),
         other => {
             let mut chars = other.chars();
             match chars.next() {
@@ -86,18 +89,28 @@ pub fn display_agent_name(agent: &str) -> String {
 pub fn normalize_agent_name(agent: &str) -> String {
     match agent.to_lowercase().as_str() {
         "antigravity" | "agy" => "gemini".to_string(),
+        // REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an
+        // alias only. The canonical execution key is `grok` and the binary is `grok`.
+        "grok-build" | "xai" | "supergrok" => "grok".to_string(),
         other => other.to_string(),
     }
 }
 
+/// The canonical list of agents this daemon can dispatch. REQ-GROK-003.
+///
+/// Every advertised `supported_agents` surface MUST render this, and `is_supported_agent_name`
+/// MUST validate against it. Before this existed the four surfaces had drifted into three
+/// different answers, none matching the allowlist: `claude` was dispatchable while advertised
+/// nowhere. A literal list in a second place is how that happened, so do not add one.
+pub fn supported_agent_names() -> &'static [&'static str] {
+    &["gemini", "codex", "deepseek", "claude", "grok"]
+}
+
 #[instrument(skip_all)]
 pub fn is_supported_agent_name(agent: &str) -> bool {
-    // Validate the CANONICAL name so aliases (antigravity/agy) are accepted via the
-    // same allowlist the dispatch arms match on — no raw alias reaches dispatch.
-    matches!(
-        normalize_agent_name(agent).as_str(),
-        "gemini" | "codex" | "deepseek" | "claude"
-    )
+    // Validate the CANONICAL name so aliases (antigravity/agy/supergrok) are accepted via
+    // the same allowlist the dispatch arms match on: no raw alias reaches dispatch.
+    supported_agent_names().contains(&normalize_agent_name(agent).as_str())
 }
 
 #[instrument(skip_all)]
@@ -293,6 +306,13 @@ pub fn gemini_command() -> (String, Vec<String>) {
 #[instrument(skip_all)]
 pub fn codex_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "codex")
+}
+
+/// REQ-GROK-004: Grok is a SPAWNED CLI, like codex exec and agy, not HTTP like DeepSeek.
+/// The binary is `grok`; there is no `supergrok` executable.
+#[instrument(skip_all)]
+pub fn grok_command() -> (String, Vec<String>) {
+    resolve_connector_command("TRIUMVIRATE_GROK_BIN", "TRIUMVIRATE_GROK_ARGS", "grok")
 }
 
 #[instrument(skip_all)]
@@ -777,4 +797,85 @@ mod tests {
         unsafe { std::env::set_var("TRIUMVIRATE_DRIVER", "claude") };
         assert_eq!(super::caller_driver_identity(), Some("claude".to_string()));
     }
+
+    // ---- REQ-GROK-001/002/003: identity. Slice A. ----
+
+    #[test]
+    fn u_grok_01_aliases_normalize_to_canonical_key() {
+        for alias in ["grok", "Grok", "GROK", "grok-build", "Grok-Build", "xai", "XAI", "supergrok", "SuperGrok"] {
+            assert_eq!(
+                super::normalize_agent_name(alias),
+                "grok",
+                "alias {alias} must normalize to the canonical key"
+            );
+        }
+    }
+
+    #[test]
+    fn u_grok_02_display_name_is_brand_correct_from_every_alias() {
+        // "Supergrok" must never reach an operator: SuperGrok is a billing plan.
+        for alias in ["grok", "grok-build", "xai", "supergrok"] {
+            assert_eq!(super::display_agent_name(alias), "Grok", "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn u_grok_03_allowlist_accepts_grok_and_its_aliases() {
+        for alias in ["grok", "grok-build", "xai", "supergrok"] {
+            assert!(super::is_supported_agent_name(alias), "alias {alias} must be supported");
+        }
+        assert!(!super::is_supported_agent_name("fake-agent"));
+        assert!(!super::is_supported_agent_name(""));
+    }
+
+    #[test]
+    fn u_grok_04_no_existing_agent_regressed() {
+        for (input, canonical, display) in [
+            ("gemini", "gemini", "Antigravity"),
+            ("agy", "gemini", "Antigravity"),
+            ("antigravity", "gemini", "Antigravity"),
+            ("codex", "codex", "Codex"),
+            ("deepseek", "deepseek", "DeepSeek"),
+            ("claude", "claude", "Claude"),
+        ] {
+            assert_eq!(super::normalize_agent_name(input), canonical, "normalize {input}");
+            assert_eq!(super::display_agent_name(input), display, "display {input}");
+            assert!(super::is_supported_agent_name(input), "supported {input}");
+        }
+    }
+
+    /// The allowlist and the advertised list must be the SAME list, not two lists that agree
+    /// today. Four surfaces had already drifted into three different answers before
+    /// `supported_agent_names` existed, which is what let `claude` be dispatchable while
+    /// advertised nowhere.
+    #[test]
+    fn u_grok_05_advertised_list_and_allowlist_cannot_drift() {
+        for name in super::supported_agent_names() {
+            assert!(
+                super::is_supported_agent_name(name),
+                "{name} is advertised but not dispatchable"
+            );
+            assert_eq!(
+                super::normalize_agent_name(name),
+                *name,
+                "{name} is advertised under a non-canonical key"
+            );
+        }
+        assert!(super::supported_agent_names().contains(&"grok"));
+        assert!(super::supported_agent_names().contains(&"claude"));
+    }
+
+    #[test]
+    fn u_grok_06_command_resolves_to_the_grok_binary_by_default() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        // SAFETY: test controls env var lifecycle in-process.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GROK_BIN");
+            std::env::remove_var("TRIUMVIRATE_GROK_ARGS");
+        }
+        let (bin, args) = super::grok_command();
+        assert_eq!(bin, "grok", "there is no `supergrok` executable");
+        assert!(args.is_empty());
+    }
+
 }

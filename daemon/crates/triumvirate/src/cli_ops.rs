@@ -200,7 +200,14 @@ pub(crate) fn build_status_report(
             "daemon_mode": snapshot.daemon_mode.unwrap_or_else(|| "incremental-dev".to_string()),
             "supported_agents": snapshot
                 .supported_agents
-                .unwrap_or_else(|| vec!["gemini".to_string(), "codex".to_string()]),
+                .unwrap_or_else(|| {
+                    // REQ-GROK-003: one list, from mcp_bridge. A literal here is what let this
+                    // fallback drift two agents behind the allowlist.
+                    mcp_bridge::supported_agent_names()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                }),
             "pending_fallbacks": snapshot.pending_fallbacks.unwrap_or(0),
             "fallback_tickets": snapshot.fallback_tickets.unwrap_or_default(),
             "daemon_bind_addr": snapshot.daemon_bind_addr.unwrap_or_else(|| daemon_bind_addr.clone()),
@@ -220,7 +227,7 @@ pub(crate) fn build_status_report(
         "health": null,
         "snapshot": {
             "daemon_mode": "incremental-dev",
-            "supported_agents": ["gemini", "codex"],
+            "supported_agents": mcp_bridge::supported_agent_names(),
             "pending_fallbacks": pending_fallbacks,
             "fallback_tickets": fallback_tickets,
             "daemon_bind_addr": daemon_bind_addr

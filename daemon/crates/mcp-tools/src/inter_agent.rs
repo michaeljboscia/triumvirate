@@ -299,7 +299,12 @@ pub async fn get_status(
             active_sessions: sessions.len(),
             supported_agents: snapshot
                 .supported_agents
-                .unwrap_or_else(|| vec!["gemini".to_string(), "codex".to_string()]),
+                .unwrap_or_else(|| {
+                    mcp_bridge::supported_agent_names()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                }),
             pending_fallbacks: snapshot.pending_fallbacks.unwrap_or(0),
             fallback_tickets: snapshot.fallback_tickets.unwrap_or_default(),
             daemon_bind_addr: snapshot.daemon_bind_addr.unwrap_or(local_bind_addr),
@@ -310,11 +315,12 @@ pub async fn get_status(
     Json(StatusResponse {
         daemon_mode: "incremental-dev".to_string(),
         active_sessions: sessions.len(),
-        supported_agents: vec![
-            "gemini".to_string(),
-            "codex".to_string(),
-            "deepseek".to_string(), // T-001 (REQ-DS-001/013/016)
-        ],
+        // REQ-GROK-003: single source of truth. This list previously omitted `claude`,
+        // which was dispatchable but advertised nowhere.
+        supported_agents: mcp_bridge::supported_agent_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         pending_fallbacks,
         fallback_tickets: fallback_tickets
             .into_iter()
