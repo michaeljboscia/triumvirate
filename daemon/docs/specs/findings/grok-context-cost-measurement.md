@@ -6,6 +6,30 @@
 
 ---
 
+> ## CORRECTION, appended after repeat runs
+>
+> **The single-run numbers below are confounded and the B and C rows should not be trusted.** Two effects were
+> missed on the first pass:
+>
+> 1. **`input_tokens` and `cache_read_input_tokens` are separate counters.** Total context is their sum. Repeat runs
+>    of the isolated config reported `input=1,323` with `cache_read=11,648`, which is 12,971 total, not a 90% drop.
+> 2. **A warm shared grok process leaks tool state across invocations.** The first isolated run saw **26** tools. Runs
+>    2 and 3, with identical arguments, saw **152**. Two interactive `grok` processes were alive on the machine
+>    (PIDs 44133 and 50314, owned by the operator and deliberately not killed), so isolation is **not durable while
+>    another grok is running.** That is itself a finding for the adapter: a daemon-spawned consult may inherit an
+>    interactive session's toolset.
+>
+> **What survives the correction:** the A-versus-D cold comparison. Baseline **67,071** total context (66,559 + 512)
+> against isolated **14,386** (14,386 + 0), both first-runs with cold or near-cold cache. That is a **79% reduction**
+> and it is the number to plan against.
+>
+> **What does not survive:** the claim that a curated set beat full isolation. E measured lower only because its cache
+> was warmer. Both configurations landed on 12,971 total context once warm, which says the comparison was never
+> measuring what it claimed.
+>
+> **Method note for anyone repeating this:** measure `input + cache_read`, kill every other grok process first, and
+> take more than one sample per configuration. One run per config is what produced the wrong conclusion above.
+
 ## Results
 
 | # | Configuration | input tokens | cost | tools | commands | answered |
@@ -72,6 +96,30 @@ adapter's actual per-consult floor, and it is the number to budget against, not 
    fixed monthly subscription, quota burn is the metric that matters and it is invisible without this.
 4. **Revisit the guide's `--max-turns 20` default.** Each turn re-ships the context. Twenty turns at the 66K floor is
    a different order of spend than at 14K.
+
+## Per-server tool census (the useful part, and it is stable)
+
+Counted from the baseline fixture, independent of the token confounds:
+
+| server | tools | note |
+|---|---|---|
+| **gdrive** | **116** | Largest by far, 28% of 420. **`gog` (v0.34.1) covers Drive, Gmail, Sheets, Docs, Calendar via CLI at zero schema cost.** Strongest cut available. |
+| triumvirate | 54 | Lets Grok drive the other siblings. Keep or cut is a policy decision, not a cost one. |
+| runpod | 54 | |
+| gemini | 37 | |
+| apollo | 34 | |
+| chrome-devtools | 29 | |
+| *(native)* | 26 | Includes `search_tool` and `use_tool`. |
+| github | 26 | |
+| playwright | 24 | |
+| pythia | 11 | |
+| graphiti-memory | 9 | |
+
+`~/.claude.json` holds **13** servers; `figma`, `figma-desktop`, and `stacklist` did not start during the baseline.
+
+**Curation via a `.claude.json` placed in the isolated HOME is leaky.** A run keeping exactly
+`triumvirate, pythia, graphiti-memory, github` came back with **`gemini` present** (not requested) and **`pythia`
+absent** (requested, never started). So the curated file is not the only input to server selection. Mechanism unknown.
 
 ## Not established
 
