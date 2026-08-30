@@ -2314,7 +2314,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'antigravity' (aliases: agy, gemini), 'codex', or 'deepseek'" }))));
         }
         let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
-        let worker = acquire_worker(&agent, &cwd).await;
+        let worker = acquire_worker(&agent, &cwd, Some(req.name.as_str())).await;
         let mut sessions = state.sessions.lock().await;
         sessions.insert(
             req.name.clone(),
@@ -2364,6 +2364,9 @@ async fn run_daemon() -> anyhow::Result<()> {
                 // resume. Without this it silently loses multi-turn memory while the MCP path
                 // keeps it — the two surfaces would disagree about what a session is.
                 reuse_session: Some(true),
+                // Without this the worker key is (agent, cwd) and two named sessions in one
+                // directory resume each other. Demonstrated live before the fix.
+                session_key: Some(req.name.clone()),
                 ..Default::default()
             },
             None,
@@ -2396,11 +2399,11 @@ async fn run_daemon() -> anyhow::Result<()> {
         let Some(removed) = sessions.remove(&req.name) else {
             return Err((StatusCode::NOT_FOUND, AxumJson(serde_json::json!({ "error": format!("session '{}' not found", req.name) }))));
         };
-        let should_drop_worker = !sessions.values().any(|s| s.agent == removed.agent && s.cwd == removed.cwd);
-        if should_drop_worker {
-            let cwd = removed.cwd.unwrap_or_else(|| ".".to_string());
-            let _ = dismiss_worker(&removed.agent, &cwd).await;
-        }
+        // Each named session owns its worker record now, so dismissing one can never strand
+        // another. The old "does another session share (agent, cwd)?" guard existed only because
+        // they DID share, which is the cross-session leak this key change removes.
+        let cwd = removed.cwd.clone().unwrap_or_else(|| ".".to_string());
+        let _ = dismiss_worker(&removed.agent, &cwd, Some(req.name.as_str())).await;
         core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(serde_json::json!({ "error": e.to_string() })))
         })?;
@@ -3680,8 +3683,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         }
 
         let cwd = "/tmp/invalid-session-recovery";
-        let _ = acquire_worker("gemini", cwd).await;
-        update_worker_session("gemini", cwd, Some("stale-session-id".to_string())).await;
+        let _ = acquire_worker("gemini", cwd, None).await;
+        update_worker_session("gemini", cwd, None, Some("stale-session-id".to_string())).await;
 
         let response = execute_ask_agent(
             &AskAgentRequest {
@@ -3741,8 +3744,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         }
 
         let cwd = "/tmp/one-shot-no-inherit";
-        let _ = acquire_worker("gemini", cwd).await;
-        update_worker_session("gemini", cwd, Some("stale-session-id".to_string())).await;
+        let _ = acquire_worker("gemini", cwd, None).await;
+        update_worker_session("gemini", cwd, None, Some("stale-session-id".to_string())).await;
 
         let response = execute_ask_agent(
             &AskAgentRequest {
@@ -3770,7 +3773,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert!(response.lifecycle.iter().any(|e| e.state == "DONE"));
 
         // And it must not have overwritten the session a named ask_session depends on.
-        let worker = acquire_worker("gemini", cwd).await;
+        let worker = acquire_worker("gemini", cwd, None).await;
         assert_eq!(
             worker.session_id.as_deref(),
             Some("stale-session-id"),

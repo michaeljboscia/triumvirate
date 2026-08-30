@@ -125,13 +125,17 @@ pub async fn spawn_session(
     }
     let agent = normalize_agent_name(&req.agent);
     if !is_supported_agent_name(&agent) {
-        return Err(
-            "spawn_session supports only 'antigravity' (aliases: agy, gemini), 'codex', 'deepseek', or 'claude'"
-                .to_string(),
-        );
+        // Derived, not hand-written. A literal here had already drifted: it advertised
+        // deepseek and claude, which `daemon_target_agents()` excludes, and omitted grok.
+        return Err(format!(
+            "spawn_session supports only: {}",
+            crate::aliases::daemon_target_agents().join(", ")
+        ));
     }
     let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
-    let worker = acquire_worker(&agent, &cwd).await;
+    // Per NAMED session, so two sessions for one agent in one directory do not resume each
+    // other. Keyed on (agent, cwd) alone this leaked a passphrase between sessions.
+    let worker = acquire_worker(&agent, &cwd, Some(req.name.as_str())).await;
 
     let mut sessions = sessions.lock().await;
     sessions.insert(
@@ -245,13 +249,11 @@ pub async fn dismiss_session(
     let mut sessions = sessions.lock().await;
     match sessions.remove(&req.name) {
         Some(removed_session) => {
-            let should_drop_worker = !sessions
-                .values()
-                .any(|s| s.agent == removed_session.agent && s.cwd == removed_session.cwd);
-            if should_drop_worker {
-                let cwd = removed_session.cwd.unwrap_or_else(|| ".".to_string());
-                let _ = dismiss_worker(&removed_session.agent, &cwd).await;
-            }
+            // Each named session now owns its worker record, so dismissing one can never strand
+            // another. The old "is any other session sharing (agent, cwd)?" guard existed only
+            // because they DID share, which is the bug this key change removes.
+            let cwd = removed_session.cwd.clone().unwrap_or_else(|| ".".to_string());
+            let _ = dismiss_worker(&removed_session.agent, &cwd, Some(req.name.as_str())).await;
             core_persist_json_file_if_enabled(sessions_file, &*sessions)
                 .map_err(|e| format!("failed to persist sessions: {e}"))?;
             Ok(format!("session '{}' dismissed", req.name))

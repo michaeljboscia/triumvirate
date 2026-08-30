@@ -38,8 +38,21 @@ pub struct WorkerAcquireResult {
 
 type WorkerRegistry = Arc<Mutex<HashMap<String, WorkerState>>>;
 
-fn worker_key(agent: &str, cwd: &str) -> String {
-    format!("{agent}::{cwd}")
+/// Identity of a cached worker.
+///
+/// `session_key` is the NAMED session this worker belongs to. Without it the key was
+/// `(agent, cwd)` alone, so two named sessions for one agent in one directory collapsed onto a
+/// single record and resumed each other's conversation. That was demonstrated live: a passphrase
+/// given only to session A was returned by session B, with tools forbidden so no shared store
+/// could explain it. It applied to codex and gemini identically; grok only made it visible.
+///
+/// `None` preserves the original behavior for one-shot `ask_agent`, which has no session of its
+/// own to keep apart.
+fn worker_key(agent: &str, cwd: &str, session_key: Option<&str>) -> String {
+    match session_key.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => format!("{agent}::{cwd}::{name}"),
+        None => format!("{agent}::{cwd}"),
+    }
 }
 
 #[cfg(not(test))]
@@ -75,8 +88,12 @@ fn worker_registry_store() -> &'static WorkerRegistry {
 }
 
 #[instrument(skip_all)]
-pub async fn acquire_worker(agent: &str, cwd: &str) -> WorkerAcquireResult {
-    let key = worker_key(agent, cwd);
+pub async fn acquire_worker(
+    agent: &str,
+    cwd: &str,
+    session_key: Option<&str>,
+) -> WorkerAcquireResult {
+    let key = worker_key(agent, cwd, session_key);
     let mut workers = worker_registry_store().lock().await;
     let now = core_unix_time_ms();
     let state = workers.entry(key).or_insert_with(|| WorkerState {
@@ -107,8 +124,12 @@ pub async fn acquire_worker(agent: &str, cwd: &str) -> WorkerAcquireResult {
 }
 
 #[instrument(skip_all)]
-pub async fn require_reused_worker(agent: &str, cwd: &str) -> Result<WorkerState, String> {
-    let key = worker_key(agent, cwd);
+pub async fn require_reused_worker(
+    agent: &str,
+    cwd: &str,
+    session_key: Option<&str>,
+) -> Result<WorkerState, String> {
+    let key = worker_key(agent, cwd, session_key);
     let mut workers = worker_registry_store().lock().await;
     let now = core_unix_time_ms();
     let Some(state) = workers.get_mut(&key) else {
@@ -153,8 +174,13 @@ pub async fn require_reused_worker(agent: &str, cwd: &str) -> Result<WorkerState
 }
 
 #[instrument(skip_all)]
-pub async fn update_worker_session(agent: &str, cwd: &str, session_id: Option<String>) {
-    let key = worker_key(agent, cwd);
+pub async fn update_worker_session(
+    agent: &str,
+    cwd: &str,
+    session_key: Option<&str>,
+    session_id: Option<String>,
+) {
+    let key = worker_key(agent, cwd, session_key);
     let mut workers = worker_registry_store().lock().await;
     if let Some(state) = workers.get_mut(&key) {
         state.session_id = session_id;
@@ -164,8 +190,8 @@ pub async fn update_worker_session(agent: &str, cwd: &str, session_id: Option<St
 }
 
 #[instrument(skip_all)]
-pub async fn dismiss_worker(agent: &str, cwd: &str) -> bool {
-    let key = worker_key(agent, cwd);
+pub async fn dismiss_worker(agent: &str, cwd: &str, session_key: Option<&str>) -> bool {
+    let key = worker_key(agent, cwd, session_key);
     let mut workers = worker_registry_store().lock().await;
     let removed = workers.remove(&key).is_some();
     if removed {
@@ -187,4 +213,32 @@ pub fn should_invalidate_cached_session(error_text: &str) -> bool {
 pub async fn reset_worker_registry_for_tests() {
     let mut workers = worker_registry_store().lock().await;
     workers.clear();
+    /// Cross-session contamination. Keyed on (agent, cwd) alone, two NAMED sessions for one agent
+    /// in one directory shared a worker record and therefore a CLI session id, so each resumed
+    /// the other's conversation.
+    ///
+    /// Demonstrated live before the fix: a passphrase given only to session A came back verbatim
+    /// from session B, with tools explicitly forbidden so no shared store could explain it. It
+    /// affected codex and gemini identically; grok only made it visible.
+    #[tokio::test]
+    async fn u_wk_01_named_sessions_do_not_share_a_worker() {
+        let a = super::worker_key("grok", "/tmp", Some("alpha"));
+        let b = super::worker_key("grok", "/tmp", Some("beta"));
+        assert_ne!(a, b, "two named sessions in one cwd must not collapse onto one worker");
+
+        // One-shot ask_agent keeps the shared record: it has no session of its own to isolate.
+        let anon1 = super::worker_key("grok", "/tmp", None);
+        let anon2 = super::worker_key("grok", "/tmp", None);
+        assert_eq!(anon1, anon2);
+        assert_ne!(anon1, a, "a named session must not reuse the anonymous worker");
+
+        // Empty or whitespace names are treated as absent, not as a distinct session.
+        assert_eq!(super::worker_key("grok", "/tmp", Some("")), anon1);
+        assert_eq!(super::worker_key("grok", "/tmp", Some("   ")), anon1);
+
+        // Still separated by agent and cwd.
+        assert_ne!(a, super::worker_key("codex", "/tmp", Some("alpha")));
+        assert_ne!(a, super::worker_key("grok", "/other", Some("alpha")));
+    }
+
 }

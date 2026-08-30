@@ -441,7 +441,9 @@ pub(crate) async fn execute_ask_agent(
         .clone()
         .unwrap_or_else(|| ".".to_string());
     let execution_prompt = inject_tool_marker_prompt(&req.message);
-    let worker = acquire_worker(&agent, &exec_cwd).await;
+    // Named sessions get their own worker record; one-shot ask_agent keeps the shared one.
+    let session_key = req.session_key.as_deref();
+    let worker = acquire_worker(&agent, &exec_cwd, session_key).await;
     // Resume is opt-in. The worker registry is keyed only by (agent, cwd), so a one-shot
     // ask_agent would otherwise resume — and get billed for — whatever named session last
     // ran in this directory, replaying its whole transcript as input on every call.
@@ -791,7 +793,7 @@ pub(crate) async fn execute_ask_agent(
                 // wrote here would clobber the named session cached under the same
                 // (agent, cwd) key and silently destroy its continuity.
                 if reuse_session && !is_faildown_attempt {
-                    update_worker_session(&agent, &exec_cwd, next_session_id).await;
+                    update_worker_session(&agent, &exec_cwd, session_key, next_session_id).await;
                 }
                 span.record(
                     "session_id",
@@ -912,7 +914,7 @@ pub(crate) async fn execute_ask_agent(
                 }
                 if session_for_attempt.is_some() && should_invalidate_cached_session(&msg) {
                     worker_session_id = None;
-                    update_worker_session(&agent, &exec_cwd, None).await;
+                    update_worker_session(&agent, &exec_cwd, session_key, None).await;
                     // The one outbox status PostHog could not otherwise see. A stale resume
                     // id is invisible to $ai_generation (the call still succeeds on the
                     // retry), yet it is the failure mode that orphans a named session's
@@ -1714,7 +1716,7 @@ pub(crate) async fn run_deepseek_with_runtime(
 }
 
 async fn prewarm_worker(agent: &str, cwd: &str) {
-    let worker = acquire_worker(agent, cwd).await;
+    let worker = acquire_worker(agent, cwd, None).await;
 
     // If a session already exists for this (agent, cwd), the worker IS warm — there is nothing
     // to prewarm. Calling anyway was actively harmful in two ways:
@@ -1738,16 +1740,16 @@ async fn prewarm_worker(agent: &str, cwd: &str) {
 
     match warm_result {
         Ok(Ok(parsed)) => {
-            update_worker_session(agent, cwd, parsed.session_id).await;
+            update_worker_session(agent, cwd, None, parsed.session_id).await;
             tracing::info!("prewarm complete for {agent} cwd={cwd}");
         }
         Ok(Err(err)) => {
             tracing::warn!("prewarm failed for {agent} cwd={cwd}: {err}");
-            let _ = dismiss_worker(agent, cwd).await;
+            let _ = dismiss_worker(agent, cwd, None).await;
         }
         Err(_) => {
             tracing::warn!("prewarm timeout for {agent} cwd={cwd}");
-            let _ = dismiss_worker(agent, cwd).await;
+            let _ = dismiss_worker(agent, cwd, None).await;
         }
     }
 }

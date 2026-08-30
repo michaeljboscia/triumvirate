@@ -45,6 +45,17 @@ pub struct AskAgentRequest {
     /// named sessions (`ask_session`/`ask_daemon`) want that; they set this true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse_session: Option<bool>,
+    /// Which NAMED session this call belongs to, when it belongs to one.
+    ///
+    /// The worker registry was keyed on `(agent, cwd)` alone, so two named sessions for the same
+    /// agent in the same directory shared one worker record and therefore one grok/codex session
+    /// id. Demonstrated live: a secret told only to session A came back verbatim from session B,
+    /// with tools explicitly forbidden so no shared store was involved.
+    ///
+    /// `None` keeps the old `(agent, cwd)` behavior for one-shot `ask_agent`, which is correct
+    /// there: an unnamed call has no session of its own to keep separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
 
     // T-011 (REQ-DS-027): per-call overrides for the DeepSeek sibling. ALL
     // four fields are Optional and skip-serialize-on-None so the wire shape
