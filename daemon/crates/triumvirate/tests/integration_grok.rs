@@ -251,6 +251,24 @@ fn i_grok_19_operator_extras_cannot_smuggle_a_managed_flag() {
     }
 }
 
+
+/// Slice G: the review panel and the dispatch gate must agree. A reviewer that is not
+/// dispatchable routes a review request to a dead agent.
+#[test]
+fn i_grok_20_every_default_reviewer_is_dispatchable() {
+    let tmp = std::env::temp_dir().join("tv-grok-panel-check");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let engine = peer_review::PeerReviewEngine::new(tmp).expect("engine");
+    let panel = engine.reviewer_names();
+    assert!(panel.iter().any(|r| r == "grok"), "grok must be a DEFAULT reviewer");
+    for r in &panel {
+        assert!(
+            mcp_bridge::is_supported_agent_name(r),
+            "{r} sits on the review panel but dispatch would refuse it"
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Slice L: live tests. Opt-in, and they spend real subscription quota.
 // ─────────────────────────────────────────────────────────────────────────────

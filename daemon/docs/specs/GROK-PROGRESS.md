@@ -13,8 +13,8 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 | D spawn/dispatch + defects 2,3 | **DONE**, 179 tests green | `e41a55d` | awaiting peer review |
 | E doctor/README/aliases + defect 1 | **DONE**, 222 tests green | `cc192b2` | |
 | F mock binary + integration | **DONE**, 14 integration + 2 live-gated | | |
-| G peer-review panel | NEXT | | |
-| H fleet | | | |
+| G peer-review panel | **DONE**, grok is a default reviewer | | |
+| H fleet | NEXT | | |
 | I ABE | | | |
 | J token-economics | | | |
 | K shared-types sweep | | | |

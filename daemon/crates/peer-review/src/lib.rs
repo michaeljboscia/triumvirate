@@ -39,9 +39,24 @@ impl PeerReviewEngine {
         }
         Ok(Self {
             db_path: project_root.join(".triumvirate").join("ledger.db"),
-            reviewers: vec!["codex".to_string(), "gemini".to_string(), "claude".to_string()],
+            // REQ-GROK-003: grok is a DEFAULT reviewer. "Peer review" means all three CLI
+            // peers (codex, antigravity/gemini, grok) plus claude. DeepSeek is deliberately
+            // absent: it is HTTP with no filesystem access through the bridge, so it can only
+            // review method-level questions, and it is consulted explicitly when that is wanted.
+            reviewers: vec![
+                "codex".to_string(),
+                "gemini".to_string(),
+                "grok".to_string(),
+                "claude".to_string(),
+            ],
             round_robin: Arc::new(Mutex::new(0)),
         })
+    }
+
+    /// The default reviewer panel. Exposed so callers can assert that every reviewer is
+    /// actually dispatchable; a reviewer that is not routes review requests to a dead agent.
+    pub fn reviewer_names(&self) -> Vec<String> {
+        self.reviewers.clone()
     }
 
     pub fn request_review(&self, req: ReviewRequest) -> anyhow::Result<ReviewRecord> {
@@ -353,4 +368,29 @@ mod tests {
         assert_eq!(third_after.state, "in_progress");
 
     }
+    /// grok is a DEFAULT reviewer, not opt-in. Asserted here so removing it is a decision.
+    #[test]
+    fn u_pr_grok_is_a_default_reviewer() {
+        let tmp = std::env::temp_dir().join("tv-peer-review-grok-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let engine = PeerReviewEngine::new(tmp).unwrap();
+        let r = engine.reviewers.clone();
+        for expected in ["codex", "gemini", "grok", "claude"] {
+            assert!(r.iter().any(|x| x == expected), "{expected} must be a default reviewer");
+        }
+        // "Every reviewer is dispatchable" is asserted in triumvirate's integration suite,
+        // which can see both crates; peer-review does not depend on mcp-bridge.
+    }
+
+    /// An author must never review its own output, including grok.
+    #[test]
+    fn u_pr_grok_cannot_review_itself() {
+        let tmp = std::env::temp_dir().join("tv-peer-review-grok-self");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let engine = PeerReviewEngine::new(tmp).unwrap();
+        // next_reviewer must be able to route around grok when grok is the author.
+        let picked = engine.next_reviewer("grok").unwrap();
+        assert_ne!(picked, "grok", "the author cannot be its own reviewer");
+    }
+
 }
