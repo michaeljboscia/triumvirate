@@ -111,13 +111,50 @@ the transport moved and nobody followed.
 can be restructured without warning, so any protocol path needs a capability probe and a graceful downgrade **from
 day one**. This repo learned that the expensive way and the machinery exists.
 
+## 4b. Grok has the same architecture, verified on the installed binary
+
+Installed `grok 1.0.13` on 2026-08-30. `grok` and `agent` are **the same binary**, identical sha256, 133MB, two names
+for one executable.
+
+```
+$ grok agent --help
+Run Grok without the interactive UI
+Commands:
+  stdio     Run the agent over stdio
+  headless  Run the agent headlessly over the Grok WebSocket relay
+  serve     Run the agent as a WebSocket server
+  leader    Run as the shared leader process for other clients
+
+$ grok agent stdio --help
+Options:
+      --leader-socket <PATH>  Use a custom leader socket path instead of the default `~/.grok/leader.sock`
+
+$ grok agent leader --help
+Run as the shared leader process for other clients
+      --no-exit-on-disconnect   Keep the leader running after the last client disconnects
+      --relay-on-demand         Defer the grok.com relay WebSocket until the first headless IPC client registers
+```
+
+**Grok's `leader` plus `stdio` is the same shape as Codex 0.145's `app-server daemon` plus `proxy`:** a persistent
+process holding session state, reached by a thin stdio client over a socket. Two vendors, independently, have
+converged on it. Codex moved *to* this shape in the restructure that broke this repo's integration.
+
+Two consequences the guide does not account for:
+
+1. **The guide's v1 is swimming against both vendors' direction.** Spawn-per-turn plus stdout scraping is the shape
+   both CLIs are moving away from, not toward. That does not make v1 wrong, spawn-per-turn is simpler and it works,
+   but "defer ACP to v2" is deferring the direction of travel, not an optional optimization.
+2. **`grok agent stdio` connects to a leader**, so session state may live in that daemon rather than purely in
+   `~/.grok/sessions`. That is directly relevant to the `-s` versus `--resume` ambiguity both reviewers flagged as
+   the guide's most unvalidated assumption. The resume semantics may differ between the `-p` path and the agent path.
+
 ## 5. What is NOT established, and must be tested before anyone acts
 
 - **Whether `codex app-server proxy` speaks the same JSON-RPC that `CodexAppServerParser` already parses.** Not
   checked. The parser may need changes, or may work unmodified. This is a bounded experiment: start the daemon, pipe
   a handshake through the proxy, compare against the parser's expectations.
-- **Whether `grok agent stdio` speaks a compatible ACP dialect**, or merely a similarly-shaped one. The Grok guide
-  never characterizes it beyond "JSON-RPC."
+- **Whether `grok agent stdio` speaks ACP proper or a bespoke JSON-RPC.** The binary is installed and the subcommand
+  exists, but the wire format has NOT been captured. Confirmed only that it exists and takes a `--leader-socket`.
 - **What ACP's current spec version is.** Claude's own knowledge of it runs to roughly May 2026 and the guide is dated
   August. Do not treat that summary as current.
 
