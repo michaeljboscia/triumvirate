@@ -163,12 +163,32 @@ pub struct ReviewRequestLike {
     pub timeout_ms: Option<u64>,
 }
 
+/// Agents that can back a long-lived daemon session: the spawnable CLI peers.
+///
+/// This is deliberately NARROWER than `mcp_bridge::supported_agent_names()`, and the difference
+/// is a real distinction rather than drift:
+///
+///   - **`claude`** is the orchestrator, not a peer to spawn a daemon of. Driving Triumvirate
+///     from another agent is a separate, currently parked, piece of work.
+///   - **`deepseek`** is HTTP to `api.deepseek.com`, not a spawned process, so there is no CLI
+///     to hold open across turns.
+///
+/// Both exclusions predate grok and are preserved, now with a reason attached. `grok` joins
+/// `gemini` and `codex` because it IS a spawnable CLI. REQ-GROK-003.
+pub fn daemon_target_agents() -> &'static [&'static str] {
+    &["gemini", "codex", "grok"]
+}
+
+/// Map a `spawn_daemon` / `ask_daemon` target onto a canonical agent key.
+///
+/// Normalizes first, so the product aliases work: `antigravity`/`agy` for gemini, and
+/// `grok-build`/`xai`/`supergrok` for grok.
 fn map_target_to_agent(target: String) -> Result<String, AliasMappingError> {
-    match target.as_str() {
-        // antigravity/agy are the product/CLI aliases of the internal `gemini` key.
-        "gemini" | "antigravity" | "agy" => Ok("gemini".to_string()),
-        "codex" => Ok("codex".to_string()),
-        _ => Err(AliasMappingError::InvalidTarget(target)),
+    let canonical = mcp_bridge::normalize_agent_name(&target);
+    if daemon_target_agents().contains(&canonical.as_str()) {
+        Ok(canonical)
+    } else {
+        Err(AliasMappingError::InvalidTarget(target))
     }
 }
 
@@ -654,4 +674,29 @@ mod tests {
             timeout_ms: None,
         }));
     }
+    /// Every daemon target must be dispatchable. The reverse is deliberately NOT true: claude is
+    /// the orchestrator and deepseek is HTTP, so neither can back a spawned CLI session.
+    #[test]
+    fn u_al_grok_daemon_targets_are_a_subset_of_dispatchable_agents() {
+        for agent in super::daemon_target_agents() {
+            assert!(mcp_bridge::is_supported_agent_name(agent),
+                "{agent} is a daemon target but not dispatchable");
+            assert_eq!(super::map_target_to_agent(agent.to_string()).unwrap(), *agent);
+        }
+        // The exclusions are intentional and stay asserted so a future change is a decision.
+        assert!(super::map_target_to_agent("claude".into()).is_err(), "claude is the orchestrator");
+        assert!(super::map_target_to_agent("deepseek".into()).is_err(), "deepseek is HTTP, not a CLI");
+    }
+
+    #[test]
+    fn u_al_grok_product_aliases_map_to_canonical_keys() {
+        for (alias, canonical) in [
+            ("agy", "gemini"), ("antigravity", "gemini"),
+            ("grok", "grok"), ("supergrok", "grok"), ("grok-build", "grok"), ("xai", "grok"),
+        ] {
+            assert_eq!(super::map_target_to_agent(alias.to_string()).unwrap(), canonical, "{alias}");
+        }
+        assert!(super::map_target_to_agent("not-an-agent".to_string()).is_err());
+    }
+
 }

@@ -10,9 +10,9 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 | A identity + `supported_agent_names()` | **DONE** | `3893d27` | not reviewed (mechanical) |
 | B invocation builder | **DONE**, 20 tests green | `68c10d3` + fixes | Codex, Antigravity (Grok hit max-turns) |
 | C parser | **DONE**, 21 tests green vs real fixtures | `4c8d8d3` + fixes | Codex (5 defects found and fixed) |
-| D spawn/dispatch + defects 2,3 | **DONE**, 179 tests green | | awaiting peer review |
-| E doctor/README/aliases + defect 1 | NEXT | | |
-| F mock binary + integration | | | |
+| D spawn/dispatch + defects 2,3 | **DONE**, 179 tests green | `e41a55d` | awaiting peer review |
+| E doctor/README/aliases + defect 1 | **DONE**, 222 tests green | | |
+| F mock binary + integration | NEXT | | |
 | G peer-review panel | | | |
 | H fleet | | | |
 | I ABE | | | |
@@ -74,6 +74,11 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 - **Duplicate `toolCallId`** attached every update to the first call, starving later ones. Now targets the last
   still-open call. Test u_c_18.
 
+## Known cosmetic issue
+
+`triumvirate doctor` prints a tracing INFO line for the `grok_command` span into operator-facing stdout. Pre-existing
+behavior of `#[instrument(skip_all)]` on the connector resolvers, not introduced by grok. Not fixed.
+
 ## Verified sandbox behavior (matters for Slice D)
 
 Profiles on grok 1.0.13: `workspace`, `read-only`, `strict`, `off`. **An unknown profile does NOT fail.** It warns
@@ -89,7 +94,11 @@ a hard error**, or a consult silently runs uncontained.
 
 ## Pre-existing defects in scope
 
-1. `aliases.rs:166` maps only gemini and codex, so `spawn_daemon` is broken for deepseek and claude. **Slice E, OPEN.**
+1. `aliases.rs:166` mapped only gemini and codex. **RESOLVED in Slice E, but NOT the way it was first framed.**
+   An existing test (`u_al_03_spawn_daemon_claude_rejected`) asserts claude IS rejected, so the exclusion was
+   deliberate rather than drift. Daemon targets are now an explicit `daemon_target_agents()` list of the spawnable
+   CLI peers (gemini, codex, grok). claude is excluded because it is the orchestrator, deepseek because it is HTTP
+   with no CLI to hold open. Both exclusions now carry a documented reason and a test.
 2. `agent_exec.rs` retry test asserted against a closure it defined itself. **FIXED in Slice D:** the schedule is now
    `attempt_schedule_for()`, a real function, and the test calls it.
 3. `agent_exec.rs:336` claimed subscription calls cost $0. **FIXED in Slice D:** corrected to say dollars, and to

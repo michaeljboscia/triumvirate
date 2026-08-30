@@ -56,6 +56,62 @@ pub(crate) fn run_uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// REQ-GROK-016: report grok's binary, version and AUTH KIND without spending a single token.
+///
+/// Auth kind matters and is not cosmetic. `XAI_API_KEY` bills a metered API account while a
+/// cached login uses the operator's SuperGrok subscription. Reporting only "authenticated" would
+/// hide which account a consult is actually charged against.
+///
+/// Deliberately never runs `-p`. A doctor that spends tokens is a doctor people stop running.
+fn probe_grok() -> Vec<String> {
+    let mut out = Vec::new();
+    let (bin, _) = mcp_bridge::grok_command();
+    let resolved = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {bin}"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    match resolved {
+        None => {
+            out.push(format!(
+                "  grok: NOT FOUND ({bin}). Install from https://x.ai/cli or set TRIUMVIRATE_GROK_BIN"
+            ));
+            return out;
+        }
+        Some(path) => out.push(format!("  grok binary: {path}")),
+    }
+
+    match std::process::Command::new(&bin).arg("--no-auto-update").arg("--version").output() {
+        Ok(o) if o.status.success() => {
+            out.push(format!("  grok version: {}", String::from_utf8_lossy(&o.stdout).trim()));
+        }
+        _ => out.push("  grok version: WARN binary exists but --version failed".to_string()),
+    }
+
+    // Report WHICH credential is in use, never its value.
+    let api_key = std::env::var("XAI_API_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let cached_login = dirs::home_dir()
+        .map(|h| h.join(".grok").join("auth.json").exists())
+        .unwrap_or(false);
+    out.push(match (api_key, cached_login) {
+        (true, _) => "  grok auth: XAI_API_KEY set (METERED API billing, not the subscription)".to_string(),
+        (false, true) => "  grok auth: cached login at ~/.grok/auth.json (subscription)".to_string(),
+        (false, false) => "  grok auth: NONE. Run `grok login --oauth`, or set XAI_API_KEY".to_string(),
+    });
+
+    let profile = mcp_bridge::grok::grok_sandbox_profile();
+    out.push(match profile {
+        Some(p) => format!("  grok sandbox: {p} (consults are write-contained)"),
+        None => "  grok sandbox: OFF. Consults can write to the workspace".to_string(),
+    });
+    out
+}
+
 pub(crate) async fn run_doctor() -> anyhow::Result<()> {
     let token_path = core_triumvirate_home_dir()?.join("daemon.token");
     let plist_path = core_launchd_plist_path()?;
@@ -160,6 +216,11 @@ pub(crate) async fn run_doctor() -> anyhow::Result<()> {
         Err(e) => {
             write_line_stdout(&format!("  binary_runnable: FAIL ({e})"))?;
         }
+    }
+
+    write_line_stdout("grok:")?;
+    for line in probe_grok() {
+        write_line_stdout(&line)?;
     }
     Ok(())
 }

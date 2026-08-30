@@ -83,6 +83,16 @@ cargo run -p triumvirate -- doctor
 
 - `TRIUMVIRATE_GEMINI_BIN`, `TRIUMVIRATE_GEMINI_ARGS`
 - `TRIUMVIRATE_CODEX_BIN`, `TRIUMVIRATE_CODEX_ARGS`
+- `TRIUMVIRATE_GROK_BIN`, `TRIUMVIRATE_GROK_ARGS` (binary is `grok`; there is no `supergrok` executable)
+- `TRIUMVIRATE_GROK_MODEL`, `TRIUMVIRATE_GROK_EFFORT`
+- `TRIUMVIRATE_GROK_MAX_TURNS` (default `20`; every turn re-ships the whole system prompt, so turns are the unit of spend)
+- `TRIUMVIRATE_GROK_CONNECTOR_TIMEOUT_SECS` (default `900`)
+- `TRIUMVIRATE_GROK_STREAMING` (default on; `0` falls back to batch `json`)
+- `TRIUMVIRATE_GROK_YOLO` (default off; `1` adds `--always-approve`)
+- `TRIUMVIRATE_GROK_SANDBOX` (default `read-only`; also `workspace`, `strict`, or `off`. An unknown profile does
+  NOT fail grok, it warns and runs uncontained, so the runner treats that warning as a hard error)
+- `XAI_API_KEY` is inherited if set, but a cached `grok login --oauth` (subscription) is sufficient and is the
+  preferred path. Note the two bill different accounts; `triumvirate doctor` reports which is in use.
 - `TRIUMVIRATE_GEMINI_STREAMING`
   - Falsey disables live stream parse path and falls back to batch parse.
 - `TRIUMVIRATE_AGENT_VERBOSITY`
