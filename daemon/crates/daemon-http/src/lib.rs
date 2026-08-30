@@ -821,12 +821,18 @@ pub async fn token_summary_route(
         ));
     }
 
+    // REQ-GROK-003: validate against the ONE dispatchable list. This used to hardcode
+    // claude|codex|gemini, so `?agent=grok` and `?agent=deepseek` both 400'd even though both
+    // are dispatchable and both accumulate token records. Same drift class as the four
+    // `supported_agents` surfaces.
     if let Some(agent) = query.agent.as_deref()
-        && !matches!(agent, "claude" | "codex" | "gemini")
+        && !mcp_bridge::is_supported_agent_name(agent)
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            AxumJson(serde_json::json!({ "error": "agent must be one of claude|codex|gemini" })),
+            AxumJson(serde_json::json!({
+                "error": format!("agent must be one of {}", mcp_bridge::supported_agent_names().join("|"))
+            })),
         ));
     }
 

@@ -104,6 +104,21 @@ impl AgentLauncher for DaemonAgentLauncher {
                     ("gemini".to_string(), vec!["-p".to_string(), task_prompt.to_string()])
                 }
             },
+            // REQ-GROK-004: fleet reuses the SAME invocation builder as the consult path, so
+            // a fleet worker inherits the forbidden-flag guard, the sandbox default, and the
+            // session-flag rules rather than assembling a second, divergent argv.
+            //
+            // No session id: a fleet worker is single-turn in its own worktree, so passing one
+            // would either create a session nothing resumes or, worse, resume a stranger's.
+            "grok" => {
+                let (bin, extra) = mcp_bridge::grok_command();
+                let cwd = worktree_path.to_string_lossy();
+                let inv = mcp_bridge::grok::build_grok_invocation(
+                    &bin, &extra, task_prompt, &cwd, None, false,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to assemble grok invocation for fleet: {e}"))?;
+                (inv.program, inv.args)
+            }
             _ => anyhow::bail!("unsupported fleet agent: {agent}"),
         };
         let child = Command::new(&cmd)
@@ -1217,4 +1232,25 @@ mod tests {
         }
         assert!(failed_events >= 1);
     }
+    /// Slice H: a fleet worker must reuse the consult path's invocation builder, not assemble a
+    /// second argv. Otherwise the forbidden-flag guard and the sandbox default silently do not
+    /// apply to fleet work.
+    #[test]
+    fn u_fleet_grok_reuses_the_shared_invocation_builder() {
+        let (bin, extra) = mcp_bridge::grok_command();
+        let inv = mcp_bridge::grok::build_grok_invocation(
+            &bin, &extra, "do the task", "/tmp/wt", None, false,
+        )
+        .expect("fleet must be able to build a grok invocation");
+        assert!(inv.args.contains(&"--sandbox".to_string()),
+            "a fleet worker must be write-contained like a consult");
+        assert!(inv.args.contains(&"--output-format".to_string()));
+        assert!(!inv.args.contains(&"--resume".to_string()),
+            "a fleet worker is single-turn in its own worktree; resuming would attach to a stranger");
+        assert!(!inv.args.contains(&"--session-id".to_string()));
+        let n = inv.args.len();
+        assert_eq!(inv.args[n - 2], "-p");
+        assert_eq!(inv.args[n - 1], "do the task");
+    }
+
 }

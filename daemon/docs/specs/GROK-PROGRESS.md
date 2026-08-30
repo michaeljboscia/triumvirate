@@ -14,11 +14,11 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 | E doctor/README/aliases + defect 1 | **DONE**, 222 tests green | `cc192b2` | |
 | F mock binary + integration | **DONE**, 14 integration + 2 live-gated | | |
 | G peer-review panel | **DONE**, grok is a default reviewer | | |
-| H fleet | NEXT | | |
-| I ABE | | | |
-| J token-economics | | | |
-| K shared-types sweep | | | |
-| L e2e | | | |
+| H fleet | **DONE**, grok launches via the shared builder | | |
+| I ABE | **BLOCKED, not a grok gap** (see below) | | |
+| J token-economics | **DONE** via the direct path; no offline scanner is possible | | |
+| K shared-types sweep | **DONE**, one real gate found and fixed | | |
+| L e2e | **DONE**, 2 live tests gated on `TRIUMVIRATE_LIVE_GROK=1` | | |
 
 ## Rulings already made, do not relitigate
 
@@ -59,6 +59,41 @@ Goal: `GOAL-grok-integration.md` · Plan: `grok-integration-test-plan.md` · Evi
 - **Duplicate managed flags** (Codex). `value_after` returns the first match; grok takes the LAST, so a duplicate
   silently wins. Test u_b_19 asserts each managed flag appears exactly once.
 - **Sampled rather than exhaustive forbidden-flag coverage** (Codex). Test u_b_20 now iterates the whole list.
+
+## Slice I (ABE): blocked, and it is NOT a grok-specific gap
+
+`abe/task_tracker.rs` hardcodes `agent: "codex"` with a pre-existing comment saying so:
+*"the daemon only spawns Codex workers via ABE today; if Claude/Gemini ABE workers land in a future task, this should
+branch on `TaskRecord` metadata."*
+
+So ABE is Codex-only for **every** agent. Gemini and Claude are equally absent. Making grok an ABE worker requires
+the ABE dispatch path to spawn non-Codex workers at all, which is a feature that does not exist yet for anyone.
+
+**Deliberately not faked.** Setting `agent: "grok"` on a lifecycle event while ABE still spawns a Codex process
+would produce telemetry that lies. The honest state is: ABE multi-agent support is one task, and grok comes along
+free when it lands.
+
+## Slice J: there is NO offline token scanner for grok, by design
+
+The other agents leave token counts on disk. Grok does not: `~/.grok/sessions/<cwd>/prompt_history.jsonl` holds only
+`{timestamp, session_id, prompt, is_bash}`, with no usage block. Verified against a real profile.
+
+Grok reports usage and `total_cost_usd` LIVE in the `end` event, so spend is recorded through
+`direct::record_daemon_tokens` from the runner, where the numbers exist. Writing a scanner over that file would
+produce records with zeroed counts, which is worse than none because it looks like measured spend.
+
+## Slice K: one real gate found
+
+`daemon-http/src/lib.rs:825` hardcoded `matches!(agent, "claude" | "codex" | "gemini")`, so `/token-summary?agent=grok`
+returned 400. **It also rejected `deepseek`**, which is dispatchable and accumulates records. Same drift class as the
+four `supported_agents` surfaces. Now validated against `is_supported_agent_name`.
+
+Every other file carrying `"codex"` without `"grok"` uses it as a test fixture or example, not a dispatch decision.
+
+## Known pre-existing issue, NOT introduced here
+
+`cargo clippy --workspace --all-targets` fails on `daemon-core/src/pantheon_session.rs:174` with
+"an async construct yields a type which is itself awaitable". That crate was never touched by this work. Left alone.
 
 ## Peer findings fixed in Slice C
 

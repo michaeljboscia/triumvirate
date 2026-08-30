@@ -32,6 +32,25 @@ struct ScanState {
     last_offset: i64,
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Grok has NO offline scanner, deliberately. REQ-GROK-012.
+//
+// The other agents leave token counts in files on disk, so `scan_codex_file` and friends can
+// reconstruct spend after the fact. Grok does not: `~/.grok/sessions/<cwd>/prompt_history.jsonl`
+// contains only `{timestamp, session_id, prompt, is_bash}`, with no usage block at all. Verified
+// against a real profile on 2026-08-30.
+//
+// Grok reports usage and its own `total_cost_usd` LIVE, in the `end` event of every turn, which
+// the parser captures. So grok spend is recorded through `direct::record_daemon_tokens` from the
+// runner, where the numbers actually exist, rather than scraped afterwards from a file that never
+// had them.
+//
+// If a future grok version starts writing usage to disk, add a scanner then. Adding one now would
+// produce records with zeroed token counts, which is worse than no records because it looks like
+// measured spend.
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub fn scan_claude_file(db: &TokenDb, file_path: &Path) -> Result<Vec<TokenRecord>> {
     scan_jsonl_file(db, file_path, "claude")
 }
