@@ -1056,36 +1056,61 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
 
     let prompt =
         "Read .triumvirate/BRIEFING.md and implement the task contract. Commit when complete.".to_string();
-    let (cmd, mut args) = (callbacks.codex_command)();
-    args.push("exec".to_string());
-    args.push("--full-auto".to_string());
-    append_codex_exec_mcp_compat_args(&mut args);
-    // Translate sandbox_permissions contract field into `-c key=value` overrides
-    // that codex-exec merges ON TOP of --full-auto. See build_sandbox_permission_args.
-    args.extend(build_sandbox_permission_args(
-        req.contract_fields.sandbox_permissions.as_deref(),
-    ));
+    // Agent-aware. The codex branch below is byte-for-byte what this site built before, so an
+    // existing worktree dispatch produces the same process.
+    let worker_agent = abe_worker_agent();
+    let (cmd, args) = if mcp_bridge::normalize_agent_name(&worker_agent) == "grok" {
+        let (bin, extra) = mcp_bridge::grok_command();
+        // `workspace` rather than the consult default of `read-only`: a worktree worker exists to
+        // write code and commit it. No session id, so it cannot attach to another task's
+        // conversation.
+        //
+        // KNOWN GAP, stated rather than hidden: codex reaches the MAIN repo's .git through
+        // `--add-dir`, which grok has no equivalent for. A grok worktree worker may therefore be
+        // unable to run git operations that need the parent .git. That is untested, because no
+        // grok worktree dispatch has been run. Do not treat this path as verified.
+        let inv = mcp_bridge::grok::build_grok_invocation_with_sandbox(
+            &bin,
+            &extra,
+            &prompt,
+            &setup.worktree_path.display().to_string(),
+            None,
+            false,
+            Some("workspace"),
+        )
+        .map_err(|e| format!("failed to assemble grok worktree worker: {e}"))?;
+        (inv.program, inv.args)
+    } else {
+        let (cmd, mut args) = (callbacks.codex_command)();
+        args.push("exec".to_string());
+        args.push("--full-auto".to_string());
+        append_codex_exec_mcp_compat_args(&mut args);
+        // Translate sandbox_permissions contract field into `-c key=value` overrides
+        // that codex-exec merges ON TOP of --full-auto. See build_sandbox_permission_args.
+        args.extend(build_sandbox_permission_args(
+            req.contract_fields.sandbox_permissions.as_deref(),
+        ));
 
-    let main_git_dir = project_root.join(".git");
-    args.push("--add-dir".to_string());
-    args.push(main_git_dir.display().to_string());
+        let main_git_dir = project_root.join(".git");
+        args.push("--add-dir".to_string());
+        args.push(main_git_dir.display().to_string());
 
-    let dot_git = setup.worktree_path.join(".git");
-    if dot_git.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&dot_git) {
-            if let Some(gitdir) = content.strip_prefix("gitdir: ").map(|s| s.trim()) {
-                let resolved = if std::path::Path::new(gitdir).is_absolute() {
-                    gitdir.to_string()
-                } else {
-                    setup.worktree_path.join(gitdir).display().to_string()
-                };
-                args.push("--add-dir".to_string());
-                args.push(resolved);
-            }
+        let dot_git = setup.worktree_path.join(".git");
+        if dot_git.is_file()
+            && let Ok(content) = std::fs::read_to_string(&dot_git)
+            && let Some(gitdir) = content.strip_prefix("gitdir: ").map(|s| s.trim())
+        {
+            let resolved = if std::path::Path::new(gitdir).is_absolute() {
+                gitdir.to_string()
+            } else {
+                setup.worktree_path.join(gitdir).display().to_string()
+            };
+            args.push("--add-dir".to_string());
+            args.push(resolved);
         }
-    }
-
-    args.push(prompt);
+        args.push(prompt.clone());
+        (cmd, args)
+    };
 
     let mut worker_env = (callbacks.completion_env)();
     worker_env.insert(

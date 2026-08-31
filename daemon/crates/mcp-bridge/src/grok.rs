@@ -346,8 +346,19 @@ pub fn build_grok_invocation_with_sandbox(
         args.push(profile);
     }
 
+    // Approval policy is Triumvirate's, and it must be stated EXPLICITLY on every invocation.
+    //
+    // `~/.grok/config.toml` carries a `permission_mode`, and the operator's is currently
+    // `always-approve`. Relying on the absence of `--always-approve` to mean "ask first" is
+    // therefore wrong: the config already said yes. Grok found this reviewing its own adapter.
+    // Passing `--permission-mode` unconditionally makes the flag, not the config file, decide.
     if grok_yolo_enabled() {
         args.push("--always-approve".to_string());
+    } else {
+        // `default` is grok's ask-before-acting mode. Combined with `--sandbox`, a consult can
+        // neither auto-approve from config nor write outside its containment.
+        args.push("--permission-mode".to_string());
+        args.push("default".to_string());
     }
 
     // Operator extras are already validated. They go BEFORE `-p` so nothing can land between
@@ -717,6 +728,30 @@ mod tests {
                 "{hostile} is a hidden alias that would override a Triumvirate-managed flag"
             );
         }
+    }
+
+    /// grok's own config carries a `permission_mode`, and the operator's is `always-approve`.
+    /// Relying on the ABSENCE of `--always-approve` to mean "ask first" was therefore wrong: the
+    /// config had already said yes. Approval policy must be stated explicitly every time.
+    #[test]
+    fn u_b_23_approval_policy_is_explicit_not_inherited_from_config() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let inv = build(None, false).unwrap();
+        assert_eq!(
+            value_after(&inv.args, "--permission-mode").as_deref(),
+            Some("default"),
+            "a consult must pass its approval mode explicitly so config cannot widen it"
+        );
+        assert!(!inv.args.contains(&"--always-approve".to_string()));
+
+        // Yolo is the deliberate opt-in, and then the explicit mode is redundant.
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_YOLO", "1") };
+        let inv = build(None, false).unwrap();
+        assert!(inv.args.contains(&"--always-approve".to_string()));
+        assert!(!inv.args.contains(&"--permission-mode".to_string()));
+        clear_env();
     }
 
 }

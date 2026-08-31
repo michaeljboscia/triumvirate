@@ -61,6 +61,11 @@ pub struct GrokStreamParser {
     termination: Termination,
     /// Verbatim `end.stopReason`, so the runner can explain WHY without re-parsing.
     stop_reason: Option<String>,
+    /// Tools and slash-commands advertised for the turn. The only visibility into context cost.
+    tool_surface: Option<(usize, usize)>,
+    /// Set when auto-compaction FAILED. The turn kept running against a context neither side can
+    /// vouch for, so the runner must be able to say so rather than report a clean answer.
+    context_rewrite_failed: Option<String>,
     error_detail: Option<String>,
     stream_tx: Option<mpsc::Sender<AgentStreamEvent>>,
     stream_seq: u64,
@@ -142,6 +147,11 @@ impl GrokStreamParser {
     /// Grok's self-reported spend for the turn, if an `end` or `usage` event carried it.
     pub fn total_cost_usd(&self) -> Option<f64> {
         self.total_cost_usd
+    }
+
+    /// Tools and commands advertised for this turn, if grok reported them.
+    pub fn tool_surface(&self) -> Option<(usize, usize)> {
+        self.tool_surface
     }
 
     /// Verbatim `end.stopReason`.
@@ -400,8 +410,48 @@ impl GrokStreamParser {
                 self.record(ev)
             }
 
-            // Skipped by design: plan, available_commands, auto_compact_*. Unknown types fall
-            // here too, so an upstream addition is inert rather than fatal.
+            // Tool and command surface. Not chat content, but it is the ONLY place the context
+            // cost is visible: the captured fixture goes from 26 tools to 420 once MCP servers
+            // connect, which is the difference between a 14K and a 67K turn. Recording the count
+            // makes that observable instead of invisible.
+            "available_commands" => {
+                let tools = json.get("tools").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+                let commands = json.get("commands").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+                self.tool_surface = Some((tools, commands));
+                let ev = self.event(
+                    WorkingState::Unknown,
+                    format!("{tools} tools, {commands} commands available"),
+                );
+                self.record(ev)
+            }
+
+            "plan" => {
+                let n = json.get("entries").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+                let ev = self.event(WorkingState::Unknown, format!("plan: {n} entries"));
+                self.record(ev)
+            }
+
+            // Auto-compaction REWRITES the conversation mid-turn. A failure here is not cosmetic:
+            // the turn continues against a context that is not what either side thinks it is, and
+            // silently dropping it was the worst of the eight missing types.
+            "auto_compact_started" | "auto_compact_completed" | "auto_compact_cancelled"
+            | "auto_continue_completed" | "memory_flush_started" | "memory_flush_completed" => {
+                let ev = self.event(WorkingState::Unknown, event_type.to_string());
+                self.record(ev)
+            }
+
+            "auto_compact_failed" => {
+                let detail = json
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("auto-compaction failed")
+                    .to_string();
+                self.context_rewrite_failed = Some(detail.clone());
+                let ev = self.event(WorkingState::Error, format!("auto_compact_failed: {detail}"));
+                self.record(ev)
+            }
+
+            // Unknown types stay inert, so an upstream addition cannot kill a turn.
             _ => None,
         }
     }
@@ -434,6 +484,8 @@ impl GrokStreamParser {
         GrokParsed {
             termination: self.termination,
             stop_reason: self.stop_reason.clone(),
+            tool_surface: self.tool_surface,
+            context_rewrite_failed: self.context_rewrite_failed.clone(),
             total_cost_usd: self.total_cost_usd,
             error_detail: self.error_detail.clone(),
             parsed: self.finish(),
@@ -533,12 +585,18 @@ mod tests {
         assert_eq!(p.finish().response_text, "ok", "a banner must not lose the answer");
     }
 
+    /// An UNKNOWN type must stay inert so an upstream addition cannot kill a turn.
+    ///
+    /// `plan` and the `auto_compact_*` family used to live here. They are handled now, and
+    /// deliberately so: a failed compaction rewrote the context mid-turn and dropping it made a
+    /// clean-looking answer out of one built on a context nobody can vouch for. This test keeps
+    /// the inertness property using types grok genuinely does not emit.
     #[test]
     fn u_c_08_unknown_event_type_is_inert() {
         let mut p = GrokStreamParser::new();
-        assert!(p.parse_line(r#"{"type":"auto_compact_start"}"#).is_none());
         assert!(p.parse_line(r#"{"type":"some_future_event","data":"x"}"#).is_none());
-        assert!(p.parse_line(r#"{"type":"plan","entries":[]}"#).is_none());
+        assert!(p.parse_line(r#"{"type":"another_unknown"}"#).is_none());
+        assert!(p.parse_line(r#"{"data":"no type field at all"}"#).is_none());
         p.parse_line(r#"{"type":"text","data":"still here"}"#);
         assert_eq!(p.finish().response_text, "still here");
     }
@@ -836,6 +894,57 @@ mod tests {
         assert!(saw_path, "the tool fixture must produce a FileRead event");
     }
 
+
+    /// Eight event types were silently dropped. The worst was auto_compact_failed: the context
+    /// gets rewritten mid-turn, the rewrite fails, and the turn still looked clean.
+    #[test]
+    fn u_c_25_previously_dropped_event_types_are_now_observed() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"available_commands","tools":[1,2,3],"commands":[1,2]}"#);
+        p.parse_line(r#"{"type":"plan","entries":[1,2,3,4]}"#);
+        p.parse_line(r#"{"type":"auto_compact_started"}"#);
+        p.parse_line(r#"{"type":"auto_continue_completed"}"#);
+        p.parse_line(r#"{"type":"memory_flush_started"}"#);
+        p.parse_line(r#"{"type":"text","data":"answer"}"#);
+        let full = p.finish_full();
+        assert_eq!(full.tool_surface, Some((3, 2)), "context cost must be observable");
+        // None of them may contaminate the answer.
+        assert_eq!(full.parsed.response_text, "answer");
+        let details: Vec<&str> = full.parsed.events.iter().map(|e| e.detail.as_str()).collect();
+        assert!(details.iter().any(|d| d.contains("3 tools, 2 commands")));
+        assert!(details.iter().any(|d| d.contains("plan: 4 entries")));
+        assert!(details.iter().any(|d| d.contains("auto_compact_started")));
+        assert!(details.iter().any(|d| d.contains("memory_flush_started")));
+    }
+
+    /// A failed auto-compaction means the answer was produced against a context that was being
+    /// rewritten and did not survive. It must be visible, not silently dropped.
+    #[test]
+    fn u_c_26_a_failed_context_rewrite_is_surfaced() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"text","data":"answer built on a rewritten context"}"#);
+        p.parse_line(r#"{"type":"auto_compact_failed","message":"summarizer timed out"}"#);
+        p.parse_line(r#"{"type":"end","sessionId":"s","stopReason":"end_turn"}"#);
+        let full = p.finish_full();
+        assert_eq!(full.context_rewrite_failed.as_deref(), Some("summarizer timed out"));
+        // The text survives so the runner can decide; it is the runner that marks it.
+        assert!(full.parsed.response_text.contains("answer"));
+        assert!(full.parsed.events.iter().any(|e| e.state == WorkingState::Error));
+    }
+
+    /// The real fixture must not regress now that available_commands is handled.
+    #[test]
+    fn u_c_27_real_fixture_reports_its_tool_surface() {
+        let mut p = GrokStreamParser::new();
+        for l in FIXTURE.lines() {
+            let _ = p.parse_line(l);
+        }
+        let full = p.finish_full();
+        let (tools, _) = full.tool_surface.expect("the capture advertises a tool surface");
+        assert!(tools >= 400, "the full-inheritance capture carries 420 tools, got {tools}");
+        assert_eq!(full.parsed.response_text, "pong", "still no contamination of the answer");
+    }
+
 }
 
 /// Grok's parse result plus the turn facts the runner must branch on. Returned by
@@ -849,6 +958,11 @@ pub struct GrokParsed {
     pub termination: Termination,
     /// Verbatim `end.stopReason`, so a caller can explain a `Stopped` turn precisely.
     pub stop_reason: Option<String>,
+    /// `(tools, commands)` advertised for the turn. The only signal for context cost.
+    pub tool_surface: Option<(usize, usize)>,
+    /// Set when auto-compaction failed mid-turn, meaning the answer was produced against a
+    /// context that was being rewritten and did not survive the rewrite.
+    pub context_rewrite_failed: Option<String>,
     /// Grok's self-reported spend. A usage signal on a flat subscription, not a bill.
     pub total_cost_usd: Option<f64>,
     pub error_detail: Option<String>,

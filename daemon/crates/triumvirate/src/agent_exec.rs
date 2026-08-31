@@ -2681,6 +2681,26 @@ async fn run_grok_cli_process_with_session(
         }
     }
 
+    // Auto-compaction rewrites the conversation mid-turn. If it FAILED, the answer was produced
+    // against a context that was being rewritten and did not survive, so neither side can vouch
+    // for what the model actually saw. Mark it rather than hand back a clean-looking answer.
+    if let Some(detail) = full.context_rewrite_failed.as_deref() {
+        tracing::warn!(agent = "grok", detail, "grok auto-compaction failed mid-turn");
+        if parsed.response_text.trim().is_empty() {
+            anyhow::bail!("grok auto-compaction failed ({detail}) and the turn produced no text");
+        }
+        parsed.response_text = format!(
+            "[UNRELIABLE: grok's auto-compaction failed mid-turn ({detail}); this answer was \
+             produced against a context that was being rewritten.]\n\n{}",
+            parsed.response_text
+        );
+    }
+
+    if let Some((tools, commands)) = full.tool_surface {
+        // The only visibility into per-turn context cost: 26 tools is a ~14K turn, 420 is ~67K.
+        tracing::info!(agent = "grok", tools, commands, "grok tool surface for this turn");
+    }
+
     // Termination policy lives HERE, not in the parser, so it is testable independently.
     match full.termination {
         GrokTermination::MaxTurnsReached => {
