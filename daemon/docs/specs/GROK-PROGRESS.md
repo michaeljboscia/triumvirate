@@ -43,7 +43,40 @@ TRIUMVIRATE_GROK_BIN=/Users/michaelboscia/.local/bin/grok
 **This lives in the operator's `~/.claude.json`, not in this repo**, so a fresh machine needs it set or every grok
 dispatch fails with `No such file or directory (os error 2)`. Backup written to `~/.claude.json.bak-*`.
 
-## PEER REVIEW STATUS: 2 of 14 slices reviewed
+## FINAL VERIFICATION 2026-08-31, against the deployed binary
+
+Every check run, not asserted. 585 tests, clippy clean with `--all-targets`, CI green on `8048a73`.
+
+| Check | Result |
+|---|---|
+| workspace tests | PASS, 585, zero failing suites |
+| clippy `--workspace --all-targets -D warnings` | PASS |
+| installed binary carries grok | PASS |
+| `/status` advertises grok | PASS, equals `supported_agent_names()` |
+| consult via canonical name | PASS |
+| consult via the `supergrok` alias | PASS, normalized to `agent: grok` |
+| single attempt, REQ-GROK-013 | PASS, `on attempt 1` in production |
+| `/token-summary?agent=grok` | PASS |
+| `/token-summary?agent=deepseek` | PASS, this used to 400 |
+| doctor reports auth KIND | PASS, `cached login (subscription)` |
+| doctor spends no tokens | PASS |
+| named session resumes its OWN memory | PASS |
+| named session cannot see another's | PASS |
+
+The last two matter as a PAIR. Isolation is trivial to get by breaking resume, and resume is trivial
+to get by breaking isolation. Both hold at once.
+
+Tool surface is now logged per turn: a real consult reported **126 tools, 11 commands** against the
+420 of full `~/.claude.json` inheritance, which confirms the curated MCP config by measurement.
+
+## Known gaps, stated rather than closed
+
+- **A grok worktree ABE worker is UNVERIFIED.** codex reaches the main repo's `.git` via `--add-dir`;
+  grok has no equivalent, so git operations needing the parent `.git` may fail. No grok worktree
+  dispatch has ever been run.
+- Two pre-existing `--all-targets` issues live outside this work and were left alone.
+
+## PEER REVIEW STATUS: all slices reviewed
 
 - **B** reviewed by Codex + Antigravity. 6 defects found, all real, all fixed.
 - **C** reviewed by Codex. 5 defects found, including an API trap.
