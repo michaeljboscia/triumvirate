@@ -135,6 +135,10 @@ pub async fn spawn_session(
     let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
     // Per NAMED session, so two sessions for one agent in one directory do not resume each
     // other. Keyed on (agent, cwd) alone this leaked a passphrase between sessions.
+    // Respawning an existing name must start a NEW conversation. Without this the visible
+    // history resets while the worker keeps its old CLI session id, so the next ask silently
+    // resumes the previous transcript under a session that looks fresh.
+    agent_worker::reset_worker_session(&agent, &cwd, Some(req.name.as_str())).await;
     let worker = acquire_worker(&agent, &cwd, Some(req.name.as_str())).await;
 
     let mut sessions = sessions.lock().await;
@@ -204,6 +208,10 @@ pub async fn ask_session(
             // A named session is the one caller that genuinely wants to resume: multi-turn
             // memory is the whole point. One-shot ask_agent leaves this None and starts fresh.
             reuse_session: Some(true),
+            // WITHOUT this the worker key falls back to (agent, cwd) and two named sessions in
+            // one directory resume each other. The HTTP route was fixed first and verified
+            // through the HTTP route, so this in-process MCP path kept the leak. Found by Codex.
+            session_key: Some(req.name.clone()),
             ..Default::default()
         },
         None,
@@ -385,4 +393,28 @@ mod ask_agent_failure_message_tests {
         assert!(message.contains("operation timed out"), "{message}");
         assert!(!message.contains(r"\"), "stray backslash from the old literal: {message}");
     }
+    /// Every production caller that RESUMES must carry a session key.
+    ///
+    /// The HTTP route was fixed first and verified through the HTTP route, so this in-process MCP
+    /// path kept the cross-session leak: resuming with no session key falls back to the anonymous
+    /// `(agent, cwd)` worker, which is exactly the bug. Codex found it in review. This asserts the
+    /// invariant on the SOURCE so a future caller cannot repeat it.
+    #[test]
+    fn u_ia_resume_callers_must_carry_a_session_key() {
+        // Built at runtime so this test's own source cannot match the pattern it searches for.
+        let needle = format!("reuse_session: {}(true)", "Some");
+        let src = include_str!("inter_agent.rs");
+        let mut checked = 0;
+        for (i, _) in src.match_indices(needle.as_str()) {
+            let window = &src[i..src.len().min(i + 400)];
+            assert!(
+                window.contains("session_key:"),
+                "a resume call at byte {i} has no adjacent session key; it would resume the \
+                 anonymous (agent, cwd) worker and cross sessions"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "the invariant found nothing to check, so it guards nothing");
+    }
+
 }

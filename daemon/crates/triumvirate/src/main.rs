@@ -2313,6 +2313,8 @@ async fn run_daemon() -> anyhow::Result<()> {
             return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'antigravity' (aliases: agy, gemini), 'codex', or 'deepseek'" }))));
         }
         let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
+        // Respawn starts a NEW conversation: clear any prior CLI session for this name first.
+        agent_worker::reset_worker_session(&agent, &cwd, Some(req.name.as_str())).await;
         let worker = acquire_worker(&agent, &cwd, Some(req.name.as_str())).await;
         let mut sessions = state.sessions.lock().await;
         sessions.insert(

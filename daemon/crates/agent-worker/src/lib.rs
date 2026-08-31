@@ -82,9 +82,44 @@ fn persist_worker_registry_if_enabled(workers: &HashMap<String, WorkerState>) {
     }
 }
 
+/// Drop session ids that a restart cannot vouch for.
+///
+/// The registry persists `session_id` across restarts, and nothing validated it before resuming.
+/// Two consequences, both found in review:
+///
+///   - A registry written BEFORE named-session keying still holds anonymous `agent::cwd` entries
+///     carrying live ids. Resuming one attaches a fresh caller to whatever conversation last ran
+///     in that directory, which is the cross-session leak in its original form.
+///   - Even a current entry may name a CLI session the agent has since deleted, so the id is at
+///     best stale and at worst someone else's.
+///
+/// A dropped id costs one fresh turn. A wrongly-resumed id costs a conversation crossing between
+/// callers, so this errs toward dropping.
+fn scrub_unvouchable_sessions(mut workers: HashMap<String, WorkerState>) -> HashMap<String, WorkerState> {
+    let mut dropped = 0usize;
+    for (key, state) in workers.iter_mut() {
+        // Three segments means the key carries a session name and is post-fix. Two means it is an
+        // anonymous worker, which must never carry a resumable id across a restart.
+        if state.session_id.is_some() && key.matches("::").count() < 2 {
+            state.session_id = None;
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "dropped session ids from anonymous worker entries on load; a resume would have \
+             attached to whatever last ran in that directory"
+        );
+    }
+    workers
+}
+
 fn worker_registry_store() -> &'static WorkerRegistry {
     static STORE: OnceLock<WorkerRegistry> = OnceLock::new();
-    STORE.get_or_init(|| Arc::new(Mutex::new(load_worker_registry_from_disk())))
+    STORE.get_or_init(|| {
+        Arc::new(Mutex::new(scrub_unvouchable_sessions(load_worker_registry_from_disk())))
+    })
 }
 
 #[instrument(skip_all)]
@@ -190,6 +225,23 @@ pub async fn update_worker_session(
 }
 
 #[instrument(skip_all)]
+/// Forget the CLI session behind a worker without removing the worker itself.
+///
+/// `spawn_session` on an EXISTING name resets the visible history but left the worker's
+/// `session_id` in place, so the next ask resumed the OLD CLI transcript under a session that
+/// looked brand new. Found by Codex. Respawning a name must start a real new conversation.
+pub async fn reset_worker_session(agent: &str, cwd: &str, session_key: Option<&str>) {
+    let key = worker_key(agent, cwd, session_key);
+    let mut workers = worker_registry_store().lock().await;
+    if let Some(state) = workers.get_mut(&key)
+        && state.session_id.is_some()
+    {
+        tracing::info!(%key, "respawn: clearing the previous CLI session id for this name");
+        state.session_id = None;
+        persist_worker_registry_if_enabled(&workers);
+    }
+}
+
 pub async fn dismiss_worker(agent: &str, cwd: &str, session_key: Option<&str>) -> bool {
     let key = worker_key(agent, cwd, session_key);
     let mut workers = worker_registry_store().lock().await;
@@ -247,4 +299,36 @@ mod worker_key_tests {
         assert_ne!(a, worker_key("codex", "/tmp", Some("alpha")));
         assert_ne!(a, worker_key("grok", "/other", Some("alpha")));
     }
+    /// A registry written before named-session keying still holds anonymous `agent::cwd` entries
+    /// with live session ids. Resuming one attaches a fresh caller to whatever conversation last
+    /// ran in that directory. Found by Codex reviewing the subsystem.
+    #[test]
+    fn u_wk_02_stale_anonymous_session_ids_are_dropped_on_load() {
+        use std::collections::HashMap;
+        let mut m: HashMap<String, super::WorkerState> = HashMap::new();
+        let mk = |sid: Option<&str>| super::WorkerState {
+            agent: "grok".into(),
+            cwd: "/tmp".into(),
+            session_id: sid.map(str::to_string),
+            spawn_count: 1,
+            ask_count: 1,
+            last_used_ms: 0,
+        };
+        // Pre-fix anonymous entry carrying a live id.
+        m.insert("grok::/tmp".into(), mk(Some("dangerous-shared-id")));
+        // Post-fix named entry: its id belongs to that session and must survive.
+        m.insert("grok::/tmp::alpha".into(), mk(Some("alpha-owned-id")));
+
+        let out = super::scrub_unvouchable_sessions(m);
+        assert_eq!(
+            out["grok::/tmp"].session_id, None,
+            "an anonymous worker must not carry a resumable id across a restart"
+        );
+        assert_eq!(
+            out["grok::/tmp::alpha"].session_id.as_deref(),
+            Some("alpha-owned-id"),
+            "a named session owns its id and must keep it"
+        );
+    }
+
 }
