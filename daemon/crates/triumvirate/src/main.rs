@@ -2578,10 +2578,20 @@ async fn run_daemon() -> anyhow::Result<()> {
     let sessions_file = core_triumvirate_home_dir()
         .ok()
         .map(|home| core_sessions_file_path(&home));
-    let sessions = sessions_file
+    let mut sessions = sessions_file
         .as_ref()
         .and_then(|path| core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok())
         .unwrap_or_default();
+    // Same migration as the MCP load path. Grok caught that it was wired ONLY there, which is the
+    // third time in this subsystem a fix landed on one of the two session surfaces. Without it,
+    // a daemon started this way resumes nothing for pre-existing named sessions.
+    agent_worker::hydrate_session_ids_from_disk(|name, sid| {
+        if let Some(st) = sessions.get_mut(name)
+            && st.cli_session_id.is_none()
+        {
+            st.cli_session_id = Some(sid);
+        }
+    });
     let metrics = Arc::new(DaemonMetrics::new()?);
     let ws_events = broadcast::channel(256).0;
     let token_db = init_process_token_db()?;

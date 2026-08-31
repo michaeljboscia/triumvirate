@@ -113,15 +113,26 @@ fn probe_grok() -> Vec<String> {
         if root.is_dir() {
             let mut dirs = 0usize;
             let mut locks = 0usize;
+            // Locks live NESTED inside each session directory, not beside them. Counting only
+            // the cwd level reported 0 while 181 sat one level down. Grok measured the real
+            // layout; this now walks both levels.
             if let Ok(cwds) = std::fs::read_dir(&root) {
                 for cwd in cwds.flatten().filter(|e| e.path().is_dir()) {
                     if let Ok(entries) = std::fs::read_dir(cwd.path()) {
                         for e in entries.flatten() {
                             let p = e.path();
-                            if p.is_dir() {
-                                dirs += 1;
-                            } else if p.extension().is_some_and(|x| x == "lock") {
+                            if p.extension().is_some_and(|x| x == "lock") {
                                 locks += 1;
+                            } else if p.is_dir() {
+                                dirs += 1;
+                                if let Ok(inner) = std::fs::read_dir(&p) {
+                                    locks += inner
+                                        .flatten()
+                                        .filter(|f| {
+                                            f.path().extension().is_some_and(|x| x == "lock")
+                                        })
+                                        .count();
+                                }
                             }
                         }
                     }
