@@ -2843,7 +2843,6 @@ async fn run_grok_cli_process_with_session(
                 Err(_) => {
                     tracing::debug!(session = %sid, "grok session reap timed out; abandoning");
                     let _ = child.kill().await;
-                    return;
                 }
                 Ok(res) => match res {
                     Ok(st) if st.success() => {
