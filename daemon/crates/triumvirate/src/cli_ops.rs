@@ -104,6 +104,42 @@ fn probe_grok() -> Vec<String> {
         (false, false) => "  grok auth: NONE. Run `grok login --oauth`, or set XAI_API_KEY".to_string(),
     });
 
+    // Orphaned sessions. Grok has NO session GC of its own, and until now every one-shot consult
+    // minted an id it then abandoned, so `~/.grok/sessions` grew per consult. Report the count
+    // rather than deleting anything: these are conversation transcripts, and silently destroying
+    // user data to tidy a directory is not a trade a doctor gets to make.
+    if let Some(home) = dirs::home_dir() {
+        let root = home.join(".grok").join("sessions");
+        if root.is_dir() {
+            let mut dirs = 0usize;
+            let mut locks = 0usize;
+            if let Ok(cwds) = std::fs::read_dir(&root) {
+                for cwd in cwds.flatten().filter(|e| e.path().is_dir()) {
+                    if let Ok(entries) = std::fs::read_dir(cwd.path()) {
+                        for e in entries.flatten() {
+                            let p = e.path();
+                            if p.is_dir() {
+                                dirs += 1;
+                            } else if p.extension().is_some_and(|x| x == "lock") {
+                                locks += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(format!(
+                "  grok sessions on disk: {dirs} transcripts, {locks} lock files"
+            ));
+            if dirs > 25 {
+                out.push(
+                    "  grok sessions: HIGH. Grok has no session GC; review with `grok sessions list` \
+                     and remove with `grok sessions delete <id>`"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     let profile = mcp_bridge::grok::grok_sandbox_profile();
     out.push(match profile {
         Some(p) => format!("  grok sandbox: {p} (consults are write-contained)"),

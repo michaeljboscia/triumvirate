@@ -1537,7 +1537,12 @@ async fn run_named_agent_with_session_and_model(
         }
         "grok" => {
             let (bin, args) = mcp_bridge::grok_command();
-            run_grok_cli_process_with_session(&bin, &args, message, cwd, session_id, events_tx).await
+            // Track only when the caller will keep the id: a named session, or explicit reuse.
+            let track = req_overrides.is_some_and(|r| {
+                r.reuse_session.unwrap_or(false) || r.session_key.is_some()
+            });
+            run_grok_cli_process_with_session(&bin, &args, message, cwd, session_id, events_tx, track)
+                .await
         }
         "claude" => {
             let (bin, args) = claude_command();
@@ -2544,19 +2549,26 @@ async fn run_grok_cli_process_with_session(
     cwd: &str,
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    // True when something will actually KEEP the resulting session id: a named session, or an
+    // explicit `reuse_session`. False for a one-shot consult.
+    track_session: bool,
 ) -> anyhow::Result<ParsedAgentResult> {
     // A session id means "resume": it is only ever populated from a previous turn's parsed
     // `end.sessionId`. The builder refuses to emit a bare `--resume`, which would silently
     // attach to the most recent session in this cwd.
-    // Turn 1 must MINT an id, not run anonymously.
     //
-    // Grok caught this reviewing its own adapter: the runner only ever passed an id when
-    // resuming, so a first turn emitted neither `--session-id` nor `--resume`. If that turn
-    // produced text but died before its `end` event, `parsed.session_id` stayed None and the
-    // next call silently began a NEW conversation instead of resuming. Generating the id here
-    // means the session exists on disk under a known id even when the turn is cut short.
+    // Mint an id ONLY when something will keep it. Turn 1 of a NAMED session must mint, or a
+    // turn that dies before its `end` event leaves nothing to resume. A one-shot consult must
+    // NOT: grok has no session GC, so `-s` on every consult creates a directory under
+    // ~/.grok/sessions that nobody will ever read or delete. Grok measured the result on this
+    // machine: 47 session directories, 162 lock files, 30MB, growing per consult. Letting grok
+    // choose its own id for untracked calls stops manufacturing orphans at the source.
     let resume = session_id.is_some_and(|s| !s.trim().is_empty());
-    let minted = if resume { None } else { Some(Uuid::new_v4().to_string()) };
+    let minted = if resume || !track_session {
+        None
+    } else {
+        Some(Uuid::new_v4().to_string())
+    };
     let effective_session = if resume { session_id } else { minted.as_deref() };
     let invocation = mcp_bridge::grok::build_grok_invocation(
         bin, args, message, cwd, effective_session, resume,
@@ -2770,6 +2782,38 @@ async fn run_grok_cli_process_with_session(
         tracing::info!(agent = "grok", cost_usd = cost, "grok turn cost");
     }
 
+    // Reap the transcript nobody will read.
+    //
+    // grok writes a session directory for EVERY turn, whether or not we pass `-s`, and it has no
+    // session GC of its own. So a one-shot consult leaves a transcript that is unreachable by
+    // design: no Triumvirate record points at it and nothing will ever resume it. Grok measured
+    // the result on this machine, 47 directories and 162 lock files, growing per consult.
+    //
+    // Only untracked calls are reaped, and only by the exact id this turn produced. A named
+    // session's transcript is its memory and is never touched. Fire-and-forget: a failed cleanup
+    // must not fail a turn that already succeeded.
+    if !track_session
+        && let Some(sid) = parsed.session_id.clone()
+    {
+        let bin = bin.to_string();
+        tokio::spawn(async move {
+            match Command::new(&bin)
+                .args(["--no-auto-update", "sessions", "delete", &sid])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+            {
+                Ok(st) if st.success() => {
+                    tracing::debug!(session = %sid, "reaped untracked grok session")
+                }
+                Ok(st) => tracing::debug!(session = %sid, ?st, "grok session reap returned nonzero"),
+                Err(e) => tracing::debug!(session = %sid, error = %e, "grok session reap failed"),
+            }
+        });
+    }
+
     Ok(parsed)
 }
 
@@ -2931,7 +2975,11 @@ async fn run_agent_process_with_session(
                 .await
         }
         "grok" => {
-            run_grok_cli_process_with_session(bin, args, message, cwd, session_id, events_tx).await
+            // This generic path is only reached for resumes and prewarm; a resume already has an
+            // id, and prewarm must not manufacture one.
+            let track = session_id.is_some_and(|s| !s.trim().is_empty());
+            run_grok_cli_process_with_session(bin, args, message, cwd, session_id, events_tx, track)
+                .await
         }
         "claude" => {
             run_claude_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)

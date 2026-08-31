@@ -754,4 +754,22 @@ mod tests {
         clear_env();
     }
 
+    /// Grok canonicalizes cwd, Triumvirate does not, and Grok itself flagged the consequence:
+    /// `/tmp` and `/private/tmp` are different worker keys but the SAME on-disk session folder.
+    /// This asserts the builder passes cwd through verbatim so the mismatch stays visible at one
+    /// layer rather than being half-normalized in two.
+    #[test]
+    fn u_b_24_cwd_is_passed_through_verbatim_not_silently_normalized() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        for cwd in ["/tmp", "/private/tmp", "/tmp/", "."] {
+            let inv = build_grok_invocation("grok", &[], "p", cwd, None, false).unwrap();
+            assert_eq!(
+                value_after(&inv.args, "--cwd").as_deref(),
+                Some(cwd),
+                "cwd must reach grok exactly as given; normalizing here would hide the mismatch"
+            );
+        }
+    }
+
 }
