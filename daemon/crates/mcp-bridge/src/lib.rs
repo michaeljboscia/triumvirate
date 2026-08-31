@@ -1063,4 +1063,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// No hand-written agent list may exist anywhere in the daemon.
+    ///
+    /// Four surfaces had already drifted into three different answers before
+    /// `supported_agent_names` existed. Even after that, THREE more stale lists survived in places
+    /// nobody thought to grep: the ask_agent MCP tool DESCRIPTION, an ask_agent rejection message,
+    /// and the HTTP spawn_session error. The tool description is the worst of them, because an
+    /// agent reads it to decide what it may call: a stale list there excludes an agent exactly as
+    /// effectively as the allowlist would, and that is what happened to grok.
+    ///
+    /// This scans the source for the shape of a hand-written list rather than trusting anyone to
+    /// remember. It runs over mcp-bridge; the same pattern is asserted in the daemon crates.
+    #[test]
+    fn u_al_no_hand_written_agent_lists_in_this_crate() {
+        let src = include_str!("lib.rs");
+        // The canonical list is allowed to name them, obviously. Everything else is suspect.
+        let canonical = "&[\"gemini\", \"codex\", \"deepseek\", \"claude\", \"grok\"]";
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim();
+            if l.starts_with("//") || l.contains(canonical) {
+                continue;
+            }
+            // A line naming two or more agents together is a list someone wrote by hand.
+            let named = ["\"codex\"", "\"deepseek\"", "\"claude\"", "\"grok\""]
+                .iter()
+                .filter(|a| l.contains(*a))
+                .count();
+            assert!(
+                named < 2,
+                "line {} looks like a hand-written agent list; derive it from \
+                 supported_agent_names() instead: {l}",
+                i + 1
+            );
+        }
+    }
+
 }

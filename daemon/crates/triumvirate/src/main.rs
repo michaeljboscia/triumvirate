@@ -493,7 +493,11 @@ impl McpBridge {
         "pong".to_string()
     }
 
-    #[tool(description = "Send a task to a specific agent. Supported: 'antigravity' (aliases: agy, gemini), 'codex', 'deepseek', 'claude'.")]
+    #[tool(
+        description = "Send a task to a specific agent. Supported: 'antigravity' (aliases: agy, \
+                       gemini), 'codex', 'grok' (aliases: grok-build, xai, supergrok), 'deepseek', \
+                       'claude'."
+    )]
     // The root span of a call, in the MCP process. daemon-http injects this span's context as a
     // W3C `traceparent`, and the daemon adopts it — so one logical call is ONE trace across two
     // processes instead of two unrelated ones. Without a span here there is nothing to inject.
@@ -2321,7 +2325,15 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
         let agent = normalize_agent_name(&req.agent);
         if !is_supported_agent_name(&agent) {
-            return Err((StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": "spawn_session supports only 'antigravity' (aliases: agy, gemini), 'codex', or 'deepseek'" }))));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                AxumJson(serde_json::json!({
+                    "error": format!(
+                        "spawn_session supports only: {}",
+                        mcp_aliases::daemon_target_agents().join(", ")
+                    )
+                })),
+            ));
         }
         let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
         // Respawn starts a NEW conversation: clear any prior CLI session for this name first.

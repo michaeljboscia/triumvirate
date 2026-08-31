@@ -351,7 +351,13 @@ pub(crate) async fn execute_ask_agent(
         span.record("agent.outcome", "rejected");
         span.record("agent.tokens", 0_u64);
         span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
-        let msg = "ask_agent supports only agent='antigravity' (aliases: agy, gemini), agent='codex', or agent='deepseek'";
+        // Derived, not hand-written. This message omitted BOTH claude and grok, and a rejection
+        // that names the wrong set teaches the caller the wrong thing.
+        let msg = format!(
+            "ask_agent supports only: {}",
+            mcp_bridge::supported_agent_names().join(", ")
+        );
+        let msg = msg.as_str();
         tel.failure(msg);
         return Err(msg.to_string());
     }
@@ -3378,6 +3384,47 @@ mod deepseek_dispatch_tests {
         assert!(arms >= 2,
             "expected a grok arm in BOTH run_named_agent_with_session_and_model and \
              run_agent_process_with_session, found {arms}");
+    }
+
+
+    /// The scan that would have caught the three stale lists a morning session tripped over.
+    ///
+    /// grok was dispatchable, but the ask_agent MCP tool DESCRIPTION still named only
+    /// antigravity/codex/deepseek/claude. An agent read that, concluded grok was unsupported, and
+    /// routed to DeepSeek instead. A stale list in a description excludes an agent exactly as
+    /// effectively as the allowlist does.
+    #[test]
+    fn no_hand_written_agent_lists_in_daemon_sources() {
+        for (label, src) in [
+            ("agent_exec.rs", include_str!("agent_exec.rs")),
+            ("main.rs", include_str!("main.rs")),
+        ] {
+            for (i, line) in src.lines().enumerate() {
+                let l = line.trim();
+                // Comments explain; match arms and test fixtures legitimately name agents one at a
+                // time. What must not exist is PROSE listing several, which is always a copy that
+                // will drift.
+                if l.starts_with("//") || !l.contains('"') {
+                    continue;
+                }
+                let prose = l.contains("supports only")
+                    || l.contains("Supported:")
+                    || l.contains("must be one of");
+                if !prose {
+                    continue;
+                }
+                let named = ["codex", "deepseek", "claude", "grok", "antigravity"]
+                    .iter()
+                    .filter(|a| l.contains(*a))
+                    .count();
+                assert!(
+                    named < 2,
+                    "{label} line {} states a hand-written agent list; build it from \
+                     mcp_bridge::supported_agent_names() so it cannot go stale: {l}",
+                    i + 1
+                );
+            }
+        }
     }
 
     /// Asserts against the REAL scheduler, `attempt_schedule_for`, not a reconstruction of it.
