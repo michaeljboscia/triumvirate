@@ -261,10 +261,21 @@ impl McpBridge {
             None
         };
         // Load persisted sessions on startup so sessions survive MCP bridge restarts.
-        let sessions = sessions_file
+        let mut sessions = sessions_file
             .as_ref()
             .and_then(|path| core_load_json_file_if_exists::<HashMap<String, SessionState>>(path).ok())
             .unwrap_or_default();
+        // Carry CLI session ids across from the old owner. Ownership moved to SessionState, and
+        // without this every pre-existing named session silently starts a fresh conversation on
+        // its next ask while its visible history keeps scrolling. Codex caught that the first
+        // version of this migration was written but never called.
+        agent_worker::hydrate_session_ids_from_disk(|name, sid| {
+            if let Some(st) = sessions.get_mut(name)
+                && st.cli_session_id.is_none()
+            {
+                st.cli_session_id = Some(sid);
+            }
+        });
         Self {
             tool_router: Self::tool_router(),
             sessions: Arc::new(Mutex::new(sessions)),

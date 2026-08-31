@@ -1157,7 +1157,11 @@ pub(crate) async fn execute_ask_agent(
                         String::new()
                     };
                     return Ok(AskAgentResponse {
-                        cli_session_id: parsed.session_id.clone(),
+                        // NOT the degraded hop's session id. A gemini session that degraded to
+                        // codex would otherwise have its authoritative id overwritten with a
+                        // codex id, and the next resume would target the wrong agent's session
+                        // entirely. Codex found this. A degraded turn publishes no session id.
+                        cli_session_id: None,
                         request_id,
                         agent: agent.clone(),
                         response: format!("{prefix}{}", parsed.response_text),
@@ -1759,8 +1763,15 @@ async fn prewarm_worker(agent: &str, cwd: &str) {
 
     match warm_result {
         Ok(Ok(parsed)) => {
-            update_worker_session(agent, cwd, None, parsed.session_id).await;
-            tracing::info!("prewarm complete for {agent} cwd={cwd}");
+            // grok is REAPED when untracked, and prewarm is untracked, so persisting its id here
+            // would cache an id the reaper is concurrently deleting: the next reuse would resume
+            // a session that no longer exists. Codex found this. Prewarm's value is the warm
+            // process, not a resumable transcript, so grok keeps the warmth and drops the id.
+            let keep_id = mcp_bridge::normalize_agent_name(agent) != "grok";
+            if keep_id {
+                update_worker_session(agent, cwd, None, parsed.session_id).await;
+            }
+            tracing::info!(keep_id, "prewarm complete for {agent} cwd={cwd}");
         }
         Ok(Err(err)) => {
             tracing::warn!("prewarm failed for {agent} cwd={cwd}: {err}");
@@ -2811,19 +2822,40 @@ async fn run_grok_cli_process_with_session(
     {
         let bin = bin.to_string();
         tokio::spawn(async move {
-            match Command::new(&bin)
+            // BOUNDED. Antigravity caught that an unbounded fire-and-forget leaks a tokio task
+            // and a zombie process forever if the CLI hangs. Cleanup is best-effort by design, so
+            // a slow delete is abandoned rather than held onto.
+            let mut child = match Command::new(&bin)
                 .args(["--no-auto-update", "sessions", "delete", &sid])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status()
-                .await
+                .kill_on_drop(true)
+                .spawn()
             {
-                Ok(st) if st.success() => {
-                    tracing::debug!(session = %sid, "reaped untracked grok session")
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(session = %sid, error = %e, "grok session reap failed to spawn");
+                    return;
                 }
-                Ok(st) => tracing::debug!(session = %sid, ?st, "grok session reap returned nonzero"),
-                Err(e) => tracing::debug!(session = %sid, error = %e, "grok session reap failed"),
+            };
+            match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
+                Err(_) => {
+                    tracing::debug!(session = %sid, "grok session reap timed out; abandoning");
+                    let _ = child.kill().await;
+                    return;
+                }
+                Ok(res) => match res {
+                    Ok(st) if st.success() => {
+                        tracing::debug!(session = %sid, "reaped untracked grok session")
+                    }
+                    Ok(st) => {
+                        tracing::debug!(session = %sid, ?st, "grok session reap returned nonzero")
+                    }
+                    Err(e) => {
+                        tracing::debug!(session = %sid, error = %e, "grok session reap failed")
+                    }
+                },
             }
         });
     }

@@ -268,35 +268,44 @@ pub async fn reset_worker_registry_for_tests() {
 
 }
 
-/// One-time migration: move CLI session ids out of the worker registry and into the sessions map.
+/// One-time migration: move CLI session ids out of the worker registry into the sessions map.
 ///
-/// `session_id` used to live on `WorkerState`. Moving ownership without migrating would silently
-/// break every existing named session: the sessions file has no id yet, so the next ask would
-/// start a fresh conversation while the visible history kept scrolling. That is exactly the
-/// "user sees a continuous log while the model answers from a blank slate" failure the review
-/// warned about, so the move has to carry the data across.
+/// SYNCHRONOUS and file-based on purpose. It runs at session-load time inside a non-async
+/// constructor, and the async registry is not initialised there. Reading `workers.json` directly
+/// is also more honest: this is a disk-format migration, not a live-state operation.
 ///
-/// Keys are `agent::cwd::name`. Only three-segment (named) keys carry an id worth keeping; a
-/// two-segment anonymous key never belonged to a session and is dropped.
-pub async fn hydrate_session_ids_from_workers<F>(mut set_id: F) -> usize
+/// Without it, moving ownership silently breaks every existing named session: the sessions file
+/// has no id yet, so the next ask starts a fresh conversation while the visible history keeps
+/// scrolling. That is the "continuous log, blank-slate model" failure the review warned about.
+///
+/// Codex caught that the first version of this was never called at all.
+///
+/// Keys are `agent::cwd::name`. Only three-segment (named) keys carry an id worth keeping.
+pub fn hydrate_session_ids_from_disk<F>(mut set_id: F) -> usize
 where
-    F: FnMut(&str, &str, &str, String),
+    F: FnMut(&str, String),
 {
-    let workers = worker_registry_store().lock().await;
+    let Some(path) = worker_store_path() else { return 0 };
+    let Ok(workers) = core_load_json_file_if_exists::<HashMap<String, WorkerState>>(&path) else {
+        return 0;
+    };
     let mut migrated = 0usize;
     for (key, state) in workers.iter() {
         let Some(sid) = state.session_id.as_deref() else { continue };
-        let parts: Vec<&str> = key.splitn(3, "::").collect();
-        if parts.len() == 3 && !parts[2].is_empty() {
-            set_id(parts[0], parts[1], parts[2], sid.to_string());
+        // rsplitn so a cwd containing "::" cannot swallow the session name: the NAME is always
+        // the last segment. The earlier splitn(3) version corrupted such names and its own test
+        // documented the corruption instead of preventing it. Codex flagged that too.
+        let mut it = key.rsplitn(2, "::");
+        let Some(name) = it.next().filter(|n| !n.is_empty()) else { continue };
+        if it.next().is_some_and(|head| head.contains("::")) {
+            set_id(name, sid.to_string());
             migrated += 1;
         }
     }
     if migrated > 0 {
-        tracing::info!(migrated, "migrated CLI session ids from the worker registry to sessions");
+        tracing::info!(migrated, "migrated CLI session ids from workers.json into sessions");
     }
     migrated
-
 }
 
 #[cfg(test)]
@@ -319,11 +328,12 @@ mod worker_key_tests {
         assert_eq!(parts[2], "alpha", "the session name must survive key parsing intact");
         assert_eq!(anon.splitn(3, "::").count(), 2, "anonymous keys carry no session to migrate");
 
-        // A cwd containing the separator must not corrupt the name. splitn(3) keeps the tail whole.
+        // A cwd containing the separator must NOT corrupt the name. rsplitn takes the name from
+        // the END, so it survives. The earlier splitn(3) version corrupted it and the test merely
+        // documented the corruption, which is not the same as handling it.
         let odd = super::worker_key("grok", "/a::b", Some("beta"));
-        let p2: Vec<&str> = odd.splitn(3, "::").collect();
-        assert_eq!(p2[0], "grok");
-        assert_eq!(p2[2], "b::beta", "documented limitation: a cwd containing :: shifts the split");
+        let name = odd.rsplitn(2, "::").next().unwrap();
+        assert_eq!(name, "beta", "the session name must survive a cwd containing the separator");
     }
 
     /// Cross-session contamination. Keyed on (agent, cwd) alone, two NAMED sessions for one agent
