@@ -154,6 +154,7 @@ pub async fn spawn_session(
             parent_session_id: None,
             root_session_id: None,
             pantheon_session_id: None,
+            cli_session_id: None,
         },
     );
     core_persist_json_file_if_enabled(sessions_file, &*sessions)
@@ -183,7 +184,7 @@ pub async fn ask_session(
             .map_err(|e| format!("ask_session via daemon failed: {e}"));
     }
 
-    let (agent, cwd, had_history) = {
+    let (agent, cwd, had_history, prior_cli_session) = {
         let mut sessions = sessions.lock().await;
         let state = sessions
             .get_mut(&req.name)
@@ -195,10 +196,11 @@ pub async fn ask_session(
             normalize_agent_name(&state.agent),
             state.cwd.clone(),
             !state.history.is_empty(),
+            state.cli_session_id.clone(),
         )
     };
 
-    let mut response = execute_ask_agent(
+    let response = execute_ask_agent(
         &AskAgentRequest {
             agent: agent.clone(),
             message: req.message.clone(),
@@ -212,13 +214,15 @@ pub async fn ask_session(
             // one directory resume each other. The HTTP route was fixed first and verified
             // through the HTTP route, so this in-process MCP path kept the leak. Found by Codex.
             session_key: Some(req.name.clone()),
+            prior_cli_session_id: prior_cli_session.clone(),
             ..Default::default()
         },
         None,
     )
     .await
-    .map_err(|e| format!("ask_session failed: {e}"))?
-    .response;
+    .map_err(|e| format!("ask_session failed: {e}"))?;
+    let new_cli_session_id = response.cli_session_id.clone();
+    let mut response = response.response;
 
     // REQ-044: the agy backend is single-turn. When a follow-up to a named
     // Antigravity session cannot carry the earlier turns, say so — never silently
@@ -236,6 +240,11 @@ pub async fn ask_session(
     if let Some(state) = sessions.get_mut(&req.name) {
         state.history.push(format!("user: {}", req.message));
         state.history.push(format!("assistant: {response}"));
+        // The session OWNS its CLI id, on BOTH surfaces. Persisting it only on the HTTP route
+        // would recreate the exact drift that let the cross-session leak survive here.
+        if new_cli_session_id.is_some() {
+            state.cli_session_id = new_cli_session_id;
+        }
     }
     core_persist_json_file_if_enabled(sessions_file, &*sessions)
         .map_err(|e| format!("failed to persist sessions: {e}"))?;
@@ -415,6 +424,23 @@ mod ask_agent_failure_message_tests {
             checked += 1;
         }
         assert!(checked > 0, "the invariant found nothing to check, so it guards nothing");
+    }
+
+    /// The CLI session id must be persisted on BOTH surfaces. Persisting it only on the HTTP
+    /// route would recreate the exact drift that let the cross-session leak survive on this one.
+    #[test]
+    fn u_ia_both_surfaces_persist_the_session_owned_cli_id() {
+        let needle = format!("state.{} = ", "cli_session_id");
+        let mcp = include_str!("inter_agent.rs");
+        assert!(
+            mcp.contains(needle.as_str()),
+            "the in-process MCP route must persist the session-owned CLI id"
+        );
+        // And it must READ it back, or the next turn falls through to the legacy worker registry.
+        assert!(
+            mcp.contains("prior_cli_session_id"),
+            "the MCP route must pass the session-owned id back in as authoritative"
+        );
     }
 
 }

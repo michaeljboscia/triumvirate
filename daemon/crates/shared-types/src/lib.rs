@@ -56,6 +56,12 @@ pub struct AskAgentRequest {
     /// there: an unnamed call has no session of its own to keep separate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
+    /// The CLI session id this NAMED session already owns, from its own `SessionState`.
+    ///
+    /// When set it is authoritative and the worker registry is not consulted. The registry stays
+    /// as a fallback so sessions created before ownership moved keep resuming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_cli_session_id: Option<String>,
 
     // T-011 (REQ-DS-027): per-call overrides for the DeepSeek sibling. ALL
     // four fields are Optional and skip-serialize-on-None so the wire shape
@@ -111,6 +117,14 @@ pub struct AskAgentResponse {
     pub agent: String,
     pub response: String,
     pub lifecycle: Vec<LifecycleEvent>,
+    /// The agent CLI's session id for this turn, when there is one.
+    ///
+    /// Returned so a NAMED session can persist it in its own `SessionState` instead of the worker
+    /// registry inferring it from `(agent, cwd)`. That inference is what let two named sessions in
+    /// one directory resume each other. Omitted from the wire when absent so existing clients see
+    /// an unchanged shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_session_id: Option<String>,
     /// Substitution honesty (REQ-053 R3): set only when a degraded route answered
     /// with a different agent/backend than requested. Omitted from the wire on the
     /// normal path so existing clients see an unchanged shape.
@@ -149,6 +163,7 @@ impl AskAgentResponse {
             agent,
             response,
             lifecycle,
+            cli_session_id: None,
             answered_by_agent: None,
             answered_by_backend: None,
             degraded_from_backend: None,
@@ -518,6 +533,20 @@ pub struct SessionState {
     #[serde(default)]
     pub cwd: Option<String>,
     pub history: Vec<String>,
+    /// The AGENT CLI's session id for this named session.
+    ///
+    /// This used to live in the worker registry, keyed on `(agent, cwd)`, which is what let two
+    /// named sessions in one directory resume each other. All three peers independently landed on
+    /// the same fix: the logical session (this history) and the physical session (the CLI id) must
+    /// have ONE owner, and it is this struct.
+    ///
+    /// With the id here, an anonymous one-shot ask physically cannot leak or inherit one, because
+    /// it has no `SessionState` to read it from.
+    ///
+    /// `#[serde(default)]` so a sessions file written before this field loads cleanly; the
+    /// migration in `hydrate_session_ids_from_workers` fills it from the old registry once.
+    #[serde(default)]
+    pub cli_session_id: Option<String>,
     /// The immediate session that triggered this session's dispatch.
     /// For Pantheon-spawned Claude Code sessions, this is the panel_id.
     /// For Codex/Gemini workers dispatched via MCP, this is the caller's session_id.
@@ -556,6 +585,7 @@ mod tests {
             parent_session_id: Some("sess-pantheon-panel-1".to_string()),
             root_session_id: Some("sess-pantheon-panel-1".to_string()),
             pantheon_session_id: Some("pantheon-uuid-abc-123".to_string()),
+            cli_session_id: None,
         };
 
         let json = serde_json::to_string(&state).unwrap();

@@ -2328,6 +2328,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 parent_session_id: None,
                 root_session_id: None,
                 pantheon_session_id: None,
+            cli_session_id: None,
             },
         );
         core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
@@ -2347,12 +2348,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
             return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
         }
-        let (agent, cwd) = {
+        let (agent, cwd, prior_cli_session) = {
             let sessions = state.sessions.lock().await;
             let session = sessions.get(&req.name).ok_or_else(|| {
                 (StatusCode::NOT_FOUND, AxumJson(serde_json::json!({ "error": format!("session '{}' not found", req.name) })))
             })?;
-            (session.agent.clone(), session.cwd.clone())
+            (session.agent.clone(), session.cwd.clone(), session.cli_session_id.clone())
         };
         let response = execute_ask_agent(
             &AskAgentRequest {
@@ -2368,18 +2369,29 @@ async fn run_daemon() -> anyhow::Result<()> {
                 // Without this the worker key is (agent, cwd) and two named sessions in one
                 // directory resume each other. Demonstrated live before the fix.
                 session_key: Some(req.name.clone()),
+                // Prefer the id the SESSION owns. The worker registry is the legacy fallback and
+                // is only consulted when this is None, which is how pre-migration sessions keep
+                // working.
+                prior_cli_session_id: prior_cli_session.clone(),
                 ..Default::default()
             },
             None,
         )
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, AxumJson(serde_json::json!({ "error": e }))))?
-        .response;
+        .map_err(|e| (StatusCode::BAD_GATEWAY, AxumJson(serde_json::json!({ "error": e }))))?;
+        let cli_session_id = response.cli_session_id.clone();
+        let response = response.response;
 
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&req.name) {
             session.history.push(format!("user: {}", req.message));
             session.history.push(format!("assistant: {response}"));
+            // The session OWNS its CLI id. Persisting it here, beside the history it belongs to,
+            // is what makes the two consistent: previously the history lived in this map while
+            // the id lived in a worker keyed on (agent, cwd), and nothing kept them in step.
+            if cli_session_id.is_some() {
+                session.cli_session_id = cli_session_id;
+            }
         }
         core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(serde_json::json!({ "error": e.to_string() })))
@@ -5819,6 +5831,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                     parent_session_id: None,
                     root_session_id: None,
                     pantheon_session_id: None,
+            cli_session_id: None,
                 },
             );
             core_persist_json_file_if_enabled(first.sessions_file.as_ref(), &*sessions)?;

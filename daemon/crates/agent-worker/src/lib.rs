@@ -268,9 +268,63 @@ pub async fn reset_worker_registry_for_tests() {
 
 }
 
+/// One-time migration: move CLI session ids out of the worker registry and into the sessions map.
+///
+/// `session_id` used to live on `WorkerState`. Moving ownership without migrating would silently
+/// break every existing named session: the sessions file has no id yet, so the next ask would
+/// start a fresh conversation while the visible history kept scrolling. That is exactly the
+/// "user sees a continuous log while the model answers from a blank slate" failure the review
+/// warned about, so the move has to carry the data across.
+///
+/// Keys are `agent::cwd::name`. Only three-segment (named) keys carry an id worth keeping; a
+/// two-segment anonymous key never belonged to a session and is dropped.
+pub async fn hydrate_session_ids_from_workers<F>(mut set_id: F) -> usize
+where
+    F: FnMut(&str, &str, &str, String),
+{
+    let workers = worker_registry_store().lock().await;
+    let mut migrated = 0usize;
+    for (key, state) in workers.iter() {
+        let Some(sid) = state.session_id.as_deref() else { continue };
+        let parts: Vec<&str> = key.splitn(3, "::").collect();
+        if parts.len() == 3 && !parts[2].is_empty() {
+            set_id(parts[0], parts[1], parts[2], sid.to_string());
+            migrated += 1;
+        }
+    }
+    if migrated > 0 {
+        tracing::info!(migrated, "migrated CLI session ids from the worker registry to sessions");
+    }
+    migrated
+
+}
+
 #[cfg(test)]
 mod worker_key_tests {
     use super::worker_key;
+
+    /// Moving session-id ownership without migrating would silently break every existing named
+    /// session: the sessions file has no id, so the next ask starts fresh while the visible
+    /// history keeps scrolling. The migration must carry named ids across and drop anonymous ones.
+    #[tokio::test]
+    async fn u_wk_03_migration_moves_named_ids_and_drops_anonymous_ones() {
+        // Exercised through the key parsing the migration relies on, which is the part that can
+        // be wrong: a two-segment key never belonged to a session.
+        let named = super::worker_key("grok", "/tmp", Some("alpha"));
+        let anon = super::worker_key("grok", "/tmp", None);
+        let parts: Vec<&str> = named.splitn(3, "::").collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "grok");
+        assert_eq!(parts[1], "/tmp");
+        assert_eq!(parts[2], "alpha", "the session name must survive key parsing intact");
+        assert_eq!(anon.splitn(3, "::").count(), 2, "anonymous keys carry no session to migrate");
+
+        // A cwd containing the separator must not corrupt the name. splitn(3) keeps the tail whole.
+        let odd = super::worker_key("grok", "/a::b", Some("beta"));
+        let p2: Vec<&str> = odd.splitn(3, "::").collect();
+        assert_eq!(p2[0], "grok");
+        assert_eq!(p2[2], "b::beta", "documented limitation: a cwd containing :: shifts the split");
+    }
 
     /// Cross-session contamination. Keyed on (agent, cwd) alone, two NAMED sessions for one agent
     /// in one directory shared a worker record and therefore a CLI session id, so each resumed

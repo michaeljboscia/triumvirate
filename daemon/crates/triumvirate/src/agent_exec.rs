@@ -448,8 +448,15 @@ pub(crate) async fn execute_ask_agent(
     // ask_agent would otherwise resume — and get billed for — whatever named session last
     // ran in this directory, replaying its whole transcript as input on every call.
     let reuse_session = req.reuse_session.unwrap_or(false);
+    // The SESSION owns its CLI id. The worker registry is a legacy fallback, consulted only when
+    // the session has none yet, which is how sessions created before ownership moved keep
+    // resuming. All three peers converged on this: the logical session (history) and the physical
+    // session (CLI id) must have one owner, or they drift and the user sees a continuous log
+    // while the model answers from a blank slate.
     let mut worker_session_id = if reuse_session {
-        worker.session_id.clone()
+        req.prior_cli_session_id
+            .clone()
+            .or_else(|| worker.session_id.clone())
     } else {
         None
     };
@@ -793,7 +800,8 @@ pub(crate) async fn execute_ask_agent(
                 // wrote here would clobber the named session cached under the same
                 // (agent, cwd) key and silently destroy its continuity.
                 if reuse_session && !is_faildown_attempt {
-                    update_worker_session(&agent, &exec_cwd, session_key, next_session_id).await;
+                    update_worker_session(&agent, &exec_cwd, session_key, next_session_id.clone())
+                        .await;
                 }
                 span.record(
                     "session_id",
@@ -866,13 +874,18 @@ pub(crate) async fn execute_ask_agent(
                 } else {
                     (None, None, None, None)
                 };
-                return Ok(AskAgentResponse::direct(
+                let mut resp = AskAgentResponse::direct(
                     request_id,
                     agent.clone(),
                     parsed.response_text,
                     lifecycle,
                 )
-                .with_shadow(sh_backend, sh_resp, sh_err, sh_ms));
+                .with_shadow(sh_backend, sh_resp, sh_err, sh_ms);
+                // Hand the CLI session id back so a NAMED session can own it in its own
+                // SessionState, rather than the worker registry inferring it from (agent, cwd).
+                // That inference is what let two named sessions resume each other.
+                resp.cli_session_id = next_session_id.clone();
+                return Ok(resp);
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -1144,6 +1157,7 @@ pub(crate) async fn execute_ask_agent(
                         String::new()
                     };
                     return Ok(AskAgentResponse {
+                        cli_session_id: parsed.session_id.clone(),
                         request_id,
                         agent: agent.clone(),
                         response: format!("{prefix}{}", parsed.response_text),
