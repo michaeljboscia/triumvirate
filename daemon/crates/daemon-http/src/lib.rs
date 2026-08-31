@@ -82,7 +82,19 @@ const DEFAULT_DAEMON_HTTP_TIMEOUT_SECS: u64 = 30;
 /// This is a CLIENT-side patience limit, not a server-side kill: the daemon keeps working and the
 /// error says so. Too low is therefore worse than too high, because it turns a slow success into
 /// a reported failure while still paying for the work.
-const DEFAULT_DAEMON_ASK_TIMEOUT_SECS: u64 = 300;
+/// Must be at least as long as the SLOWEST connector timeout, or the client abandons a request
+/// the daemon is still working on and the answer is lost after being paid for.
+///
+/// Measured 2026-08-31: a trivial grok consult takes 20 to 32 seconds, because roughly 30s is the
+/// fixed cost of spawning `grok -p` at all. It is not MCP loading (4 servers versus 0 differed by
+/// 2.4s) and not context size (input was ~1,350 tokens). A persistent `grok agent leader` brings
+/// the mean to ~22s but does not remove it. So a turn-heavy review at the default `--max-turns 20`
+/// can legitimately run past 500 seconds.
+///
+/// grok's connector timeout is 900s. This was 180, then 300, and BOTH were below it, so the client
+/// gave up on work the daemon was still doing. `u_timeout_02` now asserts the relationship instead
+/// of trusting the two numbers to stay in step.
+const DEFAULT_DAEMON_ASK_TIMEOUT_SECS: u64 = 900;
 
 /// Why a request to the daemon failed.
 ///
@@ -1863,10 +1875,10 @@ mod daemon_request_failure_tests {
     /// after 180s cut off a legitimate grok peer review that read source files before answering.
     /// Asserted so a future edit is a decision rather than a drift.
     #[test]
-    fn u_timeout_01_ask_timeout_default_is_300s_and_env_overridable() {
+    fn u_timeout_01_ask_timeout_default_is_900s_and_env_overridable() {
         assert_eq!(
             super::DEFAULT_DAEMON_ASK_TIMEOUT_SECS,
-            300,
+            900,
             "lowering this turns slow successes into reported failures while still paying for the work"
         );
         // Must be well above the plain HTTP timeout: an agent turn is not a status check.
@@ -1876,6 +1888,25 @@ mod daemon_request_failure_tests {
         assert!(
             ask > http * 5,
             "an agent turn needs far more patience than a health probe: ask={ask}s http={http}s"
+        );
+    }
+
+    /// The client must not give up before the daemon does.
+    ///
+    /// This is the actual defect behind two rounds of grok timeouts: the daemon waits 900s for a
+    /// grok turn while the client abandoned at 180, then 300. The request was accepted, the work
+    /// was done and paid for, and the answer was discarded because the caller had stopped
+    /// listening. Asserting the RELATIONSHIP is what keeps them in step; asserting either number
+    /// alone is what let them drift apart twice.
+    #[test]
+    fn u_timeout_02_client_patience_is_never_less_than_the_slowest_connector() {
+        let client = super::DEFAULT_DAEMON_ASK_TIMEOUT_SECS;
+        // The slowest connector in the daemon. grok and agy both default to 900s.
+        let slowest_connector = mcp_bridge::grok::grok_connector_timeout().as_secs();
+        assert!(
+            client >= slowest_connector,
+            "the client gives up at {client}s while the daemon works for {slowest_connector}s; \
+             the answer would be produced, paid for, and thrown away"
         );
     }
 
