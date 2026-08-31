@@ -332,7 +332,7 @@ mod worker_key_tests {
         // the END, so it survives. The earlier splitn(3) version corrupted it and the test merely
         // documented the corruption, which is not the same as handling it.
         let odd = super::worker_key("grok", "/a::b", Some("beta"));
-        let name = odd.rsplitn(2, "::").next().unwrap();
+        let name = odd.rsplit("::").next().unwrap();
         assert_eq!(name, "beta", "the session name must survive a cwd containing the separator");
     }
 
