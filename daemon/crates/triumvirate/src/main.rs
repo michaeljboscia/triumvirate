@@ -598,6 +598,10 @@ impl McpBridge {
         self.ask_session(Parameters(AskSessionRequest {
             name: mapped.name,
             message: mapped.message,
+            // Legacy alias schemas carry no sight fields, so a turn through them is ungated.
+            // Callers that want a gated session review use ask_session directly.
+            required_sources: Vec::new(),
+            require_sight: None,
         }))
         .await
     }
@@ -637,6 +641,9 @@ impl McpBridge {
         let ask_req = AskSessionRequest {
             name: mapped.name.clone(),
             message: mapped.message,
+            // Same as ask_daemon: the legacy schema has no place to put these.
+            required_sources: Vec::new(),
+            require_sight: None,
         };
         match self.ask_session(Parameters(ask_req.clone())).await {
             Ok(response) => Ok(response),

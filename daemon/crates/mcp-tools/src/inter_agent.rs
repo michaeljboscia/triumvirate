@@ -215,6 +215,10 @@ pub async fn ask_session(
             // through the HTTP route, so this in-process MCP path kept the leak. Found by Codex.
             session_key: Some(req.name.clone()),
             prior_cli_session_id: prior_cli_session.clone(),
+            // Carry the sight fields through. Without these a multi-turn review could not be
+            // gated at all, because this construction discarded them via ..Default::default().
+            required_sources: req.required_sources.clone(),
+            require_sight: req.require_sight,
             ..Default::default()
         },
         None,
@@ -443,4 +447,82 @@ mod ask_agent_failure_message_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod session_sight_tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// Captures the `AskAgentRequest` that `ask_session` actually built.
+    ///
+    /// A function pointer cannot close over state, so the capture is a static. That is fine
+    /// here: this is the only test using it, and it asserts on the whole request.
+    static CAPTURED: OnceLock<std::sync::Mutex<Option<AskAgentRequest>>> = OnceLock::new();
+
+    fn captured() -> &'static std::sync::Mutex<Option<AskAgentRequest>> {
+        CAPTURED.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn capturing_executor<'a>(
+        req: &'a AskAgentRequest,
+        _p: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        *captured().lock().unwrap() = Some(req.clone());
+        Box::pin(async move {
+            Ok(AskAgentResponse::direct(
+                "req-1".to_string(),
+                req.agent.clone(),
+                "ok".to_string(),
+                Vec::new(),
+            ))
+        })
+    }
+
+    /// A multi-turn review must be gateable.
+    ///
+    /// Before this, `ask_session` built `AskAgentRequest { ..Default::default() }`, so neither
+    /// sight field could ever reach the dispatcher and a session review could not be gated at
+    /// all. Codex found that in its route survey. This asserts the fields actually arrive,
+    /// rather than that the struct has them.
+    ///
+    /// RED IF: `ask_session` stops forwarding `required_sources` or `require_sight`, which
+    /// would silently return session reviews to being ungated while every other test passed.
+    #[tokio::test]
+    async fn ask_session_forwards_the_sight_fields_to_dispatch() {
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().await.insert(
+            "reviewer".to_string(),
+            SessionState {
+                agent: "grok".to_string(),
+                cwd: Some("/repo".to_string()),
+                history: Vec::new(),
+                cli_session_id: None,
+                parent_session_id: None,
+                root_session_id: None,
+                pantheon_session_id: None,
+            },
+        );
+
+        let req = AskSessionRequest {
+            name: "reviewer".to_string(),
+            message: "review it".to_string(),
+            required_sources: vec!["/repo/a.rs".to_string()],
+            require_sight: Some(true),
+        };
+        ask_session(&sessions, None, &req, false, capturing_executor)
+            .await
+            .expect("ask_session should dispatch");
+
+        let got = captured().lock().unwrap().clone().expect("executor ran");
+        assert_eq!(
+            got.required_sources,
+            vec!["/repo/a.rs".to_string()],
+            "named sources must reach the dispatcher, or a session review is silently ungated"
+        );
+        assert_eq!(got.require_sight, Some(true));
+        // The session identity must still be carried, or this fix would trade one leak for
+        // another: session_key is what stops two named sessions resuming each other.
+        assert_eq!(got.session_key.as_deref(), Some("reviewer"));
+    }
 }

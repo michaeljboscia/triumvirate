@@ -265,6 +265,22 @@ pub struct SessionListResponse {
 pub struct AskSessionRequest {
     pub name: String,
     pub message: String,
+
+    /// The primary sources this turn must actually open, by path.
+    ///
+    /// A multi-turn review could not be gated at all before this: `ask_session`, `ask_daemon`
+    /// and HTTP `/session/ask` all built `AskAgentRequest { ..Default::default() }`, so
+    /// neither sight field could ever be set. Codex found that in its route survey.
+    ///
+    /// Naming sources implies `require_sight`, so this one field is enough to gate a session
+    /// turn. Empty leaves every existing caller behaving exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_sources: Vec<String>,
+
+    /// Gate this turn on the reviewer having used tools at all, without naming sources.
+    /// Weaker than `required_sources` and useful when the evidence is not a fixed file set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_sight: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

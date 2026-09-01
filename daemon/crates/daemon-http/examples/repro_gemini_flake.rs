@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
         let ask_req = AskSessionRequest {
             name: session_name.clone(),
             message: prompt,
+            required_sources: Vec::new(),
+            require_sight: None,
         };
         let t0 = SystemTime::now();
         let result = daemon_http::fetch_daemon_session_ask(&ask_req).await;

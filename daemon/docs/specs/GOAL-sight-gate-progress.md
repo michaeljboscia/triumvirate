@@ -545,3 +545,59 @@ If Google changes agy's wire format the offline suite stays green while producti
 `TRIUMVIRATE_LIVE_AGY=1`. Nothing runs them automatically.
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
+
+---
+
+## Round 6, 2026-09-01. The last two open items.
+
+### Session routes could not be gated at all. CLOSED.
+
+`ask_session` built `AskAgentRequest { ..Default::default() }`, so neither sight field could
+ever reach the dispatcher and a multi-turn review was ungateable. Codex found it in its round 1
+route survey and it had stayed open through four rounds.
+
+`AskSessionRequest` now carries `required_sources` and `require_sight`, and `ask_session`
+forwards both. `ask_session_forwards_the_sight_fields_to_dispatch` asserts they ARRIVE at the
+dispatcher via a capturing executor, not merely that the struct has them, and it also pins
+`session_key` so this fix cannot trade one leak for another. Mutation-verified: deleting the
+two forwarded lines reds it.
+
+The legacy aliases (`ask_daemon`, `send_message`) pass empty values, because their schemas have
+nowhere to put these. That is stated at the call sites rather than left to be discovered.
+
+### Nothing ran the live guards. CLOSED enough to be useful.
+
+`scripts/verify-live-agents.sh` runs every `#[ignore]` live test in one command, skipping any
+agent whose binary is absent, and exits non-zero on failure so it can be scheduled.
+
+Not added to the pre-push hook: that gate deliberately skips tests for speed, and these spend
+subscription quota. The problem was never that they were opt-in, it was that running them was a
+research project.
+
+Verified by running it: agy guards pass (3 tests), grok guards pass (4 tests).
+
+Its failure message is the important part. A live failure with a green offline suite means a
+vendor changed its wire format, and the instruction is to RECAPTURE THE FIXTURES before editing
+the parser to match. A parser tuned to a belief about the format instead of to captured
+evidence is exactly how agy shipped for months recording no tool calls at all.
+
+## Open list, final state
+
+| Item | State |
+|---|---|
+| agy write containment | CLOSED, mutation-verified, live-verified |
+| Delegating tools escaping no-touch | CLOSED |
+| Session routes ungateable | CLOSED, mutation-verified |
+| Live guards unrunnable | CLOSED, one command, both agents pass |
+| "Off unless remembered" | PARTIAL: naming sources implies sight; not on by default, deliberately |
+| Plain-text fallback | PARTIAL: unit level only, subprocess wiring uncovered, test says so |
+| Stale fixtures | INHERENT: live guards exist and are run deliberately, not automatically |
+| Opening a source is not reading it | INHERENT: entailment against the read bytes is a different feature |
+| Shell writes undetectable | INHERENT: containment covers it, detection cannot |
+
+Verified end to end through the RUNNING DAEMON over HTTP, not just in tests:
+- a review that opened its named source returned an answer with `tool_calls_made: 1`
+- a review that answered from memory was REJECTED, naming the unopened source, with the
+  rejected text preserved for inspection
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning.
