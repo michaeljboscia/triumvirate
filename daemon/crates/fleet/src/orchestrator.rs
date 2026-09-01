@@ -96,7 +96,16 @@ impl AgentLauncher for DaemonAgentLauncher {
                 mcp_bridge::GeminiBackend::Agy => {
                     let (bin, extra) = mcp_bridge::agy_command();
                     let cwd = worktree_path.to_string_lossy();
-                    let inv = mcp_bridge::agy::build_agy_invocation(&bin, &extra, task_prompt, &cwd)
+                    let inv = mcp_bridge::agy::build_agy_invocation(
+                        &bin,
+                        &extra,
+                        task_prompt,
+                        &cwd,
+                        // Fleet workers WRITE code by design, so they keep the operator
+                        // default. read_only is for review dispatches, where a write is
+                        // never legitimate.
+                        false,
+                    )
                         .map_err(|e| anyhow::anyhow!("failed to assemble agy invocation for fleet: {e}"))?;
                     (inv.program, inv.args)
                 }

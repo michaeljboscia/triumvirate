@@ -188,18 +188,32 @@ fn yolo_add_dirs(cwd: &str) -> Vec<String> {
 /// Rejects forbidden operator flags (H3). Yolo by default (no seatbelt); the legacy
 /// `sandbox-exec` wrapper is opt-in via `TRIUMVIRATE_AGY_SANDBOX` — see
 /// [`agy_sandbox_enabled`]. `cwd` scopes the yolo `--add-dir` write grant.
+///
+/// `read_only` forces the seatbelt on for REVIEW dispatches, where a write is never legitimate
+/// and the sight gate's no-touch check cannot see one made inside a shell command.
 pub fn build_agy_invocation(
     bin: &str,
     extra_args: &[String],
     prompt: &str,
     cwd: &str,
+    read_only: bool,
 ) -> std::io::Result<AgyInvocation> {
     validate_extra_args(extra_args)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let print_timeout = agy_connector_timeout();
     let log_path = unique_temp("agy-log", "txt");
 
-    if agy_sandbox_enabled() {
+    // `read_only` FORCES the seatbelt on regardless of the operator default.
+    //
+    // A review must not be able to modify the thing it is reviewing. The no-touch check in the
+    // sight gate cannot see a write performed inside a shell command, and agy's default
+    // dispatch is yolo: no seatbelt, plus --dangerously-skip-permissions. That combination let
+    // an agy reviewer overwrite the repository invisibly. Antigravity found the hole in its own
+    // backend while reviewing the sight gate.
+    //
+    // The profile denies file-write* and re-allows only agy's own state dirs and temp, so
+    // reads (which is all a reviewer needs) are untouched.
+    if read_only || agy_sandbox_enabled() {
         // Legacy seatbelt: sandbox-exec -f <profile> agy ... (write-confined, H4).
         let profile_path = unique_temp("agy-sandbox", "sb");
         std::fs::write(&profile_path, render_sandbox_profile())?;
@@ -333,6 +347,52 @@ mod tests {
         );
     }
 
+    /// A REVIEW dispatch must be write-contained even though the operator default is yolo.
+    ///
+    /// agy runs with --dangerously-skip-permissions and no seatbelt by default, and the sight
+    /// gate's no-touch check cannot see a write made inside a shell command. So for a review,
+    /// the OS profile is the ONLY thing standing between a reviewer and an unrequested change
+    /// to the repo it is reviewing. Antigravity found that hole in its own backend.
+    ///
+    /// RED IF: read_only stops forcing the seatbelt, which silently returns agy reviews to
+    /// running uncontained.
+    #[test]
+    fn a_read_only_review_forces_the_seatbelt_on() {
+        let yolo = build_agy_invocation("agy", &[], "hi", "/tmp/x", false).expect("invocation");
+        assert_eq!(yolo.program, "agy", "the default is still yolo for non-reviews");
+
+        let review = build_agy_invocation("agy", &[], "hi", "/tmp/x", true).expect("invocation");
+        assert_eq!(
+            review.program, "sandbox-exec",
+            "a review must be wrapped in the seatbelt regardless of the operator default"
+        );
+        assert!(
+            review.args.iter().any(|a| a == "-f"),
+            "the seatbelt must be given a profile; got: {:?}",
+            review.args
+        );
+        // Containment must not cost the reviewer its receipt.
+        assert!(
+            review
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "a contained review still needs stream-json or it records no tool calls at all"
+        );
+    }
+
+    /// The profile must actually deny writes, not merely exist.
+    /// RED IF: `(deny file-write*)` is removed or the repo becomes writable.
+    #[test]
+    fn the_seatbelt_profile_denies_writes() {
+        let p = render_sandbox_profile();
+        assert!(p.contains("(deny file-write*)"), "profile must deny writes: {p}");
+        assert!(
+            !p.contains("(allow file-write* (subpath \"/\"))"),
+            "the profile must not re-allow the whole filesystem"
+        );
+    }
+
     /// The DEFAULT invocation must carry stream-json, asserted against `build_agy_invocation`
     /// and NOT against the `agy_args` helper.
     ///
@@ -349,7 +409,7 @@ mod tests {
     /// RED IF: the default builder loses the flag.
     #[test]
     fn default_invocation_carries_stream_json() {
-        let inv = build_agy_invocation("agy", &[], "hi", "/tmp/x").expect("invocation");
+        let inv = build_agy_invocation("agy", &[], "hi", "/tmp/x", false).expect("invocation");
         assert_eq!(
             inv.program, "agy",
             "this test is meaningless unless it took the DEFAULT branch; a sandbox-exec \
@@ -387,7 +447,7 @@ mod tests {
     fn yolo_invocation_runs_agy_directly() {
         // Default (no TRIUMVIRATE_AGY_SANDBOX): no sandbox-exec wrapper. agy runs
         // directly with auto-approve + a write grant for the dispatch cwd.
-        let inv = build_agy_invocation("agy", &[], "2+2?", "/Users/me/projects/triumvirate")
+        let inv = build_agy_invocation("agy", &[], "2+2?", "/Users/me/projects/triumvirate", false)
             .expect("invocation");
         assert_eq!(inv.program, "agy");
         assert_eq!(inv.args[0], "-p");
@@ -417,12 +477,12 @@ mod tests {
             vec!["-o".to_string(), "json".to_string()],
         ] {
             assert!(
-                build_agy_invocation("agy", &bad, "2+2?", "/tmp").is_err(),
+                build_agy_invocation("agy", &bad, "2+2?", "/tmp", false).is_err(),
                 "must reject {bad:?}"
             );
         }
         // A benign extra arg is allowed.
-        let ok = build_agy_invocation("agy", &["--add-dir".to_string(), "/x".to_string()], "2+2?", "/tmp");
+        let ok = build_agy_invocation("agy", &["--add-dir".to_string(), "/x".to_string()], "2+2?", "/tmp", false);
         if let Ok(inv) = &ok {
             let _ = std::fs::remove_file(&inv.profile_path);
         }

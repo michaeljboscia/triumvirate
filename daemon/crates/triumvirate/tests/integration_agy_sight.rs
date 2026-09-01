@@ -113,6 +113,7 @@ fn e_agy_sight_02_the_argv_triumvirate_builds_produces_a_parseable_stream() {
             file.display()
         ),
         dir.to_str().unwrap(),
+        false,
     )
     .expect("invocation");
 

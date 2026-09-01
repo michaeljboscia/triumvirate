@@ -256,6 +256,7 @@ pub(crate) async fn run_agy_cli_process_with_session(
     cwd: &str,
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    read_only: bool,
 ) -> anyhow::Result<ParsedAgentResult> {
     // REQ-058: fail loud over ARG_MAX — there is no in-band workaround (no stdin/@file).
     if message.len() > agy_max_prompt_bytes() {
@@ -294,9 +295,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
     // One retry on hang/empty (REQ-020/103). A non-zero exit is a real failure → no retry.
     for attempt in 0u32..2 {
         let run = if use_pty {
-            run_agy_once_pty(bin, extra_args, message, cwd, kill_after).await
+            run_agy_once_pty(bin, extra_args, message, cwd, kill_after, read_only).await
         } else {
-            run_agy_once(bin, extra_args, message, cwd, kill_after).await
+            run_agy_once(bin, extra_args, message, cwd, kill_after, read_only).await
         };
         match run {
             AgyRun::Ok { raw, log } => {
@@ -392,6 +393,8 @@ pub(crate) async fn doctor_probe() -> Result<String, String> {
         &cwd,
         None,
         None,
+        // The doctor probe is a readiness check, not a review.
+        false,
     )
     .await
     .map(|p| p.response_text)
@@ -424,6 +427,8 @@ pub(crate) async fn health_probe() {
         &cwd,
         None,
         None,
+        // Readiness probe, not a review.
+        false,
     )
     .await
     {
@@ -474,10 +479,11 @@ async fn run_agy_once(
     message: &str,
     cwd: &str,
     kill_after: Duration,
+    read_only: bool,
 ) -> AgyRun {
     // REQ-016: assemble the invocation from the shared builder (one source of truth,
     // shared with fleet). Yolo by default; seatbelt opt-in via TRIUMVIRATE_AGY_SANDBOX.
-    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd, read_only) {
         Ok(inv) => inv,
         Err(e) => {
             return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));
@@ -657,11 +663,12 @@ async fn run_agy_once_pty(
     message: &str,
     cwd: &str,
     kill_after: Duration,
+    read_only: bool,
 ) -> AgyRun {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::Read;
 
-    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd) {
+    let inv = match mcp_bridge::agy::build_agy_invocation(bin, extra_args, message, cwd, read_only) {
         Ok(inv) => inv,
         Err(e) => {
             return AgyRun::SpawnError(anyhow::anyhow!("failed to assemble agy invocation: {e}"));
@@ -1123,6 +1130,41 @@ mod tests {
     // Note: agy argument assembly (no -o/-r/-c/--model) is tested in
     // mcp_bridge::agy::tests::agy_args_never_include_forbidden_flags.
 
+    /// The plain-text fallback path must stay honest about what it CANNOT report.
+    ///
+    /// Converting the three subprocess mocks to stream-json lost end-to-end coverage of the
+    /// `TRIUMVIRATE_AGY_OUTPUT=text` path. Antigravity flagged that. Driving the real
+    /// subprocess in text mode would need a process-global env var inside a parallel suite,
+    /// which is exactly what produced a test that could not fail earlier in this work. So the
+    /// fallback is pinned at the unit level instead, and this comment records the gap that
+    /// remains: ANSI stripping plus build_result are covered, the subprocess wiring is not.
+    ///
+    /// RED IF: the plain-text path starts claiming tool calls it cannot observe, which would
+    /// make it look eligible for the sight gate while recording nothing.
+    #[test]
+    fn plain_text_fallback_reports_no_tool_calls_and_is_not_gate_eligible() {
+        let log = AgyLogInfo::default();
+        let ansi = "\u{1b}[32mhello\u{1b}[0m";
+        let stripped = strip_ansi(ansi);
+        assert_eq!(stripped, "hello", "ANSI must still be stripped on the text path");
+
+        for mode in [PARSER_MODE_PIPE, PARSER_MODE_PTY] {
+            let r = build_result(stripped.clone(), &log, mode);
+            assert_eq!(r.response_text, "hello");
+            assert!(
+                r.tool_calls.is_empty(),
+                "plain text carries no tool events; claiming any would be fabrication"
+            );
+            assert_eq!(r.session_id, None, "agy is single-turn (REQ-040/042)");
+            assert_ne!(
+                mode,
+                agent_adapter::AGY_PARSER_MODE_STREAM,
+                "the text modes must NEVER report themselves as the stream mode, or the sight \
+                 gate would trust a parser that records nothing"
+            );
+        }
+    }
+
     #[test]
     fn build_result_is_single_turn_plain_text() {
         // REQ-025/040: no session id, no events, no tool calls, no token usage.
@@ -1185,6 +1227,7 @@ mod tests {
             cwd.to_str().unwrap(),
             session,
             None,
+            false,
         )
         .await;
         let _ = std::fs::remove_file(&mock);
@@ -1264,8 +1307,8 @@ mod tests {
         let bin = mock.to_str().unwrap().to_string();
         let cwd = std::env::temp_dir().to_str().unwrap().to_string();
         let (a, b) = tokio::join!(
-            run_agy_cli_process_with_session(&bin, &[], "q1", &cwd, Some("inbound-a"), None),
-            run_agy_cli_process_with_session(&bin, &[], "q2", &cwd, Some("inbound-b"), None),
+            run_agy_cli_process_with_session(&bin, &[], "q1", &cwd, Some("inbound-a"), None, false),
+            run_agy_cli_process_with_session(&bin, &[], "q2", &cwd, Some("inbound-b"), None, false),
         );
         let _ = std::fs::remove_file(&mock);
         let a = a.expect("dispatch a");
@@ -1299,6 +1342,7 @@ mod tests {
             "2+2?",
             cwd.to_str().unwrap(),
             Duration::from_secs(30),
+            false,
         )
         .await;
         let _ = std::fs::remove_file(&mock);
@@ -1323,6 +1367,7 @@ mod tests {
             "2+2?",
             cwd.to_str().unwrap(),
             Duration::from_secs(30),
+            false,
         )
         .await;
         let _ = std::fs::remove_file(&mock);
@@ -1351,11 +1396,14 @@ mod tests {
             cwd.to_str().unwrap(),
             None,
             None,
+            false,
         )
         .await
         .expect("real agy dispatch");
         assert!(parsed.response_text.contains('4'), "got: {}", parsed.response_text);
         assert_eq!(parsed.session_id, None);
-        assert_eq!(parsed.parser_mode, PARSER_MODE_PIPE);
+        // agy is dispatched in stream-json since 2026-09-01; the plain-text modes record no
+        // tool calls, which locked Antigravity out of the sight gate entirely.
+        assert_eq!(parsed.parser_mode, agent_adapter::AGY_PARSER_MODE_STREAM);
     }
 }

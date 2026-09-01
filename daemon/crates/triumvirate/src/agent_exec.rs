@@ -378,7 +378,7 @@ pub(crate) async fn execute_ask_agent(
     // remote metered call, bill for it, and then discard the answer. Codex found this.
     //
     // Refused here, above worker-acquire, alongside the other pre-dispatch rejections.
-    if req.require_sight.unwrap_or(false) && AGENTS_WITHOUT_TOOLS.contains(&agent.as_str()) {
+    if sight_required(req) && AGENTS_WITHOUT_TOOLS.contains(&agent.as_str()) {
         span.record("agent.outcome", "rejected_no_tools");
         span.record("agent.tokens", 0_u64);
         span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
@@ -795,7 +795,7 @@ pub(crate) async fn execute_ask_agent(
                 // Token accounting is deliberately still performed below on the reject path
                 // through the normal Err arm: the tokens were genuinely spent whether or not the
                 // answer is usable, and hiding that would misreport cost.
-                if req.require_sight.unwrap_or(false)
+                if sight_required(req)
                     && let Err(err) = enforce_reviewer_sight(
                         &agent_display,
                         &parsed.tool_calls,
@@ -1217,7 +1217,7 @@ pub(crate) async fn execute_ask_agent(
                     // entry, emitted "responded", and recorded degraded_success before the gate
                     // ran. Fixing one of two surfaces is the recurring defect in this codebase,
                     // and this is the third time it has appeared in this change alone.
-                    if req.require_sight.unwrap_or(false)
+                    if sight_required(req)
                         && let Err(err) = enforce_reviewer_sight(
                             &hop_display,
                             &parsed.tool_calls,
@@ -1496,6 +1496,20 @@ const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
 /// capability mismatch is the caller's error and should cost nothing to discover.
 const AGENTS_WITHOUT_TOOLS: &[&str] = &["deepseek"];
 
+/// Is this dispatch a review that must prove it looked?
+///
+/// True when `require_sight` is set, OR when the caller named `required_sources`. Naming the
+/// evidence IS the declaration that this is a review, and requiring the caller to also
+/// remember a separate boolean is how a gate becomes optional in practice.
+///
+/// Grok, on the first version: "a skip-catcher that is off unless remembered is not a
+/// skip-catcher." This removes one of the two things that had to be remembered. It does not
+/// make the gate on by default, and a review of an artifact pasted inline still names no
+/// sources and is correctly unaffected, because such a review genuinely needs no tools.
+pub(crate) fn sight_required(req: &AskAgentRequest) -> bool {
+    req.require_sight.unwrap_or(false) || !req.required_sources.is_empty()
+}
+
 /// Agents whose review dispatch has NO write containment, so the no-touch check is the only
 /// thing standing between a review and an unrequested repository change, and that check cannot
 /// see a write performed inside a shell command.
@@ -1509,7 +1523,17 @@ const AGENTS_WITHOUT_TOOLS: &[&str] = &["deepseek"];
 /// Refusing agy reviews outright would be the wrong trade while it is the only Gemini backend.
 /// Closing it properly means either a read-only profile for review dispatches or denying agy's
 /// write tools at spawn, and neither is built.
-const AGENTS_WITH_NO_WRITE_CONTAINMENT: &[&str] = &["gemini"];
+/// Empty as of 2026-09-01: agy review dispatches now force the seatbelt on.
+///
+/// `require_sight` propagates a `read_only` flag to `build_agy_invocation`, which wraps agy in
+/// the `sandbox-exec` profile (`deny file-write*`, reads open) regardless of the operator
+/// default. Before that, agy ran yolo with --dangerously-skip-permissions and no seatbelt, so
+/// an agy reviewer could overwrite the repository through `run_command`, invisible to the
+/// no-touch check and unrestrained by the OS.
+///
+/// Kept as a named, tested list rather than deleted, so a future backend without containment
+/// has an obvious place to be declared instead of being silently trusted.
+const AGENTS_WITH_NO_WRITE_CONTAINMENT: &[&str] = &[];
 
 /// A reviewer that opened nothing did not review anything.
 ///
@@ -1903,7 +1927,9 @@ async fn run_gemini_shadow(
     let result = match shadow_backend {
         GeminiBackend::Agy => {
             let (bin, args) = agy_command();
-            crate::agy::run_agy_cli_process_with_session(&bin, &args, prompt, cwd, None, None).await
+            // Shadow compare mirrors the primary call, which is not a review.
+            crate::agy::run_agy_cli_process_with_session(&bin, &args, prompt, cwd, None, None, false)
+                .await
         }
         GeminiBackend::GeminiCli => {
             let (bin, args) = gemini_command();
@@ -1967,6 +1993,10 @@ async fn run_named_agent_with_session_and_model(
     req_overrides: Option<&AskAgentRequest>,
 ) -> anyhow::Result<ParsedAgentResult> {
     let _ = session_id; // deepseek arm intentionally ignores resume tokens — T-014.
+    // A review dispatch must not be able to write. Only agy consumes this today: codex exec
+    // is already read-only without --full-auto, and the others have no containment knob on
+    // this path. See AGENTS_WITH_NO_WRITE_CONTAINMENT.
+    let read_only = req_overrides.is_some_and(sight_required);
     match agent {
         "gemini" => {
             let (bin, mut args) = gemini_command();
@@ -1982,6 +2012,7 @@ async fn run_named_agent_with_session_and_model(
                 cwd,
                 session_id,
                 events_tx,
+                read_only,
             )
             .await
         }
@@ -1995,6 +2026,7 @@ async fn run_named_agent_with_session_and_model(
                 cwd,
                 session_id,
                 events_tx,
+                read_only,
             )
             .await
         }
@@ -2019,6 +2051,7 @@ async fn run_named_agent_with_session_and_model(
                 cwd,
                 session_id,
                 events_tx,
+                read_only,
             )
             .await
         }
@@ -3484,6 +3517,10 @@ async fn run_agent_process_with_session(
     cwd: &str,
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    // This dispatch is a REVIEW, so the backend must be contained against writes where it
+    // can be. Only the agy backend acts on it today: codex exec is already read-only without
+    // --full-auto, and the others have no containment knob on this path.
+    read_only: bool,
 ) -> anyhow::Result<ParsedAgentResult> {
     if is_mock_connector(bin) {
         #[cfg(test)]
@@ -3508,8 +3545,12 @@ async fn run_agent_process_with_session(
             GeminiBackend::Agy => {
                 let (agy_bin, agy_args) = agy_command();
                 tracing::info!(backend = "agy", "gemini dispatch served by agy backend");
+                // A REVIEW dispatch forces the seatbelt on. agy's default is yolo with
+                // --dangerously-skip-permissions and no sandbox, and the sight gate's
+                // no-touch check cannot see a write made inside a shell command, so this
+                // is the only thing stopping a reviewer from editing what it reviews.
                 crate::agy::run_agy_cli_process_with_session(
-                    &agy_bin, &agy_args, message, cwd, session_id, events_tx,
+                    &agy_bin, &agy_args, message, cwd, session_id, events_tx, read_only,
                 )
                 .await
             }
@@ -4724,6 +4765,8 @@ mod sight_gate_tests {
                 src.display()
             ),
             dir.to_str().unwrap(),
+            // A REVIEW: force the seatbelt, exactly as production does for require_sight.
+            true,
         )
         .expect("invocation");
 
@@ -4774,15 +4817,60 @@ mod sight_gate_tests {
     #[test]
     fn sight_24_the_uncontained_agents_are_named() {
         assert!(
-            AGENTS_WITH_NO_WRITE_CONTAINMENT.contains(&"gemini"),
-            "agy runs with --dangerously-skip-permissions and no seatbelt by default, so a \
-             review dispatched to it can write the repo through run_command, invisible to the \
-             no-touch check"
+            !AGENTS_WITH_NO_WRITE_CONTAINMENT.contains(&"gemini"),
+            "agy review dispatches force the seatbelt on via require_sight -> read_only; if \
+             that stops being true, put gemini back on this list rather than leaving the \
+             sight_10 comment claiming a protection that does not exist"
         );
         assert!(
             !AGENTS_WITH_NO_WRITE_CONTAINMENT.contains(&"codex"),
             "codex exec without --full-auto is read-only, so the OS contains it"
         );
+    }
+
+    /// Naming sources must be enough. RED IF: `required_sources` stops implying sight, so a
+    /// caller who named its evidence still silently gets no gate.
+    #[test]
+    fn sight_26_naming_sources_implies_requiring_sight() {
+        let named = AskAgentRequest {
+            agent: "grok".to_string(),
+            message: "review".to_string(),
+            required_sources: vec!["/repo/a.rs".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            sight_required(&named),
+            "a caller that named its evidence has declared this a review; making it also \
+             remember require_sight is how the gate becomes optional in practice"
+        );
+
+        let flag_only = AskAgentRequest {
+            agent: "grok".to_string(),
+            message: "review".to_string(),
+            require_sight: Some(true),
+            ..Default::default()
+        };
+        assert!(sight_required(&flag_only), "the explicit flag still works on its own");
+
+        let ordinary = AskAgentRequest {
+            agent: "grok".to_string(),
+            message: "what is 2+2".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !sight_required(&ordinary),
+            "an ordinary consult must be completely unaffected"
+        );
+
+        // A review of an artifact pasted inline names no sources and needs no tools. It must
+        // NOT be gated, or the gate false-rejects the one review shape that is legitimately
+        // toolless.
+        let inline = AskAgentRequest {
+            agent: "grok".to_string(),
+            message: "review this diff: ...".to_string(),
+            ..Default::default()
+        };
+        assert!(!sight_required(&inline));
     }
 
     /// Searching for a filename is NOT reading the file.
@@ -4985,15 +5073,14 @@ mod sight_gate_tests {
     /// `codex-exec-json` stamps every call ToolKind::Bash, so a write performed inside a shell
     /// command is INVISIBLE to this check.
     ///
-    /// AND THE FALLBACK IS NOT UNIFORM. An earlier version of this comment said "the read-only
-    /// sandbox is what actually prevents it", which is true for codex (`codex exec` without
-    /// --full-auto is read-only) and FALSE for agy: `agy_sandbox_enabled()` defaults to false,
-    /// so agy runs yolo with --dangerously-skip-permissions and no seatbelt. An agy reviewer
-    /// can overwrite the repository through `run_command`, invisible to this check and
-    /// unrestrained by the OS. Antigravity found this in its own backend.
+    /// What actually prevents it is CONTAINMENT, and the containment is per agent:
+    ///   codex  `codex exec` without --full-auto is read-only.
+    ///   agy    a review dispatch forces the sandbox-exec seatbelt via require_sight.
     ///
-    /// So the accurate statement is: a shell write is undetectable here, and whether anything
-    /// else stops it depends entirely on the agent. See AGENTS_WITH_NO_WRITE_CONTAINMENT.
+    /// An earlier version of this comment said "the read-only sandbox is what actually
+    /// prevents it" while agy ran yolo with no seatbelt at all, so the comment asserted a
+    /// protection that did not exist on that backend. Antigravity found it. See
+    /// AGENTS_WITH_NO_WRITE_CONTAINMENT, which is now empty and tested.
     /// RED IF: someone maps Bash into the mutation set, which would false-reject every codex
     /// review, or if codex.rs starts classifying kinds and this comment goes stale.
     #[test]

@@ -473,3 +473,75 @@ private to the binary. **Ran live and passed.**
 - `require_sight` is still opt-in, and only one-shot `ask_agent` can set it.
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
+
+---
+
+## Round 5, 2026-09-01. Closing the open list.
+
+### 1. Write containment for agy reviews. CLOSED.
+
+The hole Antigravity found in its own backend: agy ran yolo with
+`--dangerously-skip-permissions` and no seatbelt, and the no-touch check cannot see a write
+made inside a shell command, so an agy reviewer could overwrite the repository invisibly.
+
+`require_sight` now propagates a `read_only` flag from dispatch down to
+`build_agy_invocation`, which forces the `sandbox-exec` seatbelt on regardless of the operator
+default. The profile already existed and does exactly the right thing: `deny file-write*` with
+reads open, so a reviewer loses nothing it needs.
+
+Fleet keeps the operator default, because fleet workers write code by design. The doctor probe
+and shadow compare pass `false` explicitly.
+
+Mutation-verified: removing `read_only ||` from the seatbelt condition reds
+`a_read_only_review_forces_the_seatbelt_on`. `AGENTS_WITH_NO_WRITE_CONTAINMENT` is now empty
+and still tested, so a future backend without containment has an obvious place to be declared
+rather than being silently trusted. The `sight_10` comment that claimed a protection agy did
+not have is corrected.
+
+**`sight_25` re-ran LIVE with the seatbelt forced on and still passed**, so containment does
+not cost a review its receipt.
+
+### 2. Delegating tools escaping the no-touch check. CLOSED.
+
+`call_mcp_tool`, `invoke_subagent`, `browser_subagent`, `define_subagent`, `manage_subagents`,
+`schedule`, `manage_task`, `manage_inbox` and `send_message` were `Unknown`, so a review that
+mutated the tree through MCP or a subagent was accepted as clean. Grok found it.
+
+Now `EditFile`, so using one REJECTS the review. That is a deliberate false-rejection risk: a
+reviewer calling a read-only MCP tool will be turned away. The trade is accepted, because a
+reviewer has no business delegating and the alternative is a mutation the gate cannot see.
+
+### 3. Plain-text fallback coverage. PARTIALLY CLOSED, honestly.
+
+Converting the three subprocess mocks to stream-json lost end-to-end coverage of
+`TRIUMVIRATE_AGY_OUTPUT=text`. Antigravity flagged it and the loss was real.
+
+Restored at the UNIT level: ANSI stripping plus `build_result` for both text modes, asserting
+they report no tool calls and never claim the stream parser mode. Driving the real subprocess
+in text mode needs a process-global env var inside a parallel suite, which is precisely what
+produced a test that could not fail earlier in this work, so it was not done. **The subprocess
+wiring of the text path remains uncovered**, and the test says so.
+
+### 4. "Off unless remembered". PARTIALLY CLOSED.
+
+Grok: "a skip-catcher that is off unless remembered is not a skip-catcher."
+
+`required_sources` now IMPLIES `require_sight` via `sight_required()`. Naming the evidence IS
+the declaration that this is a review, so a caller no longer has to remember two things.
+
+Deliberately NOT made on by default: a review of an artifact pasted inline names no sources and
+genuinely needs no tools, and gating it would false-reject the one review shape that is
+legitimately toolless. `query_gemini_review` is that shape today, which is why it was left
+alone rather than having the flag forced on.
+
+**Still open:** `ask_session`, `ask_daemon` and HTTP `/session/ask` still build
+`AskAgentRequest { ..Default::default() }` and cannot set either field, so a multi-turn review
+cannot be gated at all.
+
+### 5. Stale fixtures. OPEN, by design.
+
+If Google changes agy's wire format the offline suite stays green while production breaks.
+`e_agy_sight_02` and `sight_25` are the live guards and both are opt-in behind
+`TRIUMVIRATE_LIVE_AGY=1`. Nothing runs them automatically.
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning.

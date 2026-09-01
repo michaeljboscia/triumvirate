@@ -105,6 +105,17 @@ pub fn map_agy_tool_kind(name: &str) -> ToolKind {
         "grep_search" | "search_web" => ToolKind::Grep,
         "list_dir" | "find_by_name" | "list_resources" => ToolKind::Glob,
         "ask_question" | "ask_permission" | "ask_custom_permission" => ToolKind::RequestUserInput,
+        // OPAQUE EFFECT. These delegate to something whose actions this stream never records:
+        // an MCP server, a subagent, a browser. Any of them can write. Classified `EditFile`
+        // so a review that used one is REJECTED rather than silently accepted as clean.
+        //
+        // That is a deliberate false-rejection risk. A reviewer legitimately calling a
+        // read-only MCP tool will be turned away, and the trade is accepted: a reviewer has no
+        // business delegating, and the alternative is a mutation the gate cannot see. Grok
+        // found that these escaped the no-touch check entirely as `Unknown`.
+        "call_mcp_tool" | "invoke_subagent" | "browser_subagent" | "define_subagent"
+        | "manage_subagents" | "schedule" | "manage_task" | "manage_inbox"
+        | "send_message" => ToolKind::EditFile,
         _ => ToolKind::Unknown,
     }
 }
@@ -394,6 +405,42 @@ mod tests {
             "the searched-for path must be visible in recorded args, or required_sources \
              cannot be enforced for agy; got: {args:?}"
         );
+    }
+
+    /// Tools that delegate to something the stream cannot see must count as touches.
+    ///
+    /// A subagent or an MCP server can write, and none of that appears in this stream. Left as
+    /// `Unknown` they escaped the no-touch check entirely: a review that mutated the tree
+    /// through MCP was accepted as clean. Grok found it.
+    ///
+    /// RED IF: any of these drift back to a kind the no-touch check ignores.
+    #[test]
+    fn agy_14_delegating_tools_count_as_touches() {
+        for t in [
+            "call_mcp_tool",
+            "invoke_subagent",
+            "browser_subagent",
+            "define_subagent",
+            "send_message",
+        ] {
+            assert_eq!(
+                map_agy_tool_kind(t),
+                ToolKind::EditFile,
+                "`{t}` delegates to something this stream never records, so it must be treated \
+                 as a mutation rather than trusted"
+            );
+        }
+        // And they must NOT be read-shaped, or they could also satisfy a required source.
+        for t in ["call_mcp_tool", "invoke_subagent"] {
+            assert_ne!(map_agy_tool_kind(t), ToolKind::ReadFile);
+        }
+    }
+
+    /// `notebook_execution` executes. RED IF: it goes back to ReadFile, where it could both
+    /// mutate and satisfy a named source without opening it.
+    #[test]
+    fn agy_15_notebook_execution_is_not_a_read() {
+        assert_eq!(map_agy_tool_kind("notebook_execution"), ToolKind::Bash);
     }
 
     /// An ERROR tool step is a FAILURE, not an unfinished one.
