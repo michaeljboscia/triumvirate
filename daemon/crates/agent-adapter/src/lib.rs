@@ -30,7 +30,14 @@ pub fn format_working_state(event: &WorkingStateEvent) -> String {
     match event.state {
         WorkingState::ToolCallStarted | WorkingState::ToolCallCompleted => {
             let tool = event.tool_name.as_deref().unwrap_or("tool");
-            let path = extract_param(&event.tool_args_json, &["file_path", "path"]);
+            // `target_file` FIRST, because that is what grok actually sends. The vendor guide's
+            // example showed `path`, the live capture in
+            // tests/fixtures/grok-streaming-tools-20260830.jsonl shows
+            // `"rawInput":{"target_file":"target.txt"}`, and checking only the guide's names
+            // left every grok tool line in the watch CLI showing the tool name instead of the
+            // file. The grok parser was fixed for its own FileRead event; this generic
+            // formatter was not, so the same bug survived on the other surface.
+            let path = extract_param(&event.tool_args_json, &["target_file", "file_path", "path"]);
             let cmd = extract_param(&event.tool_args_json, &["command"]);
             let pattern = extract_param(&event.tool_args_json, &["pattern", "query"]);
             if let Some(p) = path {
@@ -124,5 +131,63 @@ mod tests {
         assert!(should_display(&WorkingState::ToolCallStarted, AgentVerbosity::Standard));
         assert!(!should_display(&WorkingState::Unknown, AgentVerbosity::Detailed));
         assert!(should_display(&WorkingState::Unknown, AgentVerbosity::Raw));
+    }
+}
+
+#[cfg(test)]
+mod format_working_state_tests {
+    use super::*;
+    use crate::types::{TokenUsage, WorkingState, WorkingStateEvent};
+
+    fn ev(args: &str) -> WorkingStateEvent {
+        WorkingStateEvent {
+            agent: "grok".to_string(),
+            state: WorkingState::ToolCallStarted,
+            detail: "read_file".to_string(),
+            tool_name: Some("read_file".to_string()),
+            tool_args_json: Some(args.to_string()),
+            token_usage: None::<TokenUsage>,
+            ts_ms: None,
+        }
+    }
+
+    /// The watch CLI must show the FILE, and grok names it `target_file`.
+    ///
+    /// FIND-GROK-01. The vendor guide's example used `path`, so only `path` and `file_path`
+    /// were checked, and every grok tool line rendered the tool name instead of the file.
+    /// The grok parser had already been fixed for its own FileRead event; this generic
+    /// formatter had not, which is the two-surface split again.
+    ///
+    /// RED IF: `target_file` is dropped from the lookup list.
+    #[test]
+    fn format_shows_the_path_grok_actually_sends() {
+        let line = format_working_state(&ev(r#"{"target_file":"target.txt"}"#));
+        assert!(
+            line.contains("target.txt"),
+            "grok sends target_file; got: {line}"
+        );
+    }
+
+    /// The guide's names must keep working, since other agents use them.
+    /// RED IF: adding target_file displaced the existing lookups.
+    #[test]
+    fn format_still_shows_the_documented_names() {
+        assert!(format_working_state(&ev(r#"{"path":"a.rs"}"#)).contains("a.rs"));
+        assert!(format_working_state(&ev(r#"{"file_path":"b.rs"}"#)).contains("b.rs"));
+    }
+
+    /// Locked to the REAL capture, not to my belief about it. If the fixture is ever recaptured
+    /// with a different key, this fails rather than silently rendering blank lines again.
+    ///
+    /// RED IF: the fixture stops carrying a tool call whose rawInput names the file.
+    #[test]
+    fn the_live_fixture_uses_target_file() {
+        const TOOLS: &str =
+            include_str!("../tests/fixtures/grok-streaming-tools-20260830.jsonl");
+        assert!(
+            TOOLS.contains(r#""target_file""#),
+            "the committed live capture must still exercise target_file; if grok changed its \
+             key, update the lookup list rather than this assertion"
+        );
     }
 }

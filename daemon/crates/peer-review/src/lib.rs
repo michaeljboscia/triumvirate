@@ -25,6 +25,36 @@ pub struct ReviewRecord {
     pub state: String,
 }
 
+/// The default panel, overridable with `TRIUMVIRATE_PEER_REVIEWERS` (comma separated).
+///
+/// FIND-GROK-04. Dropping a reviewer used to require patching this file. An operator whose grok
+/// is slow, rate limited, or logged out had no way to run a review without it except editing
+/// Rust, which means in practice they turn the whole review off instead.
+///
+/// The default is unchanged and still includes grok, which was an explicit ruling. This is
+/// about HOW the seat is filled, not whether it exists.
+///
+/// Unknown names are kept rather than filtered: an unroutable reviewer must fail loudly at
+/// dispatch, not vanish from the panel silently, which would look like the review passing.
+pub fn default_reviewers() -> Vec<String> {
+    const DEFAULT: &[&str] = &["codex", "gemini", "grok", "claude"];
+    match std::env::var("TRIUMVIRATE_PEER_REVIEWERS") {
+        Ok(raw) => {
+            let picked: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if picked.is_empty() {
+                DEFAULT.iter().map(|s| s.to_string()).collect()
+            } else {
+                picked
+            }
+        }
+        Err(_) => DEFAULT.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerReviewEngine {
     db_path: PathBuf,
@@ -43,12 +73,7 @@ impl PeerReviewEngine {
             // peers (codex, antigravity/gemini, grok) plus claude. DeepSeek is deliberately
             // absent: it is HTTP with no filesystem access through the bridge, so it can only
             // review method-level questions, and it is consulted explicitly when that is wanted.
-            reviewers: vec![
-                "codex".to_string(),
-                "gemini".to_string(),
-                "grok".to_string(),
-                "claude".to_string(),
-            ],
+            reviewers: default_reviewers(),
             round_robin: Arc::new(Mutex::new(0)),
         })
     }
@@ -393,4 +418,60 @@ mod tests {
         assert_ne!(picked, "grok", "the author cannot be its own reviewer");
     }
 
+}
+
+#[cfg(test)]
+mod panel_roster_tests {
+    use super::*;
+
+    /// These tests mutate a PROCESS-GLOBAL env var and cargo runs tests in parallel, so they
+    /// must not overlap. An earlier test in this repo failed exactly this way: a sibling set a
+    /// global and the "default" case silently exercised the override. Serialise them.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The default panel is unchanged and still seats grok. That was an explicit ruling.
+    /// RED IF: a reviewer is dropped from the default.
+    #[test]
+    fn the_default_panel_is_the_four_peers() {
+        let _guard = env_guard();
+        // SAFETY: single assertion on a process-global, removed immediately. Kept here rather
+        // than spread across tests because a leaked value would silently change the default.
+        unsafe { std::env::remove_var("TRIUMVIRATE_PEER_REVIEWERS") };
+        assert_eq!(default_reviewers(), vec!["codex", "gemini", "grok", "claude"]);
+    }
+
+    /// FIND-GROK-04: dropping a reviewer must be an env change, not a patch to this file.
+    ///
+    /// An operator whose grok is slow, rate limited or logged out previously had to edit Rust
+    /// to run a review without it, which in practice means turning the whole review off.
+    ///
+    /// RED IF: the env override stops being honoured.
+    #[test]
+    fn an_operator_can_drop_a_reviewer_without_a_code_change() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("TRIUMVIRATE_PEER_REVIEWERS", "codex, gemini") };
+        let got = default_reviewers();
+        unsafe { std::env::remove_var("TRIUMVIRATE_PEER_REVIEWERS") };
+        assert_eq!(got, vec!["codex", "gemini"]);
+        assert!(!got.contains(&"grok".to_string()));
+    }
+
+    /// An empty or whitespace-only override must NOT silently produce an empty panel, which
+    /// would look exactly like a review that passed.
+    /// RED IF: an empty list stops falling back to the default.
+    #[test]
+    fn an_empty_override_falls_back_rather_than_disabling_review() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("TRIUMVIRATE_PEER_REVIEWERS", "  , ,") };
+        let got = default_reviewers();
+        unsafe { std::env::remove_var("TRIUMVIRATE_PEER_REVIEWERS") };
+        assert_eq!(
+            got.len(),
+            4,
+            "an empty roster must fall back to the default, never disable the panel silently"
+        );
+    }
 }

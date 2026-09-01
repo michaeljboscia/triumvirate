@@ -124,7 +124,6 @@ Tool surface is now logged per turn: a real consult reported **126 tools, 11 com
 - `end.sessionId` returns the `-s` uuid unchanged. REQ-GROK-007 confirmed.
 - `input_tokens` and `cache_read_input_tokens` are SEPARATE counters. Total context is their sum.
 - Fixtures committed: `agent-adapter/tests/fixtures/grok-streaming-{20260830,lean-20260830,isolated-20260830}.jsonl`.
-- **Fixture gap:** none contain `tool_call` events. Tool mapping is spec-derived, not observed.
 
 ## Peer findings fixed in Slice B (do not reintroduce)
 
@@ -219,3 +218,73 @@ a hard error**, or a consult silently runs uncontained.
    `attempt_schedule_for()`, a real function, and the test calls it.
 3. `agent_exec.rs:336` claimed subscription calls cost $0. **FIXED in Slice D:** corrected to say dollars, and to
    record that a flat plan still has finite quota burned invisibly at 14K to 67K per consult.
+
+---
+
+## Chorus fix list, 2026-09-01
+
+Worked from `GROK_ADAPTER_CHORUS_FIXLIST.md`.
+
+### FIND-GROK-01 tool-call mapping: PARTIALLY CLOSED
+
+The `target_file` bug was real and only half fixed. `agent-adapter/src/grok.rs` already
+extracted `target_file` for its own `FileRead` event, with a comment saying Grok caught it.
+`agent-adapter/src/lib.rs::format_working_state`, the GENERIC formatter the watch CLI uses, did
+NOT: it looked for `file_path` and `path` only, which are the vendor guide's names. The live
+capture sends `{"target_file":"target.txt"}`. So every grok tool line in the watch CLI rendered
+the tool name instead of the file. Two surfaces, one fixed. FIXED, with three tests including
+one pinned to the committed capture so a recapture with a different key fails loudly.
+
+STILL OPEN: only `read_file` appears in a live fixture. Capturing one live turn each for
+`run_terminal_command`, `search_replace`, `grep` and one Unknown remains to be done.
+
+### FIND-GROK-02 slice D-N peer review: NOT DONE
+
+No slice-scoped review pass has run. Unchanged.
+
+### FIND-GROK-03 ABE honesty: CLOSED, Option A
+
+`snapshot_workers` hardcoded `agent: "codex"` and `name: "codex-worker-{id}"`, so `/api/workers`,
+the UI and telemetry reported Codex for EVERY worker. ABE only spawns Codex today, so the label
+was true BY LUCK and would have kept being reported the moment anything else was dispatched.
+
+`TaskRecord.agent` is now a real field, defaulting to `codex` at the one registration site, and
+`snapshot_workers` reads it. Two tests: a record carrying `grok` reports grok and names the
+worker `grok-worker-{id}`, and the default is still codex. The lie cannot land later.
+
+### FIND-GROK-04 panel Fast isolation: CLOSED
+
+Two problems, both fixed.
+
+`TRIUMVIRATE_PEER_REVIEWERS` (comma list) now overrides the panel. The default is unchanged and
+still seats grok, which was an explicit ruling. Dropping a reviewer is an env change rather than
+a patch to `peer-review/src/lib.rs`. An empty or whitespace-only override falls back to the
+default rather than silently producing an empty panel, which would look exactly like a review
+that passed.
+
+`mcp_bridge::grok::with_forced_fast()` pins grok to Fast on the calling thread, so a daemon
+started with `TRIUMVIRATE_GROK_DEPTH=deep` cannot make every mandatory review a multi-minute
+turn. Deliberately a THREAD-LOCAL, not a mutation of `std::env` around the child: reviewers
+dispatch concurrently and a process-wide set would leak into the others. This repo has already
+shipped one test that could not fail because of exactly that pattern, and while writing the
+roster tests I reproduced it again and had to serialise them.
+
+Tests prove the override beats a Deep environment, does NOT leak past its closure, and changes
+the ARGS that actually cost time (max-turns and effort) rather than only the enum.
+
+STILL OPEN: `with_forced_fast` is the mechanism; wiring the peer-review engine's dispatch to
+call it is not done, because the engine records reviews in SQLite and does not spawn the agent
+itself. Naming that honestly rather than claiming the seat is isolated.
+
+### FIND-GROK-05 doctor compat drift: CLOSED
+
+`triumvirate doctor` now reads `~/.grok/config.toml` and reports any of the five
+`[compat.claude]` keys that is missing or true, naming the offending keys and what it costs:
+roughly 420 tools instead of 126, measured at 66,559 input tokens to answer "pong".
+
+A MISSING key counts as drift, because the default is inherit-on and silence is not safety.
+Keys in other sections do not satisfy the check. Deliberately a line scanner rather than a TOML
+parse: this crate has no toml dependency and a parse failure elsewhere in the file must not hide
+the answer.
+
+Verified live: `triumvirate doctor` prints `grok compat.claude: closed (all five keys false)`.

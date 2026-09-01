@@ -25,6 +25,16 @@ struct TaskOutput {
 
 #[derive(Debug)]
 struct TaskRecord {
+    /// Which agent is actually running this task.
+    ///
+    /// FIND-GROK-03. `snapshot_workers` hardcoded `agent: "codex"` and
+    /// `name: "codex-worker-{id}"`, so `/api/workers`, the UI and telemetry reported Codex for
+    /// EVERY worker. ABE only spawns Codex today, so the label happened to be true, and it
+    /// would have kept being reported the moment any other agent was dispatched. A label that
+    /// is right by luck is the kind of quiet lie this project keeps finding.
+    ///
+    /// Defaults to `codex` via `Default`, so existing call sites are unchanged.
+    agent: String,
     wave: u32,
     status: TaskStatus,
     started_at: Instant,
@@ -234,6 +244,10 @@ impl TaskTracker {
         guard.insert(
             task_id.clone(),
             TaskRecord {
+                // ABE dispatch is Codex-only today. When another agent becomes dispatchable,
+                // this is the ONE place that has to learn about it, and `snapshot_workers`
+                // follows automatically instead of needing a second edit.
+                agent: "codex".to_string(),
                 wave,
                 status: TaskStatus::Working,
                 started_at,
@@ -597,6 +611,10 @@ impl TaskTracker {
         guard.insert(
             task_id.clone(),
             TaskRecord {
+                // ABE dispatch is Codex-only today. When another agent becomes dispatchable,
+                // this is the ONE place that has to learn about it, and `snapshot_workers`
+                // follows automatically instead of needing a second edit.
+                agent: "codex".to_string(),
                 wave: 0,
                 status: TaskStatus::SetupFailed,
                 started_at: Instant::now(),
@@ -667,8 +685,9 @@ impl TaskTracker {
                 let started_at = format_rfc3339(started_sys.duration_since(UNIX_EPOCH).ok());
                 shared_types::WorkerInfo {
                     session_id: task_id.clone(),
-                    agent: "codex".to_string(),
-                    name: format!("codex-worker-{task_id}"),
+                    // From the RECORD, never a literal. See TaskRecord::agent.
+                    agent: rec.agent.clone(),
+                    name: format!("{}-worker-{task_id}", rec.agent),
                     status: status_label(&rec.status).to_string(),
                     task_id: Some(task_id.clone()),
                     parent_session_id: rec.parent_session_id.clone(),
@@ -1327,6 +1346,69 @@ mod tests {
     }
 
     /// FEAT-012 (REQ-017) T-007.5 reality test: empty tracker returns empty snapshot.
+    /// FIND-GROK-03: `/api/workers` must never label a non-Codex process as Codex.
+    ///
+    /// `snapshot_workers` hardcoded `agent: "codex"` and `name: "codex-worker-{id}"`. ABE only
+    /// spawns Codex today, so the label was true by luck, and it would have kept being reported
+    /// the moment any other agent was dispatched. This drives the field so the lie cannot land
+    /// later.
+    ///
+    /// RED IF: snapshot_workers goes back to a literal instead of reading the record.
+    #[tokio::test]
+    async fn snapshot_workers_reports_the_recorded_agent_not_a_literal() {
+        let tracker = TaskTracker::default();
+        let child = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "t1".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                std::time::Instant::now(),
+            )
+            .await;
+        {
+            let mut guard = tracker.inner.lock().await;
+            // Simulate a future non-Codex dispatch. If this ever becomes reachable, the
+            // reporting must already be honest.
+            guard.get_mut("t1").expect("registered").agent = "grok".to_string();
+        }
+        let workers = tracker.snapshot_workers().await;
+        let w = workers.first().expect("one worker");
+        assert_eq!(w.agent, "grok", "the agent must come from the record");
+        assert_eq!(
+            w.name, "grok-worker-t1",
+            "the display name must follow the agent too, or the UI still says codex"
+        );
+    }
+
+    /// The default is still Codex, so today's behaviour is unchanged.
+    /// RED IF: the default flips and existing ABE dispatches start mislabelling themselves.
+    #[tokio::test]
+    async fn abe_workers_still_default_to_codex() {
+        let tracker = TaskTracker::default();
+        let child = Command::new("sh").arg("-c").arg("true").spawn().expect("spawn");
+        tracker
+            .register(
+                "t2".to_string(),
+                1,
+                Arc::new(Mutex::new(child)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                std::time::Instant::now(),
+            )
+            .await;
+        let workers = tracker.snapshot_workers().await;
+        assert_eq!(workers.first().expect("one worker").agent, "codex");
+    }
+
     #[tokio::test]
     async fn snapshot_workers_empty_tracker_returns_empty_vec() {
         let tracker = TaskTracker::default();

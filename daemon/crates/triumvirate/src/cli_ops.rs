@@ -64,6 +64,51 @@ pub(crate) fn run_uninstall() -> anyhow::Result<()> {
 /// hide which account a consult is actually charged against.
 ///
 /// Deliberately never runs `-p`. A doctor that spends tokens is a doctor people stop running.
+/// The five `[compat.claude]` keys that must all be `false`.
+///
+/// FIND-GROK-05. With inheritance ON, a grok consult loads `~/.claude.json` and advertises
+/// roughly 420 tools plus 509 commands, measured at 66,559 input tokens to answer "pong". With
+/// the curated set it is about 126 tools. Nothing detects drift: a grok upgrade that ignores
+/// the section, or a user deleting five lines, silently reinstates the tax and every Fast
+/// consult pays it.
+const COMPAT_CLAUDE_KEYS: &[&str] = &["mcps", "skills", "hooks", "agents", "rules"];
+
+/// Read `~/.grok/config.toml` and report any `[compat.claude]` key that is missing or true.
+///
+/// Deliberately a line scanner rather than a TOML parse: this crate has no toml dependency,
+/// the check is a tripwire and not a config system, and a parse failure on an unrelated part
+/// of the file must not hide the answer. Returns the offending keys.
+fn grok_compat_drift(config: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut seen: Vec<(String, bool)> = Vec::new();
+    for line in config.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t.starts_with("[compat.claude]");
+            continue;
+        }
+        if !in_section || t.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = t.split_once('=') {
+            let k = k.trim().to_string();
+            let v = v.trim().trim_matches('"').to_ascii_lowercase();
+            if COMPAT_CLAUDE_KEYS.contains(&k.as_str()) {
+                seen.push((k, v == "true"));
+            }
+        }
+    }
+    let mut bad = Vec::new();
+    for key in COMPAT_CLAUDE_KEYS {
+        match seen.iter().find(|(k, _)| k == key) {
+            Some((_, true)) => bad.push(format!("{key}=true")),
+            None => bad.push(format!("{key} missing")),
+            Some((_, false)) => {}
+        }
+    }
+    bad
+}
+
 fn probe_grok() -> Vec<String> {
     let mut out = Vec::new();
     let (bin, _) = mcp_bridge::grok_command();
@@ -108,6 +153,33 @@ fn probe_grok() -> Vec<String> {
     // minted an id it then abandoned, so `~/.grok/sessions` grew per consult. Report the count
     // rather than deleting anything: these are conversation transcripts, and silently destroying
     // user data to tidy a directory is not a trade a doctor gets to make.
+    // FIND-GROK-05: report `[compat.claude]` drift BEFORE the first slow consult.
+    if let Some(home) = dirs::home_dir() {
+        let cfg_path = home.join(".grok").join("config.toml");
+        match std::fs::read_to_string(&cfg_path) {
+            Ok(cfg) => {
+                let bad = grok_compat_drift(&cfg);
+                if bad.is_empty() {
+                    out.push("  grok compat.claude: closed (all five keys false)".to_string());
+                } else {
+                    out.push(format!(
+                        "  grok compat.claude: OPEN ({}). Consults will inherit the \
+                         ~/.claude.json tool surface: roughly 420 tools instead of 126, \
+                         measured at 66,559 input tokens to answer \"pong\". Set mcps, skills, \
+                         hooks, agents and rules to false in {}.",
+                        bad.join(", "),
+                        cfg_path.display()
+                    ));
+                }
+            }
+            Err(_) => out.push(format!(
+                "  grok compat.claude: UNKNOWN (no {}). If grok inherits ~/.claude.json, every \
+                 consult pays the full tool-surface tax.",
+                cfg_path.display()
+            )),
+        }
+    }
+
     if let Some(home) = dirs::home_dir() {
         let root = home.join(".grok").join("sessions");
         if root.is_dir() {
@@ -341,4 +413,78 @@ pub(crate) fn build_status_report(
             "daemon_bind_addr": daemon_bind_addr
         }
     })
+}
+
+#[cfg(test)]
+mod grok_compat_tests {
+    use super::*;
+
+    /// FIND-GROK-05: doctor must catch inheritance being ON before the first slow consult.
+    ///
+    /// With inheritance on, a grok consult advertises roughly 420 tools instead of 126 and was
+    /// measured at 66,559 input tokens to answer "pong". Nothing detected drift: a grok upgrade
+    /// that ignores the section, or a user deleting five lines, silently reinstates the tax.
+    ///
+    /// RED IF: a `true` key stops being reported.
+    #[test]
+    fn doctor_flags_an_open_compat_key() {
+        let cfg = r#"
+[compat.claude]
+mcps = true
+skills = false
+hooks = false
+agents = false
+rules = false
+"#;
+        let bad = grok_compat_drift(cfg);
+        assert_eq!(bad, vec!["mcps=true"], "an open key must be named, not just counted");
+    }
+
+    /// A MISSING key is drift too: the default is inherit-on, so silence is not safety.
+    /// RED IF: absent keys stop being reported, which is how a partial config passes.
+    #[test]
+    fn doctor_flags_a_missing_compat_key() {
+        let cfg = "[compat.claude]\nmcps = false\n";
+        let bad = grok_compat_drift(cfg);
+        assert!(bad.contains(&"skills missing".to_string()), "got: {bad:?}");
+        assert_eq!(bad.len(), 4, "four of five keys are absent; got: {bad:?}");
+    }
+
+    /// The correct config reports clean.
+    /// RED IF: a correct config starts warning, which trains people to ignore the warning.
+    #[test]
+    fn doctor_is_quiet_when_all_five_keys_are_closed() {
+        let cfg = r#"
+[compat.claude]
+mcps = false
+skills = false
+hooks = false
+agents = false
+rules = false
+"#;
+        assert!(grok_compat_drift(cfg).is_empty());
+    }
+
+    /// Keys in OTHER sections must not satisfy the check.
+    /// RED IF: the section scoping is dropped, so an unrelated `mcps = false` elsewhere counts.
+    #[test]
+    fn keys_outside_the_compat_section_do_not_count() {
+        let cfg = r#"
+[some.other]
+mcps = false
+skills = false
+hooks = false
+agents = false
+rules = false
+
+[compat.claude]
+mcps = true
+"#;
+        let bad = grok_compat_drift(cfg);
+        assert!(bad.contains(&"mcps=true".to_string()));
+        assert!(
+            bad.contains(&"skills missing".to_string()),
+            "a key in another section must not satisfy compat.claude; got: {bad:?}"
+        );
+    }
 }
