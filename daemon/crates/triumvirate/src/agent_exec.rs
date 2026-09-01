@@ -1587,6 +1587,17 @@ const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
     "gemini-stream-json",
     "grok-streaming-json",
     "agy-stream-json",
+    // Added 2026-09-01. codex-exec-json used to stamp EVERY call ToolKind::Bash, so on that
+    // backend "opened the file" and "ran a command mentioning the file" were the same record
+    // and named sources were refused rather than faked. `codex.rs` now classifies a
+    // `command_execution` as a READ when its command is a pure content reader (cat, head, sed
+    // -n, rg, grep, ...) and leaves everything else as Bash. The allowlist is conservative and
+    // fails closed: `ls`, `find`, `stat`, compound commands, pipes and redirections are all
+    // still Bash and still cannot satisfy a source.
+    //
+    // This closes Grok's "Codex can be sighted and cannot be source-gated", which mattered
+    // because codex is the peer most likely to be reviewing code.
+    "codex-exec-json",
 ];
 
 /// Did any COMPLETED, SUCCESSFUL READ of this source happen?
@@ -1632,14 +1643,52 @@ fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
         candidates.push(format!("./{rel}"));
     }
 
-    let quoted: Vec<String> = candidates.iter().map(|c| format!("\"{c}\"")).collect();
     tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
             && c.args_json
                 .as_deref()
-                .is_some_and(|args| quoted.iter().any(|q| args.contains(q.as_str())))
+                .is_some_and(|args| candidates.iter().any(|cand| args_name_path(args, cand)))
     })
+}
+
+/// Does `args` mention `path` as a WHOLE path, at token boundaries?
+///
+/// Not a bare substring, and not quote-delimiting either.
+///
+/// Quote-delimiting (`"{path}"`) was the previous rule. It worked for parsers that record the
+/// path as its own JSON value, like agy's `{"AbsolutePath":"/repo/a.rs"}`, and FAILED for codex,
+/// which records `{"command":"cat /repo/a.rs"}` where the path is a token inside a value. Once
+/// codex learned to classify content readers, that gap would have made the classification
+/// useless.
+///
+/// Boundary matching handles both and still closes the collisions review found:
+///   `{"path":"/repo/a.rs.bak"}`               vs `/repo/a.rs`   rejected, followed by `.`
+///   `{"path":"crates/other/src/lib.rs"}`      vs `src/lib.rs`   rejected, preceded by `/`
+///   `{"command":"cat /repo/a.rs"}`            vs `/repo/a.rs`   accepted, space then quote
+fn args_name_path(args: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    // A path character cannot sit immediately either side of a whole-path match.
+    fn is_boundary(c: char) -> bool {
+        matches!(c, '"' | '\'' | ' ' | '=' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | ':')
+    }
+    let bytes = args.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = args[from..].find(path) {
+        let start = from + rel;
+        let end = start + path.len();
+        let before_ok = start == 0
+            || is_boundary(args[..start].chars().next_back().unwrap_or(' '));
+        let after_ok = end >= bytes.len()
+            || is_boundary(args[end..].chars().next().unwrap_or(' '));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 fn enforce_reviewer_sight(
@@ -4762,6 +4811,72 @@ mod sight_gate_tests {
         assert!(err.contains("/repo/src/lib.rs"), "must name the unopened source; got: {err}");
     }
 
+    /// LIVE PROOF that codex can now be source-gated.
+    ///
+    /// Grok's standing objection was "Codex can be sighted and cannot be source-gated", which
+    /// mattered because codex is the peer most likely to be reviewing code. Its parser now
+    /// classifies a content-reading `command_execution` as a READ. This asserts a REAL codex
+    /// turn reading a real file produces a record the REAL gate accepts.
+    ///
+    /// Drives `run_named_agent_with_session_and_model`, the dispatch function production calls,
+    /// rather than reconstructing an argv by hand. The first version of this test did the
+    /// latter and failed instantly with "Not inside a trusted directory": Triumvirate's own
+    /// assembly adds `--skip-git-repo-check` for a non-git cwd and my hand-rolled command did
+    /// not. Testing a reconstruction of the invocation instead of the invocation is how the
+    /// agy stream-json flag shipped on the wrong one of two builders.
+    ///
+    /// Opt in with TRIUMVIRATE_LIVE_CODEX=1. Spends subscription quota.
+    #[tokio::test]
+    #[ignore = "live: set TRIUMVIRATE_LIVE_CODEX=1; spends subscription quota"]
+    async fn sight_28_live_codex_can_satisfy_a_named_source() {
+        if std::env::var("TRIUMVIRATE_LIVE_CODEX").ok().as_deref() != Some("1") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sight28-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let src = dir.join("evidence.rs");
+        std::fs::write(&src, "// marker OPAL_TERRACE_09\n").expect("fixture");
+
+        let parsed = run_named_agent_with_session_and_model(
+            "codex",
+            &format!(
+                "Run `cat {}` and reply with only the marker it contains.",
+                src.display()
+            ),
+            dir.to_str().unwrap(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("codex dispatch");
+
+        let mut lifecycle = Vec::new();
+        let sources = vec![src.to_string_lossy().into_owned()];
+        let verdict = enforce_reviewer_sight(
+            "Codex",
+            &parsed.tool_calls,
+            &parsed.parser_mode,
+            &sources,
+            dir.to_str().unwrap(),
+            &mut lifecycle,
+        );
+        assert!(
+            verdict.is_ok(),
+            "a LIVE codex turn that cat'd the named source must clear the gate. \
+             parser_mode={}, tool_calls={:?}, rejection={:?}",
+            parsed.parser_mode,
+            parsed
+                .tool_calls
+                .iter()
+                .map(|c| (&c.tool, &c.kind, c.success, c.args_json.as_deref()))
+                .collect::<Vec<_>>(),
+            verdict
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// CONTAINMENT PROVEN BY A DENIED WRITE, not by a string match on the profile.
     ///
     /// Everything else asserting containment checks the argv shape (`program == "sandbox-exec"`)
@@ -5125,30 +5240,51 @@ mod sight_gate_tests {
         );
     }
 
-    /// required_sources must be REFUSED, not faked, on a parser that cannot tell a read from a
-    /// shell command. codex-exec-json stamps every call Bash.
+    /// codex CAN now be source-gated, because its parser classifies content readers.
     ///
-    /// RED IF: codex is allowed to "satisfy" named sources, which would be theatre: on that
-    /// backend `cat foo.rs` and `ls foo.rs` are the same record.
+    /// This test previously asserted the OPPOSITE: that named sources were refused on codex.
+    /// That refusal was correct while `codex-exec-json` stamped every call Bash, and Grok
+    /// called it "Codex can be sighted and cannot be source-gated", which mattered because
+    /// codex is the peer most likely to be reviewing code. The parser now distinguishes a
+    /// content reader from a path-naming command, so the refusal is gone.
+    ///
+    /// RED IF: codex leaves the read-classifying allowlist, or its parser stops classifying.
     #[test]
-    fn sight_23_named_sources_are_refused_on_a_parser_that_cannot_classify_reads() {
+    fn sight_23_codex_can_be_source_gated_now_that_it_classifies_reads() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let read = vec![ToolCallRecord {
             id: None,
-            tool: "shell".to_string(),
-            kind: ToolKind::Bash,
+            tool: "command_execution".to_string(),
+            kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
             args_json: Some(r#"{"command":"cat /repo/a.rs"}"#.to_string()),
         }];
         let sources = vec!["/repo/a.rs".to_string()];
-        let err = enforce_reviewer_sight(
-            "Codex", &tools, "codex-exec-json", &sources, "/repo", &mut lifecycle,
-        )
-        .expect_err("codex cannot distinguish a read, so named sources must be refused");
         assert!(
-            err.contains("does not distinguish a file READ"),
-            "must explain WHY it is refused so the caller can act; got: {err}"
+            enforce_reviewer_sight(
+                "Codex", &read, "codex-exec-json", &sources, "/repo", &mut lifecycle,
+            )
+            .is_ok(),
+            "`cat` of the named source must satisfy it on codex"
+        );
+
+        // And a path-naming command still must not.
+        let mut l2 = Vec::new();
+        let listing = vec![ToolCallRecord {
+            id: None,
+            tool: "command_execution".to_string(),
+            kind: ToolKind::Bash,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(r#"{"command":"/repo/a.rs"}"#.to_string()),
+        }];
+        assert!(
+            enforce_reviewer_sight(
+                "Codex", &listing, "codex-exec-json", &sources, "/repo", &mut l2,
+            )
+            .is_err(),
+            "a Bash-classified command naming the path must still not satisfy the source"
         );
     }
 

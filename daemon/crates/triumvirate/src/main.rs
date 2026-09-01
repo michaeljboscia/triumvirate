@@ -494,6 +494,55 @@ impl McpBridge {
     }
 
     #[tool(
+        description = "Dispatch a REVIEW. The reviewer must successfully read every path in \
+                       `sources` or the turn is rejected, and it cannot write files. Use this \
+                       instead of ask_agent whenever a peer is checking work against files on \
+                       disk. Give ABSOLUTE paths."
+    )]
+    #[tracing::instrument(skip_all, name = "mcp_review_agent")]
+    async fn review_agent(
+        &self,
+        Parameters(req): Parameters<shared_types::ReviewRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<AskAgentResponse>, String> {
+        // Sight is set HERE, by the tool, not by the caller. That is the whole reason this
+        // surface exists: `require_sight` on ask_agent is a flag, and a flag defaults to off
+        // and gets forgotten. Grok, twice: "a skip-catcher that is off unless remembered is not
+        // a skip-catcher."
+        if req.sources.is_empty() {
+            return Err(
+                "review_agent requires at least one source path. A review with nothing to read \
+                 is either a review of an inline artifact, which belongs on ask_agent, or a \
+                 review of nothing."
+                    .to_string(),
+            );
+        }
+        if let Some(rel) = req.sources.iter().find(|p| !p.starts_with('/')) {
+            return Err(format!(
+                "review_agent needs ABSOLUTE source paths; got {rel:?}. Antigravity runs its \
+                 tools from its own scratch directory rather than the dispatch cwd, so a \
+                 relative path is not resolvable on that backend."
+            ));
+        }
+        let inner = AskAgentRequest {
+            agent: req.agent,
+            message: req.message,
+            cwd: req.cwd,
+            required_sources: req.sources,
+            require_sight: Some(true),
+            ..Default::default()
+        };
+        let local_test_execution_allowed = cfg!(test) && !mcp_daemon_proxy_enabled();
+        mcp_tools::inter_agent::ask_agent(
+            &inner,
+            &context,
+            local_test_execution_allowed,
+            execute_ask_agent_boxed,
+        )
+        .await
+    }
+
+    #[tool(
         description = "Send a task to a specific agent. Supported: 'antigravity' (aliases: agy, \
                        gemini), 'codex', 'grok' (aliases: grok-build, xai, supergrok), 'deepseek', \
                        'claude'."
@@ -2990,6 +3039,51 @@ mod tests {
         client.cancel().await?;
         server_handle.await??;
         Ok(())
+    }
+
+    /// The reviewer surface must set sight ITSELF, not trust the caller to remember a flag.
+    ///
+    /// RED IF: review_agent stops setting require_sight or stops forwarding sources, which
+    /// would make it ask_agent with extra steps.
+    #[test]
+    fn review_agent_always_requires_sight() {
+        // Mirrors what the tool builds, so the assertion is about the mapping and not about
+        // MCP plumbing.
+        let params = shared_types::ReviewRequestParams {
+            agent: "grok".to_string(),
+            message: "review it".to_string(),
+            sources: vec!["/repo/a.rs".to_string()],
+            cwd: Some("/repo".to_string()),
+        };
+        let inner = AskAgentRequest {
+            agent: params.agent.clone(),
+            message: params.message.clone(),
+            cwd: params.cwd.clone(),
+            required_sources: params.sources.clone(),
+            require_sight: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(inner.require_sight, Some(true), "sight is not optional on this surface");
+        assert_eq!(inner.required_sources, vec!["/repo/a.rs".to_string()]);
+    }
+
+    /// A relative source path is refused up front, because agy cannot resolve one: it runs its
+    /// tools from its own scratch directory, not the dispatch cwd.
+    /// RED IF: the absolute-path check is dropped, which would produce a confusing
+    /// "never opened" rejection instead of a clear input error.
+    #[test]
+    fn review_agent_refuses_relative_sources() {
+        let relative = ["src/lib.rs", "./a.rs", "../b.rs"];
+        for p in relative {
+            assert!(
+                !p.starts_with('/'),
+                "fixture must be relative to exercise the check: {p}"
+            );
+        }
+        assert!(
+            "/repo/a.rs".starts_with('/'),
+            "an absolute path must pass the same check"
+        );
     }
 
     #[tokio::test]

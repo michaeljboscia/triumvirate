@@ -16,6 +16,7 @@
 #   bash scripts/verify-live-agents.sh          # all live guards
 #   bash scripts/verify-live-agents.sh agy      # just the agy ones
 #   bash scripts/verify-live-agents.sh grok
+#   bash scripts/verify-live-agents.sh codex
 #
 # Exit non-zero if any guard fails. Safe to wire into a scheduled job.
 
@@ -51,6 +52,14 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "agy" ]; then
         -p triumvirate --test integration_agy_sight
     run_guard "agy clears the real gate" TRIUMVIRATE_LIVE_AGY agy \
         -p triumvirate --bin triumvirate sight_25
+fi
+
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "codex" ]; then
+    # Proves: a live codex turn reading a file produces a record the sight gate accepts.
+    # This is the guard that caught codex wrapping every command in `/bin/zsh -lc '...'`,
+    # which no offline test saw because they all used the shape I assumed.
+    run_guard "codex source gating" TRIUMVIRATE_LIVE_CODEX codex \
+        -p triumvirate --bin triumvirate sight_28
 fi
 
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "grok" ]; then

@@ -129,6 +129,28 @@ pub struct AskAgentRequest {
     pub deepseek_model: Option<String>,
 }
 
+/// A REVIEW dispatch. Sight is not optional here, which is the entire point of the type.
+///
+/// `ask_agent` carries `require_sight` as a flag, and a flag defaults to off and gets forgotten.
+/// Grok, twice: "a skip-catcher that is off unless remembered is not a skip-catcher." A caller
+/// who wants a review reaches for a tool called review, and the tool decides the gate.
+///
+/// `sources` is REQUIRED and must be non-empty. A review with nothing to read is either a
+/// review of an inline artifact, which belongs on `ask_agent`, or it is a review of nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewRequestParams {
+    /// Which peer reviews. Same names and aliases as `ask_agent`.
+    pub agent: String,
+    /// What to review, and what to look for.
+    pub message: String,
+    /// Absolute paths the reviewer MUST successfully read. Non-empty.
+    ///
+    /// Absolute, because agy runs its tools from its own scratch directory rather than the
+    /// dispatch cwd, so a relative path is not resolvable there.
+    pub sources: Vec<String>,
+    pub cwd: Option<String>,
+}
+
 /// T-011: per-call thinking override. Lower-case wire form mirrors the
 /// DeepSeek API string.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

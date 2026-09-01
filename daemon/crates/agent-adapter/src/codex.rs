@@ -15,6 +15,91 @@ pub struct CodexExecParser {
     stream_seq: u64,
 }
 
+/// Strip codex's shell wrapper, if present.
+///
+/// codex does not report `cat /repo/a.rs`. It reports
+/// `/bin/zsh -lc 'cat /repo/a.rs'`, verified live on 2026-09-01: the first version of the
+/// classifier assumed the bare form, saw the program as `zsh`, and classified every read as
+/// Bash. The offline tests all passed because they used the shape I imagined rather than the
+/// shape codex emits. Only the live test caught it.
+///
+/// Returns the inner command when the outer one is a recognised shell invoked with `-c`
+/// (including `-lc`, `-lic`), and the input unchanged otherwise. A shell whose script is not
+/// a single quoted string is left alone, so anything unusual falls through to the caller's
+/// fail-closed checks.
+fn unwrap_shell_wrapper(cmd: &str) -> &str {
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+    let mut it = cmd.split_whitespace();
+    let Some(program) = it.next() else {
+        return cmd;
+    };
+    let base = program.rsplit('/').next().unwrap_or(program);
+    if !SHELLS.contains(&base) {
+        return cmd;
+    }
+    // The flag bundle must be a -c form: -c, -lc, -lic, -ic.
+    let Some(flag) = it.next() else {
+        return cmd;
+    };
+    if !(flag.starts_with('-') && flag.ends_with('c')) {
+        return cmd;
+    }
+    let rest = cmd[cmd.find(flag).map(|i| i + flag.len()).unwrap_or(cmd.len())..].trim();
+    // Only a single fully-quoted script is unwrapped; anything else stays as-is and is then
+    // rejected by the caller's compound/redirection checks.
+    for q in ['\'', '"'] {
+        if rest.starts_with(q) && rest.ends_with(q) && rest.len() >= 2 {
+            let inner = &rest[1..rest.len() - 1];
+            if !inner.contains(q) {
+                return inner;
+            }
+        }
+    }
+    cmd
+}
+
+/// Does this shell command READ file contents, as opposed to merely naming a path?
+///
+/// `codex exec` reports every action as `command_execution` with `ToolKind::Bash`, so on that
+/// backend "opened the file" and "ran a command mentioning the file" were the same record. That
+/// made `required_sources` unenforceable for codex, the peer most likely to be reviewing code,
+/// and the sight gate refused named sources there rather than fake them.
+///
+/// This narrows it honestly. A CONSERVATIVE ALLOWLIST of programs whose job is to emit file
+/// contents. Anything unlisted stays `Bash` and still cannot satisfy a source, so an unknown
+/// command fails closed.
+///
+/// Deliberately excluded, and worth stating: `ls`, `find`, `stat`, `file` and `mdfind` name
+/// paths without reading them, which is the exact hole that let a search satisfy a source on
+/// the agy backend. `grep` and `rg` ARE included: they read the file to match against it.
+///
+/// A compound or piped command is NOT classified, because the reader may not be the part that
+/// touched the named path. Any redirection disqualifies, and `sed -i` writes.
+fn command_reads_file_contents(command: &str) -> bool {
+    const READERS: &[&str] = &[
+        "cat", "head", "tail", "nl", "od", "xxd", "strings", "wc", "shasum", "grep", "rg",
+        "egrep", "fgrep", "sed", "awk", "jq", "yq", "diff", "cmp",
+    ];
+    let cmd = unwrap_shell_wrapper(command.trim());
+    if cmd.is_empty() {
+        return false;
+    }
+    if cmd.contains("&&") || cmd.contains("||") || cmd.contains(';') || cmd.contains('|') {
+        return false;
+    }
+    if cmd.contains('>') {
+        return false;
+    }
+    let Some(program) = cmd.split_whitespace().next() else {
+        return false;
+    };
+    let base = program.rsplit('/').next().unwrap_or(program);
+    if base == "sed" && cmd.contains(" -i") {
+        return false;
+    }
+    READERS.contains(&base)
+}
+
 impl CodexExecParser {
     pub fn new() -> Self {
         Self::default()
@@ -179,7 +264,13 @@ impl CodexExecParser {
                     self.tool_calls.push(ToolCallRecord {
                         id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
                         tool: "command_execution".to_string(),
-                        kind: ToolKind::Bash,
+                        // A pure content reader is classified as a READ so codex can satisfy
+                        // `required_sources`. Everything else stays Bash and cannot.
+                        kind: if command_reads_file_contents(command) {
+                            ToolKind::ReadFile
+                        } else {
+                            ToolKind::Bash
+                        },
                         success: None,
                         duration_ms: None,
                         args_json: Some(serde_json::json!({"command": command}).to_string()),
@@ -278,5 +369,108 @@ mod tests {
         );
         assert!(result.response_text.contains("8 crates"));
         assert_eq!(result.token_usage.as_ref().and_then(|t| t.output), Some(157));
+    }
+}
+
+#[cfg(test)]
+mod command_classification_tests {
+    use super::*;
+
+    /// Programs that emit file contents are reads, so codex can satisfy `required_sources`.
+    /// RED IF: the reader allowlist is emptied, which returns codex to being unable to
+    /// source-gate at all.
+    #[test]
+    fn codex_01_content_readers_are_reads() {
+        for c in [
+            "cat crates/foo/src/lib.rs",
+            "head -n 50 /repo/a.rs",
+            "sed -n '1,80p' /repo/a.rs",
+            "rg needle /repo/a.rs",
+            "grep -n fn /repo/a.rs",
+            "/usr/bin/cat /repo/a.rs",
+        ] {
+            assert!(command_reads_file_contents(c), "should be a read: {c}");
+        }
+    }
+
+    /// THE SHAPE CODEX ACTUALLY EMITS, captured live: a shell wrapper around the real command.
+    ///
+    /// The first classifier assumed a bare `cat /repo/a.rs`. codex emits
+    /// `/bin/zsh -lc 'cat /repo/a.rs'`, so the program looked like `zsh` and every read was
+    /// classified Bash. Every offline test passed because they all used the shape I imagined.
+    /// Only the live test caught it.
+    ///
+    /// RED IF: the shell unwrapper is removed, which silently returns codex to being
+    /// unable to satisfy a named source.
+    #[test]
+    fn codex_05_the_shell_wrapper_codex_actually_emits_is_unwrapped() {
+        assert!(
+            command_reads_file_contents("/bin/zsh -lc 'cat /repo/a.rs'"),
+            "this is the literal shape from a live codex turn"
+        );
+        assert!(command_reads_file_contents("bash -c \"head -n 5 /repo/a.rs\""));
+        assert!(command_reads_file_contents("/bin/sh -lic 'rg needle /repo/a.rs'"));
+        // The wrapper must not launder a non-reader.
+        assert!(!command_reads_file_contents("/bin/zsh -lc 'ls /repo'"));
+        // Nor a compound script: the reader may not be what touched the named path.
+        assert!(!command_reads_file_contents("/bin/zsh -lc 'ls /repo && cat /repo/a.rs'"));
+        // A shell without a -c form is left alone and fails closed.
+        assert!(!command_reads_file_contents("/bin/zsh script.sh"));
+    }
+
+    /// Naming a path is not reading it. This is the hole that let a search satisfy a source on
+    /// the agy backend, and it must not reopen on codex.
+    /// RED IF: ls, find, stat or mdfind are added to the reader allowlist.
+    #[test]
+    fn codex_02_naming_a_path_is_not_reading_it() {
+        for c in [
+            "ls -la /repo/a.rs",
+            "find . -name a.rs",
+            "stat /repo/a.rs",
+            "file /repo/a.rs",
+            "mdfind a.rs",
+            "test -f /repo/a.rs",
+        ] {
+            assert!(!command_reads_file_contents(c), "must NOT be a read: {c}");
+        }
+    }
+
+    /// Fail closed on anything the classifier cannot reason about.
+    /// RED IF: compound commands, pipes or redirections start being classified, where the
+    /// reader may not be the part that touched the named path, or the command writes.
+    #[test]
+    fn codex_03_compound_and_writing_commands_fail_closed() {
+        for c in [
+            "ls /repo && cat /repo/a.rs",
+            "cat /repo/a.rs | grep x",
+            "cat /repo/a.rs > /tmp/copy",
+            "sed -i '' 's/a/b/' /repo/a.rs",
+            "python3 -c 'open(\"/repo/a.rs\")'",
+            "",
+        ] {
+            assert!(!command_reads_file_contents(c), "must fail closed: {c}");
+        }
+    }
+
+    /// The parser must actually apply the classification, not just define it.
+    /// RED IF: command_execution goes back to hardcoding ToolKind::Bash.
+    #[test]
+    fn codex_04_the_parser_applies_the_classification() {
+        let mut p = CodexExecParser::new();
+        let read = r#"{"type":"item.started","item":{"type":"command_execution","id":"c1","command":"cat /repo/a.rs"}}"#;
+        let list = r#"{"type":"item.started","item":{"type":"command_execution","id":"c2","command":"ls /repo"}}"#;
+        let _ = p.parse_line(read);
+        let _ = p.parse_line(list);
+        let r = p.finish();
+        let by_id = |id: &str| {
+            r.tool_calls
+                .iter()
+                .find(|c| c.id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("missing {id}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(by_id("c1"), ToolKind::ReadFile, "`cat` reads the file");
+        assert_eq!(by_id("c2"), ToolKind::Bash, "`ls` does not");
     }
 }

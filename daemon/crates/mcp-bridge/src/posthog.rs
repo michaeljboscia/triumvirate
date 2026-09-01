@@ -1311,8 +1311,6 @@ mod tests {
         );
     }
 
-    use super::*;
-
     /// The two adapters use OPPOSITE conventions for `input`. This test exists because the
     /// original cost function assumed the OpenAI one for both and silently underbilled DeepSeek.
     #[test]

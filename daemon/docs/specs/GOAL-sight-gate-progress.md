@@ -722,3 +722,62 @@ correct, the tests were correct, and the behaviour was still wrong once real tel
 attached. Some things are only findable by running the thing and watching what reacts.
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
+
+---
+
+## Round 9, 2026-09-01. The last two gaps, closed.
+
+### Codex can be source-gated now
+
+Grok's standing objection across three rounds: "Codex can be sighted and cannot be
+source-gated", which mattered because codex is the peer most likely to be reviewing code.
+`codex-exec-json` stamped every action `ToolKind::Bash`, so on that backend reading a file and
+running a command that mentions one were the same record, and the gate refused named sources
+rather than fake them.
+
+The parser now classifies a `command_execution` as a READ when its command is a pure content
+reader. Conservative allowlist (`cat`, `head`, `tail`, `sed`, `rg`, `grep`, `jq`, `diff`, ...),
+and everything else stays Bash, so an unknown command fails closed. Deliberately excluded and
+stated in the code: `ls`, `find`, `stat`, `file`, `mdfind` name paths without reading them,
+which is the exact hole that let a search satisfy a source on agy. Compound commands, pipes,
+redirections and `sed -i` all fail closed.
+
+**The live test earned its keep immediately.** Codex does not emit `cat /repo/a.rs`. It emits
+`/bin/zsh -lc 'cat /repo/a.rs'`, so the classifier saw the program as `zsh` and classified
+every read as Bash. Every offline test passed, because every offline fixture used the shape I
+imagined rather than the shape codex emits. Added `unwrap_shell_wrapper`, and `codex_05` now
+pins the literal live shape.
+
+Two failures on the way there, both instructive:
+- The first live test hand-rolled a `codex exec` argv and died on "Not inside a trusted
+  directory": Triumvirate's own assembly adds `--skip-git-repo-check` for a non-git cwd.
+  Rewritten to drive `run_named_agent_with_session_and_model`, the function production calls.
+  Testing a RECONSTRUCTION of the invocation instead of the invocation is how the agy
+  stream-json flag shipped on the wrong one of two builders.
+- Matching had to change from quote-delimited JSON values to TOKEN BOUNDARIES. Quote-delimiting
+  worked for parsers that record a path as its own JSON value (agy's `{"AbsolutePath":"..."}`)
+  and failed for codex, where the path is a token inside `{"command":"cat /repo/a.rs"}`.
+  Boundary matching handles both and still rejects `<path>.bak` and an unrelated
+  `crates/other/src/lib.rs` containing `src/lib.rs`. Mutation-verified.
+
+### A distinct reviewer surface
+
+`review_agent`, a separate MCP tool. It sets `require_sight` ITSELF and requires a non-empty
+`sources` list; the caller cannot forget the flag because there is no flag. Relative paths are
+refused up front with the reason, since agy runs its tools from its own scratch directory and
+cannot resolve one.
+
+This is Grok's condition 1. `ask_agent` keeps `require_sight` as an opt-in flag for the
+inline-artifact review shape, which is legitimately toolless and must not be gated.
+
+### Grok's five conditions for default-on: final state
+
+1. A distinct reviewer surface with sight always on: **DONE** (`review_agent`).
+2. HTTP `/session/ask` forwards both fields: **DONE** (round 7).
+3. `success: None` does not satisfy a source: **DONE** (round 7).
+4. Codex classifies reads or is documented as counting-only: **DONE**, it classifies.
+5. Containment proven by a denied write outside the allow-paths: **DONE** (round 7, `sight_27`,
+   mutation-verified in both directions).
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning. Live guards pass for
+all three peers: `bash scripts/verify-live-agents.sh`.
