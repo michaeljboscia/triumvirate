@@ -2573,6 +2573,35 @@ fn is_grok_containment_failure(line: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Does this stderr genuinely say authentication failed?
+///
+/// Deliberately NOT the bare word "auth". That matched oauth, author, authentication and any
+/// passing mention, and because the check also scanned the model's whole transcript it fired on a
+/// healthy token with six hours left, telling the operator to re-run `grok login` when login was
+/// never the problem. A misleading diagnosis costs more than no diagnosis.
+fn looks_like_grok_auth_failure(stderr_lower: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        "401",
+        "403",
+        "unauthorized",
+        "authentication failed",
+        "auth failed",
+        "not authenticated",
+        "invalid api key",
+        "invalid_api_key",
+        "expired token",
+        "token expired",
+        "please log in",
+        "please login",
+        "no credentials",
+        "missing credentials",
+    ];
+    // NOT included, deliberately: "grok login --oauth" and "run `grok login`". Those are
+    // INSTRUCTIONS, and this repo prints them in its own docs, README and error strings. Matching
+    // an instruction is how the first version fired on prose. Only error-shaped phrasing counts.
+    SIGNALS.iter().any(|s| stderr_lower.contains(s))
+}
+
 async fn run_grok_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -2633,6 +2662,9 @@ async fn run_grok_cli_process_with_session(
     // `is_grok_containment_failure` for the verified string set.
     let stderr_task = tokio::spawn(async move {
         let mut sandbox_warning: Option<String> = None;
+        // Kept so auth can be classified from STDERR, where a real auth failure is reported,
+        // rather than from the model's transcript, where the word "auth" means nothing.
+        let mut stderr_tail: Vec<String> = Vec::new();
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             let trimmed = line.trim();
@@ -2643,8 +2675,11 @@ async fn run_grok_cli_process_with_session(
                 sandbox_warning.get_or_insert_with(|| trimmed.to_string());
             }
             tracing::debug!("grok stderr: {trimmed}");
+            if stderr_tail.len() < 40 {
+                stderr_tail.push(trimmed.to_string());
+            }
         }
-        sandbox_warning
+        (sandbox_warning, stderr_tail)
     });
 
     let verbosity = mcp_bridge::agent_verbosity();
@@ -2685,7 +2720,7 @@ async fn run_grok_cli_process_with_session(
     // AWAIT the drain first. The original read a shared Mutex right after `child.wait()`, but
     // the child exiting does not mean the reader task has consumed the last stderr line, so the
     // warning could be missed and an uncontained run reported as clean. Codex caught this.
-    let sandbox_warning = stderr_task.await.unwrap_or(None);
+    let (sandbox_warning, stderr_tail) = stderr_task.await.unwrap_or((None, Vec::new()));
     if let Some(warning) = sandbox_warning {
         anyhow::bail!(
             "grok ran WITHOUT the requested sandbox: {warning}. Refusing the result rather than \
@@ -2705,22 +2740,46 @@ async fn run_grok_cli_process_with_session(
         parsed = GrokStreamParser::parse_batch_json(&v);
     }
 
-    // REQ-GROK-016: classify auth distinctly. An operator sent to the wrong fix wastes a cycle.
+    // REQ-GROK-016: classify auth distinctly. An operator sent to the wrong fix wastes a cycle,
+    // and a WRONG auth message is worse than none: it tells them to re-authenticate when the token
+    // is fine, so they burn a login and the real cause stays hidden.
+    //
+    // The first version scanned `raw_output`, the entire NDJSON transcript, for the bare substring
+    // "auth". That matches oauth, author, authored, authentication, and any file or thought that
+    // merely mentions the word. This repo is full of `auth.json` and `grok login --oauth`, so a
+    // grok run that READ this repo tripped it on any nonzero exit. It fired in production against
+    // a token with six hours left on it.
+    //
+    // Now: stderr only, where a real auth failure is actually reported, and specific phrases
+    // rather than a word that appears in ordinary prose.
     if !status.success() {
         let detail = full.error_detail.clone().unwrap_or_default();
-        let haystack = format!("{detail} {raw_output}").to_lowercase();
-        if haystack.contains("unauthorized")
-            || haystack.contains("401")
-            || haystack.contains("auth")
-            || haystack.contains("login")
-        {
+        let haystack = format!("{detail} {}", stderr_tail.join(" ")).to_lowercase();
+        if looks_like_grok_auth_failure(&haystack) {
             anyhow::bail!(
                 "grok auth failed: run `grok login --oauth` for a SuperGrok subscription, or set \
                  XAI_API_KEY for metered API access"
             );
         }
         if parsed.response_text.trim().is_empty() {
-            anyhow::bail!("grok exited with status {status} and produced no text");
+            // Include the stderr. The previous message said only "exited with status X", so when
+            // the auth classifier misfired there was nothing else to go on and the wrong
+            // diagnosis was the only diagnosis. A failure that names nothing teaches nothing.
+            let tail = stderr_tail
+                .iter()
+                .rev()
+                .take(5)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if tail.is_empty() {
+                anyhow::bail!(
+                    "grok exited with status {status}, produced no text, and wrote nothing to \
+                     stderr. Re-run with TRIUMVIRATE_AGENT_VERBOSITY=raw to see the stream."
+                );
+            }
+            anyhow::bail!("grok exited with status {status} and produced no text. stderr: {tail}");
         }
     }
 
@@ -3424,6 +3483,50 @@ mod deepseek_dispatch_tests {
                     i + 1
                 );
             }
+        }
+    }
+
+
+    /// The auth classifier must not fire on prose that merely mentions authentication.
+    ///
+    /// This shipped and misfired in production: a grok turn failed for an unrelated reason, the
+    /// classifier saw the substring "auth" somewhere in the model's transcript, and told the
+    /// operator to run `grok login` against a token with six hours left. They spent the round
+    /// chasing a login that was never broken. A wrong diagnosis is worse than none.
+    #[test]
+    fn grok_auth_classifier_does_not_fire_on_incidental_mentions() {
+        use super::looks_like_grok_auth_failure as f;
+
+        // REAL auth failures, must all be caught.
+        for real in [
+            "error: 401 unauthorized",
+            "authentication failed for user",
+            "invalid api key provided",
+            "your token expired, please log in",
+            "no credentials found; run `grok login`",
+            "http 403 forbidden",
+        ] {
+            assert!(f(real), "must classify as auth: {real}");
+        }
+
+        // NOT auth failures. Every one of these contains the substring the old check used.
+        for benign in [
+            // The exact shape that misfired: this repo's own text, read by the model.
+            "reading auth.json to check the login path",
+            "grok login --oauth is documented in the readme",
+            "fn looks_like_grok_auth_failure(stderr_lower: &str) -> bool",
+            "the author of this module wrote authored tests",
+            "oauth is one of several supported flows",
+            "authentication is described in section 9",
+            "warning: sandbox could not be applied",
+            "error: connection reset by peer",
+            "thread panicked at src/main.rs:42",
+        ] {
+            assert!(
+                !f(benign),
+                "must NOT be misread as an auth failure; this is what sent an operator to \
+                 re-authenticate a working token: {benign}"
+            );
         }
     }
 
