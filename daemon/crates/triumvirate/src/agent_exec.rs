@@ -389,7 +389,7 @@ pub(crate) async fn execute_ask_agent(
              that can read: {}.",
             PARSER_MODES_WITH_TOOL_RECORDS.join(", ")
         );
-        tel.failure(&msg);
+        tel.rejected(&msg);
         return Err(msg);
     }
 
@@ -814,7 +814,10 @@ pub(crate) async fn execute_ask_agent(
                         &resolved_cwd,
                         &resolved_repo,
                     );
-                    tel.failure(err.clone());
+                    // REJECTED, not failed: the agent worked and the turn was declined by the
+                    // gate. Charting it as a generation keeps the spent tokens honest; raising
+                    // it as an exception would page on the gate working as designed.
+                    tel.rejected(err.clone());
                     // The REJECTED lifecycle event is pushed by the gate and then the function
                     // returns Err, so `lifecycle` is dropped and the caller never sees it.
                     // Antigravity caught that: without this, the ledger has no record that a
@@ -941,11 +944,16 @@ pub(crate) async fn execute_ask_agent(
                     )
                     .await
                 {
-                    span.record("agent.outcome", "failure");
+                    span.record("agent.outcome", "rejected_peer_review");
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
-                    // Overwrites the provisional success() above. The call produced a response
-                    // but is being rejected, so it is a failure — and must not be counted twice.
-                    tel.failure(err.clone());
+                    // Overwrites the provisional success() above, and must not be counted twice.
+                    //
+                    // Reclassified from failure() to rejected() on 2026-09-01, alongside the
+                    // sight gate. Mandatory peer review declining a turn is the same category:
+                    // the agent worked and a policy gate said no. Still charted as a generation
+                    // so the spent tokens stay visible; no longer raised as an exception,
+                    // because paging on a working gate is how the gate gets switched off.
+                    tel.rejected(err.clone());
                     return Err(err);
                 }
                 // Slice 6: shadow-compare — run the other Gemini backend, attach + log.
@@ -1243,7 +1251,10 @@ pub(crate) async fn execute_ask_agent(
                         persist_daemon_token_record(
                             hop.agent, &request_id, &parsed, &resolved_cwd, &resolved_repo,
                         );
-                        tel.failure(err.clone());
+                        // REJECTED, not failed: the agent worked and the turn was declined by the
+                    // gate. Charting it as a generation keeps the spent tokens honest; raising
+                    // it as an exception would page on the gate working as designed.
+                    tel.rejected(err.clone());
                         // Same REJECTED record as the primary arm. Fixing one surface and not
                         // the other is the recurring defect here.
                         if let Err(e) = append_outbox_event(&OutboxEvent {

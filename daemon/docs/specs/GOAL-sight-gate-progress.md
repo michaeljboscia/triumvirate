@@ -680,3 +680,45 @@ parser to classify tool kinds instead of stamping everything Bash. Not attempted
 5. Containment proven by a denied write outside the allow-paths: DONE this round.
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning. Live guards pass.
+
+---
+
+## Round 8, 2026-09-01. Production told us something no reviewer had.
+
+The owner got a Slack page from PostHog error tracking:
+
+> **grok: AgentCallFailed** ... "Grok was dispatched as a review over 1 named source(s) and
+> never successfully opened 1 of them: /tmp/gatecheck/evidence.rs."
+
+That was MY deliberate test rejection from two minutes earlier, arriving as an alert.
+
+**A sight-gate rejection is not an agent failure.** Grok worked perfectly; the turn was declined
+for policy. Classifying it as `AgentCallFailed` means every legitimate rejection pages someone,
+and the gate is designed to reject routinely. Paging on a working safety check is how the check
+gets switched off.
+
+Three peers had reviewed this code across four rounds and none caught it, because it is not
+visible in the source. It only appears when the thing runs and something downstream reacts.
+
+### Fix
+
+`CallTelemetry::rejected()`, a new outcome `policy_rejected`. Still recorded as a generation, so
+the tokens genuinely spent stay visible and cost is not misreported. NOT recorded as an
+exception, because `Drop` raises `AgentCallFailed` only when the outcome is exactly `failure`.
+
+Applied at all four policy-refusal sites: the primary sight gate, the degraded-hop sight gate,
+the pre-dispatch capability refusal (agent has no tools), and mandatory peer review.
+
+**The peer-review site was pre-existing code, not mine.** It was reclassified deliberately
+rather than left inconsistent: a mandatory-review refusal is the same category, an agent that
+worked and a policy gate that said no. Recorded here rather than allowed to slip in silently.
+
+Two tests, mutation-verified: reverting `rejected()` to set "failure" reds
+`a_policy_rejection_is_not_an_exception`, and `a_real_failure_still_raises_an_exception` guards
+against the reclassification quieting genuine failures too.
+
+**The lesson worth keeping:** static review cannot see this class of defect at all. The gate was
+correct, the tests were correct, and the behaviour was still wrong once real telemetry was
+attached. Some things are only findable by running the thing and watching what reacts.
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning.

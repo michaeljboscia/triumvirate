@@ -226,6 +226,23 @@ impl CallTelemetry {
         self.outcome = "failure";
         self.detail = Some(detail.into());
     }
+
+    /// The call was REFUSED BY POLICY, not broken.
+    ///
+    /// A sight-gate rejection means the agent worked correctly and the turn was declined: it
+    /// answered a review without reading the sources, or wrote files, or ran on a parser that
+    /// cannot produce a receipt. That is the gate doing its job, and it is expected to happen
+    /// routinely.
+    ///
+    /// It is still recorded as a generation, because the tokens were genuinely spent and
+    /// hiding them would misreport cost. It is NOT recorded as an exception, because paging on
+    /// a working safety check trains people to switch it off. On 2026-09-01 a deliberate test
+    /// rejection reached Slack as `AgentCallFailed` within two minutes, which is how this was
+    /// found.
+    pub fn rejected(&mut self, detail: impl Into<String>) {
+        self.outcome = "policy_rejected";
+        self.detail = Some(detail.into());
+    }
 }
 
 impl Drop for CallTelemetry {
@@ -273,8 +290,12 @@ impl Drop for CallTelemetry {
             output: self.output.as_deref(),
         });
 
-        // A failure is also an issue in error tracking. Only on a real failure, a
-        // degraded_success still produced an answer.
+        // A failure is also an issue in error tracking. ONLY on a real failure:
+        //   degraded_success   still produced an answer
+        //   policy_rejected    the agent worked and the turn was declined by a safety gate
+        //
+        // Both are charted as generations above; neither is an exception. Paging on a working
+        // gate is how the gate gets turned off.
         if self.outcome == "failure" {
             let detail = self.detail.as_deref().unwrap_or("unknown error");
             record_exception(&self.agent, "AgentCallFailed", detail, &self.trace_id);
@@ -1249,6 +1270,47 @@ fn mask_and_cap_content(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A policy rejection must be CHARTED but must NOT page.
+    ///
+    /// On 2026-09-01 a deliberate sight-gate test rejection reached Slack as `AgentCallFailed`
+    /// within two minutes of the gate going live. The agent had worked correctly; the turn was
+    /// declined for not reading its named sources, which is the gate doing exactly its job.
+    /// Paging on a working safety check is how the check gets switched off.
+    ///
+    /// RED IF: `rejected()` starts setting the outcome to "failure", which is the single
+    /// condition that raises an exception in `Drop`.
+    #[test]
+    fn a_policy_rejection_is_not_an_exception() {
+        let mut t = CallTelemetry::new("grok", "trace-1", None);
+        t.rejected("never opened the named source");
+        assert_eq!(
+            t.effective_outcome(),
+            "policy_rejected",
+            "a declined turn is its own outcome, not a failure and not a success"
+        );
+        assert_ne!(
+            t.outcome, "failure",
+            "only `failure` raises AgentCallFailed in Drop; a working gate must not page"
+        );
+        // The detail is still carried, so the rejection is inspectable in the generation.
+        assert!(t.detail.is_some(), "the reason must survive for charting");
+    }
+
+    /// The reclassification must not have made real failures silent.
+    /// RED IF: `failure()` stops setting "failure", which would stop ALL error tracking.
+    #[test]
+    fn a_real_failure_still_raises_an_exception() {
+        let mut t = CallTelemetry::new("grok", "trace-2", None);
+        t.failure("connector timed out");
+        assert_eq!(
+            t.outcome, "failure",
+            "a broken call must still reach error tracking; this is the guard against \
+             quieting genuine failures while quieting policy rejections"
+        );
+    }
+
     use super::*;
 
     /// The two adapters use OPPOSITE conventions for `input`. This test exists because the
