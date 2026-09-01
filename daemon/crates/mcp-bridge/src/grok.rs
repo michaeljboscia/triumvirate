@@ -49,14 +49,26 @@ pub fn grok_streaming_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Runaway guard. Each turn re-ships the whole system prompt and tool schemas, so turns are the
-/// unit of spend here, not tokens.
+/// Runaway guard, and the main latency control.
+///
+/// Turns are the unit of both spend and WALL TIME here: each one is a fresh 5 to 12 second model
+/// round trip that re-ships the whole system prompt and every tool schema. The old default of 20
+/// permitted a twenty-round-trip explore, which is exactly where "grok takes 3 to 5 minutes" came
+/// from. Grok's own recommendation was 1 for a consult and 4 for a file-reading review.
+///
+/// 6 is the compromise: enough to read a few files and answer, far short of an open-ended crawl.
+/// Raise it deliberately with TRIUMVIRATE_GROK_MAX_TURNS for genuine review work.
 pub fn grok_max_turns() -> u32 {
     std::env::var("TRIUMVIRATE_GROK_MAX_TURNS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(20)
+        .unwrap_or(match grok_depth() {
+            GrokDepth::Fast => 6,
+            // Enough rope to actually explore a subsystem. The 900s client timeout is what stops
+            // a runaway now, not the turn cap.
+            GrokDepth::Deep => 30,
+        })
 }
 
 /// REQ-GROK-019: write containment for the consult path, the equivalent of agy's H4 rule.
@@ -79,8 +91,59 @@ pub fn grok_model() -> Option<String> {
     std::env::var("TRIUMVIRATE_GROK_MODEL").ok().filter(|s| !s.trim().is_empty())
 }
 
+
+/// How hard a peer is asked to work. REQ-GROK-020.
+///
+/// Two coherent profiles rather than a scatter of independent knobs, because the settings only
+/// make sense together: capping turns while leaving effort on `high` still pays the reasoning tax,
+/// and raising effort while forbidding subagents still cannot explore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokDepth {
+    /// A question to answer. Low effort, few turns, no self-directed exploration.
+    ///
+    /// This is the default because a peer consult is usually "what do you think of X", and the
+    /// old behaviour (effort `high` by omission, 20 turns, subagents and web search enabled) is
+    /// what made a simple question take minutes.
+    Fast,
+    /// Let it off the leash. High effort, many turns, subagents and web search enabled.
+    ///
+    /// For "go read this subsystem and tell me what is wrong with it", where the exploring IS the
+    /// value and the wall time is the price of it. Deliberately opt-in.
+    Deep,
+}
+
+/// `TRIUMVIRATE_GROK_DEPTH=deep` (aliases: riff, wild, max) unleashes it. Anything else is Fast.
+pub fn grok_depth() -> GrokDepth {
+    match std::env::var("TRIUMVIRATE_GROK_DEPTH")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .as_deref()
+    {
+        Some("deep") | Some("riff") | Some("wild") | Some("max") => GrokDepth::Deep,
+        _ => GrokDepth::Fast,
+    }
+}
+
+/// Reasoning effort. Defaults to `low`, NOT to grok's own default.
+///
+/// Grok, asked about its own latency, identified this as the single biggest lever: when `--effort`
+/// is omitted, grok-4.6 uses **high**, and that reasoning time is the entire 5 to 12 second gap
+/// between tools being ready (~0.6s) and the first token. Local startup was never the cost.
+///
+/// `low` is the right default for a peer consult, which is a question to answer rather than a
+/// problem to grind on. Set TRIUMVIRATE_GROK_EFFORT=medium or high deliberately when a task
+/// actually warrants it. Valid values for grok-4.6: low, medium, high, xhigh.
 pub fn grok_effort() -> Option<String> {
-    std::env::var("TRIUMVIRATE_GROK_EFFORT").ok().filter(|s| !s.trim().is_empty())
+    match std::env::var("TRIUMVIRATE_GROK_EFFORT").ok().map(|v| v.trim().to_string()) {
+        Some(v) if v.eq_ignore_ascii_case("default") => None,
+        Some(v) if !v.is_empty() => Some(v),
+        // An explicit TRIUMVIRATE_GROK_EFFORT always wins; otherwise the depth profile decides.
+        _ => Some(match grok_depth() {
+            GrokDepth::Fast => "low",
+            GrokDepth::Deep => "high",
+        }
+        .to_string()),
+    }
 }
 
 /// Flags Triumvirate owns. REQ-GROK-008, mirroring agy's H3 rule.
@@ -320,6 +383,19 @@ pub fn build_grok_invocation_with_sandbox(
     args.push("--max-turns".to_string());
     args.push(grok_max_turns().to_string());
 
+    // Turn-burners, named by Grok when asked why reviews take minutes: it spawns subagents, writes
+    // todo lists and searches the web, and each of those is another 5 to 12 second round trip that
+    // produces no answer.
+    //
+    // In Deep mode they are exactly what you want: the exploring IS the value. So the profile
+    // decides, and the two settings stay coherent instead of half-throttling it.
+    if grok_depth() == GrokDepth::Fast {
+        args.push("--no-subagents".to_string());
+        args.push("--disable-web-search".to_string());
+        args.push("--disallowed-tools".to_string());
+        args.push("Agent,task,todo_write".to_string());
+    }
+
     // Containment before approval, so the ordering reads as the policy it is: contain first,
     // then decide what may be approved inside that containment.
     // An override is a DEFAULT for this call site, not a policy that outranks the operator.
@@ -394,6 +470,7 @@ mod tests {
             "TRIUMVIRATE_GROK_MODEL",
             "TRIUMVIRATE_GROK_EFFORT",
             "TRIUMVIRATE_GROK_CONNECTOR_TIMEOUT_SECS",
+            "TRIUMVIRATE_GROK_DEPTH",
         ] {
             // SAFETY: test controls env var lifecycle in-process, guarded by env_lock.
             unsafe { std::env::remove_var(k) };
@@ -547,8 +624,12 @@ mod tests {
         clear_env();
         let inv = build(None, false).unwrap();
         assert!(!inv.args.contains(&"-m".to_string()), "must not invent a model");
-        assert!(!inv.args.contains(&"--effort".to_string()));
-        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("20"), "documented default");
+        // Effort IS defaulted, deliberately. Omitting it means grok-4.6 uses `high`, and Grok
+        // identified that reasoning time as the entire 5-12s gap before the first token.
+        assert_eq!(value_after(&inv.args, "--effort").as_deref(), Some("low"),
+            "omitting --effort silently selects grok's `high` default");
+        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("6"),
+            "20 permitted a twenty-round-trip explore, which is where the minutes came from");
 
         // SAFETY: guarded by env_lock.
         unsafe {
@@ -770,6 +851,52 @@ mod tests {
                 "cwd must reach grok exactly as given; normalizing here would hide the mismatch"
             );
         }
+    }
+
+    /// Fast and Deep must be COHERENT profiles, not a scatter of knobs. Capping turns while
+    /// leaving effort high still pays the reasoning tax; raising effort while forbidding subagents
+    /// still cannot explore. Each setting is asserted against its profile so they cannot drift
+    /// into a half-throttled state that is slow AND shallow.
+    #[test]
+    fn u_b_25_depth_profiles_are_coherent() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+
+        // FAST: a question to answer.
+        let inv = build(None, false).unwrap();
+        assert_eq!(value_after(&inv.args, "--effort").as_deref(), Some("low"));
+        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("6"));
+        assert!(inv.args.contains(&"--no-subagents".to_string()));
+        assert!(inv.args.contains(&"--disable-web-search".to_string()));
+
+        // DEEP: let it off the leash.
+        // SAFETY: guarded by env_lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep") };
+        let inv = build(None, false).unwrap();
+        assert_eq!(value_after(&inv.args, "--effort").as_deref(), Some("high"),
+            "deep mode must not still be throttled to low effort");
+        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("30"));
+        assert!(!inv.args.contains(&"--no-subagents".to_string()),
+            "deep mode must be allowed to spawn subagents; exploring is the point");
+        assert!(!inv.args.contains(&"--disable-web-search".to_string()));
+        assert!(!inv.args.contains(&"--disallowed-tools".to_string()));
+
+        // Aliases, because nobody remembers the exact word.
+        for alias in ["riff", "wild", "max", "DEEP"] {
+            // SAFETY: guarded by env_lock.
+            unsafe { std::env::set_var("TRIUMVIRATE_GROK_DEPTH", alias) };
+            assert_eq!(grok_depth(), GrokDepth::Deep, "alias {alias}");
+        }
+
+        // An explicit effort ALWAYS wins over the profile, in either direction.
+        // SAFETY: guarded by env_lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep");
+            std::env::set_var("TRIUMVIRATE_GROK_EFFORT", "low");
+        }
+        assert_eq!(value_after(&build(None, false).unwrap().args, "--effort").as_deref(), Some("low"),
+            "an explicit operator setting outranks the profile");
+        clear_env();
     }
 
 }

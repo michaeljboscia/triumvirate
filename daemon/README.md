@@ -88,7 +88,14 @@ cargo run -p triumvirate -- doctor
   low turns a slow success into a reported failure while still paying for the work, which is what
   180 was doing to peer reviews that read files before answering.
 - `TRIUMVIRATE_GROK_BIN`, `TRIUMVIRATE_GROK_ARGS` (binary is `grok`; there is no `supergrok` executable)
-- `TRIUMVIRATE_GROK_MODEL`, `TRIUMVIRATE_GROK_EFFORT`
+- `TRIUMVIRATE_GROK_DEPTH` (default `fast`; `deep`/`riff`/`wild`/`max` to unleash it). Fast is
+  `--effort low --max-turns 6` with subagents, web search and todo-writing disabled: a question to
+  answer. Deep is `--effort high --max-turns 30` with all of that re-enabled: an expedition.
+  Measured on one identical repo-reading question, fast took 27s and produced 1,107 output tokens;
+  deep took 173s and produced 9,921. Grok can still READ the repo in fast mode; `read_file`, `grep`
+  and `list_dir` are always available.
+- `TRIUMVIRATE_GROK_MODEL`, `TRIUMVIRATE_GROK_EFFORT` (an explicit effort always outranks the depth
+  profile)
 - `TRIUMVIRATE_GROK_MAX_TURNS` (default `20`; every turn re-ships the whole system prompt, so turns are the unit of spend)
 - `TRIUMVIRATE_GROK_CONNECTOR_TIMEOUT_SECS` (default `900`)
 - `TRIUMVIRATE_GROK_STREAMING` (default on; `0` falls back to batch `json`)
