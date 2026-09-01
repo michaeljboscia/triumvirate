@@ -63,6 +63,49 @@ pub struct AskAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_cli_session_id: Option<String>,
 
+    /// This call is a REVIEW, so an answer produced without looking at anything is not an
+    /// answer. When true, a turn that completes with zero tool calls is rejected instead of
+    /// returned.
+    ///
+    /// 2026-09-01: three peers were dispatched with filesystem access to review one brief.
+    /// Codex made 35 tool calls and cited file and line. Grok opened four primary sources and
+    /// found the only error that had actually reached a client. The third, holding the widest
+    /// permissions of the three, made ZERO calls, then graded nine research citations from
+    /// memory and opened with "the claims below were subjected to rigorous sourcing". It was
+    /// caught by a human noticing the output had no links in it.
+    ///
+    /// This is ISO/IEC 27042's validation step pointed at the reviewer rather than the
+    /// evidence: before accepting a finding, establish that the method could have seen the
+    /// thing. A peer that opened nothing cannot have verified anything, whatever its prose says.
+    ///
+    /// Deliberately a hard failure and not a warning. The same session established that a
+    /// generated objection which does not stop the caller gets quoted approvingly and the
+    /// wrong conclusion ships anyway.
+    ///
+    /// `None`/`false` leaves every existing one-shot caller unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_sight: Option<bool>,
+
+    /// The primary sources this review must actually open, by path.
+    ///
+    /// `require_sight` alone only proves the agent made SOME tool call, which passes on one
+    /// `todo_write`, one `list_dir .`, or one `pwd`. That is citation, not method: it demands a
+    /// look be cited once a look has happened, without forcing the look at the thing in
+    /// question. Naming the sources here turns the gate from "did it do anything" into "did it
+    /// request the evidence", which is the validation step the forensic standard actually asks
+    /// for.
+    ///
+    /// Matched against the recorded arguments of SUCCESSFUL read-shaped tool calls. A failed
+    /// read saw nothing and does not count.
+    ///
+    /// This proves the method requested the named thing. It does NOT prove the contents were
+    /// used: an agent can open every source and still answer from memory. That layer is not
+    /// built, and this field should not be described as if it were.
+    ///
+    /// Empty or absent falls back to the weaker any-tool-call check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_sources: Vec<String>,
+
     // T-011 (REQ-DS-027): per-call overrides for the DeepSeek sibling. ALL
     // four fields are Optional and skip-serialize-on-None so the wire shape
     // is unchanged for Gemini/Codex callers. The runner (T-012) reads them
@@ -148,6 +191,13 @@ pub struct AskAgentResponse {
     pub shadow_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_latency_ms: Option<u64>,
+    /// How many tool calls the agent made producing this answer. The receipt.
+    ///
+    /// Always populated, not just when `require_sight` is set, because the count is the
+    /// cheapest way for a caller to tell a review apart from a recollection. Zero on a
+    /// question that needed no tools is perfectly normal; zero on a review is the finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_made: Option<u32>,
 }
 
 impl AskAgentResponse {
@@ -172,6 +222,7 @@ impl AskAgentResponse {
             shadow_response: None,
             shadow_error: None,
             shadow_latency_ms: None,
+            tool_calls_made: None,
         }
     }
 

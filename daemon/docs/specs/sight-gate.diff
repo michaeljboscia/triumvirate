@@ -1,0 +1,1025 @@
+diff --git a/daemon/crates/shared-types/src/lib.rs b/daemon/crates/shared-types/src/lib.rs
+index d86dc57..29c6b74 100644
+--- a/daemon/crates/shared-types/src/lib.rs
++++ b/daemon/crates/shared-types/src/lib.rs
+@@ -63,6 +63,49 @@ pub struct AskAgentRequest {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub prior_cli_session_id: Option<String>,
+ 
++    /// This call is a REVIEW, so an answer produced without looking at anything is not an
++    /// answer. When true, a turn that completes with zero tool calls is rejected instead of
++    /// returned.
++    ///
++    /// 2026-09-01: three peers were dispatched with filesystem access to review one brief.
++    /// Codex made 35 tool calls and cited file and line. Grok opened four primary sources and
++    /// found the only error that had actually reached a client. The third, holding the widest
++    /// permissions of the three, made ZERO calls, then graded nine research citations from
++    /// memory and opened with "the claims below were subjected to rigorous sourcing". It was
++    /// caught by a human noticing the output had no links in it.
++    ///
++    /// This is ISO/IEC 27042's validation step pointed at the reviewer rather than the
++    /// evidence: before accepting a finding, establish that the method could have seen the
++    /// thing. A peer that opened nothing cannot have verified anything, whatever its prose says.
++    ///
++    /// Deliberately a hard failure and not a warning. The same session established that a
++    /// generated objection which does not stop the caller gets quoted approvingly and the
++    /// wrong conclusion ships anyway.
++    ///
++    /// `None`/`false` leaves every existing one-shot caller unchanged.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub require_sight: Option<bool>,
++
++    /// The primary sources this review must actually open, by path.
++    ///
++    /// `require_sight` alone only proves the agent made SOME tool call, which passes on one
++    /// `todo_write`, one `list_dir .`, or one `pwd`. That is citation, not method: it demands a
++    /// look be cited once a look has happened, without forcing the look at the thing in
++    /// question. Naming the sources here turns the gate from "did it do anything" into "did it
++    /// request the evidence", which is the validation step the forensic standard actually asks
++    /// for.
++    ///
++    /// Matched against the recorded arguments of SUCCESSFUL read-shaped tool calls. A failed
++    /// read saw nothing and does not count.
++    ///
++    /// This proves the method requested the named thing. It does NOT prove the contents were
++    /// used: an agent can open every source and still answer from memory. That layer is not
++    /// built, and this field should not be described as if it were.
++    ///
++    /// Empty or absent falls back to the weaker any-tool-call check.
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub required_sources: Vec<String>,
++
+     // T-011 (REQ-DS-027): per-call overrides for the DeepSeek sibling. ALL
+     // four fields are Optional and skip-serialize-on-None so the wire shape
+     // is unchanged for Gemini/Codex callers. The runner (T-012) reads them
+@@ -148,6 +191,13 @@ pub struct AskAgentResponse {
+     pub shadow_error: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub shadow_latency_ms: Option<u64>,
++    /// How many tool calls the agent made producing this answer. The receipt.
++    ///
++    /// Always populated, not just when `require_sight` is set, because the count is the
++    /// cheapest way for a caller to tell a review apart from a recollection. Zero on a
++    /// question that needed no tools is perfectly normal; zero on a review is the finding.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub tool_calls_made: Option<u32>,
+ }
+ 
+ impl AskAgentResponse {
+@@ -172,6 +222,7 @@ impl AskAgentResponse {
+             shadow_response: None,
+             shadow_error: None,
+             shadow_latency_ms: None,
++            tool_calls_made: None,
+         }
+     }
+ 
+diff --git a/daemon/crates/triumvirate/src/agent_exec.rs b/daemon/crates/triumvirate/src/agent_exec.rs
+index 1331236..3badf48 100644
+--- a/daemon/crates/triumvirate/src/agent_exec.rs
++++ b/daemon/crates/triumvirate/src/agent_exec.rs
+@@ -5,8 +5,8 @@ use crate::{
+ use agent_adapter::{
+     ApprovalChannelMode, CodexAppServerEvent, CodexAppServerParser, CodexExecParser,
+     GrokStreamParser, GrokTermination,
+-    GeminiStreamParser, ParsedAgentResult, StuckDetector, WorkingState, WorkingStateEvent,
+-    format_working_state, probe_approval_response_channel, should_display,
++    GeminiStreamParser, ParsedAgentResult, StuckDetector, ToolCallRecord, ToolKind, WorkingState,
++    WorkingStateEvent, format_working_state, probe_approval_response_channel, should_display,
+ };
+ use agent_worker::{
+     WorkerAcquireMode, acquire_worker, dismiss_worker, should_invalidate_cached_session,
+@@ -119,6 +119,10 @@ fn cast_usize_to_i64(value: usize) -> i64 {
+     i64::try_from(value).unwrap_or(i64::MAX)
+ }
+ 
++fn cast_usize_to_u32(value: usize) -> u32 {
++    u32::try_from(value).unwrap_or(u32::MAX)
++}
++
+ fn read_build_id(cwd: Option<&str>) -> Option<String> {
+     let cwd = cwd?;
+     let path = Path::new(cwd).join("BUILD_STATE.json");
+@@ -368,6 +372,27 @@ pub(crate) async fn execute_ask_agent(
+     // $ai_input: the actual prompt for this call, so PostHog's LLM trace view shows what we sent.
+     tel.set_input(&req.message);
+ 
++    // A capability mismatch should cost nothing to discover. DeepSeek has no filesystem tools
++    // at all and its parser (`deepseek-sse`) hardcodes an empty `tool_calls`, so a review
++    // dispatched to it can never satisfy require_sight. Rejecting on the way OUT would spend a
++    // remote metered call, bill for it, and then discard the answer. Codex found this.
++    //
++    // Refused here, above worker-acquire, alongside the other pre-dispatch rejections.
++    if req.require_sight.unwrap_or(false) && AGENTS_WITHOUT_TOOLS.contains(&agent.as_str()) {
++        span.record("agent.outcome", "rejected_no_tools");
++        span.record("agent.tokens", 0_u64);
++        span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
++        let msg = format!(
++            "{agent} has no filesystem tools, so it can never satisfy require_sight and cannot \
++             serve as a sighted reviewer. Refused before dispatch so the call is not spent. \
++             Send it the material inline as a method question, or route the review to a peer \
++             that can read: {}.",
++            PARSER_MODES_WITH_TOOL_RECORDS.join(", ")
++        );
++        tel.failure(&msg);
++        return Err(msg);
++    }
++
+     // T-015 (REQ-DS-025) anti-bulk: reject oversized payloads on the metered
+     // DeepSeek path BEFORE any worker is acquired. The default ceiling (16KB)
+     // comes from TRIUMVIRATE_DEEPSEEK_BULK_BYTES (env-configurable). Gemini
+@@ -758,6 +783,47 @@ pub(crate) async fn execute_ask_agent(
+ 
+         match attempt_result {
+             Ok(parsed) => {
++                // The sight gate runs FIRST, before any success side effect.
++                //
++                // It used to run after them, and Codex caught what that meant: the turn had
++                // already persisted its token record, called tel.success(), pushed a DONE
++                // lifecycle event, appended a DONE outbox entry, updated the worker session, and
++                // emitted "responded" progress. The ledger recorded DONE for a turn that was
++                // then rejected, and a rejected turn's session id was preserved as if it were
++                // good. Rejecting before any of that is written keeps the record honest.
++                //
++                // Token accounting is deliberately still performed below on the reject path
++                // through the normal Err arm: the tokens were genuinely spent whether or not the
++                // answer is usable, and hiding that would misreport cost.
++                if req.require_sight.unwrap_or(false)
++                    && let Err(err) = enforce_reviewer_sight(
++                        &agent_display,
++                        &parsed.tool_calls,
++                        &parsed.parser_mode,
++                        &req.required_sources,
++                        &exec_cwd,
++                        &mut lifecycle,
++                    )
++                {
++                    span.record("agent.outcome", "rejected_no_sight");
++                    span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
++                    persist_daemon_token_record(
++                        &agent,
++                        &request_id,
++                        &parsed,
++                        &resolved_cwd,
++                        &resolved_repo,
++                    );
++                    tel.failure(err.clone());
++                    // The rejected text is carried in the error rather than discarded. On
++                    // 2026-09-01 the ONLY thing that caught the unsighted review was a human
++                    // reading the output and noticing it had no links in it. Throwing the text
++                    // away destroys the artifact the sole demonstrated catcher actually used.
++                    let preview: String = parsed.response_text.chars().take(600).collect();
++                    return Err(format!(
++                        "{err}\n\n--- rejected output, for inspection, NOT a review ---\n{preview}"
++                    ));
++                }
+                 if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+                     mcp_bridge::agy_resilience::agy_breaker_record_success();
+                 }
+@@ -880,6 +946,7 @@ pub(crate) async fn execute_ask_agent(
+                 } else {
+                     (None, None, None, None)
+                 };
++                let tool_calls_made = cast_usize_to_u32(parsed.tool_calls.len());
+                 let mut resp = AskAgentResponse::direct(
+                     request_id,
+                     agent.clone(),
+@@ -887,6 +954,8 @@ pub(crate) async fn execute_ask_agent(
+                     lifecycle,
+                 )
+                 .with_shadow(sh_backend, sh_resp, sh_err, sh_ms);
++                // The receipt, returned on every call and not only on reviews.
++                resp.tool_calls_made = Some(tool_calls_made);
+                 // Hand the CLI session id back so a NAMED session can own it in its own
+                 // SessionState, rather than the worker registry inferring it from (agent, cwd).
+                 // That inference is what let two named sessions resume each other.
+@@ -1162,6 +1231,25 @@ pub(crate) async fn execute_ask_agent(
+                     } else {
+                         String::new()
+                     };
++                    // A degraded hop answering a review is still answering a review. Gating only
++                    // the primary path would leave the identical hole open one route over, which
++                    // is how the session-leak fix passed its own verification and survived on the
++                    // other surface.
++                    if req.require_sight.unwrap_or(false)
++                        && let Err(err) = enforce_reviewer_sight(
++                            &hop_display,
++                            &parsed.tool_calls,
++                            &parsed.parser_mode,
++                            &req.required_sources,
++                            &exec_cwd,
++                            &mut lifecycle,
++                        )
++                    {
++                        span.record("agent.outcome", "failure");
++                        tel.failure(err.clone());
++                        return Err(err);
++                    }
++                    let tool_calls_made = cast_usize_to_u32(parsed.tool_calls.len());
+                     return Ok(AskAgentResponse {
+                         // NOT the degraded hop's session id. A gemini session that degraded to
+                         // codex would otherwise have its authoritative id overwritten with a
+@@ -1180,6 +1268,8 @@ pub(crate) async fn execute_ask_agent(
+                         shadow_response: None,
+                         shadow_error: None,
+                         shadow_latency_ms: None,
++                        // The DEGRADED hop's count, since the degraded hop is what answered.
++                        tool_calls_made: Some(tool_calls_made),
+                     });
+                 }
+                 Ok(Err(e)) => {
+@@ -1302,6 +1392,227 @@ fn require_peer_review_enabled() -> bool {
+         .unwrap_or(false)
+ }
+ 
++/// Parser modes that do NOT record tool calls, so a zero from them means "this instrument
++/// cannot see" rather than "the agent did not look".
++///
++/// `codex-app-server-jsonrpc` declares a `tool_calls` vec and returns it, and never pushes to
++/// it: it handles `initialized`, `thread/start`, `turn/start`, text deltas, `approval/request`
++/// and `turn/completed`, and no tool event at all. Treating its zero as an agent failure would
++/// false-reject every codex review under `TRIUMVIRATE_CODEX_PROTOCOL=app-server`, however many
++/// tools the agent actually ran.
++///
++/// This list is the fix's own honesty check. Reporting absence from a method structurally
++/// incapable of detecting the thing is the exact defect the sight gate exists to prevent, and
++/// it would be humiliating to reproduce it inside the gate.
++/// Parser modes PROVEN to record tool calls. An allowlist, deliberately, and not a list of
++/// blind parsers.
++///
++/// The first version of this was a denylist and it was wrong in the most embarrassing way
++/// available. It named `codex-app-server-jsonrpc`, then `grok-batch-json`, and missed that
++/// `agy-pipe-plain-text` and `agy-pty-plain-text` (`crates/triumvirate/src/agy.rs`,
++/// `build_result`) also hardcode `tool_calls: Vec::new()`. Antigravity, the agent whose zero
++/// tool calls motivated this entire gate, was therefore structurally invisible to it: every
++/// Antigravity review would have been rejected whether it looked or not. `deepseek-sse` is
++/// the same. Grok found it.
++///
++/// A denylist fails OPEN for anything unlisted, so every new parser silently becomes a false
++/// rejection. An allowlist fails CLOSED: an unlisted parser is reported as unable to produce a
++/// receipt, which is true, checkable, and blames the right component.
++///
++/// To add a mode here, open its `finish`/`build_result` and confirm a `tool_calls.push` exists
++/// on a real tool event. Do not add one because its name looks capable.
++const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
++    // crates/agent-adapter/src/codex.rs: pushes on command_execution
++    "codex-exec-json",
++    // crates/agent-adapter/src/gemini.rs: pushes on tool_use
++    "gemini-stream-json",
++    // crates/agent-adapter/src/grok.rs: pushes on tool_call
++    "grok-streaming-json",
++];
++
++/// Agents that have no tools at all, so `require_sight` can never be satisfied by them.
++///
++/// Refused BEFORE dispatch rather than after. DeepSeek is remote and metered: rejecting it
++/// on the way out would spend the call, bill for it, and then discard the answer. A
++/// capability mismatch is the caller's error and should cost nothing to discover.
++const AGENTS_WITHOUT_TOOLS: &[&str] = &["deepseek"];
++
++/// A reviewer that opened nothing did not review anything.
++///
++/// Called only when the caller set `require_sight`, i.e. declared this dispatch a review.
++/// Returns Err so the turn is rejected rather than returned with a caveat: see the field
++/// docs on `AskAgentRequest::require_sight` for why a warning is the wrong shape here.
++///
++/// Distinguishes two zeros, and the distinction is the whole point:
++///   - the agent made no tool calls           -> reject the AGENT, the finding is unverified
++///   - the parser cannot report tool calls    -> reject the DISPATCH, the receipt is unavailable
++///
++/// Both are errors, because both mean nobody can show the reviewer looked. They say different
++/// things because they need different fixes.
++///
++/// Note what this does NOT do. It proves the reviewer looked at something, not that it looked
++/// at the right things. A peer that opens four irrelevant files passes. Catching wrong reading
++/// needs the review brief to name its primary sources, which is prose and therefore bypassable.
++/// This gate is the half that can be made mechanical.
++/// Did any SUCCESSFUL read-shaped tool call name this source?
++///
++/// Successful only: a `read_file` of a path that does not exist records `success: Some(false)`
++/// and saw nothing, so it must not satisfy a source. `None` is treated as success because
++/// several parsers never populate the field, and refusing on unknown would false-reject them.
++///
++/// Read-shaped only: a write is not a look, and `RequestUserInput` is not a look. `Bash` counts
++/// because `codex-exec-json` classifies every call as Bash and puts the command in `args_json`,
++/// so `grep -n foo agent_exec.rs` is a real read that would otherwise be discarded.
++///
++/// Matching accepts the source's absolute path, or its path relative to the dispatch cwd,
++/// because agents routinely open files relative to where they were started.
++///
++/// Deliberately NOT a fuzzy suffix match. An earlier version accepted any trailing two
++/// segments, and its own test caught the hole immediately: `src/lib.rs` is the two-segment
++/// tail of `/repo/crates/shared-types/src/lib.rs`, and it is also contained in
++/// `crates/unrelated/src/lib.rs`. A reviewer could satisfy a named source by opening a
++/// completely different file with a common name, which is the exact false pass this check
++/// exists to stop. This workspace is full of `lib.rs`, `main.rs` and `mod.rs`.
++///
++/// Computing the relative form from the known cwd gives an exact string with no guessing.
++fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &str) -> bool {
++    let mut candidates: Vec<&str> = vec![source];
++    let trimmed_cwd = cwd.trim_end_matches('/');
++    if !trimmed_cwd.is_empty()
++        && let Some(rel) = source.strip_prefix(trimmed_cwd)
++    {
++        let rel = rel.trim_start_matches('/');
++        if !rel.is_empty() {
++            candidates.push(rel);
++        }
++    }
++    tool_calls.iter().any(|c| {
++        let looked = matches!(
++            c.kind,
++            ToolKind::ReadFile | ToolKind::Grep | ToolKind::Glob | ToolKind::Bash
++        );
++        // `None` counts as success: several parsers never populate the field, and refusing on
++        // unknown would false-reject them. A recorded FALSE means the read saw nothing.
++        let ok = c.success.unwrap_or(true);
++        let args = c.args_json.as_deref().unwrap_or("");
++        looked && ok && candidates.iter().any(|cand| args.contains(cand))
++    })
++}
++
++fn enforce_reviewer_sight(
++    agent_display: &str,
++    tool_calls: &[ToolCallRecord],
++    parser_mode: &str,
++    required_sources: &[String],
++    cwd: &str,
++    lifecycle: &mut Vec<LifecycleEvent>,
++) -> Result<(), String> {
++    // A reviewer LOOKS. It does not TOUCH. A review that edited the thing it was reviewing has
++    // contaminated its own evidence, and worse, has made a change nobody asked for and nobody
++    // reviewed.
++    //
++    // Detection here is deliberately the SECOND line of defence, not the first. Containment is
++    // the first: reviewers are dispatched into a read-only sandbox. The reason detection cannot
++    // carry this alone is visible in the parsers. Gemini and Grok classify read against write
++    // faithfully, but `codex-exec-json` stamps EVERY call `ToolKind::Bash`, and a bash command
++    // can write. So for codex this check sees nothing, and only the sandbox actually holds.
++    //
++    // Claiming otherwise would be reporting detection from an instrument that cannot see, which
++    // is the precise defect this whole gate exists to prevent.
++    let mutations: Vec<&str> = tool_calls
++        .iter()
++        .filter(|c| matches!(c.kind, ToolKind::WriteFile | ToolKind::EditFile))
++        .map(|c| c.tool.as_str())
++        .collect();
++    if !mutations.is_empty() {
++        let detail = format!(
++            "{agent_display} was dispatched as a review but MODIFIED files: {}. A reviewer looks \
++             and does not touch. Rejecting the turn, and the working tree should be checked: this \
++             is an unrequested, unreviewed change. Note that this check reads tool kinds, so it \
++             catches explicit write and edit calls and cannot see a write performed inside a \
++             shell command. The read-only sandbox is what actually prevents this; this message \
++             means the sandbox was not in force.",
++            mutations.join(", ")
++        );
++        lifecycle.push(LifecycleEvent {
++            state: "REJECTED".to_string(),
++            detail: detail.clone(),
++        });
++        return Err(detail);
++    }
++    // The named-sources check. This is the difference between a fig leaf and a gate.
++    //
++    // `tool_calls > 0` alone passes on one `todo_write`, one `list_dir .`, one `pwd`, or a
++    // `read_file` of a path that does not exist. Grok listed those defeats against this exact
++    // stack and noted it nearly took the first one before opening any files. Counting calls
++    // demands that a look be CITED, once a look has happened. It does not force the method,
++    // which is the same defect as citing a table list beside a grep that could not see the data.
++    //
++    // When the caller names its primary sources, require that the agent actually asked for them
++    // by path: a successful read or search whose recorded arguments mention the source. Failed
++    // calls do not count, because a read of a path that does not exist saw nothing.
++    //
++    // What this establishes and what it does not: it proves the method REQUESTED the named
++    // thing, which is ISO/IEC 27042's validation step. It does not prove the contents were used.
++    // An agent can open each source and still write from memory. That next layer is entailment
++    // against the opened text, or a human, and it is not built.
++    if !required_sources.is_empty() {
++        let missed: Vec<&str> = required_sources
++            .iter()
++            .map(String::as_str)
++            .filter(|src| !tool_call_touched_source(tool_calls, src, cwd))
++            .collect();
++        if !missed.is_empty() {
++            let detail = format!(
++                "{agent_display} was dispatched as a review over {} named source(s) and never \
++                 successfully opened {} of them: {}. A review of sources it did not read is \
++                 recollection. Rejecting the turn. If a source is genuinely not needed, drop it \
++                 from required_sources rather than leaving the claim unbacked.",
++                required_sources.len(),
++                missed.len(),
++                missed.join(", ")
++            );
++            lifecycle.push(LifecycleEvent {
++                state: "REJECTED".to_string(),
++                detail: detail.clone(),
++            });
++            return Err(detail);
++        }
++        return Ok(());
++    }
++
++    // if !tool_calls.is_empty() {
++    //     return Ok(());
++    // }
++    // No named sources to check, so fall back to the weaker question: did it look at anything.
++    if !tool_calls.is_empty() {
++        return Ok(());
++    }
++
++    let detail = if !PARSER_MODES_WITH_TOOL_RECORDS.contains(&parser_mode) {
++        format!(
++            "{agent_display} ran under parser mode `{parser_mode}`, which does not record tool \
++             calls at all, so this turn cannot produce the receipt require_sight demands. Its \
++             zero is the instrument's blind spot and not evidence about the agent. Re-dispatch \
++             on a parser that records tool calls, or teach `{parser_mode}` to record them, \
++             before trusting a review from this route."
++        )
++    } else {
++        format!(
++            "{agent_display} answered a review dispatch with zero tool calls. It opened no \
++             files, ran no commands and made no searches, so it cannot have verified anything \
++             it claims. Rejecting the turn: treat any text it produced as recollection, not \
++             review. Re-dispatch naming the primary sources by absolute path, or drop \
++             require_sight if this call was never meant to be a review."
++        )
++    };
++    lifecycle.push(LifecycleEvent {
++        state: "REJECTED".to_string(),
++        detail: detail.clone(),
++    });
++    Err(detail)
++}
++
+ fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
+     let raw = PathBuf::from(exec_cwd);
+     let base = if raw.is_absolute() {
+@@ -3925,3 +4236,327 @@ mod deepseek_dispatch_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod sight_gate_tests {
++    use super::*;
++
++    fn calls(kinds: &[ToolKind]) -> Vec<ToolCallRecord> {
++        kinds
++            .iter()
++            .map(|k| ToolCallRecord {
++                id: None,
++                tool: match k {
++                    ToolKind::WriteFile => "write_file",
++                    ToolKind::EditFile => "edit_file",
++                    ToolKind::ReadFile => "read_file",
++                    _ => "bash",
++                }
++                .to_string(),
++                kind: k.clone(),
++                success: Some(true),
++                duration_ms: None,
++                args_json: None,
++            })
++            .collect()
++    }
++
++    fn n_reads(n: usize) -> Vec<ToolCallRecord> {
++        calls(&vec![ToolKind::ReadFile; n])
++    }
++
++    // The gate exists because on 2026-09-01 a peer answered a review dispatch with zero tool
++    // calls, graded nine research citations from memory, and called its own output "rigorous
++    // sourcing". Nothing in the system noticed.
++    //
++    // Every test below states the breaking change that turns it red, because this repo has
++    // produced three tests that could not fail: one asserting against a closure the test
++    // defined itself, one encoding a bug as `"documented limitation"`, and one scanning source
++    // text with an assertion string that matched itself.
++
++    /// RED IF: the `tool_calls > 0` early return is removed or inverted.
++    #[test]
++    fn sight_01_tool_calls_pass_the_gate() {
++        let mut lifecycle = Vec::new();
++        let r = enforce_reviewer_sight("Codex", &n_reads(35), "codex-exec-json", &[], "/repo", &mut lifecycle);
++        assert!(r.is_ok(), "35 tool calls must pass, got: {r:?}");
++        assert!(
++            lifecycle.is_empty(),
++            "a passing gate must not push a lifecycle event"
++        );
++    }
++
++    /// RED IF: the gate stops rejecting, or downgrades rejection to a warning.
++    /// This is the 2026-09-01 case reproduced exactly.
++    #[test]
++    fn sight_02_zero_tool_calls_are_rejected() {
++        let mut lifecycle = Vec::new();
++        let r = enforce_reviewer_sight("Antigravity", &[], "gemini-stream-json", &[], "/repo", &mut lifecycle);
++        let err = r.expect_err("zero tool calls on a review must be rejected");
++        assert!(
++            err.contains("zero tool calls"),
++            "the error must name the actual defect so a caller can act on it; got: {err}"
++        );
++        assert_eq!(
++            lifecycle.len(),
++            1,
++            "a rejection must leave exactly one lifecycle event"
++        );
++        assert_eq!(lifecycle[0].state, "REJECTED");
++    }
++
++    /// The boundary. RED IF: the comparison becomes `>= 0`, `> 1`, or similar.
++    #[test]
++    fn sight_03_one_tool_call_is_enough() {
++        let mut lifecycle = Vec::new();
++        assert!(
++            enforce_reviewer_sight("Grok", &n_reads(1), "grok-streaming-json", &[], "/repo", &mut lifecycle).is_ok(),
++            "exactly one tool call is the pass boundary"
++        );
++    }
++
++    /// The instrument's blind spot is not evidence about the agent.
++    ///
++    /// RED IF: `PARSER_MODES_WITH_TOOL_RECORDS` gains the blind mode, or the branch is removed so a
++    /// parser that cannot count gets blamed on the agent. Reporting absence from a method
++    /// structurally incapable of detecting the thing is the defect this whole gate exists to
++    /// prevent, so reproducing it inside the gate is the worst available outcome.
++    #[test]
++    fn sight_04_a_blind_parser_blames_the_parser_not_the_agent() {
++        let mut lifecycle = Vec::new();
++        let err = enforce_reviewer_sight("Codex", &[], "codex-app-server-jsonrpc", &[], "/repo", &mut lifecycle)
++            .expect_err("a parser that cannot produce a receipt must still fail the dispatch");
++        assert!(
++            err.contains("does not record tool calls"),
++            "must name the parser as the blind instrument; got: {err}"
++        );
++        assert!(
++            !err.contains("opened no files"),
++            "must NOT accuse the agent of not looking when the parser simply cannot see; got: {err}"
++        );
++    }
++
++    /// The two zeros must produce DIFFERENT text, because they need different fixes.
++    /// RED IF: the branches are collapsed into one message.
++    #[test]
++    fn sight_05_the_two_zeros_are_distinguishable() {
++        let mut a = Vec::new();
++        let mut b = Vec::new();
++        let agent_fault = enforce_reviewer_sight("X", &[], "codex-exec-json", &[], "/repo", &mut a).unwrap_err();
++        let parser_fault =
++            enforce_reviewer_sight("X", &[], "codex-app-server-jsonrpc", &[], "/repo", &mut b).unwrap_err();
++        assert_ne!(
++            agent_fault, parser_fault,
++            "an agent that did not look and a parser that cannot see must not report identically"
++        );
++    }
++
++    /// The allowlist must not contain a mode that cannot actually record, and must not omit a
++    /// mode that can. Both directions matter: an over-broad allowlist false-rejects a real
++    /// review, an under-broad one lets a blind parser through as if it had seen.
++    ///
++    /// RED IF: a blind parser is added to the allowlist. The first version of this gate was a
++    /// DENYLIST, and it missed `agy-pipe-plain-text`, `agy-pty-plain-text` and `deepseek-sse`,
++    /// which meant Antigravity, the agent this gate was built for, would have been rejected on
++    /// every review whether it looked or not.
++    #[test]
++    fn sight_06_the_allowlist_excludes_every_parser_known_to_be_blind() {
++        // Verified by opening each parser and confirming NO `tool_calls.push` exists:
++        //   crates/triumvirate/src/agy.rs                 build_result -> tool_calls: Vec::new()
++        //   crates/agent-adapter/src/codex_app_server.rs  declares the vec, never pushes
++        //   crates/agent-adapter/src/grok.rs              parse_batch_json -> Vec::new()
++        //   crates/mcp-bridge/src/deepseek.rs             deepseek-sse, no tools by design
++        const KNOWN_BLIND: &[&str] = &[
++            "agy-pipe-plain-text",
++            "agy-pty-plain-text",
++            "codex-app-server-jsonrpc",
++            "grok-batch-json",
++            "deepseek-sse",
++        ];
++        for blind in KNOWN_BLIND {
++            assert!(
++                !PARSER_MODES_WITH_TOOL_RECORDS.contains(blind),
++                "`{blind}` records no tool calls, so trusting it would false-reject every \
++                 review from that route"
++            );
++        }
++        assert!(
++            PARSER_MODES_WITH_TOOL_RECORDS.contains(&"gemini-stream-json"),
++            "gemini-stream-json does push on tool_use and must stay trusted"
++        );
++    }
++
++    /// The named-sources check: the reviewer must have asked for the evidence by path.
++    /// RED IF: the required_sources branch is removed, so any tool call satisfies the gate.
++    #[test]
++    fn sight_12_a_named_source_that_was_never_opened_is_rejected() {
++        let mut lifecycle = Vec::new();
++        let tools = vec![ToolCallRecord {
++            id: None,
++            tool: "todo_write".to_string(),
++            kind: ToolKind::Unknown,
++            success: Some(true),
++            duration_ms: None,
++            args_json: Some("{}".to_string()),
++        }];
++        let sources = vec!["/repo/agent_exec.rs".to_string()];
++        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
++            .expect_err("one todo_write must not satisfy a named source");
++        assert!(
++            err.contains("/repo/agent_exec.rs"),
++            "the error must name the source that was never opened; got: {err}"
++        );
++    }
++
++    /// RED IF: basename matching is dropped. Agents open files by relative path constantly.
++    #[test]
++    fn sight_13_opening_the_source_by_relative_path_counts() {
++        let mut lifecycle = Vec::new();
++        let tools = vec![ToolCallRecord {
++            id: None,
++            tool: "read_file".to_string(),
++            kind: ToolKind::ReadFile,
++            success: Some(true),
++            duration_ms: None,
++            args_json: Some(r#"{"path":"crates/triumvirate/src/agent_exec.rs"}"#.to_string()),
++        }];
++        let sources = vec!["/repo/crates/triumvirate/src/agent_exec.rs".to_string()];
++        assert!(
++            enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &sources, "/repo", &mut lifecycle)
++                .is_ok(),
++            "a relative-path read of the named source must satisfy it"
++        );
++    }
++
++    /// An unrelated file with the same name must NOT satisfy a named source. This workspace
++    /// has many `lib.rs`, `main.rs` and `mod.rs`.
++    /// RED IF: matching goes back to a fuzzy suffix, letting `crates/unrelated/src/lib.rs`
++    /// pass as evidence for a source the reviewer never opened.
++    #[test]
++    fn sight_15_a_same_named_file_elsewhere_does_not_satisfy_a_source() {
++        let mut lifecycle = Vec::new();
++        let tools = vec![ToolCallRecord {
++            id: None,
++            tool: "read_file".to_string(),
++            kind: ToolKind::ReadFile,
++            success: Some(true),
++            duration_ms: None,
++            args_json: Some(r#"{"path":"crates/unrelated/src/lib.rs"}"#.to_string()),
++        }];
++        let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
++        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &sources, "/repo", &mut lifecycle)
++            .expect_err("reading a DIFFERENT lib.rs must not satisfy the named one");
++        assert!(err.contains("shared-types"), "must name the unopened source; got: {err}");
++    }
++
++    /// The legitimate relative-path case must still pass.
++    /// RED IF: matching is tightened to absolute paths only, which would reject every agent
++    /// that opens files relative to its cwd, i.e. all of them.
++    #[test]
++    fn sight_16_a_two_segment_relative_path_still_satisfies_a_source() {
++        let mut lifecycle = Vec::new();
++        let tools = vec![ToolCallRecord {
++            id: None,
++            tool: "read_file".to_string(),
++            kind: ToolKind::ReadFile,
++            success: Some(true),
++            duration_ms: None,
++            args_json: Some(r#"{"path":"crates/shared-types/src/lib.rs"}"#.to_string()),
++        }];
++        let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
++        assert!(
++            enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &sources, "/repo", &mut lifecycle)
++                .is_ok(),
++            "the cwd-relative form of the named source must satisfy it"
++        );
++    }
++
++    /// A read that FAILED saw nothing.
++    /// RED IF: the `success` check is dropped, letting a read of a nonexistent path pass.
++    #[test]
++    fn sight_14_a_failed_read_does_not_count_as_having_looked() {
++        let mut lifecycle = Vec::new();
++        let tools = vec![ToolCallRecord {
++            id: None,
++            tool: "read_file".to_string(),
++            kind: ToolKind::ReadFile,
++            success: Some(false),
++            duration_ms: None,
++            args_json: Some(r#"{"path":"/repo/missing.rs"}"#.to_string()),
++        }];
++        let sources = vec!["/repo/missing.rs".to_string()];
++        assert!(
++            enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
++                .is_err(),
++            "a failed read saw nothing and must not satisfy a named source"
++        );
++    }
++
++    /// A reviewer that WRITES has contaminated its own evidence and made an unreviewed change.
++    /// RED IF: the mutation branch is removed, or WriteFile stops being treated as a mutation.
++    #[test]
++    fn sight_07_a_reviewer_that_writes_is_rejected() {
++        let mut lifecycle = Vec::new();
++        let tools = calls(&[ToolKind::ReadFile, ToolKind::WriteFile]);
++        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &[], "/repo", &mut lifecycle)
++            .expect_err("a review that wrote a file must be rejected");
++        assert!(
++            err.contains("MODIFIED files") && err.contains("write_file"),
++            "the error must name the mutation and the tool that made it; got: {err}"
++        );
++    }
++
++    /// RED IF: EditFile is dropped from the mutation set. An edit is a write.
++    #[test]
++    fn sight_08_editing_counts_as_touching() {
++        let mut lifecycle = Vec::new();
++        let tools = calls(&[ToolKind::EditFile]);
++        assert!(
++            enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &[], "/repo", &mut lifecycle).is_err(),
++            "an edit is a write and must be rejected"
++        );
++    }
++
++    /// Writing outranks looking. A reviewer that read fifty files and then edited one is still
++    /// rejected, and for the WRITE, not for anything else.
++    /// RED IF: the mutation check is moved below the `is_empty` early return, which would let a
++    /// busy reviewer write freely.
++    #[test]
++    fn sight_09_writing_outranks_having_looked() {
++        let mut lifecycle = Vec::new();
++        let mut tools = n_reads(50);
++        tools.extend(calls(&[ToolKind::WriteFile]));
++        let err = enforce_reviewer_sight("Gemini", &tools, "gemini-stream-json", &[], "/repo", &mut lifecycle)
++            .expect_err("50 reads do not excuse 1 write");
++        assert!(
++            err.contains("MODIFIED files"),
++            "must be rejected for the write, not for failing to look; got: {err}"
++        );
++    }
++
++    /// The honest limit, pinned so nobody later claims a guarantee the code does not give.
++    /// `codex-exec-json` stamps every call ToolKind::Bash, so a write performed inside a shell
++    /// command is INVISIBLE here. The read-only sandbox is what actually prevents it.
++    /// RED IF: someone maps Bash into the mutation set, which would false-reject every codex
++    /// review, or if codex.rs starts classifying kinds and this comment goes stale.
++    #[test]
++    fn sight_10_a_bash_write_is_not_detectable_and_we_say_so() {
++        let mut lifecycle = Vec::new();
++        let tools = calls(&[ToolKind::Bash]);
++        assert!(
++            enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &[], "/repo", &mut lifecycle).is_ok(),
++            "Bash is not classified as a mutation: containment, not detection, covers this case"
++        );
++    }
++
++    /// RED IF: `AGENTS_WITHOUT_TOOLS` is emptied, so a metered remote call gets spent and then
++    /// discarded for a capability mismatch the caller could have been told about for free.
++    #[test]
++    fn sight_11_toolless_agents_are_named_so_they_can_be_refused_early() {
++        assert!(
++            AGENTS_WITHOUT_TOOLS.contains(&"deepseek"),
++            "deepseek has no tools and is remote and metered: require_sight must be refused \
++             before the call is spent, not after"
++        );
++    }
++}
+diff --git a/daemon/crates/triumvirate/tests/fixtures/mock_grok.sh b/daemon/crates/triumvirate/tests/fixtures/mock_grok.sh
+index ced2e39..a6a3a43 100755
+--- a/daemon/crates/triumvirate/tests/fixtures/mock_grok.sh
++++ b/daemon/crates/triumvirate/tests/fixtures/mock_grok.sh
+@@ -7,6 +7,9 @@
+ # Behavior is scripted through env vars so one script covers every case:
+ #   MOCK_GROK_EXIT           exit code (default 0)
+ #   MOCK_GROK_MODE           normal | max_turns | error | no_end | sandbox_fail | auth_fail
++#                            | no_tools     answers with NO tool_call events at all. Reproduces
++#                                            the 2026-09-01 review that was written from memory.
++#                            | writes       makes a WRITE tool call. A reviewer must not touch.
+ #   MOCK_GROK_ARGS_OUT       if set, the full argv is written there for assertions
+ set -u
+ 
+@@ -40,8 +43,18 @@ fi
+ 
+ echo '{"type":"available_commands","tools":["read_file","grep"],"commands":[]}'
+ echo '{"type":"thought","data":"CHAIN OF THOUGHT MUST NOT LEAK"}'
+-echo '{"type":"tool_call","toolCallId":"c1","toolName":"read_file","kind":"read","status":"in_progress","rawInput":{"path":"src/main.rs"}}'
+-echo '{"type":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"lines":42}}'
++# no_tools: a fluent answer produced without opening anything. This is the shape that shipped
++# nine graded research citations from memory on 2026-09-01 and was caught only by a human
++# noticing the output had no links in it.
++if [ "$MODE" != "no_tools" ]; then
++  if [ "$MODE" = "writes" ]; then
++    echo '{"type":"tool_call","toolCallId":"c1","toolName":"write","kind":"write","status":"in_progress","rawInput":{"path":"src/main.rs"}}'
++    echo '{"type":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"ok":true}}'
++  else
++    echo '{"type":"tool_call","toolCallId":"c1","toolName":"read_file","kind":"read","status":"in_progress","rawInput":{"path":"src/main.rs"}}'
++    echo '{"type":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"lines":42}}'
++  fi
++fi
+ 
+ if [ "$MODE" = "error" ]; then
+   echo '{"type":"error","message":"mock grok failure"}'
+diff --git a/daemon/crates/triumvirate/tests/integration_grok.rs b/daemon/crates/triumvirate/tests/integration_grok.rs
+index 9c266ee..6b697ac 100644
+--- a/daemon/crates/triumvirate/tests/integration_grok.rs
++++ b/daemon/crates/triumvirate/tests/integration_grok.rs
+@@ -312,3 +312,199 @@ fn e_grok_03_headless_works_on_cached_login_without_an_api_key() {
+         .expect("grok must run");
+     assert!(out.status.success(), "subscription auth must be sufficient for headless");
+ }
++
++// ─────────────────────────────────────────────────────────────────────────────
++// I-SIGHT-01..05: the sight gate, end to end through the real parser.
++//
++// These assert what the unit tests structurally cannot: that a real CLI turn, parsed by the
++// real parser, produces the tool-call record the gate depends on. The unit tests construct
++// ToolCallRecord by hand, so they would keep passing if the parser stopped recording entirely.
++// That is exactly the failure that made the gate blind to Antigravity.
++// ─────────────────────────────────────────────────────────────────────────────
++
++/// A normal tool-using turn must produce a NONZERO tool-call count from the real parser.
++///
++/// RED IF: the grok parser stops pushing on `tool_call`. That regression would silently turn
++/// every sighted grok review into a false rejection, and no unit test would notice.
++#[test]
++fn i_sight_01_a_tool_using_turn_records_its_tool_calls() {
++    let (stdout, _, _, ok) = run_mock(&[("MOCK_GROK_MODE", "normal")], &["-p", "review this"]);
++    assert!(ok, "mock must succeed");
++    let parsed = parse_stream(&stdout);
++    assert!(
++        !parsed.parsed.tool_calls.is_empty(),
++        "a turn that called read_file must record it; the sight gate reads this vec"
++    );
++    assert_eq!(parsed.parsed.parser_mode, "grok-streaming-json");
++}
++
++/// The 2026-09-01 failure, reproduced through the real parser: a fluent answer, no tool calls.
++///
++/// RED IF: the mock's `no_tools` mode breaks, or the parser starts inventing tool calls.
++#[test]
++fn i_sight_02_an_answer_written_from_memory_records_zero_tool_calls() {
++    let (stdout, _, _, ok) = run_mock(&[("MOCK_GROK_MODE", "no_tools")], &["-p", "review this"]);
++    assert!(ok, "mock must succeed: the point is that it ANSWERS, fluently, having read nothing");
++    let parsed = parse_stream(&stdout);
++    assert!(
++        !parsed.parsed.response_text.trim().is_empty(),
++        "the failure mode is a CONFIDENT answer, not an empty one"
++    );
++    assert!(
++        parsed.parsed.tool_calls.is_empty(),
++        "this is the shape the gate must reject: text with no evidence behind it"
++    );
++}
++
++/// The parser must classify a write as a write, or the no-touch check cannot see it.
++///
++/// RED IF: grok's `map_tool_kind` stops mapping "write" to ToolKind::WriteFile.
++#[test]
++fn i_sight_03_a_write_is_classified_as_a_write() {
++    let (stdout, _, _, _) = run_mock(&[("MOCK_GROK_MODE", "writes")], &["-p", "review this"]);
++    let parsed = parse_stream(&stdout);
++    assert!(
++        parsed
++            .parsed
++            .tool_calls
++            .iter()
++            .any(|c| matches!(c.kind, agent_adapter::ToolKind::WriteFile)),
++        "a reviewer that wrote must be visible as having written, got: {:?}",
++        parsed.parsed.tool_calls
++    );
++}
++
++/// The named-sources check depends on the parser preserving tool ARGUMENTS, not just counts.
++///
++/// RED IF: the parser stops capturing `rawInput` into `args_json`. The gate would then fall
++/// back to counting, which is the fig leaf it was upgraded away from.
++#[test]
++fn i_sight_04_tool_arguments_survive_parsing_so_sources_can_be_matched() {
++    let (stdout, _, _, _) = run_mock(&[("MOCK_GROK_MODE", "normal")], &["-p", "review this"]);
++    let parsed = parse_stream(&stdout);
++    let args: Vec<String> = parsed
++        .parsed
++        .tool_calls
++        .iter()
++        .filter_map(|c| c.args_json.clone())
++        .collect();
++    assert!(
++        args.iter().any(|a| a.contains("src/main.rs")),
++        "the path the agent opened must survive into args_json, or required_sources cannot be \
++         checked; got: {args:?}"
++    );
++}
++
++/// A tool call that FAILED must be distinguishable from one that succeeded, or a read of a
++/// path that does not exist would satisfy a named source.
++///
++/// RED IF: the parser stops recording completion status.
++#[test]
++fn i_sight_05_tool_call_success_is_recorded() {
++    let (stdout, _, _, _) = run_mock(&[("MOCK_GROK_MODE", "normal")], &["-p", "review this"]);
++    let parsed = parse_stream(&stdout);
++    let c = parsed
++        .parsed
++        .tool_calls
++        .first()
++        .expect("one tool call recorded");
++    assert_eq!(
++        c.success,
++        Some(true),
++        "a completed tool call must record success, so a FAILED read can be rejected"
++    );
++}
++
++// ─────────────────────────────────────────────────────────────────────────────
++// E-SIGHT-01..02: end to end against the real xAI CLI.
++//
++// The mock proves the parser records what the gate reads. These prove a REAL agent, given a
++// real question about a real file, produces that record. Between them the chain is closed:
++// live CLI -> parser -> ToolCallRecord -> gate.
++// ─────────────────────────────────────────────────────────────────────────────
++
++/// A live agent asked a question it cannot answer without opening a file must record a read.
++///
++/// This is the one that would catch a real regression the mock cannot: xAI changing its
++/// streaming event shape so `tool_call` stops parsing. Every sighted review would then be
++/// falsely rejected in production while the whole offline suite stayed green.
++#[test]
++#[ignore = "live: set TRIUMVIRATE_LIVE_GROK=1; spends subscription quota"]
++fn e_sight_01_a_live_agent_reading_a_file_records_the_read() {
++    if !live_enabled() {
++        return;
++    }
++    let dir = std::env::temp_dir().join(format!("sight-e2e-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    let marker = "PLUM_HORIZON_47";
++    let file = dir.join("evidence.txt");
++    std::fs::write(&file, format!("the marker is {marker}\n")).expect("write fixture");
++
++    let (bin, args) = mcp_bridge::grok_command();
++    let inv = mcp_bridge::grok::build_grok_invocation(
++        &bin,
++        &args,
++        "Read the file evidence.txt in the current directory and reply with ONLY the marker \
++         value it contains. Do not guess.",
++        dir.to_str().unwrap(),
++        None,
++        false,
++    )
++    .unwrap();
++    let out = Command::new(&inv.program)
++        .args(&inv.args)
++        .current_dir(&dir)
++        .output()
++        .expect("grok must run");
++    let full = parse_stream(&String::from_utf8_lossy(&out.stdout));
++
++    assert!(
++        !full.parsed.tool_calls.is_empty(),
++        "a live agent that answered a file question must have recorded a tool call, or the \
++         sight gate will false-reject every real review; parser_mode={}, response={}",
++        full.parsed.parser_mode,
++        full.parsed.response_text
++    );
++    assert!(
++        full.parsed.response_text.contains(marker),
++        "the agent should have actually read the file; got: {}",
++        full.parsed.response_text
++    );
++    // The path must survive into args_json or `required_sources` cannot be enforced live.
++    let args_seen: Vec<String> = full
++        .parsed
++        .tool_calls
++        .iter()
++        .filter_map(|c| c.args_json.clone())
++        .collect();
++    assert!(
++        args_seen.iter().any(|a| a.contains("evidence.txt")),
++        "the opened path must appear in recorded arguments; got: {args_seen:?}"
++    );
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// The live parser mode must be one the gate trusts.
++///
++/// RED IF: grok dispatch starts landing on `grok-batch-json`, which records no tool calls. The
++/// gate would then reject every live grok review, and the offline suite would not notice
++/// because the mock always drives the streaming path.
++#[test]
++#[ignore = "live: set TRIUMVIRATE_LIVE_GROK=1; spends subscription quota"]
++fn e_sight_02_the_live_parser_mode_is_one_the_gate_trusts() {
++    if !live_enabled() {
++        return;
++    }
++    let (bin, args) = mcp_bridge::grok_command();
++    let inv = mcp_bridge::grok::build_grok_invocation(
++        &bin, &args, "reply with the single word pong", "/tmp", None, false,
++    )
++    .unwrap();
++    let out = Command::new(&inv.program).args(&inv.args).output().expect("grok must run");
++    let full = parse_stream(&String::from_utf8_lossy(&out.stdout));
++    assert_eq!(
++        full.parsed.parser_mode, "grok-streaming-json",
++        "live grok must land on the streaming parser; `grok-batch-json` records no tool calls \
++         and is not on the gate's allowlist"
++    );
++}

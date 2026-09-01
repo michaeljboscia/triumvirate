@@ -7,6 +7,9 @@
 # Behavior is scripted through env vars so one script covers every case:
 #   MOCK_GROK_EXIT           exit code (default 0)
 #   MOCK_GROK_MODE           normal | max_turns | error | no_end | sandbox_fail | auth_fail
+#                            | no_tools     answers with NO tool_call events at all. Reproduces
+#                                            the 2026-09-01 review that was written from memory.
+#                            | writes       makes a WRITE tool call. A reviewer must not touch.
 #   MOCK_GROK_ARGS_OUT       if set, the full argv is written there for assertions
 set -u
 
@@ -40,8 +43,18 @@ fi
 
 echo '{"type":"available_commands","tools":["read_file","grep"],"commands":[]}'
 echo '{"type":"thought","data":"CHAIN OF THOUGHT MUST NOT LEAK"}'
-echo '{"type":"tool_call","toolCallId":"c1","toolName":"read_file","kind":"read","status":"in_progress","rawInput":{"path":"src/main.rs"}}'
-echo '{"type":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"lines":42}}'
+# no_tools: a fluent answer produced without opening anything. This is the shape that shipped
+# nine graded research citations from memory on 2026-09-01 and was caught only by a human
+# noticing the output had no links in it.
+if [ "$MODE" != "no_tools" ]; then
+  if [ "$MODE" = "writes" ]; then
+    echo '{"type":"tool_call","toolCallId":"c1","toolName":"write","kind":"write","status":"in_progress","rawInput":{"path":"src/main.rs"}}'
+    echo '{"type":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"ok":true}}'
+  else
+    echo '{"type":"tool_call","toolCallId":"c1","toolName":"read_file","kind":"read","status":"in_progress","rawInput":{"path":"src/main.rs"}}'
+    echo '{"type":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"lines":42}}'
+  fi
+fi
 
 if [ "$MODE" = "error" ]; then
   echo '{"type":"error","message":"mock grok failure"}'

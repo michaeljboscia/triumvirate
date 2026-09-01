@@ -312,3 +312,199 @@ fn e_grok_03_headless_works_on_cached_login_without_an_api_key() {
         .expect("grok must run");
     assert!(out.status.success(), "subscription auth must be sufficient for headless");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// I-SIGHT-01..05: the sight gate, end to end through the real parser.
+//
+// These assert what the unit tests structurally cannot: that a real CLI turn, parsed by the
+// real parser, produces the tool-call record the gate depends on. The unit tests construct
+// ToolCallRecord by hand, so they would keep passing if the parser stopped recording entirely.
+// That is exactly the failure that made the gate blind to Antigravity.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A normal tool-using turn must produce a NONZERO tool-call count from the real parser.
+///
+/// RED IF: the grok parser stops pushing on `tool_call`. That regression would silently turn
+/// every sighted grok review into a false rejection, and no unit test would notice.
+#[test]
+fn i_sight_01_a_tool_using_turn_records_its_tool_calls() {
+    let (stdout, _, _, ok) = run_mock(&[("MOCK_GROK_MODE", "normal")], &["-p", "review this"]);
+    assert!(ok, "mock must succeed");
+    let parsed = parse_stream(&stdout);
+    assert!(
+        !parsed.parsed.tool_calls.is_empty(),
+        "a turn that called read_file must record it; the sight gate reads this vec"
+    );
+    assert_eq!(parsed.parsed.parser_mode, "grok-streaming-json");
+}
+
+/// The 2026-09-01 failure, reproduced through the real parser: a fluent answer, no tool calls.
+///
+/// RED IF: the mock's `no_tools` mode breaks, or the parser starts inventing tool calls.
+#[test]
+fn i_sight_02_an_answer_written_from_memory_records_zero_tool_calls() {
+    let (stdout, _, _, ok) = run_mock(&[("MOCK_GROK_MODE", "no_tools")], &["-p", "review this"]);
+    assert!(ok, "mock must succeed: the point is that it ANSWERS, fluently, having read nothing");
+    let parsed = parse_stream(&stdout);
+    assert!(
+        !parsed.parsed.response_text.trim().is_empty(),
+        "the failure mode is a CONFIDENT answer, not an empty one"
+    );
+    assert!(
+        parsed.parsed.tool_calls.is_empty(),
+        "this is the shape the gate must reject: text with no evidence behind it"
+    );
+}
+
+/// The parser must classify a write as a write, or the no-touch check cannot see it.
+///
+/// RED IF: grok's `map_tool_kind` stops mapping "write" to ToolKind::WriteFile.
+#[test]
+fn i_sight_03_a_write_is_classified_as_a_write() {
+    let (stdout, _, _, _) = run_mock(&[("MOCK_GROK_MODE", "writes")], &["-p", "review this"]);
+    let parsed = parse_stream(&stdout);
+    assert!(
+        parsed
+            .parsed
+            .tool_calls
+            .iter()
+            .any(|c| matches!(c.kind, agent_adapter::ToolKind::WriteFile)),
+        "a reviewer that wrote must be visible as having written, got: {:?}",
+        parsed.parsed.tool_calls
+    );
+}
+
+/// The named-sources check depends on the parser preserving tool ARGUMENTS, not just counts.
+///
+/// RED IF: the parser stops capturing `rawInput` into `args_json`. The gate would then fall
+/// back to counting, which is the fig leaf it was upgraded away from.
+#[test]
+fn i_sight_04_tool_arguments_survive_parsing_so_sources_can_be_matched() {
+    let (stdout, _, _, _) = run_mock(&[("MOCK_GROK_MODE", "normal")], &["-p", "review this"]);
+    let parsed = parse_stream(&stdout);
+    let args: Vec<String> = parsed
+        .parsed
+        .tool_calls
+        .iter()
+        .filter_map(|c| c.args_json.clone())
+        .collect();
+    assert!(
+        args.iter().any(|a| a.contains("src/main.rs")),
+        "the path the agent opened must survive into args_json, or required_sources cannot be \
+         checked; got: {args:?}"
+    );
+}
+
+/// A tool call that FAILED must be distinguishable from one that succeeded, or a read of a
+/// path that does not exist would satisfy a named source.
+///
+/// RED IF: the parser stops recording completion status.
+#[test]
+fn i_sight_05_tool_call_success_is_recorded() {
+    let (stdout, _, _, _) = run_mock(&[("MOCK_GROK_MODE", "normal")], &["-p", "review this"]);
+    let parsed = parse_stream(&stdout);
+    let c = parsed
+        .parsed
+        .tool_calls
+        .first()
+        .expect("one tool call recorded");
+    assert_eq!(
+        c.success,
+        Some(true),
+        "a completed tool call must record success, so a FAILED read can be rejected"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E-SIGHT-01..02: end to end against the real xAI CLI.
+//
+// The mock proves the parser records what the gate reads. These prove a REAL agent, given a
+// real question about a real file, produces that record. Between them the chain is closed:
+// live CLI -> parser -> ToolCallRecord -> gate.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A live agent asked a question it cannot answer without opening a file must record a read.
+///
+/// This is the one that would catch a real regression the mock cannot: xAI changing its
+/// streaming event shape so `tool_call` stops parsing. Every sighted review would then be
+/// falsely rejected in production while the whole offline suite stayed green.
+#[test]
+#[ignore = "live: set TRIUMVIRATE_LIVE_GROK=1; spends subscription quota"]
+fn e_sight_01_a_live_agent_reading_a_file_records_the_read() {
+    if !live_enabled() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("sight-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let marker = "PLUM_HORIZON_47";
+    let file = dir.join("evidence.txt");
+    std::fs::write(&file, format!("the marker is {marker}\n")).expect("write fixture");
+
+    let (bin, args) = mcp_bridge::grok_command();
+    let inv = mcp_bridge::grok::build_grok_invocation(
+        &bin,
+        &args,
+        "Read the file evidence.txt in the current directory and reply with ONLY the marker \
+         value it contains. Do not guess.",
+        dir.to_str().unwrap(),
+        None,
+        false,
+    )
+    .unwrap();
+    let out = Command::new(&inv.program)
+        .args(&inv.args)
+        .current_dir(&dir)
+        .output()
+        .expect("grok must run");
+    let full = parse_stream(&String::from_utf8_lossy(&out.stdout));
+
+    assert!(
+        !full.parsed.tool_calls.is_empty(),
+        "a live agent that answered a file question must have recorded a tool call, or the \
+         sight gate will false-reject every real review; parser_mode={}, response={}",
+        full.parsed.parser_mode,
+        full.parsed.response_text
+    );
+    assert!(
+        full.parsed.response_text.contains(marker),
+        "the agent should have actually read the file; got: {}",
+        full.parsed.response_text
+    );
+    // The path must survive into args_json or `required_sources` cannot be enforced live.
+    let args_seen: Vec<String> = full
+        .parsed
+        .tool_calls
+        .iter()
+        .filter_map(|c| c.args_json.clone())
+        .collect();
+    assert!(
+        args_seen.iter().any(|a| a.contains("evidence.txt")),
+        "the opened path must appear in recorded arguments; got: {args_seen:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The live parser mode must be one the gate trusts.
+///
+/// RED IF: grok dispatch starts landing on `grok-batch-json`, which records no tool calls. The
+/// gate would then reject every live grok review, and the offline suite would not notice
+/// because the mock always drives the streaming path.
+#[test]
+#[ignore = "live: set TRIUMVIRATE_LIVE_GROK=1; spends subscription quota"]
+fn e_sight_02_the_live_parser_mode_is_one_the_gate_trusts() {
+    if !live_enabled() {
+        return;
+    }
+    let (bin, args) = mcp_bridge::grok_command();
+    let inv = mcp_bridge::grok::build_grok_invocation(
+        &bin, &args, "reply with the single word pong", "/tmp", None, false,
+    )
+    .unwrap();
+    let out = Command::new(&inv.program).args(&inv.args).output().expect("grok must run");
+    let full = parse_stream(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(
+        full.parsed.parser_mode, "grok-streaming-json",
+        "live grok must land on the streaming parser; `grok-batch-json` records no tool calls \
+         and is not on the gate's allowlist"
+    );
+}
