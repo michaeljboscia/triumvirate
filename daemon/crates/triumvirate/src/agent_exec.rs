@@ -1496,6 +1496,21 @@ const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
 /// capability mismatch is the caller's error and should cost nothing to discover.
 const AGENTS_WITHOUT_TOOLS: &[&str] = &["deepseek"];
 
+/// Agents whose review dispatch has NO write containment, so the no-touch check is the only
+/// thing standing between a review and an unrequested repository change, and that check cannot
+/// see a write performed inside a shell command.
+///
+/// codex is absent deliberately: `codex exec` without --full-auto runs a read-only sandbox, so
+/// the OS stops a shell write there. agy is present because `agy_sandbox_enabled()` defaults
+/// to false and the dispatch passes --dangerously-skip-permissions, so nothing stops it.
+/// Antigravity found this hole in its own backend while reviewing this change.
+///
+/// This list is documentation with a test attached (`sight_24`), not an enforcement point.
+/// Refusing agy reviews outright would be the wrong trade while it is the only Gemini backend.
+/// Closing it properly means either a read-only profile for review dispatches or denying agy's
+/// write tools at spawn, and neither is built.
+const AGENTS_WITH_NO_WRITE_CONTAINMENT: &[&str] = &["gemini"];
+
 /// A reviewer that opened nothing did not review anything.
 ///
 /// Called only when the caller set `require_sight`, i.e. declared this dispatch a review.
@@ -1513,27 +1528,40 @@ const AGENTS_WITHOUT_TOOLS: &[&str] = &["deepseek"];
 /// at the right things. A peer that opens four irrelevant files passes. Catching wrong reading
 /// needs the review brief to name its primary sources, which is prose and therefore bypassable.
 /// This gate is the half that can be made mechanical.
-/// Did any SUCCESSFUL read-shaped tool call name this source?
+/// Parser modes that classify a READ distinctly from a search or a shell command.
 ///
-/// Successful only: a `read_file` of a path that does not exist records `success: Some(false)`
-/// and saw nothing, so it must not satisfy a source. `None` is treated as success because
-/// several parsers never populate the field, and refusing on unknown would false-reject them.
+/// `required_sources` is only meaningful on these. `codex-exec-json` stamps EVERY call
+/// `ToolKind::Bash`, so on that backend "opened the file" and "ran a command mentioning the
+/// file" are the same record, and enforcing named sources there would be theatre.
 ///
-/// Read-shaped only: a write is not a look, and `RequestUserInput` is not a look. `Bash` counts
-/// because `codex-exec-json` classifies every call as Bash and puts the command in `args_json`,
-/// so `grep -n foo agent_exec.rs` is a real read that would otherwise be discarded.
+/// Fail closed: a parser not listed here cannot have `required_sources` enforced, and the gate
+/// says so rather than pretending. That is the same rule as the tool-record allowlist, applied
+/// one level finer.
+const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
+    "gemini-stream-json",
+    "grok-streaming-json",
+    "agy-stream-json",
+];
+
+/// Did any SUCCESSFUL READ of this source happen?
 ///
-/// Matching accepts the source's absolute path, or its path relative to the dispatch cwd,
-/// because agents routinely open files relative to where they were started.
+/// Deliberately narrower than "a look-shaped call mentioned the path". Searching for a
+/// filename is not reading the file, and this is not hypothetical: the live agy capture in
+/// `agent-adapter/tests/fixtures/agy-stream-tools-20260901.jsonl` runs `find_by_name` with
+/// `Pattern: "evidence.txt"` and a string of `run_command` (`find -name`, `ls`, `mdfind`)
+/// without ever opening the file. Under the previous rule every one of those satisfied the
+/// source. Grok found it by reading the fixture I collected and had not checked.
 ///
-/// Deliberately NOT a fuzzy suffix match. An earlier version accepted any trailing two
-/// segments, and its own test caught the hole immediately: `src/lib.rs` is the two-segment
-/// tail of `/repo/crates/shared-types/src/lib.rs`, and it is also contained in
-/// `crates/unrelated/src/lib.rs`. A reviewer could satisfy a named source by opening a
-/// completely different file with a common name, which is the exact false pass this check
-/// exists to stop. This workspace is full of `lib.rs`, `main.rs` and `mod.rs`.
+/// So: only `ToolKind::ReadFile` counts. `Grep`, `Glob` and `Bash` name paths constantly
+/// without opening them.
 ///
-/// Computing the relative form from the known cwd gives an exact string with no guessing.
+/// Matching accepts the absolute path or the path relative to the dispatch cwd. NOT a fuzzy
+/// suffix: an earlier version accepted any trailing two segments and its own test caught that
+/// `src/lib.rs` matches an unrelated `crates/unrelated/src/lib.rs`.
+///
+/// Known limit, stated rather than implied: a read whose recorded arguments merely CONTAIN the
+/// path string still counts, so `view_file` of `<path>.bak` satisfies `<path>`. Closing that
+/// needs per-parser argument field extraction rather than substring matching.
 fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &str) -> bool {
     let mut candidates: Vec<&str> = vec![source];
     let trimmed_cwd = cwd.trim_end_matches('/');
@@ -1545,16 +1573,27 @@ fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             candidates.push(rel);
         }
     }
+    // Match the candidate as a COMPLETE JSON string value, `"<cand>"`, not as a bare substring.
+    //
+    // Bare `contains` had two false passes, both found by review. Antigravity: with source
+    // `/repo/src/lib.rs` the relative candidate is `src/lib.rs`, which IS a substring of
+    // `crates/unrelated/src/lib.rs`, so reading an unrelated file satisfied the source. The
+    // old test only passed because it happened to pick a deeply nested path, hiding the very
+    // bug it claimed to guard. Grok: a read of `<path>.bak` satisfied `<path>`.
+    //
+    // Quote delimiting closes both. `"crates/unrelated/src/lib.rs"` does not contain
+    // `"src/lib.rs"` once the opening quote is required, and `"/repo/a.rs.bak"` does not
+    // contain `"/repo/a.rs"` once the closing quote is required. Every parser records
+    // arguments as JSON, so the delimiters are always present.
+    let quoted: Vec<String> = candidates.iter().map(|c| format!("\"{c}\"")).collect();
     tool_calls.iter().any(|c| {
-        let looked = matches!(
-            c.kind,
-            ToolKind::ReadFile | ToolKind::Grep | ToolKind::Glob | ToolKind::Bash
-        );
-        // `None` counts as success: several parsers never populate the field, and refusing on
-        // unknown would false-reject them. A recorded FALSE means the read saw nothing.
+        // `None` counts as success: several parsers never populate the field. A recorded FALSE
+        // means the call failed and saw nothing.
         let ok = c.success.unwrap_or(true);
         let args = c.args_json.as_deref().unwrap_or("");
-        looked && ok && candidates.iter().any(|cand| args.contains(cand))
+        matches!(c.kind, ToolKind::ReadFile)
+            && ok
+            && quoted.iter().any(|q| args.contains(q.as_str()))
     })
 }
 
@@ -1635,6 +1674,21 @@ fn enforce_reviewer_sight(
              `{parser_mode}` records tool calls and add it to PARSER_MODES_WITH_TOOL_RECORDS.",
             PARSER_MODES_WITH_TOOL_RECORDS.join(", ")
         );
+        lifecycle.push(LifecycleEvent {
+            state: "REJECTED".to_string(),
+            detail: detail.clone(),
+        });
+        return Err(detail);
+    }
+
+    if !required_sources.is_empty() && !PARSER_MODES_THAT_CLASSIFY_READS.contains(&parser_mode) {
+        let detail = format!(
+            "{agent_display} ran under parser mode `{parser_mode}`, which does not distinguish a \
+             file READ from a search or a shell command, so `required_sources` cannot be \
+             enforced on it and a pass would be theatre. Drop required_sources for this agent \
+             and rely on the weaker any-tool-call check, or route the review to a peer whose \
+             parser classifies reads ({})."
+        , PARSER_MODES_THAT_CLASSIFY_READS.join(", "));
         lifecycle.push(LifecycleEvent {
             state: "REJECTED".to_string(),
             detail: detail.clone(),
@@ -4477,8 +4531,9 @@ mod sight_gate_tests {
     /// Follows the `persist_deepseek_err_tokens` precedent already in this file: scan the
     /// PRODUCTION half of the source and assert an ordering property a unit test cannot reach.
     ///
-    /// RED IF: a third success arm appears without the gate, or a DONE write is added above
-    /// every gate call.
+    /// RED IF: a third success arm appears at all (gated or not), or a DONE write is added
+    /// above every gate call. Counting gates alone was NOT enough: an ungated third arm left
+    /// the gate count at two and the test green.
     #[test]
     fn sight_19_every_success_arm_gates_before_it_records_done() {
         let src = std::fs::read_to_string(
@@ -4502,14 +4557,19 @@ mod sight_gate_tests {
                 !production_src[start..i].trim_end().ends_with("fn")
             })
             .collect();
-        assert_eq!(
-            gate_calls.len(),
-            2,
-            "expected the gate on exactly two success arms, primary and degraded; found {}. \
-             An arm that returns an answer without gating is the two-surface split again, \
-             which has produced four separate defects in this codebase.",
-            gate_calls.len()
-        );
+        // Each DONE write must have a gate WITHIN A BOUNDED WINDOW above it, not merely
+        // somewhere earlier in the file.
+        //
+        // Counting gates alone was not enough: Antigravity pointed out that a THIRD ungated
+        // success arm leaves the gate count at two, and its DONE write still sits after the
+        // first gate, so the old assertion passed. A window makes a new ungated arm visible,
+        // because its DONE has no gate near it.
+        //
+        // Measured distances at the time of writing: 6562 and 2865 characters. The window is
+        // 9000, generous enough to absorb ordinary edits inside an arm and far tighter than
+        // "anywhere above". This follows the persist_deepseek_err_tokens precedent in this
+        // file, which uses the same shape with a 400-char window.
+        const MAX_GATE_TO_DONE: usize = 9000;
 
         let done_writes: Vec<usize> = production_src
             .match_indices("status: \"DONE\".to_string()")
@@ -4520,12 +4580,15 @@ mod sight_gate_tests {
             "expected at least one DONE outbox write to order against"
         );
 
-        let first_gate = *gate_calls.iter().min().expect("a gate call");
         for &done in &done_writes {
+            let nearest = gate_calls.iter().filter(|&&g| g < done).max().copied();
+            let gap = nearest.map(|g| done - g);
             assert!(
-                first_gate < done,
-                "a DONE outbox entry at offset {done} is written with no sight gate above it. \
-                 A rejected turn must never be recorded as DONE."
+                gap.is_some_and(|d| d <= MAX_GATE_TO_DONE),
+                "a DONE outbox entry at offset {done} has no sight gate within \
+                 {MAX_GATE_TO_DONE} chars above it (nearest gate: {nearest:?}, gap: {gap:?}). \
+                 Either a success arm records DONE without gating, or an arm grew past the \
+                 window and this constant needs a deliberate bump."
             );
         }
     }
@@ -4571,7 +4634,7 @@ mod sight_gate_tests {
         let sources = vec!["/repo/crates/triumvirate/src/agent_exec.rs".to_string()];
         assert!(
             enforce_reviewer_sight(
-                "Codex", &tools, "codex-exec-json", &sources, "/repo", &mut lifecycle,
+                "Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle,
             )
             .is_ok(),
             "the cwd-relative form of the named source must satisfy it"
@@ -4616,12 +4679,196 @@ mod sight_gate_tests {
             duration_ms: None,
             args_json: Some(r#"{"path":"crates/unrelated/src/lib.rs"}"#.to_string()),
         }];
+        // A SHALLOW source, deliberately. The relative candidate is `src/lib.rs`, which is a
+        // substring of the unrelated path above. The previous version of this test used a
+        // deeply nested source whose relative form was not a substring, so it passed while the
+        // bug it named was live. Antigravity caught that.
+        let sources = vec!["/repo/src/lib.rs".to_string()];
+        let err = enforce_reviewer_sight(
+            "Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle,
+        )
+        .expect_err("reading a DIFFERENT lib.rs must not satisfy the named one");
+        assert!(err.contains("/repo/src/lib.rs"), "must name the unopened source; got: {err}");
+    }
+
+    /// THE REAL PROOF: a live agy turn, through the real parser, into the real gate.
+    ///
+    /// `sight_20` builds a `ToolCallRecord` by hand, so it proves the gate accepts a
+    /// well-formed record and nothing about whether Antigravity can actually produce one.
+    /// Antigravity made exactly that criticism of its own regression guard. This closes it:
+    /// spawn agy through `build_agy_invocation` (the argv production uses), parse its real
+    /// stdout, and hand the result to `enforce_reviewer_sight`.
+    ///
+    /// Lives in the unit module rather than tests/ because the gate is private to this binary.
+    ///
+    /// Opt in with TRIUMVIRATE_LIVE_AGY=1. Spends subscription quota.
+    #[test]
+    #[ignore = "live: set TRIUMVIRATE_LIVE_AGY=1; spends subscription quota"]
+    fn sight_25_live_antigravity_clears_the_real_gate() {
+        if std::env::var("TRIUMVIRATE_LIVE_AGY").ok().as_deref() != Some("1") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sight25-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let src = dir.join("evidence.rs");
+        std::fs::write(&src, "// marker SLATE_FALCON_12
+").expect("fixture");
+
+        let (bin, extra) = mcp_bridge::agy_command();
+        let inv = mcp_bridge::agy::build_agy_invocation(
+            &bin,
+            &extra,
+            &format!(
+                "Open the file {} with your file viewing tool and reply with the marker it \
+                 contains. Do not search for it; read that exact path.",
+                src.display()
+            ),
+            dir.to_str().unwrap(),
+        )
+        .expect("invocation");
+
+        let out = std::process::Command::new(&inv.program)
+            .args(&inv.args)
+            .current_dir(&dir)
+            .output()
+            .expect("agy must run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        let mut p = agent_adapter::AgyStreamParser::new();
+        for line in stdout.lines() {
+            p.parse_line(line);
+        }
+        let parsed = p.finish();
+
+        let mut lifecycle = Vec::new();
+        let sources = vec![src.to_string_lossy().into_owned()];
+        let verdict = enforce_reviewer_sight(
+            "Antigravity",
+            &parsed.tool_calls,
+            &parsed.parser_mode,
+            &sources,
+            dir.to_str().unwrap(),
+            &mut lifecycle,
+        );
+        assert!(
+            verdict.is_ok(),
+            "a LIVE antigravity turn that read the named source must clear the real gate. \
+             This is the end to end claim the whole change rests on. parser_mode={}, \
+             tool_calls={:?}, rejection={:?}",
+            parsed.parser_mode,
+            parsed
+                .tool_calls
+                .iter()
+                .map(|c| (&c.tool, &c.kind, c.success))
+                .collect::<Vec<_>>(),
+            verdict
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the containment gap so it cannot be quietly forgotten.
+    ///
+    /// RED IF: agy gains a read-only review profile and this list is not updated, or codex
+    /// loses its sandbox and is not added. Either way the comment on `sight_10` is then lying
+    /// about what protects the tree, which is how the previous version of it went wrong.
+    #[test]
+    fn sight_24_the_uncontained_agents_are_named() {
+        assert!(
+            AGENTS_WITH_NO_WRITE_CONTAINMENT.contains(&"gemini"),
+            "agy runs with --dangerously-skip-permissions and no seatbelt by default, so a \
+             review dispatched to it can write the repo through run_command, invisible to the \
+             no-touch check"
+        );
+        assert!(
+            !AGENTS_WITH_NO_WRITE_CONTAINMENT.contains(&"codex"),
+            "codex exec without --full-auto is read-only, so the OS contains it"
+        );
+    }
+
+    /// Searching for a filename is NOT reading the file.
+    ///
+    /// The live agy capture runs `find_by_name` with `Pattern: "evidence.txt"` and several
+    /// `run_command` invocations naming the path, and never opens it. Under the old rule every
+    /// one of those satisfied the source.
+    ///
+    /// RED IF: Grep, Glob or Bash are allowed to satisfy a named source again.
+    #[test]
+    fn sight_21_a_search_naming_the_file_does_not_count_as_reading_it() {
+        let mut lifecycle = Vec::new();
+        let tools = vec![
+            ToolCallRecord {
+                id: None,
+                tool: "find_by_name".to_string(),
+                kind: ToolKind::Glob,
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(r#"{"Pattern":"lib.rs","SearchDirectory":"/repo"}"#.to_string()),
+            },
+            ToolCallRecord {
+                id: None,
+                tool: "run_command".to_string(),
+                kind: ToolKind::Bash,
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(r#"{"CommandLine":"ls crates/shared-types/src/lib.rs"}"#.to_string()),
+            },
+        ];
         let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
+        let err = enforce_reviewer_sight(
+            "Antigravity", &tools, "agy-stream-json", &sources, "/repo", &mut lifecycle,
+        )
+        .expect_err("searching for and listing a file is not opening it");
+        assert!(err.contains("never successfully opened"), "got: {err}");
+    }
+
+    /// A failed read saw nothing, even on the agy path where failure is an ERROR state.
+    /// RED IF: `success: Some(false)` starts satisfying a source.
+    #[test]
+    fn sight_22_a_failed_read_on_the_agy_path_does_not_satisfy_a_source() {
+        let mut lifecycle = Vec::new();
+        let tools = vec![ToolCallRecord {
+            id: Some("7".to_string()),
+            tool: "view_file".to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(false),
+            duration_ms: None,
+            args_json: Some(r#"{"AbsolutePath":"/repo/a.rs"}"#.to_string()),
+        }];
+        let sources = vec!["/repo/a.rs".to_string()];
+        assert!(
+            enforce_reviewer_sight(
+                "Antigravity", &tools, "agy-stream-json", &sources, "/repo", &mut lifecycle,
+            )
+            .is_err(),
+            "a TOOL_ERROR read saw nothing and must not satisfy the source"
+        );
+    }
+
+    /// required_sources must be REFUSED, not faked, on a parser that cannot tell a read from a
+    /// shell command. codex-exec-json stamps every call Bash.
+    ///
+    /// RED IF: codex is allowed to "satisfy" named sources, which would be theatre: on that
+    /// backend `cat foo.rs` and `ls foo.rs` are the same record.
+    #[test]
+    fn sight_23_named_sources_are_refused_on_a_parser_that_cannot_classify_reads() {
+        let mut lifecycle = Vec::new();
+        let tools = vec![ToolCallRecord {
+            id: None,
+            tool: "shell".to_string(),
+            kind: ToolKind::Bash,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(r#"{"command":"cat /repo/a.rs"}"#.to_string()),
+        }];
+        let sources = vec!["/repo/a.rs".to_string()];
         let err = enforce_reviewer_sight(
             "Codex", &tools, "codex-exec-json", &sources, "/repo", &mut lifecycle,
         )
-        .expect_err("reading a DIFFERENT lib.rs must not satisfy the named one");
-        assert!(err.contains("shared-types"), "must name the unopened source; got: {err}");
+        .expect_err("codex cannot distinguish a read, so named sources must be refused");
+        assert!(
+            err.contains("does not distinguish a file READ"),
+            "must explain WHY it is refused so the caller can act; got: {err}"
+        );
     }
 
     /// A blind parser must be cleared BEFORE the agent is blamed for missing a named source.
@@ -4734,8 +4981,19 @@ mod sight_gate_tests {
     }
 
     /// The honest limit, pinned so nobody later claims a guarantee the code does not give.
+    ///
     /// `codex-exec-json` stamps every call ToolKind::Bash, so a write performed inside a shell
-    /// command is INVISIBLE here. The read-only sandbox is what actually prevents it.
+    /// command is INVISIBLE to this check.
+    ///
+    /// AND THE FALLBACK IS NOT UNIFORM. An earlier version of this comment said "the read-only
+    /// sandbox is what actually prevents it", which is true for codex (`codex exec` without
+    /// --full-auto is read-only) and FALSE for agy: `agy_sandbox_enabled()` defaults to false,
+    /// so agy runs yolo with --dangerously-skip-permissions and no seatbelt. An agy reviewer
+    /// can overwrite the repository through `run_command`, invisible to this check and
+    /// unrestrained by the OS. Antigravity found this in its own backend.
+    ///
+    /// So the accurate statement is: a shell write is undetectable here, and whether anything
+    /// else stops it depends entirely on the agent. See AGENTS_WITH_NO_WRITE_CONTAINMENT.
     /// RED IF: someone maps Bash into the mutation set, which would false-reject every codex
     /// review, or if codex.rs starts classifying kinds and this comment goes stale.
     #[test]

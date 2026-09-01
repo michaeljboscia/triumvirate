@@ -90,8 +90,13 @@ pub struct AgyStreamParser {
 /// exact hole the sight gate exists to close.
 pub fn map_agy_tool_kind(name: &str) -> ToolKind {
     match name {
-        "view_file" | "read_url_content" | "read_resource" | "read_browser_page"
-        | "notebook_execution" => ToolKind::ReadFile,
+        "view_file" | "read_url_content" | "read_resource" | "read_browser_page" => {
+            ToolKind::ReadFile
+        }
+        // EXECUTES a notebook. Was classified ReadFile, which was doubly wrong: it could run
+        // side effects while looking like a read, AND it could satisfy a required source
+        // without opening it. Grok found it.
+        "notebook_execution" => ToolKind::Bash,
         "write_to_file" | "generate_image" => ToolKind::WriteFile,
         "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" => {
             ToolKind::EditFile
@@ -220,16 +225,26 @@ impl AgyStreamParser {
             .and_then(Value::as_f64)
             .map(|s| (s * 1000.0).round() as u64);
 
-        // A tool step that carries an `output` and state DONE succeeded. agy does not emit an
-        // explicit error flag in the captures, so absence of DONE means "still running", which
-        // is `None` and NOT a claim of success.
+        // Three terminal-ish states, and the distinction matters to the sight gate:
+        //   DONE   -> succeeded
+        //   ERROR  -> FAILED. A failed read saw nothing and must not satisfy a named source.
+        //   other  -> still running, which is `None` and NOT a claim of success.
+        //
+        // An earlier version of this comment asserted "agy does not emit an explicit error
+        // flag in the captures". That was false, and the capture shipped in
+        // tests/fixtures/agy-stream-tools-20260901.jsonl contradicts it directly:
+        //   "state":"ERROR","error":{"type":"TOOL_ERROR","message":"context canceled"}
+        // Because ERROR fell through to `None` and the gate reads `success.unwrap_or(true)`,
+        // a failed agy tool call counted as a successful look. Grok found it by reading the
+        // fixture I collected and did not check.
         let done = state.eq_ignore_ascii_case("DONE");
+        let errored = state.eq_ignore_ascii_case("ERROR");
 
         if let Some(pos) = self.open_steps.iter().position(|(i, _)| *i == idx) {
             let (_, call_pos) = self.open_steps[pos];
             let rec = &mut self.tool_calls[call_pos];
-            if done {
-                rec.success = Some(true);
+            if done || errored {
+                rec.success = Some(!errored);
                 self.open_steps.remove(pos);
             }
             if params.is_some() {
@@ -252,11 +267,17 @@ impl AgyStreamParser {
             id: Some(idx.to_string()),
             tool: name.clone(),
             kind: map_agy_tool_kind(&name),
-            success: if done { Some(true) } else { None },
+            success: if done {
+                Some(true)
+            } else if errored {
+                Some(false)
+            } else {
+                None
+            },
             duration_ms,
             args_json: params,
         });
-        if !done {
+        if !done && !errored {
             self.open_steps.push((idx, self.tool_calls.len() - 1));
         }
         self.events.push(event(
@@ -375,6 +396,44 @@ mod tests {
         );
     }
 
+    /// An ERROR tool step is a FAILURE, not an unfinished one.
+    ///
+    /// Uses the real error event from the shipped capture. RED IF: ERROR stops being recorded
+    /// as `success: Some(false)`, which is what let a failed agy read satisfy a named source
+    /// because the gate reads `success.unwrap_or(true)`.
+    #[test]
+    fn agy_12_an_error_tool_step_records_failure() {
+        let mut p = AgyStreamParser::new();
+        p.parse_line(r#"{"event":"step_update","step_update":{"step_index":7,"state":"ACTIVE","step_type":"tool","tool_name":"view_file","tool_info":{"name":"view_file","parameters":{"AbsolutePath":"/x/y.rs"}}}}"#);
+        p.parse_line(r#"{"event":"step_update","step_update":{"step_index":7,"state":"ERROR","step_type":"tool","tool_name":"view_file","error":{"type":"TOOL_ERROR","message":"context canceled"},"tool_info":{"name":"view_file","parameters":{"AbsolutePath":"/x/y.rs"}}}}"#);
+        let r = p.finish();
+        assert_eq!(r.tool_calls.len(), 1, "one step, opened then failed");
+        assert_eq!(
+            r.tool_calls[0].success,
+            Some(false),
+            "a TOOL_ERROR saw nothing and must be recorded as a failure"
+        );
+    }
+
+    /// The shipped capture really does contain an ERROR state. Guards against the fixture
+    /// being replaced with a happy-path-only capture, which would silently make agy_12 the
+    /// only coverage and let the real-world case regress.
+    ///
+    /// RED IF: the tools fixture no longer exercises a tool failure.
+    #[test]
+    fn agy_13_the_live_capture_still_exercises_a_tool_error() {
+        assert!(
+            TOOLS.contains(r#""state":"ERROR""#),
+            "the tools fixture must keep a real ERROR event; a comment in this file once \
+             claimed agy emits no error flag while this capture contradicted it"
+        );
+        let r = parse(TOOLS);
+        assert!(
+            r.tool_calls.iter().any(|c| c.success == Some(false)),
+            "the capture's ERROR event must surface as a failed tool call"
+        );
+    }
+
     /// agy is single-turn: publishing a resumable session id would let the worker registry
     /// cache something no dispatcher will ever resume.
     /// RED IF: `conversation_id` starts leaking into `session_id`.
@@ -400,12 +459,33 @@ mod tests {
         assert_eq!(PARSER_MODE_STREAM, "agy-stream-json");
     }
 
-    /// RED IF: `result.response` stops being preferred, or text is lost entirely. Switching
-    /// output formats must not cost us the actual answer.
+    /// The `result` event must WIN over accumulated deltas, and the fallback must still work.
+    ///
+    /// The previous version asserted only that the fixture yields "pong" and claimed RED IF the
+    /// result event stopped being preferred. That claim was false: the fixture's `text_delta`
+    /// also spells "pong", so dropping the result event entirely left the test green.
+    /// Antigravity caught it. Distinguishing the two now requires them to DISAGREE.
+    ///
+    /// RED IF: deltas start winning over the result event, or the delta fallback is removed.
     #[test]
-    fn agy_04_the_final_answer_comes_from_the_result_event() {
-        let r = parse(NOTOOLS);
-        assert_eq!(r.response_text, "pong", "got: {:?}", r.response_text);
+    fn agy_04_the_result_event_wins_and_deltas_are_the_fallback() {
+        assert_eq!(parse(NOTOOLS).response_text, "pong");
+
+        // Deltas and result deliberately disagree. Only preferring `result` gives "FINAL".
+        let mut p = AgyStreamParser::new();
+        p.parse_line(r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"PARTIAL"}}"#);
+        p.parse_line(r#"{"event":"result","result":{"status":"SUCCESS","response":"FINAL"}}"#);
+        assert_eq!(
+            p.finish().response_text,
+            "FINAL",
+            "result.response is authoritative and must beat accumulated deltas"
+        );
+
+        // No result event: the deltas are all we have, and losing them would discard a
+        // truncated turn's only content.
+        let mut q = AgyStreamParser::new();
+        q.parse_line(r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"PARTIAL"}}"#);
+        assert_eq!(q.finish().response_text, "PARTIAL", "deltas are the fallback");
     }
 
     /// RED IF: usage stops being read from the stream. This replaces log-file scraping.

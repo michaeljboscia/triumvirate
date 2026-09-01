@@ -385,3 +385,91 @@ works. But the relative candidate contributes nothing on this backend and should
 described as if it does.
 
 Full suite: 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
+
+---
+
+## Round 4 continued: Grok and Antigravity on the agy fix. Six real defects.
+
+Both reviewed `dded41b`, so both predate the default-path fix.
+
+### From my own fixture, which I collected and did not read
+
+**The parser never recorded a failure.** The shipped capture
+`agy-stream-tools-20260901.jsonl` contains
+`"state":"ERROR","error":{"type":"TOOL_ERROR","message":"context canceled"}`. My code comment
+beside it asserted "agy does not emit an explicit error flag in the captures". False, and
+contradicted by the file next to it. ERROR fell through to `success: None`, the gate reads
+`success.unwrap_or(true)`, so a FAILED agy read counted as a successful look and `sight_14`
+could not fail on the agy path. Grok found it by reading the evidence I had gathered.
+FIXED, with `agy_12` and `agy_13`, the latter pinning that the fixture still exercises a real
+error so a happy-path recapture cannot silently remove the coverage.
+
+### Searching for a file is not reading it
+
+`tool_call_touched_source` accepted `ReadFile | Grep | Glob | Bash`. The live capture runs
+`find_by_name` with `Pattern: "evidence.txt"` and several `run_command` (`find -name`, `ls`,
+`mdfind`) and NEVER opens the file. Every one of those satisfied the source, and `agy_02`
+asserted that as proof the check works. The substring hole written down as a passing test.
+
+FIXED: only `ToolKind::ReadFile` satisfies a named source. Consequence, stated rather than
+hidden: `codex-exec-json` stamps every call `Bash`, so `required_sources` cannot be enforced
+there at all. Rather than fake it, the gate now REFUSES named sources on parsers that cannot
+classify reads (`PARSER_MODES_THAT_CLASSIFY_READS`), which is the fail-closed rule applied one
+level finer. `sight_21`, `sight_22`, `sight_23`.
+
+### `notebook_execution` was classified as a read
+
+It EXECUTES. Doubly wrong: it could run side effects while looking like a read, and it could
+satisfy a required source without opening it. Now `Bash`. Grok found it.
+
+### Three of my RED IF comments were false. Antigravity found all three.
+
+1. **`agy_04`**: claimed red if `result.response` stopped being preferred. The fixture's
+   `text_delta` also spells "pong", so dropping the result event left it green. Now the two
+   are made to DISAGREE, and both preference and fallback are asserted.
+2. **`sight_19`**: claimed red if a third ungated success arm appeared. It would not: the gate
+   count stays 2 and the new DONE still sits after the first gate. Now each DONE must have a
+   gate within a bounded 9000-char window, following the `persist_deepseek_err_tokens`
+   precedent. Measured distances are 6562 and 2865.
+3. **`sight_15`**: claimed to guard against fuzzy matching, and only passed because I picked a
+   deeply nested source. With source `/repo/src/lib.rs` the relative form `src/lib.rs` IS a
+   substring of `crates/unrelated/src/lib.rs`. It hid the exact bug it named.
+   FIXED both the test (shallow source, the case that actually breaks) and the code: matching
+   is now on the quote-delimited JSON value `"<path>"`, not a bare substring. That also closes
+   Grok's `<path>.bak` hole. Mutation-verified: restoring bare `contains` reds `sight_15`.
+
+### The security hole, and my comment that lied about it
+
+`sight_10` said a shell write is undetectable but "the read-only sandbox is what actually
+prevents it". True for codex (`codex exec` without --full-auto is read-only). **FALSE for agy**:
+`agy_sandbox_enabled()` defaults to false and dispatch passes
+`--dangerously-skip-permissions`, so an agy reviewer can overwrite the repository through
+`run_command`, invisible to the no-touch check and unrestrained by the OS. Antigravity found
+this in its own backend.
+
+Recorded as `AGENTS_WITH_NO_WRITE_CONTAINMENT` with `sight_24`. Documentation with a test
+attached, not enforcement: refusing agy reviews outright is the wrong trade while it is the
+only Gemini backend. Closing it properly needs a read-only profile for review dispatches, or
+denying agy's write tools at spawn. NEITHER IS BUILT.
+
+### `sight_20` did not prove what it claimed
+
+It builds a `ToolCallRecord` by hand, so it proves the gate accepts a well-formed record and
+nothing about whether Antigravity can produce one. Antigravity said so about its own
+regression guard.
+
+`sight_25` closes it: spawn agy through `build_agy_invocation`, parse the real stdout, hand the
+result to the real `enforce_reviewer_sight`. It lives in the unit module because the gate is
+private to the binary. **Ran live and passed.**
+
+### Still open
+
+- Plain-text fallback (`TRIUMVIRATE_AGY_OUTPUT=text`) is no longer exercised by subprocess
+  tests. Antigravity flagged the coverage loss and it is real.
+- `call_mcp_tool`, `invoke_subagent`, `browser_subagent` are `Unknown`: they can write and
+  escape the no-touch check. Unclassifiable without guessing; containment is the answer.
+- Fixtures go stale. If Google changes the wire format the offline suite stays green while
+  production breaks. `e_agy_sight_02` and `sight_25` are the live guards, and they are opt-in.
+- `require_sight` is still opt-in, and only one-shot `ask_agent` can set it.
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning.
