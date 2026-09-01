@@ -235,6 +235,41 @@ fn daemon_bind_port(bind_addr: &str) -> Option<u16> {
     bind_addr.rsplit(':').next()?.parse::<u16>().ok()
 }
 
+/// The `review_agent` mapping, extracted so a test can drive the PRODUCTION code rather than
+/// rebuild it.
+///
+/// The first tests for this reconstructed the same struct inside the test body and asserted
+/// the reconstruction, so deleting `require_sight: Some(true)` from the tool left them green.
+/// Grok: "the same class of test this repo has already shipped: a RED IF that cannot fail."
+fn review_params_to_request(
+    req: shared_types::ReviewRequestParams,
+) -> Result<AskAgentRequest, String> {
+    if req.sources.is_empty() {
+        return Err(
+            "review_agent requires at least one source path. A review with nothing to read is \
+             either a review of an inline artifact, which belongs on ask_agent, or a review of \
+             nothing."
+                .to_string(),
+        );
+    }
+    if let Some(rel) = req.sources.iter().find(|p| !p.starts_with('/')) {
+        return Err(format!(
+            "review_agent needs ABSOLUTE source paths; got {rel:?}. Antigravity runs its tools \
+             from its own scratch directory rather than the dispatch cwd, so a relative path is \
+             not resolvable on that backend."
+        ));
+    }
+    Ok(AskAgentRequest {
+        agent: req.agent,
+        message: req.message,
+        cwd: req.cwd,
+        required_sources: req.sources,
+        // Set HERE, by the surface, not by the caller. That is the whole point of the tool.
+        require_sight: Some(true),
+        ..Default::default()
+    })
+}
+
 impl McpBridge {
     fn new() -> Self {
         Self::with_persistence(true)
@@ -509,29 +544,7 @@ impl McpBridge {
         // surface exists: `require_sight` on ask_agent is a flag, and a flag defaults to off
         // and gets forgotten. Grok, twice: "a skip-catcher that is off unless remembered is not
         // a skip-catcher."
-        if req.sources.is_empty() {
-            return Err(
-                "review_agent requires at least one source path. A review with nothing to read \
-                 is either a review of an inline artifact, which belongs on ask_agent, or a \
-                 review of nothing."
-                    .to_string(),
-            );
-        }
-        if let Some(rel) = req.sources.iter().find(|p| !p.starts_with('/')) {
-            return Err(format!(
-                "review_agent needs ABSOLUTE source paths; got {rel:?}. Antigravity runs its \
-                 tools from its own scratch directory rather than the dispatch cwd, so a \
-                 relative path is not resolvable on that backend."
-            ));
-        }
-        let inner = AskAgentRequest {
-            agent: req.agent,
-            message: req.message,
-            cwd: req.cwd,
-            required_sources: req.sources,
-            require_sight: Some(true),
-            ..Default::default()
-        };
+        let inner = review_params_to_request(req)?;
         let local_test_execution_allowed = cfg!(test) && !mcp_daemon_proxy_enabled();
         mcp_tools::inter_agent::ask_agent(
             &inner,
@@ -3041,48 +3054,56 @@ mod tests {
         Ok(())
     }
 
-    /// The reviewer surface must set sight ITSELF, not trust the caller to remember a flag.
+    /// The reviewer surface sets sight ITSELF. Drives the production mapping.
     ///
-    /// RED IF: review_agent stops setting require_sight or stops forwarding sources, which
-    /// would make it ask_agent with extra steps.
+    /// RED IF: `review_params_to_request` stops setting require_sight or stops forwarding
+    /// sources. The previous version rebuilt the struct inside the test, so deleting the field
+    /// from the tool left it green. Grok caught that.
     #[test]
     fn review_agent_always_requires_sight() {
-        // Mirrors what the tool builds, so the assertion is about the mapping and not about
-        // MCP plumbing.
-        let params = shared_types::ReviewRequestParams {
+        let out = review_params_to_request(shared_types::ReviewRequestParams {
             agent: "grok".to_string(),
             message: "review it".to_string(),
             sources: vec!["/repo/a.rs".to_string()],
             cwd: Some("/repo".to_string()),
-        };
-        let inner = AskAgentRequest {
-            agent: params.agent.clone(),
-            message: params.message.clone(),
-            cwd: params.cwd.clone(),
-            required_sources: params.sources.clone(),
-            require_sight: Some(true),
-            ..Default::default()
-        };
-        assert_eq!(inner.require_sight, Some(true), "sight is not optional on this surface");
-        assert_eq!(inner.required_sources, vec!["/repo/a.rs".to_string()]);
+        })
+        .expect("absolute sources are accepted");
+        assert_eq!(
+            out.require_sight,
+            Some(true),
+            "the SURFACE must set sight; a caller cannot forget what it never supplies"
+        );
+        assert_eq!(out.required_sources, vec!["/repo/a.rs".to_string()]);
+        assert_eq!(out.agent, "grok");
     }
 
-    /// A relative source path is refused up front, because agy cannot resolve one: it runs its
-    /// tools from its own scratch directory, not the dispatch cwd.
-    /// RED IF: the absolute-path check is dropped, which would produce a confusing
-    /// "never opened" rejection instead of a clear input error.
+    /// Empty and relative source lists are refused by the production mapping, before dispatch.
+    ///
+    /// The previous version asserted that `"src/lib.rs"` does not start with `/`, which is a
+    /// fact about string literals and not about review_agent. Grok caught that too.
+    ///
+    /// RED IF: either guard is removed, turning a clear input error into either an ungated
+    /// review or a confusing "never opened" rejection.
     #[test]
-    fn review_agent_refuses_relative_sources() {
-        let relative = ["src/lib.rs", "./a.rs", "../b.rs"];
-        for p in relative {
-            assert!(
-                !p.starts_with('/'),
-                "fixture must be relative to exercise the check: {p}"
-            );
-        }
+    fn review_agent_refuses_empty_and_relative_sources() {
+        let empty = review_params_to_request(shared_types::ReviewRequestParams {
+            agent: "grok".to_string(),
+            message: "m".to_string(),
+            sources: vec![],
+            cwd: None,
+        });
+        assert!(empty.is_err(), "an empty sources list must be refused");
+
+        let relative = review_params_to_request(shared_types::ReviewRequestParams {
+            agent: "grok".to_string(),
+            message: "m".to_string(),
+            sources: vec!["src/lib.rs".to_string()],
+            cwd: None,
+        });
+        let err = relative.expect_err("a relative source path must be refused");
         assert!(
-            "/repo/a.rs".starts_with('/'),
-            "an absolute path must pass the same check"
+            err.contains("ABSOLUTE"),
+            "the error must say WHY, since agy cannot resolve a relative path; got: {err}"
         );
     }
 

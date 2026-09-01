@@ -781,3 +781,87 @@ inline-artifact review shape, which is legitimately toolless and must not be gat
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning. Live guards pass for
 all three peers: `bash scripts/verify-live-agents.sh`.
+
+---
+
+## Round 10, 2026-09-01. My "all five conditions met" claim was wrong. Grok said three.
+
+All three peers reviewed the frozen commit. Antigravity ran the `unwrap_shell_wrapper` mutation
+itself and confirmed the suite catches it. Then they found ten defects, and Grok's verdict was
+blunt and correct: **three of five conditions met, not five.**
+
+### THE BIG ONE: codex was never contained, and I said it was
+
+`codex_yolo_enabled()` defaults ON. The dispatch injects
+`--dangerously-bypass-approvals-and-sandbox`: no sandbox, no approvals, full filesystem access,
+deliberately so a consult can write into a sibling project.
+
+Meanwhile `sight_10` asserted "codex exec without --full-auto is read-only",
+`AGENTS_WITH_NO_WRITE_CONTAINMENT` was empty, and `sight_24` encoded that as a test. And
+`read_only`, which I had already computed and plumbed, was **silently dropped** on the codex
+arm: `run_codex_cli_process_with_session` did not take the parameter.
+
+**This is the identical defect as the agy one, one file over, written WHILE fixing the agy
+version.** Both times: a comment asserting a protection that does not exist on the actual
+dispatch path, then a test encoding the comment as truth. I reasoned about what `codex exec`
+does by default instead of reading what Triumvirate passes it.
+
+FIXED: a review dispatch forces `--sandbox read-only`, and `sight_29` proves it by denied write.
+
+### And the fix's first version passed on a startup failure
+
+`sight_29` initially passed in **0.11 seconds**. codex had not run at all: `codex exec` REJECTS
+`--ask-for-approval` with a usage error, and my read-only branch pushed it alongside
+`--sandbox`. The process died instantly, the probe file was never written, and "no file was
+written" looked exactly like containment.
+
+**Grok had named this false-pass mode for `sight_27` before it happened here**: "agy never
+tries; agy fails to start". `sight_29` now carries a CONTROL asserting the turn actually
+produced output. Verified: contained takes 10.45s and denies the write, uncontained takes
+11.9s and the write LANDS.
+
+### I reopened the search-not-read hole while closing it
+
+Codex: `rg /repo/required.rs /repo/other.rs` reads other.rs. `required.rs` is the PATTERN. It
+was classified `ReadFile` and the boundary matcher counted the source as opened.
+
+Antigravity, independently: `yq -i`, `awk -i inplace`, `perl -i` and `ruby -i` classify as reads
+WHILE MUTATING, because only `sed -i` was checked, and `sed -ix` slipped past even that.
+
+Both fixed by one change, on Grok's principle: **a read is a program that puts the file's
+CONTENTS in front of the model.** READERS is now cat, head, tail, nl, bat, od, xxd, strings,
+cut, pr, zcat, more, less. Dropped: grep, rg, wc, shasum, diff, cmp, awk, sed, jq, yq. Plus a
+general in-place-flag guard and `&` as a compound.
+
+Cost, accepted: a codex reviewer that only greps a named file no longer satisfies it. Fails
+CLOSED, which is the rule.
+
+### The review_agent tests could not fail
+
+Grok: deleting `require_sight: Some(true)` from the tool left them green, because they rebuilt
+the same struct inside the test and asserted the reconstruction. The relative-path test merely
+asserted that `"src/lib.rs"` does not start with `/`, a fact about string literals.
+
+FIXED by extracting `review_params_to_request`, the production mapping, and driving THAT.
+Mutation-verified: setting `require_sight: None` in the tool now reds the test.
+
+### Also fixed
+
+- `policy_rejected` still set `$ai_is_error = true`, so a dashboard keyed on that rather than
+  `$exception` would still count rejections as errors (Codex).
+- `args_name_path` omitted `\` as a boundary, false-rejecting a JSON-escaped multiline command
+  (Antigravity).
+- `sight_27` was NOT in the live-guard runner (Grok). Both containment proofs are now in it.
+
+### Still open, honestly
+
+- `sight_19` remains proximity-based, not control-flow. Its RED IF is still inaccurate.
+- No HTTP `/review` twin; the distinct reviewer surface is MCP-only.
+- No test drives `session_ask_route` and checks the inner `AskAgentRequest`.
+- The default surfaces are still forgettable: `ask_agent` without flags, `ask_daemon`,
+  `send_message`, `query_gemini_review` all give an ungated review. Grok: condition 1 is met in
+  the tool body, and NOT met as a reason to turn the gate on by default.
+- **Grok's verdict stands: do not turn it on by default.**
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning. All SIX live guards
+pass, including both containment proofs.

@@ -76,15 +76,36 @@ fn unwrap_shell_wrapper(cmd: &str) -> &str {
 /// A compound or piped command is NOT classified, because the reader may not be the part that
 /// touched the named path. Any redirection disqualifies, and `sed -i` writes.
 fn command_reads_file_contents(command: &str) -> bool {
+    // ONLY programs that emit FILE CONTENTS to the model.
+    //
+    // The first version included `grep`, `rg`, `wc`, `shasum`, `diff`, `cmp`, `awk`, `sed`,
+    // `jq` and `yq`, and every one of them was a hole:
+    //
+    //   `rg /repo/required.rs /repo/other.rs`  reads other.rs; required.rs is the PATTERN, and
+    //                                          the boundary matcher counted it as opened.
+    //   `wc /repo/a.rs`                        shows the model a COUNT, not the file.
+    //   `shasum`, `cmp`                        same: a summary, not contents.
+    //   `yq -i`, `awk -i inplace`, `perl -i`   MUTATE while classified as reads. Only `sed -i`
+    //                                          was checked, and `sed -ix` slipped past that.
+    //
+    // Codex found the pattern-position hole, Antigravity found the in-place-mutation bypass,
+    // and Grok named the principle that fixes all of them: a read is a program that puts the
+    // file's CONTENTS in front of the model. Anything else is a search or a summary, and
+    // `sight_21` already forbids a search from satisfying a source on the other backends.
+    //
+    // Unknown programs stay Bash and fail closed, so the cost of being strict here is a false
+    // REJECTION of an unusual reader, never a false pass.
     const READERS: &[&str] = &[
-        "cat", "head", "tail", "nl", "od", "xxd", "strings", "wc", "shasum", "grep", "rg",
-        "egrep", "fgrep", "sed", "awk", "jq", "yq", "diff", "cmp",
+        "cat", "head", "tail", "nl", "bat", "od", "xxd", "strings", "cut", "pr", "zcat", "more",
+        "less",
     ];
     let cmd = unwrap_shell_wrapper(command.trim());
     if cmd.is_empty() {
         return false;
     }
-    if cmd.contains("&&") || cmd.contains("||") || cmd.contains(';') || cmd.contains('|') {
+    if cmd.contains("&&") || cmd.contains("||") || cmd.contains(';') || cmd.contains('|')
+        || cmd.contains('&')
+    {
         return false;
     }
     if cmd.contains('>') {
@@ -94,8 +115,13 @@ fn command_reads_file_contents(command: &str) -> bool {
         return false;
     };
     let base = program.rsplit('/').next().unwrap_or(program);
-    if base == "sed" && cmd.contains(" -i") {
-        return false;
+    // Belt and braces: no in-place flag may ever ride a reader, whatever gets added later.
+    // `sed -ix` and `sed --in-place` both slipped past the old `" -i"` substring check.
+    for tok in cmd.split_whitespace().skip(1) {
+        if tok == "-i" || tok.starts_with("-i") && tok.len() <= 4 || tok.starts_with("--in-place")
+        {
+            return false;
+        }
     }
     READERS.contains(&base)
 }
@@ -384,10 +410,9 @@ mod command_classification_tests {
         for c in [
             "cat crates/foo/src/lib.rs",
             "head -n 50 /repo/a.rs",
-            "sed -n '1,80p' /repo/a.rs",
-            "rg needle /repo/a.rs",
-            "grep -n fn /repo/a.rs",
             "/usr/bin/cat /repo/a.rs",
+            "bat /repo/a.rs",
+            "cut -d, -f1 /repo/a.rs",
         ] {
             assert!(command_reads_file_contents(c), "should be a read: {c}");
         }
@@ -409,7 +434,9 @@ mod command_classification_tests {
             "this is the literal shape from a live codex turn"
         );
         assert!(command_reads_file_contents("bash -c \"head -n 5 /repo/a.rs\""));
-        assert!(command_reads_file_contents("/bin/sh -lic 'rg needle /repo/a.rs'"));
+        // A search inside the wrapper is still not a read.
+        assert!(!command_reads_file_contents("/bin/zsh -lc 'rg needle /repo/a.rs'"));
+        assert!(command_reads_file_contents("/bin/sh -lic 'tail -n 5 /repo/a.rs'"));
         // The wrapper must not launder a non-reader.
         assert!(!command_reads_file_contents("/bin/zsh -lc 'ls /repo'"));
         // Nor a compound script: the reader may not be what touched the named path.
@@ -430,6 +457,19 @@ mod command_classification_tests {
             "file /repo/a.rs",
             "mdfind a.rs",
             "test -f /repo/a.rs",
+            // SEARCHES and SUMMARIES. None of these put the file's contents in front of the
+            // model, and the first two let the PATH be the search pattern rather than the file
+            // operand: `rg /repo/required.rs /repo/other.rs` reads other.rs.
+            "rg needle /repo/a.rs",
+            "grep -n fn /repo/a.rs",
+            "rg /repo/required.rs /repo/other.rs",
+            "wc /repo/a.rs",
+            "shasum /repo/a.rs",
+            "diff /repo/a.rs /repo/b.rs",
+            // PROGRAMMABLE, and all have in-place flags.
+            "sed -n '1,80p' /repo/a.rs",
+            "awk '{print}' /repo/a.rs",
+            "jq . /repo/a.json",
         ] {
             assert!(!command_reads_file_contents(c), "must NOT be a read: {c}");
         }
@@ -445,6 +485,9 @@ mod command_classification_tests {
             "cat /repo/a.rs | grep x",
             "cat /repo/a.rs > /tmp/copy",
             "sed -i '' 's/a/b/' /repo/a.rs",
+            "cat -i /repo/a.rs",
+            "cat --in-place /repo/a.rs",
+            "cat /repo/a.rs & rm /repo/b.rs",
             "python3 -c 'open(\"/repo/a.rs\")'",
             "",
         ] {

@@ -1164,7 +1164,12 @@ pub fn record_dispatch_generation(
 /// property shape (especially the structured `$ai_input`/`$ai_output_choices` the LLM UI keys on)
 /// is unit-testable without a live PostHog.
 fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
-    let is_error = g.outcome != "success" && g.outcome != "degraded_success";
+    // `policy_rejected` is NOT an error. The gate declining a turn is the gate working, and a
+    // dashboard keyed on `$ai_is_error` rather than `$exception` would otherwise count every
+    // rejection as an LLM failure and inflate the error rate. Codex found this after the
+    // exception path had already been fixed.
+    let is_error =
+        g.outcome != "success" && g.outcome != "degraded_success" && g.outcome != "policy_rejected";
 
     let mut props = json!({
             // --- PostHog's LLM analytics schema ---

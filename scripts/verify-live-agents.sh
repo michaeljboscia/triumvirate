@@ -52,6 +52,10 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "agy" ]; then
         -p triumvirate --test integration_agy_sight
     run_guard "agy clears the real gate" TRIUMVIRATE_LIVE_AGY agy \
         -p triumvirate --bin triumvirate sight_25
+    # THE CONTAINMENT PROOF. Grok pointed out this was missing from the runner: the one guard
+    # that proves the sandbox actually DENIES a write was not among the guards that get run.
+    run_guard "agy containment (denied write)" TRIUMVIRATE_LIVE_AGY agy \
+        -p triumvirate --bin triumvirate sight_27
 fi
 
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "codex" ]; then
@@ -60,6 +64,12 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "codex" ]; then
     # which no offline test saw because they all used the shape I assumed.
     run_guard "codex source gating" TRIUMVIRATE_LIVE_CODEX codex \
         -p triumvirate --bin triumvirate sight_28
+    # Codex containment. Triumvirate launches codex --dangerously-bypass-approvals-and-sandbox
+    # by default, so a review MUST override that with --sandbox read-only. This guard carries a
+    # control asserting codex actually ran, because the first version of it passed in 0.11s on
+    # a startup failure.
+    run_guard "codex containment (denied write)" TRIUMVIRATE_LIVE_CODEX codex \
+        -p triumvirate --bin triumvirate sight_29
 fi
 
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "grok" ]; then
