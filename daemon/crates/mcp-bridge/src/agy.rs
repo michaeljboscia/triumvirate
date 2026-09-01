@@ -229,6 +229,23 @@ pub fn build_agy_invocation(
         log_path.to_string_lossy().into_owned(),
         "--dangerously-skip-permissions".to_string(),
     ];
+    // THE DEFAULT PATH. This branch builds its argv inline rather than calling `agy_args`,
+    // which is why the stream-json flag has to be applied in BOTH places.
+    //
+    // 2026-09-01: it was first added to `agy_args` only. `agy_args` is used exclusively by the
+    // opt-in sandbox branch, so production (yolo, sandbox off by default) still ran plain text
+    // while the dispatcher had already switched to parsing stream-json. That combination does
+    // not merely fail to fix the lockout, it BREAKS agy: no result event, treated as truncated,
+    // retried, then failed. The unit test passed because it exercised `agy_args` directly, the
+    // helper this path does not use. Codex found it.
+    //
+    // Two builders for one invocation is the same two-surface split that has produced five
+    // separate defects in this work. Anything added to one must be added to the other, and
+    // `default_invocation_carries_stream_json` asserts against THIS function, not the helper.
+    if agy_stream_json_enabled() {
+        args.push("--output-format".to_string());
+        args.push("stream-json".to_string());
+    }
     for dir in yolo_add_dirs(cwd) {
         args.push("--add-dir".to_string());
         args.push(dir);
@@ -313,6 +330,56 @@ mod tests {
         assert!(
             validate_extra_args(&["--output-format=json".to_string()]).is_err(),
             "operators must not be able to override the output format"
+        );
+    }
+
+    /// The DEFAULT invocation must carry stream-json, asserted against `build_agy_invocation`
+    /// and NOT against the `agy_args` helper.
+    ///
+    /// The helper is used only by the opt-in sandbox branch. Testing it proved nothing about
+    /// what production actually spawns, which is how the flag was added to one builder and
+    /// missed on the other while the suite stayed green.
+    ///
+    /// The `assert_eq!(program, "agy")` is load bearing. A first draft of this test paired with
+    /// one that set `TRIUMVIRATE_AGY_SANDBOX` as a process-global; cargo runs tests in
+    /// parallel, so this test could take the SANDBOX branch and pass on a path it was not
+    /// testing. It survived a mutation that deleted the very line it guards. Pinning the
+    /// program name turns that race into a visible failure instead of a false pass.
+    ///
+    /// RED IF: the default builder loses the flag.
+    #[test]
+    fn default_invocation_carries_stream_json() {
+        let inv = build_agy_invocation("agy", &[], "hi", "/tmp/x").expect("invocation");
+        assert_eq!(
+            inv.program, "agy",
+            "this test is meaningless unless it took the DEFAULT branch; a sandbox-exec \
+             program name means an env var leaked in from another test"
+        );
+        assert!(
+            inv.args
+                .windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "the DEFAULT (yolo) invocation must request stream-json, or the dispatcher parses \
+             plain text as NDJSON and every agy turn fails as truncated; got: {:?}",
+            inv.args
+        );
+    }
+
+    /// The sandbox branch must carry it too.
+    ///
+    /// Tested through `agy_args`, which is the sandbox branch's actual builder, rather than by
+    /// setting `TRIUMVIRATE_AGY_SANDBOX` and calling `build_agy_invocation`. Mutating a
+    /// process-global env var inside a parallel test suite is what broke the test above.
+    ///
+    /// RED IF: the helper loses the flag, leaving the sandboxed path on plain text.
+    #[test]
+    fn sandbox_builder_also_carries_stream_json() {
+        let args = agy_args("hi", &PathBuf::from("/tmp/x.log"), Duration::from_secs(60), &[]);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "the sandbox branch delegates to agy_args, which must also request stream-json; \
+             got: {args:?}"
         );
     }
 

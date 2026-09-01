@@ -328,3 +328,60 @@ Three legacy mock tests were converted from plain text to stream-json, because a
 pins a path production no longer takes is worse than no test.
 
 Full suite: 38 groups green. Clippy clean except one pre-existing `pantheon` warning.
+
+---
+
+## Round 4, 2026-09-01. Codex found the agy fix did not reach production.
+
+**The fix shipped broken, and worse than "unfixed".**
+
+`build_agy_invocation` has TWO branches. The sandbox branch delegates to `agy_args`. The
+default branch, yolo, builds its argv INLINE. I added `--output-format stream-json` to
+`agy_args` only, which is the branch production does not take.
+
+So the default path still emitted plain text while the dispatcher had already switched to
+parsing NDJSON: no result event, treated as truncated, retried, failed. That does not merely
+fail to close the lockout, it breaks every agy call in the default configuration.
+
+**Why no test caught it.** `agy_args_never_include_forbidden_flags` exercises `agy_args`
+directly, the helper the default path does not use. And `e_agy_sight_01` spawns `agy` with
+hardcoded flags, so it proved the parser works and proved nothing about what the daemon spawns.
+Verifying through the path I patched rather than the path production takes, again.
+
+**This is the two-surface split for the FIFTH time in this work**: primary vs degraded arm,
+rejected-text preservation, the outbox event, and now two argv builders for one invocation.
+
+### Then my own fix-test could not fail
+
+The first `default_invocation_carries_stream_json` survived a mutation that deleted the exact
+line it guards. Cause: the test I paired it with set `TRIUMVIRATE_AGY_SANDBOX` as a
+process-global, and cargo runs tests in parallel, so the "default" test could take the SANDBOX
+branch and pass on a path it was not testing.
+
+Fixed two ways: the default test now pins `inv.program == "agy"`, so a leaked env var is a
+visible failure rather than a false pass; and the sandbox test no longer mutates the
+environment at all, asserting against `agy_args` directly since that IS the sandbox branch's
+builder.
+
+Re-verified with two independent mutations. Removing the yolo flag reds ONLY the default test.
+Removing the `agy_args` flag reds ONLY the sandbox test. Each builder is now independently
+guarded.
+
+### New live test
+
+`e_agy_sight_02` drives `build_agy_invocation`, the function production calls, and runs the
+resulting argv against the real binary. **Ran live and passed.** This is the test that would
+have caught the shipped bug.
+
+### Also verified live this round
+
+agy's `run_command` reports `pwd` as `/Users/michaelboscia/.gemini/antigravity-cli/scratch`,
+an agy-managed scratch directory. Not the dispatch cwd, and not home as first assumed. agy then
+resorted to `find / -name evidence.txt` to locate a relative path.
+
+Consequence for the gate: **cwd-relative source matching is inert for agy.** Absolute paths
+still match, and the review brief template already mandates absolute paths, so `required_sources`
+works. But the relative candidate contributes nothing on this backend and should not be
+described as if it does.
+
+Full suite: 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
