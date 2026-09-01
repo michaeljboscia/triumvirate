@@ -601,3 +601,82 @@ Verified end to end through the RUNNING DAEMON over HTTP, not just in tests:
   rejected text preserved for inspection
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
+
+---
+
+## Round 7, 2026-09-01. Three peers on the frozen commit 781760c. Nine defects.
+
+All three receipts ACCEPT. Antigravity ran three mutations itself to check my claims and
+confirmed all three held. Then it found a test of mine that did not.
+
+### The two that mattered most, both "fixed the surface production does not use"
+
+**HTTP `/session/ask` dropped both sight fields** (Codex found the drop, Grok found why it
+matters). `use_daemon_for_mcp_from_env()` defaults TRUE, so MCP `ask_session` PROXIES to this
+route. My round 6 fix and its passing test covered the in-process twin, which production does
+not take. Every session review in production was silently ungated while the suite stayed green.
+The two-surface trap, entered while fixing the two-surface trap.
+
+**Shadow agy reviews ran uncontained** (Codex). `run_gemini_shadow` hardcoded `read_only=false`,
+and my comment there said "Shadow compare mirrors the primary call, which is not a review",
+which is false exactly when the primary IS a review. I wrote that sentence to justify the
+`false`. Worse when primary is gemini-cli and shadow is agy: the visible answer is unaffected
+while the shadow can mutate the reviewed tree.
+
+**The degraded hop lost containment** (Grok). It passed `None` for the request overrides, so
+`read_only` was false. Sight was enforced on the result, containment was not. Eighth instance.
+
+### Matcher defects
+
+**`success: None` satisfied a source** (Grok). The gate used `unwrap_or(true)`, and EVERY parser
+starts a call at `None`, filling it on a later completion event. So a truncated stream that got
+as far as "I requested the file" counted as a completed read. `agy_06` documents that None is
+not a claim of success and the gate then treated it as one. Now `success == Some(true)`;
+verified all three read-classifying parsers do set it (`gemini.rs:154`, `grok.rs:311`,
+`agy_stream.rs:258`), so this does not false-reject.
+
+**Directory boundary not enforced** (Antigravity). cwd `/repo` plus source `/repo-config.json`
+produced the candidate `-config.json`, so opening an unrelated `-config.json` satisfied it. Now
+the strip requires a following `/`.
+
+**`./x` reads were false-rejected** (Antigravity). Added as a candidate.
+
+### The test that passed for the wrong reason
+
+**`sight_21` was a false pass** (Antigravity, proven by mutation). Its args used
+`ls crates/.../lib.rs`, which does not contain the quote-delimited path, so the STRING match
+failed first and the `ToolKind::ReadFile` constraint it claimed to guard was never exercised.
+Deleting that constraint left it green.
+
+Rewritten so both calls carry the EXACT quoted path, making the kind the only discriminator,
+plus `sight_21b` proving identical args pass under `ReadFile`. Re-verified: removing the kind
+check now reds `sight_21`, and reverting `success` to `unwrap_or(true)` reds `sight_21c`.
+
+### Containment was asserted entirely by string matching
+
+Grok: nobody had asserted a write is actually REFUSED inside the wrapper. Worse, the profile
+re-allows TMPDIR, `/private/tmp` and `/private/var/folders`, and every live test put its
+fixtures in `std::env::temp_dir()`, which resolves INTO an allow-path. Those tests would pass
+with no seatbelt at all.
+
+`sight_27` writes under HOME, outside every allow-path, and asserts the file does not land.
+
+**Mutation-verified, and this is the strongest evidence in the change:** with `read_only=false`
+agy WROTE the file; with `read_only=true` it did not. The seatbelt demonstrably stops a real
+write, and the test measures containment rather than the model's reluctance.
+
+### Accepted, not fixed
+
+`required_sources` remains unusable on codex, the peer most likely to be reviewing code.
+Grok: "Codex can be sighted and cannot be source-gated." Fixing it means teaching the codex
+parser to classify tool kinds instead of stamping everything Bash. Not attempted.
+
+### Grok's conditions for turning the gate on by default, current state
+
+1. A distinct reviewer surface with sight always on: NOT DONE.
+2. HTTP `/session/ask` forwards both fields: DONE this round.
+3. `success: None` does not satisfy a source: DONE this round.
+4. Codex classifies reads, or is documented as counting-only: DOCUMENTED, not fixed.
+5. Containment proven by a denied write outside the allow-paths: DONE this round.
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning. Live guards pass.

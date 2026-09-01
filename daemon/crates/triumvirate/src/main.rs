@@ -2403,6 +2403,13 @@ async fn run_daemon() -> anyhow::Result<()> {
                 // is only consulted when this is None, which is how pre-migration sessions keep
                 // working.
                 prior_cli_session_id: prior_cli_session.clone(),
+                // THE PATH PRODUCTION ACTUALLY TAKES. `use_daemon_for_mcp_from_env()` defaults
+                // TRUE, so the MCP ask_session proxies to THIS route. The in-process twin in
+                // mcp-tools forwards these fields; this one dropped them, so every session
+                // review in production was silently ungated while the test covering the other
+                // surface stayed green. Grok found that the fix had landed on the unused path.
+                required_sources: req.required_sources.clone(),
+                require_sight: req.require_sight,
                 ..Default::default()
             },
             None,
