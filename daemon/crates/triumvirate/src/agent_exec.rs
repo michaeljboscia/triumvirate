@@ -1659,9 +1659,6 @@ fn enforce_reviewer_sight(
         return Ok(());
     }
 
-    // if !tool_calls.is_empty() {
-    //     return Ok(());
-    // }
     // No named sources to check, so fall back to the weaker question: did it look at anything.
     if !tool_calls.is_empty() {
         return Ok(());

@@ -202,3 +202,63 @@ is not a mutation test.
 Final: 18 unit, 5 integration, 2 live. 38 groups green. Clippy clean on touched crates.
 
 **Rule: after any block-level source edit, count the test functions before claiming a number.**
+
+---
+
+## Round 3, 2026-09-01. Grok, on the frozen commit `4f84b3a`. The one that landed.
+
+Grok verified blob hashes against HEAD before reading, then reviewed. Receipt: it opened the
+gate, both success arms, all 18 unit tests, the integration tests, three parsers, `agy.rs`,
+`inter_agent.rs` and `streaming.rs`.
+
+### BLOCKER, verified independently: Antigravity can never pass the gate
+
+The allowlist trusts `gemini-stream-json`. The LIVE antigravity path does not emit that. It
+emits `agy-pipe-plain-text` or `agy-pty-plain-text` (`agy.rs:320`), and neither is on the
+allowlist, and `build_result` hardcodes `tool_calls: Vec::new()` regardless.
+
+**So a `require_sight` review dispatched to Antigravity is rejected 100% of the time, however
+carefully it looks.** The gate is permanently closed against the exact agent whose zero tool
+calls motivated building it. `sight_17` asserts this behaviour as CORRECT, so the lockout is
+encoded as intended rather than flagged as a defect.
+
+This fails the GOAL's own non-negotiable: "a false rejection is worse than the hole."
+
+Root cause is not the parser, it is the dispatch. agy is invoked in plain-text mode, so there
+are no structured tool events to record. `agy --output-format stream-json` exists. The fix is
+to dispatch agy structured and parse tool events, which is real work in `agy.rs` and out of
+scope for this commit. Until it lands, `require_sight` must not be used with antigravity.
+
+### Also found, all verified
+
+- **Dead commented-out copy of the counting fallback** left above the live one, residue from a
+  mutation-test revert. REMOVED.
+- **`args.contains` is substring, not path equality.** A read of `agent_exec.rs.bak` satisfies
+  a source named `agent_exec.rs`. So does `ls <path>` or a grep whose PATTERN is the path.
+  `sight_15` closed the suffix hole and not this one.
+- **`success: None` counts as success**, and grok records `success: None` on `tool_call` until
+  a later `tool_call_update`. An incomplete call reads as a completed look.
+- **`i_sight_01..05` never call `enforce_reviewer_sight`.** They prove the parser records and
+  the unit tests prove the gate against hand-built records. The chain the comments describe as
+  closed, live CLI to parser to record to gate, is not actually tested end to end. A gate that
+  ignored `args_json` entirely would leave `i_sight_04` green.
+- **`chars().take(600)` can drop the artifact it exists to preserve.** A long unsighted review
+  opens with throat-clearing, and the thing a human needs to see is what is missing from the
+  whole text.
+- **DONE WHEN item 4 is STILL UNMET.** There is no test that zero tool calls WITHOUT
+  `require_sight` still returns Ok. My own goal doc named it the regression guard most likely
+  to be missing, and it is missing: every `sight_*` test calls the inner function directly,
+  which is only reached once the flag is on.
+
+Grok's summary of the shape: "the counting fallback, the escape hatch in the error string, and
+the dead commented branch are the same voice: the gate is still willing to describe itself as
+optional."
+
+### Verdict
+
+> It is still a fig leaf on the path that will actually run.
+
+On a sighted hedge being unfixable at this layer, its verdict is that the function never
+receives tool RESULTS, only the record that a call happened, so "could have seen" is the
+honest ceiling of a dispatch gate. Closing "did use" needs the read bytes and an entailment
+check, which is a different feature.
