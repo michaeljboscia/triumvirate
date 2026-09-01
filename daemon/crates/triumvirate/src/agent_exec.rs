@@ -1479,6 +1479,14 @@ const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
     "gemini-stream-json",
     // crates/agent-adapter/src/grok.rs: pushes on tool_call
     "grok-streaming-json",
+    // crates/agent-adapter/src/agy_stream.rs: pushes on step_type="tool".
+    //
+    // Added 2026-09-01 after Grok found the gate was permanently closed against Antigravity:
+    // the live agy path emits agy-pipe-plain-text / agy-pty-plain-text, which record nothing,
+    // so every antigravity review was rejected however carefully it looked. Plain text has no
+    // tool events to record, so the fix was dispatching agy with --output-format stream-json
+    // rather than teaching the old parser to see something that was never there.
+    "agy-stream-json",
 ];
 
 /// Agents that have no tools at all, so `require_sight` can never be satisfied by them.
@@ -4445,7 +4453,12 @@ mod sight_gate_tests {
     fn sight_06_the_allowlist_is_exactly_the_three_verified_parsers() {
         assert_eq!(
             PARSER_MODES_WITH_TOOL_RECORDS,
-            &["codex-exec-json", "gemini-stream-json", "grok-streaming-json"],
+            &[
+                "codex-exec-json",
+                "gemini-stream-json",
+                "grok-streaming-json",
+                "agy-stream-json",
+            ],
             "the allowlist changed. Open the parser you are adding and confirm it actually \
              calls tool_calls.push on a real tool event. These are known NOT to: \
              agy-pipe-plain-text, agy-pty-plain-text, codex-app-server-jsonrpc, \
@@ -4621,7 +4634,7 @@ mod sight_gate_tests {
         let err = enforce_reviewer_sight(
             "Antigravity", &[], "agy-pipe-plain-text", &sources, "/repo", &mut lifecycle,
         )
-        .expect_err("a blind parser cannot produce a receipt");
+        .expect_err("the LEGACY plain-text agy mode cannot produce a receipt");
         assert!(
             err.contains("not on the allowlist of parsers verified"),
             "must blame the instrument, not the agent; got: {err}"
@@ -4630,6 +4643,35 @@ mod sight_gate_tests {
             !err.contains("never successfully opened"),
             "must NOT accuse the agent of skipping sources when the parser cannot record; \
              got: {err}"
+        );
+    }
+
+    /// Antigravity must be able to PASS. This is the regression guard for the defect Grok
+    /// found: the gate was permanently closed against the agent it was built for, because the
+    /// live agy path recorded no tool calls and its parser mode was not trusted.
+    ///
+    /// RED IF: `agy-stream-json` leaves the allowlist, or agy dispatch reverts to plain text
+    /// without this being reconsidered. Either change re-locks Antigravity out entirely.
+    #[test]
+    fn sight_20_antigravity_can_actually_pass_the_gate() {
+        let mut lifecycle = Vec::new();
+        let tools = vec![ToolCallRecord {
+            id: Some("2".to_string()),
+            tool: "view_file".to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: Some(12),
+            args_json: Some(r#"{"AbsolutePath":"crates/shared-types/src/lib.rs"}"#.to_string()),
+        }];
+        let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
+        assert!(
+            enforce_reviewer_sight(
+                "Antigravity", &tools, "agy-stream-json", &sources, "/repo", &mut lifecycle,
+            )
+            .is_ok(),
+            "an antigravity review that opened the named source must PASS. A gate that always \
+             rejects the agent it was built for is worse than no gate: it trains callers to \
+             turn it off."
         );
     }
 

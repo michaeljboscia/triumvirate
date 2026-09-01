@@ -262,3 +262,69 @@ On a sighted hedge being unfixable at this layer, its verdict is that the functi
 receives tool RESULTS, only the record that a call happened, so "could have seen" is the
 honest ceiling of a dispatch gate. Closing "did use" needs the read bytes and an entailment
 check, which is a different feature.
+
+---
+
+## Round 4, 2026-09-01. The agy lockout is FIXED and proven live.
+
+Grok's blocker was real: the gate rejected every Antigravity review because the live agy path
+records no tool calls. Root cause was dispatch, not the parser.
+
+### The stale requirement
+
+`agy-integration-spec.md` REQ-012 forbade `--output-format`, and REQ-060 recorded exactly why:
+**verified 2026-05-24 against agy v1.0.1, which had no such flag.** The installed binary is
+**v1.1.23**. The flag now exists with a `stream-json` value. The prohibition was correct when
+written and had simply gone stale, which is why "do not delete and hand-wave" matters: the
+reason was written down, so it could be checked instead of guessed at.
+
+### Verified live before writing any code
+
+`agy --output-format stream-json` emits, captured in
+`crates/agent-adapter/tests/fixtures/agy-stream-*.jsonl`:
+
+- `result.response` carries the whole final answer, replacing ANSI-stripped terminal scraping
+- `step_update` with `step_type:"tool"` carries `tool_name`, `tool_info.parameters` and output
+- `usage` carries real token counts, replacing log-file parsing
+- `result.status` gives a terminal verdict, so a truncated stream is detectable
+
+Strictly more information than the plain-text path. Also observed: agy's `run_command` reports
+`pwd` as the HOME directory even though `init` declares the dispatch cwd. Noted, not yet acted
+on, and it matters for cwd-relative source matching.
+
+### What changed
+
+- **`crates/agent-adapter/src/agy_stream.rs`**, new. Parses the stream into a real
+  `ParsedAgentResult` with populated `tool_calls`, emitting `agy-stream-json`.
+- **agy is dispatched with `--output-format stream-json` by default.**
+  `TRIUMVIRATE_AGY_OUTPUT=text` reverts, and the revert re-locks Antigravity out of the gate,
+  which is stated at the flag.
+- **`agy-stream-json` added to the sight gate allowlist.** Antigravity can now pass.
+- **A truncated stream is treated like the REQ-024 empty-output canary**: retried, not returned
+  as a confident short answer.
+- **`session_id` is deliberately NOT published** even though the stream carries a
+  `conversation_id`. agy is single-turn (REQ-040/042) and publishing an id would let the worker
+  registry cache something no dispatcher will resume, which is the shape of the cross-session
+  leak this project already fixed once. An existing test caught this bug as I introduced it.
+- **`--output-format` stays forbidden to OPERATORS** via `FORBIDDEN_EXTRA_FLAGS`. Triumvirate
+  now sets it; an operator still cannot override it. Those are different claims, and conflating
+  them is what kept agy in plain-text mode after the flag existed.
+
+### Tests
+
+11 parser tests against LIVE captures, not hand-written fixtures. A hand-written fixture only
+proves the parser matches my belief about the format, which is the mistake that left agy unable
+to report tool calls for months.
+
+`sight_20_antigravity_can_actually_pass_the_gate` is the regression guard: an antigravity
+review that opened the named source must PASS. `sight_17` was rewritten, since it previously
+asserted the LOCKOUT as correct behaviour.
+
+**`e_agy_sight_01` ran LIVE and passed**: a real agy turn read a real file, recorded the read,
+preserved the path in its arguments, and returned the marker. Full chain proven from CLI to
+gate.
+
+Three legacy mock tests were converted from plain text to stream-json, because a test that
+pins a path production no longer takes is worse than no test.
+
+Full suite: 38 groups green. Clippy clean except one pre-existing `pantheon` warning.

@@ -317,6 +317,41 @@ pub(crate) async fn run_agy_cli_process_with_session(
                     );
                 }
                 emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::TurnCompleted, "turn completed (agy)"));
+
+                // stream-json path: parse the NDJSON so tool calls are actually recorded.
+                // Without this agy returns an empty `tool_calls` vec and Antigravity can never
+                // satisfy the sight gate, however carefully it looks.
+                if mcp_bridge::agy::agy_stream_json_enabled() {
+                    let mut sp = agent_adapter::AgyStreamParser::new();
+                    for line in text.lines() {
+                        sp.parse_line(line);
+                    }
+                    // A stream that never reached its terminal `result` event is truncated, not
+                    // a short answer. Treated exactly like the REQ-024 empty-output canary:
+                    // retry rather than return a confidently incomplete turn.
+                    if !sp.saw_result() {
+                        tracing::warn!(
+                            "agy stream-json ended without a result event (attempt {attempt}); treating as truncated"
+                        );
+                        last_err = Some(anyhow::anyhow!(
+                            "agy stream-json output was truncated (no result event)"
+                        ));
+                        continue;
+                    }
+                    let mut parsed = sp.finish();
+                    if parsed.response_text.trim().is_empty() {
+                        tracing::warn!("agy stream-json result carried no response text (attempt {attempt})");
+                        last_err = Some(anyhow::anyhow!("agy returned empty output"));
+                        continue;
+                    }
+                    // The log file still carries the model name and auth method, which the
+                    // stream does not report. Keep that enrichment rather than losing it.
+                    if parsed.cli_version.is_none() {
+                        parsed.cli_version = log.model.clone();
+                    }
+                    return Ok(parsed);
+                }
+
                 let mode = if use_pty { PARSER_MODE_PTY } else { PARSER_MODE_PIPE };
                 return Ok(build_result(text, &log, mode));
             }
@@ -1127,6 +1162,15 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    /// A minimal stream-json turn, matching the live capture shape. Tests that exercise
+    /// CAPTURE mechanics (pipe vs pty, ANSI stripping) must run on the format the dispatcher
+    /// actually uses, or they pin a path production no longer takes.
+    fn stream_body(response: &str) -> String {
+        format!(
+            "printf '{{\"event\":\"init\",\"conversation_id\":\"c1\",\"init\":{{}}}}\n{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"{response}\"}}}}\n'"
+        )
+    }
+
     async fn run_mock(
         body: &str,
         msg: &str,
@@ -1151,20 +1195,22 @@ mod tests {
     #[tokio::test]
     async fn mock_agy_pipe_captures_plain_text() {
         // REQ-080 happy path: text over a pipe (agy 1.0.2's real behavior) is captured.
-        let parsed = run_mock("printf '4\\n'", "2+2?", None)
+        let parsed = run_mock(&stream_body("4"), "2+2?", None)
             .await
             .expect("mock agy should succeed");
         assert_eq!(parsed.response_text, "4");
         assert_eq!(parsed.session_id, None); // REQ-040
-        assert_eq!(parsed.parser_mode, PARSER_MODE_PIPE); // REQ-025
-        assert!(parsed.events.is_empty() && parsed.tool_calls.is_empty());
+        // Was PARSER_MODE_PIPE. agy is dispatched with --output-format stream-json since
+        // 2026-09-01 so its tool calls are recorded at all; plain text carried none, which
+        // made Antigravity permanently unable to satisfy the sight gate.
+        assert_eq!(parsed.parser_mode, agent_adapter::AGY_PARSER_MODE_STREAM);
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn mock_agy_strips_ansi() {
         // REQ-023: ANSI is stripped from captured output.
-        let parsed = run_mock("printf '\\033[32m4\\033[0m\\n'", "2+2?", None)
+        let parsed = run_mock(&format!("printf '\\033[32m' && {} && printf '\\033[0m'", stream_body("4")), "2+2?", None)
             .await
             .expect("mock agy should succeed");
         assert_eq!(parsed.response_text, "4");
@@ -1214,7 +1260,7 @@ mod tests {
     async fn mock_agy_concurrent_dispatches_carry_no_session_id() {
         // REQ-082: two simultaneous dispatches pass no resume flags (build_agy_args
         // test) and persist no synthetic session id; inbound session ids are ignored.
-        let mock = write_mock_agy("printf '4\\n'");
+        let mock = write_mock_agy(&stream_body("4"));
         let bin = mock.to_str().unwrap().to_string();
         let cwd = std::env::temp_dir().to_str().unwrap().to_string();
         let (a, b) = tokio::join!(

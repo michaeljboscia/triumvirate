@@ -120,8 +120,40 @@ fn agy_args(prompt: &str, log_path: &Path, print_timeout: Duration, extra: &[Str
         "--log-file".to_string(),
         log_path.to_string_lossy().into_owned(),
     ];
+    // REQ-012 said NEVER pass `--output-format`, and REQ-060 recorded why: verified
+    // 2026-05-24 against agy v1.0.1, which HAD NO SUCH FLAG. The installed binary is now
+    // v1.1.23 and the flag exists with a `stream-json` value, so the prohibition is stale.
+    // Re-verified live 2026-09-01; fixtures in agent-adapter/tests/fixtures/agy-stream-*.
+    //
+    // This is not a cosmetic change. Plain text carries no tool events, so agy's parsed result
+    // hardcoded an empty `tool_calls`, which made Antigravity structurally unable to satisfy
+    // the sight gate: every review dispatched to it was rejected however carefully it looked.
+    // stream-json also gives the final answer as one `result.response` field instead of
+    // ANSI-stripped terminal scraping, and real token counts instead of log-file parsing.
+    //
+    // `TRIUMVIRATE_AGY_OUTPUT=text` reverts to the old plain-text path. The revert exists
+    // because this changes how EVERY agy call is parsed, not just reviews, and a format
+    // regression on Google's side must not require a rebuild to escape. Reverting also
+    // re-locks Antigravity out of the sight gate, which is the tradeoff being made.
+    if agy_stream_json_enabled() {
+        args.push("--output-format".to_string());
+        args.push("stream-json".to_string());
+    }
     args.extend(extra.iter().cloned());
     args
+}
+
+/// Whether agy is dispatched with `--output-format stream-json` (default) or the legacy
+/// plain-text mode. See the note in `agy_args` for why the default flipped on 2026-09-01.
+pub fn agy_stream_json_enabled() -> bool {
+    !matches!(
+        std::env::var("TRIUMVIRATE_AGY_OUTPUT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "text" | "plain"
+    )
 }
 
 /// Whether the legacy `sandbox-exec` seatbelt wraps agy. Default OFF (yolo): agy
@@ -260,20 +292,28 @@ mod tests {
             Duration::from_secs(900),
             &[],
         );
-        for forbidden in [
-            "-o",
-            "--output-format",
-            "-r",
-            "--resume",
-            "-c",
-            "--continue",
-            "--model",
-        ] {
+        // `--output-format` deliberately LEFT OUT of this list on 2026-09-01. It is still
+        // forbidden to OPERATORS via FORBIDDEN_EXTRA_FLAGS, which is what that list is for;
+        // what changed is that Triumvirate now sets it itself. The two are different claims and
+        // conflating them is what kept agy in plain-text mode after the flag existed.
+        for forbidden in ["-r", "--resume", "-c", "--continue", "--model"] {
             assert!(!args.iter().any(|a| a == forbidden), "must not pass {forbidden}");
         }
         assert!(args.windows(2).any(|w| w[0] == "-p" && w[1] == "hi"));
         assert!(args.contains(&"--print-timeout".to_string()));
         assert!(args.contains(&"--log-file".to_string()));
+        // Default is stream-json, because plain text carries no tool events and that made
+        // Antigravity permanently unable to satisfy the sight gate.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "agy must be dispatched in stream-json by default; got: {args:?}"
+        );
+        // And an operator still cannot smuggle it.
+        assert!(
+            validate_extra_args(&["--output-format=json".to_string()]).is_err(),
+            "operators must not be able to override the output format"
+        );
     }
 
     #[test]
