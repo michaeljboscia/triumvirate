@@ -1942,6 +1942,22 @@ pub fn build_worktree_worker_argv(
     }
 }
 
+/// The ONE lock over this file's process-global env, at module scope, next to the state.
+///
+/// `u_abe_05` sets TRIUMVIRATE_GROK_SANDBOX and `u_abe_03`, `abe_13` and `abe_10` all read env
+/// that the grok and claude builders consult. A lock private to one test module serialises that
+/// module against itself and against nothing else, which is not a lock, it is a comment.
+///
+/// This is the FOURTH time in this work that a per-module lock has failed to serialise against a
+/// sibling, and the third distinct file. `abe_13` was committed green in isolation and red under
+/// the parallel harness for exactly this reason: `u_abe_05` set the sandbox var, which made the
+/// operator-precedence rule fire and drop the `workspace` override that abe_13 asserts.
+///
+/// The rule, restated because writing it down twice has not been enough: a lock must live
+/// wherever the STATE lives, not wherever the test lives.
+#[cfg(test)]
+pub(crate) static ABE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Which agent ABE dispatches workers as. Defaults to codex, which is what it always did.
 ///
 /// ABE hardcoded codex at both dispatch sites, so gemini, claude and grok were all equally
@@ -1978,15 +1994,15 @@ pub const ABE_BUILDABLE_AGENTS: &[&str] = &["codex", "claude", "grok"];
 #[cfg(test)]
 mod abe_agent_tests {
     use super::{abe_worker_agent, build_worker_argv};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     /// These tests mutate process-global env. Cargo runs them in parallel threads in one binary,
     /// so without a lock `u_abe_05` setting TRIUMVIRATE_GROK_SANDBOX races `u_abe_03` reading it.
     /// That surfaced only after operator-precedence landed, because before the change the
     /// override ignored the env entirely.
+    /// Shared with `abe_worktree_tests` and `abe_label_honesty_tests`, which read the same env.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &super::ABE_ENV_LOCK
     }
 
     /// One resolver for every agent, mirroring the real call site. The point of the seam is that
@@ -2101,6 +2117,14 @@ mod abe_agent_tests {
 mod abe_worktree_tests {
     use super::build_worktree_worker_argv;
 
+    /// REQUIRED, not decorative. The grok arm consults TRIUMVIRATE_GROK_SANDBOX through the
+    /// operator-precedence rule, and `u_abe_05` in a sibling module sets it. Without this,
+    /// `abe_13` passes alone and fails under the parallel harness, which is how it was
+    /// committed green and found red minutes later.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        super::ABE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn resolver(agent: &str) -> (String, Vec<String>) {
         (format!("/bin/{agent}"), Vec::new())
     }
@@ -2110,6 +2134,7 @@ mod abe_worktree_tests {
     /// RED IF: the codex branch is reordered or a flag is added or dropped.
     #[test]
     fn abe_11_codex_worktree_argv_is_unchanged() {
+        let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string(), "/repo/.git/worktrees/t".to_string()];
         let (cmd, args) =
             build_worktree_worker_argv("codex", &resolver, "do the task", &dirs, None)
@@ -2132,6 +2157,7 @@ mod abe_worktree_tests {
     /// RED IF: the permission mode weakens, or --add-dir is dropped, or -p stops being last.
     #[test]
     fn abe_12_claude_worktree_worker_can_write_and_reach_the_parent_git() {
+        let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
         let (cmd, args) =
             build_worktree_worker_argv("claude", &resolver, "do the task", &dirs, None)
@@ -2163,6 +2189,7 @@ mod abe_worktree_tests {
     /// RED IF: grok silently starts receiving --add-dir, or loses its writable sandbox.
     #[test]
     fn abe_13_grok_worktree_worker_is_writable_and_cannot_reach_the_parent_git() {
+        let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
         let (cmd, args) =
             build_worktree_worker_argv("grok", &resolver, "do the task", &dirs, None)
@@ -2181,6 +2208,7 @@ mod abe_worktree_tests {
     /// RED IF: a catch-all arm returns codex.
     #[test]
     fn abe_14_an_unbuildable_worktree_agent_is_refused() {
+        let _guard = env_guard();
         for agent in ["gemini", "deepseek"] {
             let err = build_worktree_worker_argv(agent, &resolver, "task", &[], None)
                 .expect_err("must refuse rather than spawn codex");
@@ -2207,9 +2235,9 @@ mod abe_label_honesty_tests {
         (format!("/bin/{agent}"), Vec::new())
     }
 
+    /// The SAME lock the other two test modules use. See ABE_ENV_LOCK.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::ABE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// THE DEFECT. Asking for an agent ABE cannot build must not quietly spawn codex.
