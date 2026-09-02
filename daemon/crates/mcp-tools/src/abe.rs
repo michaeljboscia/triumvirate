@@ -700,6 +700,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     let resolve_command = |a: &str| -> (String, Vec<String>) {
         match a {
             "grok" => mcp_bridge::grok_command(),
+            "claude" => mcp_bridge::claude_command(),
             // Codex keeps its injected resolver, which existing tests rely on.
             _ => (callbacks.codex_command)(),
         }
@@ -1061,58 +1062,33 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     // Agent-aware. The codex branch below is byte-for-byte what this site built before, so an
     // existing worktree dispatch produces the same process.
     let worker_agent = abe_worker_agent();
-    let (cmd, args) = if mcp_bridge::normalize_agent_name(&worker_agent) == "grok" {
-        let (bin, extra) = mcp_bridge::grok_command();
-        // `workspace` rather than the consult default of `read-only`: a worktree worker exists to
-        // write code and commit it. No session id, so it cannot attach to another task's
-        // conversation.
-        //
-        // KNOWN GAP, stated rather than hidden: codex reaches the MAIN repo's .git through
-        // `--add-dir`, which grok has no equivalent for. A grok worktree worker may therefore be
-        // unable to run git operations that need the parent .git. That is untested, because no
-        // grok worktree dispatch has been run. Do not treat this path as verified.
-        let inv = mcp_bridge::grok::build_grok_invocation_with_sandbox(
-            &bin,
-            &extra,
-            &prompt,
-            &setup.worktree_path.display().to_string(),
-            None,
-            false,
-            Some("workspace"),
-        )
-        .map_err(|e| format!("failed to assemble grok worktree worker: {e}"))?;
-        (inv.program, inv.args)
-    } else {
-        let (cmd, mut args) = (callbacks.codex_command)();
-        args.push("exec".to_string());
-        args.push("--full-auto".to_string());
-        append_codex_exec_mcp_compat_args(&mut args);
-        // Translate sandbox_permissions contract field into `-c key=value` overrides
-        // that codex-exec merges ON TOP of --full-auto. See build_sandbox_permission_args.
-        args.extend(build_sandbox_permission_args(
-            req.contract_fields.sandbox_permissions.as_deref(),
-        ));
 
-        let main_git_dir = project_root.join(".git");
-        args.push("--add-dir".to_string());
-        args.push(main_git_dir.display().to_string());
+    // The main repo's .git, so a worktree worker can run git operations that need the parent.
+    // Computed here and passed in, because every agent needs it and only the argv syntax differs.
+    let mut extra_dirs: Vec<String> = vec![project_root.join(".git").display().to_string()];
+    let dot_git = setup.worktree_path.join(".git");
+    if dot_git.is_file()
+        && let Ok(content) = std::fs::read_to_string(&dot_git)
+        && let Some(gitdir) = content.strip_prefix("gitdir: ").map(|s| s.trim())
+    {
+        extra_dirs.push(if std::path::Path::new(gitdir).is_absolute() {
+            gitdir.to_string()
+        } else {
+            setup.worktree_path.join(gitdir).display().to_string()
+        });
+    }
 
-        let dot_git = setup.worktree_path.join(".git");
-        if dot_git.is_file()
-            && let Ok(content) = std::fs::read_to_string(&dot_git)
-            && let Some(gitdir) = content.strip_prefix("gitdir: ").map(|s| s.trim())
-        {
-            let resolved = if std::path::Path::new(gitdir).is_absolute() {
-                gitdir.to_string()
-            } else {
-                setup.worktree_path.join(gitdir).display().to_string()
-            };
-            args.push("--add-dir".to_string());
-            args.push(resolved);
-        }
-        args.push(prompt.clone());
-        (cmd, args)
-    };
+    let (cmd, args) = build_worktree_worker_argv(
+        &worker_agent,
+        &|a: &str| match a {
+            "grok" => mcp_bridge::grok_command(),
+            "claude" => mcp_bridge::claude_command(),
+            _ => (callbacks.codex_command)(),
+        },
+        &prompt,
+        &extra_dirs,
+        req.contract_fields.sandbox_permissions.as_deref(),
+    )?;
 
     let mut worker_env = (callbacks.completion_env)();
     worker_env.insert(
@@ -1828,6 +1804,34 @@ pub fn build_worker_argv(
         //
         // Failing loudly is right rather than falling back, for the same reason an unroutable
         // reviewer must fail at dispatch: a silent substitution looks like it worked.
+        // claude. Verified live on 2026-09-02 against the installed CLI, not assumed.
+        //
+        // `--permission-mode bypassPermissions` is REQUIRED and `acceptEdits` is NOT enough.
+        // Tested both: with acceptEdits claude wrote the file and was then DENIED its Bash call,
+        // so `git commit` never ran and the task looked complete while producing no commit. With
+        // bypassPermissions it wrote, ran git, and committed, with zero denials.
+        //
+        // This is the opposite of the reviewer dispatch, which gets `--allowedTools Read,Grep,Glob`
+        // precisely so it CANNOT write. An ABE worker exists to write code; a reviewer exists to
+        // look at it. The two must never share a permission profile, and they do not: this arm
+        // is unreachable from `enforce_mandatory_peer_review`.
+        //
+        // `-p` LAST, and it is load bearing: `--add-dir` and `--allowedTools` are both variadic
+        // and will swallow the prompt as another value. Hit for real while capturing the claude
+        // stream fixtures.
+        "claude" => {
+            let (cmd, mut args) = command_for("claude");
+            args.push("--permission-mode".to_string());
+            args.push("bypassPermissions".to_string());
+            // stream-json so the worker's tool calls are recorded. Without `--verbose` the CLI
+            // emits only a final result and the tool calls never appear.
+            args.push("--output-format".to_string());
+            args.push("stream-json".to_string());
+            args.push("--verbose".to_string());
+            args.push("-p".to_string());
+            args.push(prompt.to_string());
+            Ok((cmd, args))
+        }
         // Codex, the default. Identical to what the call sites built inline.
         "codex" => {
             let (cmd, mut args) = command_for("codex");
@@ -1846,10 +1850,94 @@ pub fn build_worker_argv(
         // above the concrete arms makes it the only arm: the first version did exactly that and
         // refused `codex` itself. Rust match arms are ordered.
         other => Err(format!(
-            "ABE cannot dispatch a `{other}` worker: only codex and grok have a worker argv \
-             builder. Set TRIUMVIRATE_ABE_AGENT to codex or grok, or add an arm to \
+            "ABE cannot dispatch a `{other}` worker: only {ABE_BUILDABLE_AGENTS:?} have a worker \
+             argv \
+             builder. Set TRIUMVIRATE_ABE_AGENT to one of {ABE_BUILDABLE_AGENTS:?}, or add an \
+             arm to \
              build_worker_argv. Refusing rather than substituting codex, which would report a \
              `{other}` worker that is a codex process."
+        )),
+    }
+}
+
+/// Build the argv for a WORKTREE worker, per agent.
+///
+/// `dispatch_codex_worktree` used to build codex inline, and `build_worker_argv`'s own doc said
+/// routing it through was "a separate change with its own regression risk". That change is this
+/// one, made because worktree isolation for codex, claude and grok is now a requirement rather
+/// than a nice-to-have: an isolated worktree is the whole point of dispatching a peer to write
+/// code, and two of the three could not get one.
+///
+/// The difference from `build_worker_argv` is that a worktree worker needs access to directories
+/// OUTSIDE its own tree, principally the main repo's `.git`, or it cannot run git at all. Every
+/// agent needs that and only the flag syntax differs, so the paths are computed by the caller
+/// and passed in.
+///
+/// The codex branch is byte-for-byte what the call site built before, in the same order, so an
+/// existing worktree dispatch produces the same process.
+pub fn build_worktree_worker_argv(
+    agent: &str,
+    command_for: &(dyn Fn(&str) -> (String, Vec<String>) + Send + Sync),
+    prompt: &str,
+    extra_dirs: &[String],
+    sandbox_permissions: Option<&[String]>,
+) -> Result<(String, Vec<String>), String> {
+    match mcp_bridge::normalize_agent_name(agent).as_str() {
+        "grok" => {
+            // `workspace` rather than the consult default of `read-only`: a worktree worker
+            // exists to write code and commit it. No session id, so it cannot attach to another
+            // task's conversation.
+            //
+            // KNOWN GAP, stated rather than hidden: codex reaches the main repo's .git through
+            // `--add-dir`, and grok has no equivalent, so `extra_dirs` is DROPPED here. A grok
+            // worktree worker may therefore be unable to run git operations that need the parent
+            // .git. Untested, because no grok worktree dispatch has been run. Do not treat this
+            // path as verified.
+            let _ = extra_dirs;
+            let (bin, extra) = command_for("grok");
+            let inv = mcp_bridge::grok::build_grok_invocation_with_sandbox(
+                &bin, &extra, prompt, ".", None, false, Some("workspace"),
+            )
+            .map_err(|e| format!("failed to assemble grok worktree worker: {e}"))?;
+            Ok((inv.program, inv.args))
+        }
+        "claude" => {
+            let (cmd, mut args) = command_for("claude");
+            // bypassPermissions, not acceptEdits. Verified live: acceptEdits writes files and
+            // then DENIES the Bash call, so the worker cannot commit and the task looks complete
+            // having produced nothing.
+            args.push("--permission-mode".to_string());
+            args.push("bypassPermissions".to_string());
+            args.push("--output-format".to_string());
+            args.push("stream-json".to_string());
+            args.push("--verbose".to_string());
+            if !extra_dirs.is_empty() {
+                args.push("--add-dir".to_string());
+                args.extend(extra_dirs.iter().cloned());
+            }
+            // `-p` LAST. `--add-dir` is variadic and will eat the prompt as another directory.
+            args.push("-p".to_string());
+            args.push(prompt.to_string());
+            Ok((cmd, args))
+        }
+        "codex" => {
+            let (cmd, mut args) = command_for("codex");
+            args.push("exec".to_string());
+            args.push("--full-auto".to_string());
+            append_codex_exec_mcp_compat_args(&mut args);
+            // Translate sandbox_permissions contract field into `-c key=value` overrides
+            // that codex-exec merges ON TOP of --full-auto.
+            args.extend(build_sandbox_permission_args(sandbox_permissions));
+            for dir in extra_dirs {
+                args.push("--add-dir".to_string());
+                args.push(dir.clone());
+            }
+            args.push(prompt.to_string());
+            Ok((cmd, args))
+        }
+        other => Err(format!(
+            "ABE cannot dispatch a `{other}` worktree worker: only {ABE_BUILDABLE_AGENTS:?} have \
+             a worktree argv builder."
         )),
     }
 }
@@ -1885,7 +1973,7 @@ pub fn abe_worker_agent() -> String {
 ///
 /// Deliberately narrower than `mcp_bridge::supported_agent_names()`. Adding a name here without
 /// adding the matching arm reintroduces FIND-ABE-01, so `abe_09` asserts the two agree.
-pub const ABE_BUILDABLE_AGENTS: &[&str] = &["codex", "grok"];
+pub const ABE_BUILDABLE_AGENTS: &[&str] = &["codex", "claude", "grok"];
 
 #[cfg(test)]
 mod abe_agent_tests {
@@ -2004,6 +2092,103 @@ mod abe_agent_tests {
 }
 
 
+/// Worktree dispatch, for every agent that can have one.
+///
+/// `dispatch_codex_worktree` built codex inline and `build_worker_argv`'s doc called routing it
+/// through "a separate change with its own regression risk". This module is the regression net
+/// for that change.
+#[cfg(test)]
+mod abe_worktree_tests {
+    use super::build_worktree_worker_argv;
+
+    fn resolver(agent: &str) -> (String, Vec<String>) {
+        (format!("/bin/{agent}"), Vec::new())
+    }
+
+    /// THE REGRESSION PIN. The codex worktree argv must be what the call site built inline,
+    /// in the same order. If this changes, an existing worktree dispatch changed behaviour.
+    /// RED IF: the codex branch is reordered or a flag is added or dropped.
+    #[test]
+    fn abe_11_codex_worktree_argv_is_unchanged() {
+        let dirs = vec!["/repo/.git".to_string(), "/repo/.git/worktrees/t".to_string()];
+        let (cmd, args) =
+            build_worktree_worker_argv("codex", &resolver, "do the task", &dirs, None)
+                .expect("codex worktree");
+        assert_eq!(cmd, "/bin/codex");
+        assert_eq!(args[0], "exec");
+        assert_eq!(args[1], "--full-auto");
+        // Both directories, each behind its own --add-dir, in the order the caller supplied.
+        let add_dirs: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && args[i - 1] == "--add-dir")
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(add_dirs, vec![&dirs[0], &dirs[1]]);
+        assert_eq!(args.last().map(String::as_str), Some("do the task"), "prompt last");
+    }
+
+    /// A claude worktree worker must be able to WRITE and to reach the parent .git.
+    /// RED IF: the permission mode weakens, or --add-dir is dropped, or -p stops being last.
+    #[test]
+    fn abe_12_claude_worktree_worker_can_write_and_reach_the_parent_git() {
+        let dirs = vec!["/repo/.git".to_string()];
+        let (cmd, args) =
+            build_worktree_worker_argv("claude", &resolver, "do the task", &dirs, None)
+                .expect("claude worktree");
+        assert_eq!(cmd, "/bin/claude");
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--permission-mode bypassPermissions"),
+            "acceptEdits denies Bash, so the worker cannot commit. Verified live 2026-09-02: \
+             with acceptEdits the file was written and `git commit` was DENIED. got: {joined}"
+        );
+        assert!(joined.contains("--add-dir /repo/.git"), "got: {joined}");
+        assert!(joined.contains("stream-json") && joined.contains("--verbose"),
+            "without --verbose the CLI emits only a result and the worker's tool calls vanish");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("do the task"),
+            "--add-dir is VARIADIC and eats the prompt unless -p terminates it; got: {joined}"
+        );
+        assert_eq!(args.iter().position(|a| a == "-p"), Some(args.len() - 2));
+    }
+
+    /// grok gets a WRITABLE sandbox, unlike the consult and unlike a reviewer.
+    ///
+    /// And the known gap is asserted rather than left as prose: grok has no `--add-dir`
+    /// equivalent, so extra_dirs is dropped and a grok worktree worker may not be able to run
+    /// git operations needing the parent .git. Pinned so the gap is visible in the test output
+    /// rather than only in a comment nobody reads.
+    /// RED IF: grok silently starts receiving --add-dir, or loses its writable sandbox.
+    #[test]
+    fn abe_13_grok_worktree_worker_is_writable_and_cannot_reach_the_parent_git() {
+        let dirs = vec!["/repo/.git".to_string()];
+        let (cmd, args) =
+            build_worktree_worker_argv("grok", &resolver, "do the task", &dirs, None)
+                .expect("grok worktree");
+        assert_eq!(cmd, "/bin/grok");
+        let joined = args.join(" ");
+        assert!(joined.contains("--sandbox workspace"), "a worker writes; got: {joined}");
+        assert!(
+            !joined.contains("/repo/.git"),
+            "KNOWN GAP: grok has no --add-dir. If this fires, the gap was closed and the doc \
+             comment on build_worktree_worker_argv must be updated to say so; got: {joined}"
+        );
+    }
+
+    /// An agent with no worktree arm is refused, not substituted. Same rule as FIND-ABE-01.
+    /// RED IF: a catch-all arm returns codex.
+    #[test]
+    fn abe_14_an_unbuildable_worktree_agent_is_refused() {
+        for agent in ["gemini", "deepseek"] {
+            let err = build_worktree_worker_argv(agent, &resolver, "task", &[], None)
+                .expect_err("must refuse rather than spawn codex");
+            assert!(err.contains("cannot dispatch"), "got: {err}");
+        }
+    }
+}
+
 /// FIND-ABE-01: an ABE worker's LABEL and its PROCESS must be the same agent.
 ///
 /// Found while answering "is ABE still a codex-only thing". It is not: grok has a real arm. But
@@ -2031,7 +2216,10 @@ mod abe_label_honesty_tests {
     /// RED IF: the catch-all arm comes back.
     #[test]
     fn abe_07_an_unbuildable_agent_is_refused_not_substituted() {
-        for agent in ["claude", "gemini", "deepseek", "antigravity"] {
+        // claude was here until it got a real arm. gemini and deepseek remain unbuildable:
+        // gemini has no autonomous-write worker profile verified, and deepseek has no
+        // filesystem at all through the bridge, so it could never work in a worktree.
+        for agent in ["gemini", "deepseek", "antigravity"] {
             let err = build_worker_argv(agent, &resolver, "task", "/tmp").expect_err(
                 "ABE has no argv builder for this agent and must say so rather than spawn codex",
             );
@@ -2057,6 +2245,29 @@ mod abe_label_honesty_tests {
 
         let (cmd, _) = build_worker_argv("grok", &resolver, "task", "/tmp").expect("grok");
         assert!(cmd.ends_with("grok"), "a grok worker must be a grok process, got {cmd}");
+
+        let (cmd, args) = build_worker_argv("claude", &resolver, "task", "/tmp").expect("claude");
+        assert!(cmd.ends_with("claude"), "a claude worker must be a claude process, got {cmd}");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("task"),
+            "the prompt must be LAST: --add-dir and --allowedTools are variadic and swallow it"
+        );
+        assert_eq!(
+            args.iter().position(|a| a == "-p"),
+            Some(args.len() - 2),
+            "-p must immediately precede the prompt"
+        );
+        // The worker/reviewer split, asserted rather than assumed. An ABE worker WRITES.
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("bypassPermissions"),
+            "acceptEdits denies Bash, so the worker could never commit; verified live"
+        );
+        assert!(
+            !joined.contains("--allowedTools"),
+            "the read-only allow-list belongs to the REVIEWER dispatch, never to a worker"
+        );
     }
 
     /// The selection list and the builder must not drift. Adding a name to ABE_BUILDABLE_AGENTS
@@ -2078,14 +2289,22 @@ mod abe_label_honesty_tests {
     fn abe_10_selection_falls_back_for_an_unbuildable_agent() {
         let _g = env_guard();
         // SAFETY: held under the module lock, removed on both paths below.
-        unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "claude") };
+        // deepseek is dispatchable by the daemon and can never be an ABE worker: it is HTTP
+        // with no filesystem through the bridge, so it cannot touch a worktree at all.
+        unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "deepseek") };
         let selected = abe_worker_agent();
         unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
         assert_eq!(
             selected, "codex",
-            "claude is dispatchable by the daemon but not buildable by ABE; selecting it would \
-             record a claude worker and spawn a codex process"
+            "deepseek is dispatchable by the daemon but not buildable by ABE; selecting it would \
+             record a deepseek worker and spawn a codex process"
         );
+
+        // claude IS buildable now, so it must select as itself rather than falling back.
+        unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "claude") };
+        let claude = abe_worker_agent();
+        unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
+        assert_eq!(claude, "claude");
 
         unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "supergrok") };
         let alias = abe_worker_agent();
