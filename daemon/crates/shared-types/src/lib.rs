@@ -86,6 +86,26 @@ pub struct AskAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_sight: Option<bool>,
 
+    /// This dispatch IS a peer review, so it must not itself be peer reviewed.
+    ///
+    /// Without this, `enforce_mandatory_peer_review` dispatching a reviewer would trigger
+    /// mandatory review of the reviewer's answer, which would dispatch another reviewer, for
+    /// ever. The guard is an explicit field rather than a thread-local or task-local because
+    /// tokio moves tasks across threads and an ambient flag was already shown unsound in this
+    /// codebase on 2026-09-01.
+    /// NEVER deserialized from the wire. Set only in-process by the review dispatcher.
+    ///
+    /// `AskAgentRequest` IS the MCP `ask_agent` parameter object and the daemon HTTP body, so a
+    /// plain public field let any caller send `"is_peer_review": true` and skip mandatory
+    /// review entirely. Antigravity: "Moving the recursion guard from an ambient local to the
+    /// public struct breached the security boundary." Grok found the same bypass independently.
+    ///
+    /// `serde(skip)` is safe for the recursion guard because
+    /// `enforce_mandatory_peer_review` calls `execute_ask_agent` IN PROCESS. The flag never has
+    /// to cross the wire, so it can be made unforgeable without breaking the guard.
+    #[serde(skip)]
+    pub is_peer_review: Option<bool>,
+
     /// The primary sources this review must actually open, by path.
     ///
     /// `require_sight` alone only proves the agent made SOME tool call, which passes on one
