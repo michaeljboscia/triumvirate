@@ -2013,6 +2013,27 @@ async fn enforce_mandatory_peer_review(
         .reviewer_agent
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
+    // FIND-REVIEW-02: honour the inflight cap BEFORE spending a live model call.
+    //
+    // `request_review` parks a review as `pending` when `TRIUMVIRATE_REVIEW_MAX_INFLIGHT` is
+    // already met. Nothing here read that state, so the dispatch ran anyway: the cap counted
+    // reviews but never limited them. FIND-REVIEW-01's state guard turned that into a dispatch
+    // that pays for a reviewer and then fails at submit, which is fail-closed but wasteful and
+    // reads like an infrastructure fault rather than a queue that is full.
+    //
+    // Blocking rather than waiting is deliberate. Waiting inside the author's turn would hold a
+    // request open on a queue that only drains when some other turn finishes, and the operator
+    // can raise the cap. The error names the cap so it is actionable.
+    if review.state != "in_progress" {
+        return Err(format!(
+            "mandatory peer review queued, not run: review_id={} state={} \
+             (TRIUMVIRATE_REVIEW_MAX_INFLIGHT={} already in flight). No reviewer was dispatched.",
+            review.review_id,
+            review.state,
+            std::env::var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT").unwrap_or_else(|_| "2".to_string()),
+        ));
+    }
+
     let pending_detail = format!(
         "mandatory peer review requested: {} reviewer={}",
         review.review_id, reviewer
@@ -2117,7 +2138,14 @@ async fn enforce_mandatory_peer_review(
     };
 
     let _ = engine
-        .submit_review(&review.review_id, verdict.as_str(), Some(comments.as_str()))
+        .submit_review(
+            &review.review_id,
+            verdict.as_str(),
+            Some(comments.as_str()),
+            // The in-process dispatch holds the reviewer's own parsed answer. It is not
+            // reachable over MCP or HTTP, which is why it is the one trusted submitter.
+            peer_review::Submitter::Dispatch,
+        )
         .map_err(|e| format!("mandatory peer review submit failed: {e}"))?;
     let reviewed = engine
         .get_review(&review.review_id)
@@ -5990,6 +6018,10 @@ mod mandatory_review_tests {
             std::env::remove_var("TRIUMVIRATE_CLAUDE_BIN");
             std::env::remove_var("TRIUMVIRATE_PEER_REVIEWERS");
             std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+            // Cleared here rather than at the bottom of the one test that sets it, for the same
+            // reason as the rest: an assertion that fires first would leave a cap of 1 set for
+            // every other test in the binary, and they would fail as "queued, not run".
+            std::env::remove_var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT");
         }
     }
 
@@ -6061,6 +6093,54 @@ mod mandatory_review_tests {
             "the reviewer's own words must come back, or a block is unactionable; got: {err}"
         );
         assert!(fx.counts.exists(), "the reviewer process must actually have run");
+    }
+
+    /// FIND-REVIEW-02: a full inflight queue must not spend a live model call.
+    ///
+    /// `request_review` parks a review as `pending` once `TRIUMVIRATE_REVIEW_MAX_INFLIGHT` is
+    /// met, and nothing on the dispatch path read that state. The cap counted reviews and never
+    /// limited them: a parked review was dispatched exactly like a running one.
+    ///
+    /// The assertion that matters is the one on `fx.counts`. Checking only that the turn was
+    /// blocked would pass even if the reviewer HAD been spawned, because FIND-REVIEW-01's state
+    /// guard would then have blocked it at submit time, after the money was spent. The absence
+    /// of the invocation file is what distinguishes "did not run" from "ran and was rejected".
+    ///
+    /// RED IF: the state check before the dispatch is removed.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_13_a_full_queue_blocks_without_dispatching() {
+        let _guard = review_env_lock();
+        let fx = setup_review("APPROVE");
+        // SAFETY: serialised by review_env_lock, cleared by ReviewFixture::drop.
+        unsafe { std::env::set_var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT", "1") };
+
+        // Occupy the only slot with a review that is genuinely in_progress and never submitted,
+        // which is what an in-flight review of another turn looks like.
+        std::fs::create_dir_all(fx.root.join(".triumvirate").join("spool")).expect("spool");
+        LedgerStore::open(fx.root.clone()).expect("ledger");
+        let engine = PeerReviewEngine::new(fx.root.clone()).expect("engine");
+        let occupying = engine
+            .request_review(ReviewRequest {
+                fleet_id: None,
+                author_agent: "claude".to_string(),
+                artifact: "someone else's turn".to_string(),
+                review_type: "agent_output".to_string(),
+            })
+            .expect("occupy the slot");
+        assert_eq!(occupying.state, "in_progress", "the fixture must actually fill the cap");
+
+        let out = run_review(&fx, "work that arrives while the queue is full").await;
+
+        let err = out.expect_err("a queued review must not let the turn ship");
+        assert!(
+            err.contains("queued, not run"),
+            "the block must say the queue was full, not look like a reviewer failure; got: {err}"
+        );
+        assert!(
+            !fx.counts.exists(),
+            "no reviewer process may be spawned for a review that was never going to run"
+        );
     }
 
     /// An APPROVE from a real reviewer lets the turn through.

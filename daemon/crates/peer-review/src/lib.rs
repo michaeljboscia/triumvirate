@@ -68,6 +68,27 @@ pub(crate) fn reviewer_env_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Who is claiming to submit a verdict.
+///
+/// FIND-REVIEW-01. `submit_review` used to take `(review_id, verdict, comments)` and nothing
+/// else, so it could not have been safe: the caller never said who was speaking. Any client that
+/// could reach `review_submit` could land `approve` on a row that no reviewer had ever been
+/// dispatched for, and the mandatory-review gate reads that row's state to decide whether the
+/// turn ships.
+///
+/// This is a REQUIRED parameter rather than an `Option`, so adding a new submit path is a
+/// decision someone makes in the type system instead of a default that silently authorises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submitter<'a> {
+    /// The in-process mandatory-review dispatch, which just received and parsed this reviewer's
+    /// own text. It is trusted because it holds the reviewer's answer, not because it says so:
+    /// it is not reachable over MCP or HTTP.
+    Dispatch,
+    /// An external caller (MCP tool / HTTP body) claiming to speak for this agent. Checked
+    /// against the reviewer the engine actually assigned.
+    Agent(&'a str),
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerReviewEngine {
     db_path: PathBuf,
@@ -132,21 +153,69 @@ impl PeerReviewEngine {
             .ok_or_else(|| anyhow::anyhow!("review insert did not persist"))
     }
 
+    /// Record a verdict against a review row.
+    ///
+    /// FIND-REVIEW-01: an `approve` is only accepted when the row is `in_progress` AND the
+    /// submitter is the reviewer the engine assigned (or the in-process dispatch that holds that
+    /// reviewer's parsed answer). Everything else is rejected, loudly.
+    ///
+    /// Why only `approve` carries the identity check: a forged `reject` or `concerns` cannot
+    /// launder unreviewed work through the gate, it can only block or annotate, and blocking is
+    /// the safe direction. The state guard still applies to every verdict, because a row nobody
+    /// is working on has no verdict to give.
     pub fn submit_review(
         &self,
         review_id: &str,
         verdict: &str,
         comments: Option<&str>,
+        submitter: Submitter<'_>,
     ) -> anyhow::Result<Option<String>> {
         let conn = self.open_conn()?;
+        let existing = self
+            .get_review(review_id)?
+            .ok_or_else(|| anyhow::anyhow!("review not found: {review_id}"))?;
+
+        if existing.state != "in_progress" {
+            anyhow::bail!(
+                "review {review_id} is '{}', not 'in_progress': a verdict can only be recorded \
+                 against a review that is actually running",
+                existing.state
+            );
+        }
+
+        if verdict.eq_ignore_ascii_case("approve") {
+            let assigned = existing.reviewer_agent.as_deref().unwrap_or("");
+            let authorised = match submitter {
+                Submitter::Dispatch => true,
+                Submitter::Agent(name) => {
+                    !assigned.is_empty() && name.eq_ignore_ascii_case(assigned)
+                }
+            };
+            if !authorised {
+                let claimed = match submitter {
+                    Submitter::Dispatch => "in-process dispatch".to_string(),
+                    Submitter::Agent("") => "(no reviewer named)".to_string(),
+                    Submitter::Agent(name) => name.to_string(),
+                };
+                anyhow::bail!(
+                    "review {review_id} is assigned to '{assigned}', but the approve was \
+                     submitted by '{claimed}'"
+                );
+            }
+        }
+
+        // Re-checked in the WHERE clause, not just above, so a concurrent submit cannot slip
+        // between the read and the write. `open_conn` sets a busy timeout but not a transaction.
         let updated = conn.execute(
             "UPDATE reviews
              SET verdict = ?2, comments = ?3, reviewed_at = datetime('now'), state = 'done'
-             WHERE review_id = ?1",
+             WHERE review_id = ?1 AND state = 'in_progress'",
             rusqlite::params![review_id, verdict, comments],
         )?;
         if updated == 0 {
-            anyhow::bail!("review not found: {review_id}");
+            anyhow::bail!(
+                "review {review_id} changed state while the verdict was being recorded"
+            );
         }
 
         let inflight: i64 = conn.query_row(
@@ -261,7 +330,7 @@ mod tests {
 
     use ledger::LedgerStore;
 
-    use super::{PeerReviewEngine, ReviewRequest};
+    use super::{PeerReviewEngine, ReviewRequest, Submitter};
 
     #[test]
     fn review_assignment_queue_and_timeout_behave_as_expected() {
@@ -386,7 +455,7 @@ mod tests {
         drop(conn);
 
         let promoted = engine
-            .submit_review(&first.review_id, "approve", Some("ok"))
+            .submit_review(&first.review_id, "approve", Some("ok"), Submitter::Dispatch)
             .expect("submit first");
         assert_eq!(promoted.as_deref(), Some(second.review_id.as_str()));
         let second_after = engine
@@ -396,7 +465,7 @@ mod tests {
         assert_eq!(second_after.state, "in_progress");
 
         let promoted = engine
-            .submit_review(&second.review_id, "approve", Some("ok"))
+            .submit_review(&second.review_id, "approve", Some("ok"), Submitter::Dispatch)
             .expect("submit second");
         assert_eq!(promoted.as_deref(), Some(third.review_id.as_str()));
         let third_after = engine
@@ -484,5 +553,245 @@ mod panel_roster_tests {
             4,
             "an empty roster must fall back to the default, never disable the panel silently"
         );
+    }
+}
+
+/// FIND-REVIEW-01: `review_submit` cannot approve a review nobody performed.
+///
+/// The bug these cover: `submit_review` took `(review_id, verdict, comments)` and its UPDATE had
+/// no state guard and no notion of who was calling, so `SET state = 'done'` ran against any row
+/// in any state for any caller. `enforce_mandatory_peer_review` then reads that row and ships the
+/// turn if it says done+approve. That is the rubber stamp rebuilt one layer down: the dispatch
+/// was made real in `092f90b`, but the record it writes to could still be written by anyone.
+///
+/// Every test here was made to fail on purpose before it was kept.
+#[cfg(test)]
+mod submit_authority_tests {
+    use std::fs;
+
+    use ledger::LedgerStore;
+
+    use super::{PeerReviewEngine, ReviewRequest, Submitter};
+
+    /// A project with a real ledger, one review row, and the reviewer the engine picked.
+    ///
+    /// Returns `(engine, review_id, assigned_reviewer)`. Each call gets its own tempdir, which is
+    /// leaked deliberately: the engine reopens the sqlite file by path on every call, so dropping
+    /// the `TempDir` mid-test would delete the database out from under it.
+    fn seeded(author: &str) -> (PeerReviewEngine, String, String) {
+        let temp = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
+        let _store = LedgerStore::open(project_root.clone()).expect("open ledger");
+        let engine = PeerReviewEngine::new(project_root).expect("engine");
+        let review = engine
+            .request_review(ReviewRequest {
+                fleet_id: None,
+                author_agent: author.to_string(),
+                artifact: "the work under review".to_string(),
+                review_type: "agent_output".to_string(),
+            })
+            .expect("request review");
+        let reviewer = review.reviewer_agent.clone().expect("reviewer assigned");
+        (engine, review.review_id, reviewer)
+    }
+
+    fn force_state(engine: &PeerReviewEngine, review_id: &str, state: &str) {
+        let conn = engine.open_conn().expect("open conn");
+        conn.execute(
+            "UPDATE reviews SET state = ?2 WHERE review_id = ?1",
+            rusqlite::params![review_id, state],
+        )
+        .expect("force state");
+    }
+
+    /// The headline case. A row parked in `pending` has had no reviewer dispatched for it, so
+    /// there is no verdict in existence to record. Approving it is forging a review.
+    /// RED IF: the state guard is dropped from `submit_review`.
+    #[test]
+    fn u_pr_approve_on_a_pending_row_is_refused() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        force_state(&engine, &review_id, "pending");
+
+        let err = engine
+            .submit_review(&review_id, "approve", Some("lgtm"), Submitter::Agent(&reviewer))
+            .expect_err("a pending review must not be approvable");
+        assert!(
+            err.to_string().contains("not 'in_progress'"),
+            "the error must name the state problem, got: {err}"
+        );
+
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.state, "pending", "the row must be untouched");
+        assert_eq!(after.verdict, None, "no verdict may be recorded");
+    }
+
+    /// The in-process dispatch is trusted about IDENTITY, not about STATE. It cannot approve a
+    /// row that is not running either, because if the row is not `in_progress` then the dispatch
+    /// is out of step with the engine and the safe reading of that is "stop".
+    /// RED IF: `Submitter::Dispatch` is made to bypass the state check.
+    #[test]
+    fn u_pr_even_the_dispatch_cannot_approve_a_pending_row() {
+        let (engine, review_id, _reviewer) = seeded("codex");
+        force_state(&engine, &review_id, "pending");
+
+        let err = engine
+            .submit_review(&review_id, "approve", Some("lgtm"), Submitter::Dispatch)
+            .expect_err("dispatch must not approve a parked review either");
+        assert!(err.to_string().contains("not 'in_progress'"), "got: {err}");
+    }
+
+    /// A `failed` row is one `fail_timed_out_reviews` already gave up on. Approving it after the
+    /// fact resurrects a review that timed out.
+    /// RED IF: the guard only checks for `pending` instead of requiring `in_progress`.
+    #[test]
+    fn u_pr_approve_on_a_failed_row_is_refused() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        force_state(&engine, &review_id, "failed");
+
+        let err = engine
+            .submit_review(&review_id, "approve", Some("lgtm"), Submitter::Agent(&reviewer))
+            .expect_err("a failed review must not be approvable");
+        assert!(err.to_string().contains("not 'in_progress'"), "got: {err}");
+    }
+
+    /// Submitting twice is the same forgery with extra steps: the second submit lands on a row
+    /// that is already `done`.
+    /// RED IF: the terminal state stops being terminal.
+    #[test]
+    fn u_pr_a_review_cannot_be_approved_twice() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        engine
+            .submit_review(&review_id, "reject", Some("no"), Submitter::Agent(&reviewer))
+            .expect("first submit");
+
+        let err = engine
+            .submit_review(&review_id, "approve", Some("actually fine"), Submitter::Dispatch)
+            .expect_err("a completed review must not be re-verdicted");
+        assert!(err.to_string().contains("not 'in_progress'"), "got: {err}");
+
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(
+            after.verdict.as_deref(),
+            Some("reject"),
+            "the original verdict must survive the overwrite attempt"
+        );
+    }
+
+    /// Identity. The row is running, but the caller is not the agent the engine assigned.
+    /// This is the forge an MCP or HTTP client can attempt: it knows the review_id (review_status
+    /// hands it out) and simply claims to be someone.
+    /// RED IF: the reviewer comparison is removed or made permissive.
+    #[test]
+    fn u_pr_approve_by_an_agent_that_is_not_the_reviewer_is_refused() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        let impostor = if reviewer == "grok" { "gemini" } else { "grok" };
+        assert_ne!(impostor, reviewer);
+
+        let err = engine
+            .submit_review(&review_id, "approve", Some("lgtm"), Submitter::Agent(impostor))
+            .expect_err("only the assigned reviewer may approve");
+        assert!(
+            err.to_string().contains("assigned to"),
+            "the error must name the assignment mismatch, got: {err}"
+        );
+
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.state, "in_progress");
+        assert_eq!(after.verdict, None);
+    }
+
+    /// An MCP body that names no reviewer at all reaches the engine as the empty agent. It must
+    /// not match, and in particular must not match a row whose reviewer_agent is somehow null.
+    /// RED IF: the empty-string case is allowed to compare equal.
+    #[test]
+    fn u_pr_an_unidentified_caller_cannot_approve() {
+        let (engine, review_id, _reviewer) = seeded("codex");
+
+        let err = engine
+            .submit_review(&review_id, "approve", None, Submitter::Agent(""))
+            .expect_err("an unidentified submitter must not approve");
+        assert!(err.to_string().contains("assigned to"), "got: {err}");
+    }
+
+    /// The positive control. Without this the whole gate could be passing by refusing everything,
+    /// which is a different way of being useless.
+    /// RED IF: a legitimate approve stops working.
+    #[test]
+    fn u_pr_the_assigned_reviewer_can_approve() {
+        let (engine, review_id, reviewer) = seeded("codex");
+
+        engine
+            .submit_review(&review_id, "approve", Some("read it, it holds"), Submitter::Agent(&reviewer))
+            .expect("the assigned reviewer may approve");
+
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.state, "done");
+        assert_eq!(after.verdict.as_deref(), Some("approve"));
+    }
+
+    /// The name comparison must not be case sensitive: the roster is lowercased at parse time but
+    /// a client may well send "Codex".
+    /// RED IF: the comparison becomes `==`.
+    #[test]
+    fn u_pr_the_reviewer_name_match_ignores_case() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        let shouted = reviewer.to_ascii_uppercase();
+
+        engine
+            .submit_review(&review_id, "approve", None, Submitter::Agent(&shouted))
+            .expect("case must not decide authority");
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.verdict.as_deref(), Some("approve"));
+    }
+
+    /// The in-process dispatch holds the reviewer's own parsed text, so it may submit on that
+    /// reviewer's behalf. This is Goal 1.1's second required test: the gate must still be able to
+    /// record a real verdict, or mandatory review can never complete at all.
+    /// RED IF: `Submitter::Dispatch` loses its authority.
+    #[test]
+    fn u_pr_the_dispatch_can_submit_a_real_verdict() {
+        let (engine, review_id, _reviewer) = seeded("codex");
+
+        engine
+            .submit_review(&review_id, "approve", Some("APPROVE\nreasoning"), Submitter::Dispatch)
+            .expect("the dispatch may record the verdict it just parsed");
+
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.state, "done");
+        assert_eq!(after.verdict.as_deref(), Some("approve"));
+    }
+
+    /// Identity is only checked on `approve`. A forged REJECT cannot launder unreviewed work
+    /// through the gate; it can only block, and blocking is the safe direction. Requiring
+    /// identity here would let an unroutable client turn a block into a submit error, which the
+    /// caller might then treat as an infrastructure fault rather than a verdict.
+    /// RED IF: the identity check is widened to all verdicts without deciding to.
+    #[test]
+    fn u_pr_a_reject_does_not_require_the_assigned_identity() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        let other = if reviewer == "grok" { "gemini" } else { "grok" };
+
+        engine
+            .submit_review(&review_id, "reject", Some("this claim is false"), Submitter::Agent(other))
+            .expect("a reject may come from anyone: it can only block");
+
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.verdict.as_deref(), Some("reject"));
+    }
+
+    /// "APPROVE" with decoration is still an approve as far as authority goes. The verdict string
+    /// reaching the engine is already normalised by `classify_review_verdict`, but a raw MCP
+    /// client can send anything, and `eq_ignore_ascii_case` is the only thing standing between
+    /// "Approve" and an unchecked write.
+    /// RED IF: the approve detection becomes an exact `== "approve"`.
+    #[test]
+    fn u_pr_a_capitalised_approve_is_still_an_approve() {
+        let (engine, review_id, _reviewer) = seeded("codex");
+
+        let err = engine
+            .submit_review(&review_id, "APPROVE", None, Submitter::Agent("nobody"))
+            .expect_err("case must not be a way around the authority check");
+        assert!(err.to_string().contains("assigned to"), "got: {err}");
     }
 }

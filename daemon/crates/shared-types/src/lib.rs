@@ -589,6 +589,11 @@ pub struct ReviewSubmitRequest {
     pub review_id: String,
     pub verdict: String,
     pub comments: Option<String>,
+    /// Which reviewer is submitting. FIND-REVIEW-01: an `approve` is refused unless this matches
+    /// the reviewer the engine assigned to the row. Absent means unidentified, which can raise
+    /// concerns or reject but can never approve.
+    #[serde(default)]
+    pub reviewer_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

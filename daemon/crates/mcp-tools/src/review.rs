@@ -1,5 +1,5 @@
 use daemon_core::metrics::DaemonMetrics;
-use peer_review::{PeerReviewEngine, ReviewRequest as PersistedReviewRequest};
+use peer_review::{PeerReviewEngine, ReviewRequest as PersistedReviewRequest, Submitter};
 use shared_types::{
     ReviewRequestResponse, ReviewRequestTool, ReviewStatusRequest, ReviewStatusResponse,
     ReviewSubmitRequest,
@@ -48,7 +48,16 @@ pub fn review_submit(metrics: &DaemonMetrics, req: ReviewSubmitRequest) -> Resul
         .ok_or_else(|| "failed to resolve project root".to_string())?;
     let engine = PeerReviewEngine::new(project_root)
         .map_err(|e| format!("review_submit engine init failed: {e}"))?;
-    let result = engine.submit_review(&req.review_id, &req.verdict, req.comments.as_deref());
+    // FIND-REVIEW-01: this is the untrusted surface. Whatever the body claims is checked against
+    // the reviewer the engine assigned; an unidentified caller submits as the empty agent, which
+    // never matches, so it cannot approve.
+    let claimed = req.reviewer_agent.as_deref().unwrap_or("");
+    let result = engine.submit_review(
+        &req.review_id,
+        &req.verdict,
+        req.comments.as_deref(),
+        Submitter::Agent(claimed),
+    );
     // Emit on both outcomes, before the `?`: a rejected submit is invisible if we only report
     // successes. The verdict reached only local Prometheus before this.
     mcp_bridge::posthog::record_review_verdict(&req.verdict, result.is_ok());

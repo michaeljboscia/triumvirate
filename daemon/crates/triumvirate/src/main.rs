@@ -6280,6 +6280,9 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 review_id: requested.0.review_id.clone(),
                 verdict: "approve".to_string(),
                 comments: Some("looks good".to_string()),
+                // FIND-REVIEW-01: an approve must name the assigned reviewer. Passing None here
+                // is the forgery case and is covered by its own test.
+                reviewer_agent: requested.0.reviewer_agent.clone(),
             }))
             .await
             .map_err(anyhow::Error::msg)?;
@@ -6294,6 +6297,113 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(status.0.verdict.as_deref(), Some("approve"));
 
         std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    /// FIND-REVIEW-01 on the production route.
+    ///
+    /// The unit tests in `peer-review` prove the engine refuses a forged approve. This one proves
+    /// the MCP tool actually reaches that refusal, because the last sight-gate pass burned a
+    /// "tested the helper, not the route" bug and Grok's rules for this pass name it explicitly.
+    ///
+    /// `review_submit` is MCP only: there is no `/review/submit` HTTP handler in `daemon-http`,
+    /// checked rather than assumed. So this is the one surface, not one of two.
+    ///
+    /// The pending row is manufactured the way production makes one, by exceeding the inflight
+    /// cap, rather than by writing state into sqlite by hand. That keeps the test honest about
+    /// whether a pending row can exist at all.
+    #[tokio::test]
+    async fn u_review_submit_cannot_approve_a_pending_row() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let project_root = std::env::temp_dir().join(format!("triumvirate-review-forge-{now}"));
+        fs::create_dir_all(project_root.join(".triumvirate").join("spool"))?;
+        let _ = LedgerStore::open(project_root.clone())?;
+        // SAFETY: held under env_lock for the whole test, removed before returning.
+        unsafe { std::env::set_var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT", "1") };
+
+        let bridge = McpBridge::new_ephemeral();
+        let root = Some(project_root.to_string_lossy().to_string());
+        let request_one = || async {
+            bridge
+                .review_request(Parameters(ReviewRequestTool {
+                    project_root: root.clone(),
+                    fleet_id: None,
+                    author_agent: "codex".to_string(),
+                    artifact: "diff -- fake".to_string(),
+                    review_type: "code".to_string(),
+                }))
+                .await
+                .map_err(anyhow::Error::msg)
+        };
+        let running = request_one().await?;
+        let parked = request_one().await?;
+        assert_eq!(running.0.state, "in_progress");
+        assert_eq!(parked.0.state, "pending", "cap 1 must park the second review");
+
+        // The forge: the client knows the review_id and even names the correct reviewer, but no
+        // reviewer was ever dispatched for this row.
+        let forged = bridge
+            .review_submit(Parameters(ReviewSubmitRequest {
+                project_root: root.clone(),
+                review_id: parked.0.review_id.clone(),
+                verdict: "approve".to_string(),
+                comments: Some("looks good".to_string()),
+                reviewer_agent: parked.0.reviewer_agent.clone(),
+            }))
+            .await;
+        assert!(forged.is_err(), "an approve on a pending row must be rejected, not recorded");
+
+        // An unidentified caller cannot approve the row that IS running, either.
+        let anonymous = bridge
+            .review_submit(Parameters(ReviewSubmitRequest {
+                project_root: root.clone(),
+                review_id: running.0.review_id.clone(),
+                verdict: "approve".to_string(),
+                comments: None,
+                reviewer_agent: None,
+            }))
+            .await;
+        assert!(anonymous.is_err(), "an approve naming no reviewer must be rejected");
+
+        // Neither attempt may have moved anything. A gate that errors AND writes is worse than
+        // one that does neither, because the error looks transient and the record looks final.
+        for record in [&parked.0, &running.0] {
+            let status = bridge
+                .review_status(Parameters(ReviewStatusRequest {
+                    project_root: root.clone(),
+                    review_id: record.review_id.clone(),
+                }))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            assert_eq!(status.0.state, record.state, "state must be untouched");
+            assert_eq!(status.0.verdict, None, "no verdict may be recorded");
+        }
+
+        // Positive control on the same route: the assigned reviewer of the running row can.
+        bridge
+            .review_submit(Parameters(ReviewSubmitRequest {
+                project_root: root.clone(),
+                review_id: running.0.review_id.clone(),
+                verdict: "approve".to_string(),
+                comments: Some("read it".to_string()),
+                reviewer_agent: running.0.reviewer_agent.clone(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let status = bridge
+            .review_status(Parameters(ReviewStatusRequest {
+                project_root: root.clone(),
+                review_id: running.0.review_id.clone(),
+            }))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(status.0.state, "done");
+        assert_eq!(status.0.verdict.as_deref(), Some("approve"));
+
+        // SAFETY: held under env_lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT") };
         let _ = fs::remove_dir_all(project_root);
         Ok(())
     }
