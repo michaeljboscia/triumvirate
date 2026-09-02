@@ -4,7 +4,7 @@
 [![Version](https://img.shields.io/github/v/release/michaeljboscia/triumvirate)](https://github.com/michaeljboscia/triumvirate/releases)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/License-FSL--1.1--ALv2-blue.svg)](LICENSE)
 
-**Three AI models. One daemon. A methodology for building software with all of them at once.**
+**Four AI models. One daemon. A methodology for building software with all of them at once.**
 
 Claude, Gemini, and Codex, each with different strengths, working on the same codebase, coordinated by a single Rust daemon, visible in real time from inside your editor.
 
