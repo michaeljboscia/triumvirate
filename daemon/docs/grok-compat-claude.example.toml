@@ -1,0 +1,19 @@
+# Expected `[compat.claude]` block for ~/.grok/config.toml.
+#
+# WHY THIS FILE EXISTS. With inheritance ON, a grok consult loads ~/.claude.json and advertises
+# roughly 420 tools plus 509 commands: 66,559 input tokens measured to answer "pong". With the
+# curated MCP set it is about 126 tools. Nothing detected drift until `triumvirate doctor`
+# learned to check, and the setting lived only on one laptop as tribal knowledge.
+#
+# All five keys must be present AND false. A MISSING key is drift too: the default is
+# inherit-on, so silence is not safety.
+#
+# Verified against grok 1.0.13 on 2026-09-01. Contains no secrets: the real config also holds
+# MCP server env tables with API tokens, which is why only this block is committed.
+
+[compat.claude]
+mcps = false
+skills = false
+hooks = false
+agents = false
+rules = false

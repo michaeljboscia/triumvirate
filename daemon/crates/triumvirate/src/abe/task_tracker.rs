@@ -228,6 +228,7 @@ impl TaskTracker {
         worktree_path: Option<PathBuf>,
         parent_session_id: Option<String>,
         root_session_id: Option<String>,
+        agent: String,
         dispatch_surface: Option<&'static str>,
         dispatch_repo: Option<String>,
         dispatch_started_at: Instant,
@@ -247,7 +248,7 @@ impl TaskTracker {
                 // ABE dispatch is Codex-only today. When another agent becomes dispatchable,
                 // this is the ONE place that has to learn about it, and `snapshot_workers`
                 // follows automatically instead of needing a second edit.
-                agent: "codex".to_string(),
+                agent,
                 wave,
                 status: TaskStatus::Working,
                 started_at,
@@ -606,7 +607,7 @@ impl TaskTracker {
     }
 
     #[instrument(skip_all, fields(task_id = %task_id, status = "setup_failed"))]
-    pub async fn register_setup_failed(&self, task_id: String, error_message: String) {
+    pub async fn register_setup_failed(&self, task_id: String, agent: String, error_message: String) {
         let mut guard = self.inner.lock().await;
         guard.insert(
             task_id.clone(),
@@ -614,7 +615,7 @@ impl TaskTracker {
                 // ABE dispatch is Codex-only today. When another agent becomes dispatchable,
                 // this is the ONE place that has to learn about it, and `snapshot_workers`
                 // follows automatically instead of needing a second edit.
-                agent: "codex".to_string(),
+                agent,
                 wave: 0,
                 status: TaskStatus::SetupFailed,
                 started_at: Instant::now(),
@@ -773,6 +774,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -931,6 +933,7 @@ mod tests {
                 Some(wt.clone()),
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -970,6 +973,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1084,6 +1088,7 @@ mod tests {
                 None,
                 Some(parent_id.clone()),
                 Some(root_id.clone()),
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1110,6 +1115,7 @@ mod tests {
                 None,
                 Some(parent_id.clone()),
                 Some(root_id.clone()),
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1210,6 +1216,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1263,6 +1270,7 @@ mod tests {
                 None,
                 Some("pantheon-parent-A".to_string()),
                 Some("pantheon-root-A".to_string()),
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1278,6 +1286,7 @@ mod tests {
                 None,
                 None, // legacy non-Pantheon caller
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1325,6 +1334,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1366,6 +1376,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1400,6 +1411,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1437,6 +1449,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),

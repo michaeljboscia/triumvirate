@@ -176,18 +176,36 @@ mod format_working_state_tests {
         assert!(format_working_state(&ev(r#"{"file_path":"b.rs"}"#)).contains("b.rs"));
     }
 
-    /// Locked to the REAL capture, not to my belief about it. If the fixture is ever recaptured
-    /// with a different key, this fails rather than silently rendering blank lines again.
+    /// Locked to the REAL capture by RUNNING the formatter over it, not by grepping the file.
     ///
-    /// RED IF: the fixture stops carrying a tool call whose rawInput names the file.
+    /// The previous version was `include_str!(...).contains("target_file")`. Grok: "it never
+    /// calls format_working_state, never parses a fixture line, never builds a
+    /// WorkingStateEvent. It pins the fixture, not the code." Deleting `target_file` from the
+    /// lookup list left it green, so it was theater sitting between two real tests.
+    ///
+    /// RED IF: the formatter stops resolving the path a real grok capture actually carries.
     #[test]
-    fn the_live_fixture_uses_target_file() {
+    fn the_formatter_resolves_the_path_from_the_live_capture() {
         const TOOLS: &str =
             include_str!("../tests/fixtures/grok-streaming-tools-20260830.jsonl");
+
+        // Pull the real rawInput out of the real capture, and feed THAT to the formatter.
+        let raw = TOOLS
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|v| v.get("rawInput").cloned())
+            .expect("the capture must still contain a tool call with rawInput");
+        let expected = raw
+            .get("target_file")
+            .and_then(|v| v.as_str())
+            .expect("the capture uses target_file; if grok changed the key, update the \
+                     lookup list rather than this test")
+            .to_string();
+
+        let line = format_working_state(&ev(&raw.to_string()));
         assert!(
-            TOOLS.contains(r#""target_file""#),
-            "the committed live capture must still exercise target_file; if grok changed its \
-             key, update the lookup list rather than this assertion"
+            line.contains(&expected),
+            "the formatter must resolve {expected} from the live capture's rawInput; got: {line}"
         );
     }
 }

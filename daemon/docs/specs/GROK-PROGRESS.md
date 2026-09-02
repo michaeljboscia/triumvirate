@@ -288,3 +288,100 @@ parse: this crate has no toml dependency and a parse failure elsewhere in the fi
 the answer.
 
 Verified live: `triumvirate doctor` prints `grok compat.claude: closed (all five keys false)`.
+
+---
+
+## FIND-GROK-02 peer pass, 2026-09-01. Two findings I marked CLOSED were not closed.
+
+Three peers reviewed slices D-N AND the solo work in ac66950. Corrections to my own claims come
+first, because the word "closed" was the problem.
+
+### THE HEADLINE, found by Grok: mandatory peer review does not review
+
+`enforce_mandatory_peer_review` (`agent_exec.rs:1888`) writes a review row and then immediately
+calls `submit_review(review_id, "approve", "auto-approved in mandatory peer review mode")`.
+**No agent is ever spawned. No reviewer ever looks at anything.**
+
+`TRIUMVIRATE_REQUIRE_PEER_REVIEW=1` is a rubber stamp that creates a database record saying
+approved. Verified independently.
+
+Consequences that invalidate work I did today:
+- FIND-GROK-04's premise (a slow grok seat dominating panel latency) does not exist in the form
+  I fixed, because there is no panel dispatch.
+- `default_reviewers()` and `TRIUMVIRATE_PEER_REVIEWERS` configure a roster nothing dispatches
+  to. Grok, on unknown names failing "loudly at dispatch": "There is no dispatch."
+- The "grok is a default reviewer" ruling is decorative while this holds.
+
+NOT FIXED. It is a bigger change than the rest of this pass and it deserves its own goal.
+
+### FIND-GROK-04: NOT CLOSED. I marked it closed and it is not.
+
+Two independent reviewers called `with_forced_fast` unsound: tokio's work-stealing scheduler
+moves tasks across OS threads at every await, and a panic inside the closure would leave the
+flag set on that worker with no Drop guard. Grok added that the claim held only for a
+synchronous closure, and that nothing production called it anyway.
+
+The helper is REMOVED rather than patched. What survives is a test that Fast and Deep differ in
+the arguments that cost time. The finding stays OPEN, and the reason it cannot be closed is the
+auto-approve defect above.
+
+I had written "CLOSED" and then "STILL OPEN" two paragraphs apart in the same document. Grok:
+"Shipping an unused helper and marking the finding closed is the lie the chorus exists to stop."
+
+### FIND-GROK-05: was NOT closed, now is
+
+The fixlist required a NON-ZERO warn exit, fatal under `TRIUMVIRATE_GROK_STRICT_COMPAT=1`, and
+a committed config snippet. I shipped a printed line and marked it closed. Doctor still returned
+`Ok(())` no matter what, so any script gating on it could not see the drift.
+
+NOW: doctor returns an error on drift under `TRIUMVIRATE_GROK_STRICT_COMPAT=1`, prints an
+explicit WARN otherwise, and `daemon/docs/grok-compat-claude.example.toml` is committed so the
+setting is not tribal knowledge on one laptop.
+
+Grok verified the scanner against its REAL config and confirmed it parses correctly, including
+that `[compat.cursor]` is not swallowed by the `[compat.claude]` match.
+
+STILL NOT DONE from that finding: the `tool_surface.tools > 200` tripwire after live consults.
+
+### FIND-GROK-03: Option A met, but the write path was cosmetic
+
+Grok: both production write sites hardcoded `"codex"`, `register` took no agent, my comment
+claimed a `Default` impl that does not exist, and my note said "the one registration site" when
+there are two. Antigravity threaded `agent` through the `AbeTaskTracker` trait and both call
+sites, which is the real fix, and it is kept.
+
+### Test defects in my solo work
+
+- `the_live_fixture_uses_target_file` was theater: `include_str!(...).contains("target_file")`,
+  which never called the formatter. Replaced with a test that pulls the real `rawInput` out of
+  the capture and runs `format_working_state` over it.
+- `forced_fast_tests` set the depth env var without `env_lock()`, racing the neighbouring depth
+  tests. The surviving test now lives inside the module that owns the lock, because a second
+  mutex would not serialise against the first. Third time this repo has produced that race.
+
+### Slices with NO defect found
+
+D session tracking, D timeout process-group kill, D `finish_full()`, D retry double-spend,
+H fleet argv and empty resume, J token scanner roots, K HTTP agent gate. Codex gave evidence
+for each rather than a bare pass.
+
+### One real defect in slice J, found by Codex
+
+Grok direct token persistence wrote `thinking_tokens: 0` and `cost_usd: None` while the parser
+had captured both. Grok quota burn was under-recorded. Codex's patch is saved at
+`scratchpad/codex-token-fix.diff` and is NOT applied: it also carried an incomplete ABE change
+that left the workspace not compiling. Applying the token half deliberately is follow-up work.
+
+### PROCESS FAILURE: I told three reviewers the tree was frozen, then handed one a charter that
+### told it to fix things
+
+Codex modified 14 files and left the build broken while the other two were mid-read. That is my
+error: the fixlist charter says "Fix every defect that is real. Do not acknowledge and leave",
+and I passed it verbatim to a reviewer while promising the others a frozen artifact.
+
+Worse, my own harness comment claimed `codex exec` without `--full-auto` is read-only. That is
+the SAME false containment claim I had already corrected inside the daemon, repeated in
+`~/.claude/scripts/peer-review/dispatch.sh`, and it survived because no review had ever been
+told to write. `dispatch.sh` now passes `--sandbox read-only` explicitly.
+
+39 groups green. Clippy clean except the pre-existing `pantheon` warning.

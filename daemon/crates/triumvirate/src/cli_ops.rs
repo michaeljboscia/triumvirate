@@ -73,6 +73,14 @@ pub(crate) fn run_uninstall() -> anyhow::Result<()> {
 /// consult pays it.
 const COMPAT_CLAUDE_KEYS: &[&str] = &["mcps", "skills", "hooks", "agents", "rules"];
 
+/// Refuse rather than warn when compat drift is found.
+pub fn grok_strict_compat() -> bool {
+    std::env::var("TRIUMVIRATE_GROK_STRICT_COMPAT")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Read `~/.grok/config.toml` and report any `[compat.claude]` key that is missing or true.
 ///
 /// Deliberately a line scanner rather than a TOML parse: this crate has no toml dependency,
@@ -338,8 +346,33 @@ pub(crate) async fn run_doctor() -> anyhow::Result<()> {
     }
 
     write_line_stdout("grok:")?;
-    for line in probe_grok() {
+    let grok_lines = probe_grok();
+    let compat_open = grok_lines.iter().any(|l| l.contains("compat.claude: OPEN"));
+    for line in grok_lines {
         write_line_stdout(&line)?;
+    }
+
+    // FIND-GROK-05 required a NON-ZERO exit on drift, not just a printed line, and a fatal
+    // mode. Grok reviewed the first attempt and pointed out that doctor still returned Ok(())
+    // no matter what, so any script gating on `triumvirate doctor` could not see the drift, and
+    // I had marked the finding CLOSED anyway.
+    //
+    // Warn is non-fatal by default because an open compat surface is expensive, not broken.
+    // TRIUMVIRATE_GROK_STRICT_COMPAT=1 makes it refuse, for a host that must not pay the tax.
+    if compat_open {
+        if grok_strict_compat() {
+            anyhow::bail!(
+                "grok compat.claude is OPEN and TRIUMVIRATE_GROK_STRICT_COMPAT=1. Consults \
+                 would inherit the ~/.claude.json tool surface. Set mcps, skills, hooks, \
+                 agents and rules to false in ~/.grok/config.toml. Expected config: \
+                 daemon/docs/grok-compat-claude.example.toml"
+            );
+        }
+        write_line_stdout(
+            "  grok compat.claude: WARN. Expected config committed at \
+             daemon/docs/grok-compat-claude.example.toml. \
+             Set TRIUMVIRATE_GROK_STRICT_COMPAT=1 to make this fatal.",
+        )?;
     }
     Ok(())
 }

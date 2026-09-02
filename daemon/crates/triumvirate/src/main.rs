@@ -420,6 +420,7 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
         worktree_path: Option<PathBuf>,
         parent_session_id: Option<String>,
         root_session_id: Option<String>,
+        agent: String,
         dispatch_surface: Option<&'static str>,
         dispatch_repo: Option<String>,
         dispatch_started_at: std::time::Instant,
@@ -434,6 +435,7 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
                     worktree_path,
                     parent_session_id,
                     root_session_id,
+                    agent,
                     dispatch_surface,
                     dispatch_repo,
                     dispatch_started_at,
@@ -499,10 +501,11 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
     fn register_setup_failed(
         &self,
         task_id: String,
+        agent: String,
         error_message: String,
     ) -> mcp_tools::abe::BoxFuture<()> {
         let tracker = self.clone();
-        Box::pin(async move { tracker.register_setup_failed(task_id, error_message).await })
+        Box::pin(async move { tracker.register_setup_failed(task_id, agent, error_message).await })
     }
 
     fn get_status(&self, task_id: String) -> mcp_tools::abe::BoxFuture<Option<GetTaskStatusResponse>> {
@@ -6773,6 +6776,7 @@ mod pantheon_rest_tests {
                 None,
                 parent.map(ToString::to_string),
                 root.map(ToString::to_string),
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -7217,6 +7221,7 @@ mod pantheon_ws_replay_tests {
                 None,
                 Some("pantheon-parent".to_string()),
                 Some("pantheon-root".to_string()),
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),
@@ -7236,6 +7241,7 @@ mod pantheon_ws_replay_tests {
                 None,
                 None,
                 None,
+                "codex".to_string(),
                 None,
                 None,
                 std::time::Instant::now(),

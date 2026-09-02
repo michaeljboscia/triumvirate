@@ -43,6 +43,7 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
         worktree_path: Option<PathBuf>,
         parent_session_id: Option<String>,
         root_session_id: Option<String>,
+        agent: String,
         // Which dispatch tool + which repo, so the tracker (the arbiter, and therefore the
         // authoritative emitter) can report tv_codex_dispatch at terminal time. surface=None
         // means a non-codex task and suppresses the event. dispatch_started_at is the caller's
@@ -78,7 +79,7 @@ pub trait AbeTaskTracker: Clone + Send + Sync + 'static {
 
     fn mark_stuck(&self, task_id: String, error_message: String) -> BoxFuture<bool>;
 
-    fn register_setup_failed(&self, task_id: String, error_message: String) -> BoxFuture<()>;
+    fn register_setup_failed(&self, task_id: String, agent: String, error_message: String) -> BoxFuture<()>;
 
     fn get_status(&self, task_id: String) -> BoxFuture<Option<GetTaskStatusResponse>>;
 
@@ -773,6 +774,7 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
             None,
             parent_session_id,
             root_session_id,
+            abe_worker_agent(),
             Some("dispatch_codex"),
             Some(cwd.clone()),
             task_started_at,
@@ -989,7 +991,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         shared_types::validate_contract(&req.contract_fields).map_err(|e| format!("invalid contract_fields: {e}"));
     if let Err(err) = validation {
         tracker
-            .register_setup_failed(task_id.clone(), err.clone())
+            .register_setup_failed(task_id.clone(), abe_worker_agent(), err.clone())
             .await;
         return Err(err);
     }
@@ -1034,7 +1036,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             // dispatch.
             emit_worktree_setup_failed(&project_root, dispatch_started_at);
             tracker
-                .register_setup_failed(task_id.clone(), err.to_string())
+                .register_setup_failed(task_id.clone(), abe_worker_agent(), err.to_string())
                 .await;
             return Err(format!("SETUP_FAILED: {err}"));
         }
@@ -1042,14 +1044,14 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
     if let Err(err) = write_worktree_exclude_file(&setup.worktree_path) {
         emit_worktree_setup_failed(&project_root, dispatch_started_at);
         tracker
-            .register_setup_failed(task_id.clone(), err.clone())
+            .register_setup_failed(task_id.clone(), abe_worker_agent(), err.clone())
             .await;
         return Err(format!("SETUP_FAILED: {err}"));
     }
     if let Err(err) = write_worktree_commit_helper(&setup.worktree_path, &req.contract_fields.allowed_files) {
         emit_worktree_setup_failed(&project_root, dispatch_started_at);
         tracker
-            .register_setup_failed(task_id.clone(), err.clone())
+            .register_setup_failed(task_id.clone(), abe_worker_agent(), err.clone())
             .await;
         return Err(format!("SETUP_FAILED: {err}"));
     }
@@ -1172,6 +1174,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             Some(setup.worktree_path.clone()),
             parent_session_id,
             root_session_id,
+            abe_worker_agent(),
             Some("dispatch_codex_worktree"),
             Some(project_root.display().to_string()),
             dispatch_started_at,

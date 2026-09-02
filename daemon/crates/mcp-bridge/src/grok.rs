@@ -112,35 +112,20 @@ pub enum GrokDepth {
     Deep,
 }
 
-// Forces Fast regardless of `TRIUMVIRATE_GROK_DEPTH`, for callers that must not inherit an
-// operator's Deep setting.
+// FIND-GROK-04 note: an earlier attempt here was a thread_local `with_forced_fast` helper,
+// intended to stop a daemon started with TRIUMVIRATE_GROK_DEPTH=deep from making every panel
+// review a multi-minute turn. Codex and Antigravity independently called it unsound: tokio's
+// work-stealing scheduler moves tasks across OS threads at every await point, and a panic
+// inside the closure would leave the flag set on that worker with no Drop guard. It was
+// removed rather than patched.
 //
-// FIND-GROK-04: grok is a DEFAULT peer reviewer, and a daemon started with
-// `TRIUMVIRATE_GROK_DEPTH=deep` in its environment made every mandatory review a multi-minute
-// turn, because the depth is read from process env deep inside the argv builder. Four default
-// reviewers means the whole panel waits on the slowest.
-//
-// A thread-local rather than a mutation of `std::env`: the daemon dispatches reviewers
-// concurrently, and setting a process-wide variable around one child would leak into the
-// others. This repo has already shipped one test that could not fail because of exactly that
-// pattern.
-thread_local! {
-    static FORCE_FAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Run `f` with grok pinned to Fast on this thread.
-pub fn with_forced_fast<T>(f: impl FnOnce() -> T) -> T {
-    FORCE_FAST.with(|c| c.set(true));
-    let out = f();
-    FORCE_FAST.with(|c| c.set(false));
-    out
-}
+// The finding is NOT closed. Grok established the deeper reason it cannot be:
+// `enforce_mandatory_peer_review` writes a review row and immediately auto-approves it, so no
+// reviewer is ever spawned and there is no panel dispatch to isolate. Fixing the depth of a
+// dispatch that does not happen would be theater.
 
 /// `TRIUMVIRATE_GROK_DEPTH=deep` (aliases: riff, wild, max) unleashes it. Anything else is Fast.
 pub fn grok_depth() -> GrokDepth {
-    if FORCE_FAST.with(|c| c.get()) {
-        return GrokDepth::Fast;
-    }
     match std::env::var("TRIUMVIRATE_GROK_DEPTH")
         .ok()
         .map(|v| v.trim().to_lowercase())
@@ -486,6 +471,39 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Fast and Deep must differ in the ARGS that actually cost time, not just in an enum.
+    ///
+    /// Turns are the unit of wall clock: each one is a fresh round trip that re-ships the
+    /// system prompt and every tool schema.
+    ///
+    /// This is what survives of FIND-GROK-04. The `with_forced_fast` helper it originally
+    /// tested was removed as unsound (tokio moves tasks across threads at await points), and
+    /// the finding is NOT closed: there is no panel dispatch to isolate, because mandatory peer
+    /// review auto-approves without spawning a reviewer.
+    ///
+    /// Serialised with `env_lock()` like the rest of this module. The first version of these
+    /// tests set the depth env var without it, which Grok flagged as a flake against the
+    /// neighbouring depth tests, and which is the same parallel-env race this repo has now
+    /// produced three times.
+    ///
+    /// RED IF: Fast stops capping turns below Deep, or effort stops following depth.
+    #[test]
+    fn fast_and_deep_differ_in_the_arguments_that_cost_time() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialised by env_lock; both values restored below.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep") };
+        let (deep_turns, deep_effort) = (grok_max_turns(), grok_effort());
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "fast") };
+        let (fast_turns, fast_effort) = (grok_max_turns(), grok_effort());
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_DEPTH") };
+
+        assert!(
+            fast_turns < deep_turns,
+            "Fast must cap turns below Deep ({fast_turns} vs {deep_turns})"
+        );
+        assert_ne!(fast_effort, deep_effort, "effort must follow depth");
     }
 
     /// Clear every knob so a test sees documented defaults regardless of the developer's shell.
@@ -928,56 +946,4 @@ mod tests {
 
 }
 
-#[cfg(test)]
-mod forced_fast_tests {
-    use super::*;
 
-    /// FIND-GROK-04: a panel dispatch must not inherit an operator's Deep setting.
-    ///
-    /// The depth is read from process env deep inside the argv builder, so a daemon started
-    /// with TRIUMVIRATE_GROK_DEPTH=deep made every mandatory peer review a multi-minute turn,
-    /// and four default reviewers means the panel waits on the slowest.
-    ///
-    /// Thread-local rather than mutating std::env around the child: reviewers dispatch
-    /// concurrently, and a process-wide set would leak into the others. This repo has already
-    /// shipped one test that could not fail because of exactly that pattern.
-    ///
-    /// RED IF: with_forced_fast stops overriding the env, or leaks past its closure.
-    #[test]
-    fn forced_fast_beats_a_deep_environment() {
-        // SAFETY: set and removed within this test; the assertion below is what matters.
-        unsafe { std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep") };
-        assert_eq!(grok_depth(), GrokDepth::Deep, "the env really is Deep");
-
-        let inside = with_forced_fast(grok_depth);
-        let after = grok_depth();
-        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_DEPTH") };
-
-        assert_eq!(inside, GrokDepth::Fast, "a forced-fast dispatch must ignore Deep");
-        assert_eq!(
-            after,
-            GrokDepth::Deep,
-            "the override must NOT leak past its closure, or an operator's Deep consult would \
-             be silently downgraded"
-        );
-    }
-
-    /// The override must reach the ARGS, not just the depth enum, since effort and max-turns
-    /// are what actually cost the time.
-    /// RED IF: effort or max_turns stop following the forced depth.
-    #[test]
-    fn forced_fast_changes_the_arguments_that_cost_time() {
-        unsafe { std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep") };
-        let deep_turns = grok_max_turns();
-        let deep_effort = grok_effort();
-        let (fast_turns, fast_effort) = with_forced_fast(|| (grok_max_turns(), grok_effort()));
-        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_DEPTH") };
-
-        assert!(
-            fast_turns < deep_turns,
-            "Fast must cap turns below Deep ({fast_turns} vs {deep_turns}); turns are the unit \
-             of wall time, each one a fresh round trip re-shipping every tool schema"
-        );
-        assert_ne!(fast_effort, deep_effort, "effort must follow the forced depth");
-    }
-}
