@@ -19,6 +19,23 @@ use tokio::time::Duration;
 
 pub mod abe;
 pub mod blind_validation;
+
+/// The ONE lock over this crate's PROCESS ENVIRONMENT, for tests.
+///
+/// It lives here, at crate scope, because the state it guards is the process `environ` array
+/// itself, and that is shared by every module in this test binary.
+///
+/// WRITERS ARE NOT THE ONLY PARTICIPANTS, which is the part I got wrong. Antigravity found it
+/// in round 6: `abe` tests call `std::env::set_var`, and POSIX `setenv` may REALLOCATE the
+/// environ array. Meanwhile `blind_validation` tests call `tempfile::tempdir()`, which calls
+/// `getenv` to find `$TMPDIR`. A read racing that realloc can follow a freed pointer. That is
+/// undefined behaviour, not a flaky assertion, and it is exactly why Rust made `set_var` unsafe.
+///
+/// So a reader takes this lock too. The rule this file has now had to learn three times, in its
+/// final form: a lock must live wherever the STATE lives, and every participant is a
+/// participant, whether it writes or only reads.
+#[cfg(test)]
+pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub mod aliases;
 pub mod fleet;
 pub mod gemini_query;

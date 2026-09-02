@@ -697,6 +697,15 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
 
     // Agent-aware. Defaults to codex, so an ABE dispatch that worked before is unchanged.
     let worker_agent = abe_worker_agent();
+    // The `_` arm is FIND-ABE-01's shape one layer out, as Grok noted in round 4: it resolves
+    // ANY unknown name to the codex binary. It is not reachable today, because
+    // `build_worker_argv` matches the agent first and errors on anything outside
+    // ABE_BUILDABLE_AGENTS, so no unknown name gets this far. Left as codex rather than made to
+    // panic because codex IS the correct answer for the one name that legitimately arrives here,
+    // and every other name is already refused upstream. If a new arm is ever added to the
+    // builder without one here, that agent silently gets the codex binary: `abe_09` fails in
+    // that case, which is why it now asserts the spawned binary rather than the absence of an
+    // error.
     let resolve_command = |a: &str| -> (String, Vec<String>) {
         match a {
             "grok" => mcp_bridge::grok_command(),
@@ -1086,6 +1095,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             _ => (callbacks.codex_command)(),
         },
         &prompt,
+        &setup.worktree_path.display().to_string(),
         &extra_dirs,
         req.contract_fields.sandbox_permissions.as_deref(),
     )?;
@@ -1760,12 +1770,18 @@ mod sandbox_permissions_tests {
 /// parameter name implying otherwise. It now takes one resolver keyed by agent, so every arm goes
 /// through the same seam and a test can substitute any of them.
 ///
-/// **Scope, corrected after review.** `dispatch_codex_worktree` still builds codex inline, with
-/// `--full-auto`, sandbox-permission overrides and `--add-dir`. It is NOT routed through here.
-/// An earlier draft of this function carried a `full_auto` flag for that path, but the branch
-/// omitted the prompt entirely, so any caller passing `true` would have spawned a worker with no
-/// task. A half-built branch nobody calls is worse than an absent one, so it was removed. Routing
-/// the worktree path through here is a separate change with its own regression risk.
+/// **Scope. SUPERSEDED 2026-09-02, and kept because the reasoning still applies.** This used to
+/// say `dispatch_codex_worktree` builds codex inline, is NOT routed through here, and that
+/// routing it would be "a separate change with its own regression risk". That change has since
+/// landed: the worktree path now goes through `build_worktree_worker_argv`, which is a sibling
+/// of this function rather than this function itself, because a worktree worker needs
+/// directories outside its own tree and this one has no way to express that.
+///
+/// Grok caught the stale text in round 4, the same class it caught in round 3. The reason the
+/// two builders stayed separate is unchanged: an earlier draft carried a `full_auto` flag here
+/// for the worktree path, and the branch omitted the prompt entirely, so any caller passing
+/// `true` would have spawned a worker with no task. A half-built branch nobody calls is worse
+/// than an absent one.
 ///
 /// grok reuses `build_grok_invocation`, the SAME builder the consult and fleet paths use, so an
 /// ABE worker inherits the forbidden-flag guard and the session-flag rules instead of assembling
@@ -1875,10 +1891,19 @@ pub fn build_worker_argv(
 ///
 /// The codex branch is byte-for-byte what the call site built before, in the same order, so an
 /// existing worktree dispatch produces the same process.
+#[allow(clippy::too_many_arguments)]
 pub fn build_worktree_worker_argv(
     agent: &str,
     command_for: &(dyn Fn(&str) -> (String, Vec<String>) + Send + Sync),
     prompt: &str,
+    // The worktree the worker will run in, as an ABSOLUTE path.
+    //
+    // Antigravity found this in round 4: the refactor hardcoded "." here where the inline code
+    // passed `setup.worktree_path`. grok bakes this into `--cwd`, and while the spawn also sets
+    // the process cwd to the worktree so the two happen to agree today, "happens to agree" is
+    // not the same argv and is not what the old code did. Passing it explicitly restores the
+    // previous process exactly and removes the coincidence.
+    worktree_path: &str,
     extra_dirs: &[String],
     sandbox_permissions: Option<&[String]>,
 ) -> Result<(String, Vec<String>), String> {
@@ -1896,7 +1921,7 @@ pub fn build_worktree_worker_argv(
             let _ = extra_dirs;
             let (bin, extra) = command_for("grok");
             let inv = mcp_bridge::grok::build_grok_invocation_with_sandbox(
-                &bin, &extra, prompt, ".", None, false, Some("workspace"),
+                &bin, &extra, prompt, worktree_path, None, false, Some("workspace"),
             )
             .map_err(|e| format!("failed to assemble grok worktree worker: {e}"))?;
             Ok((inv.program, inv.args))
@@ -1955,8 +1980,13 @@ pub fn build_worktree_worker_argv(
 ///
 /// The rule, restated because writing it down twice has not been enough: a lock must live
 /// wherever the STATE lives, not wherever the test lives.
+/// Points at the crate-wide `PROCESS_ENV_LOCK`. Kept as a name because this file refers to it
+/// in several comments, but it is no longer a lock of its own: readers in OTHER modules of the
+/// same test binary have to hold the same one. See `lib.rs`.
 #[cfg(test)]
-pub(crate) static ABE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn abe_env_lock() -> &'static std::sync::Mutex<()> {
+    &crate::PROCESS_ENV_LOCK
+}
 
 /// Which agent ABE dispatches workers as. Defaults to codex, which is what it always did.
 ///
@@ -1968,11 +1998,15 @@ pub fn abe_worker_agent() -> String {
     // FIND-ABE-01: validated against what ABE can BUILD, not against what the daemon can
     // dispatch generally. Those are different sets and the difference was a silent mislabel.
     //
-    // `is_supported_agent_name` accepts claude, gemini and deepseek, none of which
-    // `build_worker_argv` has an arm for. The value was then recorded as the worker's agent
-    // while codex was spawned. Checking the narrower set here means the warning fires at
+    // `is_supported_agent_name` accepts gemini and deepseek, which `build_worker_argv` has no
+    // arm for. deepseek could never have one: it is HTTP with no filesystem through the bridge,
+    // so it cannot touch a worktree at all. The value was previously recorded as the worker's
+    // agent while codex was spawned. Checking the narrower set here means the warning fires at
     // selection time, where an operator can see it, rather than producing a worker whose label
     // and process disagree.
+    //
+    // claude was in that list when this comment was written and has had an arm since fe46483.
+    // Grok caught the stale sentence in round 4.
     if ABE_BUILDABLE_AGENTS.contains(&canonical.as_str()) {
         canonical
     } else {
@@ -2002,7 +2036,7 @@ mod abe_agent_tests {
     /// override ignored the env entirely.
     /// Shared with `abe_worktree_tests` and `abe_label_honesty_tests`, which read the same env.
     fn env_lock() -> &'static Mutex<()> {
-        &super::ABE_ENV_LOCK
+        super::abe_env_lock()
     }
 
     /// One resolver for every agent, mirroring the real call site. The point of the seam is that
@@ -2122,7 +2156,7 @@ mod abe_worktree_tests {
     /// `abe_13` passes alone and fails under the parallel harness, which is how it was
     /// committed green and found red minutes later.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        super::ABE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::abe_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn resolver(agent: &str) -> (String, Vec<String>) {
@@ -2137,7 +2171,7 @@ mod abe_worktree_tests {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string(), "/repo/.git/worktrees/t".to_string()];
         let (cmd, args) =
-            build_worktree_worker_argv("codex", &resolver, "do the task", &dirs, None)
+            build_worktree_worker_argv("codex", &resolver, "do the task", "/wt", &dirs, None)
                 .expect("codex worktree");
         assert_eq!(cmd, "/bin/codex");
         assert_eq!(args[0], "exec");
@@ -2160,7 +2194,7 @@ mod abe_worktree_tests {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
         let (cmd, args) =
-            build_worktree_worker_argv("claude", &resolver, "do the task", &dirs, None)
+            build_worktree_worker_argv("claude", &resolver, "do the task", "/wt", &dirs, None)
                 .expect("claude worktree");
         assert_eq!(cmd, "/bin/claude");
         let joined = args.join(" ");
@@ -2192,7 +2226,7 @@ mod abe_worktree_tests {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
         let (cmd, args) =
-            build_worktree_worker_argv("grok", &resolver, "do the task", &dirs, None)
+            build_worktree_worker_argv("grok", &resolver, "do the task", "/wt", &dirs, None)
                 .expect("grok worktree");
         assert_eq!(cmd, "/bin/grok");
         let joined = args.join(" ");
@@ -2204,13 +2238,90 @@ mod abe_worktree_tests {
         );
     }
 
+    /// Antigravity, round 4: the refactor silently changed grok's `--cwd` from the absolute
+    /// worktree path to a hardcoded ".". The spawn also sets the process cwd to the worktree, so
+    /// the two happen to agree, but "happens to agree" is not the same argv and is not what the
+    /// old code did. Coincidences are how a refactor ships a behaviour change.
+    /// RED IF: the worktree path stops reaching the grok builder.
+    #[test]
+    fn abe_15_grok_gets_the_absolute_worktree_path_not_a_dot() {
+        let _guard = env_guard();
+        let (_, args) = build_worktree_worker_argv(
+            "grok", &resolver, "task", "/abs/worktree/path", &[], None,
+        )
+        .expect("grok worktree");
+        let cwd = args
+            .iter()
+            .position(|a| a == "--cwd")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        assert_eq!(
+            cwd,
+            Some("/abs/worktree/path"),
+            "grok bakes --cwd into its argv; a relative '.' relies on the spawn cwd agreeing"
+        );
+    }
+
+    /// Antigravity, round 4: `abe_12` only ever passed ONE directory, and the multi-directory
+    /// case is the one that actually occurs, because a worktree `.git` FILE resolves to a second
+    /// gitdir. `--add-dir` is variadic, so both must ride one flag and the prompt must still be
+    /// last behind `-p`.
+    /// RED IF: a second directory is dropped, or gets its own --add-dir, or displaces the prompt.
+    #[test]
+    fn abe_16_claude_receives_every_extra_dir_on_one_variadic_flag() {
+        let _guard = env_guard();
+        let dirs = vec![
+            "/repo/.git".to_string(),
+            "/repo/.git/worktrees/task-7".to_string(),
+        ];
+        let (_, args) =
+            build_worktree_worker_argv("claude", &resolver, "the task", "/wt", &dirs, None)
+                .expect("claude worktree");
+
+        let at = args.iter().position(|a| a == "--add-dir").expect("--add-dir present");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--add-dir").count(),
+            1,
+            "the flag is variadic: one flag, every directory after it"
+        );
+        assert_eq!(&args[at + 1], &dirs[0]);
+        assert_eq!(&args[at + 2], &dirs[1], "the second gitdir must not be dropped");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("the task"),
+            "and the variadic list must still not eat the prompt: {args:?}"
+        );
+    }
+
+    /// A REGRESSION PIN, not a guard for anything in this diff, and Antigravity was right to
+    /// say so in round 5: codex was never broken, so nothing here fixes it and this test would
+    /// pass with every fix in this change reverted.
+    ///
+    /// It is kept because the two agents genuinely differ: `codex --add-dir` takes one directory
+    /// per flag while claude's is variadic, and `abe_16` pins the other half. Getting them
+    /// backwards silently drops a directory for one of them, and nothing else would catch it.
+    /// RED IF: codex's per-flag repetition collapses into one variadic flag.
+    #[test]
+    fn abe_17_codex_repeats_the_flag_where_claude_does_not() {
+        let _guard = env_guard();
+        let dirs = vec!["/repo/.git".to_string(), "/repo/.git/worktrees/t".to_string()];
+        let (_, args) =
+            build_worktree_worker_argv("codex", &resolver, "task", "/wt", &dirs, None)
+                .expect("codex worktree");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--add-dir").count(),
+            2,
+            "codex takes one directory per flag: {args:?}"
+        );
+    }
+
     /// An agent with no worktree arm is refused, not substituted. Same rule as FIND-ABE-01.
     /// RED IF: a catch-all arm returns codex.
     #[test]
     fn abe_14_an_unbuildable_worktree_agent_is_refused() {
         let _guard = env_guard();
         for agent in ["gemini", "deepseek"] {
-            let err = build_worktree_worker_argv(agent, &resolver, "task", &[], None)
+            let err = build_worktree_worker_argv(agent, &resolver, "task", "/wt", &[], None)
                 .expect_err("must refuse rather than spawn codex");
             assert!(err.contains("cannot dispatch"), "got: {err}");
         }
@@ -2237,7 +2348,7 @@ mod abe_label_honesty_tests {
 
     /// The SAME lock the other two test modules use. See ABE_ENV_LOCK.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        super::ABE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::abe_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// THE DEFECT. Asking for an agent ABE cannot build must not quietly spawn codex.
@@ -2267,6 +2378,7 @@ mod abe_label_honesty_tests {
     /// RED IF: either real arm breaks.
     #[test]
     fn abe_08_the_buildable_agents_spawn_themselves() {
+        let _guard = env_guard();
         let (cmd, args) = build_worker_argv("codex", &resolver, "task", "/tmp").expect("codex");
         assert!(cmd.ends_with("codex"), "got {cmd}");
         assert_eq!(args.first().map(String::as_str), Some("exec"));
@@ -2303,10 +2415,23 @@ mod abe_label_honesty_tests {
     /// RED IF: the two disagree.
     #[test]
     fn abe_09_the_buildable_list_matches_the_builder() {
+        let _guard = env_guard();
         for agent in ABE_BUILDABLE_AGENTS {
-            build_worker_argv(agent, &resolver, "task", "/tmp").unwrap_or_else(|e| {
-                panic!("{agent} is listed as buildable but build_worker_argv refuses it: {e}")
-            });
+            let (cmd, _) = build_worker_argv(agent, &resolver, "task", "/tmp")
+                .unwrap_or_else(|e| {
+                    panic!("{agent} is listed as buildable but build_worker_argv refuses it: {e}")
+                });
+            // ASSERTING THE BINARY, not merely the absence of an error.
+            //
+            // Antigravity found in round 4 that the first version of this test would have PASSED
+            // without the fix it exists to guard: with the old `_ =>` arm, `claude` returned
+            // `Ok(codex argv)`, so nothing errored and the test verified nothing about label
+            // honesty. A test that is green whether or not the defect is present is not a guard.
+            assert!(
+                cmd.ends_with(agent),
+                "{agent} is listed as buildable but the builder produced a {cmd} process. That \
+                 is FIND-ABE-01 exactly: a worker labelled one agent and spawned as another."
+            );
         }
     }
 
