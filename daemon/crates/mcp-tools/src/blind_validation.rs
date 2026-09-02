@@ -519,7 +519,7 @@ fn absolute_paths_in(args_json: &str) -> Vec<String> {
                 i += 1;
             }
             let raw = &args_json[start..i];
-            let cleaned = raw.trim_end_matches(|c| matches!(c, '.' | ':' | ';' | ')' | ']'));
+            let cleaned = raw.trim_end_matches(['.', ':', ';', ')', ']']);
             if cleaned.len() > 1 {
                 out.push(cleaned.to_string());
             }
