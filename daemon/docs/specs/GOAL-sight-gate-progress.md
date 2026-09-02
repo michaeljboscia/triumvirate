@@ -989,3 +989,20 @@ key.
 Fixture cleanup moved into `Drop`, because a plain call at the end of a test does not run when
 an assertion fires first, and a failing test was leaving a REJECT-returning mock installed for
 whatever ran next.
+
+### A test committed to the real repository
+
+`0a1be32 "T-016A: forbidden file write"` and `8c16f73 "T-016C: stub marker present"` are not
+mine. `abe_red_team_enforcement_blocks_non_compliant_worker` made them during a test run and
+added `src/forbidden.rs` and `src/allowed.rs` to the real source tree.
+
+The test builds a temp project and calls `std::env::set_current_dir`, which is PROCESS GLOBAL.
+Under the parallel harness another test moves the working directory back, so the ABE worker's
+`git add` and `git commit` run against this repository instead of the temp one.
+
+Same root cause as the review-env flake and the same shape as most defects this session: a
+process-global mutated by one test and observed by another. Here the observer was git.
+
+The two files are removed. The commits are LEFT IN HISTORY rather than rewritten, because that
+history is the evidence the test can do this. `set_current_dir` under a parallel harness still
+needs its own fix and has not had one.
