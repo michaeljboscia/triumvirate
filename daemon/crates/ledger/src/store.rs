@@ -148,7 +148,11 @@ CREATE TABLE IF NOT EXISTS reviews (
     comments TEXT,
     requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     reviewed_at TEXT,
-    state TEXT NOT NULL DEFAULT 'pending'
+    state TEXT NOT NULL DEFAULT 'pending',
+    -- FIND-REVIEW-03: set only by the in-process mandatory-review dispatch. No request field
+    -- deserialises into it, so an MCP client cannot claim ownership of a review the daemon is
+    -- conducting. See migrate_reviews_dispatch_owned for why it is also added by ALTER.
+    dispatch_owned INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state);
@@ -167,12 +171,40 @@ pub(crate) fn open(project_root: PathBuf) -> anyhow::Result<LedgerStore> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(CREATE_SCHEMA_SQL)?;
+    migrate_reviews_dispatch_owned(&conn)?;
     ensure_triumvirate_gitignore(&project_root)?;
 
     Ok(LedgerStore {
         project_root,
         conn: std::sync::Mutex::new(conn),
     })
+}
+
+/// Additive migration for `reviews.dispatch_owned` (FIND-REVIEW-03).
+///
+/// `CREATE TABLE IF NOT EXISTS` does not add a column to a database that already exists, and
+/// there is no migration framework here, so the column is added explicitly and idempotently.
+///
+/// What the column is for: a review the daemon is conducting itself must not be writable by an
+/// MCP client. Naming the assigned reviewer in a request body is a claim, not an identity, and
+/// `review_request` hands that name to the caller, so the name alone is not a boundary. This
+/// flag is set only by the in-process dispatch and no request field deserialises into it.
+///
+/// DEFAULT 0 is correct for existing rows: they were created before the mandatory-review
+/// dispatch could mark anything, so treating them as client-owned preserves current behaviour
+/// for old bookkeeping rows rather than retroactively locking them.
+fn migrate_reviews_dispatch_owned(conn: &Connection) -> anyhow::Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('reviews') WHERE name = 'dispatch_owned'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(
+            "ALTER TABLE reviews ADD COLUMN dispatch_owned INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn with_ingest_priority<T, F>(f: F) -> anyhow::Result<T>

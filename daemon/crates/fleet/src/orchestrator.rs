@@ -495,6 +495,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         author_agent: launch_agent.clone(),
                                         artifact: format!("fleet/{fleet_id}/{task_id}"),
                                         review_type: "code".to_string(),
+                                        // FIND-REVIEW-03: fleet queues a review for a human or
+                                        // an agent to pick up over MCP. It does not conduct it
+                                        // in-process, so it must stay client-writable.
+                                        dispatch_owned: false,
                                     });
                                     tracing::info!(
                                         fleet_id = %fleet_id,

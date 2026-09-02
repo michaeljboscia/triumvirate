@@ -22,6 +22,8 @@ pub fn review_request(req: ReviewRequestTool) -> Result<ReviewRequestResponse, S
         author_agent: req.author_agent,
         artifact: req.artifact,
         review_type: req.review_type,
+        // FIND-REVIEW-03: a review requested over MCP is client bookkeeping, not a gate.
+        dispatch_owned: false,
     });
     // Emit BEFORE the `?`, on both outcomes: a review the engine failed to assign is a real
     // failure and would be invisible if we only reported successes (Antigravity's

@@ -1979,6 +1979,18 @@ fn classify_review_verdict(response: &str) -> (ReviewVerdict, String) {
     (verdict, comments)
 }
 
+/// Above this many advertised tools, a grok turn's context cost is worth saying out loud.
+///
+/// 200 sits between the two surfaces actually observed in the captured fixtures: 26 tools
+/// (~14K of context) with no MCP servers, and 420 (~67K) once they connect. It is a cost
+/// signal, not a correctness one, which is why crossing it warns and never fails.
+pub(crate) const GROK_TOOL_SURFACE_WARN_AT: usize = 200;
+
+/// Strictly greater than the threshold, so the boundary value itself is not a warning.
+pub(crate) fn grok_tool_surface_is_bloated(tools: usize) -> bool {
+    tools > GROK_TOOL_SURFACE_WARN_AT
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_mandatory_peer_review(
     agent: &str,
@@ -2007,6 +2019,8 @@ async fn enforce_mandatory_peer_review(
             author_agent: agent.to_string(),
             artifact,
             review_type: "agent_output".to_string(),
+            // FIND-REVIEW-03: this review is conducted in-process. No client may write to it.
+            dispatch_owned: true,
         })
         .map_err(|e| format!("mandatory peer review request failed: {e}"))?;
     let reviewer = review
@@ -3628,7 +3642,23 @@ async fn run_grok_cli_process_with_session(
 
     if let Some((tools, commands)) = full.tool_surface {
         // The only visibility into per-turn context cost: 26 tools is a ~14K turn, 420 is ~67K.
-        tracing::info!(agent = "grok", tools, commands, "grok tool surface for this turn");
+        if grok_tool_surface_is_bloated(tools) {
+            // FIND-GROK-05 remainder. Doctor detects config drift before a turn; this is the
+            // live tripwire during one, because the surface an operator configured and the
+            // surface grok actually advertises are different numbers once MCP servers connect.
+            //
+            // WARN ONLY. It does not fail the consult: a large tool surface is expensive, not
+            // wrong, and failing here would break working setups over a cost signal.
+            tracing::warn!(
+                agent = "grok",
+                tools,
+                commands,
+                threshold = GROK_TOOL_SURFACE_WARN_AT,
+                "grok tool surface is large; this turn's context cost is high"
+            );
+        } else {
+            tracing::info!(agent = "grok", tools, commands, "grok tool surface for this turn");
+        }
     }
 
     // Termination policy lives HERE, not in the parser, so it is testable independently.
@@ -5786,6 +5816,76 @@ mod sight_gate_tests {
     }
 }
 
+/// FIND-GROK-05 remainder: the live tool-surface tripwire.
+///
+/// Doctor already detects config drift before a turn. This is the other half: what grok
+/// ADVERTISES during a turn is a different number from what the operator configured, because
+/// MCP servers add to it. The captured fixtures show 26 tools with none connected and 420 with
+/// them, which is the difference between a ~14K and a ~67K turn.
+#[cfg(test)]
+mod grok_tool_surface_tests {
+    use super::*;
+
+    /// The boundary. 200 is not a warning, 201 is. A `>=` here would warn on the documented
+    /// threshold itself, which makes the constant mean something other than what it says.
+    /// RED IF: the comparison flips to `>=`, or the threshold moves without the doc moving.
+    #[test]
+    fn u_ts_01_the_threshold_is_exclusive() {
+        assert!(!grok_tool_surface_is_bloated(0));
+        assert!(!grok_tool_surface_is_bloated(26), "the no-MCP fixture must stay quiet");
+        assert!(!grok_tool_surface_is_bloated(GROK_TOOL_SURFACE_WARN_AT));
+        assert!(grok_tool_surface_is_bloated(GROK_TOOL_SURFACE_WARN_AT + 1));
+        assert!(grok_tool_surface_is_bloated(420), "the full-inheritance capture must trip it");
+    }
+
+    /// Driven through the real parser, from a real `available_commands` line shape, because the
+    /// count the tripwire reads comes from `full.tool_surface` and not from anything this test
+    /// could otherwise assert. The array contents are synthetic; the event shape is not.
+    /// RED IF: `available_commands` stops populating `tool_surface`, or the count is wrong.
+    #[test]
+    fn u_ts_02_a_bloated_surface_is_counted_from_the_wire() {
+        let tools: Vec<String> = (0..201).map(|i| format!("\"tool_{i}\"")).collect();
+        let line = format!(
+            r#"{{"type":"available_commands","tools":[{}],"commands":[1,2]}}"#,
+            tools.join(",")
+        );
+        let mut p = GrokStreamParser::new();
+        p.parse_line(&line);
+        p.parse_line(r#"{"type":"text","data":"answer"}"#);
+        let full = p.finish_full();
+
+        let (tools, commands) = full.tool_surface.expect("the wire advertised a surface");
+        assert_eq!(tools, 201);
+        assert_eq!(commands, 2);
+        assert!(
+            grok_tool_surface_is_bloated(tools),
+            "201 advertised tools must trip the warning"
+        );
+        assert_eq!(
+            full.parsed.response_text, "answer",
+            "the tripwire must not fail or contaminate the consult"
+        );
+    }
+
+    /// The quiet case, same route. Without this the test above would pass even if the predicate
+    /// always returned true, which is a tripwire that fires on every turn and gets ignored.
+    /// RED IF: the predicate becomes unconditionally true.
+    #[test]
+    fn u_ts_03_an_ordinary_surface_does_not_trip() {
+        let tools: Vec<String> = (0..26).map(|i| format!("\"tool_{i}\"")).collect();
+        let line = format!(
+            r#"{{"type":"available_commands","tools":[{}],"commands":[]}}"#,
+            tools.join(",")
+        );
+        let mut p = GrokStreamParser::new();
+        p.parse_line(&line);
+        let full = p.finish_full();
+        let (tools, _) = full.tool_surface.expect("the wire advertised a surface");
+        assert_eq!(tools, 26);
+        assert!(!grok_tool_surface_is_bloated(tools));
+    }
+}
+
 #[cfg(test)]
 mod mandatory_review_tests {
     use super::*;
@@ -6126,6 +6226,7 @@ mod mandatory_review_tests {
                 author_agent: "claude".to_string(),
                 artifact: "someone else's turn".to_string(),
                 review_type: "agent_output".to_string(),
+                dispatch_owned: true,
             })
             .expect("occupy the slot");
         assert_eq!(occupying.state, "in_progress", "the fixture must actually fill the cap");

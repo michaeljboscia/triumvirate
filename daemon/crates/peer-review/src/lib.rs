@@ -12,6 +12,14 @@ pub struct ReviewRequest {
     pub author_agent: String,
     pub artifact: String,
     pub review_type: String,
+    /// FIND-REVIEW-03: true only for a review the in-process mandatory-review dispatch is
+    /// conducting. Such a row is writable ONLY by `Submitter::Dispatch`.
+    ///
+    /// Codex found why the reviewer-name check alone is not a boundary: `review_request` returns
+    /// the assigned reviewer to the caller, so an MCP client can name it back and its claim
+    /// matches. A name from a request body is an assertion, not an identity. This flag is not
+    /// settable from any request body, which is what makes it one.
+    pub dispatch_owned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +31,7 @@ pub struct ReviewRecord {
     pub verdict: Option<String>,
     pub comments: Option<String>,
     pub state: String,
+    pub dispatch_owned: bool,
 }
 
 /// The default panel, overridable with `TRIUMVIRATE_PEER_REVIEWERS` (comma separated).
@@ -137,8 +146,8 @@ impl PeerReviewEngine {
             "pending"
         };
         conn.execute(
-            "INSERT INTO reviews (review_id, fleet_id, author_agent, reviewer_agent, artifact, review_type, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO reviews (review_id, fleet_id, author_agent, reviewer_agent, artifact, review_type, state, dispatch_owned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 review_id,
                 req.fleet_id,
@@ -146,7 +155,8 @@ impl PeerReviewEngine {
                 reviewer,
                 req.artifact,
                 req.review_type,
-                state
+                state,
+                i64::from(req.dispatch_owned)
             ],
         )?;
         self.get_review(&review_id)?
@@ -170,6 +180,20 @@ impl PeerReviewEngine {
         comments: Option<&str>,
         submitter: Submitter<'_>,
     ) -> anyhow::Result<Option<String>> {
+        // FIND-REVIEW-04. The verdict was never validated: whatever string arrived was written
+        // to the row verbatim, and the identity check below only fired on an exact,
+        // case-insensitive "approve".
+        //
+        // Grok found the consequence. A raw MCP body of "approve " or "approved" wrote
+        // state='done' with NO identity check at all, because neither string equals "approve".
+        // The row then reads as a completed review to anything that inspects the ledger.
+        //
+        // Normalising and rejecting anything unrecognised closes both halves: the identity check
+        // can no longer be side-stepped by spelling, and the ledger cannot accumulate verdicts
+        // that no reader knows how to interpret.
+        let verdict = normalise_verdict(verdict)?;
+        let verdict = verdict.as_str();
+
         let conn = self.open_conn()?;
         let existing = self
             .get_review(review_id)?
@@ -183,7 +207,17 @@ impl PeerReviewEngine {
             );
         }
 
-        if verdict.eq_ignore_ascii_case("approve") {
+        // FIND-REVIEW-03. A review the daemon is conducting is not writable from outside, for
+        // ANY verdict. Refusing only `approve` here would still leave a denial of service: an
+        // MCP client could land a `reject` on a live mandatory review and the dispatch's own
+        // submit would then fail as "changed state", which reads like an infrastructure fault.
+        if existing.dispatch_owned && !matches!(submitter, Submitter::Dispatch) {
+            anyhow::bail!(
+                "review {review_id} is being conducted by the daemon's own review dispatch and                  cannot be submitted by a client"
+            );
+        }
+
+        if verdict == "approve" {
             let assigned = existing.reviewer_agent.as_deref().unwrap_or("");
             let authorised = match submitter {
                 Submitter::Dispatch => true,
@@ -205,7 +239,20 @@ impl PeerReviewEngine {
         }
 
         // Re-checked in the WHERE clause, not just above, so a concurrent submit cannot slip
-        // between the read and the write. `open_conn` sets a busy timeout but not a transaction.
+        // between the read and the write. `open_conn` sets a busy timeout but not a transaction,
+        // and the read above uses a DIFFERENT connection, so the window is real.
+        //
+        // NO TEST COVERS THIS CLAUSE, and that is stated rather than left to be assumed.
+        // Antigravity checked it: removing `AND state = 'in_progress'` from this UPDATE leaves
+        // the whole suite green, because every test that attempts an invalid transition is
+        // stopped by the Rust guard above before the SQL ever runs. The only way to reach this
+        // clause while passing that guard is a state change between the two, and no test
+        // simulates one. A threaded test that tried would be racy, and a flaky test here is
+        // worse than an honest comment: it teaches people to re-run until green.
+        //
+        // My commit message for 20be42a listed "SQL guard removed" as a mutation that killed
+        // tests. It did not. What was actually run was BOTH guards removed together, which the
+        // Rust guard accounts for. The claim was false and is corrected here.
         let updated = conn.execute(
             "UPDATE reviews
              SET verdict = ?2, comments = ?3, reviewed_at = datetime('now'), state = 'done'
@@ -255,7 +302,8 @@ impl PeerReviewEngine {
     pub fn get_review(&self, review_id: &str) -> anyhow::Result<Option<ReviewRecord>> {
         let conn = self.open_conn()?;
         conn.query_row(
-            "SELECT review_id, fleet_id, author_agent, reviewer_agent, verdict, comments, state
+            "SELECT review_id, fleet_id, author_agent, reviewer_agent, verdict, comments, state,
+                    COALESCE(dispatch_owned, 0)
              FROM reviews
              WHERE review_id = ?1",
             [review_id],
@@ -268,6 +316,7 @@ impl PeerReviewEngine {
                     verdict: row.get(4)?,
                     comments: row.get(5)?,
                     state: row.get(6)?,
+                    dispatch_owned: row.get::<_, i64>(7)? != 0,
                 })
             },
         )
@@ -316,6 +365,24 @@ impl PeerReviewEngine {
     }
 }
 
+/// The only verdicts a review row may carry.
+///
+/// `indeterminate` is included because `classify_review_verdict` produces it for a reviewer that
+/// answered unusably or did not answer at all, and that outcome has to be recordable: it is the
+/// fail-closed verdict, and refusing to store it would turn a blocked turn into a submit error.
+///
+/// Trimmed and lowercased rather than compared loosely, so the stored string is canonical and
+/// every later reader (`review_status`, telemetry, the dashboard) sees one spelling.
+fn normalise_verdict(raw: &str) -> anyhow::Result<String> {
+    let cleaned = raw.trim().to_ascii_lowercase();
+    match cleaned.as_str() {
+        "approve" | "concerns" | "reject" | "indeterminate" => Ok(cleaned),
+        other => anyhow::bail!(
+            "unknown verdict {other:?}: expected one of approve, concerns, reject, indeterminate"
+        ),
+    }
+}
+
 fn max_inflight_limit() -> usize {
     std::env::var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT")
         .ok()
@@ -352,6 +419,7 @@ mod tests {
                     author_agent: "codex".to_string(),
                     artifact: format!("diff-{idx}"),
                     review_type: "code".to_string(),
+                    dispatch_owned: false,
                 })
                 .expect("request review");
             assert_ne!(
@@ -420,6 +488,7 @@ mod tests {
                 author_agent: "codex".to_string(),
                 artifact: "diff-1".to_string(),
                 review_type: "code".to_string(),
+                dispatch_owned: false,
             })
             .expect("request first");
         let second = engine
@@ -428,6 +497,7 @@ mod tests {
                 author_agent: "codex".to_string(),
                 artifact: "diff-2".to_string(),
                 review_type: "code".to_string(),
+                dispatch_owned: false,
             })
             .expect("request second");
         let third = engine
@@ -436,6 +506,7 @@ mod tests {
                 author_agent: "codex".to_string(),
                 artifact: "diff-3".to_string(),
                 review_type: "code".to_string(),
+                dispatch_owned: false,
             })
             .expect("request third");
 
@@ -578,7 +649,15 @@ mod submit_authority_tests {
     /// Returns `(engine, review_id, assigned_reviewer)`. Each call gets its own tempdir, which is
     /// leaked deliberately: the engine reopens the sqlite file by path on every call, so dropping
     /// the `TempDir` mid-test would delete the database out from under it.
-    fn seeded(author: &str) -> (PeerReviewEngine, String, String) {
+    pub(super) fn seeded(author: &str) -> (PeerReviewEngine, String, String) {
+        seeded_with_owner(author, false)
+    }
+
+    pub(super) fn seeded_dispatch(author: &str) -> (PeerReviewEngine, String, String) {
+        seeded_with_owner(author, true)
+    }
+
+    fn seeded_with_owner(author: &str, dispatch_owned: bool) -> (PeerReviewEngine, String, String) {
         let temp = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
         let project_root = temp.path().join("project");
         fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
@@ -590,6 +669,7 @@ mod submit_authority_tests {
                 author_agent: author.to_string(),
                 artifact: "the work under review".to_string(),
                 review_type: "agent_output".to_string(),
+                dispatch_owned,
             })
             .expect("request review");
         let reviewer = review.reviewer_agent.clone().expect("reviewer assigned");
@@ -793,5 +873,173 @@ mod submit_authority_tests {
             .submit_review(&review_id, "APPROVE", None, Submitter::Agent("nobody"))
             .expect_err("case must not be a way around the authority check");
         assert!(err.to_string().contains("assigned to"), "got: {err}");
+    }
+}
+
+/// FIND-REVIEW-03: a review the daemon is conducting is not writable by a client.
+///
+/// Codex raised this against the first version of FIND-REVIEW-01: the reviewer-name check was
+/// not an authentication boundary, because `review_request` returns the assigned reviewer to the
+/// caller, so an MCP client can simply name it back and match. A name in a request body is an
+/// assertion about identity, not identity.
+///
+/// The boundary that can actually be enforced is ownership, not naming: the mandatory-review
+/// dispatch marks its own rows, no request field deserialises into that flag, and such a row
+/// accepts writes from `Submitter::Dispatch` only.
+#[cfg(test)]
+mod dispatch_ownership_tests {
+    use super::submit_authority_tests::{seeded, seeded_dispatch};
+    use super::Submitter;
+
+    /// The exact attack Codex described: the client knows the review_id and names the correct
+    /// reviewer, because `review_request` told it both.
+    /// RED IF: the ownership check is removed, or narrowed back to a name comparison.
+    #[test]
+    fn u_pr_naming_the_right_reviewer_does_not_authorise_a_client() {
+        let (engine, review_id, reviewer) = seeded_dispatch("codex");
+
+        let err = engine
+            .submit_review(&review_id, "approve", Some("lgtm"), Submitter::Agent(&reviewer))
+            .expect_err("knowing the reviewer's name is not being the reviewer");
+        assert!(
+            err.to_string().contains("conducted by the daemon"),
+            "the refusal must be about ownership, not naming; got: {err}"
+        );
+
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.state, "in_progress");
+        assert_eq!(after.verdict, None);
+    }
+
+    /// Refusing only `approve` would leave a denial of service: a client lands a `reject` on a
+    /// live mandatory review, and the dispatch's own submit then fails as "changed state", which
+    /// reads like an infrastructure fault rather than an attack.
+    /// RED IF: the ownership check is narrowed to approve only.
+    #[test]
+    fn u_pr_a_client_cannot_reject_a_dispatch_owned_review_either() {
+        let (engine, review_id, reviewer) = seeded_dispatch("codex");
+
+        let err = engine
+            .submit_review(&review_id, "reject", Some("no"), Submitter::Agent(&reviewer))
+            .expect_err("a client must not be able to derail a live review");
+        assert!(err.to_string().contains("conducted by the daemon"), "got: {err}");
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.verdict, None);
+    }
+
+    /// The dispatch itself must still be able to finish its own review, or mandatory review can
+    /// never complete.
+    /// RED IF: the ownership check starts refusing Dispatch.
+    #[test]
+    fn u_pr_the_dispatch_can_still_write_its_own_review() {
+        let (engine, review_id, _reviewer) = seeded_dispatch("codex");
+        engine
+            .submit_review(&review_id, "approve", Some("read it"), Submitter::Dispatch)
+            .expect("the dispatch owns this row");
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.verdict.as_deref(), Some("approve"));
+    }
+
+    /// Client-requested reviews are unaffected. They are bookkeeping, not a gate: fleet queues
+    /// them and an agent picks them up over MCP. Locking them would break that workflow to
+    /// defend a boundary they were never part of.
+    /// RED IF: ownership starts defaulting to true, which would silently disable review_submit.
+    #[test]
+    fn u_pr_a_client_requested_review_stays_client_writable() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        assert!(
+            !engine.get_review(&review_id).expect("get").expect("present").dispatch_owned,
+            "a review requested through the ordinary path must not be dispatch owned"
+        );
+        engine
+            .submit_review(&review_id, "approve", None, Submitter::Agent(&reviewer))
+            .expect("the assigned reviewer may still submit a client review");
+    }
+
+    /// The flag has to survive the round trip through sqlite, including on a database created
+    /// before the column existed, where COALESCE supplies the default.
+    /// RED IF: the INSERT stops writing the column, or the SELECT stops reading it.
+    #[test]
+    fn u_pr_ownership_round_trips_through_the_database() {
+        let (engine, owned, _) = seeded_dispatch("codex");
+        let (other_engine, unowned, _) = seeded("codex");
+        assert!(engine.get_review(&owned).expect("get").expect("present").dispatch_owned);
+        assert!(!other_engine.get_review(&unowned).expect("get").expect("present").dispatch_owned);
+    }
+}
+
+/// FIND-REVIEW-04: the verdict string is validated, not stored verbatim.
+///
+/// Grok found this reviewing FIND-REVIEW-01. The identity check fired only on an exact,
+/// case-insensitive `"approve"`, and the engine wrote whatever string it was handed. So a raw
+/// MCP body of `"approve "` or `"approved"` skipped the identity check entirely and still set
+/// `state = 'done'`. The row then reads as a completed review to anything inspecting the ledger.
+#[cfg(test)]
+mod verdict_normalisation_tests {
+    use super::submit_authority_tests::seeded;
+    use super::Submitter;
+
+    /// The exact strings Grok named, plus the empty and whitespace cases. Each one used to
+    /// write `done` with no identity check, because none of them equals "approve".
+    /// RED IF: `normalise_verdict` starts accepting anything outside the four.
+    #[test]
+    fn u_pr_an_unknown_verdict_leaves_the_row_alone() {
+        for sneaky in ["approved", "approve!", "ok", "", "  "] {
+            let (engine, review_id, _) = seeded("codex");
+            let err = engine
+                .submit_review(&review_id, sneaky, None, Submitter::Agent("nobody"))
+                .expect_err(&format!("{sneaky:?} must not be accepted as a verdict"));
+            assert!(
+                err.to_string().contains("unknown verdict"),
+                "the refusal must name the verdict problem for {sneaky:?}; got: {err}"
+            );
+            let after = engine.get_review(&review_id).expect("get").expect("present");
+            assert_eq!(after.state, "in_progress", "{sneaky:?} must not complete the review");
+            assert_eq!(after.verdict, None, "{sneaky:?} must not be stored");
+        }
+    }
+
+    /// Whitespace and case must not be a way past the identity check. `" APPROVE "` normalises
+    /// to `approve`, so it takes the authority path rather than sliding by as an unknown string.
+    /// RED IF: normalisation stops trimming, or the identity compare stops using the normalised
+    /// value.
+    #[test]
+    fn u_pr_a_padded_approve_still_takes_the_identity_path() {
+        let (engine, review_id, _) = seeded("codex");
+        let err = engine
+            .submit_review(&review_id, "  APPROVE  ", None, Submitter::Agent("nobody"))
+            .expect_err("a padded approve is still an approve");
+        assert!(
+            err.to_string().contains("assigned to"),
+            "it must be refused for identity, not as an unknown verdict; got: {err}"
+        );
+    }
+
+    /// The stored string is canonical, so every later reader sees one spelling.
+    /// RED IF: the raw string is written instead of the normalised one.
+    #[test]
+    fn u_pr_the_stored_verdict_is_canonical() {
+        let (engine, review_id, reviewer) = seeded("codex");
+        engine
+            .submit_review(&review_id, " Approve ", None, Submitter::Agent(&reviewer))
+            .expect("the assigned reviewer may approve");
+        let after = engine.get_review(&review_id).expect("get").expect("present");
+        assert_eq!(after.verdict.as_deref(), Some("approve"), "not \" Approve \"");
+    }
+
+    /// `indeterminate` must be storable. It is what `classify_review_verdict` produces for a
+    /// reviewer that answered unusably or not at all, and refusing it would turn a blocked turn
+    /// into a submit error, which reads as infrastructure rather than as a verdict.
+    /// RED IF: indeterminate is dropped from the accepted set.
+    #[test]
+    fn u_pr_the_fail_closed_verdict_is_recordable() {
+        for v in ["indeterminate", "reject", "concerns"] {
+            let (engine, review_id, _) = seeded("codex");
+            engine
+                .submit_review(&review_id, v, Some("why"), Submitter::Dispatch)
+                .unwrap_or_else(|e| panic!("{v} must be recordable: {e}"));
+            let after = engine.get_review(&review_id).expect("get").expect("present");
+            assert_eq!(after.verdict.as_deref(), Some(v));
+        }
     }
 }
