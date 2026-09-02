@@ -509,3 +509,366 @@ test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Orchestration.
+//
+// Kept behind injected callbacks, the same shape ABE uses, so the whole flow is testable without
+// spawning a model or touching a real repo. The guarantees above are pure functions; this is the
+// plumbing that arranges for them to be true.
+// ---------------------------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+
+/// Everything a blind validation needs, with the side effects injected.
+pub struct BlindValidationCallbacks<'a> {
+    /// Run the agent in `cwd` with `prompt` and return (stdout, tool calls it made).
+    ///
+    /// Returning the tool calls is what lets `reads_outside_allowed_root` run at all. An adapter
+    /// whose parser records nothing yields an empty list, which is why the module doc insists
+    /// containment is the defence: an empty list is indistinguishable from a clean run.
+    #[allow(clippy::type_complexity)]
+    pub run_agent: &'a (dyn Fn(
+        &str,
+        &str,
+        &Path,
+    ) -> Result<(String, Vec<agent_adapter::ToolCallRecord>), String>
+                  + Send
+                  + Sync),
+    /// Run the test suite in `cwd` and return its raw output.
+    pub run_tests: &'a (dyn Fn(&Path) -> Result<String, String> + Send + Sync),
+}
+
+/// The inputs that describe one validation.
+#[derive(Debug, Clone)]
+pub struct BlindValidationRequest {
+    /// The worktree the worker built in. The validator must never see this.
+    pub impl_worktree: PathBuf,
+    /// A directory containing the contract and nothing else. The validator's whole world.
+    pub validator_dir: PathBuf,
+    /// The contract text, which carries the API surface.
+    pub contract: String,
+    /// Where the validator writes its tests, relative to `validator_dir`.
+    pub test_file_rel: String,
+    /// The command used to run tests, quoted into the prompt so the validator writes for it.
+    pub test_command: String,
+    /// Who wrote the code. Cannot be the validator.
+    pub worker_agent: String,
+    /// Candidate validators, in preference order.
+    pub roster: Vec<String>,
+    /// The suite's outcome BEFORE the worker ran. Without this, pre-existing failures are
+    /// blamed on the worker.
+    pub baseline: TestRun,
+}
+
+/// Run one blind validation, end to end.
+///
+/// ORDER MATTERS and every step is a refusal point:
+///
+/// 1. Pick a validator that is not the worker. No validator, no validation.
+/// 2. Stage the contract into the validator's own directory. If the implementation is reachable
+///    from there, stop: the run cannot be blind, so it cannot be an answer.
+/// 3. Let the validator write tests, seeing only that directory.
+/// 4. Check what it touched. A violation ends the run before any verdict is formed.
+/// 5. Copy the tests into the implementation worktree and run the suite THERE.
+/// 6. Diff against the baseline.
+///
+/// Step 4 is deliberately before step 5. Running the tests of a sighted validator and then
+/// discarding the result would waste the run and, worse, would produce a number that somebody
+/// eventually quotes.
+pub fn run_blind_validation(
+    req: &BlindValidationRequest,
+    cb: &BlindValidationCallbacks<'_>,
+) -> Result<BlindReport, String> {
+    let validator = pick_validator(&req.worker_agent, &req.roster)?;
+
+    // The validator's directory must NOT contain the implementation. Checked rather than
+    // assumed, because the entire guarantee rests on it and a caller that passes the same path
+    // twice would otherwise get a confident, meaningless PASS.
+    let impl_canon = canonical(&req.impl_worktree);
+    let val_canon = canonical(&req.validator_dir);
+    if val_canon == impl_canon || val_canon.starts_with(&impl_canon) {
+        return Err(format!(
+            "the validator directory {} is inside the implementation worktree {}. The validator \
+             would be able to read the code it is supposed to be blind to, so this run could not \
+             mean anything. Give it a directory of its own.",
+            val_canon.display(),
+            impl_canon.display()
+        ));
+    }
+
+    std::fs::create_dir_all(&req.validator_dir)
+        .map_err(|e| format!("could not create the validator directory: {e}"))?;
+    let contract_path = req.validator_dir.join("CONTRACT.md");
+    std::fs::write(&contract_path, &req.contract)
+        .map_err(|e| format!("could not stage the contract: {e}"))?;
+
+    let test_path = req.validator_dir.join(&req.test_file_rel);
+    if let Some(parent) = test_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create the validator test directory: {e}"))?;
+    }
+
+    let prompt = build_validator_prompt(
+        &req.contract,
+        &test_path.to_string_lossy(),
+        &req.test_command,
+    );
+    let (_answer, tool_calls) = (cb.run_agent)(&validator, &prompt, &req.validator_dir)?;
+
+    let violations =
+        reads_outside_allowed_root(&tool_calls, &req.validator_dir.to_string_lossy());
+    if !violations.is_empty() {
+        // Stop here. Do not run the tests: see the ordering note above.
+        return Ok(BlindReport {
+            validator_agent: validator,
+            blind_tests_passed: false,
+            newly_failing: Vec::new(),
+            blindness_violations: violations,
+        });
+    }
+
+    let written = std::fs::read_to_string(&test_path).map_err(|e| {
+        format!(
+            "{validator} did not write tests to {}: {e}. Without tests there is nothing to run, \
+             and an empty run must not be read as a pass.",
+            test_path.display()
+        )
+    })?;
+    if written.trim().is_empty() {
+        return Err(format!(
+            "{validator} wrote an EMPTY test file at {}. An empty suite passes trivially, which \
+             would report the strongest possible result for the weakest possible reason.",
+            test_path.display()
+        ));
+    }
+
+    let dest = req.impl_worktree.join(&req.test_file_rel);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create the destination test directory: {e}"))?;
+    }
+    std::fs::copy(&test_path, &dest)
+        .map_err(|e| format!("could not copy the blind tests into the worktree: {e}"))?;
+
+    let output = (cb.run_tests)(&req.impl_worktree)?;
+    let after = parse_cargo_test_output(&output);
+
+    // The blind tests are the ones the validator just wrote. Identified by their presence in
+    // this run and absence from the baseline, which is exactly what a new test file produces.
+    let blind_tests: Vec<&String> = after.keys().filter(|k| !req.baseline.contains_key(*k)).collect();
+    let blind_tests_passed = !blind_tests.is_empty()
+        && blind_tests.iter().all(|k| after.get(*k) == Some(&TestOutcome::Passed));
+
+    Ok(BlindReport {
+        validator_agent: validator,
+        blind_tests_passed,
+        newly_failing: newly_failing(&req.baseline, &after),
+        blindness_violations: Vec::new(),
+    })
+}
+
+/// Canonicalise a path that may not exist yet, by canonicalising its deepest existing ancestor
+/// and re-joining the rest.
+///
+/// A plain `canonicalize().unwrap_or(as-given)` is NOT enough here and the difference is a real
+/// bypass, not a test artifact. The validator directory is created AFTER the containment check,
+/// so it does not exist when the check runs. On macOS a tempdir lives at `/var/...` and
+/// canonicalises to `/private/var/...`, so the existing implementation worktree normalised and
+/// the not-yet-created validator directory did not. `starts_with` then compared
+/// `/var/x/impl/validator` against `/private/var/x/impl` and found no overlap, so a validator
+/// placed INSIDE the implementation worktree passed the check and returned a confident,
+/// meaningless PASS.
+///
+/// Found by `bv_25` failing for a reason that was not the one it was written to test, which is
+/// the third time in this work that a path-normalisation mismatch has masqueraded as something
+/// else.
+fn canonical(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = p.to_path_buf();
+    while let Some(parent) = current.parent().map(Path::to_path_buf) {
+        let Some(name) = current.file_name().map(|n| n.to_os_string()) else {
+            break;
+        };
+        suffix.push(name);
+        if let Ok(c) = std::fs::canonicalize(&parent) {
+            let mut out = c;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        current = parent;
+    }
+    p.to_path_buf()
+}
+
+#[cfg(test)]
+mod orchestration_tests {
+    use super::*;
+    use agent_adapter::{ToolCallRecord, ToolKind};
+
+    struct Harness {
+        writes: String,
+        tool_calls: Vec<ToolCallRecord>,
+        test_output: String,
+    }
+
+    fn run(h: &Harness, req: &BlindValidationRequest) -> Result<BlindReport, String> {
+        let run_agent = |_agent: &str, _prompt: &str, cwd: &Path| {
+            // The stand-in writes where a real validator was told to write.
+            let path = cwd.join(&req.test_file_rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, &h.writes).unwrap();
+            Ok((String::from("done"), h.tool_calls.clone()))
+        };
+        let run_tests = |_cwd: &Path| Ok(h.test_output.clone());
+        run_blind_validation(
+            req,
+            &BlindValidationCallbacks { run_agent: &run_agent, run_tests: &run_tests },
+        )
+    }
+
+    fn request(dir: &Path) -> BlindValidationRequest {
+        let impl_wt = dir.join("impl");
+        let val = dir.join("validator");
+        std::fs::create_dir_all(&impl_wt).unwrap();
+        BlindValidationRequest {
+            impl_worktree: impl_wt,
+            validator_dir: val,
+            contract: "pub fn duration_secs(s: &str) -> Option<u64>".to_string(),
+            test_file_rel: "tests/blind.rs".to_string(),
+            test_command: "cargo test".to_string(),
+            worker_agent: "codex".to_string(),
+            roster: vec!["codex".into(), "claude".into(), "grok".into()],
+            baseline: parse_cargo_test_output("test existing::a ... ok\n"),
+        }
+    }
+
+    /// THE HAPPY PATH, and it must be a real pass rather than a vacuous one: the blind tests are
+    /// the ones absent from the baseline, and there must be at least one.
+    /// RED IF: a run with no new tests reports success.
+    #[test]
+    fn bv_20_a_worktree_that_did_the_job_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = request(dir.path());
+        let h = Harness {
+            writes: "#[test] fn blind_a() {}".to_string(),
+            tool_calls: vec![],
+            test_output: "test existing::a ... ok\ntest blind_a ... ok\n".to_string(),
+        };
+        let report = run(&h, &req).unwrap();
+        assert_eq!(report.validator_agent, "claude", "must not be the worker");
+        assert!(report.accepted(), "{:?}", report.why_rejected());
+    }
+
+    /// The failure this whole feature exists to catch: the worktree did not do what it was told.
+    /// RED IF: a failing blind test is accepted.
+    #[test]
+    fn bv_21_a_worktree_that_did_not_do_the_job_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = request(dir.path());
+        let h = Harness {
+            writes: "#[test] fn blind_a() {}".to_string(),
+            tool_calls: vec![],
+            test_output: "test existing::a ... ok\ntest blind_a ... FAILED\n".to_string(),
+        };
+        let report = run(&h, &req).unwrap();
+        assert!(!report.accepted());
+        assert!(report.why_rejected().unwrap().contains("did not do what it was dispatched"));
+    }
+
+    /// An EMPTY suite passes trivially. A validator that wrote no tests must be an error, not the
+    /// strongest possible result for the weakest possible reason.
+    /// RED IF: a run with zero new tests reports blind_tests_passed.
+    #[test]
+    fn bv_22_a_validator_that_wrote_no_tests_is_not_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = request(dir.path());
+
+        // Nothing new in the run at all.
+        let h = Harness {
+            writes: "// no tests here".to_string(),
+            tool_calls: vec![],
+            test_output: "test existing::a ... ok\n".to_string(),
+        };
+        let report = run(&h, &req).unwrap();
+        assert!(!report.blind_tests_passed, "no new tests ran, so nothing was validated");
+        assert!(!report.accepted());
+
+        // And a literally empty file is refused before anything is run.
+        let h2 = Harness { writes: "   \n".to_string(), ..Harness { writes: String::new(), tool_calls: vec![], test_output: String::new() } };
+        let err = run(&h2, &req).unwrap_err();
+        assert!(err.contains("EMPTY test file"), "got: {err}");
+    }
+
+    /// Collateral damage, caught by the baseline and attributed correctly.
+    /// RED IF: a test that broke outside the contract goes unreported.
+    #[test]
+    fn bv_23_breaking_an_unrelated_test_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = request(dir.path());
+        let h = Harness {
+            writes: "#[test] fn blind_a() {}".to_string(),
+            tool_calls: vec![],
+            test_output: "test existing::a ... FAILED\ntest blind_a ... ok\n".to_string(),
+        };
+        let report = run(&h, &req).unwrap();
+        assert!(report.blind_tests_passed, "the contract itself was met");
+        assert!(!report.accepted(), "but something else broke");
+        assert_eq!(report.newly_failing, vec!["existing::a".to_string()]);
+    }
+
+    /// A sighted validator ends the run BEFORE the tests are executed. Running them and then
+    /// discarding the result would waste the run and produce a number somebody eventually quotes.
+    /// RED IF: the tests are run despite a violation, or a violated run is accepted.
+    #[test]
+    fn bv_24_a_sighted_validator_stops_before_the_tests_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = request(dir.path());
+        let peeked = req.impl_worktree.join("src/thing.rs").to_string_lossy().to_string();
+        let h = Harness {
+            writes: "#[test] fn blind_a() {}".to_string(),
+            tool_calls: vec![ToolCallRecord {
+                id: Some("t".into()),
+                tool: "Read".into(),
+                kind: ToolKind::ReadFile,
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(format!("{{\"file_path\":\"{peeked}\"}}")),
+            }],
+            // Would be a clean pass if it were ever consulted.
+            test_output: "test existing::a ... ok\ntest blind_a ... ok\n".to_string(),
+        };
+        let report = run(&h, &req).unwrap();
+        assert!(!report.accepted());
+        assert!(!report.blindness_violations.is_empty());
+        assert!(
+            report.newly_failing.is_empty() && !report.blind_tests_passed,
+            "no verdict may be formed from a sighted run: {report:?}"
+        );
+        assert!(report.why_rejected().unwrap().contains("NOT BLIND"));
+    }
+
+    /// The containment check on the ARGUMENTS themselves. A caller that points the validator at
+    /// the implementation worktree would otherwise get a confident, meaningless PASS.
+    /// RED IF: the two directories are allowed to overlap.
+    #[test]
+    fn bv_25_the_validator_may_not_live_inside_the_implementation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(dir.path());
+        req.validator_dir = req.impl_worktree.join("validator");
+        let h = Harness {
+            writes: "#[test] fn blind_a() {}".to_string(),
+            tool_calls: vec![],
+            test_output: "test blind_a ... ok\n".to_string(),
+        };
+        let err = run(&h, &req).unwrap_err();
+        assert!(err.contains("inside the implementation worktree"), "got: {err}");
+    }
+}
