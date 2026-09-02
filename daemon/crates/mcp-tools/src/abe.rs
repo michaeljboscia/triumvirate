@@ -1814,8 +1814,22 @@ pub fn build_worker_argv(
             .map_err(|e| format!("failed to assemble grok ABE worker: {e}"))?;
             Ok((inv.program, inv.args))
         }
-        // Codex, and the default. Identical to what the call sites built inline.
-        _ => {
+        // FIND-ABE-01. An agent ABE cannot BUILD must be refused, not silently turned into
+        // codex.
+        //
+        // This arm used to be `_ =>`, so `TRIUMVIRATE_ABE_AGENT=claude` passed validation (claude
+        // IS a dispatchable agent), was recorded in `TaskRecord.agent` as claude by the caller,
+        // and then spawned CODEX. `/api/workers`, the UI and telemetry would all report a claude
+        // worker that is a codex process.
+        //
+        // That is the exact lie FIND-GROK-03 was opened to kill, surviving one layer up because
+        // that fix was applied to the REPORTING and not to the SELECTION. It is also Grok's
+        // Rule 4 for this pass, inverted: do not label a worker with an agent the argv is not.
+        //
+        // Failing loudly is right rather than falling back, for the same reason an unroutable
+        // reviewer must fail at dispatch: a silent substitution looks like it worked.
+        // Codex, the default. Identical to what the call sites built inline.
+        "codex" => {
             let (cmd, mut args) = command_for("codex");
             args.push("exec".to_string());
             // 0.145 deprecated `--full-auto`; this is the explicit equivalent it resolves to.
@@ -1828,6 +1842,15 @@ pub fn build_worker_argv(
             args.push(prompt.to_string());
             Ok((cmd, args))
         }
+        // LAST, and that is load bearing. A binding pattern matches everything, so placing this
+        // above the concrete arms makes it the only arm: the first version did exactly that and
+        // refused `codex` itself. Rust match arms are ordered.
+        other => Err(format!(
+            "ABE cannot dispatch a `{other}` worker: only codex and grok have a worker argv \
+             builder. Set TRIUMVIRATE_ABE_AGENT to codex or grok, or add an arm to \
+             build_worker_argv. Refusing rather than substituting codex, which would report a \
+             `{other}` worker that is a codex process."
+        )),
     }
 }
 
@@ -1838,13 +1861,31 @@ pub fn build_worker_argv(
 pub fn abe_worker_agent() -> String {
     let raw = std::env::var("TRIUMVIRATE_ABE_AGENT").unwrap_or_else(|_| "codex".to_string());
     let canonical = mcp_bridge::normalize_agent_name(&raw);
-    if mcp_bridge::is_supported_agent_name(&canonical) {
+    // FIND-ABE-01: validated against what ABE can BUILD, not against what the daemon can
+    // dispatch generally. Those are different sets and the difference was a silent mislabel.
+    //
+    // `is_supported_agent_name` accepts claude, gemini and deepseek, none of which
+    // `build_worker_argv` has an arm for. The value was then recorded as the worker's agent
+    // while codex was spawned. Checking the narrower set here means the warning fires at
+    // selection time, where an operator can see it, rather than producing a worker whose label
+    // and process disagree.
+    if ABE_BUILDABLE_AGENTS.contains(&canonical.as_str()) {
         canonical
     } else {
-        tracing::warn!(requested = %raw, "TRIUMVIRATE_ABE_AGENT is not a dispatchable agent; using codex");
+        tracing::warn!(
+            requested = %raw,
+            buildable = ?ABE_BUILDABLE_AGENTS,
+            "TRIUMVIRATE_ABE_AGENT is not an agent ABE can build a worker for; using codex"
+        );
         "codex".to_string()
     }
 }
+
+/// The agents `build_worker_argv` actually has an arm for.
+///
+/// Deliberately narrower than `mcp_bridge::supported_agent_names()`. Adding a name here without
+/// adding the matching arm reintroduces FIND-ABE-01, so `abe_09` asserts the two agree.
+pub const ABE_BUILDABLE_AGENTS: &[&str] = &["codex", "grok"];
 
 #[cfg(test)]
 mod abe_agent_tests {
@@ -1959,5 +2000,96 @@ mod abe_agent_tests {
         unsafe { std::env::remove_var("TRIUMVIRATE_GROK_SANDBOX") };
         let _ = build_worker_argv("grok", &resolver, "task", "/tmp").unwrap();
         assert!(std::env::var("TRIUMVIRATE_GROK_SANDBOX").is_err(), "must not leave a value behind");
+    }
+}
+
+
+/// FIND-ABE-01: an ABE worker's LABEL and its PROCESS must be the same agent.
+///
+/// Found while answering "is ABE still a codex-only thing". It is not: grok has a real arm. But
+/// the fallback arm was `_ =>`, so any other dispatchable name was recorded as the worker's agent
+/// and then spawned as codex.
+///
+/// That is FIND-GROK-03's lie surviving one layer up. FIND-GROK-03 made `TaskRecord.agent` a real
+/// field so `/api/workers` would stop hardcoding codex; this made the field carry a value the
+/// process did not match. Fixing the reporting without fixing the selection moved the defect
+/// rather than closing it.
+#[cfg(test)]
+mod abe_label_honesty_tests {
+    use super::{abe_worker_agent, build_worker_argv, ABE_BUILDABLE_AGENTS};
+
+    fn resolver(agent: &str) -> (String, Vec<String>) {
+        (format!("/bin/{agent}"), Vec::new())
+    }
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// THE DEFECT. Asking for an agent ABE cannot build must not quietly spawn codex.
+    /// RED IF: the catch-all arm comes back.
+    #[test]
+    fn abe_07_an_unbuildable_agent_is_refused_not_substituted() {
+        for agent in ["claude", "gemini", "deepseek", "antigravity"] {
+            let err = build_worker_argv(agent, &resolver, "task", "/tmp").expect_err(
+                "ABE has no argv builder for this agent and must say so rather than spawn codex",
+            );
+            // The message names the CANONICAL agent, because that is what the match saw.
+            // `antigravity` normalises to `gemini`, and the first version of this assertion
+            // looked for the alias and failed on a correct message.
+            let canonical = mcp_bridge::normalize_agent_name(agent);
+            assert!(
+                err.contains("cannot dispatch") && err.contains(&canonical),
+                "the refusal must name the agent; got: {err}"
+            );
+        }
+    }
+
+    /// The two it CAN build still build, and build as themselves. Without this the rule above
+    /// would pass on a function that refuses everything.
+    /// RED IF: either real arm breaks.
+    #[test]
+    fn abe_08_the_buildable_agents_spawn_themselves() {
+        let (cmd, args) = build_worker_argv("codex", &resolver, "task", "/tmp").expect("codex");
+        assert!(cmd.ends_with("codex"), "got {cmd}");
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+
+        let (cmd, _) = build_worker_argv("grok", &resolver, "task", "/tmp").expect("grok");
+        assert!(cmd.ends_with("grok"), "a grok worker must be a grok process, got {cmd}");
+    }
+
+    /// The selection list and the builder must not drift. Adding a name to ABE_BUILDABLE_AGENTS
+    /// without adding its arm reintroduces the mislabel, silently.
+    /// RED IF: the two disagree.
+    #[test]
+    fn abe_09_the_buildable_list_matches_the_builder() {
+        for agent in ABE_BUILDABLE_AGENTS {
+            build_worker_argv(agent, &resolver, "task", "/tmp").unwrap_or_else(|e| {
+                panic!("{agent} is listed as buildable but build_worker_argv refuses it: {e}")
+            });
+        }
+    }
+
+    /// Selection warns and falls back at the point an operator can see it, rather than producing
+    /// a worker whose label and process disagree.
+    /// RED IF: abe_worker_agent goes back to validating against the daemon-wide agent list.
+    #[test]
+    fn abe_10_selection_falls_back_for_an_unbuildable_agent() {
+        let _g = env_guard();
+        // SAFETY: held under the module lock, removed on both paths below.
+        unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "claude") };
+        let selected = abe_worker_agent();
+        unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
+        assert_eq!(
+            selected, "codex",
+            "claude is dispatchable by the daemon but not buildable by ABE; selecting it would \
+             record a claude worker and spawn a codex process"
+        );
+
+        unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "supergrok") };
+        let alias = abe_worker_agent();
+        unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
+        assert_eq!(alias, "grok", "aliases must still resolve to a buildable agent");
     }
 }
