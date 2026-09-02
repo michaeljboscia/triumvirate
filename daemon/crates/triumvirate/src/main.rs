@@ -3179,7 +3179,7 @@ mod tests {
         Ok(())
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    pub(crate) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -3976,11 +3976,35 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         fs::create_dir_all(&project_root)?;
         let project_root_str = project_root.display().to_string();
 
+        // A MOCK REVIEWER IS NOW REQUIRED.
+        //
+        // Mandatory review used to auto-approve without dispatching anything, so this test
+        // needed no reviewer. It now spawns one for real, which meant this test was silently
+        // launching the REAL codex CLI, paying for it, and failing whenever codex legitimately
+        // rejected the mock gemini output. That is also what made the suite flaky.
+        //
+        // The mock speaks the connector's JSON-RPC shape and always approves, so the assertions
+        // below test the review LIFECYCLE rather than a live model's opinion.
+        let reviewer = temp.path().join("mock-approver");
+        fs::write(
+            &reviewer,
+            "#!/usr/bin/env bash\ncat > /dev/null\nprintf '{\"result\":{\"text\":\"APPROVE\\\\n\\\\nlooks fine\"}}\\n'\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&reviewer)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&reviewer, perms)?;
+        }
+
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
             std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", reviewer.as_os_str());
+            std::env::set_var("TRIUMVIRATE_PEER_REVIEWERS", "codex");
         }
 
         let reviewed = execute_ask_agent(
@@ -4026,6 +4050,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_PEER_REVIEWERS");
         }
         let unreviewed = execute_ask_agent(
             &AskAgentRequest {

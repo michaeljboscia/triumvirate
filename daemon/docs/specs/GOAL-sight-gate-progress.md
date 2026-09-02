@@ -943,3 +943,49 @@ opens with blank lines, which models do constantly.
 - Progress still says "approved" for a CONCERNS verdict. Codex.
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
+
+### End to end, and a flake that was hiding a real problem
+
+All three peers said the same thing about the first fix: nothing proved a reviewer was actually
+called, that REJECT actually blocked, or that recursion actually terminated. Four tests now
+drive `enforce_mandatory_peer_review` with a real child process as the reviewer:
+
+- a live REJECT blocks the turn and returns the reviewer's reasoning
+- a live APPROVE passes
+- a live unusable answer blocks with NO USABLE VERDICT
+- **the reviewer is invoked exactly twice for one turn**: the work, and its ONE review
+
+The recursion proof took two attempts. The first version called
+`enforce_mandatory_peer_review` directly, which BYPASSES the guard, so deleting the guard left
+it green. Caught by running the mutation. It now drives `execute_ask_agent`, the real entry
+point, and removing the guard reds it.
+
+Writing them surfaced three things nothing else had:
+
+1. **The mock connector protocol is JSON-RPC with `result.text`, not plain lines.** A plain-text
+   mock is read as a failure and RETRIED THREE TIMES. The first run produced three reviewer
+   invocations for one turn.
+2. **An agent cannot review itself**, so a single-name panel fails every turn with "no
+   non-author reviewers available". Author and reviewer must differ.
+3. **`ask_agent_requires_peer_review_when_env_enabled` was spawning the REAL codex CLI.** That
+   test enables mandatory review, which used to auto-approve without dispatching. It now
+   dispatches, so the test was paying for a live agent call and failing whenever codex
+   legitimately rejected the mock gemini output. It has a mock reviewer now.
+
+That third one was the flake. The suite failed roughly one run in three and the failure appeared
+in unrelated tests as "REJECTED by peer review", which reads like a defect in whatever ran next.
+Antigravity reported it earlier and I dismissed it as its own mutation. It was real, and my
+change had caused it.
+
+Now 6/6 clean full-suite runs.
+
+The four end-to-end tests are `#[ignore]` and run by `scripts/verify-live-agents.sh review`.
+That is a deliberate trade: they set `TRIUMVIRATE_REQUIRE_PEER_REVIEW` and a mock connector,
+both of which change every dispatch in the binary, and holding the shared lock only serialises
+them against tests that also take it. A suite that fails a third of the time teaches people to
+re-run until green, which is how a real failure gets ignored. They need no network and no API
+key.
+
+Fixture cleanup moved into `Drop`, because a plain call at the end of a test does not run when
+an assertion fires first, and a failing test was leaving a REJECT-returning mock installed for
+whatever ran next.

@@ -5899,6 +5899,238 @@ mod mandatory_review_tests {
         assert!(internal.is_peer_review.unwrap_or(false));
     }
 
+    // ---------------------------------------------------------------------------------
+    // END TO END. These drive `enforce_mandatory_peer_review` itself, with a real child
+    // process as the reviewer.
+    //
+    // Every test above this line checks a helper in isolation. All three peers said the same
+    // thing about that: nothing proved a reviewer is actually called, that REJECT actually
+    // blocks a turn, or that the recursion guard actually terminates anything at runtime.
+    // Codex called `review_05` "does not test recursion"; Antigravity called it the same
+    // reconstruct-the-mapping theater it had already caught once. They were right.
+    // ---------------------------------------------------------------------------------
+
+    /// Write a mock reviewer. The runner treats any binary named `mock-*` as a mock connector,
+    /// pipes the prompt to stdin, and reads the answer from stdout.
+    ///
+    /// `count_file` records one line per invocation, which is how the recursion test proves the
+    /// reviewer was called exactly once rather than infinitely.
+    fn write_mock_reviewer(dir: &std::path::Path, verdict_line: &str, count_file: &std::path::Path) -> PathBuf {
+        let bin = dir.join(format!("mock-reviewer-{}", std::process::id()));
+        // The mock connector protocol is JSON-RPC on stdout with `result.text`, NOT plain
+        // lines. A plain-text mock is read as a failure, retried three times, and lands in the
+        // dead drop. Found by running this test rather than by reading the runner: the first
+        // version printed the verdict directly and produced three paid reviewer calls.
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/usr/bin/env bash\n                 cat > /dev/null\n                 echo invoked >> {count}\n                 printf '{{\"result\":{{\"text\":\"%s\\\\n\\\\nreasoning follows\"}}}}\\n' '{verdict}'\n",
+                count = count_file.display(),
+                verdict = verdict_line,
+            ),
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).expect("chmod");
+        }
+        bin
+    }
+
+    /// Clears the review env on EVERY exit path, including a panicking assertion.
+    ///
+    /// A plain `clear_review_env()` call at the end of each test does not run when an assert
+    /// fires first, so a failing test left `TRIUMVIRATE_CODEX_BIN` pointing at a mock that
+    /// answers REJECT. Other tests in the same binary then failed with
+    /// "REJECTED by peer review", which looks like a real defect in whatever ran next.
+    ///
+    /// That is what made the suite flaky at roughly one run in three, and it is why cleanup
+    /// belongs in Drop rather than in a line at the bottom of the test.
+    struct ReviewFixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        counts: PathBuf,
+    }
+
+    impl Drop for ReviewFixture {
+        fn drop(&mut self) {
+            clear_review_env();
+        }
+    }
+
+    fn setup_review(verdict_line: &str) -> ReviewFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let counts = root.join("invocations.txt");
+        let bin = write_mock_reviewer(&root, verdict_line, &counts);
+        // Author and reviewer must be DIFFERENT agents: the engine refuses to let an agent
+        // review its own output, and a single-name panel therefore fails every turn with
+        // "no non-author reviewers available". Found by running this test.
+        //
+        // `claude` is the author because that arm goes through `run_agent_process_with_session`,
+        // which is where the mock connector is honoured. `grok` has its own runner and would
+        // not use the mock.
+        //
+        // SAFETY: serialised by `review_env_lock`, cleared by `clear_review_env`.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", &bin);
+            std::env::set_var("TRIUMVIRATE_CLAUDE_BIN", &bin);
+            std::env::set_var("TRIUMVIRATE_PEER_REVIEWERS", "codex");
+            std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
+        }
+        ReviewFixture { _dir: dir, root, counts }
+    }
+
+    fn clear_review_env() {
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_CLAUDE_BIN");
+            std::env::remove_var("TRIUMVIRATE_PEER_REVIEWERS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+    }
+
+    /// THE SAME lock every other env-mutating test in this binary uses.
+    ///
+    /// A private lock here would serialise these tests against each other and NOT against the
+    /// rest of the binary, which is worthless: `TRIUMVIRATE_REQUIRE_PEER_REVIEW` changes the
+    /// behaviour of EVERY dispatch, so a private lock let these leak into
+    /// `abe_phase1_dispatch_poll_output_review_and_cancel` and made both flaky.
+    ///
+    /// That is the third time this session a per-module lock has failed to serialise against a
+    /// sibling module. The rule: a lock must live wherever the STATE lives, not wherever the
+    /// test lives.
+    fn review_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn run_review(fx: &ReviewFixture, artifact: &str) -> Result<(), String> {
+        let mut lifecycle = Vec::new();
+        enforce_mandatory_peer_review(
+            "grok",
+            artifact,
+            fx.root.to_str().expect("utf8 root"),
+            "req-e2e",
+            &None,
+            &None,
+            &None,
+            &mut lifecycle,
+            None,
+        )
+        .await
+    }
+
+    // THESE FOUR ARE #[ignore] AND THAT IS A DELIBERATE TRADE, NOT AN OVERSIGHT.
+    //
+    // They set TRIUMVIRATE_REQUIRE_PEER_REVIEW and TRIUMVIRATE_CODEX_BIN, and both change the
+    // behaviour of EVERY dispatch in this binary. Holding the shared env_lock serialises them
+    // against the tests that also take it, and does nothing about the ones that do not. Run
+    // under the default parallel harness they failed roughly one run in three, and the failure
+    // surfaced in OTHER tests as "REJECTED by peer review", which reads like a real defect in
+    // whatever happened to run next.
+    //
+    // Locking every dispatch-touching test in the binary is open ended. Leaving a suite that
+    // fails a third of the time is worse than either: a flaky suite teaches people to re-run
+    // until green, which is how a real failure gets ignored.
+    //
+    // So they are opt-in and single-threaded, and `scripts/verify-live-agents.sh review` runs
+    // them. They need no network and no API key; the reviewer is a mock binary.
+    //
+    //     bash scripts/verify-live-agents.sh review
+    //
+    /// A REJECT from a REAL reviewer process BLOCKS the turn, and the reasoning comes back.
+    ///
+    /// This is the test that proves the gate is a gate. RED IF: the dispatch stops happening,
+    /// or a reject stops blocking.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_09_a_live_reject_blocks_the_turn() {
+        let _guard = review_env_lock();
+        let fx = setup_review("REJECT");
+        let out = run_review(&fx, "the 82% figure is unsupported").await;
+
+        let err = out.expect_err("a REJECT verdict must block the turn");
+        assert!(err.contains("REJECTED by peer review"), "got: {err}");
+        assert!(
+            err.contains("reasoning follows"),
+            "the reviewer's own words must come back, or a block is unactionable; got: {err}"
+        );
+        assert!(fx.counts.exists(), "the reviewer process must actually have run");
+    }
+
+    /// An APPROVE from a real reviewer lets the turn through.
+    /// RED IF: approval starts blocking, which would halt everything.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_10_a_live_approve_passes() {
+        let _guard = review_env_lock();
+        let fx = setup_review("APPROVE");
+        let out = run_review(&fx, "some output").await;
+        assert!(out.is_ok(), "an approval must not block; got: {out:?}");
+    }
+
+    /// THE RECURSION PROOF, driven through `execute_ask_agent`, the real entry point.
+    ///
+    /// The guard lives in `execute_ask_agent`'s success arms, so a test that calls
+    /// `enforce_mandatory_peer_review` directly bypasses it entirely. The first version of this
+    /// test did exactly that: removing the guard left it GREEN, which made it another test that
+    /// could not fail for the reason it claimed. Caught by running the mutation.
+    ///
+    /// Two agent turns are expected: the work itself, and its one review. A third means the
+    /// review is being reviewed.
+    ///
+    /// RED IF: `!req.is_peer_review` is removed from a success arm. The count climbs.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_11_a_review_is_not_itself_reviewed() {
+        let _guard = review_env_lock();
+        let fx = setup_review("APPROVE");
+
+        let req = AskAgentRequest {
+            // Author is claude, reviewer is codex. An agent cannot review itself.
+            agent: "claude".to_string(),
+            message: "do the work".to_string(),
+            cwd: Some(fx.root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let out = execute_ask_agent(&req, None).await;
+
+        assert!(out.is_ok(), "the mock turn should succeed; got: {out:?}");
+        let n = std::fs::read_to_string(&fx.counts)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            n, 2,
+            "expected exactly two agent turns: the work, and its ONE review. {n} means each \
+             review is itself being reviewed and the recursion guard is not holding."
+        );
+    }
+
+    /// A reviewer that answers with junk BLOCKS, end to end.
+    ///
+    /// The unit test proves the classifier returns Indeterminate. This proves the whole path
+    /// refuses the turn rather than shipping it, which is the fail-open hole Grok named.
+    ///
+    /// RED IF: Indeterminate stops blocking anywhere along the path.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_12_a_live_unusable_answer_blocks() {
+        let _guard = review_env_lock();
+        let fx = setup_review("looks fine to me");
+        let out = run_review(&fx, "some output").await;
+        let err = out.expect_err("an unusable verdict must block, not pass");
+        assert!(
+            err.contains("NO USABLE VERDICT"),
+            "the caller must be told the review was unreadable, not that it failed; got: {err}"
+        );
+    }
+
     /// An artifact that tries to instruct the reviewer must be fenced as DATA.
     ///
     /// Grok found this: the artifact was pasted straight into the prompt, so an author under

@@ -17,6 +17,7 @@
 #   bash scripts/verify-live-agents.sh agy      # just the agy ones
 #   bash scripts/verify-live-agents.sh grok
 #   bash scripts/verify-live-agents.sh codex
+#   bash scripts/verify-live-agents.sh review   # mandatory peer review, mock reviewer, no network
 #
 # Exit non-zero if any guard fails. Safe to wire into a scheduled job.
 
@@ -43,6 +44,27 @@ run_guard() {
         FAILED=1
     fi
 }
+
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "review" ]; then
+    # Mandatory peer review, end to end, with a MOCK reviewer. No network, no API key.
+    #
+    # Single-threaded and opt-in because these set TRIUMVIRATE_REQUIRE_PEER_REVIEW and a mock
+    # connector binary, both of which change every dispatch in that test binary. Under the
+    # default parallel harness they failed about one run in three, and the failure surfaced in
+    # unrelated tests as "REJECTED by peer review".
+    #
+    # These are the tests that prove the gate is a gate: that a reviewer is really spawned,
+    # that REJECT really blocks, that an unreadable answer blocks, and that a review is not
+    # itself reviewed.
+    echo "RUN   mandatory review end to end"
+    if cargo test -p triumvirate --bin triumvirate mandatory_review_tests \
+        -- --ignored --test-threads=1 2>&1 | tail -12; then
+        echo "PASS  mandatory review end to end"
+    else
+        echo "FAIL  mandatory review end to end"
+        FAILED=1
+    fi
+fi
 
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "agy" ]; then
     # Proves: live agy emits tool events, the argv Triumvirate BUILDS produces a parseable

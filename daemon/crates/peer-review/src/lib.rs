@@ -55,6 +55,19 @@ pub fn default_reviewers() -> Vec<String> {
     }
 }
 
+/// Serialises every test that touches `TRIUMVIRATE_PEER_REVIEWERS`.
+///
+/// It lives at crate scope because the tests that MUTATE that variable and the tests that READ
+/// it are in two different modules, and a per-module lock does not serialise across them. That
+/// is not hypothetical: `u_pr_grok_is_a_default_reviewer` began failing intermittently the
+/// moment the roster tests were added, Antigravity reported it, and I dismissed it as its own
+/// mutation. It was real.
+#[cfg(test)]
+pub(crate) fn reviewer_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerReviewEngine {
     db_path: PathBuf,
@@ -396,6 +409,10 @@ mod tests {
     /// grok is a DEFAULT reviewer, not opt-in. Asserted here so removing it is a decision.
     #[test]
     fn u_pr_grok_is_a_default_reviewer() {
+        // Shares the lock with panel_roster_tests, which mutate TRIUMVIRATE_PEER_REVIEWERS.
+        let _guard = crate::reviewer_env_guard();
+        // SAFETY: held under that lock.
+        unsafe { std::env::remove_var("TRIUMVIRATE_PEER_REVIEWERS") };
         let tmp = std::env::temp_dir().join("tv-peer-review-grok-test");
         std::fs::create_dir_all(&tmp).unwrap();
         let engine = PeerReviewEngine::new(tmp).unwrap();
@@ -424,13 +441,7 @@ mod tests {
 mod panel_roster_tests {
     use super::*;
 
-    /// These tests mutate a PROCESS-GLOBAL env var and cargo runs tests in parallel, so they
-    /// must not overlap. An earlier test in this repo failed exactly this way: a sibling set a
-    /// global and the "default" case silently exercised the override. Serialise them.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    use super::reviewer_env_guard as env_guard;
 
     /// The default panel is unchanged and still seats grok. That was an explicit ruling.
     /// RED IF: a reviewer is dropped from the default.
