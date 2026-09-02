@@ -532,6 +532,13 @@ the failure actually observed on 2026-09-01 when a peer described its own toolle
 and still write from memory. That next layer is entailment against the opened text, or a human,
 and it is not built.
 
+**SUPERSEDED, 2026-09-02.** "text that is also in the prompt" stopped being true when
+FIND-REVIEW-06 removed the paste, and "partly ceremonial" stopped being true when
+FIND-REVIEW-07 refused partial reads. Grok flagged that this paragraph contradicted the section
+that replaced it. Kept rather than deleted, because the sequence is the evidence: the read was
+ceremonial, was called ceremonial here, and was then made to mean something. The last sentence
+still stands and is the honest limit.
+
 ### A false claim in my own commit message, found by Antigravity
 
 `20be42a` listed "SQL guard removed" among five mutations that killed tests. It did not. What
@@ -619,3 +626,54 @@ never executed. Four tests now drive it with a fake claude that records its own 
 bypass:** `is_mock_connector` matches only the `mock-` prefix, the reviewer stand-in is
 `fake-codex-*`, so tests execute the real runner and the real parser, and neither allowlist
 carries a `cfg(test)` directive. Grok reached the same conclusion independently.
+
+### FIND-REVIEW-07, found by Grok in round 3: the nonce moved the attack, it did not close it
+
+Grok reviewed `3fb09c5`, the commit that implemented Grok's own proposed mitigation, and refused
+to accept it. Its verdict: **"You built what I wrote. You did not close the attack I was
+pointing at."**
+
+The reasoning, which is correct. Putting the secret on the LAST line converts `head -1` into
+`tail -1`, and `tail` sits in the classified-reader array immediately beside `head`. One command
+satisfies the sight gate and returns the nonce, and the work under review never enters the
+model's context. Every default panel seat has such a call:
+
+- **codex**: `tail -1 <artifact>`. One command. `review_16` only ever drove `head -1`, so the
+  twin would have been green.
+- **claude**: `Read` with `"limit": 1` satisfies sight, and `Grep` for `REVIEW-NONCE:` returns
+  the nonce. **Both tools are on the review allow-list this daemon ships.**
+- **grok and gemini**: `read_file` with an `offset` past the body is still `ToolKind::ReadFile`
+  and still matches the path. Sight never inspected `offset` or `limit`.
+
+Grok named the overclaim precisely: the code comment said the nonce was "a proof of read rather
+than a receipt for a syscall". The first half of that claim was true of the two calls named in
+FIND-REVIEW-06 and false of the family they belong to.
+
+**The fix, which is what Grok said would actually close the class:** inspect the read that
+satisfied the source, and refuse a partial one. A named source is now only satisfied by a
+whole-file read. A slice is still a read for the no-touch check and no longer satisfies a source.
+
+Two shapes, because the backends disagree on how a slice is expressed. A slice by ARGUMENT is a
+non-null `limit` or `offset`. A slice by PROGRAM is `head`, `tail`, `cut`, or a pager, since
+codex reports every action as a shell command and the program name is the only signal. An
+explicit `"offset": null` is not a slice: grok's own live capture records exactly that.
+
+"Never opened" and "opened only part of" now report differently. They need different fixes, and
+collapsing them is what let the previous round believe the class was closed.
+
+Grok also caught three smaller things in the same pass:
+
+- The doc comment on `command_reads_file_contents` still said "`grep` and `rg` ARE included".
+  The array does not contain them and the body records why they were removed. In this repo a
+  wrong comment is a defect, because it is what the next reader trusts.
+- The `as_bool().unwrap_or(false)` fold that Codex found at the TOOL level was still present at
+  the TURN level in the same file. Fixing one instance of a pattern and leaving its twin is the
+  two-surface defect shape this repo keeps hitting.
+- `u_gd_05` pinned the operator turn-cap rule on the builder only, so hardcoding `--max-turns 6`
+  on the panel route would have left it green. Same "tested the helper" shape as the Fast
+  override itself. `u_gp_02` now drives it through the route.
+
+**What is still not proven, unchanged and restated:** the reviewer read the whole file. It was
+not shown to have judged it. An agent can read every byte and write its verdict from nothing.
+Grok lists four other ways work still ships without review, all pre-existing and all recorded
+above: ABE and fleet never enter this gate, the gate is opt-in, and CONCERNS does not block.

@@ -323,8 +323,21 @@ impl ClaudeStreamParser {
         if let Some(id) = v.get("session_id").and_then(Value::as_str) {
             self.session_id = Some(id.to_string());
         }
-        if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
-            self.is_error = true;
+        // The SAME three-way split as the tool-level flag, for the same reason.
+        //
+        // Grok found in round 3 that Codex's finding had been fixed at the tool level and left
+        // in place here: `as_bool().unwrap_or(false)` folded "absent", "explicit bool" and
+        // "present but unparseable" into two outcomes, so a malformed turn-level failure read as
+        // a clean turn. Fixing one instance of a pattern and leaving its twin is how this repo
+        // has shipped two-surface defects before.
+        //
+        // Absent is fine here: a successful turn simply omits it in the capture. Anything
+        // present that is not a boolean is treated as failure.
+        match v.get("is_error") {
+            None => {}
+            Some(Value::Bool(true)) => self.is_error = true,
+            Some(Value::Bool(false)) => {}
+            Some(_) => self.is_error = true,
         }
         if let Some(text) = v.get("result").and_then(Value::as_str) {
             self.final_response = Some(text.to_string());
@@ -620,6 +633,32 @@ mod tests {
         let mut streamed = ClaudeStreamParser::new();
         streamed.parse_line(r#"{"type":"result","subtype":"success","result":"x"}"#);
         assert_eq!(streamed.finish().parser_mode, "claude-stream-json");
+    }
+
+    /// Grok, round 3: the same fold Codex found at the tool level was still here at the turn
+    /// level. Fixing one instance of a pattern and leaving its twin is the two-surface defect
+    /// shape this repo keeps hitting.
+    /// RED IF: the turn-level flag goes back to an `unwrap_or`.
+    #[test]
+    fn u_cs_14_a_malformed_turn_error_flag_is_a_failure() {
+        for weird in [r#""true""#, r#""false""#, "0", "1", "null", "{}"] {
+            let mut p = ClaudeStreamParser::new();
+            p.parse_line(&format!(
+                r#"{{"type":"result","subtype":"success","is_error":{weird},"result":"x"}}"#
+            ));
+            assert!(
+                p.turn_failed(),
+                "is_error={weird} is unreadable and must not read as a clean turn"
+            );
+        }
+
+        let mut clean = ClaudeStreamParser::new();
+        clean.parse_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"x"}"#);
+        assert!(!clean.turn_failed(), "an explicit false is still a clean turn");
+
+        let mut absent = ClaudeStreamParser::new();
+        absent.parse_line(r#"{"type":"result","subtype":"success","result":"x"}"#);
+        assert!(!absent.turn_failed(), "absent is still a clean turn");
     }
 
     /// A tool_use whose result never arrives (turn cut off) must stay `None`, not become a

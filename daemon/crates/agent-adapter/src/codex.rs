@@ -71,10 +71,41 @@ fn unwrap_shell_wrapper(cmd: &str) -> &str {
 ///
 /// Deliberately excluded, and worth stating: `ls`, `find`, `stat`, `file` and `mdfind` name
 /// paths without reading them, which is the exact hole that let a search satisfy a source on
-/// the agy backend. `grep` and `rg` ARE included: they read the file to match against it.
+/// the agy backend. `grep` and `rg` are excluded TOO, for the pattern-position reason in the
+/// body: `rg needle a.rs` reads a.rs while the boundary matcher counted `needle` as opened.
 ///
 /// A compound or piped command is NOT classified, because the reader may not be the part that
 /// touched the named path. Any redirection disqualifies, and `sed -i` writes.
+/// Programs that put the WHOLE file in front of the model, as opposed to a slice of it.
+///
+/// FIND-REVIEW-07. Grok found the hole in round 3 and it is the same class it named in
+/// FIND-REVIEW-06, moved to the other end of the file. Putting the proof-of-read nonce on the
+/// LAST line turned `head -1` into `tail -1`, and `tail` sits in the reader list right next to
+/// `head`. One command satisfies the sight gate and returns the nonce, and the work under
+/// review never enters the model's context.
+///
+/// So a source that must be READ is now only satisfied by a program that emits all of it.
+///
+/// `head`, `tail` and `cut` are readers (they do put file contents in front of the model, which
+/// is why they stay in READERS and still count as a read for the no-touch check) but they are
+/// PARTIAL: a slice of lines or a slice of columns. `more` and `less` are pagers; non-interactively
+/// they dump everything, but that depends on the terminal and on `$PAGER`, so they are treated as
+/// partial rather than reasoned about. Fail closed: the cost is a false rejection of an unusual
+/// full read, never a false pass on a one-line peek.
+pub fn command_reads_whole_file(command: &str) -> bool {
+    const WHOLE_FILE_READERS: &[&str] =
+        &["cat", "nl", "bat", "od", "xxd", "strings", "pr", "zcat"];
+    if !command_reads_file_contents(command) {
+        return false;
+    }
+    let cmd = unwrap_shell_wrapper(command.trim());
+    let Some(program) = cmd.split_whitespace().next() else {
+        return false;
+    };
+    let base = program.rsplit('/').next().unwrap_or(program);
+    WHOLE_FILE_READERS.contains(&base)
+}
+
 fn command_reads_file_contents(command: &str) -> bool {
     // ONLY programs that emit FILE CONTENTS to the model.
     //
@@ -92,6 +123,11 @@ fn command_reads_file_contents(command: &str) -> bool {
     // and Grok named the principle that fixes all of them: a read is a program that puts the
     // file's CONTENTS in front of the model. Anything else is a search or a summary, and
     // `sight_21` already forbids a search from satisfying a source on the other backends.
+    //
+    // The doc comment on this function used to say "`grep` and `rg` ARE included: they read the
+    // file to match against it." That was FALSE: the array below does not contain them, and the
+    // list above records why they were taken out. Grok caught the stale sentence in round 3.
+    // In this repo a wrong comment is a defect, because it is what the next reader trusts.
     //
     // Unknown programs stay Bash and fail closed, so the cost of being strict here is a false
     // REJECTION of an unusual reader, never a false pass.

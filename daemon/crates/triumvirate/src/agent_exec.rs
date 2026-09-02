@@ -1684,7 +1684,11 @@ const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
 /// Known limit, stated rather than implied: this proves the method REQUESTED the named thing.
 /// It does not prove the contents were used. An agent can open every source and answer from
 /// memory. That layer is entailment against the read bytes, and it is not built.
-fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &str) -> bool {
+/// Every spelling of `source` an agent might plausibly have written.
+///
+/// Shared by the "did it open this" and "did it read all of this" checks so the two can never
+/// disagree about what counts as the same path.
+fn source_path_candidates(source: &str, cwd: &str) -> Vec<String> {
     let mut candidates: Vec<String> = vec![source.to_string()];
 
     // Strip the cwd prefix at a DIRECTORY BOUNDARY only.
@@ -1704,6 +1708,11 @@ fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
         // false-rejects a genuine read. Antigravity found it.
         candidates.push(format!("./{rel}"));
     }
+    candidates
+}
+
+fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &str) -> bool {
+    let candidates = source_path_candidates(source, cwd);
 
     tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
@@ -1712,6 +1721,73 @@ fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
                 .as_deref()
                 .is_some_and(|args| candidates.iter().any(|cand| args_name_path(args, cand)))
     })
+}
+
+/// Was the source read IN FULL, as opposed to peeked at?
+///
+/// FIND-REVIEW-07, found by Grok in round 3 and it is the same class it named in
+/// FIND-REVIEW-06, moved to the other end of the file.
+///
+/// The proof-of-read nonce sits on the LAST line of the artifact. That stops `head -1` and a
+/// `Read` with `"limit": 1`, which is what the previous round claimed and all it claimed. Grok
+/// showed the class is wider than the two calls it named:
+///
+///   codex   `tail -1 <artifact>` is a classified reader, returns the nonce, one command. The
+///           work never enters context. `tail` sits in the reader list next to `head`.
+///   claude  `Read` with `"limit": 1` satisfies sight, and `Grep` for `REVIEW-NONCE:` returns
+///           the nonce. BOTH tools are on the review allow-list this daemon ships.
+///   grok    `read_file` with an `offset` past the body is still `ToolKind::ReadFile` and still
+///   gemini  matches the path. Sight never inspected `offset` or `limit`.
+///
+/// So the read that satisfies a NAMED SOURCE must now be a whole-file read. A slice is still a
+/// read for the no-touch check, and still fails the source.
+///
+/// This is deliberately stricter than "did it look". A caller that names a primary source is
+/// claiming the agent worked from it, and a ten-line peek does not support that claim.
+fn tool_call_read_source_in_full(
+    tool_calls: &[ToolCallRecord],
+    source: &str,
+    cwd: &str,
+) -> bool {
+    let candidates = source_path_candidates(source, cwd);
+    tool_calls.iter().any(|c| {
+        matches!(c.kind, ToolKind::ReadFile)
+            && c.success == Some(true)
+            && c.args_json.as_deref().is_some_and(|args| {
+                candidates.iter().any(|cand| args_name_path(args, cand)) && !read_args_are_partial(&c.tool, args)
+            })
+    })
+}
+
+/// Do these tool arguments describe a PARTIAL read?
+///
+/// Two shapes, because the backends disagree on how a slice is expressed:
+///
+///   a slice by argument   `Read`/`read_file`/`view_file` with a non-null `limit` or `offset`.
+///   a slice by program    codex reports every action as a shell command, so the program name is
+///                         the only signal: `head`, `tail`, `cut`, `more`, `less`.
+///
+/// Fails closed on anything it cannot read: an args blob that is not an object is treated as
+/// partial, because an unreadable claim is not evidence of a full read.
+fn read_args_are_partial(tool: &str, args_json: &str) -> bool {
+    // codex: the slice lives in the command line, not in a field.
+    if tool == "command_execution" {
+        let command = serde_json::from_str::<serde_json::Value>(args_json)
+            .ok()
+            .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string));
+        return match command {
+            Some(cmd) => !agent_adapter::codex::command_reads_whole_file(&cmd),
+            None => true,
+        };
+    }
+
+    // Everyone else: an explicit, non-null limit or offset means a slice was requested.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return true;
+    };
+    ["limit", "offset", "start_line", "end_line", "line_offset", "max_lines"]
+        .iter()
+        .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
 }
 
 /// Does `args` mention `path` as a WHOLE path, at token boundaries?
@@ -1859,6 +1935,39 @@ fn enforce_reviewer_sight(
     }
 
     if !required_sources.is_empty() {
+        // FIND-REVIEW-07: a source that was only PEEKED at is reported separately from one that
+        // was never opened, because they need different fixes and because conflating them was
+        // the previous version's whole problem.
+        //
+        // Grok's attack: `tail -1` on a file whose last line carries the proof-of-read nonce
+        // satisfies "opened it" and returns the secret, while the work never enters context.
+        // Checked BEFORE the never-opened branch so the more specific message wins.
+        let peeked: Vec<&str> = required_sources
+            .iter()
+            .map(String::as_str)
+            .filter(|src| {
+                tool_call_touched_source(tool_calls, src, cwd)
+                    && !tool_call_read_source_in_full(tool_calls, src, cwd)
+            })
+            .collect();
+        if !peeked.is_empty() {
+            let detail = format!(
+                "{agent_display} was dispatched as a review over {} named source(s) and only \
+                 read PART of {}: {}. A slice is not the source. `head`, `tail`, `cut`, a pager, \
+                 or a read carrying `limit`/`offset` returns a few lines and leaves the work \
+                 itself out of context, so a verdict formed from one cannot be about the work. \
+                 Re-read the whole file (`cat`, or a read with no limit and no offset).",
+                required_sources.len(),
+                if peeked.len() == 1 { "it" } else { "them" },
+                peeked.join(", ")
+            );
+            lifecycle.push(LifecycleEvent {
+                state: "REJECTED".to_string(),
+                detail: detail.clone(),
+            });
+            return Err(detail);
+        }
+
         let missed: Vec<&str> = required_sources
             .iter()
             .map(String::as_str)
@@ -6303,8 +6412,13 @@ mod grok_panel_route_tests {
             std::env::set_var("TRIUMVIRATE_GROK_BIN", &bin);
             std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep");
             std::env::remove_var("TRIUMVIRATE_GROK_EFFORT");
-            std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS");
             std::env::remove_var("TRIUMVIRATE_GROK_ARGS");
+            // TRIUMVIRATE_GROK_MAX_TURNS is deliberately NOT cleared here. `u_gp_02` sets it to
+            // assert the operator-authority rule, and the first version of this helper wiped it
+            // on the way in, so that test failed against a value it had itself set. A fixture
+            // that clobbers the input of the test using it fails in a way that mimics a real
+            // defect, which cost a minute here and would cost more later.
+            // Callers that need it absent remove it themselves.
         }
         let req = AskAgentRequest {
             agent: "grok".to_string(),
@@ -6334,6 +6448,35 @@ mod grok_panel_route_tests {
             .collect()
     }
 
+    /// The operator-authority rule, ON THE ROUTE.
+    ///
+    /// Grok flagged in round 3 that `u_gd_05` calls the builder directly, so hardcoding
+    /// `--max-turns 6` on the panel route would leave it green. Same "tested the helper" shape
+    /// it caught for the Fast override itself, one level down.
+    /// RED IF: the panel route stops honouring an explicit TRIUMVIRATE_GROK_MAX_TURNS.
+    #[tokio::test]
+    async fn u_gp_02_an_operator_turn_cap_survives_the_panel_route() {
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: held under the binary-wide env_lock, removed below.
+        unsafe { std::env::set_var("TRIUMVIRATE_GROK_MAX_TURNS", "3") };
+        let panel = dispatch(true).await;
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS") };
+
+        assert_eq!(
+            flag_value(&panel, "--max-turns").as_deref(),
+            Some("3"),
+            "the Fast override must not overrule a number the operator set on purpose; \
+             argv was {panel:?}"
+        );
+        assert_eq!(
+            flag_value(&panel, "--effort").as_deref(),
+            Some("low"),
+            "and the rest of the Fast profile must still apply"
+        );
+    }
+
     /// THE ROUTE TEST. A panel seat is Fast on a Deep daemon, measured on the argv the daemon
     /// actually spawns rather than on a builder call the test made itself.
     /// RED IF: `panel_child` stops being read from the request in
@@ -6344,6 +6487,9 @@ mod grok_panel_route_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        // SAFETY: held under env_lock. The helper no longer clears this, so the Fast-profile
+        // defaults are what is under test here rather than an operator value left by a sibling.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS") };
         let panel = dispatch(true).await;
         assert_eq!(flag_value(&panel, "--effort").as_deref(), Some("low"), "argv was {panel:?}");
         assert_eq!(flag_value(&panel, "--max-turns").as_deref(), Some("6"));
@@ -6625,7 +6771,7 @@ mod mandatory_review_tests {
         verdict_line: &str,
         count_file: &std::path::Path,
     ) -> PathBuf {
-        write_reviewer_with_reader(dir, verdict_line, count_file, "cat")
+        write_reviewer_with_reader(dir, verdict_line, count_file, "cat", true)
     }
 
     /// As `write_sighted_reviewer`, with the reading command as a parameter.
@@ -6639,10 +6785,16 @@ mod mandatory_review_tests {
         verdict_line: &str,
         count_file: &std::path::Path,
         reader: &str,
+        // FIND-REVIEW-07 made the partial-read gate fire BEFORE the nonce check, so `head -1`
+        // no longer reaches the nonce at all. Suppressing the nonce on an otherwise honest full
+        // read is now the only way to exercise that check, and it is a real shape: a reviewer
+        // that read everything and simply did not follow the answer format.
+        echo_nonce: bool,
     ) -> PathBuf {
         let bin = dir.join(format!(
-            "fake-codex-{}-{}",
-            if reader.is_empty() { "blind" } else { reader },
+            "fake-codex-{}-{}-{}",
+            if reader.is_empty() || !echo_nonce { "blind" } else { reader },
+            if echo_nonce { "nonce" } else { "nononce" },
             std::process::id()
         ));
 
@@ -6680,7 +6832,7 @@ mod mandatory_review_tests {
         // `NONCE` is empty for the blind and `ls` variants, so those answers carry no nonce and
         // are rejected for that as well as for the missing read. That is deliberate: the two
         // defences are independent and each is asserted separately.
-        if reader.is_empty() {
+        if reader.is_empty() || !echo_nonce {
             script.push_str(&format!(
                 "printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{verdict_line}\\\\n\\\\nreasoning follows\"}}}}\\n'\n"
             ));
@@ -6734,11 +6886,16 @@ mod mandatory_review_tests {
     }
 
     fn setup_review_with_reader(verdict_line: &str, reader: &str) -> ReviewFixture {
+        setup_review_full(verdict_line, reader, true)
+    }
+
+    fn setup_review_full(verdict_line: &str, reader: &str, echo_nonce: bool) -> ReviewFixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let counts = root.join("invocations.txt");
         let author_bin = write_mock_author(&root, &counts);
-        let reviewer_bin = write_reviewer_with_reader(&root, verdict_line, &counts, reader);
+        let reviewer_bin =
+            write_reviewer_with_reader(&root, verdict_line, &counts, reader, echo_nonce);
         // Author and reviewer must be DIFFERENT agents: the engine refuses to let an agent
         // review its own output, and a single-name panel therefore fails every turn with
         // "no non-author reviewers available". Found by running this test.
@@ -6920,13 +7077,19 @@ mod mandatory_review_tests {
         let out = run_review(&fx, "a claim that needs checking").await;
 
         let err = out.expect_err("a reviewer that read one line must not approve");
+        // FIND-REVIEW-07 moved this rejection EARLIER and made it more specific. Before that,
+        // `head -1` opened the file, satisfied the sight gate, missed the nonce at the end, and
+        // was caught by the nonce check. Now the partial read itself is refused, which is
+        // stronger: it no longer depends on where the nonce happens to sit in the file. Grok's
+        // point was exactly that the nonce's position is not a defence, because `tail -1` is one
+        // command away.
         assert!(
-            err.contains("did not carry the nonce"),
-            "it must be rejected for the PARTIAL read, not for never reading; got: {err}"
+            err.contains("only read PART of"),
+            "it must be rejected for the PARTIAL read itself; got: {err}"
         );
         assert!(
             !err.contains("never successfully opened"),
-            "the sight gate must have PASSED: head is a classified reader and the path matched.              If this fires, the test is proving the wrong thing; got: {err}"
+            "head IS a classified reader and the path matched, so this is not a miss; got: {err}"
         );
     }
 
@@ -7003,6 +7166,198 @@ mod mandatory_review_tests {
         assert!(answer.contains("TV-deadbeef"), "position must not matter to the proof");
     }
 
+    /// The nonce check itself, now that no partial read can reach it.
+    ///
+    /// A reviewer that read the WHOLE file and simply did not carry the nonce back is the only
+    /// remaining way to exercise this, and it is a real shape: an agent that ignored the answer
+    /// format. It blocks, because an answer that cannot show it saw the end of the file is not
+    /// distinguishable from one that did not.
+    /// RED IF: the nonce check is removed now that FIND-REVIEW-07 sits in front of it.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_26_a_full_read_without_the_nonce_still_blocks() {
+        let _guard = review_env_lock();
+        let fx = setup_review_full("APPROVE", "cat", false);
+        let out = run_review(&fx, "a claim that needs checking").await;
+
+        let err = out.expect_err("an approve with no nonce must not ship");
+        assert!(
+            err.contains("did not carry the nonce"),
+            "the nonce check must still be reachable behind the partial-read gate; got: {err}"
+        );
+        assert!(
+            !err.contains("only read PART of"),
+            "this reviewer read the whole file; the partial gate must NOT fire; got: {err}"
+        );
+    }
+
+    /// FIND-REVIEW-07, THE TWIN GROK ASKED FOR. `tail -1` is the attack, not `head -1`.
+    ///
+    /// Grok's round 3 finding, quoted: "Placing the secret on the last line converts
+    /// `head`/`limit: 1` into `tail`/`offset`/`Grep`, and every default panel seat already has
+    /// one of those." `tail` sits in the classified-reader list right next to `head`, so
+    /// `tail -1 <artifact>` satisfied the sight gate AND returned the nonce, in one command,
+    /// with the work never entering the model's context.
+    ///
+    /// This test would have been GREEN before FIND-REVIEW-07. `review_16` only ever drove
+    /// `head -1`, which is exactly the "you stopped the two calls I named, not the family"
+    /// criticism.
+    /// RED IF: a partial read can satisfy a named source again.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_21_tailing_the_nonce_cannot_approve() {
+        let _guard = review_env_lock();
+        let fx = setup_review_with_reader("APPROVE", "tail -1");
+        let out = run_review(&fx, "a claim that needs checking").await;
+
+        let err = out.expect_err("tail -1 returns the nonce and must still be rejected");
+        assert!(
+            err.contains("only read PART of"),
+            "it must be rejected for the PARTIAL read. If this says 'did not carry the nonce' \
+             then tail defeated the nonce and the gate is relying on the wrong defence; got: {err}"
+        );
+    }
+
+    /// The same family, one rung along: a slice by ARGUMENT rather than by program.
+    ///
+    /// This is the claude shape Grok named: `Read` with `"limit": 1` satisfies sight, and `Grep`
+    /// for `REVIEW-NONCE:` returns the nonce. Both are on the review allow-list this daemon
+    /// ships. Driven through `enforce_reviewer_sight` directly because it is about the RECORD
+    /// shape, which is backend independent.
+    /// RED IF: limit/offset stop being inspected.
+    #[test]
+    fn review_22_a_read_carrying_limit_or_offset_is_a_slice() {
+        for args in [
+            r#"{"file_path":"/repo/a.md","limit":1}"#,
+            r#"{"file_path":"/repo/a.md","offset":9000}"#,
+            r#"{"file_path":"/repo/a.md","limit":1,"offset":9000}"#,
+        ] {
+            let calls = vec![ToolCallRecord {
+                id: Some("t".into()),
+                tool: "Read".into(),
+                kind: ToolKind::ReadFile,
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+            }];
+            let mut lifecycle = Vec::new();
+            let err = enforce_reviewer_sight(
+                "Claude",
+                &calls,
+                "claude-stream-json",
+                &["/repo/a.md".to_string()],
+                "/repo",
+                &mut lifecycle,
+            )
+            .expect_err("a sliced read must not satisfy a named source");
+            assert!(err.contains("only read PART of"), "args {args}: {err}");
+        }
+    }
+
+    /// The control for review_22, and it matters: without it the rule above would pass on a gate
+    /// that rejects every claude read. A `Read` with NO limit and NO offset is a full read.
+    /// RED IF: an honest whole-file read starts being called a slice.
+    #[test]
+    fn review_23_a_read_without_limit_or_offset_is_a_full_read() {
+        let calls = vec![ToolCallRecord {
+            id: Some("t".into()),
+            tool: "Read".into(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(r#"{"file_path":"/repo/a.md"}"#.to_string()),
+        }];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight(
+            "Claude",
+            &calls,
+            "claude-stream-json",
+            &["/repo/a.md".to_string()],
+            "/repo",
+            &mut lifecycle,
+        )
+        .expect("an unbounded read of the named source must pass");
+
+        // An explicit null is not a slice either: grok's own capture records "offset":null.
+        let with_nulls = vec![ToolCallRecord {
+            id: Some("t".into()),
+            tool: "read_file".into(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(r#"{"target_file":"/repo/a.md","offset":null,"limit":null}"#.to_string()),
+        }];
+        let mut lifecycle2 = Vec::new();
+        enforce_reviewer_sight(
+            "Grok",
+            &with_nulls,
+            "grok-streaming-json",
+            &["/repo/a.md".to_string()],
+            "/repo",
+            &mut lifecycle2,
+        )
+        .expect("a null offset is not a slice; grok's live capture records exactly this");
+    }
+
+    /// "Never opened" and "opened only part of" must not report identically. They need different
+    /// fixes, and collapsing them is what let the previous round claim the class was closed.
+    /// RED IF: the partial branch is removed and both fall through to the same message.
+    #[test]
+    fn review_24_a_peek_and_a_miss_report_differently() {
+        let peek = vec![ToolCallRecord {
+            id: Some("t".into()),
+            tool: "command_execution".into(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(r#"{"command":"tail -1 /repo/a.md"}"#.to_string()),
+        }];
+        let mut a = Vec::new();
+        let peeked = enforce_reviewer_sight(
+            "Codex", &peek, "codex-exec-json", &["/repo/a.md".to_string()], "/repo", &mut a,
+        )
+        .unwrap_err();
+
+        let mut b = Vec::new();
+        let missed = enforce_reviewer_sight(
+            "Codex", &[], "codex-exec-json", &["/repo/a.md".to_string()], "/repo", &mut b,
+        )
+        .unwrap_err();
+
+        assert!(peeked.contains("only read PART of"), "{peeked}");
+        assert!(missed.contains("never successfully opened"), "{missed}");
+        assert_ne!(peeked, missed);
+    }
+
+    /// The nonce must never be interpolated into the prompt. Grok pointed out that neither
+    /// `review_08` nor `review_16` pinned this: `review_08` scans for the old `{artifact}`
+    /// placeholder, and the test stand-in extracts the nonce from its own read, so putting
+    /// `{nonce}` in the prompt would reopen the original attack in production and leave both
+    /// tests green.
+    /// RED IF: the nonce is ever added to the prompt format string.
+    #[test]
+    fn review_25_the_nonce_is_never_put_in_the_prompt() {
+        let src = include_str!("agent_exec.rs");
+        let prompt_region = src
+            .split("You are reviewing another agent's output")
+            .nth(1)
+            .expect("the review prompt must exist");
+        // Up to the closing of the format! call.
+        let prompt: String = prompt_region
+            .split("author = display_agent_name(agent)")
+            .next()
+            .expect("the format arguments must follow the template")
+            .to_string();
+        assert!(
+            !prompt.contains("{nonce}"),
+            "the nonce must be readable ONLY from the file. In the prompt it proves nothing."
+        );
+        assert!(
+            !prompt.contains("nonce = "),
+            "no format argument may bind the nonce into the prompt"
+        );
+    }
+
     /// The control for review_16. The same reviewer reading the WHOLE file approves.
     /// Without this, review_16 would pass on a gate that rejects everything.
     /// RED IF: an honest full read stops being able to approve.
@@ -7023,7 +7378,10 @@ mod mandatory_review_tests {
     #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
     async fn review_18_a_missing_nonce_never_downgrades_a_reject() {
         let _guard = review_env_lock();
-        let fx = setup_review_with_reader("REJECT", "head -1");
+        // A FULL read with the nonce suppressed. `head -1` cannot be used any more: since
+        // FIND-REVIEW-07 the partial-read gate rejects it before the nonce check runs, so the
+        // test would have been asserting a path that no longer executes.
+        let fx = setup_review_full("REJECT", "cat", false);
         let out = run_review(&fx, "the 82% figure is unsupported").await;
 
         let err = out.expect_err("a REJECT must still block");
