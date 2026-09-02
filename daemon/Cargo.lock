@@ -2646,6 +2646,7 @@ dependencies = [
 name = "mcp-tools"
 version = "3.9.0"
 dependencies = [
+ "agent-adapter",
  "agent-worker",
  "anyhow",
  "daemon-core",
@@ -2661,6 +2662,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared-types",
+ "tempfile",
  "token-economics",
  "tokio",
  "tracing",
