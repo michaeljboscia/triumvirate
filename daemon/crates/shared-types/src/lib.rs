@@ -596,6 +596,65 @@ pub struct ReviewSubmitRequest {
     pub reviewer_agent: Option<String>,
 }
 
+/// Ask a DIFFERENT agent to write tests from the contract, blind, and run them.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BlindValidateRequest {
+    /// The repository. `git worktree add` is run here to build the pre-change tree.
+    ///
+    /// Scratch is NOT created under it: it lives under the system temp directory, so the
+    /// implementation cannot be reached from the validator by relative traversal.
+    pub project_root: String,
+    /// The worktree the worker built in.
+    pub impl_worktree: String,
+    /// The task contract. It MUST carry the API surface (names and signatures), or the
+    /// validator has to guess the interface and a name mismatch becomes a compile error rather
+    /// than a test failure. See the module docs in `mcp-tools::blind_validation`.
+    pub contract: String,
+    /// The commit the worker started from. The pre-change tree is built at this ref, which is
+    /// what makes the red/green proof possible.
+    pub base_ref: String,
+    /// Who wrote the code. The validator will never be this agent.
+    pub worker_agent: String,
+    /// Where the Cargo package lives, RELATIVE to the worktree root. Defaults to ".".
+    ///
+    /// REQUIRED for any repository whose manifest is not at the git root, which includes every
+    /// virtual workspace and this repository (`daemon/`). Grok found in round 7 that hardcoding
+    /// the git root put the blind tests at `<checkout>/tests/`, where Cargo never compiles them:
+    /// `cargo test` walks PARENTS for a manifest, not children. Every declared test was then
+    /// absent, and the gate rejected good worktrees as well as bad ones. It was stuck closed.
+    ///
+    /// The same relative path is used in both trees, which is also what makes the baseline and
+    /// the after-run comparable.
+    #[serde(default)]
+    pub package_dir: Option<String>,
+    /// Candidate validators in preference order. Omit for the default panel.
+    #[serde(default)]
+    pub roster: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BlindValidateResponse {
+    pub validator_agent: String,
+    /// The bottom line. False means do not merge this worktree.
+    pub accepted: bool,
+    /// Why not, in words, when it was not accepted.
+    pub rejection: Option<String>,
+    pub blind_tests_passed: bool,
+    /// What the pre-change run established: proven, refuted, or one of two inconclusive states.
+    /// `inconclusive_no_api` is the ordinary answer for a contract that adds something new, and
+    /// it is NOT proof that the tests are strong.
+    pub baseline_proof: String,
+    /// When `baseline_proof` is `refuted`, the tests that were already green. Returned as NAMES
+    /// so an automated caller can act on them without parsing prose.
+    #[serde(default)]
+    pub already_green: Vec<String>,
+    pub newly_failing: Vec<String>,
+    pub deleted: Vec<String>,
+    /// Paths the validator touched outside its own directory. Non-empty means the run was not
+    /// blind and its verdict cannot be trusted in either direction.
+    pub blindness_violations: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewStatusRequest {
     pub project_root: Option<String>,

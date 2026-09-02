@@ -88,6 +88,8 @@ use shared_types::{
     FleetSpawnRequest, FleetSpawnResponse, FleetStatusRequest, FleetStatusResponse, FleetTaskListRequest,
     FleetTaskListResponse,
     ReviewRequestResponse, ReviewRequestTool, ReviewStatusRequest, ReviewStatusResponse,
+    BlindValidateRequest,
+    BlindValidateResponse,
     ReviewSubmitRequest,
     LessonAddResponse, LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse,
     LessonValidateRequest, ManualRecord,
@@ -125,6 +127,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_exec;
+mod blind_validate;
 mod agy;
 mod streaming;
 mod http_mcp;
@@ -1082,6 +1085,24 @@ impl McpBridge {
         Ok(Json(response))
     }
 
+    #[tool(
+        description = "Blind-validate a worktree: a DIFFERENT agent writes tests from the \
+                       contract, in a directory that does not contain the implementation, and \
+                       they are run against the worktree and against the pre-change tree. The \
+                       verdict comes from a test run. LIMITS, stated because they change how to \
+                       read the result: the validator is not sandboxed, so an absolute-path read \
+                       of the implementation is DETECTED rather than prevented; and a \
+                       baseline_proof of `inconclusive_no_api` means the tests could not run \
+                       against the old tree, which is normal for a new API and is NOT evidence \
+                       that they are strong."
+    )]
+    async fn blind_validate(
+        &self,
+        Parameters(req): Parameters<BlindValidateRequest>,
+    ) -> Result<Json<BlindValidateResponse>, String> {
+        Ok(Json(blind_validate::tool_impl(req).await?))
+    }
+
     #[tool(description = "Submit peer review verdict and comments.")]
     async fn review_submit(
         &self,
@@ -1287,6 +1308,9 @@ fn infer_mcp_intent(tool_name: &str, params: Option<&serde_json::Value>) -> Stri
         "query_gemini_review" | "query_antigravity_review" | "code_review"
         | "review_request" | "review_submit" => {
             "Requesting or submitting a code review".to_string()
+        }
+        "blind_validate" => {
+            "Blind-validating a worktree: a different agent writes the tests".to_string()
         }
         "spawn_daemon" | "spawn_session" => {
             "Spawning a persistent sibling worker for a longer exchange".to_string()

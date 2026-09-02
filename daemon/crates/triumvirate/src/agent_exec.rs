@@ -2543,7 +2543,7 @@ fn log_shadow_comparison(
     }
 }
 
-async fn run_named_agent_with_session_and_model(
+pub(crate) async fn run_named_agent_with_session_and_model(
     agent: &str,
     message: &str,
     cwd: &str,
