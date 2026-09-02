@@ -5997,6 +5997,208 @@ mod sight_gate_tests {
 /// ADVERTISES during a turn is a different number from what the operator configured, because
 /// MCP servers add to it. The captured fixtures show 26 tools with none connected and 420 with
 /// them, which is the difference between a ~14K and a ~67K turn.
+/// FIND-REVIEW-05 on the RUNNER, not just the parser.
+///
+/// Antigravity found this gap in round 2: every mandatory-review test seats claude as the
+/// AUTHOR, whose binary is a `mock-` connector, so `run_claude_cli_process_with_session` was
+/// never executed. The parser had twelve tests and the code that feeds it had none: the flags,
+/// the fallback, and the `-p` ordering were all unexercised.
+#[cfg(test)]
+mod claude_runner_tests {
+    use super::*;
+
+    /// Writes a fake claude that records its own argv and prints whatever body is given.
+    ///
+    /// NOT named `mock-`, deliberately: that prefix routes to the test-only mock connector and
+    /// would bypass the very function under test. That is the same trap this module exists to
+    /// close.
+    fn fake_claude(dir: &std::path::Path, argv_log: &std::path::Path, body: &str) -> PathBuf {
+        let bin = dir.join(format!("fake-claude-{}", std::process::id()));
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {log}\ncat <<'CLAUDE_EOF'\n{body}\nCLAUDE_EOF\n",
+            log = argv_log.display(),
+            body = body,
+        );
+        std::fs::write(&bin, script).expect("write fake claude");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).expect("chmod");
+        }
+        bin
+    }
+
+    const STREAM: &str = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/repo/artifact.md"}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"the artifact"}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s1","result":"APPROVE","usage":{"input_tokens":5,"output_tokens":7}}"#,
+    );
+
+    /// The runner must dispatch stream-json and hand back a SIGHTED result.
+    /// RED IF: the streaming flags stop being added, or the parser stops being fed.
+    #[tokio::test]
+    async fn u_cr_01_a_review_dispatch_is_sighted_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let bin = fake_claude(dir.path(), &argv_log, STREAM);
+
+        let parsed = run_claude_cli_process_with_session(
+            bin.to_str().expect("utf8"),
+            &[],
+            "review the artifact at /repo/artifact.md",
+            dir.path().to_str().expect("utf8"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("the fake claude answers");
+
+        assert_eq!(
+            parsed.parser_mode, "claude-stream-json",
+            "without this the sight gate rejects every claude review as blind"
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].kind, ToolKind::ReadFile);
+        assert_eq!(parsed.tool_calls[0].success, Some(true));
+        assert_eq!(parsed.response_text, "APPROVE");
+        assert_eq!(parsed.session_id.as_deref(), Some("s1"));
+        let usage = parsed.token_usage.expect("usage from the stream");
+        assert_eq!(usage.input, Some(5));
+    }
+
+    /// THE FLAG ORDER TRAP, pinned. `--allowedTools` is variadic and swallows whatever follows
+    /// it, so the prompt must arrive behind `-p`. Hit for real while capturing the fixture:
+    /// the CLI died with "Input must be provided either through stdin or as a prompt argument".
+    /// RED IF: `-p` stops being last, or the allow-list moves after it.
+    #[tokio::test]
+    async fn u_cr_02_the_prompt_comes_last_behind_an_explicit_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let bin = fake_claude(dir.path(), &argv_log, STREAM);
+
+        let _ = run_claude_cli_process_with_session(
+            bin.to_str().expect("utf8"),
+            &[],
+            "THE PROMPT",
+            dir.path().to_str().expect("utf8"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("answers");
+
+        let argv: Vec<String> = std::fs::read_to_string(&argv_log)
+            .expect("argv recorded")
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("THE PROMPT"),
+            "the prompt must be the final argument; argv was {argv:?}"
+        );
+        let p_at = argv.iter().position(|a| a == "-p").expect("-p present");
+        assert_eq!(p_at, argv.len() - 2, "-p must immediately precede the prompt");
+
+        let allowed_at = argv
+            .iter()
+            .position(|a| a == "--allowedTools")
+            .expect("a review must carry a read-only allow-list or claude auto-denies its reads");
+        assert!(
+            allowed_at < p_at,
+            "the variadic allow-list must be terminated by -p, not the other way round"
+        );
+        assert_eq!(argv[allowed_at + 1], "Read,Grep,Glob");
+        assert!(
+            !argv[allowed_at + 1].contains("Write") && !argv[allowed_at + 1].contains("Bash"),
+            "the allow-list is the containment: nothing that writes belongs in it"
+        );
+        assert!(argv.iter().any(|a| a == "stream-json"));
+        assert!(argv.iter().any(|a| a == "--verbose"), "stream-json without --verbose omits tool calls");
+    }
+
+    /// A NON-review dispatch gets the streaming flags but NOT the allow-list.
+    ///
+    /// Antigravity flagged that this diff changes behaviour for ordinary claude consults, which
+    /// is true and intended: tool calls and token usage become visible where they were invisible
+    /// before. What must NOT change is capability, so the read-only allow-list is review-only.
+    /// RED IF: the allow-list starts being applied to every claude call, which would silently
+    /// remove Write and Bash from ordinary consults.
+    #[tokio::test]
+    async fn u_cr_03_an_ordinary_consult_is_not_silently_restricted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let bin = fake_claude(dir.path(), &argv_log, STREAM);
+
+        let _ = run_claude_cli_process_with_session(
+            bin.to_str().expect("utf8"),
+            &[],
+            "just answer a question",
+            dir.path().to_str().expect("utf8"),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("answers");
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            !argv.contains("--allowedTools"),
+            "a consult must keep its tools; the allow-list is containment for reviews only"
+        );
+        assert!(argv.contains("stream-json"), "observability still applies to every call");
+    }
+
+    /// An operator who chose an output format keeps it, and the turn then FAILS CLOSED on the
+    /// sight gate instead of claiming a receipt it cannot produce.
+    /// RED IF: the runner overrides an explicit operator flag, or stamps the streaming mode on
+    /// a turn that never streamed.
+    #[tokio::test]
+    async fn u_cr_04_a_non_streaming_claude_cannot_claim_a_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let bin = fake_claude(dir.path(), &argv_log, "just some plain text, no events at all");
+
+        let parsed = run_claude_cli_process_with_session(
+            bin.to_str().expect("utf8"),
+            &["--output-format".to_string(), "text".to_string()],
+            "review something",
+            dir.path().to_str().expect("utf8"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("answers");
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert_eq!(
+            argv.matches("--output-format").count(),
+            1,
+            "the operator's explicit format must not be duplicated or overridden"
+        );
+        assert_eq!(
+            parsed.parser_mode, "claude-plain-text",
+            "a turn that never streamed must not claim the trusted mode"
+        );
+        assert!(
+            !PARSER_MODES_WITH_TOOL_RECORDS.contains(&parsed.parser_mode.as_str()),
+            "and that mode must fail closed on the sight gate"
+        );
+        assert!(parsed.response_text.contains("plain text"));
+    }
+}
+
 #[cfg(test)]
 mod grok_tool_surface_tests {
     use super::*;

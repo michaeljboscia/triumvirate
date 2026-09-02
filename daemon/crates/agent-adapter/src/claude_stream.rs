@@ -132,6 +132,14 @@ pub struct ClaudeStreamParser {
     pending: HashMap<String, usize>,
     /// True when the CLI reported the whole turn as an error.
     is_error: bool,
+    /// True once a `type: "result"` event has been seen, whatever it contained.
+    ///
+    /// Separate from `final_response`, which Codex found was the wrong proxy: a terminal event
+    /// carrying no string `result` field would be parsed correctly and then thrown away by the
+    /// runner as "not stream-json", discarding real tool calls and false-rejecting a sighted
+    /// review. The question "was this stream-json" and the question "did it produce text" are
+    /// not the same question.
+    saw_result: bool,
 }
 
 impl ClaudeStreamParser {
@@ -263,12 +271,20 @@ impl ClaudeStreamParser {
             }
             // ABSENT MEANS SUCCESS. The CLI only emits `is_error` when the call failed.
             // Defaulting to failure here would mark every successful read as failed and reject
-            // every review; defaulting to success would mark a denied read as a look. Read the
-            // field, and treat only an explicit `true` as failure.
-            let ok = !block
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            // every review; defaulting to success would mark a denied read as a look.
+            //
+            // PRESENT BUT NOT A BOOLEAN FAILS CLOSED. Codex found this: the first version was
+            // `as_bool().unwrap_or(false)`, so a string "true", a number, or null all collapsed
+            // to "no error" and a malformed explicit FAILURE could satisfy the sight gate. The
+            // three cases are genuinely different and are now spelled out rather than folded
+            // into one `unwrap_or`, because the folding is what hid the third one.
+            let ok = match block.get("is_error") {
+                None => true,
+                Some(Value::Bool(failed)) => !failed,
+                // Something is there and it is not a bool. We cannot tell what it means, and an
+                // unreadable error flag is not evidence of success.
+                Some(_) => false,
+            };
             let idx = block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
@@ -299,6 +315,7 @@ impl ClaudeStreamParser {
     }
 
     fn on_result(&mut self, v: &Value) {
+        self.saw_result = true;
         if let Some(id) = v.get("session_id").and_then(Value::as_str) {
             self.session_id = Some(id.to_string());
         }
@@ -342,7 +359,7 @@ impl ClaudeStreamParser {
     /// blind parser on the sight gate's allowlist. That is the exact fig leaf the allowlist was
     /// built to remove, so the mode is only claimed when the receipt mechanism demonstrably ran.
     pub fn saw_result(&self) -> bool {
-        self.final_response.is_some()
+        self.saw_result
     }
 
     pub fn finish(self) -> ParsedAgentResult {
@@ -496,6 +513,85 @@ mod tests {
         assert_eq!(tool_kind("Read"), ToolKind::ReadFile);
         assert_eq!(tool_kind("Write"), ToolKind::WriteFile);
         assert_eq!(tool_kind("Bash"), ToolKind::Bash);
+    }
+
+    /// Codex, round 2. A malformed `is_error` must FAIL CLOSED, not read as success.
+    ///
+    /// The first version was `as_bool().unwrap_or(false)`, which folded three different cases
+    /// into one: absent (success), an explicit bool (read it), and present-but-unparseable
+    /// (unknown). The third collapsed into "no error", so a malformed explicit FAILURE could
+    /// satisfy the sight gate.
+    /// RED IF: the match goes back to an `unwrap_or`.
+    #[test]
+    fn u_cs_09_a_malformed_error_flag_is_not_a_success() {
+        for weird in [r#""true""#, r#""false""#, "0", "1", "null", "{}", "[]"] {
+            let mut p = ClaudeStreamParser::new();
+            p.parse_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"Read","input":{"file_path":"/a"}}]}}"#,
+            );
+            p.parse_line(&format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t","is_error":{weird},"content":"x"}}]}}}}"#
+            ));
+            let parsed = p.finish();
+            assert_eq!(
+                parsed.tool_calls[0].success,
+                Some(false),
+                "is_error={weird} is unreadable and must not count as a look"
+            );
+        }
+    }
+
+    /// The two shapes that ARE readable still behave, so the fix above did not simply reject
+    /// everything. Without this, `u_cs_09` would pass on a parser that never succeeds.
+    /// RED IF: a genuine success starts failing.
+    #[test]
+    fn u_cs_10_the_two_readable_shapes_still_work() {
+        let mut p = ClaudeStreamParser::new();
+        p.parse_line(
+            r#"{"type":"assistant","message":{"content":[
+               {"type":"tool_use","id":"ok","name":"Read","input":{"file_path":"/a"}},
+               {"type":"tool_use","id":"bad","name":"Read","input":{"file_path":"/b"}}]}}"#,
+        );
+        p.parse_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"ok","content":"x"}]}}"#);
+        p.parse_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bad","is_error":true,"content":"x"}]}}"#);
+        let parsed = p.finish();
+        assert_eq!(parsed.tool_calls[0].success, Some(true), "absent is success");
+        assert_eq!(parsed.tool_calls[1].success, Some(false), "true is failure");
+    }
+
+    /// Codex, round 2. "Was this stream-json" and "did it produce text" are different questions.
+    ///
+    /// `saw_result` used to be `final_response.is_some()`. A terminal event carrying no string
+    /// `result` field would be parsed correctly, tool calls and all, and then thrown away by the
+    /// runner as `claude-plain-text`, false-rejecting a review that really did look.
+    /// RED IF: saw_result goes back to proxying on the response text.
+    #[test]
+    fn u_cs_11_a_result_event_without_text_is_still_stream_json() {
+        let mut p = ClaudeStreamParser::new();
+        p.parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"Read","input":{"file_path":"/a"}}]}}"#,
+        );
+        p.parse_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"x"}]}}"#);
+        // A terminal event with no `result` string.
+        p.parse_line(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#);
+        assert!(
+            p.saw_result(),
+            "the stream terminated properly; the runner must not discard its tool calls"
+        );
+        let parsed = p.finish();
+        assert_eq!(parsed.tool_calls.len(), 1, "the recorded read must survive");
+        assert_eq!(parsed.parser_mode, "claude-stream-json");
+    }
+
+    /// The other half: a turn that never terminated must NOT claim the mode. This is what stops
+    /// a plain-text claude (a mock, an operator override, an older CLI) from being trusted.
+    /// RED IF: saw_result starts defaulting to true.
+    #[test]
+    fn u_cs_12_a_stream_that_never_terminated_cannot_claim_the_mode() {
+        let mut p = ClaudeStreamParser::new();
+        p.parse_line("APPROVE");
+        p.parse_line("some plain text a mock might print");
+        assert!(!p.saw_result(), "no result event means no receipt mechanism ran");
     }
 
     /// A tool_use whose result never arrives (turn cut off) must stay `None`, not become a

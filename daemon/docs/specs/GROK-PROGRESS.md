@@ -85,21 +85,30 @@ Tool surface is now logged per turn: a real consult reported **126 tools, 11 com
 
 ## Slice status
 
+**This table was stale until 2026-09-02 and said slices D to N were awaiting review.** They were
+reviewed on 2026-09-01 and the chorus section below recorded it, so the top of this file
+contradicted its own body. Corrected here. The contradiction is kept in the record rather than
+deleted, because a status table that disagrees with the evidence beneath it is the failure mode
+this document exists to prevent.
+
 | Slice | State | Commit | Peers reviewed |
 |---|---|---|---|
 | A identity + `supported_agent_names()` | **DONE** | `3893d27` | not reviewed (mechanical) |
 | B invocation builder | **DONE**, 20 tests green | `68c10d3` + fixes | Codex, Antigravity (Grok hit max-turns) |
 | C parser | **DONE**, 21 tests green vs real fixtures | `4c8d8d3` + fixes | Codex (5 defects found and fixed) |
-| D spawn/dispatch + defects 2,3 | **DONE**, 179 tests green | `e41a55d` | awaiting peer review |
-| E doctor/README/aliases + defect 1 | **DONE**, 222 tests green | `cc192b2` | |
-| F mock binary + integration | **DONE**, 14 integration + 2 live-gated | | |
-| G peer-review panel | **DONE**, grok is a default reviewer | | |
-| H fleet | **DONE**, grok launches via the shared builder | | |
-| I/N ABE | **DONE**, ABE is agent-aware; codex path byte-identical | | |
-| J token-economics | **DONE** via the direct path; no offline scanner is possible | | |
-| K shared-types sweep | **DONE**, one real gate found and fixed | | |
-| L e2e | **DONE**, 2 live tests gated on `TRIUMVIRATE_LIVE_GROK=1` | | |
-| M connector resolution | **DONE**, no per-machine config needed | `24a3dd0` | |
+| D spawn/dispatch + defects 2,3 | **DONE**, 179 tests green | `e41a55d` | Codex, Antigravity, Grok, 2026-09-01 |
+| E doctor/README/aliases + defect 1 | **DONE**, 222 tests green | `cc192b2` | Codex, Antigravity, Grok, 2026-09-01 |
+| F mock binary + integration | **DONE**, 14 integration + 2 live-gated | | Codex, Antigravity, Grok, 2026-09-01 |
+| G peer-review panel | **DONE**, grok is a default reviewer | | Codex, Antigravity, Grok, 2026-09-01 |
+| H fleet | **DONE**, grok launches via the shared builder | | Codex, Antigravity, Grok, 2026-09-01 |
+| I/N ABE | **DONE**, ABE is agent-aware; codex path byte-identical | | Codex, Antigravity, Grok, 2026-09-01. **ABE is Codex only. The grok worktree path is UNVERIFIED.** |
+| J token-economics | **DONE** via the direct path; no offline scanner is possible | | Codex, Antigravity, Grok, 2026-09-01 |
+| K shared-types sweep | **DONE**, one real gate found and fixed | | Codex, Antigravity, Grok, 2026-09-01 |
+| L e2e | **DONE**, 2 live tests gated on `TRIUMVIRATE_LIVE_GROK=1` | | Codex, Antigravity, Grok, 2026-09-01 |
+| M connector resolution | **DONE**, no per-machine config needed | `24a3dd0` | Codex, Antigravity, Grok, 2026-09-01 |
+
+That pass found 5 defects. Two of them were findings I had already marked CLOSED and which were
+not closed. See the chorus section below; it is evidence, not history to be tidied.
 
 ## Rulings already made, do not relitigate
 
@@ -238,11 +247,13 @@ one pinned to the committed capture so a recapture with a different key fails lo
 STILL OPEN: only `read_file` appears in a live fixture. Capturing one live turn each for
 `run_terminal_command`, `search_replace`, `grep` and one Unknown remains to be done.
 
-### FIND-GROK-02 slice D-N peer review: NOT DONE
+### FIND-GROK-02 slice D to N peer review: CLOSED 2026-09-01
 
-No slice-scoped review pass has run. Unchanged.
+The pass ran. Codex, Antigravity and Grok each took a different lens. 5 defects, listed in the
+chorus section below. The header table above said "awaiting peer review" for another full day
+after this was true, which is its own small instance of the same problem.
 
-### FIND-GROK-03 ABE honesty: CLOSED, Option A
+### FIND-GROK-03 ABE honesty: CLOSED, Option A. Option B is OUT OF SCOPE.
 
 `snapshot_workers` hardcoded `agent: "codex"` and `name: "codex-worker-{id}"`, so `/api/workers`,
 the UI and telemetry reported Codex for EVERY worker. ABE only spawns Codex today, so the label
@@ -252,7 +263,7 @@ was true BY LUCK and would have kept being reported the moment anything else was
 `snapshot_workers` reads it. Two tests: a record carrying `grok` reports grok and names the
 worker `grok-worker-{id}`, and the default is still codex. The lie cannot land later.
 
-### FIND-GROK-04 panel Fast isolation: CLOSED
+### FIND-GROK-04 panel Fast isolation: CLOSED 2026-09-02, after being wrongly marked closed once
 
 Two problems, both fixed.
 
@@ -262,19 +273,32 @@ a patch to `peer-review/src/lib.rs`. An empty or whitespace-only override falls 
 default rather than silently producing an empty panel, which would look exactly like a review
 that passed.
 
-`mcp_bridge::grok::with_forced_fast()` pins grok to Fast on the calling thread, so a daemon
-started with `TRIUMVIRATE_GROK_DEPTH=deep` cannot make every mandatory review a multi-minute
-turn. Deliberately a THREAD-LOCAL, not a mutation of `std::env` around the child: reviewers
-dispatch concurrently and a process-wide set would leak into the others. This repo has already
-shipped one test that could not fail because of exactly that pattern, and while writing the
-roster tests I reproduced it again and had to serialise them.
+**The rest of this section is SUPERSEDED and kept as evidence. `with_forced_fast` was deleted.**
 
-Tests prove the override beats a Deep environment, does NOT leak past its closure, and changes
-the ARGS that actually cost time (max-turns and effort) rather than only the enum.
+What it said: a thread-local pinned grok to Fast on the calling thread, and the mechanism was
+shipped while the wiring was not, which was already recorded here as STILL OPEN.
 
-STILL OPEN: `with_forced_fast` is the mechanism; wiring the peer-review engine's dispatch to
-call it is not done, because the engine records reviews in SQLite and does not spawn the agent
-itself. Naming that honestly rather than claiming the seat is isolated.
+Two things were wrong with it, found by review rather than by me.
+
+Codex and Antigravity independently called the thread-local unsound. Tokio's work-stealing
+scheduler moves tasks across OS threads at every await point, so the flag does not follow the
+task it was set for, and a panic inside the closure would leave it set on that worker with no
+Drop guard. It was deleted rather than patched.
+
+Grok found the deeper one: there was no panel dispatch to isolate. `enforce_mandatory_peer_review`
+wrote a review row and auto-approved it, so no reviewer was ever spawned. Fixing the depth of a
+dispatch that does not happen is theatre.
+
+**CLOSED 2026-09-02, commit `9cfa54a`.** Depth is now a parameter on
+`build_grok_invocation_with_profile`, the same shape `sandbox_override` already uses. Not a
+thread-local, and not a child env var either: the argv is built in the parent, so a child env
+would arrive too late to change a flag. The panel seat reads `is_peer_review`, which is
+`serde(skip)`, so no client can set it to make its own consult cheap. An explicit
+`TRIUMVIRATE_GROK_EFFORT` still wins, because the override exists to stop a Deep daemon making
+every review multi-minute, not to overrule a person.
+
+Four tests, including the control that an ordinary consult on the SAME Deep daemon is still
+Deep. Mutations run: override ignored, and None defaulting to Fast.
 
 ### FIND-GROK-05 doctor compat drift: CLOSED
 
@@ -286,6 +310,13 @@ A MISSING key counts as drift, because the default is inherit-on and silence is 
 Keys in other sections do not satisfy the check. Deliberately a line scanner rather than a TOML
 parse: this crate has no toml dependency and a parse failure elsewhere in the file must not hide
 the answer.
+
+**Live tripwire added 2026-09-02, commit `9cfa54a`, which was the remaining half.** Doctor
+detects drift BEFORE a turn. What grok advertises DURING a turn is a different number, because
+MCP servers add to it. A tool surface above 200 now warns with the count. Warn only: a large
+surface is expensive, not wrong, and failing there would break working setups over a cost
+signal. The threshold sits between the two observed captures, 26 tools with none connected and
+420 with them.
 
 Verified live: `triumvirate doctor` prints `grok compat.claude: closed (all five keys false)`.
 
@@ -414,3 +445,110 @@ than inventing one.
 `~/.claude/scripts/peer-review/dispatch.sh` passes `codex exec --sandbox read-only`. Verified
 empirically: told to create a file, codex did not, and reported "The filesystem sandbox is
 read-only."
+
+## The review gate, 2026-09-02. FIND-REVIEW-01 through 05.
+
+Worked from `GROK_CHORUS_NEXT.md`. Every item below was reviewed by Codex, Antigravity and Grok
+on a frozen tree, each with a different lens. Two of the five findings came from that review
+rather than from me, and one of my own commit-message claims was proven false by it.
+
+| Finding | State | Commit | Found by |
+|---|---|---|---|
+| FIND-REVIEW-01 `review_submit` cannot approve an unfinished review | **CLOSED** | `20be42a` | Grok (spec), Claude (bug) |
+| FIND-REVIEW-02 inflight cap honoured on the dispatch path | **CLOSED** | `20be42a` | Grok (spec) |
+| FIND-REVIEW-03 a dispatch-owned review is not client writable | **CLOSED** | `4a457fc` | **Codex**, confirmed by Grok |
+| FIND-REVIEW-04 the verdict string is validated, not stored verbatim | **CLOSED** | `4a457fc` | **Grok** |
+| FIND-REVIEW-05 the `claude` seat could never produce a receipt | **CLOSED** | `b9c13bd` | Claude, while implementing 1.5 |
+
+### FIND-REVIEW-01: the record could be written by anyone
+
+`092f90b` made the review dispatch real, which removed the auto-approve. The layer underneath
+was still open: `submit_review` took `(review_id, verdict, comments)` and its UPDATE had no
+state guard and no notion of who was calling. It set `state = 'done'` on any row in any state
+for any caller.
+
+An approve now requires the row to be `in_progress` AND the submitter to be the assigned
+reviewer, or the in-process dispatch. `Submitter` is a required parameter rather than an
+`Option`, so every submit path has to state on the record which it is.
+
+### FIND-REVIEW-02: the cap counted reviews and never limited them
+
+`request_review` parks a review as `pending` once the inflight cap is met, and nothing on the
+dispatch path read that state, so a parked review was dispatched exactly like a running one.
+It now blocks BEFORE spending a live model call. The test asserts the invocation file does not
+exist, because asserting only that the turn was blocked would pass even if the reviewer had
+been spawned and rejected afterwards.
+
+### FIND-REVIEW-03: a name in a request body is not an identity
+
+**Codex found this against my first fix, and Grok confirmed it independently.** The
+reviewer-name check was not an authentication boundary: `review_request` RETURNS the assigned
+reviewer to the caller, and the mandatory path emits it in the `REVIEW_PENDING` outbox line, so
+a client can simply name it back and match.
+
+Ownership can be enforced where naming cannot. A review the mandatory dispatch is conducting is
+marked `dispatch_owned`, set only in-process, with no request field that deserialises into it,
+and accepts writes from `Submitter::Dispatch` alone. The check covers every verdict, not just
+approve: refusing only approve would leave a denial of service where a client lands a reject on
+a live review and the dispatch's own submit then fails as "changed state", which reads like an
+infrastructure fault.
+
+Client-requested reviews are deliberately unaffected. Fleet queues those for an agent to pick up
+over MCP; they are bookkeeping and were never a gate.
+
+### FIND-REVIEW-04: a padded approve was not an approve
+
+**Grok found this.** The verdict string was written to the row verbatim, and the identity check
+fired only on an exact case-insensitive `approve`. So an MCP body carrying a trailing space, or
+the word `approved`, skipped the identity check entirely and still set `state = 'done'`.
+Verdicts are now normalised and anything outside approve, concerns, reject, indeterminate is
+refused. `indeterminate` is accepted on purpose: it is the fail-closed verdict, and refusing to
+store it would turn a blocked turn into a submit error.
+
+### FIND-REVIEW-05: the claude seat was blind
+
+`claude` is a DEFAULT reviewer, and its runner built `ParsedAgentResult` from
+`Default::default()`: no parser mode, no tool calls. Turning sight on for the reviewer would
+have rejected that seat 100% of the time for a fault that is the harness's, which is exactly the
+failure already hit with agy one seat over.
+
+New `claude_stream.rs`, verified live against the installed CLI, fixtures captured from that run
+including the permission-DENIED case. Two flag traps are recorded in the source:
+`--allowedTools` is variadic and swallows the prompt, and without an allow-list a headless
+claude auto-denies its own reads.
+
+### Goal 1.5: what the sight gate on the reviewer does and does not buy
+
+The artifact is written to `.triumvirate/reviews/<review_id>.md`, named in the prompt, and
+passed as `required_sources`. The old comment here said `required_sources` had to stay empty
+because a pasted artifact makes a toolless review legitimate. That was true, and it also meant a
+reviewer could approve having opened nothing. Giving the artifact a path removes the tension
+rather than picking a side.
+
+Stated plainly: requiring a read of text that is also in the prompt is partly ceremonial. What
+it buys is exact. A reviewer that made zero tool calls can no longer return APPROVE, which is
+the failure actually observed on 2026-09-01 when a peer described its own toolless output as
+"rigorous sourcing". **It does not prove the contents were used.** A reviewer can open the file
+and still write from memory. That next layer is entailment against the opened text, or a human,
+and it is not built.
+
+### A false claim in my own commit message, found by Antigravity
+
+`20be42a` listed "SQL guard removed" among five mutations that killed tests. It did not. What
+was actually run was BOTH guards removed together, which the Rust guard accounts for. Removing
+only the state condition from the UPDATE leaves the whole suite green, because every test that
+attempts an invalid transition is stopped by the Rust guard before the SQL runs. Verified by
+running that mutation. The clause stays as defence in depth against a read/write race across two
+connections, and the code now says plainly that no test covers it.
+
+### Known open, stated rather than left to silence
+
+- The concurrent-modification arm of `submit_review` and the telemetry-on-rejection path have no
+  test. Both named by Antigravity.
+- `persistent_worker_reuse_second_call_is_faster_and_marked_reused` failed once under full
+  parallel load and passed 3/3 alone. It asserts one call is faster than another, which is a
+  wall-clock assertion on a loaded machine.
+- FIND-GROK-01 remainder: only `read_file` appears in a live grok fixture. Capturing
+  `run_terminal_command`, `search_replace`, `grep` and one Unknown is still to do.
+- ABE `dispatch_codex` and fleet task completion do not enter this gate at all. That is not a way
+  the gate is a stamp; it is work that leaves the building without it.
