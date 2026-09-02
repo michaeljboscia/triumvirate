@@ -2179,11 +2179,12 @@ async fn enforce_mandatory_peer_review(
          THE OUTPUT IS NOT IN THIS MESSAGE. It is on disk at:\n\n  {path}\n\n\
          Read that entire file with your file-reading tool. Read it to the END: the last line \
          carries a line beginning `REVIEW-NONCE:`. Do not read only the first lines.\n\n\
-         Then answer in exactly this shape:\n\
+         Then answer like this:\n\
          line 1: your verdict, exactly one of APPROVE, CONCERNS or REJECT, alone on the line, \
-         no markdown and no other words.\n\
-         line 2: the nonce, copied exactly, in the form `REVIEW-NONCE: ...`.\n\
-         line 3 onward: your reasoning.\n\n\
+         no markdown and no other words. This line IS position sensitive.\n\
+         somewhere in your answer: the nonce, copied exactly, in the form `REVIEW-NONCE: ...`. \
+         Anywhere is fine, and the line after the verdict is the obvious place.\n\
+         the rest: your reasoning.\n\n\
          REJECT means a defect that must block: a false claim, a broken invariant, or work \
          that does not do what it says. CONCERNS means something worth raising that should not \
          stop the turn. If you cannot tell, say REJECT and explain what you would need.\n\n\
@@ -2216,6 +2217,22 @@ async fn enforce_mandatory_peer_review(
             // file, so it is Indeterminate, which blocks. Checked AFTER classification so a
             // reviewer that correctly REJECTED still rejects: a missing nonce must never turn a
             // block into a pass, only a pass into a block.
+            //
+            // POSITION IS DELIBERATELY NOT CHECKED, and the prompt now says so.
+            //
+            // Codex found the mismatch in round 3: the prompt demanded the nonce on line 2 while
+            // this accepted it anywhere, so the stated protocol and the enforced one disagreed.
+            // Codex proposed tightening the check. The prompt is the half that was wrong.
+            //
+            // Position adds nothing to the PROOF. The nonce is the last line of the file, so
+            // quoting it at all means reading to the end, whether it lands on line 2 or line 40.
+            // Enforcing the position would reject honest reviewers over formatting, which is the
+            // same false-rejection shape that made the agy seat look guilty when the harness was
+            // at fault. The verdict line stays position sensitive because THAT one is genuinely
+            // ambiguous otherwise: "REJECT" buried in prose is not a verdict.
+            //
+            // A reviewer that dumps the whole file into its answer also passes. That is correct,
+            // not a hole: it had to read the whole file to do it.
             if !resp.response.contains(&nonce) && !v.blocks() {
                 (
                     ReviewVerdict::Indeterminate,
@@ -6911,6 +6928,79 @@ mod mandatory_review_tests {
             !err.contains("never successfully opened"),
             "the sight gate must have PASSED: head is a classified reader and the path matched.              If this fires, the test is proving the wrong thing; got: {err}"
         );
+    }
+
+    /// Antigravity, round 3, raised this as a defect. It is not one, and the reason is worth
+    /// pinning so nobody has to re-derive it.
+    ///
+    /// The claim: the artifact is written under the PROJECT root while the reviewer is dispatched
+    /// with `exec_cwd`, so a review started from a subdirectory would put the file outside the
+    /// reviewer's read-only sandbox and every review would fail structurally.
+    ///
+    /// That would be serious if true. It is not, because `resolve_absolute_project_root` does not
+    /// walk up to a repo root: it canonicalises `exec_cwd` and returns it. So the artifact is
+    /// always at `exec_cwd/.triumvirate/reviews/`, which is inside the reviewer's own cwd and
+    /// therefore inside its containment.
+    ///
+    /// RED IF: `resolve_absolute_project_root` ever starts searching upward for a `.git` or a
+    /// workspace marker. At that moment Antigravity's finding becomes correct, and the artifact
+    /// would need to be written somewhere the reviewer can actually reach.
+    #[test]
+    fn review_20_the_artifact_is_always_inside_the_reviewers_own_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("crates").join("deep");
+        std::fs::create_dir_all(&nested).expect("nested");
+
+        let root = resolve_absolute_project_root(nested.to_str().expect("utf8"))
+            .expect("resolves");
+        assert_eq!(
+            root,
+            std::fs::canonicalize(&nested).expect("canonical"),
+            "project_root must be the dispatch cwd itself, not an ancestor: the reviewer is \
+             contained to its cwd and could not read an artifact written above it"
+        );
+
+        // Compared against the CANONICAL path, not the raw one: on macOS a tempdir is
+        // /var/... which canonicalises to /private/var/..., and the first version of this
+        // assertion failed on that alone. A test that fails for a path-normalisation reason
+        // while claiming to prove a containment property is worse than no test.
+        let canonical_nested = std::fs::canonicalize(&nested).expect("canonical");
+        let artifact = root.join(".triumvirate").join("reviews").join("r.md");
+        assert!(
+            artifact.starts_with(&canonical_nested),
+            "the artifact must live under the reviewer's cwd, got {}",
+            artifact.display()
+        );
+    }
+
+    /// Codex, round 3. The nonce may appear ANYWHERE in the answer, and that is deliberate.
+    ///
+    /// Codex found that the prompt demanded line 2 while the check accepted anywhere, so the
+    /// stated protocol and the enforced one disagreed. The prompt was the wrong half: position
+    /// adds nothing to the proof, because the nonce is the last line of the file and quoting it
+    /// at all means reading to the end. Enforcing position would reject honest reviewers over
+    /// formatting.
+    ///
+    /// This pins the decision so a later "tighten it up" has to argue with it rather than
+    /// silently introduce a false-rejection.
+    /// RED IF: the check starts requiring a particular line.
+    #[test]
+    fn review_19_the_nonce_may_appear_anywhere_in_the_answer() {
+        // The verdict line, by contrast, IS position sensitive, and that is asserted here too
+        // so the asymmetry is on the record rather than implied.
+        let (v, _) = classify_review_verdict("APPROVE\nreasoning\nREVIEW-NONCE: TV-abc");
+        assert_eq!(v, ReviewVerdict::Approve, "line 1 decides the verdict");
+
+        let (buried, _) = classify_review_verdict("I would say APPROVE here.\nREVIEW-NONCE: TV-abc");
+        assert_eq!(
+            buried,
+            ReviewVerdict::Indeterminate,
+            "a verdict buried in prose is still not a verdict, nonce or no nonce"
+        );
+
+        // And the containment check itself, which is what the dispatch applies.
+        let answer = "APPROVE\n\nlots of reasoning\n\nREVIEW-NONCE: TV-deadbeef\n";
+        assert!(answer.contains("TV-deadbeef"), "position must not matter to the proof");
     }
 
     /// The control for review_16. The same reviewer reading the WHOLE file approves.
