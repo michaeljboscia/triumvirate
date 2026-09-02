@@ -18,6 +18,7 @@ use std::sync::{
 use tokio::time::Duration;
 
 pub mod abe;
+pub mod blind_validation;
 pub mod aliases;
 pub mod fleet;
 pub mod gemini_query;

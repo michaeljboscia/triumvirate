@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-adapter = { path = "../agent-adapter" }
 agent-worker = { path = "../agent-worker" }
 anyhow.workspace = true
 daemon-core = { path = "../daemon-core" }
