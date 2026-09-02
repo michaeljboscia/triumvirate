@@ -3999,10 +3999,11 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
              ARTIFACT=\"$(printf '%s' \"$PROMPT\" | grep -o '/[^[:space:]]*/[.]triumvirate/reviews/[^[:space:]]*[.]md' | head -1)\"\n\
              if [ -n \"$ARTIFACT\" ]; then\n\
              printf '{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\"}}\\n' \"$ARTIFACT\"\n\
-             cat \"$ARTIFACT\" > /dev/null 2>&1\n\
+             READ_OUTPUT=\"$(cat \"$ARTIFACT\" 2>/dev/null)\"\n\
              printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\",\"exit_code\":0}}\\n' \"$ARTIFACT\"\n\
              fi\n\
-             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"APPROVE\\\\n\\\\nlooks fine\"}}\\n'\n",
+             NONCE=\"$(printf '%s' \"$READ_OUTPUT\" | grep -o 'REVIEW-NONCE: [^ ]*' | tail -1)\"\n\
+             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"APPROVE\\\\n%s\\\\nlooks fine\"}}\\n' \"$NONCE\"\n",
         )?;
         #[cfg(unix)]
         {

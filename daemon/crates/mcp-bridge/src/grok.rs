@@ -64,6 +64,16 @@ pub fn grok_max_turns() -> u32 {
 
 /// As `grok_max_turns`, for a caller that has already decided the depth for THIS invocation
 /// rather than reading the daemon's process-wide setting. FIND-GROK-04.
+///
+/// AN EXPLICIT `TRIUMVIRATE_GROK_MAX_TURNS` STILL WINS, exactly as an explicit
+/// `TRIUMVIRATE_GROK_EFFORT` does in `grok_effort_for`. Grok flagged in round 2 that the
+/// exception was documented for effort and not for turns, which made the asymmetry look like an
+/// oversight rather than the same deliberate rule twice.
+///
+/// The rule: the Fast override exists to stop a daemon started in Deep from making every panel
+/// review a multi-minute turn. It does not exist to overrule an operator who set a number on
+/// purpose. An operator who caps turns at 3 gets 3 on the panel too, and one who raises it to
+/// 50 has said so deliberately and owns the wait.
 pub fn grok_max_turns_for(depth: GrokDepth) -> u32 {
     std::env::var("TRIUMVIRATE_GROK_MAX_TURNS")
         .ok()
@@ -1108,6 +1118,30 @@ mod panel_depth_tests {
 
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GROK_EFFORT");
+            std::env::remove_var("TRIUMVIRATE_GROK_DEPTH");
+        }
+    }
+
+    /// The operator-authority rule applies to TURNS as well as effort, and is now asserted
+    /// rather than merely intended. Grok flagged in round 2 that only the effort half was
+    /// documented, so the turns half read like an accident.
+    /// RED IF: the Fast override starts overruling an explicit TRIUMVIRATE_GROK_MAX_TURNS.
+    #[test]
+    fn u_gd_05_an_explicit_operator_turn_cap_still_wins() {
+        let _g = env_guard();
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep");
+            std::env::set_var("TRIUMVIRATE_GROK_MAX_TURNS", "3");
+        }
+
+        let panel = build_grok_invocation_with_profile(
+            "grok", &[], "review this", "/tmp", None, false, None, Some(GrokDepth::Fast),
+        )
+        .expect("panel invocation");
+        assert_eq!(flag_value(&panel.args, "--max-turns").as_deref(), Some("3"));
+
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS");
             std::env::remove_var("TRIUMVIRATE_GROK_DEPTH");
         }
     }

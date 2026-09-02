@@ -552,3 +552,70 @@ connections, and the code now says plainly that no test covers it.
   `run_terminal_command`, `search_replace`, `grep` and one Unknown is still to do.
 - ABE `dispatch_codex` and fleet task completion do not enter this gate at all. That is not a way
   the gate is a stamp; it is work that leaves the building without it.
+
+### FIND-REVIEW-06, found by Grok in round 2: a partial read is not a read
+
+Grok reviewed the frozen tree at `b9c13bd` and showed how cheap the receipt was to satisfy
+without reading. Claude's own captured fixture is `Read` with `"limit": 1`, and `head` is a
+classified reader on the codex backend. Either satisfies the sight gate after looking at ONE
+line of a file whose contents were, at that point, also pasted into the prompt. The receipt
+proved a syscall ran against the path, not that anything was read.
+
+Grok's own proposed mitigation was taken, in its words: stop pasting the artifact into the
+prompt, put a daemon-generated nonce in the file that is not in the prompt, and require that
+nonce on the verdict. The nonce sits at the END of the file, so a `head -1` or `limit: 1` read
+now fails.
+
+The author cannot forge it: the nonce is minted after the author's turn has already finished, so
+it does not exist at the time the artifact was written.
+
+Removing the paste is also strictly stronger prompt-injection containment than the fence that
+replaced it. Text that is not in the prompt cannot compete with the prompt's own instructions.
+`review_08` was rewritten to assert that stronger property rather than the fence markers.
+
+A missing nonce only ever upgrades a PASSING verdict to Indeterminate. It never touches a
+blocking one, so a reviewer that correctly rejected on a partial read still rejects with its own
+reasoning intact. `review_18` pins that, and the mutation that removes the guard turns it red.
+
+**Still not proven, and this is the honest limit:** the reviewer read the file. It was not shown
+to have judged it. An agent can read every byte, quote the last line, and write its verdict from
+nothing. That layer is entailment against the opened text, or a human. Grok said the same and
+recommended this before entailment rather than instead of it.
+
+### Round 2 also caught two more, and one disagreement between peers
+
+**Codex:** a malformed `is_error` was read as success, because `as_bool().unwrap_or(false)`
+folded "absent", "explicit bool" and "present but unparseable" into two outcomes instead of
+three. A malformed explicit FAILURE could satisfy sight. Now an explicit match, failing closed.
+
+**Codex:** `saw_result()` returned `final_response.is_some()`, so a terminal event with no string
+`result` field would be parsed correctly, tool calls and all, then discarded as plain text and
+false-reject an honest review.
+
+**Grok, on the same code, said the `is_error` handling HOLDS.** It read both fixtures, confirmed
+both were handled, and stopped there. That is true and insufficient: neither fixture contains a
+malformed flag. Codex was right. This is the argument for a panel rather than a reviewer, and it
+is recorded rather than smoothed over.
+
+**Grok:** `u_gd_01` tests the BUILDER, not the route. Deleting `panel_child = req.is_peer_review`
+from `run_named_agent_with_session_and_model` would leave it green. That is precisely the
+"tested the helper, not the route" bug this pass was told not to repeat. Rule 5 was satisfied and
+Rule 2 was not. `u_gp_01` now drives a real grok child through the dispatch path and reads its
+argv; running that exact deletion leaves the builder test green (4 passed) and turns the route
+test red.
+
+**Grok:** the operator-authority exception was documented for `TRIUMVIRATE_GROK_EFFORT` and not
+for `TRIUMVIRATE_GROK_MAX_TURNS`, which made the same deliberate rule look like an oversight on
+one of the two. Documented and pinned.
+
+**Grok:** `finish()` stamped the streaming parser mode unconditionally, which was safe only while
+every caller remembered to check `saw_result()` first. The parser now names its own mode.
+
+**Antigravity:** `run_claude_cli_process_with_session` had no test at all. Every review test
+seats claude as the AUTHOR, whose binary is a `mock-` connector, so the runner under change was
+never executed. Four tests now drive it with a fake claude that records its own argv.
+
+**Antigravity confirmed, by tracing rather than by assertion, that the test mock is not a
+bypass:** `is_mock_connector` matches only the `mock-` prefix, the reviewer stand-in is
+`fake-codex-*`, so tests execute the real runner and the real parser, and neither allowlist
+carries a `cfg(test)` directive. Grok reached the same conclusion independently.

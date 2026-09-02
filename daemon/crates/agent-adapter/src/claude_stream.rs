@@ -54,6 +54,10 @@ use crate::types::{
 /// plain-text runner produced does not, and fails closed there.
 pub const PARSER_MODE_STREAM: &str = "claude-stream-json";
 
+/// What a claude turn that never streamed reports. Deliberately NOT on either sight allowlist,
+/// so such a turn fails closed rather than claiming a receipt it cannot produce.
+pub const PARSER_MODE_PLAIN: &str = "claude-plain-text";
+
 /// Map a claude tool name to the kind the sight gate reasons about.
 ///
 /// Names are claude's own, taken from the `system.init` event's `tools` array in the capture.
@@ -380,7 +384,16 @@ impl ClaudeStreamParser {
             token_usage: self.usage,
             self_reported_cost_usd: None,
             cli_version: None,
-            parser_mode: PARSER_MODE_STREAM.to_string(),
+            // The mode is decided HERE, not by the caller, because Grok pointed out that
+            // `finish()` unconditionally stamping the streaming mode is a footgun: it is only
+            // safe while every caller remembers to check `saw_result()` first. Production did
+            // remember; the next caller might not. A turn that never terminated as stream-json
+            // now cannot claim the trusted mode no matter who calls this.
+            parser_mode: if self.saw_result {
+                PARSER_MODE_STREAM.to_string()
+            } else {
+                PARSER_MODE_PLAIN.to_string()
+            },
         }
     }
 }
@@ -592,6 +605,21 @@ mod tests {
         p.parse_line("APPROVE");
         p.parse_line("some plain text a mock might print");
         assert!(!p.saw_result(), "no result event means no receipt mechanism ran");
+    }
+
+    /// Grok, round 2. `finish()` used to stamp the streaming mode unconditionally, which was
+    /// safe only while every caller remembered to check `saw_result()` first. The parser now
+    /// decides its own mode, so a future caller cannot accidentally launder a blind turn.
+    /// RED IF: finish() goes back to always writing PARSER_MODE_STREAM.
+    #[test]
+    fn u_cs_13_the_parser_names_its_own_mode_honestly() {
+        let mut blind = ClaudeStreamParser::new();
+        blind.parse_line("plain text, no events");
+        assert_eq!(blind.finish().parser_mode, "claude-plain-text");
+
+        let mut streamed = ClaudeStreamParser::new();
+        streamed.parse_line(r#"{"type":"result","subtype":"success","result":"x"}"#);
+        assert_eq!(streamed.finish().parser_mode, "claude-stream-json");
     }
 
     /// A tool_use whose result never arrives (turn cut off) must stay `None`, not become a
