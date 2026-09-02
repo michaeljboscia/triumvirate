@@ -59,11 +59,17 @@ pub fn grok_streaming_enabled() -> bool {
 /// 6 is the compromise: enough to read a few files and answer, far short of an open-ended crawl.
 /// Raise it deliberately with TRIUMVIRATE_GROK_MAX_TURNS for genuine review work.
 pub fn grok_max_turns() -> u32 {
+    grok_max_turns_for(grok_depth())
+}
+
+/// As `grok_max_turns`, for a caller that has already decided the depth for THIS invocation
+/// rather than reading the daemon's process-wide setting. FIND-GROK-04.
+pub fn grok_max_turns_for(depth: GrokDepth) -> u32 {
     std::env::var("TRIUMVIRATE_GROK_MAX_TURNS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(match grok_depth() {
+        .unwrap_or(match depth {
             GrokDepth::Fast => 6,
             // Enough rope to actually explore a subsystem. The 900s client timeout is what stops
             // a runaway now, not the turn cap.
@@ -124,6 +130,19 @@ pub enum GrokDepth {
 // reviewer is ever spawned and there is no panel dispatch to isolate. Fixing the depth of a
 // dispatch that does not happen would be theater.
 
+/// The ONE lock over this file's process-global env, sitting next to the state it guards.
+///
+/// It is here rather than inside a test module because `TRIUMVIRATE_GROK_DEPTH` is read by
+/// `grok_depth`, `grok_effort` and `grok_max_turns`, and TWO test modules mutate it. A
+/// per-module lock serialises a module against itself and against nothing else, which is not a
+/// lock, it is a comment. That exact mistake produced three separate intermittent failures
+/// earlier in this work, each of which surfaced inside an unrelated test and read like a real
+/// defect in whatever happened to run next.
+///
+/// The rule it encodes: a lock must live wherever the STATE lives, not wherever the test lives.
+#[cfg(test)]
+pub(crate) static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `TRIUMVIRATE_GROK_DEPTH=deep` (aliases: riff, wild, max) unleashes it. Anything else is Fast.
 pub fn grok_depth() -> GrokDepth {
     match std::env::var("TRIUMVIRATE_GROK_DEPTH")
@@ -146,11 +165,20 @@ pub fn grok_depth() -> GrokDepth {
 /// problem to grind on. Set TRIUMVIRATE_GROK_EFFORT=medium or high deliberately when a task
 /// actually warrants it. Valid values for grok-4.6: low, medium, high, xhigh.
 pub fn grok_effort() -> Option<String> {
+    grok_effort_for(grok_depth())
+}
+
+/// As `grok_effort`, for a caller that has already decided the depth for THIS invocation.
+///
+/// An explicit `TRIUMVIRATE_GROK_EFFORT` still wins. A panel child is forced Fast to stop a
+/// daemon started in Deep from making every review a multi-minute turn; it is not there to
+/// override an operator who deliberately set an effort.
+pub fn grok_effort_for(depth: GrokDepth) -> Option<String> {
     match std::env::var("TRIUMVIRATE_GROK_EFFORT").ok().map(|v| v.trim().to_string()) {
         Some(v) if v.eq_ignore_ascii_case("default") => None,
         Some(v) if !v.is_empty() => Some(v),
         // An explicit TRIUMVIRATE_GROK_EFFORT always wins; otherwise the depth profile decides.
-        _ => Some(match grok_depth() {
+        _ => Some(match depth {
             GrokDepth::Fast => "low",
             GrokDepth::Deep => "high",
         }
@@ -330,6 +358,43 @@ pub fn build_grok_invocation_with_sandbox(
     resume: bool,
     sandbox_override: Option<&str>,
 ) -> Result<GrokInvocation, String> {
+    build_grok_invocation_with_profile(
+        bin,
+        extra_args,
+        prompt,
+        cwd,
+        session_id,
+        resume,
+        sandbox_override,
+        None,
+    )
+}
+
+/// As `build_grok_invocation_with_sandbox`, with an explicit depth for THIS invocation.
+///
+/// FIND-GROK-04, and the reason it stayed open. The first attempt was a thread_local
+/// `with_forced_fast`; Codex and Antigravity independently called it unsound, because tokio's
+/// work-stealing scheduler moves tasks across OS threads at every await point and a panic inside
+/// the closure would leave the flag set on that worker with no Drop guard. It was deleted rather
+/// than patched, and it must not come back.
+///
+/// Setting the variable on the child `Command` would not work either: the argv is built HERE, in
+/// the parent, so a child env would arrive too late to change a single flag. The depth has to be
+/// a parameter, which is the same shape `sandbox_override` already uses for the same reason.
+///
+/// `depth_override: None` means "use the daemon's configured depth".
+#[allow(clippy::too_many_arguments)]
+pub fn build_grok_invocation_with_profile(
+    bin: &str,
+    extra_args: &[String],
+    prompt: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    resume: bool,
+    sandbox_override: Option<&str>,
+    depth_override: Option<GrokDepth>,
+) -> Result<GrokInvocation, String> {
+    let depth = depth_override.unwrap_or_else(grok_depth);
     validate_extra_args(extra_args)?;
 
     // REQ-GROK-006. A bare `-r` resumes "most recent session in this cwd", which is the exact
@@ -387,13 +452,13 @@ pub fn build_grok_invocation_with_sandbox(
         args.push("-m".to_string());
         args.push(model);
     }
-    if let Some(effort) = grok_effort() {
+    if let Some(effort) = grok_effort_for(depth) {
         args.push("--effort".to_string());
         args.push(effort);
     }
 
     args.push("--max-turns".to_string());
-    args.push(grok_max_turns().to_string());
+    args.push(grok_max_turns_for(depth).to_string());
 
     // Turn-burners, named by Grok when asked why reviews take minutes: it spawns subagents, writes
     // todo lists and searches the web, and each of those is another 5 to 12 second round trip that
@@ -401,7 +466,7 @@ pub fn build_grok_invocation_with_sandbox(
     //
     // In Deep mode they are exactly what you want: the exploring IS the value. So the profile
     // decides, and the two settings stay coherent instead of half-throttling it.
-    if grok_depth() == GrokDepth::Fast {
+    if depth == GrokDepth::Fast {
         args.push("--no-subagents".to_string());
         args.push("--disable-web-search".to_string());
         args.push("--disallowed-tools".to_string());
@@ -466,11 +531,11 @@ pub fn build_grok_invocation_with_sandbox(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
+    /// Shared with `panel_depth_tests`, which mutates the SAME variables. See GROK_ENV_LOCK.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &super::GROK_ENV_LOCK
     }
 
     /// Fast and Deep must differ in the ARGS that actually cost time, not just in an enum.
@@ -947,3 +1012,124 @@ mod tests {
 }
 
 
+
+/// FIND-GROK-04: a panel seat is Fast even when the daemon is Deep.
+///
+/// The finding stayed open for two reasons, both worth keeping. First, the original fix was a
+/// thread_local `with_forced_fast`, which Codex and Antigravity independently called unsound:
+/// tokio's work-stealing scheduler moves tasks across OS threads at every await point, and a
+/// panic inside the closure would leave the flag set on that worker with no Drop guard. Second,
+/// and more fundamentally, Grok pointed out there was no panel dispatch to isolate at all,
+/// because mandatory review auto-approved without spawning anything. Both are now fixed.
+#[cfg(test)]
+mod panel_depth_tests {
+    use super::*;
+
+    /// The SAME lock `mod tests` uses. A private one here would serialise these four tests
+    /// against each other and not against the eight in `mod tests` that set the same variable.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        super::GROK_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn flag_value(args: &[String], flag: &str) -> Option<String> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    }
+
+    /// The headline. A daemon running Deep must still build a Fast panel child.
+    /// RED IF: the depth override is dropped, or the builder goes back to reading the env.
+    #[test]
+    fn u_gd_01_a_panel_child_is_fast_on_a_deep_daemon() {
+        let _g = env_guard();
+        // SAFETY: held under the module lock, removed at the end.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep");
+            std::env::remove_var("TRIUMVIRATE_GROK_EFFORT");
+            std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS");
+        }
+        assert_eq!(grok_depth(), GrokDepth::Deep, "the fixture must actually be Deep");
+
+        let panel = build_grok_invocation_with_profile(
+            "grok", &[], "review this", "/tmp", None, false, None, Some(GrokDepth::Fast),
+        )
+        .expect("panel invocation");
+
+        assert_eq!(flag_value(&panel.args, "--effort").as_deref(), Some("low"));
+        assert_eq!(flag_value(&panel.args, "--max-turns").as_deref(), Some("6"));
+        assert!(
+            panel.args.iter().any(|a| a == "--no-subagents"),
+            "the Fast turn-burner suppression must apply to the panel child too"
+        );
+        assert!(panel.args.iter().any(|a| a == "--disable-web-search"));
+
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_DEPTH") };
+    }
+
+    /// The control, in the SAME process state. Without it the test above would pass even if the
+    /// daemon env were being ignored entirely, which would mean Deep no longer works at all.
+    /// RED IF: the override leaks into ordinary consults.
+    #[test]
+    fn u_gd_02_an_ordinary_consult_on_the_same_daemon_is_still_deep() {
+        let _g = env_guard();
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep");
+            std::env::remove_var("TRIUMVIRATE_GROK_EFFORT");
+            std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS");
+        }
+
+        let consult =
+            build_grok_invocation("grok", &[], "a question", "/tmp", None, false).expect("consult");
+
+        assert_eq!(flag_value(&consult.args, "--effort").as_deref(), Some("high"));
+        assert_eq!(flag_value(&consult.args, "--max-turns").as_deref(), Some("30"));
+        assert!(
+            !consult.args.iter().any(|a| a == "--no-subagents"),
+            "Deep must keep the exploring that is the whole point of it"
+        );
+
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_DEPTH") };
+    }
+
+    /// An operator who set an effort deliberately outranks the panel default. The override is
+    /// there to stop a Deep daemon making every review multi-minute, not to overrule a person.
+    /// RED IF: the forced depth starts ignoring TRIUMVIRATE_GROK_EFFORT.
+    #[test]
+    fn u_gd_03_an_explicit_operator_effort_still_wins() {
+        let _g = env_guard();
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep");
+            std::env::set_var("TRIUMVIRATE_GROK_EFFORT", "medium");
+        }
+
+        let panel = build_grok_invocation_with_profile(
+            "grok", &[], "review this", "/tmp", None, false, None, Some(GrokDepth::Fast),
+        )
+        .expect("panel invocation");
+        assert_eq!(flag_value(&panel.args, "--effort").as_deref(), Some("medium"));
+
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GROK_EFFORT");
+            std::env::remove_var("TRIUMVIRATE_GROK_DEPTH");
+        }
+    }
+
+    /// `None` must mean "whatever the daemon is configured for", so every existing caller keeps
+    /// its behaviour. A default of Fast here would silently throttle ABE workers and consults.
+    /// RED IF: the None arm stops falling through to grok_depth().
+    #[test]
+    fn u_gd_04_no_override_means_the_daemon_setting() {
+        let _g = env_guard();
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_GROK_DEPTH", "deep");
+            std::env::remove_var("TRIUMVIRATE_GROK_EFFORT");
+            std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS");
+        }
+
+        let inv = build_grok_invocation_with_profile(
+            "grok", &[], "hi", "/tmp", None, false, None, None,
+        )
+        .expect("invocation");
+        assert_eq!(flag_value(&inv.args, "--max-turns").as_deref(), Some("30"));
+
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_DEPTH") };
+    }
+}

@@ -2376,8 +2376,15 @@ async fn run_named_agent_with_session_and_model(
             let track = req_overrides.is_some_and(|r| {
                 r.reuse_session.unwrap_or(false) || r.session_key.is_some()
             });
-            run_grok_cli_process_with_session(&bin, &args, message, cwd, session_id, events_tx, track)
-                .await
+            // FIND-GROK-04: a panel seat is Fast even on a Deep daemon. Read from the request
+            // rather than from any ambient state, and `is_peer_review` is `serde(skip)`, so no
+            // client can set it to make its own consult cheap or to dodge the gate.
+            let panel_child =
+                req_overrides.is_some_and(|r| r.is_peer_review.unwrap_or(false));
+            run_grok_cli_process_with_session(
+                &bin, &args, message, cwd, session_id, events_tx, track, panel_child,
+            )
+            .await
         }
         "claude" => {
             let (bin, args) = claude_command();
@@ -3444,6 +3451,7 @@ fn looks_like_grok_auth_failure(stderr_lower: &str) -> bool {
     SIGNALS.iter().any(|s| stderr_lower.contains(s))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_grok_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -3454,6 +3462,14 @@ async fn run_grok_cli_process_with_session(
     // True when something will actually KEEP the resulting session id: a named session, or an
     // explicit `reuse_session`. False for a one-shot consult.
     track_session: bool,
+    // FIND-GROK-04. True when this child is a mandatory-review panel seat, which is forced Fast
+    // regardless of the daemon's TRIUMVIRATE_GROK_DEPTH. A daemon started in Deep would
+    // otherwise make every review a multi-minute turn, which is how a gate gets turned off.
+    //
+    // An explicit parameter, not a thread-local: `with_forced_fast` was deleted as unsound
+    // because tokio moves tasks across OS threads, and it must not return. Not a child env var
+    // either: the argv is built in the parent, so a child env arrives too late.
+    force_fast: bool,
 ) -> anyhow::Result<ParsedAgentResult> {
     // A session id means "resume": it is only ever populated from a previous turn's parsed
     // `end.sessionId`. The builder refuses to emit a bare `--resume`, which would silently
@@ -3472,8 +3488,9 @@ async fn run_grok_cli_process_with_session(
         Some(Uuid::new_v4().to_string())
     };
     let effective_session = if resume { session_id } else { minted.as_deref() };
-    let invocation = mcp_bridge::grok::build_grok_invocation(
-        bin, args, message, cwd, effective_session, resume,
+    let depth_override = force_fast.then_some(mcp_bridge::grok::GrokDepth::Fast);
+    let invocation = mcp_bridge::grok::build_grok_invocation_with_profile(
+        bin, args, message, cwd, effective_session, resume, None, depth_override,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -3956,8 +3973,14 @@ async fn run_agent_process_with_session(
             // This generic path is only reached for resumes and prewarm; a resume already has an
             // id, and prewarm must not manufacture one.
             let track = session_id.is_some_and(|s| !s.trim().is_empty());
-            run_grok_cli_process_with_session(bin, args, message, cwd, session_id, events_tx, track)
-                .await
+            // This arm is resumes and prewarm only. A mandatory review is a one-shot with no
+            // session id, so it never lands here. Stated as a false rather than inherited, so
+            // that if a review ever DOES reach this path the omission is visible in the diff
+            // instead of silently taking the daemon's depth.
+            run_grok_cli_process_with_session(
+                bin, args, message, cwd, session_id, events_tx, track, false,
+            )
+            .await
         }
         "claude" => {
             run_claude_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
