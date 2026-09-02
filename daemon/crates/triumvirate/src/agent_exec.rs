@@ -3,7 +3,8 @@ use crate::{
     spawn_dead_drop,
 };
 use agent_adapter::{
-    ApprovalChannelMode, CodexAppServerEvent, CodexAppServerParser, CodexExecParser,
+    ApprovalChannelMode, ClaudeStreamParser, CodexAppServerEvent, CodexAppServerParser,
+    CodexExecParser,
     GrokStreamParser, GrokTermination,
     GeminiStreamParser, ParsedAgentResult, StuckDetector, ToolCallRecord, ToolKind, WorkingState,
     WorkingStateEvent, format_working_state, probe_approval_response_channel, should_display,
@@ -1546,6 +1547,18 @@ const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
     // tool events to record, so the fix was dispatching agy with --output-format stream-json
     // rather than teaching the old parser to see something that was never there.
     "agy-stream-json",
+    // crates/agent-adapter/src/claude_stream.rs: pushes on a content block of type "tool_use".
+    //
+    // Added 2026-09-02, and the reason is the same one as agy's, one seat over. `claude` is a
+    // DEFAULT reviewer and its runner built ParsedAgentResult from Default::default(): empty
+    // parser mode, empty tool_calls. So the claude seat was permanently closed against the
+    // sight gate, and turning sight on for the reviewer would have rejected roughly one review
+    // in three for a fault that is the harness's.
+    //
+    // `claude-plain-text` is deliberately NOT here. That mode is what the runner falls back to
+    // when no `result` event arrived, which means the turn was not stream-json and there is no
+    // receipt mechanism to trust.
+    "claude-stream-json",
 ];
 
 /// Agents that have no tools at all, so `require_sight` can never be satisfied by them.
@@ -1642,6 +1655,11 @@ const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
     // This closes Grok's "Codex can be sighted and cannot be source-gated", which mattered
     // because codex is the peer most likely to be reviewing code.
     "codex-exec-json",
+    // Added 2026-09-02. The claude stream names the tool directly ("Read", "Grep", "Bash"), so
+    // read against search against shell is a first-class distinction rather than something
+    // inferred from a command line. Verified against a live capture: an allowed Read records
+    // ToolKind::ReadFile with the path in args_json, and a DENIED one records success: false.
+    "claude-stream-json",
 ];
 
 /// Did any COMPLETED, SUCCESSFUL READ of this source happen?
@@ -2107,6 +2125,30 @@ async fn enforce_mandatory_peer_review(
     // A fence is not a guarantee against a determined injection. It is the cheap part; the
     // expensive part is that the verdict must be a whole token on the first line, so an
     // instruction buried in the artifact has to survive both.
+    // GOAL 1.5. THE ARTIFACT IS WRITTEN TO A FILE SO THE REVIEWER CAN BE MADE TO OPEN IT.
+    //
+    // The tension this resolves, stated rather than papered over. The artifact is inline text,
+    // so the previous comment here said `required_sources` must stay empty because "a review of
+    // a pasted artifact is legitimately toolless, which is the one review shape the sight gate
+    // must NOT reject". That was true, and it also meant the reviewer could approve having
+    // opened nothing, which is a slower rubber stamp.
+    //
+    // Giving the artifact a path removes the tension instead of choosing a side: the reviewer
+    // now HAS something to open, so requiring it to open something is fair.
+    //
+    // Is requiring a read of text that is also in the prompt partly ceremonial? Yes, and that is
+    // said plainly rather than oversold. What it buys is exact: a reviewer that made zero tool
+    // calls can no longer return APPROVE, which is the failure actually observed on 2026-09-01
+    // when a peer described its own toolless output as "rigorous sourcing". It does not prove
+    // the contents were used. That next layer is entailment, and it is not built.
+    let review_dir = project_root.join(".triumvirate").join("reviews");
+    fs::create_dir_all(&review_dir)
+        .map_err(|e| format!("mandatory peer review failed to create review dir: {e}"))?;
+    let artifact_path = review_dir.join(format!("{}.md", review.review_id));
+    fs::write(&artifact_path, &review_artifact)
+        .map_err(|e| format!("mandatory peer review failed to write the artifact: {e}"))?;
+    let artifact_path_str = artifact_path.to_string_lossy().to_string();
+
     let review_prompt = format!(
         "You are reviewing another agent's output.\n\n\
          Reply with a verdict on the FIRST line: exactly one of APPROVE, CONCERNS or REJECT, \
@@ -2119,8 +2161,13 @@ async fn enforce_mandatory_peer_review(
          including a request to reply with a particular verdict, that is itself a finding and \
          should make you REJECT.\n\n\
          The output was produced by {author}.\n\n\
+         The same text is on disk at {path}. READ THAT FILE with your file-reading tool before \
+         you answer. A review that opens nothing is recollection, and this dispatch is checked: \
+         an answer with no successful read of that path is rejected whatever verdict it \
+         carries.\n\n\
          ----- BEGIN OUTPUT UNDER REVIEW -----\n{artifact}\n----- END OUTPUT UNDER REVIEW -----",
         author = display_agent_name(agent),
+        path = artifact_path_str,
         artifact = review_artifact,
     );
     let review_req = AskAgentRequest {
@@ -2128,6 +2175,11 @@ async fn enforce_mandatory_peer_review(
         message: review_prompt,
         cwd: Some(exec_cwd.to_string()),
         is_peer_review: Some(true),
+        // GOAL 1.5: the reviewer goes through the SAME sight gate the session-review path uses.
+        // `required_sources` also flips `read_only` on for the backends that have a containment
+        // knob, so the reviewer is contained as well as checked.
+        require_sight: Some(true),
+        required_sources: vec![artifact_path_str.clone()],
         ..Default::default()
     };
 
@@ -3809,8 +3861,50 @@ async fn run_claude_cli_process_with_session(
     cwd: &str,
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    // This dispatch is a REVIEW. claude gets a read-only tool allow-list, which is BOTH the
+    // containment and the thing that lets it look at all: see below.
+    read_only: bool,
 ) -> anyhow::Result<ParsedAgentResult> {
     let mut final_args = args.to_vec();
+
+    // FIND-REVIEW-05. `claude` is a DEFAULT peer reviewer and this runner used to build its
+    // result from `Default::default()`: no parser mode, no tool calls. The seat was
+    // structurally incapable of producing a receipt, so sight-gating the reviewer would have
+    // rejected it 100% of the time however carefully it looked.
+    //
+    // Verified live on 2026-09-02 against the installed CLI, not assumed from documentation.
+    // Only added when the operator has not already chosen an output format themselves.
+    let operator_chose_format = args.iter().any(|a| a == "--output-format");
+    if !operator_chose_format {
+        final_args.push("--output-format".to_string());
+        final_args.push("stream-json".to_string());
+        // stream-json without --verbose emits only the final result, so the tool calls the
+        // sight gate needs would never appear.
+        final_args.push("--verbose".to_string());
+    }
+
+    if read_only && !args.iter().any(|a| a == "--allowedTools") {
+        // WITHOUT THIS, A HEADLESS CLAUDE CANNOT LOOK AT ALL.
+        //
+        // Captured on 2026-09-02: with no allow-list it asked to Read, was auto-denied, and
+        // emitted `permission_denied` plus a tool_result with is_error. The turn then looks
+        // exactly like a reviewer that chose not to look, and the gate would reject it for a
+        // fault that is the harness's. Same failure agy had, same rule: a zero from a blocked
+        // instrument is not evidence about the agent.
+        //
+        // The list is also the containment. It is read-only by construction: no Write, no Edit,
+        // no Bash, so a reviewer cannot touch what it is reviewing even though nothing here
+        // wraps it in a sandbox.
+        final_args.push("--allowedTools".to_string());
+        final_args.push("Read,Grep,Glob".to_string());
+    }
+
+    // `-p` LAST, and this is load bearing, not style.
+    //
+    // `--allowedTools` is VARIADIC: `claude --allowedTools "Read,Grep,Glob" "the prompt"`
+    // swallows the prompt as another tool name and dies with "Input must be provided either
+    // through stdin or as a prompt argument when using --print". Hit while capturing the
+    // fixture. The prompt must arrive behind an explicit flag that terminates the list.
     final_args.push("-p".to_string());
     final_args.push(message.to_string());
 
@@ -3862,12 +3956,14 @@ async fn run_claude_cli_process_with_session(
 
     let mut reader = BufReader::new(stdout).lines();
     let mut raw_output = String::new();
+    let mut parser = ClaudeStreamParser::new();
     let timeout_duration = connector_timeout();
 
     let read = async {
         while let Some(line) = reader.next_line().await? {
             raw_output.push_str(&line);
             raw_output.push('\n');
+            parser.parse_line(&line);
             if let Some(events_tx) = events_tx.as_ref() {
                 emit_working_event(
                     Some(events_tx),
@@ -3901,9 +3997,21 @@ async fn run_claude_cli_process_with_session(
         anyhow::bail!("claude connector failed: exited with status {status}");
     }
 
-    let mut parsed = ParsedAgentResult {
-        response_text: raw_output.trim().to_string(),
-        ..Default::default()
+    // The parser only gets to claim its mode when a `result` event actually arrived.
+    //
+    // A claude that ran in plain text (a mock binary in a test, an operator override in
+    // TRIUMVIRATE_CLAUDE_ARGS, an older CLI) produces no events, and stamping
+    // `claude-stream-json` on that turn would put a blind parser on the sight gate's allowlist.
+    // That is precisely the fig leaf the allowlist exists to remove, so the fallback keeps the
+    // raw text and an UNTRUSTED mode name, and the gate fails it closed.
+    let mut parsed = if parser.saw_result() {
+        parser.finish()
+    } else {
+        ParsedAgentResult {
+            response_text: raw_output.trim().to_string(),
+            parser_mode: "claude-plain-text".to_string(),
+            ..Default::default()
+        }
     };
     if parsed.session_id.is_none() {
         parsed.session_id = session_id.map(ToString::to_string);
@@ -3983,8 +4091,10 @@ async fn run_agent_process_with_session(
             .await
         }
         "claude" => {
-            run_claude_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
-                .await
+            run_claude_cli_process_with_session(
+                bin, args, message, cwd, session_id, events_tx, read_only,
+            )
+            .await
         }
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
@@ -4956,7 +5066,7 @@ mod sight_gate_tests {
     ///
     /// RED IF: any parser mode is added to or removed from the allowlist.
     #[test]
-    fn sight_06_the_allowlist_is_exactly_the_three_verified_parsers() {
+    fn sight_06_the_allowlist_is_exactly_the_verified_parsers() {
         assert_eq!(
             PARSER_MODES_WITH_TOOL_RECORDS,
             &[
@@ -4964,13 +5074,55 @@ mod sight_gate_tests {
                 "gemini-stream-json",
                 "grok-streaming-json",
                 "agy-stream-json",
+                // Added 2026-09-02. Confirmed the way this test demands: `claude_stream.rs`
+                // pushes a ToolCallRecord on every content block of type "tool_use", and that
+                // is exercised against a LIVE capture, not a hand-written fixture.
+                "claude-stream-json",
             ],
             "the allowlist changed. Open the parser you are adding and confirm it actually \
              calls tool_calls.push on a real tool event. These are known NOT to: \
              agy-pipe-plain-text, agy-pty-plain-text, codex-app-server-jsonrpc, \
-             grok-batch-json, deepseek-sse. Trusting a blind parser false-rejects every \
-             review from that route."
+             grok-batch-json, deepseek-sse, claude-plain-text. Trusting a blind parser \
+             false-rejects every review from that route."
         );
+    }
+
+    /// The SECOND allowlist is pinned too, and it had no pin until 2026-09-02.
+    ///
+    /// `sight_06` pins `PARSER_MODES_WITH_TOOL_RECORDS` and explains exactly why an exact pin
+    /// beats a known-blind list. `PARSER_MODES_THAT_CLASSIFY_READS` decides whether
+    /// `required_sources` can be enforced at all, which is the stronger of the two checks, and
+    /// nothing guarded it. Adding a mode that stamps every call the same way would have made
+    /// named-source enforcement silently meaningless on that route, which is the exact defect
+    /// codex-exec-json was fixed for.
+    ///
+    /// RED IF: any parser mode is added to or removed from the read-classifying allowlist.
+    #[test]
+    fn sight_30_the_read_classifying_allowlist_is_pinned() {
+        assert_eq!(
+            PARSER_MODES_THAT_CLASSIFY_READS,
+            &[
+                "gemini-stream-json",
+                "grok-streaming-json",
+                "agy-stream-json",
+                "codex-exec-json",
+                "claude-stream-json",
+            ],
+            "the read-classifying allowlist changed. Open the parser and confirm it can tell a              file READ from a search or a shell command. If it stamps every call the same kind,              required_sources cannot be enforced on it and a pass would be theatre."
+        );
+    }
+
+    /// A mode that claims to classify reads but is not trusted to record tool calls at all is
+    /// incoherent: the finer check would run on records the coarser check does not trust.
+    /// RED IF: the two lists drift apart.
+    #[test]
+    fn sight_31_read_classifiers_are_a_subset_of_recorders() {
+        for mode in PARSER_MODES_THAT_CLASSIFY_READS {
+            assert!(
+                PARSER_MODES_WITH_TOOL_RECORDS.contains(mode),
+                "{mode} classifies reads but is not on the tool-record allowlist, so the                  stronger check would run on records the weaker one does not trust"
+            );
+        }
     }
 
     /// BOTH success arms must gate before they record DONE.
@@ -6066,29 +6218,114 @@ mod mandatory_review_tests {
     ///
     /// `count_file` records one line per invocation, which is how the recursion test proves the
     /// reviewer was called exactly once rather than infinitely.
-    fn write_mock_reviewer(dir: &std::path::Path, verdict_line: &str, count_file: &std::path::Path) -> PathBuf {
-        let bin = dir.join(format!("mock-reviewer-{}", std::process::id()));
-        // The mock connector protocol is JSON-RPC on stdout with `result.text`, NOT plain
-        // lines. A plain-text mock is read as a failure, retried three times, and lands in the
-        // dead drop. Found by running this test rather than by reading the runner: the first
-        // version printed the verdict directly and produced three paid reviewer calls.
-        std::fs::write(
+    /// The AUTHOR stand-in. Reached through `run_mock_connector_process`, which is
+    /// `#[cfg(test)]` only and bails in production.
+    ///
+    /// Its protocol is JSON-RPC on stdout with `result.text`, NOT plain lines. A plain-text mock
+    /// is read as a failure, retried three times, and lands in the dead drop. Found by running
+    /// the test rather than by reading the runner: the first version printed the verdict
+    /// directly and produced three paid reviewer calls.
+    ///
+    /// The `mock-` filename prefix is what routes it there (`is_mock_connector`).
+    fn write_mock_author(dir: &std::path::Path, count_file: &std::path::Path) -> PathBuf {
+        let bin = dir.join(format!("mock-author-{}", std::process::id()));
+        write_executable(
             &bin,
-            format!(
-                "#!/usr/bin/env bash\n                 cat > /dev/null\n                 echo invoked >> {count}\n                 printf '{{\"result\":{{\"text\":\"%s\\\\n\\\\nreasoning follows\"}}}}\\n' '{verdict}'\n",
+            &format!(
+                "#!/usr/bin/env bash\ncat > /dev/null\necho invoked >> {count}\nprintf '{{\"result\":{{\"text\":\"the work\"}}}}\\n'\n",
                 count = count_file.display(),
-                verdict = verdict_line,
             ),
-        )
-        .expect("write mock");
+        );
+        bin
+    }
+
+    /// The REVIEWER stand-in, and deliberately NOT a `mock-` binary.
+    ///
+    /// As of Goal 1.5 the reviewer dispatch is sight-gated, so a stand-in that only prints a
+    /// verdict produces parser mode `codex-mock`, which is not on the allowlist, and every
+    /// review is rejected as "the instrument cannot see". Routing it through the mock connector
+    /// would mean inventing a way for a mock to satisfy the gate, and a gate with a test-only
+    /// bypass is not the gate that runs in production.
+    ///
+    /// So this emits the REAL `codex exec --experimental-json` wire format instead. These tests
+    /// then exercise the actual `CodexExecParser`, the actual read classification, and the
+    /// actual named-source matching.
+    ///
+    /// The `cat` is real: it reads the artifact file the dispatch just wrote, so the receipt is
+    /// earned rather than asserted. `command_reads_file_contents` classifies `cat` as a read and
+    /// `tool_call_touched_source` matches the path. Change `cat` to `ls` here and these tests go
+    /// red, which is exactly the property being claimed.
+    ///
+    /// The artifact path is recovered from the prompt rather than passed in, because that is
+    /// where a real reviewer gets it too.
+    fn write_sighted_reviewer(
+        dir: &std::path::Path,
+        verdict_line: &str,
+        count_file: &std::path::Path,
+    ) -> PathBuf {
+        write_reviewer_with_reader(dir, verdict_line, count_file, "cat")
+    }
+
+    /// As `write_sighted_reviewer`, with the reading command as a parameter.
+    ///
+    /// `cat` is a read. `ls` names the path without reading it, which is the exact hole the
+    /// sight gate already ruled on ("search is not a read"). An empty string emits no tool call
+    /// at all, which is the reviewer that answered from recollection. All three are needed:
+    /// without the negatives, the positive test passes for a gate that accepts anything.
+    fn write_reviewer_with_reader(
+        dir: &std::path::Path,
+        verdict_line: &str,
+        count_file: &std::path::Path,
+        reader: &str,
+    ) -> PathBuf {
+        let bin = dir.join(format!(
+            "fake-codex-{}-{}",
+            if reader.is_empty() { "blind" } else { reader },
+            std::process::id()
+        ));
+
+        // Built from explicit parts rather than by filtering lines out of one template. The
+        // filtering version dropped the wrong lines when the reader was empty and produced a
+        // script that emitted nothing, which surfaced as "no usable verdict" instead of the
+        // rejection the test was asserting. A test helper that fails in a way that mimics a
+        // different defect is worse than no helper.
+        let mut script = String::from("#!/usr/bin/env bash\n");
+        script.push_str("PROMPT=\"$*\"\n");
+        script.push_str(&format!("echo invoked >> {}\n", count_file.display()));
+
+        if !reader.is_empty() {
+            script.push_str(
+                "ARTIFACT=\"$(printf '%s' \"$PROMPT\" | grep -o '/[^[:space:]]*/[.]triumvirate/reviews/[^[:space:]]*[.]md' | head -1)\"\n",
+            );
+            script.push_str("if [ -n \"$ARTIFACT\" ]; then\n");
+            script.push_str(&format!(
+                "  printf '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\"}}}}\\n' \"$ARTIFACT\"\n"
+            ));
+            script.push_str(&format!("  {reader} \"$ARTIFACT\" > /dev/null 2>&1\n"));
+            script.push_str("  RC=$?\n");
+            script.push_str(&format!(
+                "  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\",\"exit_code\":%d}}}}\\n' \"$ARTIFACT\" \"$RC\"\n"
+            ));
+            script.push_str("fi\n");
+        }
+
+        script.push_str(&format!(
+            "printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{verdict_line}\\\\n\\\\nreasoning follows\"}}}}\\n'\n"
+        ));
+
+        write_executable(&bin, &script);
+        bin
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).expect("write mock");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
+            let mut perms = std::fs::metadata(path).expect("meta").permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&bin, perms).expect("chmod");
+            std::fs::set_permissions(path, perms).expect("chmod");
         }
-        bin
     }
 
     /// Clears the review env on EVERY exit path, including a panicking assertion.
@@ -6113,10 +6350,15 @@ mod mandatory_review_tests {
     }
 
     fn setup_review(verdict_line: &str) -> ReviewFixture {
+        setup_review_with_reader(verdict_line, "cat")
+    }
+
+    fn setup_review_with_reader(verdict_line: &str, reader: &str) -> ReviewFixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let counts = root.join("invocations.txt");
-        let bin = write_mock_reviewer(&root, verdict_line, &counts);
+        let author_bin = write_mock_author(&root, &counts);
+        let reviewer_bin = write_reviewer_with_reader(&root, verdict_line, &counts, reader);
         // Author and reviewer must be DIFFERENT agents: the engine refuses to let an agent
         // review its own output, and a single-name panel therefore fails every turn with
         // "no non-author reviewers available". Found by running this test.
@@ -6127,8 +6369,8 @@ mod mandatory_review_tests {
         //
         // SAFETY: serialised by `review_env_lock`, cleared by `clear_review_env`.
         unsafe {
-            std::env::set_var("TRIUMVIRATE_CODEX_BIN", &bin);
-            std::env::set_var("TRIUMVIRATE_CLAUDE_BIN", &bin);
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", &reviewer_bin);
+            std::env::set_var("TRIUMVIRATE_CLAUDE_BIN", &author_bin);
             std::env::set_var("TRIUMVIRATE_PEER_REVIEWERS", "codex");
             std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
         }
@@ -6216,6 +6458,64 @@ mod mandatory_review_tests {
             "the reviewer's own words must come back, or a block is unactionable; got: {err}"
         );
         assert!(fx.counts.exists(), "the reviewer process must actually have run");
+    }
+
+    /// GOAL 1.5, the headline: a reviewer that approves without opening anything is REJECTED.
+    ///
+    /// This is the failure actually observed on 2026-09-01, when a peer given filesystem access
+    /// made zero tool calls and described its own output as "rigorous sourcing". Before this,
+    /// mandatory review would have taken that APPROVE and shipped the turn.
+    ///
+    /// The assertion is on APPROVE specifically, not on any verdict. A reject that opened
+    /// nothing still blocks, so testing with REJECT would pass on a gate that does nothing.
+    ///
+    /// RED IF: require_sight or required_sources is dropped from the reviewer dispatch.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_14_a_reviewer_that_opened_nothing_cannot_approve() {
+        let _guard = review_env_lock();
+        let fx = setup_review_with_reader("APPROVE", "");
+        let out = run_review(&fx, "a claim that needs checking").await;
+
+        let err = out.expect_err("an approval from a reviewer that read nothing must not ship");
+        // The named-source branch fires, NOT the zero-tool-calls branch, because the reviewer
+        // dispatch always names the artifact. The bare "did it look at anything" fallback is
+        // only reachable when required_sources is empty, which this path never is. Asserting on
+        // the wrong branch was the first version of this test, and it failed for a reason that
+        // read like a different defect.
+        assert!(
+            err.contains("never successfully opened"),
+            "the block must name the source it never opened; got: {err}"
+        );
+        assert!(
+            err.contains("recollection"),
+            "the reason must survive to the caller; got: {err}"
+        );
+        assert!(
+            fx.counts.exists(),
+            "the reviewer must actually have RUN: this is a rejection of what it did, not of a              dispatch that never happened"
+        );
+    }
+
+    /// Naming the file is not reading it. `ls` puts the path in front of the model and the
+    /// contents nowhere, and the sight gate already ruled that a search cannot satisfy a source.
+    /// That ruling is re-asserted HERE, on the mandatory-review path, because a ruling that
+    /// holds in the helper and not on the route is the bug this pass was told not to repeat.
+    ///
+    /// RED IF: `command_reads_file_contents` starts accepting a path-namer, or the reviewer
+    /// dispatch stops passing required_sources.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh review"]
+    async fn review_15_naming_the_artifact_is_not_reading_it() {
+        let _guard = review_env_lock();
+        let fx = setup_review_with_reader("APPROVE", "ls");
+        let out = run_review(&fx, "a claim that needs checking").await;
+
+        let err = out.expect_err("an ls is not a read");
+        assert!(
+            err.contains("never successfully opened"),
+            "the block must name the unopened source; got: {err}"
+        );
     }
 
     /// FIND-REVIEW-02: a full inflight queue must not spend a live model call.

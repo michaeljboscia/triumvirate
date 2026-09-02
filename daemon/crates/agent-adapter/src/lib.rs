@@ -4,6 +4,7 @@
 
 pub mod codex;
 pub mod agy_stream;
+pub mod claude_stream;
 pub mod codex_app_server;
 pub mod gemini;
 pub mod grok;
@@ -11,6 +12,7 @@ pub mod markers;
 pub mod stuck;
 pub mod types;
 
+pub use claude_stream::{ClaudeStreamParser, PARSER_MODE_STREAM as CLAUDE_PARSER_MODE_STREAM};
 pub use codex::CodexExecParser;
 pub use agy_stream::{AgyStreamParser, PARSER_MODE_STREAM as AGY_PARSER_MODE_STREAM};
 pub use codex_app_server::{

@@ -3983,12 +3983,26 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // launching the REAL codex CLI, paying for it, and failing whenever codex legitimately
         // rejected the mock gemini output. That is also what made the suite flaky.
         //
-        // The mock speaks the connector's JSON-RPC shape and always approves, so the assertions
-        // below test the review LIFECYCLE rather than a live model's opinion.
-        let reviewer = temp.path().join("mock-approver");
+        // It must also be a SIGHTED reviewer, and its filename must NOT start with `mock-`.
+        //
+        // As of Goal 1.5 the reviewer dispatch carries require_sight and names the artifact
+        // file, so a stand-in routed through the mock connector reports parser mode
+        // `codex-mock`, which is not on the sight allowlist, and the review is rejected as
+        // "the instrument cannot see". Building a test-only bypass into the gate would mean the
+        // gate under test is not the gate that runs, so the stand-in emits the real
+        // `codex exec --experimental-json` shape and performs a real `cat` of the artifact.
+        let reviewer = temp.path().join("fake-codex-approver");
         fs::write(
             &reviewer,
-            "#!/usr/bin/env bash\ncat > /dev/null\nprintf '{\"result\":{\"text\":\"APPROVE\\\\n\\\\nlooks fine\"}}\\n'\n",
+            "#!/usr/bin/env bash\n\
+             PROMPT=\"$*\"\n\
+             ARTIFACT=\"$(printf '%s' \"$PROMPT\" | grep -o '/[^[:space:]]*/[.]triumvirate/reviews/[^[:space:]]*[.]md' | head -1)\"\n\
+             if [ -n \"$ARTIFACT\" ]; then\n\
+             printf '{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\"}}\\n' \"$ARTIFACT\"\n\
+             cat \"$ARTIFACT\" > /dev/null 2>&1\n\
+             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\",\"exit_code\":0}}\\n' \"$ARTIFACT\"\n\
+             fi\n\
+             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"APPROVE\\\\n\\\\nlooks fine\"}}\\n'\n",
         )?;
         #[cfg(unix)]
         {
