@@ -367,6 +367,7 @@ impl CodexExecParser {
             events: self.events,
             tool_calls: self.tool_calls,
             token_usage: self.token_usage,
+            self_reported_cost_usd: None,
             cli_version: None,
             parser_mode: "codex-exec-json".to_string(),
         }

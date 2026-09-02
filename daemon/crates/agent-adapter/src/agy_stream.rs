@@ -345,6 +345,7 @@ impl AgyStreamParser {
             events: self.events,
             tool_calls: self.tool_calls,
             token_usage: self.usage,
+            self_reported_cost_usd: None,
             cli_version: None,
             parser_mode: PARSER_MODE_STREAM.to_string(),
         }

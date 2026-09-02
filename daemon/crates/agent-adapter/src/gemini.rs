@@ -255,6 +255,7 @@ impl GeminiStreamParser {
             events: self.events,
             tool_calls: self.tool_calls,
             token_usage: self.token_usage,
+            self_reported_cost_usd: None,
             cli_version: self.cli_version,
             parser_mode: "gemini-stream-json".to_string(),
         }

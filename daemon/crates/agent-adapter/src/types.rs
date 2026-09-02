@@ -84,13 +84,23 @@ pub struct WorkingStateEvent {
     pub ts_ms: Option<u128>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]  // `Eq` dropped: f64 has no total order.
 pub struct ParsedAgentResult {
     pub response_text: String,
     pub session_id: Option<String>,
     pub events: Vec<WorkingStateEvent>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub token_usage: Option<TokenUsage>,
+    /// Cost the AGENT reported for this turn, in USD, when it reports one.
+    ///
+    /// Only grok does today: `end.total_cost_usd`. It runs on a flat SuperGrok plan, so this is
+    /// a USAGE signal rather than a bill, and it is the only per-turn quota number available
+    /// for a subscription agent.
+    ///
+    /// It was being dropped: the runner persisted `cost_usd: None` while the parser had the
+    /// value in hand, so grok quota burn was under-recorded. Codex found it reviewing slice J.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_reported_cost_usd: Option<f64>,
     pub cli_version: Option<String>,
     pub parser_mode: String,
 }

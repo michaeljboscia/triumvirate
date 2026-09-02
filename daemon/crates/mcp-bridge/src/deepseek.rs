@@ -1375,6 +1375,9 @@ async fn consume_stream(
         tool_calls: Vec::new(),
         token_usage: Some(to_adapter_token_usage(&usage)),
         cli_version: None,
+        // DeepSeek is metered per token and its cost is computed from the price table, not
+        // self-reported by the agent.
+        self_reported_cost_usd: None,
         parser_mode: "deepseek-sse".to_string(),
     })
 }

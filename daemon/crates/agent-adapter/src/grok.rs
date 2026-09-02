@@ -468,6 +468,8 @@ impl GrokStreamParser {
             session_id: value.get("sessionId").and_then(Value::as_str).map(str::to_string),
             events: Vec::new(),
             tool_calls: Vec::new(),
+            // The batch payload carries no cost field; only the streaming `end` event does.
+            self_reported_cost_usd: None,
             token_usage: usage,
             cli_version: None,
             parser_mode: "grok-batch-json".to_string(),
@@ -499,6 +501,9 @@ impl GrokStreamParser {
             events: self.events,
             tool_calls: self.tool_calls,
             token_usage: self.token_usage,
+            // grok's own `end.total_cost_usd`. The runner used to persist `cost_usd: None`
+            // while this value sat here unused, so quota burn was under-recorded.
+            self_reported_cost_usd: self.total_cost_usd,
             cli_version: None,
             parser_mode: "grok-streaming-json".to_string(),
         }
@@ -966,4 +971,65 @@ pub struct GrokParsed {
     /// Grok's self-reported spend. A usage signal on a flat subscription, not a bill.
     pub total_cost_usd: Option<f64>,
     pub error_detail: Option<String>,
+}
+
+#[cfg(test)]
+mod cost_passthrough_tests {
+    use super::*;
+
+    const TOOLS: &str = include_str!("../tests/fixtures/grok-streaming-tools-20260830.jsonl");
+
+    fn parse_fixture() -> ParsedAgentResult {
+        let mut p = GrokStreamParser::new();
+        for line in TOOLS.lines() {
+            let _ = p.parse_line(line);
+        }
+        p.finish()
+    }
+
+    /// grok's self-reported cost must reach `ParsedAgentResult`, or the runner cannot persist it.
+    ///
+    /// Slice J of the chorus fix list requires direct token records to use `end.usage` AND
+    /// `total_cost_usd`. The parser captured the cost and the runner wrote `cost_usd: None`, so
+    /// grok quota burn was under-recorded on every consult. Codex found it.
+    ///
+    /// grok runs on a flat plan, so this is a USAGE signal rather than a bill, and it is the
+    /// only per-turn quota figure a subscription agent gives us.
+    ///
+    /// RED IF: `finish()` stops carrying `total_cost_usd` through.
+    #[test]
+    fn grok_cost_survives_into_the_parsed_result() {
+        let parsed = parse_fixture();
+        assert_eq!(
+            parsed.self_reported_cost_usd,
+            Some(0.00271796),
+            "the live capture reports total_cost_usd and it must not be dropped"
+        );
+    }
+
+    /// Reasoning tokens must survive too: the runner wrote `thinking_tokens: 0` while the
+    /// usage block had them.
+    /// RED IF: thinking tokens stop reaching the usage block.
+    #[test]
+    fn grok_reasoning_tokens_survive_into_the_usage_block() {
+        let parsed = parse_fixture();
+        let thinking = parsed
+            .token_usage
+            .as_ref()
+            .and_then(|u| u.thinking_tokens)
+            .unwrap_or(0);
+        assert!(
+            thinking > 0,
+            "the live capture carries reasoning_tokens; got {thinking}"
+        );
+    }
+
+    /// The batch path genuinely has no cost, and must say so rather than inventing one.
+    /// RED IF: batch starts reporting a fabricated cost.
+    #[test]
+    fn the_batch_path_reports_no_cost_rather_than_a_wrong_one() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"text":"hi","usage":{"input_tokens":1}}"#).unwrap();
+        assert_eq!(GrokStreamParser::parse_batch_json(&v).self_reported_cost_usd, None);
+    }
 }

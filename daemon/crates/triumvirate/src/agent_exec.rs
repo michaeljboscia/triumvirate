@@ -188,9 +188,14 @@ fn persist_daemon_token_record(
         input_tokens: cast_u64_to_i64(input),
         output_tokens: cast_u64_to_i64(output),
         cached_tokens: cast_u64_to_i64(cached),
-        thinking_tokens: 0,
+        // Both were hardcoded away while the parser had them. `thinking_tokens` is on the
+        // usage block every streaming parser fills, and `cost_usd` is grok's self-reported
+        // `end.total_cost_usd`. Grok runs on a flat plan, so the number is a USAGE signal
+        // rather than a bill, and it is the only per-turn quota figure a subscription agent
+        // gives us. Codex found this reviewing slice J.
+        thinking_tokens: cast_u64_to_i64(usage.and_then(|u| u.thinking_tokens).unwrap_or(0)),
         total_tokens: cast_u64_to_i64(total),
-        cost_usd: None,
+        cost_usd: parsed.self_reported_cost_usd,
         latency_ms: None,
         tool_calls: Some(cast_usize_to_i64(parsed.tool_calls.len())),
         lines_added: None,
@@ -2529,6 +2534,8 @@ async fn run_mock_connector_process(
         tool_calls: vec![],
         token_usage: None,
         cli_version: None,
+        // Mock connector: no agent, no cost.
+        self_reported_cost_usd: None,
         parser_mode: format!("{agent}-mock"),
     })
 }

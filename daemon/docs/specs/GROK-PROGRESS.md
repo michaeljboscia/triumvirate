@@ -385,3 +385,32 @@ the SAME false containment claim I had already corrected inside the daemon, repe
 told to write. `dispatch.sh` now passes `--sandbox read-only` explicitly.
 
 39 groups green. Clippy clean except the pre-existing `pantheon` warning.
+
+### Slice J defect applied deliberately, 2026-09-01
+
+Codex's finding, applied by hand rather than by taking its patch, because that patch also
+carried an incomplete ABE change that left the workspace not compiling.
+
+`persist_daemon_token_record` wrote `thinking_tokens: 0` and `cost_usd: None` while the grok
+parser had both values in hand. Every grok consult under-recorded its quota burn.
+
+- `ParsedAgentResult` gains `self_reported_cost_usd`. Only grok sets it, from
+  `end.total_cost_usd`. Every other parser sets `None` explicitly rather than by default, so a
+  new parser has to decide rather than inherit silence.
+- `thinking_tokens` now reads from the usage block, which every streaming parser already fills.
+- `Eq` was dropped from the `ParsedAgentResult` derive, since `f64` has no total order.
+- The DeepSeek Err-path record still writes zeros. That one is deliberate and commented as a
+  narrow error record, not the same defect.
+
+grok runs on a flat plan, so the cost figure is a USAGE signal rather than a bill, and it is the
+only per-turn quota number a subscription agent gives us.
+
+Three tests against the live capture, mutation-verified: dropping the passthrough reds
+`grok_cost_survives_into_the_parsed_result`. The batch path asserts it reports NO cost rather
+than inventing one.
+
+### Harness containment, now tested rather than claimed
+
+`~/.claude/scripts/peer-review/dispatch.sh` passes `codex exec --sandbox read-only`. Verified
+empirically: told to create a file, codex did not, and reported "The filesystem sandbox is
+read-only."

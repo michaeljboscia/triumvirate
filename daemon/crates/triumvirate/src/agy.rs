@@ -864,6 +864,9 @@ fn build_result(text: String, log_info: &AgyLogInfo, parser_mode: &str) -> Parse
         tool_calls: Vec::new(),
         token_usage: None,
         cli_version: log_info.model.clone(),
+        // The plain-text agy path reports no cost. The stream path carries usage but agy
+        // does not self-report a dollar figure.
+        self_reported_cost_usd: None,
         parser_mode: parser_mode.to_string(),
     }
 }
