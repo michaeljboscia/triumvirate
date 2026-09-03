@@ -14,16 +14,24 @@ The hard part of multi-agent development is not dispatch. It is knowing whether 
 
 ```bash
 git clone https://github.com/michaeljboscia/triumvirate
-cd triumvirate/daemon
-cargo build --release && cargo run --release
+cd triumvirate
+bash scripts/install.sh
 ```
 
 That's it. One binary. No Docker. No NATS. No cloud services. Register it in Claude Code:
 
 ```bash
 # Add to ~/.claude.json under mcpServers:
-"triumvirate": { "command": "/path/to/triumvirate", "args": ["mcp"] }
+"triumvirate": { "command": "~/.local/bin/triumvirate", "args": ["mcp"] }
 ```
+
+> **Do NOT point this at `daemon/target/release/triumvirate`.** `target/` is Cargo's disposable
+> build directory: `cargo clean`, a toolchain change or any disk cleaner wipes it. When that
+> happened here on 2026-07-23, every new MCP session in every repo failed with ENOENT while
+> already-running processes kept working, because Unix keeps a deleted binary alive for an open
+> file descriptor. A total outage disguised as "broken everywhere except here".
+> `scripts/install.sh` builds into `target/` and then installs to a stable path for exactly
+> this reason.
 
 Then from any Claude session: `spawn a Gemini session called 'research'`
 
@@ -69,8 +77,8 @@ Persistent sessions. Live streaming. Cross-model coordination. From inside Claud
 
 | Skill | What It Does |
 |-------|-------------|
-| **`/goatrodeo`** | Multi-round spec review. Spawns Gemini and Codex as adversarial reviewers. They interrogate your spec, auto-resolve what they agree on, and surface only what needs human judgment. Produces battle-tested requirements with traceable REQ-IDs. |
-| **`/postrodeo`** | Post-build retrospective. Audits what was built against what was specced. Spawns twins to review code diffs. Produces a completion matrix, deviation analysis, and lessons. |
+| **`/goatrodeo`** | Multi-round spec review. Spawns peers as adversarial reviewers, each on a different lens. They interrogate your spec, auto-resolve what they agree on, and surface only what needs human judgment. Produces battle-tested requirements with traceable REQ-IDs. |
+| **`/postrodeo`** | Post-build retrospective. Audits what was built against what was specced. Spawns peers to review code diffs. Produces a completion matrix, deviation analysis, and lessons. |
 | **`/design-goatrodeo`** | Design-specific variant. Pressure-tests visual specs, UX flows, and information architecture. |
 
 **The verification:** blind validation, when the thing being checked is code.
@@ -112,10 +120,10 @@ This is how software gets built with Triumvirate:
 ```
          ┌─────────────────────────────────────────┐
          │                                         │
-    Spec ──→ /goatrodeo ──→ Implementation ──→ /postrodeo
-         │   (Gemini +       (Codex builds      (twins audit   │
-         │    Codex review    from the spec)      the code)     │
-         │    the spec)                                         │
+    Spec ──→ /goatrodeo ──→ Implementation ──→ /postrodeo ──→ blind_validate
+         │   (the panel      (a worker builds   (the panel     (a DIFFERENT   │
+         │    reviews         in an isolated     audits the     agent writes   │
+         │    the spec)       worktree)          code)          the tests)     │
          │                                         │
          └──── lessons feed back into next cycle ──┘
 ```
@@ -124,8 +132,9 @@ The goatrodeo runs *through the daemon*. It spawns peers as daemon sessions to r
 
 Since the trust layer landed, the loop has a fourth step that is not optional in practice:
 nothing is committed until the panel has seen it. That is not a rule the daemon enforces on a
-human, it is a working practice, and it exists because there is no CI here yet. The panel is the
-only gate.
+human, it is a working practice. CI exists and runs check, clippy and the unit tests on every
+push, but it runs AFTER the commit and only covers `--lib`. The panel is the part that runs
+before, and it is the part that reads intent rather than types.
 
 **This project was built using this loop.** The Flow State feature (live agent streaming) went through a 4-round goatrodeo: 27 requirements, 29 auto-resolves, 5 human decisions, all running through the daemon. Then Codex implemented all 6 phases from the resulting spec while the human took a nap.
 
@@ -174,16 +183,16 @@ it does. That would need a mutation run, and it is not built.
 
 | Skill | Lines | What It Does |
 |-------|-------|-------------|
-| `/goatrodeo` | ~900 | Industrialized spec review. Interrogation rounds, live research, twin review, auto-resolve, decision ledger. |
-| `/postrodeo` | ~600 | Build retrospective. Completion matrix, deviation analysis, Layer 6 semantic check, twin code review. |
-| `/design-goatrodeo` | ~500 | Design spec variant. Visual standards, UX flows, information architecture. |
+| `/goatrodeo` | 748 | Industrialized spec review. Interrogation rounds, live research, panel review, auto-resolve, decision ledger. |
+| `/postrodeo` | 573 | Build retrospective. Completion matrix, deviation analysis, Layer 6 semantic check, panel code review. |
+| `/design-goatrodeo` | 348 | Design spec variant. Visual standards, UX flows, information architecture. |
 
 ### Starter Kit (`starter-kit/`)
 
 Full installer for multi-agent development:
 - **Claude:** hooks (session lifecycle, token gating, artifact protection), skills, CLAUDE.md
 - **Codex:** hooks (session recovery, pre-compact), config, AGENTS.md
-- **Gemini:** hooks (session recovery, pre-compact), GEMINI.md
+- **Antigravity / Gemini:** hooks (session recovery, pre-compact), GEMINI.md
 - **Stenographer:** local session notes via Ollama (zero cloud cost)
 - **MCP server registration:** wires agents to communicate through the daemon
 
@@ -264,14 +273,15 @@ The dispatch half and the trust half both ship. What is left is coverage and sca
 | **The trust layer** | **Shipped** | Sight gate, named sources, whole-file reads, mandatory review with a real dispatch, proof of read, verdict authority, blind validation. |
 | **Mutation-based validation** | Not built | The honest gap in blind validation. Break the implementation deliberately and require the blind tests to go red. Until then a weak test against a NEW API passes. |
 | **Live tool captures for every parser** | Partial | Only `read_file` appears in a live grok fixture. `run_terminal_command`, `search_replace`, `grep` and one Unknown are still to capture. |
-| **CI** | Not built | There is no CI on this repo. The peer panel is currently the only gate between a change and `main`, which is why review runs before commit rather than after. |
+| **CI beyond `--lib`** | Partial | GitHub Actions runs check, clippy `-D warnings`, `cargo test --lib` and a release build on Linux and macOS, on every push and PR. It does NOT run integration tests, and `cargo fmt --check` is commented out because the workspace has pre-existing unformatted code. |
 | **Dashboard** | In progress | Web UI for watching all agent sessions in real time. |
 | **Fleet scaling** | Planned | Multiple orchestrators, mixed worker types, concurrent builds. |
 | **Cedar governance** | Planned | Policy-based approval gates for destructive operations. |
 
-Two things are deliberately NOT claimed. ABE and fleet task completion do not enter the review
-gate at all, so work can still leave the building without a reviewer. And `TRIUMVIRATE_REQUIRE_PEER_REVIEW`
-is opt-in.
+Three things are deliberately NOT claimed. ABE and fleet task completion do not enter the review
+gate at all, so work can still leave the building without a reviewer. `TRIUMVIRATE_REQUIRE_PEER_REVIEW`
+is opt-in. And CI runs `cargo test --lib` only, so the integration tests under
+`daemon/crates/triumvirate/tests/` are green locally and unverified in CI.
 
 The daemon is the coordination layer. The methodology runs on top of it. The agents do the work.
 
@@ -308,7 +318,7 @@ Every fix is mutation tested: the fix is broken on purpose and the test must go 
 caught four tests of mine that were green for the wrong reason, including one whose input
 happened to contain an even number of quotes so a parser bug cancelled itself out.
 
-37 research artifacts documenting the design process are in `archive/research/`.
+51 research artifacts documenting the design process are in `archive/research/`.
 
 ---
 
@@ -319,13 +329,21 @@ Triumvirate doesn't work alone. It's one layer in a stack of tools that collabor
 | Tool | Role | How It Fits |
 |------|------|-------------|
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Primary development agent | The cockpit. You sit here. Triumvirate and Pythia plug in as MCP servers. Skills like `/goatrodeo` run from here. |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Research + adversarial review | 2M context window. Goatrodeo spawns Gemini sessions for spec interrogation. Gemini search provides live web research during review rounds. |
-| [Codex CLI](https://github.com/openai/codex) | Implementation engine | Builds from specs. Goatrodeo spawns Codex for implementer-perspective review. Then Codex builds the thing it just reviewed. |
+| [Codex CLI](https://github.com/openai/codex) | Implementation, and authorisation review | Builds from specs, and is the peer most likely to find a boundary that is not a boundary. Real sandbox: `--sandbox read-only` is verified, not assumed. |
+| [Antigravity](https://antigravity.google) / [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Research, and test adequacy | Large context. The peer that asks whether a test could actually fail, which has caught several that could not. |
+| [grok CLI](https://x.ai) | Adversarial review | The peer most willing to say a fix closed the two cases you named and not the family they belong to. Reports its own per-turn cost. |
+| [DeepSeek](https://deepseek.com) | Method questions, over HTTP | No CLI and no filesystem through the bridge, so it is never a sighted reviewer. Cheap enough to ask freely. |
 | [Pythia](https://github.com/michaeljboscia/pythia) | Local code search | MCP server that indexes entire projects: code, docs, SQL, config, research. Agents query Pythia before making changes. Available in the same Claude session as Triumvirate. |
 | [Ollama](https://ollama.com) | Local LLM for session notes | Stenographer feeds transcripts to a local model. Zero cloud cost. Zero token spend. |
 | [MCP](https://modelcontextprotocol.io) | The protocol | Everything connects through MCP. Triumvirate is an MCP server. Pythia is an MCP server. Claude Code is the MCP client. One protocol, many tools, same session. |
 
 The daily workflow: Claude Code has Triumvirate and Pythia both registered as MCP servers. You search code with Pythia, spawn agent sessions with Triumvirate, and run goatrodeos that use both, all without leaving the editor. The tools compose because they share a protocol.
+
+**A note on the panel, learned by getting it wrong.** Dispatch every peer in ONE message and
+give each a DIFFERENT lens. Fanning out with `&` inside one backgrounded wrapper kills the
+siblings when the first one finishes, which cost two full reviews and looked like the models
+failing rather than the harness. And freeze the artifact before dispatching: two reviewers
+reading a tree that a third was editing produced findings about code that no longer existed.
 
 ---
 
@@ -344,6 +362,7 @@ No source code was vendored from any of these projects. Where patterns were adap
 | [RunDiffusion Agents](https://github.com/rundiffusion/RunDiffusion-Agents) | Apache 2.0 | YAML governance control plane, agent-manages-agents pattern |
 | [AgentsMesh](https://github.com/AgentsMesh/AgentsMesh) | BSL-1.1 | gRPC+mTLS control plane architecture (studied only, not used in production per BSL-1.1 terms) |
 | [Claude Agent Teams](https://docs.anthropic.com) | Anthropic | Git worktree isolation, shared task list with dependency tracking, peer-to-peer mailbox messaging |
+| ISO/IEC 27042 | Standard | The validation step, pointed at the reviewer rather than the evidence: before accepting a finding of absence, establish that the method could have detected the thing. That is the sight gate in one sentence. |
 
 ---
 
