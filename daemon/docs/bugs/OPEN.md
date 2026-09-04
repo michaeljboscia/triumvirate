@@ -136,6 +136,29 @@ artifact is not verifying the path.
 
 ## Closed
 
+### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"
+The codex read classifier allowed `cat`/`head`/`nl`; codex-cli 0.145.0 reads files as
+`sed -n 'N,Mp' FILE` windows and `nl -ba FILE | sed -n`, so 4 of 4 gated reviews that day
+were rejected, fresh worker and reused alike. The report that surfaced it blamed a stale
+worker. Fixed in `agent-adapter::codex::command_read_range` (the two shapes, nothing wider)
+and `agent_exec::codex_ranged_reads_cover_source` (windows unioned against the file's real
+line count). Rejections now carry a receipt: line count and windows seen, or every call that
+named the source. Check passed live: a 763-line file, 7 tool calls, gate PASSED; a reused
+thread that skipped lines 1-260 was rejected PART with the receipt showing exactly that.
+
+### 2026-09-03: grok Fast turn cap (6) below the floor for a review that opens files
+Three default-depth review dispatches hit max-turns at 6 with 19 to 32 tool calls and
+returned a one-line preamble. Raised to 12, and `grok_depth: "fast"|"deep"` added to
+`AskAgentRequest` so depth is a property of the request, not of the daemon's environment.
+The panel seat stays forced Fast. Check passed live: a request with `grok_depth: deep` on a
+Fast daemon spawned `--effort high --max-turns 30` (sampled from the child's argv).
+
+### 2026-09-03: comment misstated the ask timeout as 180s
+`agent_exec.rs` said the caller's `ask_agent` timeout fires at 180s. It is
+`DEFAULT_DAEMON_ASK_TIMEOUT_SECS` (900); 180s is the generic connector default. Two
+confidently wrong conclusions were drawn from it before the code was read. Comment now names
+the constant.
+
 ### 2026-07-28 — ask_agent timeout misreported as a dead daemon
 Error source chain discarded, unconditional restart advice, and autostart firing on timeout
 (one call, two paid dispatches). Fixed in `daemon-http` and `mcp-tools`, 8 tests, negative
@@ -163,4 +186,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-08-07
+**Last reviewed:** 2026-09-03

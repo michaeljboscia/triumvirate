@@ -425,12 +425,18 @@ pub(crate) async fn execute_ask_agent(
     // Every synchronous validation gate (unsupported agent, oversized DeepSeek payload) is now
     // behind us and classifies itself before returning. From here on we begin the real dispatch:
     // acquire a worker, talk to the provider, run peer review. Arm the telemetry so that if this
-    // future is CANCELLED mid-await — the caller's client-side `ask_agent` timeout fires at 180s,
-    // or the client disconnects — the guard emits `tv_outcome = "cancelled"` instead of the
-    // `unreported` sentinel. The metered DeepSeek path is the one that routinely runs long enough
-    // (thinking mode, absolute SLA of 1800s) to be killed by the 180s ceiling before any
-    // classify() arm runs, which is exactly how three terminal errors went missing from
-    // outcome-based monitoring.
+    // future is CANCELLED mid-await (the caller's client-side `ask_agent` timeout fires, which is
+    // `DEFAULT_DAEMON_ASK_TIMEOUT_SECS` in daemon-http, 900s unless
+    // `TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS` says otherwise, or the client disconnects) the guard
+    // emits `tv_outcome = "cancelled"` instead of the `unreported` sentinel. The metered DeepSeek
+    // path is the one that routinely runs long enough (thinking mode, absolute SLA of 1800s) to be
+    // killed by that ceiling before any classify() arm runs, which is exactly how three terminal
+    // errors went missing from outcome-based monitoring.
+    //
+    // This comment used to say the ceiling was 180s. It never was on this path: 180s is
+    // `TRIUMVIRATE_CONNECTOR_TIMEOUT_SECS`, the generic connector default, and a reader who
+    // trusted the number concluded that grok's 900s connector timeout was unreachable. Name the
+    // constant, not a literal, so it cannot drift again; `u_timeout_02` pins the relationship.
     tel.begin_dispatch();
 
     // REQ-001: resolve the gemini backend once, up front — it drives both the attempt
@@ -1647,10 +1653,17 @@ const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
     // Added 2026-09-01. codex-exec-json used to stamp EVERY call ToolKind::Bash, so on that
     // backend "opened the file" and "ran a command mentioning the file" were the same record
     // and named sources were refused rather than faked. `codex.rs` now classifies a
-    // `command_execution` as a READ when its command is a pure content reader (cat, head, sed
-    // -n, rg, grep, ...) and leaves everything else as Bash. The allowlist is conservative and
-    // fails closed: `ls`, `find`, `stat`, compound commands, pipes and redirections are all
+    // `command_execution` as a READ when its command is a pure content reader (cat, head, nl,
+    // ...) or one of the two RANGED shapes codex actually reads with (`sed -n 'a,bp' FILE` and
+    // `nl -ba FILE | sed -n 'a,bp'`), and leaves everything else as Bash. `rg` and `grep` are
+    // searches, not reads, and are NOT on the list. The allowlist is conservative and fails
+    // closed: `ls`, `find`, `stat`, compound commands, other pipes and redirections are all
     // still Bash and still cannot satisfy a source.
+    //
+    // 2026-09-03: the ranged shapes were added after every source-gated codex review that day
+    // was rejected "never opened". Codex reads files in 260-line windows with `sed -n`, which
+    // the reader list did not contain, and the previous version of THIS comment claimed
+    // `sed -n` was on it. See `codex_ranged_reads_cover_source` for how windows add up.
     //
     // This closes Grok's "Codex can be sighted and cannot be source-gated", which mattered
     // because codex is the peer most likely to be reviewing code.
@@ -1750,13 +1763,200 @@ fn tool_call_read_source_in_full(
     cwd: &str,
 ) -> bool {
     let candidates = source_path_candidates(source, cwd);
-    tool_calls.iter().any(|c| {
+    let whole = tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
             && c.args_json.as_deref().is_some_and(|args| {
                 candidates.iter().any(|cand| args_name_path(args, cand)) && !read_args_are_partial(&c.tool, args)
             })
-    })
+    });
+    whole || codex_ranged_reads_cover_source(tool_calls, &candidates, source, cwd)
+}
+
+/// Did codex's RANGED reads of `source`, taken together, cover every line of it?
+///
+/// Codex reads a file in windows (`sed -n '1,260p'`, then `'261,556p'`), never as one `cat`.
+/// Each window is a partial read, and FIND-REVIEW-07 is right that a partial read does not
+/// support a claim about the whole. The windows added up DO, so this unions every successful
+/// ranged read that names the source and checks the union against the file's real line count,
+/// read from disk here. The daemon runs on the same machine as the file, which is what makes
+/// the count available.
+///
+/// Fails closed at every step: no ranged reads, a file this process cannot read, or a gap
+/// anywhere between line 1 and the last line, and the answer is "not in full", which the gate
+/// reports as "only read PART". Grok's attack from round 3 stays closed: `sed -n '$p'` is not a
+/// range the parser accepts, and `'500,$p'` on a 556-line file leaves lines 1 to 499 uncovered.
+fn codex_ranged_reads_cover_source(
+    tool_calls: &[ToolCallRecord],
+    candidates: &[String],
+    source: &str,
+    cwd: &str,
+) -> bool {
+    let Some(bytes) = source_bytes(source, cwd) else {
+        return false;
+    };
+    // `nl` omits logical-page delimiter lines, so a window over `nl` output on a file that
+    // has one is a window over fewer lines than the source. Those windows do not count on
+    // such a file; a direct `sed -n` on it still does. Grok, round 3.
+    let nl_drops_lines = has_nl_delimiter_line(&bytes);
+    let ranges: Vec<agent_adapter::codex::LineRange> = tool_calls
+        .iter()
+        .filter(|c| {
+            c.tool == "command_execution"
+                && matches!(c.kind, ToolKind::ReadFile)
+                && c.success == Some(true)
+        })
+        .filter_map(|c| {
+            let args = c.args_json.as_deref()?;
+            let command = serde_json::from_str::<serde_json::Value>(args).ok()?;
+            let command = command.get("command")?.as_str()?;
+            let read = agent_adapter::codex::command_read_range(command)?;
+            // Bound to the operand the reader opened, not to a path string anywhere in the
+            // command. Codex, round 3: a decoy operand embedding the source path used to
+            // collect the source's coverage.
+            if !candidates.iter().any(|cand| cand == &read.operand) {
+                return None;
+            }
+            if read.via_nl && nl_drops_lines {
+                return None;
+            }
+            Some(read.range)
+        })
+        .collect();
+    if ranges.is_empty() {
+        return false;
+    }
+    ranges_cover_lines(&ranges, count_lines(&bytes))
+}
+
+/// The raw bytes of `source`, resolved against `cwd` when relative. `None` when this process
+/// cannot read it, which every caller treats as "not verifiable".
+fn source_bytes(source: &str, cwd: &str) -> Option<Vec<u8>> {
+    let path = std::path::Path::new(source);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(cwd).join(path)
+    };
+    std::fs::read(path).ok()
+}
+
+/// How many lines `sed` would number: newlines, plus one for an unterminated last line.
+fn count_lines(bytes: &[u8]) -> u64 {
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+    let unterminated = !bytes.is_empty() && bytes.last() != Some(&b'\n');
+    newlines + u64::from(unterminated)
+}
+
+/// Does the file contain a line that is exactly an `nl` logical-page delimiter (`\:`, `\:\:`
+/// or `\:\:\:`)? `nl` prints nothing for those lines, so its output has fewer lines than the
+/// source and a window over it is not a window over the source.
+fn has_nl_delimiter_line(bytes: &[u8]) -> bool {
+    bytes
+        .split(|b| *b == b'\n')
+        .any(|line| matches!(line, b"\\:" | b"\\:\\:" | b"\\:\\:\\:"))
+}
+
+/// The receipt for a PARTIAL rejection: the source's line count and each successful read that
+/// named it, as the parser recorded it. Codex reads show as their line windows; everything else
+/// shows its recorded arguments, truncated. Diagnostic text for a human, not parsed by anything.
+fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &str) -> String {
+    let candidates = source_path_candidates(source, cwd);
+    let total = source_line_count(source, cwd)
+        .map(|n| format!("{n} lines"))
+        .unwrap_or_else(|| "a line count the daemon could not obtain".to_string());
+    let reads: Vec<String> = tool_calls
+        .iter()
+        .filter(|c| matches!(c.kind, ToolKind::ReadFile) && c.success == Some(true))
+        .filter_map(|c| {
+            let args = c.args_json.as_deref()?;
+            if !candidates.iter().any(|cand| args_name_path(args, cand)) {
+                return None;
+            }
+            let window = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|v| v.get("command")?.as_str().map(str::to_string))
+                .and_then(|cmd| agent_adapter::codex::command_read_range(&cmd).map(|x| x.range));
+            Some(match window {
+                Some(r) => match r.end {
+                    Some(e) => format!("lines {}-{}", r.start, e),
+                    None => format!("lines {}-$", r.start),
+                },
+                None => {
+                    let mut a = args.to_string();
+                    if a.len() > 160 {
+                        a.truncate(160);
+                        a.push_str("...");
+                    }
+                    a
+                }
+            })
+        })
+        .collect();
+    format!("{source} has {total}; read this turn as [{}]", reads.join(", "))
+}
+
+/// The receipt for a NEVER-OPENED rejection: every recorded tool call, of any kind and any
+/// outcome, whose arguments name the source, so the caller can see whether the agent tried and
+/// failed, tried with a command the parser does not count as a read, or never tried at all.
+fn describe_attempts_on_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &str) -> String {
+    let candidates = source_path_candidates(source, cwd);
+    let attempts: Vec<String> = tool_calls
+        .iter()
+        .filter_map(|c| {
+            let args = c.args_json.as_deref()?;
+            if !candidates.iter().any(|cand| args_name_path(args, cand)) {
+                return None;
+            }
+            let outcome = match c.success {
+                Some(true) => "ok",
+                Some(false) => "FAILED",
+                None => "no exit status",
+            };
+            let mut a = args.to_string();
+            if a.len() > 160 {
+                a.truncate(160);
+                a.push_str("...");
+            }
+            Some(format!("{:?} {outcome} {a}", c.kind))
+        })
+        .collect();
+    if attempts.is_empty() {
+        format!(
+            "{source}: no tool call named it in {} recorded call(s) this turn",
+            tool_calls.len()
+        )
+    } else {
+        format!("{source}: named by [{}], none counted as a successful whole read", attempts.join(", "))
+    }
+}
+
+/// How many lines `sed` would number in `source`, resolved against `cwd` when relative.
+/// `None` when the file cannot be read by this process, which the caller treats as "not
+/// covered": an unverifiable claim is not evidence.
+fn source_line_count(source: &str, cwd: &str) -> Option<u64> {
+    source_bytes(source, cwd).map(|b| count_lines(&b))
+}
+
+/// Do these 1-based inclusive windows, unioned, cover lines 1 through `total`?
+fn ranges_cover_lines(ranges: &[agent_adapter::codex::LineRange], total: u64) -> bool {
+    if total == 0 {
+        return true;
+    }
+    let mut spans: Vec<(u64, u64)> = ranges
+        .iter()
+        .map(|r| (r.start, r.end.unwrap_or(total).min(total)))
+        .filter(|(s, e)| s <= e)
+        .collect();
+    spans.sort_unstable();
+    let mut need = 1u64;
+    for (start, end) in spans {
+        if start > need {
+            return false;
+        }
+        need = need.max(end + 1);
+    }
+    need > total
 }
 
 /// Do these tool arguments describe a PARTIAL read?
@@ -1951,15 +2151,28 @@ fn enforce_reviewer_sight(
             })
             .collect();
         if !peeked.is_empty() {
+            // Say WHAT was read, not only that it was partial. On 2026-09-03 a caller spent
+            // three dispatches deciding whether codex could not read or did not read; the
+            // rejection looked identical either way. Now it carries the receipt: the file's line
+            // count and every counted read of it, so "1,260 and 261,520 of 763" is one glance.
+            let evidence: Vec<String> = peeked
+                .iter()
+                .map(|src| describe_reads_of_source(tool_calls, src, cwd))
+                .collect();
             let detail = format!(
                 "{agent_display} was dispatched as a review over {} named source(s) and only \
                  read PART of {}: {}. A slice is not the source. `head`, `tail`, `cut`, a pager, \
                  or a read carrying `limit`/`offset` returns a few lines and leaves the work \
                  itself out of context, so a verdict formed from one cannot be about the work. \
-                 Re-read the whole file (`cat`, or a read with no limit and no offset).",
+                 Re-read the whole file ON THIS TURN (`cat`, or a read with no limit and no \
+                 offset; codex may read it in `sed -n` windows, and they must together cover \
+                 every line from 1 to the last with no gap). Only this turn's tool calls count: \
+                 a reused worker that read part of it on an earlier turn must read it all \
+                 again. Reads counted this turn: {}",
                 required_sources.len(),
                 if peeked.len() == 1 { "it" } else { "them" },
-                peeked.join(", ")
+                peeked.join(", "),
+                evidence.join(" | ")
             );
             lifecycle.push(LifecycleEvent {
                 state: "REJECTED".to_string(),
@@ -1974,14 +2187,23 @@ fn enforce_reviewer_sight(
             .filter(|src| !tool_call_touched_source(tool_calls, src, cwd))
             .collect();
         if !missed.is_empty() {
+            // Attempted-and-failed against never-attempted, which look identical without this.
+            // The report that asked for it had spent three dispatches telling them apart.
+            let evidence: Vec<String> = missed
+                .iter()
+                .map(|src| describe_attempts_on_source(tool_calls, src, cwd))
+                .collect();
             let detail = format!(
                 "{agent_display} was dispatched as a review over {} named source(s) and never \
                  successfully opened {} of them: {}. A review of sources it did not read is \
                  recollection. Rejecting the turn. If a source is genuinely not needed, drop it \
-                 from required_sources rather than leaving the claim unbacked.",
+                 from required_sources rather than leaving the claim unbacked. Only THIS turn's \
+                 tool calls count: a reused worker that read the file on an earlier turn must \
+                 read it again. Evidence: {}",
                 required_sources.len(),
                 missed.len(),
-                missed.join(", ")
+                missed.join(", "),
+                evidence.join(" | ")
             );
             lifecycle.push(LifecycleEvent {
                 state: "REJECTED".to_string(),
@@ -2604,8 +2826,19 @@ pub(crate) async fn run_named_agent_with_session_and_model(
             // client can set it to make its own consult cheap or to dodge the gate.
             let panel_child =
                 req_overrides.is_some_and(|r| r.is_peer_review.unwrap_or(false));
+            // Otherwise the caller's per-request `grok_depth` wins over the daemon's
+            // TRIUMVIRATE_GROK_DEPTH, and absent means the daemon default. Depth used to be a
+            // property of the process; a review that needs Deep and a consult that needs Fast
+            // arrive at the same daemon, so it has to be a property of the request.
+            let depth_override = if panel_child {
+                Some(mcp_bridge::grok::GrokDepth::Fast)
+            } else {
+                req_overrides
+                    .and_then(|r| r.grok_depth)
+                    .map(mcp_bridge::grok::GrokDepth::from)
+            };
             run_grok_cli_process_with_session(
-                &bin, &args, message, cwd, session_id, events_tx, track, panel_child,
+                &bin, &args, message, cwd, session_id, events_tx, track, depth_override,
             )
             .await
         }
@@ -3685,14 +3918,16 @@ async fn run_grok_cli_process_with_session(
     // True when something will actually KEEP the resulting session id: a named session, or an
     // explicit `reuse_session`. False for a one-shot consult.
     track_session: bool,
-    // FIND-GROK-04. True when this child is a mandatory-review panel seat, which is forced Fast
-    // regardless of the daemon's TRIUMVIRATE_GROK_DEPTH. A daemon started in Deep would
-    // otherwise make every review a multi-minute turn, which is how a gate gets turned off.
+    // The depth for THIS invocation, decided by the caller: `Some(Fast)` for a mandatory-review
+    // panel seat (FIND-GROK-04: forced Fast regardless of the daemon's TRIUMVIRATE_GROK_DEPTH,
+    // because a daemon started in Deep would otherwise make every review a multi-minute turn,
+    // which is how a gate gets turned off), the request's `grok_depth` for a consult that set
+    // one, and `None` to take the daemon default.
     //
     // An explicit parameter, not a thread-local: `with_forced_fast` was deleted as unsound
     // because tokio moves tasks across OS threads, and it must not return. Not a child env var
     // either: the argv is built in the parent, so a child env arrives too late.
-    force_fast: bool,
+    depth_override: Option<mcp_bridge::grok::GrokDepth>,
 ) -> anyhow::Result<ParsedAgentResult> {
     // A session id means "resume": it is only ever populated from a previous turn's parsed
     // `end.sessionId`. The builder refuses to emit a bare `--resume`, which would silently
@@ -3711,7 +3946,6 @@ async fn run_grok_cli_process_with_session(
         Some(Uuid::new_v4().to_string())
     };
     let effective_session = if resume { session_id } else { minted.as_deref() };
-    let depth_override = force_fast.then_some(mcp_bridge::grok::GrokDepth::Fast);
     let invocation = mcp_bridge::grok::build_grok_invocation_with_profile(
         bin, args, message, cwd, effective_session, resume, None, depth_override,
     )
@@ -4257,7 +4491,7 @@ async fn run_agent_process_with_session(
             // that if a review ever DOES reach this path the omission is visible in the diff
             // instead of silently taking the daemon's depth.
             run_grok_cli_process_with_session(
-                bin, args, message, cwd, session_id, events_tx, track, false,
+                bin, args, message, cwd, session_id, events_tx, track, None,
             )
             .await
         }
@@ -5390,6 +5624,219 @@ mod sight_gate_tests {
             err.contains("/repo/agent_exec.rs"),
             "the error must name the source that was never opened; got: {err}"
         );
+        assert!(
+            err.contains("no tool call named it in 1 recorded call(s)"),
+            "never-attempted must be stated as such; got: {err}"
+        );
+    }
+
+    /// Attempted-and-failed is reported differently from never-attempted. Both are rejections;
+    /// they need different fixes (a path or permission problem against a brief problem), and
+    /// the 2026-09-03 report spent three dispatches telling them apart because the message was
+    /// the same.
+    /// RED IF: the never-opened rejection stops carrying the calls that named the source.
+    #[test]
+    fn sight_36_a_failed_or_uncounted_attempt_is_reported_as_such() {
+        let mut lifecycle = Vec::new();
+        let tools = vec![
+            ToolCallRecord {
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: ToolKind::ReadFile,
+                success: Some(false),
+                duration_ms: None,
+                args_json: Some(r#"{"command":"cat /repo/agent_exec.rs"}"#.to_string()),
+            },
+            ToolCallRecord {
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: ToolKind::Bash,
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(r#"{"command":"wc -l /repo/agent_exec.rs"}"#.to_string()),
+            },
+        ];
+        let sources = vec!["/repo/agent_exec.rs".to_string()];
+        let err = enforce_reviewer_sight(
+            "Codex", &tools, "codex-exec-json", &sources, "/repo", &mut lifecycle,
+        )
+        .expect_err("a failed read and a wc are not a read");
+        assert!(err.contains("ReadFile FAILED"), "the failed cat must show; got: {err}");
+        assert!(err.contains("Bash ok"), "the uncounted wc must show; got: {err}");
+        assert!(err.contains("Only THIS turn's tool calls count"), "got: {err}");
+    }
+
+    fn codex_read(command: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            id: None,
+            tool: "command_execution".to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(serde_json::json!({ "command": command }).to_string()),
+        }
+    }
+
+    fn file_with_lines(dir: &std::path::Path, name: &str, n: usize) -> String {
+        let path = dir.join(name);
+        let body: String = (1..=n).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, body).expect("write fixture");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// THE SHAPE CODEX ACTUALLY READS WITH. Captured live 2026-09-03: a 556-line file read as
+    /// `sed -n '1,260p'` then `sed -n '261,556p'`, never as one `cat`. Before this, every
+    /// source-gated codex review was rejected "never opened", four out of four that day, on a
+    /// fresh worker and a reused one alike. The report that surfaced it blamed a stale worker
+    /// workspace; the worker was reading fine, the gate could not see it.
+    /// RED IF: ranged windows stop unioning, which returns codex to failing every
+    /// `required_sources` dispatch however carefully it reads.
+    #[test]
+    fn sight_32_codex_windows_that_add_up_to_the_whole_file_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "a.rs", 556);
+        let tools = vec![
+            codex_read(&format!("/bin/zsh -lc \"sed -n '1,260p' {src}\"")),
+            codex_read(&format!("/bin/zsh -lc \"nl -ba {src} | sed -n '261,400p'\"")),
+            codex_read(&format!("/bin/zsh -lc \"sed -n '380,$p' {src}\"")),
+        ];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect("three overlapping windows covering 1..=556 are a whole read");
+    }
+
+    /// A window that stops short is still a peek, and so is a set of windows with a hole in
+    /// it. This is FIND-REVIEW-07 kept intact: `'500,$p'` returns the nonce on the last line
+    /// and covers nothing before it.
+    /// RED IF: coverage is judged by "reached the last line" or "read most of it".
+    #[test]
+    fn sight_33_codex_windows_with_a_gap_are_only_part() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "a.rs", 556);
+        for windows in [
+            vec!["1,260p"],
+            vec!["500,$p"],
+            vec!["1,260p", "262,$p"],
+            vec!["1,260p", "261,555p"],
+        ] {
+            let tools: Vec<ToolCallRecord> = windows
+                .iter()
+                .map(|w| codex_read(&format!("/bin/zsh -lc \"sed -n '{w}' {src}\"")))
+                .collect();
+            let mut lifecycle = Vec::new();
+            let err = enforce_reviewer_sight(
+                "Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle,
+            )
+            .expect_err("a gap must not pass");
+            assert!(err.contains("PART"), "windows {windows:?} must read as partial; got: {err}");
+            // Grok's round-2 finding: the same windows through `nl | sed` used to be a WHOLE
+            // read because the first token was `nl`, so the union never ran.
+            let tools: Vec<ToolCallRecord> = windows
+                .iter()
+                .map(|w| codex_read(&format!("/bin/zsh -lc \"nl -ba {src} | sed -n '{w}'\"")))
+                .collect();
+            let mut lifecycle = Vec::new();
+            let err = enforce_reviewer_sight(
+                "Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle,
+            )
+            .expect_err("a gap must not pass");
+            assert!(err.contains("PART"), "windows {windows:?} must read as partial; got: {err}");
+            assert!(
+                err.contains("has 556 lines; read this turn as [lines "),
+                "the rejection must carry the receipt (line count and windows); got: {err}"
+            );
+        }
+    }
+
+    /// Coverage is bound to the operand the reader opened. Codex, round 3: matching the whole
+    /// command let `sed -n '1,$p' /tmp/decoy=SOURCE` collect SOURCE's coverage when the decoy
+    /// had the same line count.
+    /// RED IF: ranged windows go back to being matched by path string anywhere in the command.
+    #[test]
+    fn sight_37_a_decoy_operand_embedding_the_source_path_does_not_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "a.rs", 40);
+        let decoy = dir.path().join("decoy=a.rs");
+        std::fs::write(&decoy, (1..=40).map(|i| format!("x {i}\n")).collect::<String>()).expect("decoy");
+        // The decoy's path ends in `=a.rs`, and `a.rs` is a cwd-relative candidate for SOURCE.
+        let tools = vec![codex_read(&format!("sed -n '1,$p' {}", decoy.display()))];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("reading the decoy is not reading the source");
+        assert!(err.contains("never successfully opened") || err.contains("PART"), "got: {err}");
+        // And a quoted operand that IS the source still counts.
+        let tools = vec![codex_read(&format!("sed -n '1,$p' '{src}'"))];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect("a quoted operand is the same operand");
+    }
+
+    /// `nl` prints nothing for a logical-page delimiter line, so on a file that has one an
+    /// `nl | sed -n` window is over fewer lines than the source. Grok, round 3.
+    /// RED IF: `via_nl` windows count on a file containing `\:` alone on a line.
+    #[test]
+    fn sight_38_nl_windows_do_not_count_on_a_file_with_a_delimiter_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let path = dir.path().join("d.txt");
+        std::fs::write(&path, "one\n\\:\nthree\n").expect("write");
+        let src = path.to_string_lossy().into_owned();
+        let tools = vec![codex_read(&format!("nl -ba {src} | sed -n '1,$p'"))];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("nl dropped the delimiter line");
+        assert!(err.contains("PART"), "got: {err}");
+        // A direct sed window over the same file is over the source's own lines.
+        let tools = vec![codex_read(&format!("sed -n '1,$p' {src}"))];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect("direct sed does not drop lines");
+        assert!(has_nl_delimiter_line(b"a\n\\:\\:\nb"));
+        assert!(!has_nl_delimiter_line(b"a\n \\:\nb"), "only a delimiter ALONE on the line");
+    }
+
+    /// The count comes from the file on disk, so a source the daemon cannot read fails closed
+    /// even when the windows look complete. An unverifiable claim is not evidence.
+    /// RED IF: a missing file is treated as zero lines and therefore covered.
+    #[test]
+    fn sight_34_codex_windows_on_a_file_the_daemon_cannot_read_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = dir.path().join("missing.rs").to_string_lossy().into_owned();
+        let tools = vec![codex_read(&format!("sed -n '1,$p' {src}"))];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &[src], &cwd, &mut lifecycle)
+            .expect_err("no line count, no coverage");
+        assert!(err.contains("PART"), "got: {err}");
+    }
+
+    /// Pure unit coverage of the union, including the unterminated-last-line count.
+    #[test]
+    fn sight_35_range_union_and_line_count_edge_cases() {
+        use agent_adapter::codex::LineRange;
+        let r = |s, e| LineRange { start: s, end: e };
+        assert!(ranges_cover_lines(&[r(1, Some(10))], 10));
+        assert!(ranges_cover_lines(&[r(1, None)], 10));
+        assert!(ranges_cover_lines(&[r(6, Some(10)), r(1, Some(5))], 10));
+        assert!(ranges_cover_lines(&[r(1, Some(999))], 10), "a window past EOF is clamped");
+        assert!(ranges_cover_lines(&[], 0), "an empty file has nothing left to read");
+        assert!(!ranges_cover_lines(&[], 1));
+        assert!(!ranges_cover_lines(&[r(2, None)], 10));
+        assert!(!ranges_cover_lines(&[r(1, Some(4)), r(6, Some(10))], 10));
+        assert!(!ranges_cover_lines(&[r(1, Some(9))], 10));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        std::fs::write(dir.path().join("t.txt"), "a\nb\nc").expect("write");
+        assert_eq!(source_line_count("t.txt", &cwd), Some(3), "unterminated last line counts");
+        std::fs::write(dir.path().join("u.txt"), "a\nb\nc\n").expect("write");
+        assert_eq!(source_line_count("u.txt", &cwd), Some(3));
+        std::fs::write(dir.path().join("e.txt"), "").expect("write");
+        assert_eq!(source_line_count("e.txt", &cwd), Some(0));
+        assert_eq!(source_line_count("nope.txt", &cwd), None);
     }
 
     /// The legitimate relative-path case must pass.
@@ -6404,6 +6851,13 @@ mod grok_panel_route_tests {
     }
 
     async fn dispatch(is_peer_review: bool) -> Vec<String> {
+        dispatch_with_depth(is_peer_review, None).await
+    }
+
+    async fn dispatch_with_depth(
+        is_peer_review: bool,
+        grok_depth: Option<shared_types::GrokDepthOverride>,
+    ) -> Vec<String> {
         let dir = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
         let argv_log = dir.path().join("argv.txt");
         let bin = fake_grok(dir.path(), &argv_log);
@@ -6425,6 +6879,7 @@ mod grok_panel_route_tests {
             message: "hello".to_string(),
             cwd: Some(dir.path().to_string_lossy().into_owned()),
             is_peer_review: is_peer_review.then_some(true),
+            grok_depth,
             ..Default::default()
         };
         let _ = run_named_agent_with_session_and_model(
@@ -6477,6 +6932,37 @@ mod grok_panel_route_tests {
         );
     }
 
+    /// The per-request depth, ON THE ROUTE. `grok_depth` on `AskAgentRequest` is read in
+    /// `run_named_agent_with_session_and_model` and nowhere else, so a builder-level test would
+    /// stay green if that read were deleted. Same two-surfaces rule as `u_gp_01`.
+    /// RED IF: the route stops reading `req.grok_depth`, or the panel seat starts honouring it.
+    #[tokio::test]
+    async fn u_gp_03_the_request_depth_wins_on_the_real_dispatch_path() {
+        use shared_types::GrokDepthOverride;
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: held under env_lock. See u_gp_01 for why this is removed here.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS") };
+
+        // The daemon is Deep (the helper sets it). A consult asking for Fast gets Fast.
+        let fast = dispatch_with_depth(false, Some(GrokDepthOverride::Fast)).await;
+        assert_eq!(flag_value(&fast, "--effort").as_deref(), Some("low"), "argv was {fast:?}");
+        assert_eq!(flag_value(&fast, "--max-turns").as_deref(), Some("12"));
+
+        // And asking for Deep on a Deep daemon is Deep, which is also the "absent" control.
+        let deep = dispatch_with_depth(false, Some(GrokDepthOverride::Deep)).await;
+        assert_eq!(flag_value(&deep, "--effort").as_deref(), Some("high"));
+        assert_eq!(flag_value(&deep, "--max-turns").as_deref(), Some("30"));
+
+        // A panel seat cannot be talked into Deep. `is_peer_review` is serde(skip), so this
+        // combination is only reachable from inside the daemon, and the daemon never sets it,
+        // but the precedence is stated here so it cannot drift.
+        let panel = dispatch_with_depth(true, Some(GrokDepthOverride::Deep)).await;
+        assert_eq!(flag_value(&panel, "--effort").as_deref(), Some("low"));
+        assert_eq!(flag_value(&panel, "--max-turns").as_deref(), Some("12"));
+    }
+
     /// THE ROUTE TEST. A panel seat is Fast on a Deep daemon, measured on the argv the daemon
     /// actually spawns rather than on a builder call the test made itself.
     /// RED IF: `panel_child` stops being read from the request in
@@ -6492,7 +6978,7 @@ mod grok_panel_route_tests {
         unsafe { std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS") };
         let panel = dispatch(true).await;
         assert_eq!(flag_value(&panel, "--effort").as_deref(), Some("low"), "argv was {panel:?}");
-        assert_eq!(flag_value(&panel, "--max-turns").as_deref(), Some("6"));
+        assert_eq!(flag_value(&panel, "--max-turns").as_deref(), Some("12"));
         assert!(panel.iter().any(|a| a == "--no-subagents"));
 
         let consult = dispatch(false).await;

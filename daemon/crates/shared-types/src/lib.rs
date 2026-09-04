@@ -138,6 +138,17 @@ pub struct AskAgentRequest {
     pub deepseek_include_reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_max_tokens: Option<u32>,
+
+    /// Per-call depth for the grok sibling: `"fast"` (default, low effort, 12 turns, no
+    /// subagents or web search) or `"deep"` (high effort, 30 turns, exploration on).
+    ///
+    /// Before this field, depth was `TRIUMVIRATE_GROK_DEPTH` in the daemon's environment: one
+    /// value for every caller, changed only by a restart. A source-gated review needs Deep and
+    /// a one-line consult needs Fast, and both arrive at the same daemon. Absent keeps the
+    /// daemon's default. A mandatory-review panel seat ignores it and stays Fast (FIND-GROK-04).
+    /// Ignored for every other agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_depth: Option<GrokDepthOverride>,
     /// 2026-05-26 follow-up to T-011: per-call model override. When set, this
     /// value replaces `cfg.model` for this consult only — lets callers pick
     /// between `"deepseek-v4-flash"` (default; matches Pro on quality across
@@ -191,6 +202,15 @@ pub enum DeepSeekEffort {
     High,
     Max,
     Xhigh,
+}
+
+/// The two grok depth profiles a caller may pick per request. Mirrors `mcp_bridge::grok::GrokDepth`
+/// without making this crate depend on the bridge; the bridge owns the `From` impl.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GrokDepthOverride {
+    Fast,
+    Deep,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

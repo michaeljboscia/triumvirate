@@ -80,9 +80,18 @@ pub fn grok_max_turns_for(depth: GrokDepth) -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(match depth {
-            GrokDepth::Fast => 6,
-            // Enough rope to actually explore a subsystem. The 900s client timeout is what stops
-            // a runaway now, not the turn cap.
+            // 12, raised from 6 on 2026-09-03. Three default-depth review dispatches that day,
+            // one of them cut to two questions with the code facts supplied inline, all hit
+            // max-turns at 6 with 19 to 32 tool calls and returned a one-line preamble. Six is
+            // below the floor for any consult that opens files. A review that names sources
+            // should send `grok_depth: "deep"` on the request rather than lean on this number.
+            GrokDepth::Fast => 12,
+            // Enough rope to actually explore a subsystem.
+            //
+            // The turn cap is the LOAD-BEARING guard on the ask path, not the backstop. Hitting
+            // it returns the partial output prefixed `[INCOMPLETE: grok hit --max-turns ...]`,
+            // which the caller can use. The 900s client timeout returns nothing. An earlier
+            // version of this comment had that backwards.
             GrokDepth::Deep => 30,
         })
 }
@@ -154,6 +163,15 @@ pub enum GrokDepth {
 pub(crate) static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `TRIUMVIRATE_GROK_DEPTH=deep` (aliases: riff, wild, max) unleashes it. Anything else is Fast.
+impl From<shared_types::GrokDepthOverride> for GrokDepth {
+    fn from(d: shared_types::GrokDepthOverride) -> Self {
+        match d {
+            shared_types::GrokDepthOverride::Fast => GrokDepth::Fast,
+            shared_types::GrokDepthOverride::Deep => GrokDepth::Deep,
+        }
+    }
+}
+
 pub fn grok_depth() -> GrokDepth {
     match std::env::var("TRIUMVIRATE_GROK_DEPTH")
         .ok()
@@ -748,8 +766,9 @@ mod tests {
         // identified that reasoning time as the entire 5-12s gap before the first token.
         assert_eq!(value_after(&inv.args, "--effort").as_deref(), Some("low"),
             "omitting --effort silently selects grok's `high` default");
-        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("6"),
-            "20 permitted a twenty-round-trip explore, which is where the minutes came from");
+        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("12"),
+            "20 permitted a twenty-round-trip explore, which is where the minutes came from; \
+             6 could not finish a review that opened files (2026-09-03)");
 
         // SAFETY: guarded by env_lock.
         unsafe {
@@ -985,7 +1004,7 @@ mod tests {
         // FAST: a question to answer.
         let inv = build(None, false).unwrap();
         assert_eq!(value_after(&inv.args, "--effort").as_deref(), Some("low"));
-        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("6"));
+        assert_eq!(value_after(&inv.args, "--max-turns").as_deref(), Some("12"));
         assert!(inv.args.contains(&"--no-subagents".to_string()));
         assert!(inv.args.contains(&"--disable-web-search".to_string()));
 
@@ -1064,7 +1083,7 @@ mod panel_depth_tests {
         .expect("panel invocation");
 
         assert_eq!(flag_value(&panel.args, "--effort").as_deref(), Some("low"));
-        assert_eq!(flag_value(&panel.args, "--max-turns").as_deref(), Some("6"));
+        assert_eq!(flag_value(&panel.args, "--max-turns").as_deref(), Some("12"));
         assert!(
             panel.args.iter().any(|a| a == "--no-subagents"),
             "the Fast turn-burner suppression must apply to the panel child too"

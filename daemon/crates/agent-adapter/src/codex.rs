@@ -98,6 +98,12 @@ pub fn command_reads_whole_file(command: &str) -> bool {
     if !command_reads_file_contents(command) {
         return false;
     }
+    // A ranged read is partial by definition, whatever program feeds it. Grok found that
+    // without this line `nl FILE | sed -n '161,360p'` took the first token, saw `nl`, and was
+    // a WHOLE read, so the coverage union never ran and 200 lines satisfied a source.
+    if command_read_range(command).is_some() {
+        return false;
+    }
     let cmd = unwrap_shell_wrapper(command.trim());
     let Some(program) = cmd.split_whitespace().next() else {
         return false;
@@ -106,7 +112,219 @@ pub fn command_reads_whole_file(command: &str) -> bool {
     WHOLE_FILE_READERS.contains(&base)
 }
 
+/// The line window a RANGED read put in front of the model, when `command` is one of the two
+/// shapes codex actually uses to read a file in pieces. `end == None` means "to end of file".
+///
+/// Captured live on 2026-09-03 from `codex exec --json` (codex-cli 0.145.0) asked to review a
+/// 556-line file:
+///
+///   /bin/zsh -lc "sed -n '1,260p' /repo/a.rs"
+///   /bin/zsh -lc "sed -n '261,556p' /repo/a.rs"
+///   /bin/zsh -lc "nl -ba /repo/a.rs | sed -n '161,360p'"
+///
+/// Eight reads on that turn, and not one was `cat`. Every source-gated codex review that day
+/// was rejected "never opened" because `sed` was not a reader and a pipe fails closed.
+///
+/// What is accepted, and nothing wider:
+///
+///   sed -n 'N,Mp' FILE            one flag, exactly `-n`; one script, exactly a line range
+///   sed -n 'N,$p' FILE            ending in `p`; exactly one operand after it.
+///   sed -n 'Np'   FILE
+///   READER [flags] FILE | sed -n 'N,Mp'
+///                                 stage 1 is a whole-file reader with exactly one operand;
+///                                 stage 2 is the same sed form with NO operand.
+///
+/// `sed` cannot write under that shape: `-i` is not `-n`, `w` is not `p`, and a script that is
+/// only digits, a comma, `$` and `p` has no room for a command. Any other flag, a second
+/// operand, `-e`, `--expression`, `2>`, `&&`, a third pipeline stage: all `None`.
+///
+/// A window is a PARTIAL read on its own. `agent_exec::codex_ranged_reads_cover_source` unions
+/// the windows a turn read against the file's real line count, so `1,260` plus `261,556` on a
+/// 556-line file is a whole read and `1,260` alone is the "only read PART" rejection it should
+/// be. That is what keeps Grok's `tail -1` attack closed: a window that stops short of the last
+/// line does not cover the file, whatever it contains.
+pub fn command_read_range(command: &str) -> Option<RangedRead> {
+    let cmd = unwrap_shell_wrapper(command.trim());
+    if cmd.is_empty()
+        || cmd.contains("&&")
+        || cmd.contains("||")
+        || cmd.contains(';')
+        || cmd.contains('&')
+        || cmd.contains('>')
+        || cmd.contains('<')
+        || cmd.contains('`')
+        || cmd.contains("$(")
+        || cmd.contains("$'")
+    {
+        return None;
+    }
+    let stages: Vec<&str> = cmd.split('|').map(str::trim).collect();
+    match stages.as_slice() {
+        [single] => {
+            let (range, operand) = sed_range_stage(single, true)?;
+            Some(RangedRead { range, operand: operand?, via_nl: false })
+        }
+        [reader, filter] => {
+            let (operand, via_nl) = whole_file_reader_with_one_operand(reader)?;
+            let (range, _) = sed_range_stage(filter, false)?;
+            Some(RangedRead { range, operand, via_nl })
+        }
+        _ => None,
+    }
+}
+
+/// A ranged read, with the ONE operand it read, so the gate can bind the window to the file
+/// rather than to a path string that happens to appear somewhere in the command. Codex found
+/// on review that matching the whole command let a decoy operand embedding the source path
+/// collect the source's coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangedRead {
+    pub range: LineRange,
+    /// The file operand, surrounding quotes stripped, otherwise as written.
+    pub operand: String,
+    /// True when the window was taken over `nl` output. `nl` omits logical-page delimiter
+    /// lines (`\:`, `\:\:`, `\:\:\:` alone on a line), so on a file containing one the window
+    /// is over fewer lines than the source has. The gate checks the file for that.
+    pub via_nl: bool,
+}
+
+fn strip_quotes(tok: &str) -> &str {
+    for q in ['\'', '"'] {
+        if let Some(inner) = tok.strip_prefix(q).and_then(|t| t.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    tok
+}
+
+/// A line window, 1-based and inclusive, as `sed` numbers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: u64,
+    /// `None` is `$`: to the end of the file.
+    pub end: Option<u64>,
+}
+
+/// `sed -n 'SCRIPT' [FILE]`, and nothing else. `with_operand` says whether exactly one FILE must
+/// follow the script (the bare form) or none may (the pipeline filter form). Returns the window
+/// and, in the bare form, the operand.
+fn sed_range_stage(stage: &str, with_operand: bool) -> Option<(LineRange, Option<String>)> {
+    let toks: Vec<&str> = stage.split_whitespace().collect();
+    let expected = if with_operand { 4 } else { 3 };
+    if toks.len() != expected {
+        return None;
+    }
+    let base = toks[0].rsplit('/').next().unwrap_or(toks[0]);
+    if base != "sed" || toks[1] != "-n" {
+        return None;
+    }
+    let operand = if with_operand {
+        let op = strip_quotes(toks[3]);
+        if op.starts_with('-') || op.is_empty() {
+            return None;
+        }
+        Some(op.to_string())
+    } else {
+        None
+    };
+    Some((parse_sed_print_range(toks[2])?, operand))
+}
+
+/// `'N,Mp'`, `"N,$p"`, `Np`, with or without the quotes, and NOTHING else.
+fn parse_sed_print_range(script: &str) -> Option<LineRange> {
+    let inner = script
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| script.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(script);
+    let body = inner.strip_suffix('p')?;
+    let (start, end) = match body.split_once(',') {
+        Some((a, "$")) => (a, None),
+        Some((a, b)) => (a, Some(b)),
+        None => (body, Some(body)),
+    };
+    let start: u64 = start.parse().ok().filter(|n| *n > 0)?;
+    let end = match end {
+        Some(e) => Some(e.parse::<u64>().ok().filter(|n| *n >= start)?),
+        None => None,
+    };
+    Some(LineRange { start, end })
+}
+
+/// `cat FILE`, `nl -ba FILE`: a LINE-PRESERVING whole-file reader, exactly one operand. The
+/// operand is what the gate matches the named source against, so there must be only one.
+///
+/// Line-preserving is the whole requirement, because the `sed -n 'N,Mp'` after the pipe
+/// numbers OUTPUT lines and the coverage check numbers SOURCE lines. Codex found on review
+/// that `pr` (paginates, inserts headers) and `bat` (decorations, wrapping, depending on
+/// config) were on the first version of this list, so `pr FILE | sed -n '1,9999p'` clamped to
+/// the source line count and passed while source lines never reached the model. Now only
+/// `nl` and `cat`, each with an allowlist of flags that cannot change the line count AND
+/// exist on both macOS and GNU. Returns the one operand (quotes stripped) and whether the
+/// reader is `nl`.
+///
+/// `cat -s` squeezes blank lines. `nl -s SEP` puts SEP after every number, and Grok showed SEP
+/// can be a newline (`-s$'\n'`), which doubles the output lines; `-d`, `-h`, `-f`, `-l`, `-p`,
+/// `-v` and `-i` change numbering or sectioning and are simply not needed to read a file.
+///
+/// Portability is a gate property, not a nicety. Grok's round 3: `nl -w0` and `cat -A` both
+/// ERROR on this host, and the live wrapper is `/bin/zsh -lc` without `pipefail`, so the
+/// pipeline's exit code is sed's 0 on empty stdin. The record says success, the model saw
+/// nothing, and a `1,$p` window would have covered the file. So `-w` must be a positive number
+/// and only the flags BSD cat and GNU cat share are accepted.
+fn whole_file_reader_with_one_operand(stage: &str) -> Option<(String, bool)> {
+    const CAT_PORTABLE_LINE_PRESERVING_FLAGS: &[&str] = &["-n", "-b", "-v", "-e", "-t"];
+    // `-ba` / `-bt` / `-bn` (which lines get numbers) and `-w<digits>`, width, at least 1.
+    fn nl_flag_is_line_preserving(tok: &str) -> bool {
+        matches!(tok, "-ba" | "-bt" | "-bn")
+            || tok
+                .strip_prefix("-w")
+                .is_some_and(|d| d.parse::<u32>().is_ok_and(|n| n > 0))
+    }
+    let mut toks = stage.split_whitespace();
+    let program = toks.next()?;
+    let base = program.rsplit('/').next().unwrap_or(program);
+    if base != "cat" && base != "nl" {
+        return None;
+    }
+    let mut operand: Option<String> = None;
+    for tok in toks {
+        // A bare `-` is stdin, which is a second input the window would then be over. Codex
+        // found this on the live review of this very function: `cat - FILE | sed -n` counted
+        // as one operand because `-` starts with a dash.
+        if tok == "-" {
+            return None;
+        }
+        if tok.starts_with('-') {
+            let ok = if base == "cat" {
+                CAT_PORTABLE_LINE_PRESERVING_FLAGS.contains(&tok)
+            } else {
+                nl_flag_is_line_preserving(tok)
+            };
+            if !ok {
+                return None;
+            }
+        } else {
+            if operand.is_some() {
+                return None;
+            }
+            let op = strip_quotes(tok);
+            if op.is_empty() || op.starts_with('-') {
+                return None;
+            }
+            operand = Some(op.to_string());
+        }
+    }
+    operand.map(|op| (op, base == "nl"))
+}
+
 fn command_reads_file_contents(command: &str) -> bool {
+    // A ranged read is a read. Checked first because its pipeline form would otherwise be
+    // refused by the compound-command rule below, which exists for commands where the reader
+    // may not be the part that touched the named path. Here both stages are constrained.
+    if command_read_range(command).is_some() {
+        return true;
+    }
     // ONLY programs that emit FILE CONTENTS to the model.
     //
     // The first version included `grep`, `rg`, `wc`, `shasum`, `diff`, `cmp`, `awk`, `sed`,
@@ -503,11 +721,140 @@ mod command_classification_tests {
             "wc /repo/a.rs",
             "shasum /repo/a.rs",
             "diff /repo/a.rs /repo/b.rs",
-            // PROGRAMMABLE, and all have in-place flags.
-            "sed -n '1,80p' /repo/a.rs",
+            // PROGRAMMABLE, and all have in-place flags. `sed -n 'N,Mp' FILE` is the one
+            // exception, as a ranged read under a shape that cannot write; see codex_06.
+            "sed -i '' 's/a/b/' /repo/a.rs",
+            "sed -n '1,80w /tmp/out' /repo/a.rs",
+            "sed -e '1,80p' /repo/a.rs",
             "awk '{print}' /repo/a.rs",
             "jq . /repo/a.json",
         ] {
+            assert!(!command_reads_file_contents(c), "must NOT be a read: {c}");
+        }
+    }
+
+    /// THE SHAPES CODEX READS WITH, captured live on 2026-09-03 from codex-cli 0.145.0.
+    ///
+    /// Every source-gated codex review that day was rejected "never opened". The reader list
+    /// had `cat`; codex used `sed -n` windows and `nl | sed -n`, eight times in one turn and
+    /// never once `cat`. Same lesson as codex_05: the classifier was built from the command a
+    /// human types, not the one the agent emits.
+    ///
+    /// RED IF: `sed -n` ranged reads or the `nl | sed -n` pipeline stop classifying as reads,
+    /// which returns codex to failing every `required_sources` dispatch.
+    #[test]
+    fn codex_06_the_ranged_read_shapes_codex_actually_emits_are_reads() {
+        let r = |s, e| Some(LineRange { start: s, end: e });
+        let command_read_range = |c: &str| command_read_range(c).map(|x| x.range);
+        // Verbatim from the live trace.
+        assert_eq!(command_read_range("/bin/zsh -lc \"sed -n '1,260p' /repo/a.rs\""), r(1, Some(260)));
+        assert_eq!(command_read_range("/bin/zsh -lc \"sed -n '261,556p' /repo/a.rs\""), r(261, Some(556)));
+        assert_eq!(command_read_range("/bin/zsh -lc \"nl -ba /repo/a.rs | sed -n '161,360p'\""), r(161, Some(360)));
+        assert!(command_reads_file_contents("/bin/zsh -lc \"sed -n '1,260p' /repo/a.rs\""));
+        assert!(command_reads_file_contents("/bin/zsh -lc \"nl -ba /repo/a.rs | sed -n '161,360p'\""));
+        // The other spellings of the same window.
+        assert_eq!(command_read_range("sed -n 1,80p /repo/a.rs"), r(1, Some(80)));
+        assert_eq!(command_read_range("sed -n \"1,80p\" /repo/a.rs"), r(1, Some(80)));
+        assert_eq!(command_read_range("sed -n '200,$p' /repo/a.rs"), r(200, None));
+        assert_eq!(command_read_range("sed -n '7p' /repo/a.rs"), r(7, Some(7)));
+        assert_eq!(command_read_range("cat /repo/a.rs | sed -n '1,50p'"), r(1, Some(50)));
+        assert_eq!(command_read_range("cat -n /repo/a.rs | sed -n '1,50p'"), r(1, Some(50)));
+        assert_eq!(command_read_range("nl -w3 -bt /repo/a.rs | sed -n '1,50p'"), r(1, Some(50)));
+        // A window is PARTIAL on its own; the union check in agent_exec decides coverage.
+        // The pipeline forms too: Grok found the first version took `nl` as the program and
+        // called the window a whole read, so coverage never ran.
+        assert!(!command_reads_whole_file("sed -n '1,260p' /repo/a.rs"));
+        assert!(!command_reads_whole_file("sed -n '1,$p' /repo/a.rs"));
+        assert!(!command_reads_whole_file("/bin/zsh -lc \"nl -ba /repo/a.rs | sed -n '161,360p'\""));
+        assert!(!command_reads_whole_file("cat /repo/a.rs | sed -n '1,50p'"));
+        assert!(!command_reads_whole_file("nl -ba /repo/a.rs | sed -n '1,$p'"));
+        // And the plain whole readers still are.
+        assert!(command_reads_whole_file("/bin/zsh -lc 'cat /repo/a.rs'"));
+        assert!(command_reads_whole_file("nl -ba /repo/a.rs"));
+    }
+
+    /// The window is bound to the OPERAND, quotes stripped, and says whether `nl` fed it.
+    /// Codex's round-3 finding: matching the whole command string let a decoy operand that
+    /// embeds the source path collect the source's coverage.
+    /// RED IF: `operand` stops being the file the reader actually opened.
+    #[test]
+    fn codex_08_a_ranged_read_names_its_one_operand() {
+        let op = |c: &str| super::command_read_range(c).map(|x| (x.operand, x.via_nl));
+        assert_eq!(op("sed -n '1,80p' /repo/a.rs"), Some(("/repo/a.rs".into(), false)));
+        assert_eq!(op("sed -n '1,80p' '/repo/a.rs'"), Some(("/repo/a.rs".into(), false)));
+        assert_eq!(op("sed -n '1,80p' \"/repo/a.rs\""), Some(("/repo/a.rs".into(), false)));
+        assert_eq!(op("cat -n /repo/a.rs | sed -n '1,80p'"), Some(("/repo/a.rs".into(), false)));
+        assert_eq!(op("nl -ba /repo/a.rs | sed -n '1,80p'"), Some(("/repo/a.rs".into(), true)));
+        assert_eq!(op("nl -ba '/repo/a.rs' | sed -n '1,80p'"), Some(("/repo/a.rs".into(), true)));
+        // A decoy that merely CONTAINS the source path is its own operand, nothing else.
+        assert_eq!(
+            op("sed -n '1,80p' /tmp/decoy=/repo/a.rs"),
+            Some(("/tmp/decoy=/repo/a.rs".into(), false))
+        );
+        // Grok's round-3 finding: flags that error on this host, hidden by the pipe.
+        for c in [
+            "nl -w0 /repo/a.rs | sed -n '1,$p'",
+            "nl -w /repo/a.rs | sed -n '1,$p'",
+            "cat -A /repo/a.rs | sed -n '1,$p'",
+            "cat -E /repo/a.rs | sed -n '1,$p'",
+            "cat -T /repo/a.rs | sed -n '1,$p'",
+        ] {
+            assert_eq!(super::command_read_range(c), None, "must NOT be a ranged read: {c}");
+        }
+        assert!(super::command_read_range("nl -w3 /repo/a.rs | sed -n '1,$p'").is_some());
+    }
+
+    /// Everything one character wider than the accepted shape is not a read.
+    /// RED IF: the sed parser learns `-e`, a second operand, a write script, a third pipeline
+    /// stage, or lets a non-reader feed the pipe.
+    #[test]
+    fn codex_07_anything_wider_than_the_ranged_shape_fails_closed() {
+        for c in [
+            "sed -i '1,80p' /repo/a.rs",
+            "sed -ni '1,80p' /repo/a.rs",
+            "sed -n -i '1,80p' /repo/a.rs",
+            "sed -n -e '1,80p' /repo/a.rs",
+            "sed -n '1,80w /tmp/x' /repo/a.rs",
+            "sed -n '1,80d' /repo/a.rs",
+            "sed -n '/fn/p' /repo/a.rs",
+            "sed -n '$p' /repo/a.rs",
+            "sed -n '0,5p' /repo/a.rs",
+            "sed -n '80,1p' /repo/a.rs",
+            "sed -n '1,80p' /repo/a.rs /repo/b.rs",
+            "sed -n '1,80p'",
+            "sed -n '1,80p' /repo/a.rs > /tmp/out",
+            "sed -n '1,80p' /repo/a.rs 2>&1",
+            "sed -n '1,80p' /repo/a.rs; rm -rf /",
+            "rg needle /repo/a.rs | sed -n '1,80p'",
+            "ls /repo | sed -n '1,80p'",
+            "cat /repo/a.rs /repo/b.rs | sed -n '1,80p'",
+            "cat - /repo/a.rs | sed -n '1,80p'",
+            "cat /repo/a.rs - | sed -n '1,80p'",
+            // Codex, on review: a reader that does not preserve lines makes the window a
+            // window over something other than the source.
+            "pr /repo/a.rs | sed -n '1,9999p'",
+            "bat /repo/a.rs | sed -n '1,763p'",
+            "zcat /repo/a.rs.gz | sed -n '1,80p'",
+            "cat -s /repo/a.rs | sed -n '1,80p'",
+            "cat -ns /repo/a.rs | sed -n '1,80p'",
+            "cat --squeeze-blank /repo/a.rs | sed -n '1,80p'",
+            // Grok: `nl -s` with a newline separator doubles the output lines.
+            "nl -s$'\\n' /repo/a.rs | sed -n '1,80p'",
+            "nl -ba -s' ' /repo/a.rs | sed -n '1,80p'",
+            "nl -d'' /repo/a.rs | sed -n '1,80p'",
+            "nl -v0 /repo/a.rs | sed -n '1,80p'",
+            "nl -p /repo/a.rs | sed -n '1,80p'",
+            "nl -ba /repo/a.rs | sed -n '1,80p' | head -1",
+            "nl -ba /repo/a.rs | sed -n '1,80p' /repo/b.rs",
+            "cat /repo/a.rs | tail -1",
+            "/bin/zsh -lc 'ls /repo && sed -n \"1,80p\" /repo/a.rs'",
+        ] {
+            assert_eq!(command_read_range(c), None, "must NOT be a ranged read: {c}");
+            assert!(!command_reads_whole_file(c), "must NOT be a whole read: {c}");
+        }
+        // And none of them launder through the general classifier either, except the ones
+        // that were already plain readers (there are none in this list).
+        for c in ["sed -n -e '1,80p' /repo/a.rs", "cat /repo/a.rs | tail -1"] {
             assert!(!command_reads_file_contents(c), "must NOT be a read: {c}");
         }
     }
