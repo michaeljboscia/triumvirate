@@ -670,6 +670,7 @@ impl McpBridge {
             // Callers that want a gated session review use ask_session directly.
             required_sources: Vec::new(),
             require_sight: None,
+            grok_depth: None,
         }))
         .await
     }
@@ -712,6 +713,7 @@ impl McpBridge {
             // Same as ask_daemon: the legacy schema has no place to put these.
             required_sources: Vec::new(),
             require_sight: None,
+            grok_depth: None,
         };
         match self.ask_session(Parameters(ask_req.clone())).await {
             Ok(response) => Ok(response),
@@ -2499,6 +2501,9 @@ async fn run_daemon() -> anyhow::Result<()> {
                 // surface stayed green. Grok found that the fix had landed on the unused path.
                 required_sources: req.required_sources.clone(),
                 require_sight: req.require_sight,
+                // Forwarded on BOTH surfaces on purpose. The sight fields were once fixed on
+                // the in-process path only and production (this route) kept dropping them.
+                grok_depth: req.grok_depth,
                 ..Default::default()
             },
             None,

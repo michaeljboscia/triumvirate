@@ -343,6 +343,17 @@ pub struct AskSessionRequest {
     /// Weaker than `required_sources` and useful when the evidence is not a fixed file set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_sight: Option<bool>,
+
+    /// Per-turn depth for a grok session: `"fast"` or `"deep"`. Same semantics as
+    /// `AskAgentRequest::grok_depth`.
+    ///
+    /// Before this field only one-shot `ask_agent` could pick Deep. A named grok session
+    /// (the shape every ceremony review panel uses) always ran at the daemon default, which
+    /// is Fast: 12 turns, no exploration, so a source-gated review through a session could
+    /// not actually read its sources. Found 2026-09-06 while seating Grok on the goatrodeo
+    /// panel. Absent keeps the daemon default. Ignored for every other agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_depth: Option<GrokDepthOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

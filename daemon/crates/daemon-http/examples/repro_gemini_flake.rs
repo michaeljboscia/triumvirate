@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
             message: prompt,
             required_sources: Vec::new(),
             require_sight: None,
+            grok_depth: None,
         };
         let t0 = SystemTime::now();
         let result = daemon_http::fetch_daemon_session_ask(&ask_req).await;

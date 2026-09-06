@@ -219,6 +219,9 @@ pub async fn ask_session(
             // gated at all, because this construction discarded them via ..Default::default().
             required_sources: req.required_sources.clone(),
             require_sight: req.require_sight,
+            // Same story as the sight fields: without this a named grok session could never
+            // run Deep, so a session review could be gated on sources it had no turns to read.
+            grok_depth: req.grok_depth,
             ..Default::default()
         },
         None,
@@ -486,8 +489,9 @@ mod session_sight_tests {
     /// all. Codex found that in its route survey. This asserts the fields actually arrive,
     /// rather than that the struct has them.
     ///
-    /// RED IF: `ask_session` stops forwarding `required_sources` or `require_sight`, which
-    /// would silently return session reviews to being ungated while every other test passed.
+    /// RED IF: `ask_session` stops forwarding `required_sources`, `require_sight` or
+    /// `grok_depth`, which would silently return session reviews to being ungated (or to
+    /// Fast, which cannot read the gated sources) while every other test passed.
     #[tokio::test]
     async fn ask_session_forwards_the_sight_fields_to_dispatch() {
         let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -509,6 +513,7 @@ mod session_sight_tests {
             message: "review it".to_string(),
             required_sources: vec!["/repo/a.rs".to_string()],
             require_sight: Some(true),
+            grok_depth: Some(shared_types::GrokDepthOverride::Deep),
         };
         ask_session(&sessions, None, &req, false, capturing_executor)
             .await
@@ -521,6 +526,11 @@ mod session_sight_tests {
             "named sources must reach the dispatcher, or a session review is silently ungated"
         );
         assert_eq!(got.require_sight, Some(true));
+        assert_eq!(
+            got.grok_depth,
+            Some(shared_types::GrokDepthOverride::Deep),
+            "depth must reach the dispatcher, or a named grok session is stuck at Fast"
+        );
         // The session identity must still be carried, or this fix would trade one leak for
         // another: session_key is what stops two named sessions resuming each other.
         assert_eq!(got.session_key.as_deref(), Some("reviewer"));
