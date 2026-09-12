@@ -361,7 +361,7 @@ fn cleanup_failed_worktree(
 }
 
 /// Translate user-facing sandbox permission names into codex-exec `-c key=value`
-/// config overrides that extend the `--full-auto` preset without clobbering it.
+/// config overrides that extend the workspace-write sandbox without clobbering it.
 ///
 /// The daemon's contract API exposes a stable string vocabulary
 /// (`"network-full-access"`, etc.) and owns the mapping to codex's actual
@@ -373,7 +373,7 @@ fn cleanup_failed_worktree(
 ///
 /// Verified working 2026-04-14 on codex v0.118.0 via direct exec smoke test
 /// (TEST-SANDBOX-NET, `/tmp/sandbox-perms-test`):
-///   `codex exec --full-auto -c 'sandbox_workspace_write.network_access=true' ...`
+///   `codex exec --sandbox workspace-write -c 'sandbox_workspace_write.network_access=true' ...`
 /// preamble reports "network access enabled" and curl to registry.npmjs.org
 /// returns HTTP/2 200.
 ///
@@ -383,7 +383,7 @@ fn cleanup_failed_worktree(
 /// Unknown names are skipped with a warning rather than passed through raw —
 /// an unrecognized `-c key=value` at the wrong codex version can silently
 /// change behavior. Prefer loud-fail: the worker's sandbox stays at
-/// --full-auto defaults and the operator sees the warning in daemon logs.
+/// workspace-write defaults and the operator sees the warning in daemon logs.
 pub(crate) fn build_sandbox_permission_args(perms: Option<&[String]>) -> Vec<String> {
     let list = match perms {
         Some(l) if !l.is_empty() => l,
@@ -1741,13 +1741,14 @@ mod sandbox_permissions_tests {
 
     #[test]
     fn codex_exec_mcp_compat_args_disable_mcp_elicitation() {
-        let mut args = vec!["exec".to_string(), "--full-auto".to_string()];
+        let mut args = vec!["exec".to_string(), "--sandbox".to_string(), "workspace-write".to_string()];
         append_codex_exec_mcp_compat_args(&mut args);
         assert_eq!(
             args,
             vec![
                 "exec".to_string(),
-                "--full-auto".to_string(),
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
                 "--disable".to_string(),
                 "tool_call_mcp_elicitation".to_string(),
             ]
@@ -1852,13 +1853,17 @@ pub fn build_worker_argv(
         "codex" => {
             let (cmd, mut args) = command_for("codex");
             args.push("exec".to_string());
-            // 0.145 deprecated `--full-auto`; this is the explicit equivalent it resolves to.
+            // 0.145 deprecated `--full-auto` and 0.154 removed it from `codex exec`; this is
+            // the explicit equivalent it resolved to. `exec` is non-interactive and defaults to
+            // `approval: never` (its run banner says so); its only approval knob is the opt-in
+            // `--approve-for-me`. `--ask-for-approval` is rejected with "unexpected argument"
+            // (verified against 0.154.0 on 2026-09-12), so passing it killed the worker at parse.
             args.push("--sandbox".to_string());
             args.push("workspace-write".to_string());
-            args.push("--ask-for-approval".to_string());
-            args.push("never".to_string());
             append_codex_exec_mcp_compat_args(&mut args);
             args.push("--skip-git-repo-check".to_string());
+            // `--` so a prompt that begins with a dash is a prompt, not a flag.
+            args.push("--".to_string());
             args.push(prompt.to_string());
             Ok((cmd, args))
         }
@@ -1948,15 +1953,20 @@ pub fn build_worktree_worker_argv(
         "codex" => {
             let (cmd, mut args) = command_for("codex");
             args.push("exec".to_string());
-            args.push("--full-auto".to_string());
+            // `--full-auto` was removed from `codex exec` in 0.154. Same explicit equivalent as
+            // `build_worker_argv`: a workspace-write sandbox, approval left at exec's `never` default.
+            args.push("--sandbox".to_string());
+            args.push("workspace-write".to_string());
             append_codex_exec_mcp_compat_args(&mut args);
             // Translate sandbox_permissions contract field into `-c key=value` overrides
-            // that codex-exec merges ON TOP of --full-auto.
+            // that codex-exec merges ON TOP of the workspace-write sandbox.
             args.extend(build_sandbox_permission_args(sandbox_permissions));
             for dir in extra_dirs {
                 args.push("--add-dir".to_string());
                 args.push(dir.clone());
             }
+            // `--` so a prompt that begins with a dash is a prompt, not a flag.
+            args.push("--".to_string());
             args.push(prompt.to_string());
             Ok((cmd, args))
         }
@@ -2059,8 +2069,12 @@ mod abe_agent_tests {
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--sandbox".to_string()));
         assert!(args.contains(&"workspace-write".to_string()));
-        assert!(args.contains(&"--ask-for-approval".to_string()));
-        assert!(args.contains(&"never".to_string()));
+        assert!(
+            !args.contains(&"--ask-for-approval".to_string()),
+            "codex exec rejects --ask-for-approval; the worker dies at argv parse: {args:?}"
+        );
+        assert!(!args.contains(&"--full-auto".to_string()), "removed in codex 0.154: {args:?}");
+        assert!(!args.contains(&"never".to_string()), "stray approval value would become the prompt: {args:?}");
         assert!(args.contains(&"--skip-git-repo-check".to_string()));
         assert_eq!(args.last().unwrap(), "do the task");
     }
@@ -2175,7 +2189,8 @@ mod abe_worktree_tests {
                 .expect("codex worktree");
         assert_eq!(cmd, "/bin/codex");
         assert_eq!(args[0], "exec");
-        assert_eq!(args[1], "--full-auto");
+        assert_eq!(&args[1..3], ["--sandbox", "workspace-write"], "got: {args:?}");
+        assert!(!args.contains(&"--full-auto".to_string()), "removed in codex 0.154: {args:?}");
         // Both directories, each behind its own --add-dir, in the order the caller supplied.
         let add_dirs: Vec<&String> = args
             .iter()
@@ -2463,5 +2478,118 @@ mod abe_label_honesty_tests {
         let alias = abe_worker_agent();
         unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
         assert_eq!(alias, "grok", "aliases must still resolve to a buildable agent");
+    }
+}
+
+/// The installed binary is the oracle for the argv the builders emit.
+///
+/// Every test above asserts what Triumvirate BUILDS. None asserted what the binary ACCEPTS,
+/// which is how `--full-auto` (removed in codex 0.154) and `--ask-for-approval` (never valid
+/// on `exec`) shipped green: the worker died on a clap usage error before running a task, and
+/// `cargo test` never noticed. `<bin> <args> --help` runs clap over the full argv and exits 0, or
+/// exits 2 on an unknown flag or a bad enum value (`--sandbox bogus` is rejected before help
+/// prints; verified on 0.154.0), without launching an agent.
+///
+/// `--help` must come AFTER every flag: clap validates left to right and stops at `--help`, so
+/// `codex exec --help --full-auto` exits 0 while `codex exec --full-auto --help` exits 2 (both
+/// verified on 0.154.0). The helper inserts it just before the `--` separator when one is
+/// present, which is after every flag and before the free-text prompt, and appends it otherwise.
+/// `abe_oracle_00` is the negative control: the helper must reject a known-bad flag, or the
+/// two positive tests are theatre.
+///
+/// Scope: this is a PARSE oracle. It proves the flag names and enum values exist on the installed
+/// binary. It does not run the agent, so it cannot see runtime rejections such as an opaque
+/// `-c key=value` the binary ignores or a `--cd` that does not exist. Neither builder emits those
+/// today; if one starts to, this test will not be the one that catches it.
+#[cfg(test)]
+mod abe_binary_oracle_tests {
+    use super::{build_worker_argv, build_worktree_worker_argv};
+
+    /// Skipping is opt-in and visible: the env var, not the absence of a binary, is the only
+    /// way to not run this. Review found the first draft returned early when codex was missing,
+    /// which is the same skip-as-pass shape the test was written to close.
+    fn skip_requested() -> bool {
+        std::env::var_os("TRIUMVIRATE_SKIP_CODEX_ORACLE").is_some_and(|v| v == "1")
+    }
+
+    fn installed_codex() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|d| d.join("codex"))
+            .find(|p| is_executable_file(p))
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    fn is_executable_file(p: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+
+    fn parses_on_installed_binary(bin: &str, args: &[String]) -> Result<(), String> {
+        let mut probe: Vec<String> = args.to_vec();
+        let at = probe.iter().position(|a| a == "--").unwrap_or(probe.len());
+        probe.insert(at, "--help".to_string());
+        let out = std::process::Command::new(bin)
+            .args(&probe)
+            .output()
+            .map_err(|e| format!("could not run {bin}: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "codex rejected the built argv (exit {:?}): {}\nargv: {args:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    /// Negative control. RED IF: the helper passes a flag the binary is known to reject, which
+    /// would mean `--help` landed before the flags and the positive tests prove nothing.
+    #[test]
+    fn abe_oracle_00_helper_rejects_a_known_bad_flag() {
+        if skip_requested() {
+            return;
+        }
+        let bin = installed_codex().expect("no codex on PATH; set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly");
+        let bad = vec!["exec".to_string(), "--full-auto".to_string(), "--".to_string(), "x".to_string()];
+        assert!(
+            parses_on_installed_binary(&bin, &bad).is_err(),
+            "oracle accepted --full-auto, which codex 0.154 removed: the probe is not validating flags"
+        );
+    }
+
+    /// RED IF: the installed codex rejects any flag in the plain ABE argv.
+    #[test]
+    fn abe_oracle_01_plain_dispatch_argv_parses_on_installed_codex() {
+        if skip_requested() {
+            eprintln!("TRIUMVIRATE_SKIP_CODEX_ORACLE=1: oracle skipped on request");
+            return;
+        }
+        let bin = installed_codex().expect(
+            "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it exists to close. \
+             Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
+        );
+        let resolver = |agent: &str| (if agent == "codex" { bin.clone() } else { format!("/bin/{agent}") }, Vec::new());
+        let (cmd, args) = build_worker_argv("codex", &resolver, "noop task", "/tmp").expect("codex argv");
+        parses_on_installed_binary(&cmd, &args).unwrap();
+    }
+
+    /// RED IF: the installed codex rejects any flag in the worktree ABE argv.
+    #[test]
+    fn abe_oracle_02_worktree_dispatch_argv_parses_on_installed_codex() {
+        if skip_requested() {
+            eprintln!("TRIUMVIRATE_SKIP_CODEX_ORACLE=1: oracle skipped on request");
+            return;
+        }
+        let bin = installed_codex().expect(
+            "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it exists to close. \
+             Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
+        );
+        let resolver = |agent: &str| (if agent == "codex" { bin.clone() } else { format!("/bin/{agent}") }, Vec::new());
+        let dirs = vec!["/tmp".to_string()];
+        let (cmd, args) =
+            build_worktree_worker_argv("codex", &resolver, "noop task", "/tmp", &dirs, None).expect("codex argv");
+        parses_on_installed_binary(&cmd, &args).unwrap();
     }
 }

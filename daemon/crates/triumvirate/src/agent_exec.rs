@@ -3630,6 +3630,10 @@ async fn run_codex_cli_process_with_session(
     // 0.145 DEPRECATED `--full-auto` (it warns per call and a future release removes it). Inject
     // the explicit equivalent it resolves to instead — workspace-write sandbox + no approval
     // prompts — which is stable across the deprecation. Same gate: a user-supplied policy flag wins.
+    //
+    // 0.154 REMOVED `--full-auto`, and `codex exec` has never accepted `--ask-for-approval`
+    // (usage error, verified on 0.154.0, 2026-09-12; the review arm above already knew this).
+    // Approval on `exec` defaults to `never`, so the sandbox flag alone is the equivalent.
     let explicit_approval_policy = caps.args_include_explicit_policy(&final_args);
     if should_use_full_auto
         && !read_only
@@ -3638,8 +3642,6 @@ async fn run_codex_cli_process_with_session(
     {
         final_args.push("--sandbox".to_string());
         final_args.push("workspace-write".to_string());
-        final_args.push("--ask-for-approval".to_string());
-        final_args.push("never".to_string());
     }
 
     if !is_git_worktree(cwd) && !has_any_arg(&final_args, &["--skip-git-repo-check"]) {

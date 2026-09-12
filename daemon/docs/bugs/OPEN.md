@@ -134,6 +134,39 @@ artifact is not verifying the path.
 
 ---
 
+### D-010 - sight gate cannot see a grok shell read, and its own message recommends one
+**Found:** 2026-09-12 · **Severity:** MEDIUM
+**Evidence:** three `ask_agent` grok dispatches with `required_sources` on a 199-line diff
+were rejected. Attempt three did what the rejection text asked and ran `cat <path>` in one
+shell command. `agent-adapter/src/grok.rs:104` maps every `run_terminal_command` to
+`ToolKind::Bash`; `tool_call_touched_source` (`agent_exec.rs`) counts only `ToolKind::ReadFile`.
+The codex adapter classifies `cat` and `sed -n` reads (`codex.rs:104`) and the gate unions
+codex sed windows; grok has neither. Attempt two used `read_file` and was also rejected as
+"never opened", cause not yet established (the grok unified log records no arguments).
+**Why it matters:** the rejection reads as "the reviewer did not open the file" when the
+reviewer opened it. A gate that blames the reader for the instrument's blind spot trains the
+operator to route around the gate, which is the rubber stamp it was built to end.
+**Workaround:** dispatch grok with `require_sight` only and no `required_sources`, which is
+what the gate's own parser-mode message recommends. Used 2026-09-12 for the codex 0.154 review.
+**Check:** dispatch grok with `required_sources=[<file>]` and instruct it to `cat` the file;
+the turn must pass. Then instruct it to `head -5` the file; the turn must be rejected as PART.
+
+### D-011 - codex argv is assembled on four surfaces and only two have a binary oracle
+**Found:** 2026-09-12 · **Severity:** MEDIUM
+**Evidence:** codex 0.154.0 removed `--full-auto` from `exec`. Four places build codex argv:
+`mcp-tools/src/abe.rs` (`build_worker_argv`, `build_worktree_worker_argv`),
+`triumvirate/src/agent_exec.rs` (consult, the `should_use_full_auto` branch), and
+`fleet/src/orchestrator.rs`. Three of the four emitted a flag the binary rejects (`--full-auto`,
+`--ask-for-approval never`, `--message`), and every test stayed green because the tests assert
+what Triumvirate builds, not what the installed binary parses. All three were fixed 2026-09-12.
+Only the two ABE builders got a parse oracle (`abe_binary_oracle_tests`); the consult and
+fleet argv are built inline inside spawn code and have no oracle.
+**Why it matters:** the next removed flag goes red on two surfaces and ships on two. This is
+the "fix lands on one surface" shape again, with a test that certifies half the class.
+**Fix shape:** lift each inline codex argv into a pure builder, then one table-driven test that
+runs every builder's output through `codex <args> --help` on the installed binary.
+**Check:** temporarily push a bogus flag into the consult or fleet argv; `cargo test` must fail.
+
 ## Closed
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"

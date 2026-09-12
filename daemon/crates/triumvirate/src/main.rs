@@ -3794,11 +3794,16 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let _ = execute_ask_agent(&req, None).await.map_err(anyhow::Error::msg)?;
         let captured = fs::read_to_string(&args_file)?;
         // 0.145: inject the explicit workspace-write policy, not the deprecated --full-auto.
+        // 0.154: `--full-auto` is removed and `exec` rejects `--ask-for-approval`, so neither
+        // may appear; the sandbox flag alone is the injection.
         assert!(captured.lines().any(|line| line == "--sandbox"), "sandbox flag injected");
         assert!(captured.lines().any(|line| line == "workspace-write"));
-        assert!(captured.lines().any(|line| line == "--ask-for-approval"));
-        assert!(captured.lines().any(|line| line == "never"));
-        assert!(!captured.lines().any(|line| line == "--full-auto"), "no deprecated flag");
+        assert!(
+            !captured.lines().any(|line| line == "--ask-for-approval"),
+            "codex exec rejects --ask-for-approval; the worker dies at argv parse"
+        );
+        assert!(!captured.lines().any(|line| line == "never"), "stray approval value");
+        assert!(!captured.lines().any(|line| line == "--full-auto"), "removed in codex 0.154");
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE") };

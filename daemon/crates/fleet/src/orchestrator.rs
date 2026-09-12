@@ -81,11 +81,11 @@ impl AgentLauncher for DaemonAgentLauncher {
         let (cmd, args): (String, Vec<String>) = match agent {
             "codex" => (
                 "codex".to_string(),
-                vec![
-                    "exec".to_string(),
-                    "--message".to_string(),
-                    task_prompt.to_string(),
-                ],
+                // `codex exec` takes the prompt as a positional argument. `--message` is not a
+                // flag it accepts (usage error on 0.154.0, verified 2026-09-12), so this spawn
+                // died at argv parse before running any task.
+                // `--` so a prompt that begins with a dash is a prompt, not a flag.
+                vec!["exec".to_string(), "--".to_string(), task_prompt.to_string()],
             ),
             "gemini" => match mcp_bridge::gemini_backend() {
                 // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
