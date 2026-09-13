@@ -339,10 +339,27 @@ pub(crate) async fn run_agy_cli_process_with_session(
                         ));
                         continue;
                     }
+                    let status = sp.status().map(str::to_string);
                     let mut parsed = sp.finish();
                     if parsed.response_text.trim().is_empty() {
-                        tracing::warn!("agy stream-json result carried no response text (attempt {attempt})");
-                        last_err = Some(anyhow::anyhow!("agy returned empty output"));
+                        // The status and any permission request were parsed and dropped, so an
+                        // empty result was undiagnosable after the fact (D-012). Carry both.
+                        let permission_requests = parsed
+                            .tool_calls
+                            .iter()
+                            .filter(|c| matches!(c.kind, agent_adapter::ToolKind::RequestUserInput))
+                            .count();
+                        let status_label = status.as_deref().unwrap_or("none");
+                        tracing::warn!(
+                            status = status_label,
+                            permission_requests,
+                            tool_calls = parsed.tool_calls.len(),
+                            "agy stream-json result carried no response text (attempt {attempt})"
+                        );
+                        last_err = Some(anyhow::anyhow!(
+                            "agy returned empty output (status={status_label}, permission_requests={permission_requests}, tool_calls={})",
+                            parsed.tool_calls.len()
+                        ));
                         continue;
                     }
                     // The log file still carries the model name and auth method, which the

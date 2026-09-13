@@ -28,8 +28,10 @@ use shared_types::{
     TokenUsage as SharedTokenUsage,
 };
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -591,9 +593,14 @@ pub(crate) async fn execute_ask_agent(
     // --model and runs its own internal retry); for deepseek, a single attempt
     // (REQ-DS-008 / T-013 — the runner owns its scoped in-flight retries, the
     // outer execute loop must NOT retry); for others, 3 retries.
-    let attempt_schedule = attempt_schedule_for(&agent, gemini_backend_selected);
+    let attempt_schedule = attempt_schedule_for(&agent, gemini_backend_selected, sight_required(req));
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
+    // Every failure on the way to the terminal error, oldest first. `last_err` alone is what
+    // the caller used to see, and it is the LAST hop's error: a gemini request that died in agy
+    // and then timed out on the codex fallback reported "codex connector timed out", and two
+    // sessions on 2026-09-13 diagnosed a mis-routed alias from it. D-012.
+    let mut failure_chain: Vec<String> = Vec::new();
 
     // Slice 6 (shadow-compare): the OTHER Gemini backend to run alongside the primary
     // for comparison when TRIUMVIRATE_GEMINI_SHADOW is on. None disables shadowing.
@@ -629,6 +636,7 @@ pub(crate) async fn execute_ask_agent(
             tool_name: None,
         });
         last_err = Some("agy capacity/quota: circuit breaker open".to_string());
+        failure_chain.push("agy: circuit breaker open (repeated quota)".to_string());
     }
 
     for (idx, (backoff, model_override)) in attempt_schedule.iter().enumerate() {
@@ -1153,6 +1161,17 @@ pub(crate) async fn execute_ask_agent(
                     error = %msg,
                     "agent attempt failed"
                 );
+                failure_chain.push(format!(
+                    "{} attempt {}/{}: {msg}",
+                    gemini_backend_selected
+                        .map(|b| match b {
+                            GeminiBackend::Agy => "agy",
+                            GeminiBackend::GeminiCli => "gemini-cli",
+                        })
+                        .unwrap_or(agent.as_str()),
+                    idx + 1,
+                    attempt_schedule.len()
+                ));
                 last_err = Some(msg);
                 sleep(*backoff).await;
             }
@@ -1395,6 +1414,7 @@ pub(crate) async fn execute_ask_agent(
                         state: "DEGRADED_FAILED".to_string(),
                         detail: format!("{} hop failed: {msg}", hop.backend),
                     });
+                    failure_chain.push(format!("degraded {}: {msg}", hop.backend));
                     last_err = Some(msg);
                 }
                 Err(_) => {
@@ -1402,16 +1422,25 @@ pub(crate) async fn execute_ask_agent(
                         state: "DEGRADED_TIMEOUT".to_string(),
                         detail: format!("{} hop exceeded remaining degraded budget", hop.backend),
                     });
+                    failure_chain.push(format!("degraded {}: exceeded remaining degraded budget", hop.backend));
                     last_err = Some(format!("{} hop timed out", hop.backend));
                 }
             }
         }
     }
 
+    // The chain, oldest first, is the error. `last_err` is kept only as the fallback for a
+    // path that recorded nothing. Computed here so the FAILED lifecycle event and the outbox
+    // carry it too (Grok, review of this change: the outbox said only "failed after N attempts").
+    let failure_detail = if failure_chain.is_empty() {
+        last_err.clone().unwrap_or_else(|| "unknown error".to_string())
+    } else {
+        failure_chain.join(" -> ")
+    };
     lifecycle.push(LifecycleEvent {
         state: "FAILED".to_string(),
         detail: format!(
-            "{} failed after {} attempts",
+            "{} failed after {} attempts: {failure_detail}",
             agent_display,
             attempt_schedule.len()
         ),
@@ -1444,7 +1473,7 @@ pub(crate) async fn execute_ask_agent(
     let fallback_path = spawn_dead_drop(
         &agent,
         &req.message,
-        &last_err.clone().unwrap_or_else(|| "unknown error".to_string()),
+        &failure_detail,
         &resolved_cwd,
         &resolved_repo,
         &resolved_branch,
@@ -1479,7 +1508,7 @@ pub(crate) async fn execute_ask_agent(
     span.record("agent.tokens", 0_u64);
     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
 
-    let failure_detail = last_err.unwrap_or_else(|| "unknown error".to_string());
+    drop(last_err);
 
     // The terminal failure path (retries exhausted). The guard emits $ai_generation AND, because
     // this is a real failure, an $exception — once, on drop.
@@ -3086,12 +3115,71 @@ fn is_mock_connector(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The last lines codex printed before a non-zero exit, for the error message.
+///
+/// Codex writes its own errors to STDOUT. Under `--json`, which the daemon passes, a quota or
+/// auth failure is `{"type":"error","message":...}` followed by
+/// `{"type":"turn.failed","error":{"message":...}}` (captured 2026-09-13 while over quota).
+/// Without `--json` it is a plain `ERROR: ...` line. Both shapes are kept. Stderr's
+/// "Reading additional input from stdin..." is codex noticing a non-tty stdin and says nothing
+/// about the failure, so it is dropped.
+fn codex_error_tail(raw_output: &str, stderr_tail: &Arc<Mutex<VecDeque<String>>>) -> String {
+    let mut lines: Vec<String> = raw_output
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| {
+            if l.starts_with("ERROR") {
+                return Some(l.to_string());
+            }
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("error") => v.get("message").and_then(|m| m.as_str()).map(str::to_string),
+                Some("turn.failed") => v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string),
+                _ => None,
+            }
+        })
+        .collect();
+    if let Ok(tail) = stderr_tail.lock() {
+        lines.extend(
+            tail.iter()
+                .filter(|l| !l.starts_with("Reading additional input from stdin"))
+                .cloned(),
+        );
+    }
+    lines.dedup();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let keep = lines.len().saturating_sub(3);
+        format!("; codex said: {}", lines[keep..].join(" | "))
+    }
+}
+
 fn connector_timeout() -> Duration {
     std::env::var("TRIUMVIRATE_CONNECTOR_TIMEOUT_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(180))
+}
+
+/// Timeout for a sight-gated review, which must read files and run commands. Distinct from
+/// `connector_timeout()`, which is sized for a one-line consult. 2026-09-13: reviews were
+/// dying at 180s through the daemon while the same agent finished them by hand.
+///
+/// Default 840s, deliberately BELOW the bridge's 900s `DEFAULT_DAEMON_ASK_TIMEOUT_SECS`: the
+/// server must give up first, or the client abandons a turn the daemon is still running and the
+/// answer is paid for and lost. Raise both together.
+fn review_timeout() -> Duration {
+    std::env::var("TRIUMVIRATE_REVIEW_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(840))
 }
 
 fn daemon_prewarm_enabled() -> bool {
@@ -3676,12 +3764,24 @@ async fn run_codex_cli_process_with_session(
         .take()
         .ok_or_else(|| anyhow::anyhow!("codex stderr missing"))?;
 
-    tokio::spawn(async move {
+    // Keep the tail of stderr for the error message. "exited with status 1" told nobody that
+    // codex had printed "You've hit your usage limit ... try again at 7:03 PM" (2026-09-13).
+    let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let stderr_tail_writer = Arc::clone(&stderr_tail);
+    let stderr_drain = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 tracing::debug!("codex stderr: {trimmed}");
+                if let Ok(mut tail) = stderr_tail_writer.lock() {
+                    if tail.len() >= 5 {
+                        tail.pop_front();
+                    }
+                    // One minified JSON error line can be kilobytes; the excerpt that reaches
+                    // the caller is capped at 2000 chars, so keep each line short.
+                    tail.push_back(trimmed.chars().take(300).collect());
+                }
             }
         }
     });
@@ -3691,7 +3791,7 @@ async fn run_codex_cli_process_with_session(
     let mut app_server_approval_requests: Vec<String> = Vec::new();
     let mut reader = BufReader::new(stdout).lines();
     let mut raw_output = String::new();
-    let timeout_duration = connector_timeout();
+    let timeout_duration = if read_only { review_timeout() } else { connector_timeout() };
     let read = async {
         while let Some(line) = reader.next_line().await? {
             raw_output.push_str(&line);
@@ -3776,7 +3876,13 @@ async fn run_codex_cli_process_with_session(
     let _ = fs::remove_file(&output_file);
 
     if !status.success() {
-        anyhow::bail!("codex connector failed: exited with status {status}");
+        // The pipe closes when the child exits, so the drain finishes promptly; await it or the
+        // tail is read before its last lines land (Antigravity, review of this change).
+        let _ = timeout(Duration::from_secs(2), stderr_drain).await;
+        anyhow::bail!(
+            "codex connector failed: exited with status {status}{}",
+            codex_error_tail(&raw_output, &stderr_tail)
+        );
     }
 
     let mut parsed = if protocol == "app-server" {
@@ -3828,7 +3934,15 @@ async fn run_codex_cli_process_with_session(
 pub(crate) fn attempt_schedule_for(
     agent: &str,
     gemini_backend_selected: Option<GeminiBackend>,
+    review: bool,
 ) -> Vec<(Duration, Option<&'static str>)> {
+    // A sight-gated review reads files and runs commands, and gets `review_timeout()` for it.
+    // It is ONE attempt: three retries of a review that timed out are three more reviews that
+    // time out, and the first failure ends up buried under the last. 2026-09-13: a codex review
+    // ran 3 x 180s, failed at 543s, and the caller was told only about the third.
+    if review {
+        return vec![(Duration::ZERO, None)];
+    }
     if agent == "gemini" {
         if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
             vec![(Duration::ZERO, None)]
@@ -4364,7 +4478,7 @@ async fn run_claude_cli_process_with_session(
     let mut reader = BufReader::new(stdout).lines();
     let mut raw_output = String::new();
     let mut parser = ClaudeStreamParser::new();
-    let timeout_duration = connector_timeout();
+    let timeout_duration = if read_only { review_timeout() } else { connector_timeout() };
 
     let read = async {
         while let Some(line) = reader.next_line().await? {
@@ -4947,18 +5061,23 @@ mod deepseek_dispatch_tests {
     fn attempt_schedule_is_single_for_metered_and_context_heavy_agents() {
         use super::attempt_schedule_for;
         // Single attempt: the runner owns its retries, or a retry is genuinely expensive.
-        assert_eq!(attempt_schedule_for("deepseek", None).len(), 1,
+        assert_eq!(attempt_schedule_for("deepseek", None, false).len(), 1,
             "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)");
-        assert_eq!(attempt_schedule_for("grok", None).len(), 1,
+        assert_eq!(attempt_schedule_for("grok", None, false).len(), 1,
             "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)");
-        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy)).len(), 1,
+        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false).len(), 1,
             "agy runs its own internal retry (REQ-013)");
 
         // Everything else keeps the generic ladder. This is the regression guard: adding a
         // single-attempt agent must not silently convert the default.
-        assert_eq!(attempt_schedule_for("codex", None).len(), 3);
-        assert_eq!(attempt_schedule_for("claude", None).len(), 3);
-        assert!(attempt_schedule_for("gemini", None).len() > 1,
+        assert_eq!(attempt_schedule_for("codex", None, false).len(), 3);
+        // A sight-gated review is one attempt for every agent: a review that timed out is
+        // not improved by two more, and the first failure would be buried under the last.
+        for agent in ["codex", "claude", "gemini", "grok"] {
+            assert_eq!(attempt_schedule_for(agent, None, true).len(), 1, "{agent} review must be one attempt");
+        }
+        assert_eq!(attempt_schedule_for("claude", None, false).len(), 3);
+        assert!(attempt_schedule_for("gemini", None, false).len() > 1,
             "gemini-cli uses the model faildown chain");
     }
 
@@ -8043,5 +8162,46 @@ mod mandatory_review_tests {
             head.contains("REVIEW-NONCE"),
             "the proof of read must be demanded in the prompt, or no reviewer will send it"
         );
+    }
+}
+
+#[cfg(test)]
+mod codex_error_tail_tests {
+    use super::codex_error_tail;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    fn tail(lines: &[&str]) -> Arc<Mutex<VecDeque<String>>> {
+        Arc::new(Mutex::new(lines.iter().map(|l| l.to_string()).collect()))
+    }
+
+    /// The exact stdout codex 0.154.0 produced under `--json` while over quota, 2026-09-13.
+    /// RED IF: the quota message stops reaching the error, which is how "exited with status 1"
+    /// hid it for a whole afternoon.
+    #[test]
+    fn json_quota_error_reaches_the_message() {
+        let raw = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"Skill descriptions were shortened\"}}\n",
+            "{\"type\":\"error\",\"message\":\"You've hit your usage limit. try again at 7:03 PM.\"}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. try again at 7:03 PM.\"}}\n",
+        );
+        let out = codex_error_tail(raw, &tail(&["Reading additional input from stdin..."]));
+        assert!(out.contains("usage limit"), "got: {out}");
+        assert!(!out.contains("Skill descriptions"), "item-level notices are not the failure: {out}");
+        assert!(!out.contains("Reading additional input"), "stdin notice is noise: {out}");
+        assert_eq!(out.matches("usage limit").count(), 1, "error and turn.failed carry the same text once: {out}");
+    }
+
+    #[test]
+    fn plain_error_line_and_stderr_still_count() {
+        let out = codex_error_tail("OK\nERROR: something broke\n", &tail(&["fatal: boom"]));
+        assert!(out.contains("ERROR: something broke") && out.contains("fatal: boom"), "got: {out}");
+    }
+
+    #[test]
+    fn nothing_useful_adds_nothing() {
+        assert_eq!(codex_error_tail("{\"type\":\"turn.started\"}\n", &tail(&[])), "");
     }
 }

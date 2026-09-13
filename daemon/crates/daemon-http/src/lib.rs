@@ -286,7 +286,7 @@ async fn daemon_get_json<T: serde::de::DeserializeOwned>(url: String) -> anyhow:
                 if body.is_empty() {
                     anyhow::bail!("daemon responded with HTTP {status}");
                 }
-                anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
+                anyhow::bail!("daemon responded with HTTP {status}: {}", body_excerpt(body));
             }
             Ok(response.json::<T>().await?)
         }
@@ -307,7 +307,7 @@ async fn daemon_get_json<T: serde::de::DeserializeOwned>(url: String) -> anyhow:
                     if body.is_empty() {
                         anyhow::bail!("daemon responded with HTTP {status}");
                     }
-                    anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
+                    anyhow::bail!("daemon responded with HTTP {status}: {}", body_excerpt(body));
                 }
                 return Ok(retry.json::<T>().await?);
             }
@@ -404,7 +404,7 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
                 if body.is_empty() {
                     anyhow::bail!("daemon responded with HTTP {status}");
                 }
-                anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
+                anyhow::bail!("daemon responded with HTTP {status}: {}", body_excerpt(body));
             }
             Ok(response.json::<TResp>().await?)
         }
@@ -438,7 +438,7 @@ async fn daemon_post_json_with_timeout<TReq: serde::Serialize, TResp: serde::de:
                     if body.is_empty() {
                         anyhow::bail!("daemon responded with HTTP {status}");
                     }
-                    anyhow::bail!("daemon responded with HTTP {status}: {}", &body[..body.len().min(300)]);
+                    anyhow::bail!("daemon responded with HTTP {status}: {}", body_excerpt(body));
                 }
                 return Ok(retry.json::<TResp>().await?);
             }
@@ -1910,4 +1910,44 @@ mod daemon_request_failure_tests {
         );
     }
 
+}
+
+/// The part of a daemon error body that reaches the caller.
+///
+/// This was `&body[..300]` at four sites. A failure chain ("agy attempt 1/1: empty (status=X)
+/// -> degraded codex: connector timed out") is longer than 300 bytes, so the truncation
+/// re-created the defect the chain exists to fix: the caller saw the first hop and lost the
+/// rest. Byte slicing also panics on a multibyte boundary. 2000 chars, cut on a char boundary.
+/// Grok found the truncation in the plan review, 2026-09-13.
+fn body_excerpt(body: &str) -> &str {
+    const MAX_CHARS: usize = 2000;
+    match body.char_indices().nth(MAX_CHARS) {
+        Some((idx, _)) => &body[..idx],
+        None => body,
+    }
+}
+
+#[cfg(test)]
+mod body_excerpt_tests {
+    use super::body_excerpt;
+
+    #[test]
+    fn short_body_passes_through() {
+        assert_eq!(body_excerpt("HTTP 502: agy failed"), "HTTP 502: agy failed");
+    }
+
+    #[test]
+    fn a_failure_chain_longer_than_300_bytes_survives() {
+        let chain = "agy attempt 1/1: agy returned empty output (status=none, permission_requests=1, tool_calls=3) -> degraded gemini-cli: IneligibleTierError -> degraded codex: codex connector failed: exited with status 1; codex said: ERROR: You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage or try again at 7:03 PM.";
+        assert!(chain.len() > 300, "fixture must exceed the old cap");
+        assert_eq!(body_excerpt(chain), chain);
+    }
+
+    #[test]
+    fn cuts_on_a_char_boundary_not_a_byte() {
+        let body = "é".repeat(2500);
+        let out = body_excerpt(&body);
+        assert_eq!(out.chars().count(), 2000);
+        assert!(out.is_char_boundary(out.len()));
+    }
 }

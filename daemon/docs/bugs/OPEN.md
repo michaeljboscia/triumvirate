@@ -167,6 +167,49 @@ the "fix lands on one surface" shape again, with a test that certifies half the 
 runs every builder's output through `codex <args> --help` on the installed binary.
 **Check:** temporarily push a bogus flag into the consult or fleet argv; `cargo test` must fail.
 
+### D-012 - a failed gemini request reports the fallback hop's error and hides its own
+**Found:** 2026-09-13 · **Severity:** HIGH (misdiagnosis in the field)
+**Status 2026-09-13:** fixed in the working tree and live on the daemon. `execute_ask_agent`
+collects a `failure_chain` and formats it oldest first; the chain reaches the 502 body, the
+FAILED lifecycle and outbox event, and the dead-drop `reason`. Codex's stdout JSON error
+events and stderr tail are in the connector error. Antigravity's empty result carries
+`status`, `permission_requests`, and `tool_calls`. The bridge's four 300-byte body cuts are a
+2000-char excerpt. Verified live: a Codex quota failure now reads "codex said: You've hit your
+usage limit ... try again at 7:03 PM" on all three surfaces. Panel: antigravity and grok
+reviewed; codex's seat pending its own quota reset. Close after the codex pass.
+**Evidence:** an `ask_agent {agent: "gemini"}` review from the masterFFL session at 18:03Z was
+served by agy (log: "gemini dispatch served by agy backend"). agy completed in 15s and again in
+12s with "stream-json result carried no response text". The daemon then walked the default
+degraded route `gemini-cli,codex`; the codex hop hit the 180s connector timeout. The 502 the
+caller received said only `codex connector timed out`, and the dead drop's `reason:` says the
+same. The calling session concluded "Gemini alias is mis-routing to Codex" and rerouted its
+work. No mis-routing occurred; the original failure was never surfaced.
+Two gaps compound it: (1) the agy parser reads `result.status` (`agy_stream.rs:175`) but the
+WARN at `no response text` does not log it, and `RequestUserInput` tool events are not logged,
+so whether agy stopped on a permission prompt or an error is unrecoverable; (2) agy's
+`--log-file` is deleted after the run. A text-only replay of the same prompt on 2026-09-13
+returned SUCCESS, so it is not a content refusal; it fails when agy tries to act.
+**Why it matters:** an error that names the wrong component sends the operator to fix the
+wrong thing. Same class as the closed 2026-07-28 "timeout misreported as a dead daemon".
+**Fix shape:** the terminal error must carry the chain: `agy: empty response (status=X)` then
+`degraded codex: connector timed out`. Log `status` and any `RequestUserInput` event at WARN on
+the empty-response path. Keep the agy log on failure.
+**Check:** force agy to return empty (e.g. a prompt that needs a permission it cannot get) and
+read the 502 body: it must name agy first and codex second.
+
+### D-013 - a child's exit code was the whole error; the quota message was thrown away
+**Found:** 2026-09-13 · **Severity:** HIGH
+**Evidence:** Codex over its usage limit. Every dispatch: "codex connector failed: exited with
+status 1". The reason was on codex's stdout as `{"type":"error","message":"You've hit your
+usage limit ..."}`, parsed by `CodexExecParser`, never surfaced. Stderr was drained to
+`tracing::debug`. The claude connector already included stderr in its message
+(`agent_exec.rs`, "Include the stderr"); codex and the two Antigravity connectors did not.
+**Status:** codex fixed with D-012 (`codex_error_tail`, drain awaited, 300 chars per line,
+fixture test from the real binary). The two Antigravity connector bails
+(`agent_exec.rs` "Antigravity connector failed: exited with status") still carry no output;
+they are the dead gemini-cli path and are left for step 5 of the recovery plan.
+**Check:** exhaust a quota or revoke auth, dispatch, read the 502: the child's own words are in it.
+
 ## Closed
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"
