@@ -1759,9 +1759,7 @@ fn tool_call_touched_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
     tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
-            && c.args_json
-                .as_deref()
-                .is_some_and(|args| candidates.iter().any(|cand| args_name_path(args, cand)))
+            && candidates.iter().any(|cand| record_names_source(c, cand))
     })
 }
 
@@ -1795,9 +1793,7 @@ fn tool_call_read_source_in_full(
     let whole = tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
-            && c.args_json.as_deref().is_some_and(|args| {
-                candidates.iter().any(|cand| args_name_path(args, cand)) && !read_args_are_partial(&c.tool, args)
-            })
+            && candidates.iter().any(|cand| record_read_source_whole(c, cand))
     });
     whole || codex_ranged_reads_cover_source(tool_calls, &candidates, source, cwd)
 }
@@ -1831,15 +1827,14 @@ fn codex_ranged_reads_cover_source(
     let ranges: Vec<agent_adapter::codex::LineRange> = tool_calls
         .iter()
         .filter(|c| {
-            c.tool == "command_execution"
+            is_shell_read_tool(&c.tool)
                 && matches!(c.kind, ToolKind::ReadFile)
                 && c.success == Some(true)
         })
         .filter_map(|c| {
             let args = c.args_json.as_deref()?;
-            let command = serde_json::from_str::<serde_json::Value>(args).ok()?;
-            let command = command.get("command")?.as_str()?;
-            let read = agent_adapter::codex::command_read_range(command)?;
+            let command = agent_adapter::codex::shell_command_from_args_json(args)?;
+            let read = agent_adapter::codex::command_read_range(&command)?;
             // Bound to the operand the reader opened, not to a path string anywhere in the
             // command. Codex, round 3: a decoy operand embedding the source path used to
             // collect the source's coverage.
@@ -1904,7 +1899,7 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             }
             let window = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
-                .and_then(|v| v.get("command")?.as_str().map(str::to_string))
+                .and_then(|v| agent_adapter::codex::shell_command_from_value(Some(&v)))
                 .and_then(|cmd| agent_adapter::codex::command_read_range(&cmd).map(|x| x.range));
             Some(match window {
                 Some(r) => match r.end {
@@ -1998,12 +1993,72 @@ fn ranges_cover_lines(ranges: &[agent_adapter::codex::LineRange], total: u64) ->
 ///
 /// Fails closed on anything it cannot read: an args blob that is not an object is treated as
 /// partial, because an unreadable claim is not evidence of a full read.
+/// The tool names under which an adapter records a shell command: codex's
+/// `command_execution`, grok's `run_terminal_command`. A ReadFile record under one of these
+/// carries the read in `args.command`, and whole-vs-partial is decided from the command.
+fn is_shell_read_tool(tool: &str) -> bool {
+    // codex `command_execution`; grok `run_terminal_command`/`bash`/`shell`/`terminal`;
+    // claude `Bash` (grok's matcher lowercases); agy `run_command`; gemini `bash`.
+    tool == "command_execution" || tool == "run_command" || agent_adapter::grok::is_shell_tool(tool)
+}
+
+/// Does this ReadFile record name `cand` as THE file it read?
+///
+/// A shell read is bound to its operand (`whole_file_read_operand`, or the ranged read's
+/// operand), never to a substring of the recorded arguments: `cat /dev/null < SRC` and a
+/// `description` field that names SRC both matched before (Antigravity, D-010 review). A
+/// non-shell read keeps the field-based match.
+fn record_names_source(c: &ToolCallRecord, cand: &str) -> bool {
+    let Some(args) = c.args_json.as_deref() else {
+        return false;
+    };
+    if is_shell_read_tool(&c.tool) {
+        let Some(cmd) = agent_adapter::codex::shell_command_from_args_json(args) else {
+            return false;
+        };
+        if let Some(op) = agent_adapter::codex::whole_file_read_operand(&cmd) {
+            return op == cand;
+        }
+        if let Some(read) = agent_adapter::codex::command_read_range(&cmd) {
+            return read.operand == cand;
+        }
+        // A peek (`head -5 SRC`, `tail -1 SRC`) is neither whole nor ranged, but it DID open
+        // the source, and the gate reports a peek ("only read PART") differently from a miss
+        // ("never opened"). Bind to an operand TOKEN: the path must be a bare argument of a
+        // reading command. A `description` field never matches; a redirect target does, and
+        // that read is then rejected as PART rather than as a miss, which is still a rejection.
+        if agent_adapter::codex::command_reads_file_contents_pub(&cmd) {
+            return cmd
+                .split_whitespace()
+                .map(|t| t.trim_matches(|c| c == '\'' || c == '"'))
+                .any(|t| t == cand);
+        }
+        return false;
+    }
+    args_name_path(args, cand)
+}
+
+/// Did this ReadFile record read `cand` WHOLE? Stricter than `record_names_source`: a shell
+/// read must be a single whole-file reader with `cand` as its only operand, so the peek
+/// binding (`head`, `tail`, a redirect) can mark a source as touched but never as read in full.
+/// `cat /dev/null < SRC` passed the first version of this because the whole-read check trusted
+/// `cat` at the front of the command; the operand is what proves the contents were shown.
+fn record_read_source_whole(c: &ToolCallRecord, cand: &str) -> bool {
+    let Some(args) = c.args_json.as_deref() else {
+        return false;
+    };
+    if is_shell_read_tool(&c.tool) {
+        return agent_adapter::codex::shell_command_from_args_json(args)
+            .and_then(|cmd| agent_adapter::codex::whole_file_read_operand(&cmd))
+            .is_some_and(|op| op == cand);
+    }
+    args_name_path(args, cand) && !read_args_are_partial(&c.tool, args)
+}
+
 fn read_args_are_partial(tool: &str, args_json: &str) -> bool {
-    // codex: the slice lives in the command line, not in a field.
-    if tool == "command_execution" {
-        let command = serde_json::from_str::<serde_json::Value>(args_json)
-            .ok()
-            .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string));
+    // codex and grok: the slice lives in the command line, not in a field.
+    if is_shell_read_tool(tool) {
+        let command = agent_adapter::codex::shell_command_from_args_json(args_json);
         return match command {
             Some(cmd) => !agent_adapter::codex::command_reads_whole_file(&cmd),
             None => true,
@@ -2194,7 +2249,7 @@ fn enforce_reviewer_sight(
                  or a read carrying `limit`/`offset` returns a few lines and leaves the work \
                  itself out of context, so a verdict formed from one cannot be about the work. \
                  Re-read the whole file ON THIS TURN (`cat`, or a read with no limit and no \
-                 offset; codex may read it in `sed -n` windows, and they must together cover \
+                 offset; codex and grok may read it in `sed -n` windows, and they must together cover \
                  every line from 1 to the last with no gap). Only this turn's tool calls count: \
                  a reused worker that read part of it on an earlier turn must read it all \
                  again. Reads counted this turn: {}",
@@ -8203,5 +8258,101 @@ mod codex_error_tail_tests {
     #[test]
     fn nothing_useful_adds_nothing() {
         assert_eq!(codex_error_tail("{\"type\":\"turn.started\"}\n", &tail(&[])), "");
+    }
+}
+
+#[cfg(test)]
+mod grok_shell_read_gate_tests {
+    use super::enforce_reviewer_sight;
+    use agent_adapter::{ToolCallRecord, ToolKind};
+
+    fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
+        ToolCallRecord {
+            id: None,
+            tool: "run_terminal_command".to_string(),
+            kind,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(serde_json::json!({ "command": command, "description": "x" }).to_string()),
+        }
+    }
+
+    /// D-010. Three grok reviews were rejected "never opened" after doing exactly what the
+    /// rejection text asked: `cat` the file. RED IF: a grok whole-file `cat` stops satisfying a
+    /// named source.
+    #[test]
+    fn a_grok_cat_of_the_named_source_passes() {
+        let tools = vec![grok_shell("cat /repo/a.rs", ToolKind::ReadFile)];
+        let sources = vec!["/repo/a.rs".to_string()];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+            .expect("a whole-file cat is the source");
+    }
+
+    /// RED IF: a peek passes as the source. `head -5` is the FIND-REVIEW-07 shape.
+    #[test]
+    fn a_grok_head_of_the_named_source_is_rejected_as_partial() {
+        let tools = vec![grok_shell("head -5 /repo/a.rs", ToolKind::ReadFile)];
+        let sources = vec!["/repo/a.rs".to_string()];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+            .expect_err("a peek is not the source");
+        assert!(err.contains("only read PART"), "got: {err}");
+    }
+
+    /// Antigravity's bypasses (review of D-010): the read is bound to its operand, so a
+    /// redirect, a comment, or a `description` naming the source cannot stand in for reading it.
+    /// RED IF: any of these passes as "opened".
+    #[test]
+    fn a_read_of_something_else_that_mentions_the_source_does_not_open_it() {
+        for cmd in ["cat /dev/null < /repo/a.rs", "cat /repo/b.rs # /repo/a.rs", "cat /dev/null"] {
+            let mut rec = grok_shell(cmd, ToolKind::ReadFile);
+            rec.args_json = Some(serde_json::json!({ "command": cmd, "description": "reading /repo/a.rs" }).to_string());
+            let sources = vec!["/repo/a.rs".to_string()];
+            let mut lifecycle = Vec::new();
+            let err = enforce_reviewer_sight("Grok", &[rec], "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+                .expect_err(cmd);
+            assert!(
+                err.contains("never successfully opened") || err.contains("only read PART"),
+                "{cmd}: {err}"
+            );
+        }
+    }
+
+    /// Every adapter's shell tool name is a shell read for the gate: agy `run_command` with
+    /// `CommandLine`, claude `Bash`, gemini `bash`.
+    #[test]
+    fn every_adapters_shell_tool_is_a_shell_read_for_the_gate() {
+        for (tool, args) in [
+            ("run_command", serde_json::json!({ "CommandLine": "cat /repo/a.rs" })),
+            ("Bash", serde_json::json!({ "command": "cat /repo/a.rs" })),
+            ("bash", serde_json::json!({ "command": "cat /repo/a.rs" })),
+            ("command_execution", serde_json::json!({ "command": "cat /repo/a.rs" })),
+        ] {
+            let rec = ToolCallRecord {
+                id: None,
+                tool: tool.to_string(),
+                kind: ToolKind::ReadFile,
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+            };
+            let sources = vec!["/repo/a.rs".to_string()];
+            let mut lifecycle = Vec::new();
+            enforce_reviewer_sight("X", &[rec], "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+        }
+    }
+
+    /// A shell command that is NOT a read, recorded as Bash by the adapter, does not touch the
+    /// source even if the path appears in it.
+    #[test]
+    fn a_grok_wc_naming_the_source_does_not_count_as_opening_it() {
+        let tools = vec![grok_shell("wc -l /repo/a.rs", ToolKind::Bash)];
+        let sources = vec!["/repo/a.rs".to_string()];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+            .expect_err("wc is not a read");
+        assert!(err.contains("never successfully opened"), "got: {err}");
     }
 }

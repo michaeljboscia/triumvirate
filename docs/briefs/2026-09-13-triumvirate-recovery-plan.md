@@ -18,6 +18,13 @@ Every step goes through the three-peer panel before commit, artifact frozen in `
 - Found during Step 1: Codex was over its usage limit all afternoon, hidden behind "exited
   with status 1" (D-013). Instant repeated failures with exit 1 are a quota or auth failure,
   not a timeout.
+- Step 3, 2026-09-13 evening: a shell command that reads a file is a ReadFile in every
+  adapter (grok, agy, claude, gemini) via one shared classifier, so the class is closed. The
+  gate binds a shell read to its operand through the strict cat/nl parser: pipes, redirects,
+  comments, subshells, second operands, output-suppressing flags, and a `description` naming
+  the source all fail the whole-read check. Live: grok `cat` passes, `head -5` rejected as PART.
+  Panel: antigravity (three bypasses, then `xxd -l0`) and grok (class across adapters, evidence
+  strings, FileRead consumers) in; codex seat pending quota.
 
 ## Reorder after the panel review of this plan
 Antigravity: Step 4 (Antigravity 429 under a burst) must precede any panel-gated step, or the

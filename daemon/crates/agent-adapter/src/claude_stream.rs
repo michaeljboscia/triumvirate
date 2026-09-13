@@ -239,7 +239,8 @@ impl ClaudeStreamParser {
                     }
                     self.tool_calls.push(ToolCallRecord {
                         id: id.clone(),
-                        kind: tool_kind(&name),
+                        // D-010: a `Bash` call that reads a file is a read for the sight gate.
+                        kind: crate::codex::shell_read_kind(tool_kind(&name), block.get("input")),
                         tool: name.clone(),
                         // Unknown until the matching tool_result arrives. A turn cut off before
                         // that leaves it None, which the sight gate treats as "not a proven

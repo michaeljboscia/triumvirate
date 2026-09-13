@@ -108,7 +108,8 @@ impl GeminiStreamParser {
                 self.tool_calls.push(ToolCallRecord {
                     id: json.get("tool_id").and_then(|v| v.as_str()).map(ToString::to_string),
                     tool: tool_name.to_string(),
-                    kind: map_tool_kind(tool_name),
+                    // D-010: a `bash` call that reads a file is a read for the sight gate.
+                    kind: crate::codex::shell_read_kind(map_tool_kind(tool_name), json.get("parameters")),
                     success: None,
                     duration_ms: None,
                     args_json: args_json.clone(),

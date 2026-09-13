@@ -259,6 +259,11 @@ impl AgyStreamParser {
                 self.open_steps.remove(pos);
             }
             if params.is_some() {
+                // Parameters can arrive on the DONE update, after the record was classified by
+                // name. Re-classify: a `run_command` whose CommandLine reads a file is a read.
+                if let Some(v) = params.as_deref().and_then(|p| serde_json::from_str::<Value>(p).ok()) {
+                    rec.kind = crate::codex::shell_read_kind(rec.kind.clone(), Some(&v));
+                }
                 rec.args_json = params;
             }
             if duration_ms.is_some() {
@@ -274,10 +279,12 @@ impl AgyStreamParser {
             return;
         }
 
+        let params_value = params.as_deref().and_then(|p| serde_json::from_str::<Value>(p).ok());
         self.tool_calls.push(ToolCallRecord {
             id: Some(idx.to_string()),
             tool: name.clone(),
-            kind: map_agy_tool_kind(&name),
+            // D-010: a `run_command` that reads a file is a read for the sight gate.
+            kind: crate::codex::shell_read_kind(map_agy_tool_kind(&name), params_value.as_ref()),
             success: if done {
                 Some(true)
             } else if errored {

@@ -136,6 +136,13 @@ artifact is not verifying the path.
 
 ### D-010 - sight gate cannot see a grok shell read, and its own message recommends one
 **Found:** 2026-09-12 · **Severity:** MEDIUM
+**Status 2026-09-13:** fixed in the working tree and live on the daemon. `shell_read_kind`
+(codex.rs) classifies a shell command that reads a file as ReadFile, applied in the grok, agy,
+claude and gemini adapters, so the class is closed and not the grok case. The gate binds a shell
+read to its operand (`whole_file_read_operand`): a pipe, redirect, comment, subshell, or second
+operand does not count, and a `description` naming the source does not match. Live: a grok
+`cat` of a named source passes; `head -5` is rejected as PART. Panel: antigravity and grok
+reviewed, antigravity's three bypasses closed; codex seat pending quota. Close after that pass.
 **Evidence:** three `ask_agent` grok dispatches with `required_sources` on a 199-line diff
 were rejected. Attempt three did what the rejection text asked and ran `cat <path>` in one
 shell command. `agent-adapter/src/grok.rs:104` maps every `run_terminal_command` to

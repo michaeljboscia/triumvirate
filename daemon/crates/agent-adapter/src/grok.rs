@@ -109,6 +109,14 @@ fn map_tool_kind(kind: Option<&str>, tool_name: &str) -> ToolKind {
     }
 }
 
+/// Grok's shell tools. The gate's whole-vs-partial read logic keys on the tool name.
+pub fn is_shell_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_lowercase().as_str(),
+        "run_terminal_command" | "bash" | "shell" | "terminal"
+    )
+}
+
 fn u64_at(v: &Value, key: &str) -> Option<u64> {
     v.get(key).and_then(Value::as_u64)
 }
@@ -238,7 +246,14 @@ impl GrokStreamParser {
                     .or_else(|| json.get("title").and_then(Value::as_str))
                     .unwrap_or("unknown")
                     .to_string();
-                let kind = map_tool_kind(json.get("kind").and_then(Value::as_str), &tool);
+                // A shell command that reads a file IS a file read. Grok sends `kind: "execute"`
+                // and `rawInput.command` for `run_terminal_command` (captured live 2026-09-13).
+                // Without this the sight gate could not see a `cat`, while its own rejection
+                // text told the reviewer to `cat` the file (D-010). Shared with every adapter.
+                let kind = super::codex::shell_read_kind(
+                    map_tool_kind(json.get("kind").and_then(Value::as_str), &tool),
+                    json.get("rawInput"),
+                );
                 let args_json = json.get("rawInput").map(|v| v.to_string());
 
                 self.tool_calls.push(ToolCallRecord {
@@ -251,7 +266,9 @@ impl GrokStreamParser {
                 });
 
                 let seq = self.next_seq();
-                if kind == ToolKind::ReadFile {
+                // A shell read is a ReadFile for the gate, but its path lives in the command,
+                // not in a path field, so it is streamed as a ToolCall like any other command.
+                if kind == ToolKind::ReadFile && !is_shell_tool(&tool) {
                     // Real captures use `target_file`; the vendor guide's example showed `path`.
                     // Checking only `path` left every FileRead event with an empty file path, and
                     // the committed tool fixture proves it. Grok caught this in review.
@@ -1031,5 +1048,47 @@ mod cost_passthrough_tests {
         let v: serde_json::Value =
             serde_json::from_str(r#"{"text":"hi","usage":{"input_tokens":1}}"#).unwrap();
         assert_eq!(GrokStreamParser::parse_batch_json(&v).self_reported_cost_usd, None);
+    }
+}
+
+#[cfg(test)]
+mod shell_read_classification_tests {
+    use super::{map_tool_kind, GrokStreamParser};
+    use crate::codex::shell_read_kind;
+    use crate::ToolKind;
+    use serde_json::json;
+
+    fn classify(raw: serde_json::Value) -> ToolKind {
+        shell_read_kind(map_tool_kind(Some("execute"), "run_terminal_command"), Some(&raw))
+    }
+
+    /// The exact tool_call grok 1.0.13 emitted for a `cat`, captured 2026-09-13. RED IF: a
+    /// shell read goes back to Bash, which re-opens D-010 (the gate cannot see the read).
+    #[test]
+    fn a_cat_through_run_terminal_command_is_a_read_even_with_kind_execute() {
+        assert_eq!(classify(json!({"command": "cat /repo/probe.txt", "description": "Read probe.txt"})), ToolKind::ReadFile);
+    }
+
+    #[test]
+    fn a_sed_window_is_a_read_too() {
+        assert_eq!(classify(json!({"command": "sed -n '1,120p' /repo/a.rs"})), ToolKind::ReadFile);
+    }
+
+    #[test]
+    fn a_non_reading_command_stays_bash() {
+        for cmd in ["ls -la", "wc -l /repo/a.rs", "cargo test", "grep -rn foo /repo"] {
+            assert_eq!(classify(json!({"command": cmd})), ToolKind::Bash, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_shell_read_is_recorded_with_its_command_for_the_gate() {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(r#"{"type":"tool_call","toolCallId":"c1","title":"run_terminal_command","kind":"execute","status":"pending","toolName":"run_terminal_command","rawInput":{"command":"cat /repo/probe.txt","description":"Read"}}"#);
+        let r = p.finish();
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].tool, "run_terminal_command");
+        assert_eq!(r.tool_calls[0].kind, ToolKind::ReadFile);
+        assert!(r.tool_calls[0].args_json.as_deref().unwrap_or("").contains("cat /repo/probe.txt"));
     }
 }

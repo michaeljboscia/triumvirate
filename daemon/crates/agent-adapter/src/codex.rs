@@ -92,9 +92,63 @@ fn unwrap_shell_wrapper(cmd: &str) -> &str {
 /// they dump everything, but that depends on the terminal and on `$PAGER`, so they are treated as
 /// partial rather than reasoned about. Fail closed: the cost is a false rejection of an unusual
 /// full read, never a false pass on a one-line peek.
+const WHOLE_FILE_READERS: &[&str] = &["cat", "nl", "bat", "od", "xxd", "strings", "pr", "zcat"];
+
+/// The ONE file a whole-file shell read opened, or None.
+///
+/// The sight gate used to match a named source as a substring of the recorded arguments. That
+/// passed `cat /dev/null < /repo/a.rs`, `cat /repo/b.rs # /repo/a.rs`, and a grok call whose
+/// `description` field named the source while `command` read something else (Antigravity,
+/// review of D-010, 2026-09-13). A whole-file read is now bound to its operand: exactly one
+/// reader, any flags, exactly one file, and no pipe, redirect, comment, subshell, or chain.
+/// Ranged reads are bound separately by `command_read_range`, which already checks the operand.
+pub fn whole_file_read_operand(command: &str) -> Option<String> {
+    if command_read_range(command).is_some() {
+        return None;
+    }
+    let cmd = unwrap_shell_wrapper(command.trim());
+    if cmd.contains(['|', '<', '>', '#', ';', '&', '`', '$', '(', ')']) {
+        return None;
+    }
+    // Only `cat` and `nl`, with the line-preserving flags the ranged-read parser already vets.
+    // The wider reader list (`od`, `xxd`, `strings`, ...) is fine for "did it read something"
+    // but not for "did it show the whole file": `xxd -l0 SRC` and `od -N0 SRC` are readers that
+    // print nothing (Antigravity, second pass on D-010). Any flag outside the vetted list fails.
+    whole_file_reader_with_one_operand(cmd).map(|(op, _)| op)
+}
+
+/// A shell tool call that READS a file is a `ReadFile` for the sight gate.
+///
+/// Every adapter mapped its shell tool to `Bash` by name alone, so a `cat` of a named source
+/// was invisible to the gate while the gate's own rejection text told the reviewer to `cat`
+/// the file (D-010). This is applied by every adapter after its name-based mapping. The
+/// command is read from `command` (grok, claude, gemini, codex) or `CommandLine` (agy).
+pub fn shell_read_kind(kind: ToolKind, args: Option<&serde_json::Value>) -> ToolKind {
+    if kind != ToolKind::Bash {
+        return kind;
+    }
+    match shell_command_from_value(args) {
+        Some(cmd) if command_reads_file_contents(&cmd) => ToolKind::ReadFile,
+        _ => kind,
+    }
+}
+
+/// The command string inside a shell tool's recorded arguments, whichever key the adapter uses.
+pub fn shell_command_from_value(args: Option<&serde_json::Value>) -> Option<String> {
+    let v = args?;
+    v.get("command")
+        .or_else(|| v.get("CommandLine"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Same, from the JSON string a `ToolCallRecord` carries.
+pub fn shell_command_from_args_json(args_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    shell_command_from_value(Some(&v))
+}
+
 pub fn command_reads_whole_file(command: &str) -> bool {
-    const WHOLE_FILE_READERS: &[&str] =
-        &["cat", "nl", "bat", "od", "xxd", "strings", "pr", "zcat"];
     if !command_reads_file_contents(command) {
         return false;
     }
@@ -318,7 +372,12 @@ fn whole_file_reader_with_one_operand(stage: &str) -> Option<(String, bool)> {
     operand.map(|op| (op, base == "nl"))
 }
 
-fn command_reads_file_contents(command: &str) -> bool {
+/// Public face of `command_reads_file_contents` for the gate's peek binding.
+pub fn command_reads_file_contents_pub(command: &str) -> bool {
+    command_reads_file_contents(command)
+}
+
+pub(crate) fn command_reads_file_contents(command: &str) -> bool {
     // A ranged read is a read. Checked first because its pipeline form would otherwise be
     // refused by the compound-command rule below, which exists for commands where the reader
     // may not be the part that touched the named path. Here both stages are constrained.
@@ -899,5 +958,54 @@ mod command_classification_tests {
         };
         assert_eq!(by_id("c1"), ToolKind::ReadFile, "`cat` reads the file");
         assert_eq!(by_id("c2"), ToolKind::Bash, "`ls` does not");
+    }
+}
+
+#[cfg(test)]
+mod whole_file_read_operand_tests {
+    use super::{shell_read_kind, whole_file_read_operand};
+    use crate::ToolKind;
+    use serde_json::json;
+
+    #[test]
+    fn a_plain_cat_binds_to_its_operand() {
+        assert_eq!(whole_file_read_operand("cat /repo/a.rs").as_deref(), Some("/repo/a.rs"));
+        assert_eq!(whole_file_read_operand("cat -n '/repo/a.rs'").as_deref(), Some("/repo/a.rs"));
+        assert_eq!(whole_file_read_operand("/bin/zsh -lc \"cat /repo/a.rs\"").as_deref(), Some("/repo/a.rs"));
+    }
+
+    /// The three shapes Antigravity named. RED IF: any of them yields an operand, because the
+    /// gate would then count a read that never put the source in front of the model.
+    #[test]
+    fn redirects_comments_and_second_operands_do_not_bind() {
+        for cmd in [
+            "cat /dev/null < /repo/a.rs",
+            "cat /repo/b.rs # /repo/a.rs",
+            "cat /repo/b.rs /repo/a.rs",
+            "cat /repo/a.rs > /dev/null",
+            "cat /repo/a.rs | wc -l",
+            "cat $(echo /repo/a.rs)",
+            "cat -",
+            "xxd -l0 /repo/a.rs",
+            "od -N0 /repo/a.rs",
+            "cat -s /repo/a.rs",
+            "strings -n 9999 /repo/a.rs",
+        ] {
+            assert_eq!(whole_file_read_operand(cmd), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_ranged_read_is_not_a_whole_read() {
+        assert_eq!(whole_file_read_operand("sed -n '1,5p' /repo/a.rs"), None);
+    }
+
+    #[test]
+    fn shell_read_kind_lifts_a_reading_command_and_leaves_the_rest() {
+        assert_eq!(shell_read_kind(ToolKind::Bash, Some(&json!({"command": "cat /repo/a.rs"}))), ToolKind::ReadFile);
+        assert_eq!(shell_read_kind(ToolKind::Bash, Some(&json!({"CommandLine": "sed -n '1,9p' a.rs"}))), ToolKind::ReadFile);
+        assert_eq!(shell_read_kind(ToolKind::Bash, Some(&json!({"command": "ls -la"}))), ToolKind::Bash);
+        assert_eq!(shell_read_kind(ToolKind::Grep, Some(&json!({"command": "cat a"}))), ToolKind::Grep);
+        assert_eq!(shell_read_kind(ToolKind::Bash, None), ToolKind::Bash);
     }
 }
