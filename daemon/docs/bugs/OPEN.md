@@ -217,6 +217,18 @@ fixture test from the real binary). The two Antigravity connector bails
 they are the dead gemini-cli path and are left for step 5 of the recovery plan.
 **Check:** exhaust a quota or revoke auth, dispatch, read the 502: the child's own words are in it.
 
+### D-014 - agy quota detectors over-match glog noise
+**Found:** 2026-09-13 (Grok, review of recovery step 4) · **Severity:** LOW
+**Evidence:** `classify_failure_message` matches any "429" (glog thread ids hit it,
+`conversation_manager.go` 2026-08-20) and any "quota" (`doRefreshQuota`,
+`retrieveUserQuotaSummary` health lines classify as capacity/quota). `quota_signal_in_line` is
+the narrower detector and still shares the "429" substring. A false quota classification now
+also triggers the step 4 backoff and feeds the breaker.
+**Why it matters:** a benign log line can back off a healthy call by 60s and nudge the breaker.
+**Fix shape:** anchor "429" to `code 429` / `HTTP 429` / `(429)` and "quota" to
+`RESOURCE_EXHAUSTED` / `quota exceeded` / `capacity`; add the two glog lines as negative fixtures.
+**Check:** the 2026-08-20 thread-id line and a `doRefreshQuota` line classify AuthOrExec.
+
 ## Closed
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"

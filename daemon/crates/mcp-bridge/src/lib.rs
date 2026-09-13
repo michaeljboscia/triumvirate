@@ -342,14 +342,19 @@ impl GeminiBackend {
     }
 }
 
-/// Select the gemini backend from `TRIUMVIRATE_GEMINI_BACKEND`. The value must be
-/// exactly `agy` to select agy; unset or ANY other value is the legacy gemini-cli
-/// path, so the default behavior is byte-for-byte the current path (REQ-001/002).
+/// Select the gemini backend from `TRIUMVIRATE_GEMINI_BACKEND`.
+///
+/// Unset, or any value other than exactly `gemini-cli`, is agy. This used to default to
+/// gemini-cli (REQ-001/002), and that default caused a four-day outage when the env var went
+/// missing; `scripts/start-daemon.sh` refuses to start without it for that reason. Google
+/// retired the Gemini CLI's individual tier on or before 2026-09-13 (`IneligibleTierError` on
+/// every auth), so the safe default is now the only backend that works. `gemini-cli` stays
+/// selectable for an operator who still has a tier (REQ-083 rollback).
 #[instrument(skip_all)]
 pub fn gemini_backend() -> GeminiBackend {
     match std::env::var("TRIUMVIRATE_GEMINI_BACKEND").ok().as_deref() {
-        Some("agy") => GeminiBackend::Agy,
-        _ => GeminiBackend::GeminiCli,
+        Some("gemini-cli") => GeminiBackend::GeminiCli,
+        _ => GeminiBackend::Agy,
     }
 }
 
@@ -537,18 +542,19 @@ mod tests {
     }
 
     #[test]
-    fn gemini_backend_defaults_to_gemini_cli_and_only_agy_selects_agy() {
-        // REQ-001/002 + REQ-083 rollback config: unset or ANY non-"agy" value is the
-        // legacy gemini-cli path; only exactly "agy" selects the agy backend.
+    fn gemini_backend_defaults_to_agy_and_only_gemini_cli_selects_the_retired_cli() {
+        // 2026-09-13: the Gemini CLI tier is retired, so unset or any value other than exactly
+        // "gemini-cli" is agy. "gemini-cli" stays selectable for rollback (REQ-083).
+        // RED IF: the default drifts back to the dead CLI, which is the four-day-outage shape.
         let _guard = env_lock().lock().expect("env lock poisoned");
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
-        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::Agy);
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "agy") };
         assert_eq!(super::gemini_backend(), super::GeminiBackend::Agy);
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli") };
         assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "anything-else") };
-        assert_eq!(super::gemini_backend(), super::GeminiBackend::GeminiCli);
+        assert_eq!(super::gemini_backend(), super::GeminiBackend::Agy);
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
     }
 

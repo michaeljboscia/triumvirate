@@ -26,6 +26,16 @@ Every step goes through the three-peer panel before commit, artifact frozen in `
   Panel: antigravity (three bypasses, then `xxd -l0`) and grok (class across adapters, evidence
   strings, FileRead consumers) in; codex seat pending quota.
 
+- Steps 4 and 5, 2026-09-13 evening: a quota/429 from Antigravity (non-zero exit, or an
+  empty result with a quota line in the log, on stderr, or on stdout) is retried after a
+  backoff (default 15s then 45s), the breaker sees every 429, the concurrency slot is held per
+  attempt and not across the sleep, and the whole call ends by the connector deadline. The
+  degraded route default is `codex`, and the primary Gemini backend defaults to agy (the
+  gemini-cli default was the four-day-outage shape). Panel: antigravity (slot starvation,
+  breaker regression, deadline overrun, all fixed) and grok (stderr dropped on zero exit,
+  fixed; backend default, fixed; detectors over-match glog thread ids and doRefreshQuota
+  lines, noted, not changed). Codex seat pending quota.
+
 ## Reorder after the panel review of this plan
 Antigravity: Step 4 (Antigravity 429 under a burst) must precede any panel-gated step, or the
 panel's three parallel calls trip the throttle. Grok: the panel path is sight-gated and so

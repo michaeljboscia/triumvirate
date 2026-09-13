@@ -227,10 +227,22 @@ pub(crate) fn plan_degraded_route(route_env: &str, class: AgyFailureClass) -> Ve
 }
 
 /// The degraded route value (`TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`, default
-/// `gemini-cli,codex`; `fail` disables). REQ-053.
+/// `codex`; `fail` disables). REQ-053.
 pub(crate) fn degraded_route_env() -> String {
-    std::env::var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE")
-        .unwrap_or_else(|_| "gemini-cli,codex".to_string())
+    // Default was `gemini-cli,codex`. Google retired the Gemini CLI's individual tier on or
+    // before 2026-09-13 (`IneligibleTierError` on every auth), so that hop failed every time
+    // before codex got its turn. Operators with a tier can still set the env var.
+    std::env::var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE").unwrap_or_else(|_| "codex".to_string())
+}
+
+/// Waits before retrying agy after a quota/429 signal, in order. `TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS`
+/// is a comma list of seconds; default `15,45`; empty disables quota retries.
+pub(crate) fn quota_backoff_schedule() -> Vec<Duration> {
+    let raw = std::env::var("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS").unwrap_or_else(|_| "15,45".to_string());
+    raw.split(',')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .collect()
 }
 
 /// Total wall-clock budget for the whole degraded route (REQ-054, default 900s).
@@ -280,28 +292,64 @@ pub(crate) async fn run_agy_cli_process_with_session(
     }
 
     // REQ-055/102: bound global concurrency + call rate across ALL agy callers (ask
-    // path + fleet). The permit is held for the lifetime of this dispatch.
-    let _slot = mcp_bridge::agy_resilience::agy_acquire_slot().await;
-    mcp_bridge::agy_resilience::agy_rate_limit().await;
-
+    // path + fleet). The permit is held per ATTEMPT (inside the loop below), never across a
+    // quota backoff sleep: three panel calls in backoff would otherwise hold all three slots
+    // and starve a fourth caller (Antigravity, review of step 4).
     emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::TurnStarted, "turn started (agy)"));
 
     // Outer hard-kill bound: a small grace beyond agy's own --print-timeout so a
     // clean agy exit wins the race; if agy ignores its own timeout (hang), we SIGKILL.
     let kill_after = mcp_bridge::agy::agy_connector_timeout() + Duration::from_secs(15);
+    // The WHOLE call, retries and backoffs included, ends by this deadline. Without it a
+    // review that hit 429 twice could run 15s + 45s + a full attempt and outlive the bridge's
+    // client timeout (Antigravity, review of step 4).
+    let overall_deadline = std::time::Instant::now() + kill_after;
 
     let mut last_err: Option<anyhow::Error> = None;
 
-    // One retry on hang/empty (REQ-020/103). A non-zero exit is a real failure → no retry.
-    for attempt in 0u32..2 {
+    // One retry on hang/empty (REQ-020/103). A non-zero exit is a real failure → no retry,
+    // EXCEPT a quota/429: one more attempt per entry in the quota backoff schedule. Before
+    // this a 429 failed the connector instantly, the empty result rode the degraded route into
+    // "codex connector timed out", and the panel's three parallel calls became three parallel
+    // 429s (recovery plan step 4, 2026-09-13).
+    let mut attempt_idx = 0u32;
+    let mut budget = 2u32;
+    let mut quota_backoffs = quota_backoff_schedule().into_iter();
+    loop {
+        if attempt_idx >= budget {
+            break;
+        }
+        // A retry after the breaker opened would only burn quota the breaker is protecting.
+        if attempt_idx > 0 && mcp_bridge::agy_resilience::agy_breaker_should_skip() {
+            last_err = Some(anyhow::anyhow!("agy capacity/quota: circuit breaker opened during backoff"));
+            break;
+        }
+        let remaining = overall_deadline.saturating_duration_since(std::time::Instant::now());
+        if attempt_idx > 0 && remaining < Duration::from_secs(30) {
+            break;
+        }
+        let attempt = attempt_idx;
+        attempt_idx += 1;
+        let slot = mcp_bridge::agy_resilience::agy_acquire_slot().await;
+        mcp_bridge::agy_resilience::agy_rate_limit().await;
+        let attempt_kill_after = kill_after.min(remaining);
         let run = if use_pty {
-            run_agy_once_pty(bin, extra_args, message, cwd, kill_after, read_only).await
+            run_agy_once_pty(bin, extra_args, message, cwd, attempt_kill_after, read_only).await
         } else {
-            run_agy_once(bin, extra_args, message, cwd, kill_after, read_only).await
+            run_agy_once(bin, extra_args, message, cwd, attempt_kill_after, read_only).await
         };
+        drop(slot);
         match run {
-            AgyRun::Ok { raw, log } => {
+            AgyRun::Ok { raw, stderr, log } => {
                 let text = strip_ansi(&raw).trim().to_string();
+                // A 429 on a zero exit: in the log, or only on stderr/stdout (Grok, step 4 review).
+                let quota_signal = log.quota_signal.clone().or_else(|| {
+                    stderr
+                        .lines()
+                        .chain(text.lines())
+                        .find(|l| quota_signal_in_line(l))
+                        .map(|l| l.trim().to_string())
+                });
                 if text.is_empty() {
                     // REQ-024 canary: exit 0 + empty is NEVER a silent success (US-2).
                     // Retry once (transient / capture-drop regression); a still-empty
@@ -342,6 +390,24 @@ pub(crate) async fn run_agy_cli_process_with_session(
                     let status = sp.status().map(str::to_string);
                     let mut parsed = sp.finish();
                     if parsed.response_text.trim().is_empty() {
+                        if let Some(signal) = quota_signal.as_deref() {
+                            if let Some(wait) = quota_backoffs.next() {
+                                tracing::warn!(
+                                    wait_s = wait.as_secs(),
+                                    quota = signal,
+                                    "agy returned empty output on a quota/429 signal (attempt {attempt}); backing off"
+                                );
+                                last_err = Some(anyhow::anyhow!(
+                                    "agy capacity/quota: empty output, signal: {signal}"
+                                ));
+                                // The breaker must see every 429, not only the one that ends
+                                // the call, or it opens later than before this change.
+                                mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                                budget += 1;
+                                tokio::time::sleep(wait).await;
+                                continue;
+                            }
+                        }
                         // The status and any permission request were parsed and dropped, so an
                         // empty result was undiagnosable after the fact (D-012). Carry both.
                         let permission_requests = parsed
@@ -383,9 +449,25 @@ pub(crate) async fn run_agy_cli_process_with_session(
             }
             AgyRun::NonZero { code, stderr, log } => {
                 // REQ-034/051/052: classify for a user-visible message. Non-zero is a
-                // real failure → no retry (the degraded route is at the dispatch loop).
+                // real failure → no retry (the degraded route is at the dispatch loop),
+                // except a quota/429, which gets the backoff schedule.
+                let err = classify_failure(code, &stderr, &log);
+                if classify_failure_message(&err.to_string()) == AgyFailureClass::Quota {
+                    if let Some(wait) = quota_backoffs.next() {
+                        tracing::warn!(
+                            wait_s = wait.as_secs(),
+                            error = %err,
+                            "agy quota/429 (attempt {attempt}); backing off before retry"
+                        );
+                        last_err = Some(err);
+                        mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                        budget += 1;
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                }
                 emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::Error, "error (agy)"));
-                return Err(classify_failure(code, &stderr, &log));
+                return Err(err);
             }
             AgyRun::SpawnError(e) => {
                 emit_working_event(events_tx.as_ref(), lifecycle(WorkingState::Error, "error (agy)"));
@@ -480,7 +562,9 @@ pub(crate) async fn health_probe() {
 // ---------------------------------------------------------------------------
 
 enum AgyRun {
-    Ok { raw: String, log: AgyLogInfo },
+    /// `stderr` is kept on a ZERO exit too: a 429 that agy prints there and never writes to
+    /// its log was invisible to the empty-result path (Grok, review of step 4).
+    Ok { raw: String, stderr: String, log: AgyLogInfo },
     Timeout,
     NonZero {
         code: String,
@@ -572,6 +656,7 @@ async fn run_agy_once(
                 match timeout(POST_STDIO_WAIT, child.wait()).await {
                     Ok(Ok(status)) if status.success() => AgyRun::Ok {
                         raw: String::from_utf8_lossy(&out_buf).into_owned(),
+                        stderr: String::from_utf8_lossy(&err_buf).into_owned(),
                         log: read_and_parse_log(&inv.log_path),
                     },
                     Ok(Ok(status)) => AgyRun::NonZero {
@@ -590,6 +675,7 @@ async fn run_agy_once(
                         let _ = child.kill().await; // tokio kill() reaps; no separate wait needed
                         AgyRun::Ok {
                             raw: String::from_utf8_lossy(&out_buf).into_owned(),
+                            stderr: String::from_utf8_lossy(&err_buf).into_owned(),
                             log: read_and_parse_log(&inv.log_path),
                         }
                     }
@@ -803,6 +889,8 @@ async fn run_agy_once_pty(
         match pty_wait_bounded(&mut child, pid, POST_STDIO_WAIT).await {
             Some(status) if status.success() => AgyRun::Ok {
                 raw: String::from_utf8_lossy(&out).into_owned(),
+                // A pty merges the streams; the raw capture IS the stderr.
+                stderr: String::new(),
                 log: read_and_parse_log(&inv.log_path),
             },
             Some(status) => AgyRun::NonZero {
@@ -1064,7 +1152,7 @@ fn strip_ansi(input: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1213,6 +1301,29 @@ mod tests {
     // the verification battery and the #[ignore]d test below.
 
     #[cfg(target_os = "macos")]
+    /// Serializes tests that touch the quota-backoff and degraded-route env vars, and restores
+    /// the prior value on drop. Process-global env is the isolation trap this crate has hit
+    /// before; the lock is the cure, the restore is the other half.
+    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    pub(crate) struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => unsafe { std::env::set_var(self.0, v) },
+                None => unsafe { std::env::remove_var(self.0) },
+            }
+        }
+    }
+    pub(crate) fn set_env_scoped(key: &'static str, value: Option<&str>) -> EnvRestore {
+        let prior = std::env::var_os(key);
+        match value {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        EnvRestore(key, prior)
+    }
+
     fn write_mock_agy(body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!("mock-agy-{}.sh", uuid::Uuid::new_v4()));
@@ -1307,6 +1418,8 @@ mod tests {
     async fn mock_agy_quota_exit_classifies_as_quota() {
         // REQ-051/053: a non-zero exit with a quota string classifies as quota (which
         // feeds the breaker + skips gemini-cli in the degraded route).
+        let _lock = ENV_LOCK.lock().await;
+        let _env = set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some(""));
         let err = run_mock(
             "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2",
             "2+2?",
@@ -1316,6 +1429,51 @@ mod tests {
         .expect_err("non-zero exit must fail");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("quota") || msg.contains("capacity"), "got: {msg}");
+    }
+
+    /// Grok, review of step 4: the 18:03Z empties had no quota line in the LOG. A 429 that agy
+    /// prints to stderr on a zero exit with an empty result must trigger the same retry.
+    /// RED IF: an empty-plus-stderr-429 goes straight to "empty output" with no retry.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_empty_result_with_429_on_stderr_is_retried_then_succeeds() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some("0"));
+        // The breaker is process-global. Other quota tests in this binary may have opened it,
+        // and the retry loop now stops when it is open, so start closed.
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        let marker = std::env::temp_dir().join(format!("agy-empty-429-once-{}", uuid::Uuid::new_v4()));
+        let body = format!(
+            "if [ ! -f '{m}' ]; then touch '{m}'; echo 'RESOURCE_EXHAUSTED (code 429): Resource has been exhausted' 1>&2; printf '{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"response\":\"\"}}}}\n'; exit 0; fi\n{ok}",
+            m = marker.display(),
+            ok = stream_body("4")
+        );
+        let result = run_mock(&body, "2+2?", None).await;
+        let _ = std::fs::remove_file(&marker);
+        let parsed = result.expect("the retry after an empty 429 result must return the answer");
+        assert_eq!(parsed.response_text, "4");
+    }
+
+    /// Recovery plan step 4. A quota/429 exit is retried after the backoff, and a success on
+    /// the retry is the answer. RED IF: a 429 goes back to an instant connector failure.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_quota_exit_is_retried_after_backoff_and_then_succeeds() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some("0"));
+        // The breaker is process-global. Other quota tests in this binary may have opened it,
+        // and the retry loop now stops when it is open, so start closed.
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        let marker = std::env::temp_dir().join(format!("agy-quota-once-{}", uuid::Uuid::new_v4()));
+        let body = format!(
+            "if [ ! -f '{m}' ]; then touch '{m}'; echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2; fi\n{ok}",
+            m = marker.display(),
+            ok = stream_body("4")
+        );
+        let result = run_mock(&body, "2+2?", None).await;
+        let _ = std::fs::remove_file(&marker);
+        let parsed = result.expect("the retry after a quota exit must return the answer");
+        assert_eq!(parsed.response_text, "4");
     }
 
     #[cfg(target_os = "macos")]
@@ -1425,5 +1583,28 @@ mod tests {
         // agy is dispatched in stream-json since 2026-09-01; the plain-text modes record no
         // tool calls, which locked Antigravity out of the sight gate entirely.
         assert_eq!(parsed.parser_mode, agent_adapter::AGY_PARSER_MODE_STREAM);
+    }
+}
+
+#[cfg(test)]
+mod quota_backoff_and_route_default_tests {
+    use super::{degraded_route_env, plan_degraded_route, quota_backoff_schedule, AgyFailureClass};
+    use std::time::Duration;
+
+    /// RED IF: the default backoff disappears, which returns a 429 to an instant failure.
+    #[tokio::test]
+    async fn default_schedule_is_two_waits() {
+        let _lock = super::tests::ENV_LOCK.lock().await;
+        let _env = super::tests::set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", None);
+        assert_eq!(quota_backoff_schedule(), vec![Duration::from_secs(15), Duration::from_secs(45)]);
+    }
+
+    /// RED IF: the dead gemini-cli hop comes back into the default route.
+    #[tokio::test]
+    async fn default_degraded_route_has_no_gemini_cli_hop() {
+        let _lock = super::tests::ENV_LOCK.lock().await;
+        let _env = super::tests::set_env_scoped("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", None);
+        let hops = plan_degraded_route(&degraded_route_env(), AgyFailureClass::AuthOrExec);
+        assert_eq!(hops.iter().map(|h| h.backend).collect::<Vec<_>>(), vec!["codex"]);
     }
 }

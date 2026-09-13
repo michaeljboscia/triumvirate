@@ -3146,6 +3146,8 @@ mod tests {
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
             std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
         }
@@ -3199,6 +3201,7 @@ mod tests {
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
             std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
         }
@@ -3478,6 +3481,8 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -3527,6 +3532,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         Ok(())
@@ -3558,6 +3564,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
             std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
         }
@@ -3606,6 +3614,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -3645,6 +3655,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         Ok(())
@@ -3717,6 +3728,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -3758,6 +3771,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         Ok(())
@@ -3891,6 +3905,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -3929,6 +3945,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         let _ = fs::remove_file(script_path);
@@ -3952,6 +3969,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -3995,6 +4014,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         let _ = fs::remove_file(script_path);
@@ -4050,6 +4070,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
             std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
             std::env::set_var("TRIUMVIRATE_CODEX_BIN", reviewer.as_os_str());
@@ -4124,6 +4146,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
             std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
         }
@@ -4139,6 +4162,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -4184,6 +4209,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         let _ = fs::remove_file(script_path);
@@ -4197,6 +4223,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_script.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -4268,6 +4296,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         Ok(())
@@ -5673,6 +5702,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         unsafe {
             std::env::set_var("TRIUMVIRATE_HOME", &test_home);
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         fs::write(
@@ -5736,6 +5767,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         unsafe {
             std::env::remove_var("TRIUMVIRATE_HOME");
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         let _ = fs::remove_file(script_path);
@@ -5757,6 +5789,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         unsafe {
             std::env::set_var("TRIUMVIRATE_HOME", &test_home);
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", script_path.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -5784,6 +5818,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         unsafe {
             std::env::remove_var("TRIUMVIRATE_HOME");
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         let _ = fs::remove_file(script_path);
@@ -6521,6 +6556,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex_commit_script.as_os_str());
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
             std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_script.as_os_str());
+            // Mocks the gemini CLI binary: select that backend explicitly, the default is agy (2026-09-13).
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
@@ -6656,6 +6693,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
             std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
         let _ = fs::remove_file(codex_commit_script);
