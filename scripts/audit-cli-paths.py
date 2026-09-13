@@ -277,7 +277,10 @@ def main():
                 if any(k in low for k in ('"completed"', '"failed"', '"done"', '"error"', '"cancelled"')):
                     break
                 time.sleep(10)
-            good = '"failed"' not in last.lower() and '"error"' not in last.lower() and '"completed"' in last.lower()
+            # The ledger's terminal success state is "done" (fleet_status reports the ledger
+            # since recovery step 6); "completed" was the harness's guess and never matched.
+            low = last.lower()
+            good = '"failed"' not in low and '"error"' not in low and ('"done"' in low or '"completed"' in low)
             mcp.tool("fleet_cancel", {"fleet_id": fid}, timeout=60)
             return good, f"fleet_id={fid}\n{head(last, 600)}"
         add(f"fleet_spawn.{ag}", "mcp", {"agent": ag, "tool": "fleet_spawn"}, fleet)

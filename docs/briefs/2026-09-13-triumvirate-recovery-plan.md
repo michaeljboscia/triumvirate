@@ -36,6 +36,17 @@ Every step goes through the three-peer panel before commit, artifact frozen in `
   fixed; backend default, fixed; detectors over-match glog thread ids and doRefreshQuota
   lines, noted, not changed). Codex seat pending quota.
 
+- Step 6, 2026-09-13 evening: four causes found. (1) Worker stdout/stderr were piped and
+  never read, so a chatty worker deadlocked on a full pipe and `wait()` never returned; the
+  non-agy path also had no timeout. Both pipes are now drained on their own tasks (8 KiB tail
+  kept for the failure reason) and the wait is bounded by TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS
+  (900s) with a kill. (2) `fleet_status` read an in-memory record written once at spawn; it
+  now refreshes from the ledger (`fleets.state`, worktrees on disk). (3) `fleet_cancel`
+  removed the record and killed nothing; a per-fleet pid registry lets it SIGTERM the workers
+  and mark the ledger `cancelled`. (4) Task ids collide across fleets in one repo (D-015, not
+  fixed here: it touches the merge queue and branch names). Live: a grok fleet reached `done`
+  in 20s with its worktree reported, no worker survived cancel.
+
 ## Reorder after the panel review of this plan
 Antigravity: Step 4 (Antigravity 429 under a burst) must precede any panel-gated step, or the
 panel's three parallel calls trip the throttle. Grok: the panel path is sight-gated and so

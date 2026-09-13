@@ -229,6 +229,19 @@ also triggers the step 4 backoff and feeds the breaker.
 `RESOURCE_EXHAUSTED` / `quota exceeded` / `capacity`; add the two glog lines as negative fixtures.
 **Check:** the 2026-08-20 thread-id line and a `doRefreshQuota` line classify AuthOrExec.
 
+### D-015 - fleet task ids collide across fleets in the same repo
+**Found:** 2026-09-13 (audit) · **Severity:** MEDIUM
+**Evidence:** `tasks.task_id` is the PRIMARY KEY of the ledger's tasks table and the
+orchestrator names tasks `T-001`, `T-002`, ... per fleet (`orchestrator.rs`, `format!("T-{:03}")`).
+The second `fleet_spawn` in the audit repo failed at once: `UNIQUE constraint failed:
+tasks.task_id`, recorded in `fleets.failure_reason`. One fleet per repo, ever, unless the
+ledger is wiped.
+**Why it matters:** the second fleet in any project fails before it spawns anything.
+**Fix shape:** key tasks on (fleet_id, task_id), or name tasks `<fleet_id>-T-001`. The merge
+queue, branch names (`fleet/<fleet_id>/T-001`) and worktree names read the task id, so the
+change has to land on all of them together; not a one-line fix.
+**Check:** two consecutive `fleet_spawn` calls in one repo both reach `running`.
+
 ## Closed
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"

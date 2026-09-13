@@ -564,6 +564,12 @@ pub struct FleetStatusResponse {
     pub fleet_id: String,
     pub state: String,
     pub worktree_paths: Vec<String>,
+    /// Where this fleet's ledger lives, so `fleet_status` can refresh from it. Not on the
+    /// wire: the in-memory record was written once at spawn and never again, so a no-wait
+    /// fleet reported `spawning` with no worktrees for its whole life (audit, 2026-09-13).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -401,45 +401,31 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     .launch(&launch_agent, &project_root, &worktree_path, &task_prompt)
                     .await;
                 match launch_result {
-                    Ok(mut child) => {
-                        // Bound the agy wait so a hung agy can't hold the shared
-                        // concurrency slot forever (Codex H). On timeout the task
-                        // completes (slot released); kill_on_drop kills sandbox-exec and
-                        // agy self-terminates via its own --print-timeout. A non-zero
-                        // agy EXIT still degrades to codex below; a TIMEOUT fails loud.
-                        // Must track what we ACTUALLY launched, not what was requested: with
-                        // the breaker open this task is a codex child, and applying agy's
-                        // connector timeout to it would kill a healthy codex run early.
-                        let agy_primary = use_agy;
-                        let wait_result = if agy_primary {
-                            match tokio::time::timeout(
-                                mcp_bridge::agy::agy_connector_timeout()
-                                    + std::time::Duration::from_secs(30),
-                                child.wait(),
+                    Ok(child) => {
+                        // One helper for every fleet child: drain both pipes (a worker that
+                        // printed more than the pipe buffer used to block on write forever and
+                        // `wait()` never returned; the audit's codex worker committed in a minute
+                        // and was alive 13 minutes later), register the pid for cancel, bound
+                        // the wait, kill on expiry, keep an output tail for the failure reason.
+                        let (limit, timeout_msg) = if use_agy {
+                            (
+                                mcp_bridge::agy::agy_connector_timeout() + std::time::Duration::from_secs(30),
+                                "agy fleet task exceeded connector timeout",
                             )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    // Explicit kill + bounded reap (don't rely only on
-                                    // kill_on_drop): SIGKILL sandbox-exec now and reap it
-                                    // so the slot is freed promptly; agy's own
-                                    // --print-timeout bounds any orphaned grandchild.
-                                    let _ = child.start_kill();
-                                    let _ = tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        child.wait(),
-                                    )
-                                    .await;
-                                    Err(std::io::Error::new(
-                                        std::io::ErrorKind::TimedOut,
-                                        "agy fleet task exceeded connector timeout",
-                                    ))
-                                }
-                            }
                         } else {
-                            child.wait().await
+                            (fleet_task_timeout(), "fleet task exceeded TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS")
                         };
+                        let (wait_result, stdout_tail, stderr_tail) =
+                            wait_fleet_child(child, &fleet_id, limit, timeout_msg).await;
+                        if !matches!(&wait_result, Ok(s) if s.success()) {
+                            tracing::warn!(
+                                fleet_id = %fleet_id,
+                                task_id = %task_id,
+                                stdout_tail = %stdout_tail,
+                                stderr_tail = %stderr_tail,
+                                "fleet agent subprocess did not succeed"
+                            );
+                        }
                         match wait_result {
                             Ok(status) if status.success() => {
                                 tracing::info!(
@@ -537,8 +523,22 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         .launch("codex", &project_root, &worktree_path, &task_prompt)
                                         .await
                                     {
-                                        Ok(mut codex_child) => {
-                                            matches!(codex_child.wait().await, Ok(s) if s.success())
+                                        Ok(codex_child) => {
+                                            // Same helper as the primary wait: the degrade child
+                                            // was piped-and-not-drained and never registered for
+                                            // cancel (Grok, review of step 6).
+                                            let (r, out_tail, err_tail) = wait_fleet_child(
+                                                codex_child,
+                                                &fleet_id,
+                                                fleet_task_timeout(),
+                                                "degraded codex fleet task exceeded TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS",
+                                            )
+                                            .await;
+                                            let ok = matches!(&r, Ok(s) if s.success());
+                                            if !ok {
+                                                tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, stdout_tail = %out_tail, stderr_tail = %err_tail, "degraded codex fleet worker did not succeed");
+                                            }
+                                            ok
                                         }
                                         Err(e) => {
                                             tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "fleet codex degraded launch failed");
@@ -888,6 +888,179 @@ fn event_sequence_for(
         |row| row.get::<_, Option<i64>>(0),
     )?;
     Ok(max_seq.unwrap_or(0) + 1)
+}
+
+/// Wall-clock bound for one non-agy fleet worker. `TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS`,
+/// default 900s. The agy path already had its connector timeout; codex, claude and grok had
+/// none, so a stuck worker was forever.
+fn fleet_task_timeout() -> std::time::Duration {
+    std::env::var("TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(900))
+}
+
+/// Read a pipe to the end on its own task, keeping the last 8 KiB for diagnostics. A `None`
+/// pipe (not captured) yields an empty tail.
+fn spawn_drain<R>(reader: Option<R>) -> tokio::task::JoinHandle<String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    tokio::spawn(async move {
+        let Some(mut reader) = reader else {
+            return String::new();
+        };
+        const KEEP: usize = 8 * 1024;
+        let mut tail: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.len() > KEEP {
+                        let cut = tail.len() - KEEP;
+                        tail.drain(..cut);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&tail).into_owned()
+    })
+}
+
+/// Unregisters the pid on drop, so a panic or a cancelled future between register and the
+/// end of the wait cannot strand an entry in the registry (Antigravity, review of step 6).
+struct FleetChildRegistration {
+    fleet_id: String,
+    pid: u32,
+}
+
+impl Drop for FleetChildRegistration {
+    fn drop(&mut self) {
+        unregister_fleet_child(&self.fleet_id, self.pid);
+    }
+}
+
+/// Wait for one fleet worker: drain both pipes on their own tasks, register the pid for
+/// `fleet_cancel`, bound the wait and kill on expiry. Returns the exit result and the last
+/// 8 KiB of each stream. The drain awaits are bounded too: a grandchild holding the pipe
+/// open must not hang the fleet after the worker has exited.
+async fn wait_fleet_child(
+    mut child: Child,
+    fleet_id: &str,
+    limit: std::time::Duration,
+    timeout_msg: &str,
+) -> (std::io::Result<std::process::ExitStatus>, String, String) {
+    let stdout_tail = spawn_drain(child.stdout.take());
+    let stderr_tail = spawn_drain(child.stderr.take());
+    let _registration = child.id().map(|pid| {
+        register_fleet_child(fleet_id, pid);
+        FleetChildRegistration { fleet_id: fleet_id.to_string(), pid }
+    });
+    let wait_result = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{timeout_msg} ({}s)", limit.as_secs()),
+            ))
+        }
+    };
+    async fn bounded(h: tokio::task::JoinHandle<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(5), h)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    }
+    (wait_result, bounded(stdout_tail).await, bounded(stderr_tail).await)
+}
+
+/// Live worker pids per fleet, so `fleet_cancel` can reach the processes. Before this, cancel
+/// removed the in-memory record and the workers ran on (audit, 2026-09-13: a cancelled codex
+/// worker was killed by hand).
+static FLEET_CHILDREN: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u32>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn register_fleet_child(fleet_id: &str, pid: u32) {
+    if let Ok(mut m) = FLEET_CHILDREN.lock() {
+        m.entry(fleet_id.to_string()).or_default().push(pid);
+    }
+}
+
+fn unregister_fleet_child(fleet_id: &str, pid: u32) {
+    let Ok(mut m) = FLEET_CHILDREN.lock() else {
+        return;
+    };
+    let Some(v) = m.get_mut(fleet_id) else {
+        return;
+    };
+    v.retain(|p| *p != pid);
+    if v.is_empty() {
+        m.remove(fleet_id);
+    }
+}
+
+/// SIGTERM every live worker of `fleet_id`. Returns how many were signalled.
+pub fn kill_fleet_children(fleet_id: &str) -> usize {
+    let pids: Vec<u32> = FLEET_CHILDREN
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(fleet_id))
+        .unwrap_or_default();
+    for pid in &pids {
+        let _ = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+    }
+    pids.len()
+}
+
+/// The fleet's state as the ledger records it, with the worktrees that exist on disk for its
+/// tasks. `None` when the ledger has no row. This is the truth `fleet_status` should report;
+/// the in-memory record is written once at spawn.
+pub fn fleet_ledger_snapshot(project_root: &Path, fleet_id: &str) -> Option<(String, Vec<PathBuf>)> {
+    let db = project_root.join(".triumvirate").join("ledger.db");
+    let conn = rusqlite::Connection::open(&db).ok()?;
+    let state: String = conn
+        .query_row("SELECT state FROM fleets WHERE fleet_id = ?1", rusqlite::params![fleet_id], |r| r.get(0))
+        .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT task_id, assigned_agent FROM tasks WHERE fleet_id = ?1 ORDER BY task_id")
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![fleet_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .ok()?;
+    let mut paths = Vec::new();
+    for (task_id, agent) in rows.flatten() {
+        let Some(agent) = agent else { continue };
+        let p = project_root
+            .join(".triumvirate")
+            .join("worktrees")
+            .join(format!("{fleet_id}-{task_id}-{agent}"));
+        if p.exists() {
+            paths.push(p);
+        }
+    }
+    Some((state, paths))
+}
+
+/// Mark a fleet cancelled in its ledger. Returns false when the ledger could not be written.
+pub fn mark_fleet_cancelled(project_root: &Path, fleet_id: &str, reason: &str) -> bool {
+    let db = project_root.join(".triumvirate").join("ledger.db");
+    let Ok(conn) = rusqlite::Connection::open(&db) else {
+        return false;
+    };
+    conn.execute(
+        "UPDATE fleets SET state = 'cancelled', failure_reason = ?2 WHERE fleet_id = ?1",
+        rusqlite::params![fleet_id, reason],
+    )
+    .is_ok()
 }
 
 #[cfg(test)]

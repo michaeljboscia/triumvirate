@@ -11,7 +11,7 @@ use shared_types::{
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::Mutex;
@@ -100,6 +100,7 @@ where
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
+        project_root: Some(project_root.display().to_string()),
     };
     let mut fleet_states = fleet_states.lock().await;
     fleet_states.insert(result.fleet_id.clone(), status);
@@ -133,11 +134,23 @@ pub async fn fleet_status(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     req: FleetStatusRequest,
 ) -> Result<FleetStatusResponse, String> {
-    let fleet_states = fleet_states.lock().await;
-    let status = fleet_states
+    let mut fleet_states = fleet_states.lock().await;
+    let mut status = fleet_states
         .get(&req.fleet_id)
         .cloned()
         .ok_or_else(|| format!("fleet not found: {}", req.fleet_id))?;
+    // The in-memory record is written once at spawn. A no-wait fleet said `spawning` with no
+    // worktrees for its whole life while the ledger said `running` and the worker had already
+    // committed (audit, 2026-09-13). The ledger is the truth once it has a row.
+    if let Some(root) = status.project_root.clone() {
+        if let Some((state, paths)) =
+            fleet::orchestrator::fleet_ledger_snapshot(Path::new(&root), &req.fleet_id)
+        {
+            status.state = state;
+            status.worktree_paths = paths.iter().map(|p| p.display().to_string()).collect();
+            fleet_states.insert(req.fleet_id.clone(), status.clone());
+        }
+    }
     Ok(status)
 }
 
@@ -195,6 +208,16 @@ pub async fn fleet_cancel(
     // (worktree_paths.len()) instead of a misleading zero.
     let removed = fleet_states.remove(&req.fleet_id);
     let canceled = removed.is_some();
+    // Reach the processes, not only the record. Before this the workers ran on after cancel.
+    let killed = fleet::orchestrator::kill_fleet_children(&req.fleet_id);
+    if let Some(root) = removed.as_ref().and_then(|s| s.project_root.clone()) {
+        fleet::orchestrator::mark_fleet_cancelled(
+            Path::new(&root),
+            &req.fleet_id,
+            &format!("cancelled by operator; {killed} worker(s) signalled"),
+        );
+    }
+    tracing::info!(fleet_id = %req.fleet_id, killed, "fleet cancel");
     let cancelled_width = removed.map(|s| s.worktree_paths.len()).unwrap_or(0);
     let active = fleet_states
         .values()

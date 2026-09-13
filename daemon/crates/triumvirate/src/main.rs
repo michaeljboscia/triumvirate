@@ -6324,8 +6324,15 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .await
             .map_err(anyhow::Error::msg)?;
         assert_eq!(status.0.fleet_id, execute.0.fleet_id);
-        assert_eq!(status.0.state, "running");
-        assert_eq!(status.0.worktree_paths.len(), 2);
+        // `fleet_status` now reports the ledger's state, not the record written at spawn.
+        // With `wait: true` the workers have already run (and in this environment they may
+        // have failed fast), so the state is whatever the ledger recorded, never `spawning`.
+        assert!(
+            ["running", "merging", "done", "failed"].contains(&status.0.state.as_str()),
+            "ledger state: {}",
+            status.0.state
+        );
+        assert_eq!(status.0.worktree_paths.len(), 2, "both worktrees exist on disk");
 
         std::env::set_current_dir(&original_cwd)?;
         let _ = fs::remove_dir_all(project_root);
