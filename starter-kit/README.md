@@ -11,7 +11,7 @@ One-command setup for the complete multi-agent operating environment.
 | `post-compact-recovery.sh` | SessionStart:compact | Restores context after memory compaction |
 | `pre-compact.sh` | PreCompact | Auto-saves session state before compaction (Gemini summarization → git commit) |
 | `post-tool-use.sh` | PostToolUse | Auto-stages files, logs activity, taxonomy enforcement |
-| `post-tool-use-token-gate.sh` | PostToolUse | Auto-saves at configurable token thresholds (~50K tokens) via Stenographer |
+| `post-tool-use-token-gate.sh` | PostToolUse | Logs configurable token thresholds (~50K tokens) |
 | `pre-tool-use-artifact-guard.sh` | PreToolUse | **The Airlock** — Snapshots every file before edit; enforces backup requirements for Supabase SQL |
 | `pre-tool-use-bash-guard.sh` | PreToolUse | Blocks destructive SQL (DELETE/TRUNCATE/DROP) without a fresh backup |
 | `_find-session-log.sh` | (shared) | Helper that finds the latest session log across multiple locations |
@@ -28,16 +28,6 @@ One-command setup for the complete multi-agent operating environment.
 - `hooks/session-start.sh` — Session log recovery for Gemini
 - `hooks/pre-compact.sh` — Self-summarization before context compaction (Gemini summarizes its own transcript)
 - `hooks/post-tool-use.sh` — Auto-stages files, logs activity to session log
-
-### Stenographer (Local Session Notes Engine)
-- `stenographer.py` — Main orchestrator: state management, lock, delta extraction, Ollama generation
-- `parsers/claude.py` — Claude JSONL byte-range parser with secret redaction
-- `parsers/gemini.py` — Gemini JSON message-index parser
-- `parsers/codex.py` — Codex JSONL byte-range parser
-- `prompts/incremental.txt` — Incremental summarization prompt template
-- `prompts/gapfill.txt` — Gap-fill prompt for missed content
-
-Runs locally via Ollama — **zero API cost, zero context window impact**. Called automatically by the token gate hook. See [`stenographer/README.md`](stenographer/README.md) for details.
 
 ### Shared Templates
 - `.env.example` — Credential vault template (API keys)
@@ -149,7 +139,6 @@ This is why the taxonomy naming matters — it's how any agent finds any other a
 - **Gemini CLI** (optional) — For intelligent pre-compact summarization. Without it, hooks fall back to jq-based transcript extraction.
 - **Codex CLI** (optional) — For multi-agent code generation. Requires the [hooks-enabled fork](https://github.com/michaeljboscia/codex).
 - **git** — Used by hooks for auto-staging and session log commits
-- **Ollama** (optional) — For Stenographer local session notes. Without it, token gate logs thresholds but doesn't generate notes. Install: `brew install ollama` then `ollama pull qwen2.5:32b`
 
 ## How the Hooks Work
 
