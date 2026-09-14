@@ -258,9 +258,24 @@ def main():
             return good, f"status={status}\nstatus={head(st, 400)}\noutput={head(out, 500)}"
         add("dispatch_codex.worktree", "mcp", {"agent": "codex", "tool": "dispatch_codex_worktree"}, dispatch_worktree)
 
+    def fleet_repo(ag):
+        # One repo per fleet probe: task ids are a repo-wide primary key (D-015), so a second
+        # fleet in the same repo fails on a duplicate T-001 and would mask the real result.
+        sub = repo.parent / f"{repo.name}-fleet-{ag}"
+        if sub.exists():
+            subprocess.run(["rm", "-rf", str(sub)])
+        sub.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=sub, check=True)
+        (sub / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        (sub / "README.md").write_text(f"# fleet probe {ag}\n")
+        subprocess.run(["git", "add", "-A"], cwd=sub, check=True)
+        subprocess.run(["git", "-c", "user.email=audit@local", "-c", "user.name=audit", "commit", "-qm", "init"], cwd=sub, check=True)
+        return sub
+
     for ag in agents:
         def fleet(ag=ag):
-            ok, t = mcp.tool("fleet_spawn", {"project_root": str(repo), "agents": [ag], "dry_run": False, "wait": False,
+            frepo = fleet_repo(ag)
+            ok, t = mcp.tool("fleet_spawn", {"project_root": str(frepo), "agents": [ag], "dry_run": False, "wait": False,
                                              "task_description": "Add a function mul(a, b) returning a * b to calc.py."})
             if not ok:
                 return False, f"fleet_spawn: {t}"

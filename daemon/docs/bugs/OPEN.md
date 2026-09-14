@@ -135,6 +135,7 @@ artifact is not verifying the path.
 ---
 
 ### D-010 - sight gate cannot see a grok shell read, and its own message recommends one
+**CLOSED 2026-09-13 23:5x ET:** codex seat reviewed the recovery commits (five findings, four fixed in the follow-up commit, one is D-016); full audit on the final daemon passes every probe except the retired Gemini CLI and the by-design Antigravity session resume.
 **Found:** 2026-09-12 · **Severity:** MEDIUM
 **Status 2026-09-13:** fixed in the working tree and live on the daemon. `shell_read_kind`
 (codex.rs) classifies a shell command that reads a file as ReadFile, applied in the grok, agy,
@@ -175,6 +176,7 @@ runs every builder's output through `codex <args> --help` on the installed binar
 **Check:** temporarily push a bogus flag into the consult or fleet argv; `cargo test` must fail.
 
 ### D-012 - a failed gemini request reports the fallback hop's error and hides its own
+**CLOSED 2026-09-13 23:5x ET:** codex seat reviewed the recovery commits (five findings, four fixed in the follow-up commit, one is D-016); full audit on the final daemon passes every probe except the retired Gemini CLI and the by-design Antigravity session resume.
 **Found:** 2026-09-13 · **Severity:** HIGH (misdiagnosis in the field)
 **Status 2026-09-13:** fixed in the working tree and live on the daemon. `execute_ask_agent`
 collects a `failure_chain` and formats it oldest first; the chain reaches the 502 body, the
@@ -205,6 +207,7 @@ the empty-response path. Keep the agy log on failure.
 read the 502 body: it must name agy first and codex second.
 
 ### D-013 - a child's exit code was the whole error; the quota message was thrown away
+**CLOSED 2026-09-13 23:5x ET:** codex seat reviewed the recovery commits (five findings, four fixed in the follow-up commit, one is D-016); full audit on the final daemon passes every probe except the retired Gemini CLI and the by-design Antigravity session resume.
 **Found:** 2026-09-13 · **Severity:** HIGH
 **Evidence:** Codex over its usage limit. Every dispatch: "codex connector failed: exited with
 status 1". The reason was on codex's stdout as `{"type":"error","message":"You've hit your
@@ -241,6 +244,17 @@ ledger is wiped.
 queue, branch names (`fleet/<fleet_id>/T-001`) and worktree names read the task id, so the
 change has to land on all of them together; not a one-line fix.
 **Check:** two consecutive `fleet_spawn` calls in one repo both reach `running`.
+
+### D-016 - fleet_status cannot find a fleet after a daemon restart
+**Found:** 2026-09-13 (Codex, review of the recovery commits) · **Severity:** MEDIUM
+**Evidence:** `fleet_status` looks the fleet up in the daemon's in-memory map first and only
+then refreshes from the ledger; the map is empty after a restart, and the ledger it would
+read lives under a `project_root` that only the map knew. `FleetStatusRequest` carries only
+`fleet_id`. The `fleets` table already has `source_project_root`, but the daemon does not know
+which repo's ledger to open.
+**Fix shape:** a daemon-level index `~/.triumvirate/fleets.json` mapping fleet_id to
+project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
+**Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
 
 ## Closed
 

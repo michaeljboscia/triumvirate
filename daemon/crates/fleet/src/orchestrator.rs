@@ -130,15 +130,21 @@ impl AgentLauncher for DaemonAgentLauncher {
             }
             _ => anyhow::bail!("unsupported fleet agent: {agent}"),
         };
-        let child = Command::new(&cmd)
+        let mut child = Command::new(&cmd);
+        let child = child
             .args(&args)
             .current_dir(worktree_path)
             .env("TRIUMVIRATE_PROJECT_ROOT", project_root.as_os_str())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        // Own process group, so cancel and timeout can signal the worker AND its children
+        // (codex is a node wrapper around a vendor binary; SIGTERM to the wrapper alone left
+        // the binary running when it was killed by hand on 2026-09-13).
+        #[cfg(unix)]
+        let child = child.process_group(0);
+        let child = child.spawn()?;
         Ok(child)
     }
 }
@@ -397,6 +403,19 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 } else {
                     None
                 };
+                // A fleet cancelled before this worker started must not start it (Codex,
+                // review of step 6: cancel between the in-memory insert and the background
+                // spawn returned `canceled: true` and the workers launched anyway).
+                if fleet_is_cancelled(&fleet_id) {
+                    tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, "fleet cancelled before worker launch; skipping");
+                    if let Ok(conn) = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")) {
+                        let _ = conn.execute(
+                            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
+                            rusqlite::params![task_id.as_str()],
+                        );
+                    }
+                    return;
+                }
                 let launch_result = launcher
                     .launch(&launch_agent, &project_root, &worktree_path, &task_prompt)
                     .await;
@@ -512,7 +531,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     mcp_bridge::agy_resilience::agy_breaker_record_other_failure();
                                 }
                                 let mut degraded_ok = false;
-                                if use_agy {
+                                // A SIGTERM from fleet_cancel is a non-zero exit too. Without this
+                                // check, cancelling an agy worker launched a codex replacement
+                                // (Codex, review of step 6).
+                                if use_agy && !fleet_is_cancelled(&fleet_id) {
                                     tracing::warn!(
                                         fleet_id = %fleet_id,
                                         task_id = %task_id,
@@ -963,6 +985,9 @@ async fn wait_fleet_child(
     let wait_result = match tokio::time::timeout(limit, child.wait()).await {
         Ok(r) => r,
         Err(_) => {
+            if let Some(pid) = child.id() {
+                signal_group(pid, "KILL");
+            }
             let _ = child.start_kill();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
             Err(std::io::Error::new(
@@ -1006,17 +1031,39 @@ fn unregister_fleet_child(fleet_id: &str, pid: u32) {
     }
 }
 
-/// SIGTERM every live worker of `fleet_id`. Returns how many were signalled.
+/// Fleets the operator cancelled, so a worker not yet launched stays unlaunched and a
+/// SIGTERMed agy worker is not replaced by a codex one. Process-global like the pid registry.
+static CANCELLED_FLEETS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+pub fn fleet_is_cancelled(fleet_id: &str) -> bool {
+    CANCELLED_FLEETS.lock().map(|s| s.contains(fleet_id)).unwrap_or(false)
+}
+
+/// SIGTERM every live worker of `fleet_id` and remember the cancellation. Returns how many
+/// were signalled.
 pub fn kill_fleet_children(fleet_id: &str) -> usize {
+    if let Ok(mut s) = CANCELLED_FLEETS.lock() {
+        s.insert(fleet_id.to_string());
+    }
     let pids: Vec<u32> = FLEET_CHILDREN
         .lock()
         .ok()
         .and_then(|mut m| m.remove(fleet_id))
         .unwrap_or_default();
     for pid in &pids {
-        let _ = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+        signal_group(*pid, "TERM");
     }
     pids.len()
+}
+
+/// Signal the worker's whole process group (the launcher puts each worker in its own).
+fn signal_group(pid: u32, sig: &str) {
+    let _ = std::process::Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .status();
 }
 
 /// The fleet's state as the ledger records it, with the worktrees that exist on disk for its

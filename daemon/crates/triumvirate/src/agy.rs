@@ -324,14 +324,24 @@ pub(crate) async fn run_agy_cli_process_with_session(
             last_err = Some(anyhow::anyhow!("agy capacity/quota: circuit breaker opened during backoff"));
             break;
         }
-        let remaining = overall_deadline.saturating_duration_since(std::time::Instant::now());
-        if attempt_idx > 0 && remaining < Duration::from_secs(30) {
+        if attempt_idx > 0
+            && overall_deadline.saturating_duration_since(std::time::Instant::now()) < Duration::from_secs(30)
+        {
             break;
         }
         let attempt = attempt_idx;
         attempt_idx += 1;
         let slot = mcp_bridge::agy_resilience::agy_acquire_slot().await;
         mcp_bridge::agy_resilience::agy_rate_limit().await;
+        // Measured AFTER the slot and rate-limit waits, which can consume real budget
+        // (Codex, review of this change: measured before them, the call could outlive the
+        // deadline by the queueing delay).
+        let remaining = overall_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining < Duration::from_secs(5) {
+            drop(slot);
+            last_err.get_or_insert_with(|| anyhow::anyhow!("agy: overall deadline reached before the attempt could start"));
+            break;
+        }
         let attempt_kill_after = kill_after.min(remaining);
         let run = if use_pty {
             run_agy_once_pty(bin, extra_args, message, cwd, attempt_kill_after, read_only).await
@@ -351,6 +361,18 @@ pub(crate) async fn run_agy_cli_process_with_session(
                         .map(|l| l.trim().to_string())
                 });
                 if text.is_empty() {
+                    // Empty stdout with a 429 on stderr is a quota event, not a capture drop
+                    // (Codex, review of this change: this branch ignored the signal).
+                    if let Some(signal) = quota_signal.as_deref() {
+                        if let Some(wait) = quota_backoffs.next() {
+                            tracing::warn!(wait_s = wait.as_secs(), quota = signal, "agy empty stdout on a quota/429 signal (attempt {attempt}); backing off");
+                            last_err = Some(anyhow::anyhow!("agy capacity/quota: empty output, signal: {signal}"));
+                            mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                            budget += 1;
+                            tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
+                            continue;
+                        }
+                    }
                     // REQ-024 canary: exit 0 + empty is NEVER a silent success (US-2).
                     // Retry once (transient / capture-drop regression); a still-empty
                     // result falls through the loop and fails loud via last_err.
@@ -404,7 +426,8 @@ pub(crate) async fn run_agy_cli_process_with_session(
                                 // the call, or it opens later than before this change.
                                 mcp_bridge::agy_resilience::agy_breaker_record_quota();
                                 budget += 1;
-                                tokio::time::sleep(wait).await;
+                                // Bounded by the overall deadline (Codex, review of this change).
+                                tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
                                 continue;
                             }
                         }
@@ -462,7 +485,8 @@ pub(crate) async fn run_agy_cli_process_with_session(
                         last_err = Some(err);
                         mcp_bridge::agy_resilience::agy_breaker_record_quota();
                         budget += 1;
-                        tokio::time::sleep(wait).await;
+                        // Bounded by the overall deadline (Codex, review of this change).
+                        tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
                         continue;
                     }
                 }
