@@ -4,7 +4,7 @@
 #
 # Installs the multi-agent development system in tiers:
 #
-#   [1] Full Stack    — daemon + skills + operating environment + stenographer
+#   [1] Full Stack    — daemon + skills + operating environment
 #   [2] Daemon+Skills — daemon binary + goatrodeo/postrodeo methodology
 #   [3] Daemon Only   — just the coordination daemon, register as MCP server
 #   [4] Skills Only   — just the methodology skills (no build required)
@@ -103,12 +103,12 @@ fi
 step "What would you like to install?"
 
 echo "    ${BOLD}1. Full Stack${NC} ${DIM}(recommended)${NC}"
-echo "       Daemon + methodology skills + operating environment + stenographer"
+echo "       Daemon + methodology skills + operating environment"
 echo "       Everything you need for multi-agent development."
 echo ""
 echo "    ${BOLD}2. Daemon + Skills${NC}"
 echo "       The coordination daemon + goatrodeo/postrodeo methodology."
-echo "       No hooks, no stenographer, no agent configs."
+echo "       No hooks, no agent configs."
 echo ""
 echo "    ${BOLD}3. Daemon Only${NC}"
 echo "       Just the Rust binary registered as an MCP server."
@@ -243,7 +243,7 @@ if [[ "$TIER" == "1" ]]; then
   step "Setting up the operating environment..."
 
   echo "  The starter kit will now configure hooks, agent configs,"
-  echo "  stenographer, and MCP wiring for all your agents."
+  echo "  and MCP wiring for all your agents."
   echo ""
   read -p "  Continue? [Y/n]: " continue_starter
   if [[ ! "$continue_starter" =~ ^[Nn] ]]; then
@@ -275,7 +275,7 @@ case "$TIER" in
     echo "    Daemon:        $DAEMON_BIN"
     echo "    MCP server:    registered in ~/.claude.json"
     echo "    Skills:        ~/.claude/skills/{goatrodeo,postrodeo,design-goatrodeo}.md"
-    echo "    Environment:   hooks, configs, stenographer (see starter-kit output above)"
+    echo "    Environment:   hooks, configs (see starter-kit output above)"
     echo ""
     echo "  ${BOLD}Get started:${NC}"
     echo ""
@@ -298,7 +298,7 @@ case "$TIER" in
     echo "    Open Claude and try:"
     echo "      \"spawn a Gemini session called research\""
     echo ""
-    echo "    Want hooks + stenographer later?"
+    echo "    Want hooks later?"
     echo "      cd starter-kit && ./install.sh"
     ;;
   3)

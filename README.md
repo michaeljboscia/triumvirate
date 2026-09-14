@@ -6,7 +6,7 @@
 
 **Five AI agents. One daemon. A methodology for building software with all of them at once, and a trust layer that checks whether they actually did the work.**
 
-Claude, Codex, Antigravity (Gemini), Grok and DeepSeek, each with different strengths, working on the same codebase, coordinated by a single Rust daemon, visible in real time from inside your editor.
+Claude, Codex, Antigravity (the Gemini seat), Grok and DeepSeek, each with different strengths, working on the same codebase, coordinated by a single Rust daemon, visible in real time from inside your editor.
 
 The hard part of multi-agent development is not dispatch. It is knowing whether a peer that said "looks good" read anything at all. Triumvirate answers that mechanically: a review that opened no files is rejected, a reviewer that skimmed one line is rejected, and code can be validated by a different agent that writes the tests without ever seeing the implementation.
 
@@ -35,7 +35,7 @@ That's it. One binary. No Docker. No NATS. No cloud services. Register it in Cla
 
 Then from any Claude session: `spawn a Gemini session called 'research'`
 
-> **Requirements:** Rust 1.82+ and at least one agent CLI: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Antigravity](https://antigravity.google) or the [Gemini CLI](https://github.com/google-gemini/gemini-cli), or the [grok CLI](https://x.ai). DeepSeek needs no CLI: it is reached over HTTP.
+> **Requirements:** Rust 1.82+ and at least one agent CLI: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Antigravity](https://antigravity.google), or the [grok CLI](https://x.ai). DeepSeek needs no CLI: it is reached over HTTP.
 >
 > Works with one agent or with all of them. The parts that need more than one say so: peer review
 > needs a second agent, and blind validation needs one that is not the agent that wrote the code.
@@ -109,7 +109,7 @@ were already green, or read outside its own directory is refused rather than bel
 cd starter-kit && ./install.sh
 ```
 
-Hooks, configs, skills, and session notes for Claude, Codex and Antigravity. Plus a local stenographer that captures session notes via Ollama, at zero cloud cost.
+Hooks, configs and skills for Claude, Codex and Antigravity.
 
 ---
 
@@ -192,13 +192,8 @@ it does. That would need a mutation run, and it is not built.
 Full installer for multi-agent development:
 - **Claude:** hooks (session lifecycle, token gating, artifact protection), skills, CLAUDE.md
 - **Codex:** hooks (session recovery, pre-compact), config, AGENTS.md
-- **Antigravity / Gemini:** hooks (session recovery, pre-compact), GEMINI.md
-- **Stenographer:** local session notes via Ollama (zero cloud cost)
+- **Antigravity:** hooks (session recovery, pre-compact), GEMINI.md (the agent key is still `gemini`)
 - **MCP server registration:** wires agents to communicate through the daemon
-
-### Stenographer (`stenographer/`)
-
-Standalone Python tool. Reads agent transcripts, feeds them to a local Ollama model, and appends narrative session notes. Triggered automatically by hooks when transcript growth crosses a threshold.
 
 ---
 
@@ -255,7 +250,7 @@ disagreed.
 | **Skills only** | `cp skills/claude/*.md ~/.claude/skills/` | No |
 | **Full stack** | `cd starter-kit && ./install.sh` | Yes (Rust) |
 
-The full stack installer sets up: daemon, skills, hooks, configs and the stenographer for Claude, Codex and Antigravity.
+The full stack installer sets up: daemon, skills, hooks and configs for Claude, Codex and Antigravity.
 
 ---
 
@@ -330,11 +325,10 @@ Triumvirate doesn't work alone. It's one layer in a stack of tools that collabor
 |------|------|-------------|
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Primary development agent | The cockpit. You sit here. Triumvirate and Pythia plug in as MCP servers. Skills like `/goatrodeo` run from here. |
 | [Codex CLI](https://github.com/openai/codex) | Implementation, and authorisation review | Builds from specs, and is the peer most likely to find a boundary that is not a boundary. Real sandbox: `--sandbox read-only` is verified, not assumed. |
-| [Antigravity](https://antigravity.google) / [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Research, and test adequacy | Large context. The peer that asks whether a test could actually fail, which has caught several that could not. |
+| [Antigravity](https://antigravity.google) | Research, and test adequacy | Large context. The peer that asks whether a test could actually fail, which has caught several that could not. |
 | [grok CLI](https://x.ai) | Adversarial review | The peer most willing to say a fix closed the two cases you named and not the family they belong to. Reports its own per-turn cost. |
 | [DeepSeek](https://deepseek.com) | Method questions, over HTTP | No CLI and no filesystem through the bridge, so it is never a sighted reviewer. Cheap enough to ask freely. |
 | [Pythia](https://github.com/michaeljboscia/pythia) | Local code search | MCP server that indexes entire projects: code, docs, SQL, config, research. Agents query Pythia before making changes. Available in the same Claude session as Triumvirate. |
-| [Ollama](https://ollama.com) | Local LLM for session notes | Stenographer feeds transcripts to a local model. Zero cloud cost. Zero token spend. |
 | [MCP](https://modelcontextprotocol.io) | The protocol | Everything connects through MCP. Triumvirate is an MCP server. Pythia is an MCP server. Claude Code is the MCP client. One protocol, many tools, same session. |
 
 The daily workflow: Claude Code has Triumvirate and Pythia both registered as MCP servers. You search code with Pythia, spawn agent sessions with Triumvirate, and run goatrodeos that use both, all without leaving the editor. The tools compose because they share a protocol.
@@ -372,7 +366,7 @@ Triumvirate exists because several companies built AI agents good enough to coor
 good enough to catch each other:
 
 - **Anthropic:** Claude Code and the MCP protocol that connects everything
-- **Google:** Antigravity and the Gemini CLI, stream-json and a large context window
+- **Google:** Antigravity, stream-json and a large context window. The Gemini CLI is no longer supported: Google retired its individual tier in September 2026, and the daemon defaults the Gemini seat to Antigravity.
 - **OpenAI:** Codex CLI with `exec --experimental-json` and a real sandbox
 - **xAI:** grok CLI with streaming-json and per-turn cost reporting
 - **DeepSeek:** an HTTP sibling for method questions at a fraction of the cost
