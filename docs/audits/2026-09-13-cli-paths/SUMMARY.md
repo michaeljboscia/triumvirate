@@ -1,5 +1,30 @@
 # CLI path audit, 2026-09-13
 
+## Final matrix, 2026-09-13 23:5x ET, daemon at commit 0647a20 plus the residual fix
+
+Full 23-probe run on the final daemon (`progress-final.jsonl`), fleet probes each in their own
+repo (D-015), plus a Codex fleet cancelled while running.
+
+| Path | Codex | Gemini (Antigravity) | Grok |
+|---|---|---|---|
+| CLI run directly | OK | OK | not probed |
+| Gemini CLI (`gemini`) | | DEAD, Google retired the tier | |
+| `ask_agent` consult | OK | OK | OK |
+| `ask_agent` with `required_sources` | OK | OK | OK |
+| `review_agent` | OK | OK | OK |
+| Session, two turns, state carried | OK | not carried, by design (no resume on agy) | OK (one flaky run: the model chose a ledger tool over answering; passed on rerun) |
+| `query_antigravity` and alias | | OK | |
+| `dispatch_codex` plain | spawned, wrote the file (probe prompt forbids the commit ABE requires) | | |
+| `dispatch_codex_worktree` | OK, committed, 65s | | |
+| `fleet_spawn` to ledger `done` | OK, 70s | OK, 30s | OK, 20s |
+| `fleet_cancel` on a running worker | kills wrapper and binary, ledger `cancelled` | | kills worker |
+| Codex quota failure | error names "You've hit your usage limit" on the 502, outbox, dead drop | | |
+
+Still open: D-014 (agy quota detectors over-match log noise), D-015 (task ids collide across
+fleets in one repo), D-016 (fleet_status after a daemon restart).
+
+## Original run, 2026-09-13 afternoon
+
 Every Triumvirate path that spawns an agent CLI, probed end to end through a fresh
 `triumvirate mcp` on the installed binary (3.9.0, commit 9843c7e), plus the CLIs run
 directly as a baseline. Raw results: `progress.jsonl`, one line per probe. Harness:
