@@ -214,9 +214,8 @@ All three agents (Claude, Codex, Gemini) read/write session logs in this format 
 7. **Installs GEMINI.md** starter template (skips if exists)
 8. **Builds the Triumvirate daemon** (`cargo build --release`) if not already built
 9. **Wires MCP configs** for all three agents (triumvirate daemon registered in Claude, Gemini, and Codex)
-10. **Installs Stenographer** to `~/.triumvirate/stenographer/` (checks for Ollama + model)
-11. **Copies .env.example** and **taxonomy.json.example** as reference
-12. **Creates `~/.ai-memory/`** — git-initialized central session log store
+10. **Copies .env.example** and **taxonomy.json.example** as reference
+11. **Creates `~/.ai-memory/`** — git-initialized central session log store
 
 Safe to re-run — always backs up before overwriting.
 
