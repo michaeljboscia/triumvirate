@@ -160,7 +160,7 @@ Every Tool Call:
   └─► PostToolUse: post-tool-use.sh
         └─ git add (staged = experimental) → on test pass: git commit (blessed)
   └─► PostToolUse: token-gate.sh
-        └─ Transcript growth > threshold? → Background save via Stenographer (local Ollama)
+        └─ Transcript growth > threshold? → logged
 
 Before Memory Loss:
   └─► PreCompact: pre-compact.sh
@@ -183,10 +183,6 @@ Before Memory Loss:
 | `TOKEN_GATE_DISABLE` | Disable token gate | `0` |
 | `ARTIFACT_GUARD_BYPASS` | Emergency bypass for Airlock | `0` |
 | `BASH_GUARD_BYPASS` | Emergency bypass for bash guard | `0` |
-| `STENOGRAPHER_MODEL` | Ollama model for session notes | `qwen2.5:32b` |
-| `STENOGRAPHER_TIMEOUT` | Ollama generation timeout (seconds) | `180` |
-| `STENOGRAPHER_NUM_CTX` | Ollama context window size | `65536` |
-| `STENO_COMPLETION_NOTIFY` | Show ✅/❌ Stenographer block in Claude's context after each run | `1` |
 | `RECOVERY_PRINT_SUMMARY` | Print full Gemini summary to terminal when resuming after compaction | `1` |
 
 ### Taxonomy
