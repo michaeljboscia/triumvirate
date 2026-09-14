@@ -524,7 +524,9 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 // guess that trips the shared breaker on evidence we do not
                                 // have; record_other_failure is the honest arm (REQ-103
                                 // biases repeated ambiguous failures toward OPEN anyway).
-                                if use_agy {
+                                // An operator cancel is not an agy failure; it must not feed
+                                // the breaker (Codex, confirmation pass).
+                                if use_agy && !fleet_is_cancelled(&fleet_id) {
                                     // record_other_failure emits "tripped_other" itself, and
                                     // only on the actual transition to OPEN. Emitting here
                                     // too would report a trip on every failed task.
@@ -980,6 +982,11 @@ async fn wait_fleet_child(
     let stderr_tail = spawn_drain(child.stderr.take());
     let _registration = child.id().map(|pid| {
         register_fleet_child(fleet_id, pid);
+        // A cancel that landed between the pre-launch check and this registration would
+        // otherwise leave an unregistered, unsignalled worker (Codex, confirmation pass).
+        if fleet_is_cancelled(fleet_id) {
+            signal_group(pid, "TERM");
+        }
         FleetChildRegistration { fleet_id: fleet_id.to_string(), pid }
     });
     let wait_result = match tokio::time::timeout(limit, child.wait()).await {

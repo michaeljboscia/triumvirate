@@ -331,8 +331,21 @@ pub(crate) async fn run_agy_cli_process_with_session(
         }
         let attempt = attempt_idx;
         attempt_idx += 1;
-        let slot = mcp_bridge::agy_resilience::agy_acquire_slot().await;
-        mcp_bridge::agy_resilience::agy_rate_limit().await;
+        // The slot and rate-limit waits sit under the deadline too (Codex, confirmation pass).
+        let budget_left = overall_deadline.saturating_duration_since(std::time::Instant::now());
+        let slot = match tokio::time::timeout(budget_left, mcp_bridge::agy_resilience::agy_acquire_slot()).await {
+            Ok(slot) => slot,
+            Err(_) => {
+                last_err.get_or_insert_with(|| anyhow::anyhow!("agy: overall deadline reached while waiting for a concurrency slot"));
+                break;
+            }
+        };
+        let budget_left = overall_deadline.saturating_duration_since(std::time::Instant::now());
+        if tokio::time::timeout(budget_left, mcp_bridge::agy_resilience::agy_rate_limit()).await.is_err() {
+            drop(slot);
+            last_err.get_or_insert_with(|| anyhow::anyhow!("agy: overall deadline reached while waiting on the rate limiter"));
+            break;
+        }
         // Measured AFTER the slot and rate-limit waits, which can consume real budget
         // (Codex, review of this change: measured before them, the call could outlive the
         // deadline by the queueing delay).
@@ -362,12 +375,13 @@ pub(crate) async fn run_agy_cli_process_with_session(
                 });
                 if text.is_empty() {
                     // Empty stdout with a 429 on stderr is a quota event, not a capture drop
-                    // (Codex, review of this change: this branch ignored the signal).
+                    // (Codex, review of this change: this branch ignored the signal). The
+                    // breaker sees it whether or not a backoff remains.
                     if let Some(signal) = quota_signal.as_deref() {
+                        mcp_bridge::agy_resilience::agy_breaker_record_quota();
                         if let Some(wait) = quota_backoffs.next() {
                             tracing::warn!(wait_s = wait.as_secs(), quota = signal, "agy empty stdout on a quota/429 signal (attempt {attempt}); backing off");
                             last_err = Some(anyhow::anyhow!("agy capacity/quota: empty output, signal: {signal}"));
-                            mcp_bridge::agy_resilience::agy_breaker_record_quota();
                             budget += 1;
                             tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
                             continue;
