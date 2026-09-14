@@ -51,6 +51,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: daemon
+      # The ABE binary-oracle tests parse the argv Triumvirate builds against the REAL codex
+      # binary (`codex exec <flags> --help`, no login needed). They fail loud when codex is
+      # absent, on purpose: a skipped oracle is the quiet pass that let three dispatch surfaces
+      # ship flags codex 0.154 rejects. Latest on purpose too, so a removed flag goes red here.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install codex CLI for the binary oracle
+        run: npm install -g @openai/codex && codex --version
       - name: Run unit tests
         run: cargo test --workspace --exclude pantheon --lib
 
