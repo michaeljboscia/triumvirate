@@ -386,6 +386,13 @@ pub(crate) async fn run_agy_cli_process_with_session(
                             tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
                             continue;
                         }
+                        // Backoff schedule exhausted, but this is still a quota event. Keep the
+                        // quota classification on the final error so the degraded route skips the
+                        // shared-quota gemini-cli hop. A generic "empty output" here classifies as
+                        // AuthOrExec, which routes the fallback to gemini-cli and hits the same 429.
+                        tracing::warn!(quota = signal, "agy empty stdout on a quota/429 signal (attempt {attempt}); quota backoff schedule exhausted");
+                        last_err = Some(anyhow::anyhow!("agy capacity/quota: empty output after quota backoff, signal: {signal}"));
+                        continue;
                     }
                     // REQ-024 canary: exit 0 + empty is NEVER a silent success (US-2).
                     // Retry once (transient / capture-drop regression); a still-empty
@@ -427,6 +434,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
                     let mut parsed = sp.finish();
                     if parsed.response_text.trim().is_empty() {
                         if let Some(signal) = quota_signal.as_deref() {
+                            // The breaker must see every 429, not only the one that ends
+                            // the call, or it opens later than before this change.
+                            mcp_bridge::agy_resilience::agy_breaker_record_quota();
                             if let Some(wait) = quota_backoffs.next() {
                                 tracing::warn!(
                                     wait_s = wait.as_secs(),
@@ -436,14 +446,22 @@ pub(crate) async fn run_agy_cli_process_with_session(
                                 last_err = Some(anyhow::anyhow!(
                                     "agy capacity/quota: empty output, signal: {signal}"
                                 ));
-                                // The breaker must see every 429, not only the one that ends
-                                // the call, or it opens later than before this change.
-                                mcp_bridge::agy_resilience::agy_breaker_record_quota();
                                 budget += 1;
                                 // Bounded by the overall deadline (Codex, review of this change).
                                 tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
                                 continue;
                             }
+                            // Backoff schedule exhausted, but this is still a quota event. Keep the
+                            // quota classification on the final error so the degraded route skips
+                            // the shared-quota gemini-cli hop instead of retrying the same 429.
+                            tracing::warn!(
+                                quota = signal,
+                                "agy returned empty output on a quota/429 signal (attempt {attempt}); quota backoff schedule exhausted"
+                            );
+                            last_err = Some(anyhow::anyhow!(
+                                "agy capacity/quota: empty output after quota backoff, signal: {signal}"
+                            ));
+                            continue;
                         }
                         // The status and any permission request were parsed and dropped, so an
                         // empty result was undiagnosable after the fact (D-012). Carry both.
@@ -1252,6 +1270,20 @@ pub(crate) mod tests {
         );
     }
 
+    /// The final error the retry loop surfaces once the quota backoff schedule is spent
+    /// must still classify as quota, or the degraded route sends the fallback to the
+    /// shared-quota gemini-cli hop and hits the same 429.
+    /// RED IF: the exhausted-backoff message loses its quota marker.
+    #[test]
+    fn empty_output_after_exhausted_backoff_stays_quota_classified() {
+        assert_eq!(
+            classify_failure_message(
+                "agy capacity/quota: empty output after quota backoff, signal: RESOURCE_EXHAUSTED (code 429)"
+            ),
+            AgyFailureClass::Quota
+        );
+    }
+
     #[test]
     fn route_plan_quota_skips_gemini_cli() {
         let hops = plan_degraded_route("gemini-cli,codex", AgyFailureClass::Quota);
@@ -1512,6 +1544,37 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&marker);
         let parsed = result.expect("the retry after a quota exit must return the answer");
         assert_eq!(parsed.response_text, "4");
+    }
+
+    /// The Sept-17 daemon-v2 pattern: agy keeps returning empty output on a 429 until the
+    /// quota backoff schedule is spent. The dispatch must FAIL as a quota failure, so the
+    /// degraded route skips the shared-quota gemini-cli hop. Before the fix the final error
+    /// was the generic "empty output", which classifies as AuthOrExec and misroutes.
+    /// RED IF: a persistent empty-plus-429 ends as an AuthOrExec-classified failure.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_persistent_empty_429_fails_as_quota_after_backoff() {
+        let _lock = ENV_LOCK.lock().await;
+        // One 0-second backoff, so the loop actually enters the backoff path and then
+        // exhausts it — the branch this test guards.
+        let _backoff = set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some("0"));
+        // Keep the breaker closed for the whole loop, so it never short-circuits before the
+        // exhausted-backoff branch runs (that path is quota-classified too, but it is not
+        // the one under test here).
+        let _threshold = set_env_scoped("TRIUMVIRATE_AGY_BREAKER_THRESHOLD", Some("1000"));
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        // Every attempt: a 429 on stderr and an empty stream-json result on a zero exit.
+        let body = "echo 'RESOURCE_EXHAUSTED (code 429): Resource has been exhausted' 1>&2; \
+                    printf '{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"response\":\"\"}}\\n'; exit 0";
+        let err = run_mock(body, "2+2?", None)
+            .await
+            .expect_err("a persistent empty 429 must fail, not succeed");
+        assert_eq!(
+            classify_failure_message(&err.to_string()),
+            AgyFailureClass::Quota,
+            "an exhausted quota backoff must stay quota-classified so the fallback skips \
+             gemini-cli; got: {err}"
+        );
     }
 
     #[cfg(target_os = "macos")]
