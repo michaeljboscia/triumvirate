@@ -2750,6 +2750,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         info!(backend = resolved_backend, %agy_bin, agy_max_concurrent, agy_max_rpm, "daemon config resolved");
     }
     mcp_bridge::posthog::record_daemon_started(resolved_backend, &agy_bin, agy_max_concurrent, agy_max_rpm);
+    // D-009: prove the sight gate can still say no, before any review relies on it. Loud, and
+    // never fatal: an inert gate is serious, but a canary bug must not take the daemon down.
+    match agent_exec::sight_gate_canary() {
+        Ok(()) => tracing::info!("sight gate armed: it rejected the startup canary"),
+        Err(why) => tracing::error!(canary = %why, "SIGHT GATE INERT"),
+    }
 
     // Probe the codex binary so agent_exec can make version-aware flag-injection
     // decisions. Fire-and-forget is fine — if it hasn't completed by the first

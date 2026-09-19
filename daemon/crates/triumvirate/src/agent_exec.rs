@@ -2190,6 +2190,39 @@ fn args_name_path(args: &str, path: &str) -> bool {
     false
 }
 
+/// Prove the sight gate still REJECTS, at startup (D-009).
+///
+/// A guard that is installed but inert looks exactly like a guard that is working, because
+/// both are silent on a clean run. So the gate is handed a GENUINE violation, a review that read
+/// nothing at all against a source that exists, through the same `enforce_reviewer_sight` real
+/// dispatches use. It is not told this is a test and nothing in it is special-cased: a canary
+/// that takes a different path from real data is a canary that can pass while the gate is dead.
+///
+/// `Ok(())` means the gate rejected it, which is the healthy outcome. The owner's call
+/// (2026-09-19): an inert gate is logged LOUDLY and the daemon still serves, so a bug in the
+/// canary can never become an outage.
+pub(crate) fn sight_gate_canary() -> Result<(), String> {
+    let dir = std::env::temp_dir().join(format!("triumvirate-sight-canary-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("canary could not create its source: {e}"))?;
+    let source = dir.join("canary-source.md");
+    std::fs::write(&source, "a file a reviewer was required to read\n")
+        .map_err(|e| format!("canary could not write its source: {e}"))?;
+    let source = source.to_string_lossy().into_owned();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut lifecycle = Vec::new();
+    // Zero tool calls, one named source: the reviewer that "reviewed" without opening anything.
+    let verdict = enforce_reviewer_sight("Canary", &[], "codex-exec-json", &[source], &cwd, &mut lifecycle);
+    let _ = std::fs::remove_dir_all(&dir);
+    match verdict {
+        Err(_) => Ok(()),
+        Ok(()) => Err(
+            "the sight gate ACCEPTED a review that read nothing. It is installed and inert: every \
+             source-gated review since it stopped rejecting is unverified."
+                .to_string(),
+        ),
+    }
+}
+
 fn enforce_reviewer_sight(
     agent_display: &str,
     tool_calls: &[ToolCallRecord],
@@ -8731,5 +8764,17 @@ mod strict_agent_tests {
             "the error must be agy's own, not a later hop's; got: {err}"
         );
         assert!(!fx.codex_ran.exists(), "no other agent may even be spawned under strict_agent");
+    }
+}
+
+#[cfg(test)]
+mod sight_gate_canary_tests {
+    use super::*;
+
+    /// The canary itself. RED IF: it reports a healthy gate as inert, which would put a false
+    /// alarm in the log on every boot and train the reader to ignore the real one.
+    #[test]
+    fn the_canary_passes_while_the_gate_rejects() {
+        sight_gate_canary().expect("a working gate rejects a review that read nothing");
     }
 }

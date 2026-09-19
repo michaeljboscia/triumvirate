@@ -24,6 +24,11 @@ install_hook "$REPO_ROOT/scripts/version-drift-check.sh" "$HOOKS_DIR/pre-commit"
 # pre-push: cargo check + clippy gate (mirrors Rust CI Check & Lint)
 install_hook "$REPO_ROOT/scripts/pre-push-ci-checks.sh" "$HOOKS_DIR/pre-push"
 
+# D-009: installed is not armed. Ask GIT whether it will run them, because on 2026-07-28 this
+# repo's hooks were "installed" and verified by running the script by hand while git itself
+# was pointed elsewhere by core.hooksPath and never called them at all.
+bash "$REPO_ROOT/scripts/verify-guards.sh" || exit 1
+
 echo ""
 echo "Hooks installed. Tip: use 'gh pr merge --auto --squash' so PRs only"
 echo "merge once CI is green — branch protection isn't available on free-tier."

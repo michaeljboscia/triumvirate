@@ -65,24 +65,6 @@ entirely hypothesis #2 misreading a timeout, which is now impossible.
 **Check:** next occurrence will produce a classified error naming the real cause. Until one
 occurs, this is untested rather than fixed.
 
-### D-009 — No detection for a guard that is installed but inert
-**Found:** 2026-07-28 · **Severity:** MEDIUM
-**Evidence:** git hooks were dead on this machine from 2026-05-10 to 2026-07-29 in **two
-independent ways**, and fixing the first did not fix the hooks:
-1. Both symlinks in `.git/hooks/` pointed at `/Users/mikeboscia/...`, a username that does
-   not exist here. `ls -la` showed hooks present; `head` on them said No such file or
-   directory. Repointed 2026-07-28.
-2. `core.hooksPath` in `.git/config` was ALSO set to `/Users/mikeboscia/projects/triumvirate/.git/hooks`.
-   When that config is set, git uses it **exclusively** and never looks in `.git/hooks/`, so
-   repointing the symlinks changed nothing. Unset 2026-07-29.
-**Why it matters:** the same failure class as everything above, applied to our own tooling.
-It also shows the verification trap: on 2026-07-28 the fix was "verified" by executing the
-hook script by hand, which proves the script works and says nothing about whether git calls
-it. Only a real `git push` distinguishes those.
-**Check:** a startup or CI step that pushes a throwaway ref (or otherwise triggers each
-guard through its real entry point) and fails if the guard produces no output. Verifying the
-artifact is not verifying the path.
-
 ---
 
 ### 2026-09-19: agy ran past its version pin on every dispatch (D-007)

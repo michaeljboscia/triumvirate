@@ -19,6 +19,7 @@
 #   bash scripts/verify-live-agents.sh codex
 #   bash scripts/verify-live-agents.sh review   # mandatory peer review, mock reviewer, no network
 #   bash scripts/verify-live-agents.sh strict   # strict_agent never substitutes, mock binaries, no network
+#   bash scripts/verify-live-agents.sh guards   # git hooks are armed, not merely present (D-009)
 #
 # Exit non-zero if any guard fails. Safe to wire into a scheduled job.
 
@@ -63,6 +64,18 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "review" ]; then
         echo "PASS  mandatory review end to end"
     else
         echo "FAIL  mandatory review end to end"
+        FAILED=1
+    fi
+fi
+
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "guards" ]; then
+    # D-009: every git hook is ARMED (git itself will run it), and the checker can fail. Run from
+    # here and from the installer, never from a hook: a hook cannot report that hooks are dead.
+    echo "RUN   guards are armed, and the checker can fail"
+    if bash "$REPO_ROOT/scripts/verify-guards.sh" --self-test && bash "$REPO_ROOT/scripts/verify-guards.sh"; then
+        echo "PASS  guards are armed, and the checker can fail"
+    else
+        echo "FAIL  guards are armed, and the checker can fail"
         FAILED=1
     fi
 fi
