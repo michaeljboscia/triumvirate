@@ -93,17 +93,6 @@ artifact is not verifying the path.
 
 ---
 
-### D-016 - fleet_status cannot find a fleet after a daemon restart
-**Found:** 2026-09-13 (Codex, review of the recovery commits) · **Severity:** MEDIUM
-**Evidence:** `fleet_status` looks the fleet up in the daemon's in-memory map first and only
-then refreshes from the ledger; the map is empty after a restart, and the ledger it would
-read lives under a `project_root` that only the map knew. `FleetStatusRequest` carries only
-`fleet_id`. The `fleets` table already has `source_project_root`, but the daemon does not know
-which repo's ledger to open.
-**Fix shape:** a daemon-level index `~/.triumvirate/fleets.json` mapping fleet_id to
-project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
-**Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
-
 ### 2026-09-19: agy ran past its version pin on every dispatch (D-007)
 The pin was 1.1.5 in `~/.claude.json` and 1.0.2 as the code default, while 1.2.7 was installed
 and serving every call, so the mismatch warning fired on every agy dispatch. A warning that
