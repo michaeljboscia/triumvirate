@@ -173,6 +173,139 @@ pub struct AskAgentRequest {
     pub strict_agent: Option<bool>,
 }
 
+/// One brief, N seats, no substitution. See `docs/briefs/ask-jury-brief.md`.
+///
+/// `context` is not a field: the bridge injects it into every tool's schema and strips it
+/// before dispatch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AskJuryRequest {
+    /// The same message goes to every seat, verbatim.
+    pub message: String,
+    pub cwd: Option<String>,
+    /// Which agents sit. Default `codex`, `grok`, `gemini`. At least two, and no agent twice:
+    /// `gemini` and `antigravity` are ONE seat, and asking both is one agent voting twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats: Vec<String>,
+    /// Same meaning and type as on `ask_agent`. Implied by a non-empty `required_sources`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_sight: Option<bool>,
+    /// Absolute paths every seat must actually open. Same field as on `ask_agent`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_sources: Vec<String>,
+    /// Applied to the grok seat only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_depth: Option<GrokDepthOverride>,
+    /// Seat name to the file that seat was told to write. Verified after the seat returns.
+    /// Counts only are reported, never contents.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub outputs: std::collections::BTreeMap<String, String>,
+    /// When true, an output file that holds no parseable JSON is reported as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_json: Option<bool>,
+    /// Extracts the verdict from a reply: capture group 1 if there is one, else the whole match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_regex: Option<String>,
+    /// RFC 6901 pointer into a JSON reply, for example `/verdict`. Wins over `verdict_regex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_json_pointer: Option<String>,
+    /// Per seat. A seat that runs past it is reported `timeout`; the others are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+}
+
+/// What became of one output file. Counts and flags only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JuryOutputCheck {
+    pub path: String,
+    pub exists: bool,
+    /// False when the file was already there and this call did not touch it. A leftover from
+    /// an earlier run exists and parses, and says nothing about this seat.
+    pub written_this_call: bool,
+    /// `json`, `jsonl`, or `embedded_json` (an array or object inside surrounding prose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Array length, JSONL line count, or 1 for a single object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct JurySeat {
+    /// The canonical agent that was asked.
+    pub agent: String,
+    /// `answered`: this agent answered. `unavailable`: its backend could not, and nobody was
+    /// asked in its place. `timeout`: it ran past `timeout_s`. `invalid`: something other than
+    /// this agent answered, so the reply is withheld from the tally.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Always set on an answered or invalid seat, even though `ask_agent` omits it on the
+    /// normal path. A reader should never have to infer who voted from an absent field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by_backend: Option<String>,
+    /// Not reported by `ask_agent` today, so absent. Never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    /// The normalized verdict this seat cast, when one could be extracted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_made: Option<u32>,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<JuryOutputCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JuryMajority {
+    pub verdict: String,
+    pub count: usize,
+}
+
+/// Every tally lands on exactly one `outcome`. All counts are against seats REQUESTED, so a
+/// jury that lost a seat cannot look more agreed than it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JuryTally {
+    pub seats_requested: usize,
+    /// Seats whose own agent answered.
+    pub seats_answered: usize,
+    /// Answered seats a verdict could be extracted from.
+    pub verdicts_cast: usize,
+    /// `unanimous`, `majority`, `split`, or `no_quorum`.
+    pub outcome: String,
+    /// EVERY requested seat answered, cast a verdict, and they all match. Two agreeing seats
+    /// out of three is a majority, never unanimity.
+    pub unanimous: bool,
+    /// A verdict held by more than half of the seats requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub majority: Option<JuryMajority>,
+    /// Two or more verdicts were cast and none has a majority.
+    pub split: bool,
+    /// How verdicts were read: `json_pointer`, `regex`, or `first_line`.
+    pub verdict_source: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AskJuryResponse {
+    /// Also the ledger record's `session_id`, so the run can be found with `ledger_session`.
+    pub jury_id: String,
+    pub seats: std::collections::BTreeMap<String, JurySeat>,
+    #[serde(flatten)]
+    pub tally: JuryTally,
+    /// False when the ledger write failed. The verdicts stand either way.
+    pub ledger_recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_error: Option<String>,
+}
+
 /// The agy circuit breaker as a caller can see it. Read-only: taking one never moves the breaker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BreakerSnapshot {
