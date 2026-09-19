@@ -117,6 +117,72 @@ pub fn whole_file_read_operand(command: &str) -> Option<String> {
     whole_file_reader_with_one_operand(cmd).map(|(op, _)| op)
 }
 
+/// The segments of an `&&` chain, quotes honored. A command with no `&&` is one segment.
+///
+/// D-017: codex read a 97-line brief with `wc -l F && sed -n '1,240p' F`, which reads every
+/// line of it, and the gate rejected the turn as "never opened". Both read parsers refuse any
+/// command containing `&&`, because that refusal is what closed the D-010 decoy attacks. The
+/// refusal is right about the ATTACKS and wrong about the CHAIN: each link is its own command.
+///
+/// ONLY `&&`, deliberately. The gate counts a call only when the tool reported success, and an
+/// `&&` chain exits zero only if every link ran and succeeded, so each link's read really
+/// happened. `;` and `||` both mask a failure (`cat missing ; true`, `cat missing || true`
+/// exit zero having read nothing), so a command containing either is still refused whole.
+///
+/// Splitting changes only which text each parser sees. Every segment goes through the same
+/// unchanged parser, which still refuses a redirect, a comment, a subshell, a backtick, a
+/// single `&`, and a second operand, so no D-010 shape survives the split.
+pub fn and_chain_segments(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let (mut out, mut start, mut i) = (Vec::new(), 0usize, 0usize);
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                } else if b == b'&' && bytes.get(i + 1) == Some(&b'&') {
+                    out.push(command[start..i].trim());
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // An unterminated quote is a command we do not understand; refuse to split it.
+    if quote.is_some() {
+        return vec![command.trim()];
+    }
+    out.push(command[start..].trim());
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// Every whole-file read in a command, one per `&&` segment.
+pub fn whole_file_read_operands(command: &str) -> Vec<String> {
+    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+        .into_iter()
+        .filter_map(whole_file_read_operand)
+        .collect()
+}
+
+/// Every ranged read in a command, one per `&&` segment. A chain that walks a file in windows
+/// (`sed -n '1,200p' F && sed -n '201,400p' F`) yields both, so the gate can union them.
+pub fn command_read_ranges(command: &str) -> Vec<RangedRead> {
+    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+        .into_iter()
+        .filter_map(command_read_range)
+        .collect()
+}
+
 /// A shell tool call that READS a file is a `ReadFile` for the sight gate.
 ///
 /// Every adapter mapped its shell tool to `Bash` by name alone, so a `cat` of a named source
@@ -149,6 +215,14 @@ pub fn shell_command_from_args_json(args_json: &str) -> Option<String> {
 }
 
 pub fn command_reads_whole_file(command: &str) -> bool {
+    // Per `&&` segment (D-017): `wc -l F && cat F` took `wc` as the program and reported a
+    // partial read of a command that shows the whole file.
+    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+        .into_iter()
+        .any(segment_reads_whole_file)
+}
+
+fn segment_reads_whole_file(command: &str) -> bool {
     if !command_reads_file_contents(command) {
         return false;
     }

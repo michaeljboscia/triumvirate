@@ -256,41 +256,49 @@ which repo's ledger to open.
 project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
 **Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
 
-### D-017 - the sight gate rejects a whole-file read when it shares a shell command
-**Found:** 2026-09-19 · **Severity:** HIGH
-**Evidence:** an `ask_jury` seat dispatched over `docs/briefs/ask-jury-brief.md` (97 lines).
-Codex ran `wc -l FILE && sed -n '1,240p' FILE`, which covers every line of the file, and the
-gate rejected the turn: "named by [Bash ok ...], none counted as a successful whole read". Its
-answer, thrown away, was a correct READY with sound reasoning.
-**Why it matters:** the same family as D-010, and worse. The gate exists to catch an agent that
-did not look. Here the agent looked at the whole file and was told it had not, so the defect
-converts good work into a refusal and a wasted call. Two of three jury seats were lost on this
-run, and neither loss was disagreement.
-**Cause (probable, not yet confirmed):** the read classifier matches a command whose read is the
-whole command, and does not decompose `a && b`. A `wc -l` in front of the `sed` is enough.
-**Check:** dispatch a sight-gated review whose reader runs `wc -l F && sed -n '1,999p' F` over a
-short file; the gate must accept it. Negative control: `wc -l F && head -5 F` must still fail.
-
-### D-018 - daemon telemetry has been silent since 2026-09-16 while configured
-**Found:** 2026-09-19 · **Severity:** HIGH
-**Evidence:** `SELECT ... FROM events WHERE event LIKE 'tv_%'` returns rows every day from
-2026-09-05 to 2026-09-16 (~280/day) and NOTHING from 2026-09-17 onward. The running daemon has
-both `POSTHOG_HOST` and `POSTHOG_API_KEY` set, which `start-daemon.sh` also validates, so this
-is not the "not configured, stay silent" path in `mcp-bridge::posthog::capture_as`. Two daemon
-restarts today produced no `tv_daemon_started`. Today's log contains zero lines mentioning
-posthog: not even a failure. The last `posthog POST failed` warning is 2026-09-15 20:00.
-**Why it matters:** every `tv_*` stream is a dead instrument right now, including the defect
-dashboard this register feeds (1886865). It also means the `tv_jury_seat` events added with
-`ask_jury` have never been observed landing, and cannot be until this is fixed: that
-instrumentation is written and unverified, and must not be described as working.
-**Relationship to D-005:** D-005 asked whether a quiet stream meant "path idle" or "emitter
-broken". This is the answer for the whole fleet of streams at once, and it is not idleness:
-`tv_agy_health` is a periodic heartbeat that cannot be idle while the daemon runs.
-**Check:** restart the daemon and find `tv_daemon_started` in PostHog within a minute. Until
-that passes, treat every `tv_*` absence as unknown rather than as evidence.
+### D-018 - a PostHog quota rejection is dropped without a single log line
+**Found:** 2026-09-19 · **Severity:** MEDIUM (was HIGH before the cause was known)
+**Cause: KNOWN, not a Triumvirate bug.** The PostHog account has been out of quota for several
+days (owner, 2026-09-19). The missing events are explained; this row is about how that
+absence presented.
+**Evidence:** no `tv_*` event since 2026-09-16, ~280/day before it. The daemon has
+`POSTHOG_HOST` and `POSTHOG_API_KEY` set, so `capture_as` was posting. Two daemon restarts on
+2026-09-19 produced no `tv_daemon_started` and **not one line mentioning posthog in the log**:
+no warning, no status code, no "quota". The last `posthog POST failed` warning is 2026-09-15
+20:00, before the quota ran out.
+**Why it matters:** this is D-002's shape one layer up. A provider refusing our data is a
+condition the daemon can see and did not report, so "no events" was indistinguishable from
+"nothing happened" for three days, and diagnosing it took a query against PostHog itself. The
+first suspicion was that the newly added `tv_jury_seat` instrumentation was broken.
+**Check:** point the daemon at a token that will be refused and confirm the log carries the
+status and the provider's reason. Quota exhaustion must be loud.
+**Consequence, so nothing is overclaimed:** the `tv_jury_seat` events added with `ask_jury`
+have never been observed landing. That instrumentation is written and unverified until the
+quota is restored.
 
 
 ## Closed
+
+### 2026-09-19: the sight gate rejected a whole-file read that shared an `&&` chain
+On the first live `ask_jury` run, codex read a 97-line brief with
+`wc -l F && sed -n '1,240p' F`, which shows every line, and the gate threw the turn away as
+"never successfully opened". Its answer was correct and was lost, and two of three jury seats
+were lost that run without a single disagreement between them. Both read parsers refused any
+command containing `&&`, which is what closed the D-010 decoy attacks; the refusal was right
+about the attacks and wrong about the chain.
+Fixed in `agent-adapter::codex::and_chain_segments` plus plural `whole_file_read_operands` /
+`command_read_ranges`, consumed at all five gate sites. Splitting is on `&&` ONLY: the gate
+counts a call only when it reported success, and an `&&` chain exits zero only if every link
+ran, so each link's read really happened. `;` and `||` mask a failed read and stay refused
+whole, as does an unterminated quote, which is a parse error that runs nothing. Every segment
+still goes through the unchanged strict parser, so no D-010 shape survives the split.
+Check passed: `d017_a_whole_file_read_still_counts_when_it_shares_an_and_chain` (5 chain
+shapes, including a file walked in two windows across the chain) and
+`d017_the_and_chain_split_reopens_nothing` (8 controls: a peek in a chain, half a file, a
+redirect, a comment, a `;` chain, an `||` chain, a filename that is only echoed, and an
+unterminated quote). All 95 agent-adapter and 44 gate tests still pass. Mutation checked:
+splitting on `;`/`&`, and splitting an unterminated quote, each turn the controls red.
+
 
 ### 2026-09-19: the agy health probe ratcheted an open breaker to the five hour cap
 The 300s health probe shares `run_agy_cli_process_with_session` with request traffic. On a

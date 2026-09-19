@@ -1854,20 +1854,24 @@ fn codex_ranged_reads_cover_source(
                 && matches!(c.kind, ToolKind::ReadFile)
                 && c.success == Some(true)
         })
-        .filter_map(|c| {
-            let args = c.args_json.as_deref()?;
-            let command = agent_adapter::codex::shell_command_from_args_json(args)?;
-            let read = agent_adapter::codex::command_read_range(&command)?;
-            // Bound to the operand the reader opened, not to a path string anywhere in the
-            // command. Codex, round 3: a decoy operand embedding the source path used to
-            // collect the source's coverage.
-            if !candidates.iter().any(|cand| cand == &read.operand) {
-                return None;
-            }
-            if read.via_nl && nl_drops_lines {
-                return None;
-            }
-            Some(read.range)
+        .flat_map(|c| {
+            // EVERY window in the command. One codex call can walk a file in `&&`-chained
+            // windows, and taking only the first reported partial coverage of a whole read
+            // (D-017).
+            let ranges = c
+                .args_json
+                .as_deref()
+                .and_then(agent_adapter::codex::shell_command_from_args_json)
+                .map(|command| agent_adapter::codex::command_read_ranges(&command))
+                .unwrap_or_default();
+            ranges.into_iter().filter(|read| {
+                // Bound to the operand the reader opened, not to a path string anywhere in the
+                // command. Codex, round 3: a decoy operand embedding the source path used to
+                // collect the source's coverage.
+                candidates.iter().any(|cand| cand == &read.operand)
+                    && !(read.via_nl && nl_drops_lines)
+            })
+            .map(|read| read.range)
         })
         .collect();
     if ranges.is_empty() {
@@ -1923,7 +1927,12 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             let window = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
                 .and_then(|v| agent_adapter::codex::shell_command_from_value(Some(&v)))
-                .and_then(|cmd| agent_adapter::codex::command_read_range(&cmd).map(|x| x.range));
+                .map(|cmd| agent_adapter::codex::command_read_ranges(&cmd))
+                .filter(|reads| !reads.is_empty())
+                // The evidence line reports the FIRST window of the command; the coverage
+                // check above unions all of them. Reporting one of several is a cosmetic
+                // shortfall in a rejection message, not a gate decision.
+                .map(|reads| reads[0].range);
             Some(match window {
                 Some(r) => match r.end {
                     Some(e) => format!("lines {}-{}", r.start, e),
@@ -2039,11 +2048,16 @@ fn record_names_source(c: &ToolCallRecord, cand: &str) -> bool {
         let Some(cmd) = agent_adapter::codex::shell_command_from_args_json(args) else {
             return false;
         };
-        if let Some(op) = agent_adapter::codex::whole_file_read_operand(&cmd) {
-            return op == cand;
+        // Plural: a read may sit in any segment of an `&&` chain (D-017). When the command
+        // contains reads but none of them opened THIS source, the answer is still false, as
+        // before; the fall-through below is only for a command with no parseable read at all.
+        let whole = agent_adapter::codex::whole_file_read_operands(&cmd);
+        if !whole.is_empty() {
+            return whole.iter().any(|op| op == cand);
         }
-        if let Some(read) = agent_adapter::codex::command_read_range(&cmd) {
-            return read.operand == cand;
+        let ranged = agent_adapter::codex::command_read_ranges(&cmd);
+        if !ranged.is_empty() {
+            return ranged.iter().any(|read| read.operand == cand);
         }
         // A peek (`head -5 SRC`, `tail -1 SRC`) is neither whole nor ranged, but it DID open
         // the source, and the gate reports a peek ("only read PART") differently from a miss
@@ -2071,9 +2085,10 @@ fn record_read_source_whole(c: &ToolCallRecord, cand: &str) -> bool {
         return false;
     };
     if is_shell_read_tool(&c.tool) {
+        // Plural: the whole-file read may be any link of an `&&` chain (D-017).
         return agent_adapter::codex::shell_command_from_args_json(args)
-            .and_then(|cmd| agent_adapter::codex::whole_file_read_operand(&cmd))
-            .is_some_and(|op| op == cand);
+            .map(|cmd| agent_adapter::codex::whole_file_read_operands(&cmd))
+            .is_some_and(|ops| ops.iter().any(|op| op == cand));
     }
     args_name_path(args, cand) && !read_args_are_partial(&c.tool, args)
 }
@@ -8315,6 +8330,90 @@ mod grok_shell_read_gate_tests {
             success: Some(true),
             duration_ms: None,
             args_json: Some(serde_json::json!({ "command": command, "description": "x" }).to_string()),
+        }
+    }
+
+    fn codex_shell(command: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            id: None,
+            tool: "command_execution".to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(serde_json::json!({ "command": command }).to_string()),
+        }
+    }
+
+    /// A real file on disk, because the coverage check reads it to learn its line count.
+    fn source_file(lines: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("brief.md");
+        let body: String = (1..=lines).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&path, body).expect("write source");
+        let p = path.to_string_lossy().into_owned();
+        (dir, p)
+    }
+
+    fn gate_codex(cmds: &[&str], source: &str, cwd: &str) -> Result<(), String> {
+        let tools: Vec<ToolCallRecord> = cmds.iter().map(|c| codex_shell(c)).collect();
+        let sources = vec![source.to_string()];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &sources, cwd, &mut lifecycle)
+    }
+
+    /// D-017, THE LIVE CASE. On the first real `ask_jury` run, codex read a 97-line brief with
+    /// `wc -l F && sed -n '1,240p' F`, which shows every line of it, and the gate threw the
+    /// turn away as "never successfully opened". Its answer was correct and was lost.
+    ///
+    /// RED IF: a read stops counting because something else shares its `&&` chain.
+    #[test]
+    fn d017_a_whole_file_read_still_counts_when_it_shares_an_and_chain() {
+        let (dir, src) = source_file(97);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        for cmd in [
+            // The live command, verbatim in shape.
+            format!("wc -l {src} && sed -n '1,240p' {src}"),
+            // The chain in the other order.
+            format!("sed -n '1,240p' {src} && wc -l {src}"),
+            // A whole-file reader rather than a window.
+            format!("wc -l {src} && cat {src}"),
+            // Walked in windows across the chain: neither covers it alone.
+            format!("sed -n '1,50p' {src} && sed -n '51,97p' {src}"),
+            // Three links, the read in the middle.
+            format!("pwd && cat {src} && echo done"),
+        ] {
+            gate_codex(&[&cmd], &src, &cwd).unwrap_or_else(|e| panic!("must count as a read: {cmd}\n  gate said: {e}"));
+        }
+    }
+
+    /// The controls. Splitting on `&&` must not reopen anything D-010 closed, and must not
+    /// turn a peek into a whole read.
+    /// RED IF: any of these starts passing.
+    #[test]
+    fn d017_the_and_chain_split_reopens_nothing() {
+        let (dir, src) = source_file(97);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        for (cmd, why) in [
+            (format!("wc -l {src} && head -5 {src}"), "a peek in a chain is still only PART"),
+            (format!("sed -n '1,50p' {src} && wc -l {src}"), "half the file in a chain is still PART"),
+            (format!("cat /dev/null < {src} && wc -l {src}"), "a redirect still reads nothing"),
+            (format!("cat /etc/hostname # {src} && wc -l {src}"), "a comment still names nothing"),
+            // `;` and `||` mask a failed read: both exit zero having read nothing, so the
+            // success flag the gate trusts would be a lie. They stay refused whole.
+            (format!("cat /nonexistent ; cat {src}"), "a semicolon chain is still refused"),
+            (format!("cat /nonexistent || cat {src}"), "an or-chain is still refused"),
+            (format!("echo {src} && cat /etc/hostname"), "naming the file is not reading it"),
+            // An UNTERMINATED quote is a parse error for the whole line, so the shell runs
+            // NOTHING, including the read that precedes it. Splitting would credit a read that
+            // never happened. (The mirror case, `echo 'oops && cat SRC`, needs no guard: the
+            // scanner is inside the quote when it reaches the `&&`, so it never splits there.)
+            (format!("cat {src} && echo 'oops"), "an unterminated quote runs nothing"),
+        ] {
+            let err = gate_codex(&[&cmd], &src, &cwd).expect_err(&format!("must NOT pass: {why}\n  {cmd}"));
+            assert!(
+                err.contains("never successfully opened") || err.contains("only read PART"),
+                "{why}: unexpected rejection text: {err}"
+            );
         }
     }
 
