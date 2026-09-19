@@ -256,6 +256,40 @@ which repo's ledger to open.
 project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
 **Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
 
+### D-017 - the sight gate rejects a whole-file read when it shares a shell command
+**Found:** 2026-09-19 · **Severity:** HIGH
+**Evidence:** an `ask_jury` seat dispatched over `docs/briefs/ask-jury-brief.md` (97 lines).
+Codex ran `wc -l FILE && sed -n '1,240p' FILE`, which covers every line of the file, and the
+gate rejected the turn: "named by [Bash ok ...], none counted as a successful whole read". Its
+answer, thrown away, was a correct READY with sound reasoning.
+**Why it matters:** the same family as D-010, and worse. The gate exists to catch an agent that
+did not look. Here the agent looked at the whole file and was told it had not, so the defect
+converts good work into a refusal and a wasted call. Two of three jury seats were lost on this
+run, and neither loss was disagreement.
+**Cause (probable, not yet confirmed):** the read classifier matches a command whose read is the
+whole command, and does not decompose `a && b`. A `wc -l` in front of the `sed` is enough.
+**Check:** dispatch a sight-gated review whose reader runs `wc -l F && sed -n '1,999p' F` over a
+short file; the gate must accept it. Negative control: `wc -l F && head -5 F` must still fail.
+
+### D-018 - daemon telemetry has been silent since 2026-09-16 while configured
+**Found:** 2026-09-19 · **Severity:** HIGH
+**Evidence:** `SELECT ... FROM events WHERE event LIKE 'tv_%'` returns rows every day from
+2026-09-05 to 2026-09-16 (~280/day) and NOTHING from 2026-09-17 onward. The running daemon has
+both `POSTHOG_HOST` and `POSTHOG_API_KEY` set, which `start-daemon.sh` also validates, so this
+is not the "not configured, stay silent" path in `mcp-bridge::posthog::capture_as`. Two daemon
+restarts today produced no `tv_daemon_started`. Today's log contains zero lines mentioning
+posthog: not even a failure. The last `posthog POST failed` warning is 2026-09-15 20:00.
+**Why it matters:** every `tv_*` stream is a dead instrument right now, including the defect
+dashboard this register feeds (1886865). It also means the `tv_jury_seat` events added with
+`ask_jury` have never been observed landing, and cannot be until this is fixed: that
+instrumentation is written and unverified, and must not be described as working.
+**Relationship to D-005:** D-005 asked whether a quiet stream meant "path idle" or "emitter
+broken". This is the answer for the whole fleet of streams at once, and it is not idleness:
+`tv_agy_health` is a periodic heartbeat that cannot be idle while the daemon runs.
+**Check:** restart the daemon and find `tv_daemon_started` in PostHog within a minute. Until
+that passes, treat every `tv_*` absence as unknown rather than as evidence.
+
+
 ## Closed
 
 ### 2026-09-19: the agy health probe ratcheted an open breaker to the five hour cap
@@ -332,4 +366,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-19
+**Last reviewed:** 2026-09-19 (D-017, D-018 added from the first live ask_jury run)
