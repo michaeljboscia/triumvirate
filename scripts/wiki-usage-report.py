@@ -5,9 +5,17 @@ The daemon stores raw evidence per call (`wiki_call` events, schema 2). EVERY ju
 here, at report time, so a better rule can be re-run over old events: that was the one point the
 design jury (2026-09-19) was unanimous on.
 
-What this does NOT do: publish a usage rate. The jury also agreed no rate is believable until a
-placebo map, a canary id and a holdout exist, because nothing yet shows either signal FIRES when
-a peer definitely uses a page. So this reports counts per class, and says so at the top.
+The rate (owner's decision, 2026-09-19: the map stays in the peers' own files, no holdout): the
+share of eligible delivered calls that CONSULTED the wiki, meaning any successful tool call whose
+arguments name the wiki. Opening a page is one way; the first ceiling probes showed it is not the
+usual way. Grok answered six of six hinted probes correctly from `grep` and shell output with no
+page opened, so a page-open rate would have reported zero use for a seat using the wiki every time. Its floor is zero by construction (the
+page files did not exist before 2026-09-17, a peer without the map has no way to know a page path,
+and a prompt that names a page is excluded). A seat's rate is published only when a HINTED ceiling
+probe (scripts/wiki-probes.py) registered an open of its target page for that seat: the positive
+control that the instrument can see an open at all. A seat without one gets no rate, only counts.
+Page ids in the response text are reported as a secondary signal, because after delivery they
+include map echo.
 
 Usage:
   python3 scripts/wiki-usage-report.py                 # writes reports/wiki-usage/usage-<date>.md
@@ -29,6 +37,7 @@ HOME = Path.home()
 DEFAULT_ROOTS = [HOME / "projects", HOME / ".triumvirate", Path("/private/tmp")]
 MAX_DEPTH = 6
 RETENTION_DAYS = 30  # the ledger sweeps events on created_at
+PROBE_JOURNAL = REPO / "reports" / "wiki-usage" / "probes.jsonl"
 
 # The subject rule and the thresholds come from the controls script, so there is ONE copy of each.
 _spec = importlib.util.spec_from_file_location("wiki_controls", REPO / "scripts" / "wiki-controls.py")
@@ -99,14 +108,50 @@ def parse_ts(ts: str) -> dt.datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
-def classify(e: dict) -> dict:
+def load_probes(journal: Path) -> dict[str, dict]:
+    """request_id -> probe row, for every answered probe in the journal."""
+    if not journal.is_file():
+        return {}
+    rows = [json.loads(line) for line in journal.read_text().splitlines() if line.strip()]
+    return {r["request_id"]: r for r in rows if r.get("request_id")}
+
+
+def consulted(ev: dict) -> bool | None:
+    """Did this call touch the wiki with any tool? None when the parser cannot see tool calls.
+
+    Reads both evidence shapes: schema 2 counted wiki touches by kind ({"grep": 1}), schema 3
+    lists them ([{"kind": ..., "pages": [...], "index": bool}]).
+    """
+    calls = ev.get("wiki_tool_calls")
+    opened = ev.get("pages_opened")
+    if calls is None and opened is None:
+        return None
+    if calls is None:  # schema 2 events written before the field existed
+        return bool(opened) or None
+    return bool(calls) or bool(opened)
+
+
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if n == 0:
+        return (0.0, 1.0)
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
+    return (max(0.0, c - h), min(1.0, c + h))
+
+
+def classify(e: dict, probes: dict | None = None) -> dict:
     """One call's labels. Order matters: a call leaves the use population at the first rule it
     meets, and every rule that removes it is named in the output."""
     seat = e.get("answered_by_agent") or e.get("agent_requested") or "?"
     ev = e.get("evidence")
     out = {"seat": seat, "db": e["db"], "exclusion": None, "arm": None,
-           "text_ids": [], "opened": None, "call_class": "peer_review" if e.get("is_peer_review") else "ask"}
+           "text_ids": [], "opened": None, "consulted": None, "call_class": "peer_review" if e.get("is_peer_review") else "ask"}
 
+    probe = (probes or {}).get(e.get("request_id") or e.get("session_id"))
+    if probe:
+        out["probe"] = probe
     if e.get("_unparseable"):
         out["exclusion"] = "unparseable payload"
     elif e.get("outcome") != "answered":
@@ -127,6 +172,13 @@ def classify(e: dict) -> dict:
     if out["exclusion"]:
         return out
 
+    out["text_ids"] = ev.get("text_ids") or []
+    out["opened"] = ev.get("pages_opened")  # None = the parser cannot see reads
+    out["consulted"] = consulted(ev)
+    if probe:
+        out["exclusion"] = "ceiling probe"
+        return out
+
     wiki_dir = (ev.get("wiki") or {}).get("dir") or ""
     pointed = [s for s in (e.get("required_sources") or []) + (ev.get("prompt_paths") or [])]
     if ev.get("prompt_ids") or any(wiki_dir and s.startswith(wiki_dir.rstrip("/") + "/")
@@ -137,8 +189,6 @@ def classify(e: dict) -> dict:
     elif any(WIKI_SUBJECT.search(s) for s in pointed):
         out["exclusion"] = "wiki is the subject"
 
-    out["text_ids"] = ev.get("text_ids") or []
-    out["opened"] = ev.get("pages_opened")  # None = the parser cannot see reads
     if not out["exclusion"] and len(set(out["text_ids"])) >= RECITATION_DISTINCT:
         out["exclusion"] = "recitation"
 
@@ -152,14 +202,32 @@ def classify(e: dict) -> dict:
 def summarise(classified: list[dict]) -> dict:
     groups: dict[tuple, dict] = collections.defaultdict(lambda: {
         "calls": 0, "text_cited": 0, "page_refs": 0, "opens_observable": 0, "opened_any": 0,
-        "pages": collections.Counter()})
+        "consult_observable": 0, "consulted": 0, "pages": collections.Counter()})
     excluded = collections.Counter()
+    ceiling: dict[tuple, dict] = collections.defaultdict(lambda: {
+        "probes": 0, "opens_observable": 0, "opened_target": 0, "opened_any": 0, "answer_matched": 0,
+        "consult_observable": 0, "consulted": 0})
     for c in classified:
+        if c.get("probe") and c["exclusion"] == "ceiling probe":
+            pr = c["probe"]
+            k = ceiling[(c["seat"], pr["variant"])]
+            k["probes"] += 1
+            k["answer_matched"] += bool(pr.get("answer_matched"))
+            if c["consulted"] is not None:
+                k["consult_observable"] += 1
+                k["consulted"] += bool(c["consulted"])
+            if c["opened"] is not None:
+                k["opens_observable"] += 1
+                k["opened_any"] += bool(c["opened"])
+                k["opened_target"] += pr["target_page"] in c["opened"]
         if c["exclusion"]:
             excluded[(c["seat"], c["exclusion"])] += 1
             continue
         g = groups[(c["seat"], c["arm"], c["call_class"])]
         g["calls"] += 1
+        if c["consulted"] is not None:
+            g["consult_observable"] += 1
+            g["consulted"] += bool(c["consulted"])
         if c["text_ids"]:
             g["text_cited"] += 1
             g["page_refs"] += len(c["text_ids"])
@@ -169,7 +237,55 @@ def summarise(classified: list[dict]) -> dict:
             if c["opened"]:
                 g["opened_any"] += 1
                 g["pages"].update(c["opened"])
-    return {"groups": dict(groups), "excluded": dict(excluded)}
+    rates = {}
+    for seat in sorted({k[0] for k in groups} | {k[0] for k in ceiling}):
+        # The positive control: a hinted probe in which the instrument SAW the seat consult the
+        # wiki. Requiring a page open here would fail a seat that uses the wiki by searching it.
+        proven = ceiling.get((seat, "hinted"), {}).get("consulted", 0) > 0
+        pool = [g for (s_, arm, cls), g in groups.items() if s_ == seat and arm == "delivered"]
+        n = sum(g["consult_observable"] for g in pool)
+        k = sum(g["consulted"] for g in pool)
+        rates[seat] = {"proven": proven, "n": n, "k": k,
+                       "opened_n": sum(g["opens_observable"] for g in pool),
+                       "opened_k": sum(g["opened_any"] for g in pool),
+                       "text_n": sum(g["calls"] for g in pool), "text_k": sum(g["text_cited"] for g in pool)}
+    return {"groups": dict(groups), "excluded": dict(excluded), "ceiling": dict(ceiling), "rates": rates}
+
+
+def rate_section(summary: dict) -> list[str]:
+    rates = summary["rates"]
+    published = [s for s, r in rates.items() if r["proven"]]
+    lines = ["## Rate: delivered calls that consulted the wiki", ""]
+    if not published:
+        lines += ["**NO RATE IS PUBLISHED.** No seat has a hinted ceiling probe in which the instrument",
+                  "saw it consult the wiki, so for every seat a zero here could be a blind instrument.", ""]
+    lines += ["Floor: 0 by construction (no page files before 2026-09-17; without the map a peer cannot",
+              "know a page path; prompt-named pages are excluded). Interval: Wilson 95%.", "",
+              "| seat | instrument proven | consulted | rate | 95% interval | of which opened a page | text-cited (secondary, includes map echo) |",
+              "|---|---|---:|---:|---|---:|---:|"]
+    for seat, r in sorted(rates.items()):
+        text = f"{r['text_k']}/{r['text_n']}"
+        opened = f"{r['opened_k']}/{r['opened_n']}"
+        if r["proven"] and r["n"]:
+            lo, hi = wilson(r["k"], r["n"])
+            lines.append(f"| {seat} | yes | {r['k']}/{r['n']} | {r['k'] / r['n']:.1%} | {lo:.1%} to {hi:.1%} | {opened} | {text} |")
+        elif r["proven"]:
+            lines.append(f"| {seat} | yes | 0/0 | no eligible calls yet | | {opened} | {text} |")
+        else:
+            lines.append(f"| {seat} | NO | {r['k']}/{r['n']} | not published | | {opened} | {text} |")
+    ceiling = summary["ceiling"]
+    lines += ["", "## Ceiling probes (held apart from the rate)", "",
+              "Questions answerable only from one page body, page never named. `hinted` tells the peer to",
+              "check its knowledge base and is the positive control; `unhinted` is need alone. An answer",
+              "can also come from a peer's other memory tools, so `answer matched` is not proof of a page read.", "",
+              "| seat | variant | probes | consult observable | consulted wiki | opened target page | answer matched |",
+              "|---|---|---:|---:|---:|---:|---:|"]
+    for (seat, variant), k in sorted(ceiling.items()):
+        lines.append(f"| {seat} | {variant} | {k['probes']} | {k['consult_observable']} | {k['consulted']} "
+                     f"| {k['opened_target']} | {k['answer_matched']} |")
+    if not ceiling:
+        lines.append("| (none run) | | 0 | | | | |")
+    return lines
 
 
 def render(inventory: list[dict], summary: dict, roots: list[Path]) -> str:
@@ -177,10 +293,7 @@ def render(inventory: list[dict], summary: dict, roots: list[Path]) -> str:
     lines = [
         f"# Wiki usage, {now:%Y-%m-%d %H:%M} UTC",
         "",
-        "**NO RATE IS PUBLISHED.** Counts only. The design jury (2026-09-19) agreed that no rate is",
-        "believable before a placebo map, a canary id and a holdout exist: nothing yet shows either",
-        "signal fires when a peer definitely uses a page, so a low count cannot yet tell \"ignored\"",
-        "from \"instrument dead\".",
+        *rate_section(summary),
         "",
         f"## Ledgers found: {len(inventory)}",
         "",
@@ -221,7 +334,7 @@ def render(inventory: list[dict], summary: dict, roots: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run(roots: list[Path]) -> tuple[list[dict], dict, str]:
+def run(roots: list[Path], journal: Path = PROBE_JOURNAL) -> tuple[list[dict], dict, str]:
     inventory, events = [], []
     for db in find_ledgers(roots):
         try:
@@ -230,7 +343,8 @@ def run(roots: list[Path]) -> tuple[list[dict], dict, str]:
             inv, evs = {"db": str(db), "error": f"unreadable: {e}"}, []
         inventory.append(inv)
         events.extend(evs)
-    summary = summarise([classify(e) for e in events])
+    probes = load_probes(journal)
+    summary = summarise([classify(e, probes) for e in events])
     return inventory, summary, render(inventory, summary, roots)
 
 
