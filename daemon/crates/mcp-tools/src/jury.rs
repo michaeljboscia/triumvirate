@@ -338,7 +338,14 @@ pub fn classify_seat(
     seat.answered_by_backend = resp.answered_by_backend.clone();
     seat.tool_calls_made = resp.tool_calls_made;
 
-    let invalid = if answered_by != agent {
+    seat.model = resp.model.clone();
+    let invalid = if resp.strict_agent_honored != Some(true) {
+        // Silence is not proof. Every seat is dispatched strict, so a daemon that took the
+        // strict path says so; one that ignored the field says nothing, and a substituted vote
+        // from it would otherwise have to be caught by fields it may also omit (Codex).
+        Some("this daemon did not acknowledge strict_agent, so no substitution check it reports \
+              can be trusted. Install the daemon that ships with ask_jury".to_string())
+    } else if answered_by != agent {
         Some(format!("asked {agent}, answered by {answered_by}"))
     } else if normalize_agent_name(&resp.agent) != agent {
         Some(format!("asked {agent}, the reply is labelled {}", resp.agent))
@@ -459,7 +466,17 @@ where
 
     let mut finish = |mut seat: JurySeat, seats: &mut BTreeMap<String, JurySeat>| {
         if let Some(path) = outputs.get(&seat.agent) {
-            seat.output = Some(check_output(path, &baselines[&seat.agent], expect_json));
+            let mut check = check_output(path, &baselines[&seat.agent], expect_json);
+            // A timeout ends the WAIT, not the work. The daemon does not cancel on client
+            // disconnect, so the seat may still be running and may write this file afterwards
+            // (Codex). Reporting "the seat did not write it" would be a claim about a race.
+            if seat.status == STATUS_TIMEOUT {
+                check.error = Some(format!(
+                    "{} (the seat may still be running in the daemon and may write this file later)",
+                    check.error.as_deref().unwrap_or("checked while the seat was still running")
+                ));
+            }
+            seat.output = Some(check);
         }
         on_seat(&seat);
         seats.insert(seat.agent.clone(), seat);
@@ -688,8 +705,11 @@ async fn write_ledger(record: ManualRecord, cwd: Option<&str>, via_daemon: bool)
 mod tests {
     use super::*;
 
+    /// What a CURRENT daemon returns for a strict seat: it acknowledges the strict path.
     fn reply(agent: &str, text: &str) -> AskAgentResponse {
-        AskAgentResponse::direct(format!("req-{agent}"), agent.to_string(), text.to_string(), Vec::new())
+        let mut r = AskAgentResponse::direct(format!("req-{agent}"), agent.to_string(), text.to_string(), Vec::new());
+        r.strict_agent_honored = Some(true);
+        r
     }
 
     /// What a daemon WITHOUT `strict_agent` sends back when agy is over quota.
@@ -783,12 +803,44 @@ mod tests {
         }
     }
 
+    /// RED IF: an unacknowledged reply counts. A daemon that never heard of `strict_agent`
+    /// ignores the field, substitutes, and may omit the provenance fields too, so trusting
+    /// silence put the whole defence on evidence that daemon had no reason to send.
+    #[tokio::test]
+    async fn a_daemon_that_does_not_acknowledge_strict_cannot_cast_a_vote() {
+        let out = run(&jury(&[]), |r| {
+            // No `strict_agent_honored`, and clean provenance: the pre-strict daemon's shape.
+            Ok(AskAgentResponse::direct(
+                "req-old".to_string(),
+                r.agent.clone(),
+                "APPROVE".to_string(),
+                Vec::new(),
+            ))
+        })
+        .await
+        .expect("jury runs");
+
+        for seat in out.seats.values() {
+            assert_eq!(seat.status, STATUS_INVALID, "{}: {seat:?}", seat.agent);
+            assert!(seat.reason.as_deref().unwrap_or_default().contains("did not acknowledge"));
+            assert_eq!(seat.response, None);
+        }
+        assert_eq!(out.tally.outcome, "no_quorum", "unverifiable is not agreement");
+        assert_eq!(out.tally.seats_answered, 0);
+    }
+
     /// The three provenance checks are independent, so each is exercised ALONE. The test above
     /// trips two at once and would stay green with either one deleted.
     #[test]
     fn each_provenance_check_stands_on_its_own() {
         let first = VerdictExtractor::FirstLine;
         let judge = |resp: AskAgentResponse| classify_seat("gemini", SeatOutcome::Replied(Box::new(resp)), 1, &first);
+
+        assert_eq!(
+            judge(AskAgentResponse::direct("r".into(), "gemini".into(), "APPROVE".into(), Vec::new())).status,
+            STATUS_INVALID,
+            "an unacknowledged reply is unverifiable, whatever else it says"
+        );
 
         let mut only_answered_by = reply("gemini", "APPROVE");
         only_answered_by.answered_by_agent = Some("codex".to_string());

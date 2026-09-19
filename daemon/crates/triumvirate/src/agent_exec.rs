@@ -593,7 +593,11 @@ pub(crate) async fn execute_ask_agent(
     // --model and runs its own internal retry); for deepseek, a single attempt
     // (REQ-DS-008 / T-013 — the runner owns its scoped in-flight retries, the
     // outer execute loop must NOT retry); for others, 3 retries.
-    let attempt_schedule = attempt_schedule_for(&agent, gemini_backend_selected, sight_required(req));
+    // Read once, up here: it decides the attempt schedule, the degraded route, and the
+    // acknowledgement the caller needs in order to trust any of it.
+    let strict_agent = req.strict_agent.unwrap_or(false);
+    let attempt_schedule =
+        attempt_schedule_for(&agent, gemini_backend_selected, sight_required(req), strict_agent);
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
     // Every failure on the way to the terminal error, oldest first. `last_err` alone is what
@@ -1009,6 +1013,10 @@ pub(crate) async fn execute_ask_agent(
                 .with_shadow(sh_backend, sh_resp, sh_err, sh_ms);
                 // The receipt, returned on every call and not only on reviews.
                 resp.tool_calls_made = Some(tool_calls_made);
+                // Which model actually answered, when the dispatch named one, and the
+                // acknowledgement that makes the no-substitution guarantee checkable.
+                resp.model = model_override.map(|m| m.to_string());
+                resp.strict_agent_honored = strict_agent.then_some(true);
                 // Hand the CLI session id back so a NAMED session can own it in its own
                 // SessionState, rather than the worker registry inferring it from (agent, cwd).
                 // That inference is what let two named sessions resume each other.
@@ -1185,7 +1193,6 @@ pub(crate) async fn execute_ask_agent(
     //
     // `strict_agent` skips the whole route. The caller asked for THIS seat, so the honest
     // result of an unavailable backend is a failure naming that backend, not codex's answer.
-    let strict_agent = req.strict_agent.unwrap_or(false);
     if strict_agent && matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
         let detail = "strict_agent: degraded route skipped, no other agent or backend may answer";
         lifecycle.push(LifecycleEvent {
@@ -1416,6 +1423,10 @@ pub(crate) async fn execute_ask_agent(
                         shadow_response: None,
                         shadow_error: None,
                         shadow_latency_ms: None,
+                        // A degraded turn is unreachable under strict, so it claims no
+                        // acknowledgement, and the hop named no model.
+                        strict_agent_honored: None,
+                        model: None,
                         // The DEGRADED hop's count, since the degraded hop is what answered.
                         tool_calls_made: Some(tool_calls_made),
                     });
@@ -4004,6 +4015,10 @@ pub(crate) fn attempt_schedule_for(
     agent: &str,
     gemini_backend_selected: Option<GeminiBackend>,
     review: bool,
+    // `strict_agent`: the caller wants the agent it asked for, which means the MODEL it asked
+    // for too. The gemini-cli faildown chain answers as `gemini` on any of four models, and a
+    // jury seat has no way to see which one voted. Under strict there is no chain to hide in.
+    strict: bool,
 ) -> Vec<(Duration, Option<&'static str>)> {
     // A sight-gated review reads files and runs commands, and gets `review_timeout()` for it.
     // It is ONE attempt: three retries of a review that timed out are three more reviews that
@@ -4015,6 +4030,8 @@ pub(crate) fn attempt_schedule_for(
     if agent == "gemini" {
         if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
             vec![(Duration::ZERO, None)]
+        } else if strict {
+            vec![(Duration::ZERO, Some(GEMINI_MODEL_FAILDOWN[0]))]
         } else {
             GEMINI_MODEL_FAILDOWN
                 .iter()
@@ -5131,23 +5148,32 @@ mod deepseek_dispatch_tests {
     fn attempt_schedule_is_single_for_metered_and_context_heavy_agents() {
         use super::attempt_schedule_for;
         // Single attempt: the runner owns its retries, or a retry is genuinely expensive.
-        assert_eq!(attempt_schedule_for("deepseek", None, false).len(), 1,
+        assert_eq!(attempt_schedule_for("deepseek", None, false, false).len(), 1,
             "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)");
-        assert_eq!(attempt_schedule_for("grok", None, false).len(), 1,
+        assert_eq!(attempt_schedule_for("grok", None, false, false).len(), 1,
             "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)");
-        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false).len(), 1,
+        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false, false).len(), 1,
             "agy runs its own internal retry (REQ-013)");
 
         // Everything else keeps the generic ladder. This is the regression guard: adding a
         // single-attempt agent must not silently convert the default.
-        assert_eq!(attempt_schedule_for("codex", None, false).len(), 3);
+        assert_eq!(attempt_schedule_for("codex", None, false, false).len(), 3);
         // A sight-gated review is one attempt for every agent: a review that timed out is
         // not improved by two more, and the first failure would be buried under the last.
         for agent in ["codex", "claude", "gemini", "grok"] {
-            assert_eq!(attempt_schedule_for(agent, None, true).len(), 1, "{agent} review must be one attempt");
+            assert_eq!(attempt_schedule_for(agent, None, true, false).len(), 1, "{agent} review must be one attempt");
         }
-        assert_eq!(attempt_schedule_for("claude", None, false).len(), 3);
-        assert!(attempt_schedule_for("gemini", None, false).len() > 1,
+        assert_eq!(attempt_schedule_for("claude", None, false, false).len(), 3);
+
+        // STRICT pins the model. The gemini-cli chain answers as `gemini` on any of four
+        // models, so a seat that asked for one voter could get a different one and no field
+        // said so (Grok). RED IF: strict keeps the faildown chain.
+        let loose = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, false);
+        assert_eq!(loose.len(), 4, "the chain is still there for ordinary Q&A");
+        let strict = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, true);
+        assert_eq!(strict.len(), 1, "strict is one attempt, no faildown");
+        assert_eq!(strict[0].1, loose[0].1, "and it is the PRIMARY model, not some other one");
+        assert!(attempt_schedule_for("gemini", None, false, false).len() > 1,
             "gemini-cli uses the model faildown chain");
     }
 

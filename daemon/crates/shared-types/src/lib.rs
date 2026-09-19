@@ -453,6 +453,24 @@ pub struct AskAgentResponse {
     pub shadow_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_latency_ms: Option<u64>,
+    /// The daemon ACKNOWLEDGES that it honored `strict_agent` on this turn.
+    ///
+    /// The no-substitution defence used to rest on an absence: no `answered_by_agent` meant the
+    /// asked agent answered. Codex: "absence must be treated as unverifiable." A daemon that
+    /// never heard of `strict_agent` ignores the unknown field, substitutes, and if it also
+    /// omits the provenance fields the vote reads as clean. Silence cannot be the proof.
+    ///
+    /// This is the positive signal. Only a daemon that took the strict path sets it, so a
+    /// caller can tell "verified" from "I cannot tell", which are different answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_agent_honored: Option<bool>,
+    /// Which MODEL produced this answer, when the dispatch chose one.
+    ///
+    /// The gemini-cli backend walks a faildown chain, so `gemini` can answer on any of four
+    /// models and every reply looked identical. A jury could not see which voter it got (Grok).
+    /// `None` means the dispatch named no model, not that the model is unknowable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// How many tool calls the agent made producing this answer. The receipt.
     ///
     /// Always populated, not just when `require_sight` is set, because the count is the
@@ -484,6 +502,8 @@ impl AskAgentResponse {
             shadow_response: None,
             shadow_error: None,
             shadow_latency_ms: None,
+            strict_agent_honored: None,
+            model: None,
             tool_calls_made: None,
         }
     }
