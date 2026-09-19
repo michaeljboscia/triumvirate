@@ -2,6 +2,9 @@
 
 Owner's request, 2026-09-19: "doing wiki checks and injections when the CLIs get called via Triumvirate."
 
+The measurement half is `/Users/michaelboscia/projects/triumvirate/docs/briefs/wiki-usage-measurement-brief.md`.
+Item 4 below is summarised there in full, with the guards and controls it needs; build against that file, not this paragraph.
+
 ## Why the bridge is the right place
 Each peer CLI loads instructions differently, verified today with canary tokens rather than from documentation:
 
