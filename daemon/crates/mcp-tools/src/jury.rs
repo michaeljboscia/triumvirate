@@ -78,9 +78,9 @@ pub fn resolve_outputs(
         if !seats.contains(&canonical) {
             return Err(format!("ask_jury: outputs names '{name}', which is not one of the seats {seats:?}"));
         }
-        // Two seats, one file: each would read as "exists, parses, written this call" on the
-        // strength of the OTHER seat's write, and the later writer erases the earlier vote.
-        if let Some((other, _)) = resolved.iter().find(|(_, p)| *p == path) {
+        // Two seats, one file: each would read as "exists, parses, changed during the call" on
+        // the strength of the OTHER seat's write, and the later writer erases the earlier vote.
+        if let Some((other, _)) = resolved.iter().find(|(_, existing): &(&String, &String)| is_same_file(existing, path)) {
             return Err(format!("ask_jury: the {other} and {canonical} seats are both told to write {path}"));
         }
         if resolved.insert(canonical.clone(), path.clone()).is_some() {
@@ -88,6 +88,42 @@ pub fn resolve_outputs(
         }
     }
     Ok(resolved)
+}
+
+/// Do two paths name one file? Compared by identity, not by spelling.
+///
+/// String equality rejected `/tmp/x` twice and accepted `/tmp/x` beside `/tmp/./x`, which is
+/// the same file and the same collision. Grok found it: the fix had closed the exact input I
+/// had thought of.
+///
+/// `.` and `..` are resolved lexically FIRST, then the parent directory is canonicalized (it
+/// exists; the output file usually does not yet). Canonicalizing first is not an option: a
+/// parent that does not exist falls back to its literal spelling, and on macOS that compares
+/// `/private/tmp` against `/tmp` and calls one file two.
+///
+/// Limit: lexical `..` is not symlink-aware, so two paths through a symlinked directory can be
+/// called the same file. That direction is safe here. It rejects the configuration and says
+/// why, rather than accepting a collision and losing a vote to it.
+fn is_same_file(a: &str, b: &str) -> bool {
+    fn key(p: &str) -> (std::path::PathBuf, Option<std::ffi::OsString>) {
+        use std::path::Component;
+        let mut lexical = std::path::PathBuf::new();
+        for part in Path::new(p).components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !lexical.pop() {
+                        lexical.push("..");
+                    }
+                }
+                other => lexical.push(other),
+            }
+        }
+        let parent = lexical.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        (dir, lexical.file_name().map(|n| n.to_os_string()))
+    }
+    key(a) == key(b)
 }
 
 /// How a verdict is read out of a reply.
@@ -125,17 +161,19 @@ impl VerdictExtractor {
     /// The normalized verdict, or `None` when this reply does not carry one.
     pub fn extract(&self, reply: &str) -> Option<String> {
         let raw = match self {
-            Self::JsonPointer(pointer) => {
-                let value = parse_json_loosely(reply)?;
+            Self::JsonPointer(pointer) => json_objects_in(reply).iter().rev().find_map(|value| {
                 match value.pointer(pointer)? {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    _ => return None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Bool(b) => Some(b.to_string()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
                 }
-            }
+            })?,
+            // The LAST match. A seat that echoes the question back ("you asked for VERDICT:
+            // approve or reject") matches first on the prompt, and the first match would turn
+            // that echo into a vote. The decision comes after the restatement.
             Self::Regex(re) => {
-                let caps = re.captures(reply)?;
+                let caps = re.captures_iter(reply).last()?;
                 caps.get(1).or_else(|| caps.get(0))?.as_str().to_string()
             }
             Self::FirstLine => reply.lines().find(|l| !l.trim().is_empty())?.to_string(),
@@ -154,13 +192,29 @@ pub fn normalize_verdict(raw: &str) -> Option<String> {
     (!collapsed.is_empty()).then_some(collapsed)
 }
 
-/// Strict JSON first, then the outermost object in surrounding prose.
-fn parse_json_loosely(text: &str) -> Option<serde_json::Value> {
-    if let Ok(v) = serde_json::from_str(text.trim()) {
-        return Some(v);
+/// Every JSON object in a reply, in order: the whole reply if it is one, else each object
+/// found by trying to parse from every `{`.
+///
+/// NOT "first brace to last brace". A reply of two objects, thinking then verdict, makes that
+/// span invalid JSON, and a valid vote vanished into a false split. Antigravity found it.
+fn json_objects_in(text: &str) -> Vec<serde_json::Value> {
+    if let Ok(v @ serde_json::Value::Object(_)) = serde_json::from_str(text.trim()) {
+        return vec![v];
     }
-    let (start, end) = (text.find('{')?, text.rfind('}')?);
-    (start < end).then(|| serde_json::from_str(&text[start..=end]).ok()).flatten()
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('{') {
+        let start = from + offset;
+        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(v @ serde_json::Value::Object(_))) => {
+                found.push(v);
+                from = start + stream.byte_offset();
+            }
+            _ => from = start + 1,
+        }
+    }
+    found
 }
 
 /// What an output path looked like BEFORE the seat ran.
@@ -187,8 +241,8 @@ pub fn check_output(path: &str, baseline: &OutputBaseline, expect_json: bool) ->
         check.error = Some("the seat did not write this file".to_string());
         return check;
     }
-    check.written_this_call = &now != baseline;
-    if !check.written_this_call {
+    check.changed_during_call = &now != baseline;
+    if !check.changed_during_call {
         check.error = Some("the file predates this call and was not touched by it".to_string());
     }
     if !expect_json {
@@ -213,8 +267,19 @@ pub fn check_output(path: &str, baseline: &OutputBaseline, expect_json: bool) ->
 
 /// `(format, rows)`. The mneme labelers write `.raw` files holding an array inside prose, which
 /// is why `embedded_json` exists; it is reported as such so a caller can insist on strict JSON.
+///
+/// `rows` counts JSON VALUES. It is not a claim that any of them is a well-formed anything:
+/// `["nonsense","garbage"]` is honestly two rows. A caller that needs structure must check the
+/// structure. What the count does catch is the common case, a seat that wrote nothing, wrote
+/// prose, or wrote fewer rows than it was given parts.
 fn count_json_rows(text: &str) -> Option<(&'static str, u64)> {
-    let rows_of = |v: &serde_json::Value| v.as_array().map_or(1, |a| a.len() as u64);
+    // An empty object is not a row. It parses, and reporting `rows: 1` for it told a caller
+    // that something had been written when the file carried nothing (Antigravity).
+    let rows_of = |v: &serde_json::Value| match v {
+        serde_json::Value::Array(a) => a.len() as u64,
+        serde_json::Value::Object(o) if o.is_empty() => 0,
+        _ => 1,
+    };
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
         return Some(("json", rows_of(&v)));
     }
@@ -344,6 +409,8 @@ pub fn seat_request(req: &AskJuryRequest, agent: &str) -> AskAgentRequest {
         required_sources: req.required_sources.clone(),
         grok_depth: if agent == "grok" { req.grok_depth } else { None },
         strict_agent: Some(true),
+        // Without this the daemon runs the seats one at a time: they share a `cwd`.
+        own_lane: Some(true),
         ..Default::default()
     }
 }
@@ -485,13 +552,45 @@ pub async fn ask_jury(
     }))
 }
 
+/// What a seat's failure reason may become OUTSIDE the caller's response.
+///
+/// `reason` is the daemon's own error text, and the daemon quotes things. A sight-gate
+/// rejection appends the rejected reply verbatim under a marker; a peer-review block quotes the
+/// reviewer. For a labelling jury that reply IS the label, so writing the reason straight into
+/// the outbox and the ledger defeated the rule that only counts leave this tool. Two of those
+/// rejections happened while this very change was under review.
+///
+/// The caller still gets the whole reason in the response: it asked, and it already holds the
+/// brief. The journal gets the first line, cut at the first quoting marker, capped at 200
+/// characters on a char boundary.
+fn journal_reason(reason: &str) -> String {
+    const MARKERS: [&str; 4] = ["--- rejected output", "rejected output, for inspection", "Evidence:", "codex said:"];
+    let mut text = reason;
+    for marker in MARKERS {
+        if let Some(at) = text.find(marker) {
+            text = &text[..at];
+        }
+    }
+    let line = text.lines().next().unwrap_or_default().trim();
+    match line.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line.to_string(),
+    }
+}
+
+/// The outbox line for a seat. A function of its own so a test can assert on the string that
+/// is actually written, rather than on the helper it is supposed to call.
+fn seat_detail(seat: &JurySeat) -> String {
+    match (&seat.reason, &seat.output) {
+        (Some(reason), _) => journal_reason(reason),
+        (None, Some(out)) => format!("output rows={:?} changed_during_call={}", out.rows, out.changed_during_call),
+        (None, None) => format!("answered by {}", seat.answered_by_agent.as_deref().unwrap_or(&seat.agent)),
+    }
+}
+
 /// One outbox line and one PostHog event per seat, as that seat lands.
 fn journal_seat(jury_id: &str, seat: &JurySeat, cwd: &Option<String>) {
-    let detail = match (&seat.reason, &seat.output) {
-        (Some(reason), _) => reason.clone(),
-        (None, Some(out)) => format!("output rows={:?} written_this_call={}", out.rows, out.written_this_call),
-        (None, None) => format!("answered by {}", seat.answered_by_agent.as_deref().unwrap_or(&seat.agent)),
-    };
+    let detail = seat_detail(seat);
     if let Err(e) = fallback_outbox::append_outbox_event(&OutboxEvent {
         ts_ms: daemon_core::unix_time_ms(),
         request_id: jury_id.to_string(),
@@ -529,13 +628,13 @@ fn ledger_record_for(jury_id: &str, run: &JuryRun) -> ManualRecord {
             serde_json::json!({
                 "agent": s.agent,
                 "status": s.status,
-                "reason": s.reason,
+                "reason": s.reason.as_deref().map(journal_reason),
                 "answered_by_agent": s.answered_by_agent,
                 "answered_by_backend": s.answered_by_backend,
                 "request_id": s.request_id,
                 "cast_a_verdict": s.verdict.is_some(),
                 "output_rows": s.output.as_ref().and_then(|o| o.rows),
-                "output_written_this_call": s.output.as_ref().map(|o| o.written_this_call),
+                "output_changed_during_call": s.output.as_ref().map(|o| o.changed_during_call),
             })
         })
         .collect();
@@ -745,6 +844,7 @@ mod tests {
         assert_eq!(seen.len(), 3);
         for r in seen.iter() {
             assert_eq!(r.strict_agent, Some(true), "{} was not dispatched strict", r.agent);
+            assert_eq!(r.own_lane, Some(true), "{} would queue behind the other seats in the daemon", r.agent);
             assert_eq!(r.message, "label part 7");
             assert_eq!(r.require_sight, Some(true), "named sources imply the sight gate");
             assert_eq!(r.required_sources, vec!["/abs/part-7.md".to_string()]);
@@ -813,8 +913,18 @@ mod tests {
         let seats = vec!["codex".to_string(), "gemini".to_string()];
         let typo = BTreeMap::from([("grokk".to_string(), "/tmp/x".to_string())]);
         assert!(resolve_outputs(&typo, &seats).unwrap_err().contains("not one of the seats"));
-        let shared = BTreeMap::from([("codex".to_string(), "/tmp/x".to_string()), ("gemini".to_string(), "/tmp/x".to_string())]);
-        assert!(resolve_outputs(&shared, &seats).unwrap_err().contains("both told to write"));
+        for (a, b) in [
+            ("/tmp/x", "/tmp/x"),
+            // Same file, different spelling. String equality accepted these (Grok).
+            ("/tmp/x", "/tmp/./x"),
+            ("/tmp/x", "/tmp/sub/../x"),
+        ] {
+            let shared = BTreeMap::from([("codex".to_string(), a.to_string()), ("gemini".to_string(), b.to_string())]);
+            let err = resolve_outputs(&shared, &seats).unwrap_err();
+            assert!(err.contains("both told to write"), "{a} vs {b}: {err}");
+        }
+        let distinct = BTreeMap::from([("codex".to_string(), "/tmp/a".to_string()), ("gemini".to_string(), "/tmp/b".to_string())]);
+        assert!(resolve_outputs(&distinct, &seats).is_ok(), "different files are fine");
         let alias = BTreeMap::from([("agy".to_string(), "/tmp/x".to_string())]);
         assert_eq!(resolve_outputs(&alias, &seats).expect("alias").keys().collect::<Vec<_>>(), vec!["gemini"]);
 
@@ -881,6 +991,68 @@ mod tests {
         assert_eq!(ptr.extract(r#"{"label":["a"]}"#), None, "a non-scalar is not a verdict");
     }
 
+    /// ANTIGRAVITY'S FINDINGS on extraction. Each one silently changed a tally.
+    #[test]
+    fn a_reply_cannot_hide_or_fake_a_vote_through_the_extractor() {
+        let mut req = jury(&[]);
+        req.verdict_json_pointer = Some("/verdict".to_string());
+        let ptr = VerdictExtractor::from_request(&req).expect("pointer");
+
+        // Two objects: brace-to-brace spanned them both and parsed as nothing, so a cast vote
+        // vanished and the tally reported a false split.
+        let two = "{\"thinking\":\"weighing it up\"}\n{\"verdict\":\"APPROVE\"}";
+        assert_eq!(ptr.extract(two).as_deref(), Some("approve"), "the vote must survive a preamble object");
+        // The LAST object that carries the pointer wins: a seat that reconsiders votes once.
+        let revised = "{\"verdict\":\"APPROVE\"}\nOn reflection:\n{\"verdict\":\"REJECT\"}";
+        assert_eq!(ptr.extract(revised).as_deref(), Some("reject"));
+        assert_eq!(ptr.extract("{\"thinking\":\"no verdict anywhere\"}"), None);
+
+        // A regex matching the ECHOED PROMPT, which is the false-unanimity shape: every seat
+        // restates the question, so first-match makes every seat vote the same way.
+        req.verdict_json_pointer = None;
+        req.verdict_regex = Some(r"(?i)verdict:\s*(approve|reject)".to_string());
+        let re = VerdictExtractor::from_request(&req).expect("regex");
+        let echo = "You asked for verdict: approve or reject.\nMy answer: VERDICT: Reject";
+        assert_eq!(re.extract(echo).as_deref(), Some("reject"), "the decision follows the restatement");
+    }
+
+    /// The reason a seat failed is the DAEMON'S text, and the daemon quotes what it rejected.
+    /// RED IF: the journal stops trimming it. A rejected reply is a label.
+    #[test]
+    fn a_failure_reason_never_carries_a_quoted_reply_into_the_journal() {
+        let label = "PERSON: Jane Rutherford";
+        let rejection = format!(
+            "Codex was dispatched as a review over 1 named source(s) and never opened it. \
+             Evidence: /work/part-7.md: no tool call named it\n\n\
+             --- rejected output, for inspection, NOT a review ---\n[{{\"n\":1,\"label\":\"{label}\"}}]"
+        );
+        let long = format!("quota exhausted: {}", "x".repeat(500));
+        assert!(journal_reason(&long).chars().count() <= 204, "bounded");
+
+        let first = VerdictExtractor::FirstLine;
+        let seat = classify_seat("grok", SeatOutcome::Failed(rejection.clone()), 1, &first);
+        // The CALLER still gets the whole thing: it asked, and it already holds the brief.
+        assert_eq!(seat.reason.as_deref(), Some(rejection.as_str()));
+
+        // THE TWO PAYLOADS THAT LEAVE, asserted on the real strings. Asserting on
+        // `journal_reason` alone left both call sites free to drop it: two mutants that
+        // wrote the reason verbatim to the outbox and the ledger both survived.
+        let outbox = seat_detail(&seat);
+        let run = JuryRun {
+            tally: tally(3, &BTreeMap::from([("grok".to_string(), seat)]), "first_line"),
+            seats: BTreeMap::from([("grok".to_string(), classify_seat("grok", SeatOutcome::Failed(rejection.clone()), 1, &first))]),
+        };
+        let record = ledger_record_for("jury-test", &run);
+        let ledger = serde_json::to_string(&record).expect("record serializes");
+        for (surface, text) in [("outbox detail", &outbox), ("ledger record", &ledger)] {
+            assert!(!text.contains(label), "{surface} carried the label: {text}");
+            assert!(!text.contains("rejected output"), "{surface} carried the quoting marker: {text}");
+            assert!(!text.contains("Evidence:"), "{surface} carried the evidence block: {text}");
+        }
+        assert!(outbox.starts_with("Codex was dispatched"), "the cause itself survives: {outbox}");
+        assert!(ledger.contains("Codex was dispatched"), "the ledger keeps the cause: {ledger}");
+    }
+
     /// BRIEF ACCEPTANCE 3: a resolver can consume the result from counts alone.
     /// RED IF: a file left over from an earlier run passes as this call's output.
     #[test]
@@ -891,7 +1063,7 @@ mod tests {
         let secret = "SECRET-LABEL-TEXT";
 
         let missing = check_output(&path("missing.json"), &OutputBaseline::default(), true);
-        assert!(!missing.exists && !missing.written_this_call && missing.error.is_some());
+        assert!(!missing.exists && !missing.changed_during_call && missing.error.is_some());
 
         for (name, body, format, rows) in [
             ("a.json", format!(r#"[{{"n":1,"label":"{secret}"}},{{"n":2,"label":"NONE"}}]"#), "json", 2),
@@ -903,15 +1075,23 @@ mod tests {
             std::fs::write(&p, body).expect("write");
             let check = check_output(&p, &before, true);
             assert_eq!((check.format.as_deref(), check.rows), (Some(format), Some(rows)), "{name}");
-            assert!(check.written_this_call && check.error.is_none(), "{name}: {check:?}");
+            assert!(check.changed_during_call && check.error.is_none(), "{name}: {check:?}");
             assert!(!serde_json::to_string(&check).expect("json").contains(secret), "{name} leaked a label");
         }
 
         let stale = path("a.json");
         let before = output_baseline(Path::new(&stale));
         let check = check_output(&stale, &before, true);
-        assert!(check.exists && !check.written_this_call, "an untouched file is not this call's work");
+        assert!(check.exists && !check.changed_during_call, "an untouched file is not this call's work");
         assert!(check.error.as_deref().unwrap_or_default().contains("predates"));
+
+        // `{}` parses and used to report one row, telling a caller something had been written.
+        for (name, body) in [("empty.json", "{}"), ("empty-arr.json", "[]")] {
+            let p = path(name);
+            std::fs::write(&p, body).expect("write");
+            let check = check_output(&p, &OutputBaseline::default(), true);
+            assert_eq!(check.rows, Some(0), "{name} carries nothing: {check:?}");
+        }
 
         let junk = path("junk.raw");
         std::fs::write(&junk, "I could not complete the task.").expect("write");

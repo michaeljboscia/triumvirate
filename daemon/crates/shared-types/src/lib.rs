@@ -171,6 +171,19 @@ pub struct AskAgentRequest {
     /// caller's decision. `ask_jury` always sets it. `None`/`false` keeps today's behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_agent: Option<bool>,
+
+    /// Queue this call on its AGENT's lane within the project, not the project's single lane.
+    ///
+    /// The daemon runs one `ask_agent` at a time per project, to keep ordering predictable
+    /// for concurrent bridges. A jury sends every seat with the same `cwd`, so its "parallel"
+    /// seats ran one after another, and the last seat's timeout was spent waiting in the queue
+    /// behind the others. Found in review, in a draft the sight gate rejected.
+    ///
+    /// A bool and not a free-form lane name on purpose: the queue registry is never pruned,
+    /// so a caller-chosen key would leak an entry per call. Lanes are bounded by the agent
+    /// list, and two calls to the SAME agent in one project still run one at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_lane: Option<bool>,
 }
 
 /// One brief, N seats, no substitution. See `docs/briefs/ask-jury-brief.md`.
@@ -218,9 +231,14 @@ pub struct AskJuryRequest {
 pub struct JuryOutputCheck {
     pub path: String,
     pub exists: bool,
-    /// False when the file was already there and this call did not touch it. A leftover from
-    /// an earlier run exists and parses, and says nothing about this seat.
-    pub written_this_call: bool,
+    /// The file changed while this call ran. It does NOT prove THIS seat changed it.
+    ///
+    /// Named `written_this_call` at first, which claimed the stronger thing. All seats share a
+    /// `cwd`, so seat A can touch seat B's path and B's check would pass on A's write
+    /// (Antigravity). What this does catch, and what it is for, is the common case: a file left
+    /// behind by an earlier run, which exists and parses and says nothing about this one.
+    /// Blindness between seats is the caller's to arrange.
+    pub changed_during_call: bool,
     /// `json`, `jsonl`, or `embedded_json` (an array or object inside surrounding prose).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,

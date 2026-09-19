@@ -265,13 +265,16 @@ quota exit that runner called `agy_breaker_record_quota`, and its retry called
 still counted, so every third probe re-tripped and doubled the cooldown. Past the cooldown, the
 probe's retry claimed the single half-open slot, failed as the half-open probe, and re-tripped:
 with a 120s base cooldown and a 300s interval that is EVERY probe. A healthy probe closed
-nothing, because only `execute_ask_agent` calls `record_success`. This is why the 2026-09-19
+nothing: the scheduled health probe never calls `record_success` (request traffic does, in
+`execute_ask_agent` and the fleet orchestrator). This is why the 2026-09-19
 quota reset did not close the breaker.
 The first fix (a failure while Open is ignored) closed only the first ratchet and was written
 up here as done. Grok's review found the second. The fix that closes the class is
 `agy::BreakerRole`: the health probe, `breaker_probe`, `doctor_probe` and shadow-compare run
-as `Observer` and never read or write the breaker. `breaker_probe` (MCP tool,
-`POST /agy/breaker/probe`) closes it on demand, and only on the exact expected answer.
+as `Observer`, so the shared runner never reads or writes the breaker on their behalf. The one
+deliberate exception is in the caller, not the runner: `breaker_probe` (MCP tool,
+`POST /agy/breaker/probe`) takes a read-only snapshot and calls `record_success`, and only on
+the exact expected answer.
 Check passed: `probe_03` (breaker past its cooldown, five failed probes, `open_count` and
 phase unmoved) is RED with the probe dispatched as Traffic and green as Observer. `probe_04`
 (a quota sentence on a zero exit) is RED when any non-empty reply closes. Unit:
