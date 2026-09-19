@@ -17,10 +17,10 @@ Read first, because both carry numbers and lessons this brief depends on:
 | Claude | `@` import in `/Users/michaelboscia/.claude/CLAUDE.md` | yes, `state/deploy.json` in the mneme repo | yes, nightly scan of both transcript trees |
 | Codex | managed block in `/Users/michaelboscia/.codex/AGENTS.md` | no | no |
 | Gemini, via the Antigravity CLI | managed block in `/Users/michaelboscia/.gemini/GEMINI.md` | no | no |
-| Grok | nothing reaches it | no | no |
+| Grok | `/Users/michaelboscia/.grok/rules/bosciamem-wiki.md`, a global user rule, since 2026-09-19 15:47 UTC | yes, `state/deploy.json` in the mneme repo | no |
 
-Three of the four Primes are instrumented for neither delivery nor effect, and none of the three
-leaves a transcript on this machine. The bridge is the only place that can see either side of those
+All four Primes now receive the map from files. Three of them are measured for neither use nor effect,
+and none of the three leaves a transcript on this machine. The bridge is the only place that can see either side of those
 exchanges, which is why this work belongs here and not in the mneme repo.
 
 ## Verified seams
@@ -69,10 +69,10 @@ and needs three guards.
 
 ## Two free controls that should be used before writing any Rust
 
-**Grok is a true negative control today.** It receives no map, from any route. Run the detector over
-whatever response history exists and over a handful of live Grok calls. It must return zero. If it
-fires on Grok before injection, the detector is wrong and the number it would have produced later
-would have been noise reported as signal.
+**Grok's history before 2026-09-19 15:47 UTC is a true negative control.** Until then it received no map
+from any route. Run the detector over Grok responses from before that time: it must return zero. If it
+fires there, the detector is wrong. Live Grok calls are no longer a negative control, because Grok now
+loads the map from its global rules folder.
 
 **The instruction files have a known start date.** Codex and Gemini have carried the map since
 2026-09-19 14:23 UTC. Calls before that are the coincidence floor for those two seats, in the same
@@ -149,7 +149,7 @@ database.
 
 - One event per call reaches the ledger the daemon actually opened, proven by reading it back, with the database path named in the run output.
 - The reader finds all 13 ledgers and says how many it found, and does not treat an empty events table as evidence of anything without checking sqlite_sequence and the 30 day retention rule.
-- The detector returns zero on Grok before injection is switched on.
+- The detector returns zero on Grok responses from before 2026-09-19 15:47 UTC.
 - A response that recites the map is labelled `recitation` and does not appear in the use numerator.
 - A degraded call is keyed to the seat that answered and is excluded from both seats' rates.
 - A map older than `wiki.max_age_days` is not injected, and the event records `skip_reason: stale`.

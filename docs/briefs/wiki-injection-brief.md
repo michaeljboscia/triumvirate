@@ -1,5 +1,15 @@
 # Brief: inject the bosciamem wiki map into peer calls, and check whether it was used
 
+> **SUPERSEDED FOR GROK, 2026-09-19 15:47 UTC.** Grok now receives the map from
+> `/Users/michaelboscia/.grok/rules/bosciamem-wiki.md`, which grok 1.0.30 loads as a global user rule.
+> Verified through this bridge: `ask_agent` grok, request `bd869ac0-af28-4479-bb4b-add17c77a4f1`, answered
+> the page count and top page with zero tool calls. The canary below was wrong because it tested files
+> Grok does not load under this config. **Do not build injection for Grok: it would put the map in twice.**
+> All four seats are now reached by files, so nothing in this brief is needed for delivery. The measurement
+> half is still needed; see `wiki-usage-measurement-brief.md`. Evidence:
+> `/Users/michaelboscia/projects/mneme-bosciamem/research/2026-09-19-grok-rules-delivery.md`.
+
+
 Owner's request, 2026-09-19: "doing wiki checks and injections when the CLIs get called via Triumvirate."
 
 The measurement half is `/Users/michaelboscia/projects/triumvirate/docs/briefs/wiki-usage-measurement-brief.md`.
