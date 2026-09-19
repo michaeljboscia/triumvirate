@@ -128,6 +128,7 @@ use uuid::Uuid;
 
 mod agent_exec;
 mod wiki_usage;
+mod wiki_search;
 mod blind_validate;
 mod agy;
 mod streaming;
@@ -166,6 +167,42 @@ enum CliCommand {
     Proxy,
     /// Watch live agent streaming events.
     Watch(watch::WatchArgs),
+}
+
+/// Append one line per `wiki_search` call to `~/.triumvirate/wiki-search.jsonl`.
+///
+/// The bridge already records a peer's tool calls, but only as that peer's parser reports them.
+/// This is the server's own count, which no parser can be blind to. Term COUNT and result page
+/// ids only: the query is the caller's words and is not stored, the same rule the ledger event
+/// follows.
+pub(crate) fn wiki_search_journal(terms: &[String], hits: &[crate::wiki_search::PageHit]) {
+    let Some(home) = std::env::var_os("TRIUMVIRATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".triumvirate")))
+    else {
+        return;
+    };
+    let row = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "terms": terms.len(),
+        "pages": hits.iter().map(|h| h.page.clone()).collect::<Vec<_>>(),
+        "lines": hits.iter().map(|h| h.lines.len()).sum::<usize>(),
+    });
+    // Loud on failure. The first live peer call left no journal row and no error anywhere,
+    // because this function swallowed both. A silent recorder reports zero use forever.
+    let path = home.join("wiki-search.jsonl");
+    let wrote = std::fs::create_dir_all(&home).and_then(|()| {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(f, "{row}")
+    });
+    if let Err(e) = wrote {
+        tracing::warn!(
+            journal = %path.display(),
+            error = %e,
+            "wiki_search journal NOT written; this search is missing from the server-side count"
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +570,38 @@ impl McpBridge {
     #[tool(description = "Health check tool for MCP connectivity")]
     async fn ping(&self) -> String {
         "pong".to_string()
+    }
+
+    /// The tool the ceiling probes said to build.
+    ///
+    /// Peers do not read wiki pages: they `grep` the wiki directory and answer from the output
+    /// (Grok, six of six hinted probes, zero pages opened, 2026-09-19). The description below is
+    /// the part that decides whether it gets called at all, so it says WHEN to call it, not what
+    /// it is. Grounded search on this on the same day was weakly sourced and is not cited as
+    /// evidence, but its one durable pattern agrees with the probes: retrieval gets used when it
+    /// is a tool whose description names its trigger.
+    #[tool(
+        description = "Search Mike's knowledge base: standing rules, conventions, infrastructure                        facts (hosts, ports, addresses), past decisions and hard-won lessons.                        CALL THIS FIRST, before answering anything about how things are done                        here, what a host/port/setting/convention is, or why something was                        decided, and before saying you do not know. Do NOT grep or ls the wiki                        directory: this searches every page for you and returns the matching                        lines with their page ids. Query with the words you would expect on the                        page, e.g. `langfuse port homebox`."
+    )]
+    #[tracing::instrument(skip_all, name = "mcp_wiki_search")]
+    async fn wiki_search(
+        &self,
+        Parameters(req): Parameters<shared_types::WikiSearchParams>,
+    ) -> Result<String, String> {
+        let dir = crate::wiki_usage::wiki_dir()?;
+        let wiki = crate::wiki_usage::load_wiki(&dir)?;
+        let terms = crate::wiki_search::terms(&req.query);
+        let hits = crate::wiki_search::search(
+            &wiki.dir,
+            &wiki.pages,
+            &req.query,
+            req.max_pages.unwrap_or(3).clamp(1, 10) as usize,
+            8,
+        );
+        // The server's own record of every search, independent of whatever the calling peer's
+        // parser reports. Page ids and counts, never the query text.
+        crate::wiki_search_journal(&terms, &hits);
+        Ok(crate::wiki_search::render(&wiki.dir, &hits, &terms))
     }
 
     #[tool(
@@ -4269,12 +4338,14 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(ev["wiki"]["pages"], 3);
         assert_eq!(ev["wiki"]["generated"], "2026-09-19");
         assert_eq!(ev["harness"], "cargo-test", "a test-suite call must say so: {ev}");
+        // Names only, so a tool call the wiki filter did not match can still be seen from here.
+        assert_eq!(ev["tools"], serde_json::json!({"command_execution": 2}), "{ev}");
         // The read AND the search of the wiki both count here; only the read names a page.
         assert_eq!(
             ev["wiki_tool_calls"],
             serde_json::json!([
-                {"kind": "read_file", "pages": ["alpha-page"], "index": false},
-                {"kind": "bash", "pages": [], "index": false},
+                {"tool": "command_execution", "kind": "read_file", "pages": ["alpha-page"], "index": false, "wiki_search": false},
+                {"tool": "command_execution", "kind": "bash", "pages": [], "index": false, "wiki_search": false},
             ]),
             "{ev}"
         );

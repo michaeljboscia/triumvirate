@@ -57,6 +57,8 @@ CASES_A = [
     ("path near miss", AFTER, ev(text_ids=[])),
     ("opened a page", AFTER, ev(opened=["verify-by-reading-back"])),
     ("searched the wiki, opened no page", AFTER, ev(wiki_calls=[{"kind": "grep", "pages": [], "index": False}])),
+    ("used the wiki_search tool", AFTER, ev(wiki_calls=[{"tool": "triumvirate__wiki_search", "kind": "unknown",
+                                                         "pages": [], "index": False, "wiki_search": True}])),
     ("legacy event, no wiki_tool_calls field", AFTER, ev(legacy=True)),
     ("recited map", AFTER, ev(text_ids=IDS)),
     ("degraded", AFTER, ev(agent="gemini", answered_by_agent="codex", degraded_from_backend="agy")),
@@ -139,12 +141,13 @@ def main() -> int:
     g = summary["groups"]
     x = summary["excluded"]
     codex = g.get(("codex", "delivered", "ask"), {})
-    check("codex calls in population", codex.get("calls"), 5)
-    check("codex consulted: the page open and the search, not the legacy row", codex.get("consulted"), 2)
-    check("a legacy row is not observable, so it is not a zero", codex.get("consult_observable"), 4)
+    check("codex calls in population", codex.get("calls"), 6)
+    check("codex consulted: the page open, the grep and the wiki_search call", codex.get("consulted"), 3)
+    check("only the wiki_search call counts as via_search", codex.get("via_search"), 1)
+    check("a legacy row is not observable, so it is not a zero", codex.get("consult_observable"), 5)
     check("codex text-cited calls (clean citation only; path near miss is not)", codex.get("text_cited"), 1)
     check("codex opened a page", codex.get("opened_any"), 1)
-    check("codex opens observable", codex.get("opens_observable"), 5)
+    check("codex opens observable", codex.get("opens_observable"), 6)
     check("recitation held apart", x.get(("codex", "recitation")), 1)
     check("degraded keyed to the seat that answered", x.get(("codex", "degraded")), 1)
     check("degraded never credited to the asked seat", any(k[0] == "gemini" for k in list(g) + list(x)), False)
@@ -171,17 +174,17 @@ def main() -> int:
     check("unhinted probe consulted nothing", ceil.get(("codex", "unhinted"), {}).get("consulted"), 0)
     rates = summary["rates"]
     check("codex instrument proven", rates["codex"]["proven"], True)
-    check("codex rate is consults over observable delivered calls", (rates["codex"]["k"], rates["codex"]["n"]), (2, 4))
-    check("page opens still reported alongside", (rates["codex"]["opened_k"], rates["codex"]["opened_n"]), (1, 5))
+    check("codex rate is consults over observable delivered calls", (rates["codex"]["k"], rates["codex"]["n"]), (3, 5))
+    check("page opens still reported alongside", (rates["codex"]["opened_k"], rates["codex"]["opened_n"]), (1, 6))
     check("grok's hinted probe never touched the wiki, so no rate", rates["grok"]["proven"], False)
     check("grok hinted probe recorded as not consulting", summary["ceiling"].get(("grok", "hinted"), {}).get("consulted"), 0)
     check("unproven seat shown as not published", "| grok | NO |" in text and "not published" in text, True)
-    check("a published rate carries an interval", "| codex | yes | 2/4 | 50.0% |" in text, True)
+    check("a published rate carries an interval", "| codex | yes | 3/5 | 60.0% |" in text, True)
     check("banner only when nothing is published", "NO RATE IS PUBLISHED" in text, False)
     check("with no probes, no seat is proven", any(v["proven"] for v in bare_summary["rates"].values()), False)
     check("with no probes, the banner says so", "NO RATE IS PUBLISHED" in bare_text, True)
-    lo, hi = r.wilson(2, 4)
-    check("wilson interval sane", (round(lo, 3), round(hi, 3)), (0.15, 0.85))
+    lo, hi = r.wilson(3, 5)
+    check("wilson interval sane", (round(lo, 3), round(hi, 3)), (0.231, 0.882))
 
     # Zero counts are the failure this fixture exists for.
     zeros = [k for k, v in {**{str(k): v for k, v in x.items()}}.items() if not v]
