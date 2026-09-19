@@ -173,6 +173,8 @@ of the fix.
 | **Mandatory peer review** | `TRIUMVIRATE_REQUIRE_PEER_REVIEW=1` dispatches a real reviewer and blocks the turn on REJECT or on an unreadable verdict. | It used to write "approved" to a database row and dispatch nothing. It was a rubber stamp that had never reviewed anything. |
 | **Proof of read** | The artifact is written to disk with a daemon-minted nonce on the last line, and is NOT pasted into the prompt. The reviewer must return the nonce. | A reviewer that reads only the first lines cannot produce it. |
 | **Verdict authority** | An `approve` requires the review row to be `in_progress` and the submitter to be the assigned reviewer. A review the daemon is conducting is not writable by any client. | Naming the assigned reviewer in a request body is a claim, not an identity. |
+| **No substitution** | `ask_agent` with `strict_agent`, and every `ask_jury` seat, fails rather than letting another agent or backend answer for the one that was asked. A reply that something else produced is returned as `invalid` with its text withheld. | On 2026-09-19 a 98-part labelling jury ran with three blind seats. The Antigravity seat hit its quota, the bridge degraded it to Codex exactly as it is built to for Q&A, and returned success. For a vote that is silent corruption: "unanimous" would have been Codex agreeing with itself. Graceful degradation is right for an answer and wrong for a ballot. |
+| **Jury tally** | `ask_jury` puts one brief to several agents and reports the outcome against seats REQUESTED, so a jury that lost a seat cannot read as more agreed than it is. `unanimous` needs every requested seat. | Two of three agreeing is a majority. Calling it unanimity is how a lost seat disappears from the result. |
 | **Blind validation** | A DIFFERENT agent writes tests from the contract, in a directory that does not contain the implementation, and they are run against both the worktree and the pre-change tree. | Every other gate proves a reviewer LOOKED. None proves it JUDGED. On code you can: the tests run, and the answer is an exit code rather than an opinion. |
 
 Blind validation states its own limit rather than overselling it: it catches a tautology written
@@ -202,8 +204,8 @@ Full installer for multi-agent development:
 ```
 triumvirate-daemon (single Rust binary, 13 crates)
 │
-├── MCP Server (rmcp): 56 tools
-│   Sessions, ABE dispatch, fleet, knowledge, review, blind validation, tokens
+├── MCP Server (rmcp): 58 tools
+│   Sessions, ABE dispatch, fleet, knowledge, review, blind validation, jury, tokens
 │
 ├── HTTP API (axum): REST + Prometheus + WebSocket
 │   Same tools as REST endpoints, plus /metrics, /ws, /api/tokens/*
