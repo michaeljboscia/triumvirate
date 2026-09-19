@@ -256,6 +256,31 @@ which repo's ledger to open.
 project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
 **Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
 
+### D-017 - the sight gate discards codex reviews that did read the sources
+**Found:** 2026-09-19 · **Severity:** HIGH · **Partially fixed 2026-09-19, NOT closed**
+**Evidence:** on the first live `ask_jury` run, codex read a 97-line brief with
+`wc -l F && sed -n '1,240p' F`, which shows every line, and the gate rejected the turn as
+"never successfully opened". Its answer was correct and was thrown away. On the second run,
+after the fix below, codex was rejected again with
+`sed -n '1,240p' OTHER.md && sed -n '1,320p' BRIEF.md`.
+**FIXED so far:** both read parsers refused any command containing `&&`, which is what closed
+the D-010 decoy attacks. That refusal is right about the attacks and wrong about a chain, where
+each link is its own command. `agent-adapter::codex::and_chain_segments` splits on `&&` only,
+honoring quotes, consumed at all five gate sites through plural
+`whole_file_read_operands` / `command_read_ranges`. `;` and `||` mask a failed read and stay
+refused whole, as does an unterminated quote, which is a parse error that runs nothing.
+`command_reads_whole_file` is per-segment too: it took the FIRST token as the program, so
+`wc -l F && cat F` was a "partial" read of a command that cats the file.
+**STILL OPEN:** the exact two-file chain above passes as a unit test and was still rejected
+live. Either the live command differs from that reconstruction in a way the receipt hid, or
+there is a second cause. The receipt truncated the command at 160 characters, below the length
+of a real one, so it could not be diagnosed; that is fixed separately (it now reports the
+operand and window each read bound to), and the next live rejection should say which.
+**Do not close on the unit tests.** They pass now and the live path does not.
+**Check:** run a sight-gated `ask_jury` over a source and confirm the codex seat ANSWERS.
+**Note, separate from this defect:** codex sometimes returns zero tool calls because it opens
+by asking whether to use Pythia. That rejection is correct and is not evidence about D-017.
+
 ### D-018 - a PostHog quota rejection is dropped without a single log line
 **Found:** 2026-09-19 · **Severity:** MEDIUM (was HIGH before the cause was known)
 **Cause: KNOWN, not a Triumvirate bug.** The PostHog account has been out of quota for several
@@ -278,51 +303,6 @@ quota is restored.
 
 
 ## Closed
-
-### 2026-09-19: the sight gate rejected a whole-file read that shared an `&&` chain
-On the first live `ask_jury` run, codex read a 97-line brief with
-`wc -l F && sed -n '1,240p' F`, which shows every line, and the gate threw the turn away as
-"never successfully opened". Its answer was correct and was lost, and two of three jury seats
-were lost that run without a single disagreement between them. Both read parsers refused any
-command containing `&&`, which is what closed the D-010 decoy attacks; the refusal was right
-about the attacks and wrong about the chain.
-Fixed in `agent-adapter::codex::and_chain_segments` plus plural `whole_file_read_operands` /
-`command_read_ranges`, consumed at all five gate sites. Splitting is on `&&` ONLY: the gate
-counts a call only when it reported success, and an `&&` chain exits zero only if every link
-ran, so each link's read really happened. `;` and `||` mask a failed read and stay refused
-whole, as does an unterminated quote, which is a parse error that runs nothing. Every segment
-still goes through the unchanged strict parser, so no D-010 shape survives the split.
-Check passed: `d017_a_whole_file_read_still_counts_when_it_shares_an_and_chain` (5 chain
-shapes, including a file walked in two windows across the chain) and
-`d017_the_and_chain_split_reopens_nothing` (8 controls: a peek in a chain, half a file, a
-redirect, a comment, a `;` chain, an `||` chain, a filename that is only echoed, and an
-unterminated quote). All 95 agent-adapter and 44 gate tests still pass. Mutation checked:
-splitting on `;`/`&`, and splitting an unterminated quote, each turn the controls red.
-
-
-### 2026-09-19: the agy health probe ratcheted an open breaker to the five hour cap
-The 300s health probe shares `run_agy_cli_process_with_session` with request traffic. On a
-quota exit that runner called `agy_breaker_record_quota`, and its retry called
-`agy_breaker_should_skip`, which mutates. Two ratchets came out of that. While Open, failures
-still counted, so every third probe re-tripped and doubled the cooldown. Past the cooldown, the
-probe's retry claimed the single half-open slot, failed as the half-open probe, and re-tripped:
-with a 120s base cooldown and a 300s interval that is EVERY probe. A healthy probe closed
-nothing: the scheduled health probe never calls `record_success` (request traffic does, in
-`execute_ask_agent` and the fleet orchestrator). This is why the 2026-09-19
-quota reset did not close the breaker.
-The first fix (a failure while Open is ignored) closed only the first ratchet and was written
-up here as done. Grok's review found the second. The fix that closes the class is
-`agy::BreakerRole`: the health probe, `breaker_probe`, `doctor_probe` and shadow-compare run
-as `Observer`, so the shared runner never reads or writes the breaker on their behalf. The one
-deliberate exception is in the caller, not the runner: `breaker_probe` (MCP tool,
-`POST /agy/breaker/probe`) takes a read-only snapshot and calls `record_success`, and only on
-the exact expected answer.
-Check passed: `probe_03` (breaker past its cooldown, five failed probes, `open_count` and
-phase unmoved) is RED with the probe dispatched as Traffic and green as Observer. `probe_04`
-(a quota sentence on a zero exit) is RED when any non-empty reply closes. Unit:
-`failures_while_open_never_extend_the_cooldown`.
-NOT done, owner's call: the scheduled health probe still does not CLOSE the breaker on
-success. Its comment says it stays away from request traffic on purpose.
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"
 The codex read classifier allowed `cat`/`head`/`nl`; codex-cli 0.145.0 reads files as
