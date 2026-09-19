@@ -144,18 +144,6 @@ the "fix lands on one surface" shape again, with a test that certifies half the 
 runs every builder's output through `codex <args> --help` on the installed binary.
 **Check:** temporarily push a bogus flag into the consult or fleet argv; `cargo test` must fail.
 
-### D-014 - agy quota detectors over-match glog noise
-**Found:** 2026-09-13 (Grok, review of recovery step 4) · **Severity:** LOW
-**Evidence:** `classify_failure_message` matches any "429" (glog thread ids hit it,
-`conversation_manager.go` 2026-08-20) and any "quota" (`doRefreshQuota`,
-`retrieveUserQuotaSummary` health lines classify as capacity/quota). `quota_signal_in_line` is
-the narrower detector and still shares the "429" substring. A false quota classification now
-also triggers the step 4 backoff and feeds the breaker.
-**Why it matters:** a benign log line can back off a healthy call by 60s and nudge the breaker.
-**Fix shape:** anchor "429" to `code 429` / `HTTP 429` / `(429)` and "quota" to
-`RESOURCE_EXHAUSTED` / `quota exceeded` / `capacity`; add the two glog lines as negative fixtures.
-**Check:** the 2026-08-20 thread-id line and a `doRefreshQuota` line classify AuthOrExec.
-
 ### D-015 - fleet task ids collide across fleets in the same repo
 **Found:** 2026-09-13 (audit) · **Severity:** MEDIUM
 **Evidence:** `tasks.task_id` is the PRIMARY KEY of the ledger's tasks table and the
@@ -220,6 +208,26 @@ landing and cannot be until quota is restored. It is written and unverified.
 
 
 ## Closed
+
+### 2026-09-19: agy quota detectors matched benign glog noise (D-014)
+`classify_failure_message` matched ANY occurrence of `429` and ANY occurrence of `quota`, so a
+glog thread id containing `429` and a health line containing `doRefreshQuota` both classified
+as capacity/quota. A false quota is not free: it triggers the retry backoff AND feeds the
+circuit breaker, so benign log noise could back off a healthy call and nudge the breaker
+toward shedding real traffic.
+
+Fixed by a Codex worker in an isolated worktree (task `d014-agy-quota-anchors`, commit
+22db81d, cherry-picked as 58766d2). Both detectors now go through
+`contains_anchored_phrase`, which requires the match not to be embedded in an identifier or a
+longer numeric token, over the markers `RESOURCE_EXHAUSTED`, `quota exceeded`, `code 429`,
+`HTTP 429`, `(429)` and `capacity`.
+
+**CHECK PASSED:** `quota_detectors_ignore_benign_glog_tokens` classifies the real 2026-08-20
+thread-id line and a `doRefreshQuota` line as `AuthOrExec`, and
+`quota_detectors_preserve_anchored_positive_signals` keeps every real quota form classifying
+as `Quota`. Verified independently of the worker's own report: I ran both tests, then reverted
+the anchoring by hand and confirmed the negative test goes red.
+
 
 ### 2026-09-19: the daemon had no shutdown path at all (D-001)
 Fourteen months of `tv_daemon_started` with no matching stop, because `axum::serve` was called
