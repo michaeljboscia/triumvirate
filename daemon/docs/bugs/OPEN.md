@@ -19,207 +19,145 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-### D-001 — The daemon has no shutdown event
-**Found:** 2026-07-28 · **Severity:** HIGH
-**Evidence:** `tv_daemon_started` fired 14 times in 30 days. There is no corresponding stop
-event. Two SIGTERMs sent on 2026-07-28 (22:08, 22:29 EDT) produced no record at all.
-**Why it matters:** a daemon that ends is visible only later, by the absence of traffic. A
-crash and a clean restart are the same evidence. This is the specific case the defect
-dashboard was built to catch, and it catches nothing because nothing is emitted.
-**Check:** kill the daemon, then find an event or log line naming the shutdown and its cause.
-**RE-CHECKED 2026-09-19, STILL OPEN:** the daemon was SIGTERMed and restarted four times
-during the ask_jury work. `grep -icE 'shutdown|sigterm|stopping|graceful'` over the log:
-**zero**. Fourteen months of births, no deaths, and four more today.
-**Tile:** "Daemon restarts — births with no recorded deaths" (dashboard 1886865).
+### D-004 - Failed generations carry no error text
+**Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
+**Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried
+`tv_outcome` and nothing else; `$ai_error` did not exist in this project's taxonomy. The outcome
+half was resolved 2026-08-07 (`cancelled` instead of `unreported`).
+**What was actually wrong (found 2026-09-19):** the cause WAS captured. `CallTelemetry::failure`
+stored it in `self.detail`, and it was then sent only to a separate `$exception` event: the
+`AiGeneration` struct had no field for it, so the generation itself said "error" and never said
+what. An existing test claimed "the rejection is inspectable in the generation" and asserted
+`t.detail.is_some()`, which checked the holder and passed while the event never carried it.
+**Fixed:** `AiGeneration` carries `error`, emitted as PostHog's documented `$ai_error` ("the error
+message or object", confirmed against posthog.com/docs/ai-observability/generations) on every
+error outcome, and as `tv_detail` whenever present. BY CONSTRUCTION an event marked
+`$ai_is_error: true` now always carries a non-empty `$ai_error`: a caller-side cancel or an
+unclassified exit says so in words rather than shipping silence. Covered on BOTH surfaces that
+emit failed generations, the telemetry guard and `record_dispatch_generation`; fixing only the
+first would have left every failed dispatch causeless. The misleading test now asserts on the
+emitted payload. Removing the fallback cause turns `every_error_generation_carries_a_non_empty_cause` red.
+**Why it is not closed:** the check is "a failed generation IN POSTHOG carries a cause string",
+and nothing lands in PostHog while the account is over quota (D-018 measured it). The payload
+is proven; its arrival is not, and closing on the payload would be closing on reasoning.
+**Unblocks:** 2026-09-20 14:03 ET.
+**Check:** with `/health` reporting `telemetry_delivery: trusted`, force one failed dispatch and
+find its `$ai_error` in PostHog.
 
-### D-002 — OTLP export failures ship with an empty body
-**Found:** 2026-07-28 · **Severity:** HIGH
-**Evidence:** `BatchLogProcessor.ExportError` rows in PostHog carry `body: ""`. The cause
-(`dns error: failed to lookup address information`, `TimedOut`) exists in `fields.error` in
-`~/.triumvirate/daemon.log` and does not survive into PostHog.
-**Why it matters:** the one signal that tells you telemetry is broken arrives carrying no
-information about how it is broken.
-**Check:** trigger an export failure (block DNS to us.i.posthog.com), confirm the PostHog row
-carries the cause string.
-**RE-CHECKED 2026-09-19, STILL OPEN, and it is not rare:** today's log holds **4,266**
-`BatchLogProcessor.ExportError` lines. The newest still carries `body: ""`, with the cause
-(`url: ".../i/v1/logs", source: TimedOut`) only in `fields.error`, exactly as first recorded
-on 2026-07-28. Whatever volume was needed to make this worth fixing, it has arrived.
+### D-005 - Instrumentation streams gone silent, cause unknown
+**Found:** 2026-07-28 · **Severity:** LOW · **Blocked on an external reset, NOT fixed**
+**Remaining streams:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`,
+`tv_maintenance`. (`tv_codex_dispatch` was shown healthy on 2026-08-02.)
+**What changed 2026-09-19:** this row could never be resolved because nothing could tell "path
+idle" from "emitter broken". That question now has an instrument. The delivery round trip
+(`mcp_bridge::telemetry_delivery`, D-018) reports whether events are arriving AT ALL, so a
+quiet stream is interpretable: while `/health` says `telemetry_delivery: untrusted`, no stream's
+silence means anything; while it says `trusted`, a silent stream is an idle path.
+**Why it is still open:** its own check is "exercise each path once and confirm the event
+lands", and nothing lands while the PostHog account is over quota. Closing it on the new
+instrument alone would be closing it on reasoning rather than on its check, which is exactly
+what this file forbids.
+**Unblocks:** 2026-09-20 14:03 ET, when the quota resets.
+**Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
+stream once and find the event in PostHog.
 
-### D-003 — No gap marker for windows when logs did not ship
-**Found:** 2026-07-28 · **Severity:** HIGH · **Depends on:** D-002
-**Evidence:** during the DNS-failure windows on 2026-07-28, logs generated locally never
-reached PostHog. Nothing marks those windows as untrusted.
-**Why it matters:** absence of a log currently proves nothing. A quiet hour and a broken hour
-render identically, which makes every "nothing happened" conclusion unsound.
-**Check:** after an export outage, the affected window is explicitly marked as untrusted
-rather than simply empty.
+### 2026-09-19: the test suite wrote wiki_call events into real shared ledgers (D-019)
 
-### D-004 — Failed generations carry no error text
-**Found:** 2026-07-28 · **Severity:** MEDIUM · **Partially resolved 2026-08-07**
-**Evidence:** the three failed `$ai_generation` events of 2026-07-28 carry
-`tv_outcome = "unreported"` and nothing else. `$ai_error` does not exist in this project's
-taxonomy. Recurred 2026-08-06: three more DeepSeek dispatches (`180.001s`, `68.083s`,
-`180.0s`; `model=unknown`, one primary attempt, metered) landed as `unreported`.
+Found by the first real run of `scripts/wiki-usage-report.py`: 11 rows said "wiki not loadable
+at call time" although the real wiki loaded fine on every live call. Traced to my own
+`cargo test` run. The suite drives `execute_ask_agent` with stand-in agents, some of its calls
+use shared directories (`/private/tmp/project`, `/private/tmp/worker-reuse`, and with no cwd this
+crate's git-tracked `.triumvirate/ledger.db`), and step one's recorder wrote a `wiki_call` event
+for each. The report counted them as peer calls. A test that clears HOME also made the wiki path
+relative, which is the "not loadable" text.
 
-**RESOLVED (the outcome half, 2026-08-07):** those drops were the caller's client-side
-`ask_agent` ceiling (180s) cancelling the daemon's `execute_ask_agent` future before any
-classify() arm ran, so `CallTelemetry` emitted its `unreported` default. `CallTelemetry` now
-arms on dispatch (`begin_dispatch`) and, on a drop with no recorded outcome while in-flight,
-emits `tv_outcome = "cancelled"` (an error outcome, visible to outcome-based monitoring). The
-`unreported` sentinel is retained for a genuinely unclassified *synchronous* exit. DeepSeek is
-the prone path: its absolute SLA is 1800s, far past the 180s client ceiling.
+Fixed three ways: a test build records only when a test opts in
+(`TRIUMVIRATE_TEST_RECORD_WIKI_CALL`, set by the four `wiki_call_*` tests alone); every
+test-build event carries `evidence.harness = "cargo-test"`, which the report holds apart; and
+`wiki_dir()` refuses a relative path. The 11 pre-fix rows stay in place, held apart as
+unloadable.
 
-**Still open (the cause-string half):** a `cancelled`/`failure` generation still carries no
-provider cause string — `$ai_error` does not exist in the taxonomy.
-**Check:** a failed generation in PostHog carries a cause string.
+**CHECK PASSED, 2026-09-19:** full `cargo test -p triumvirate --bin triumvirate` (296 passed), then
+every ledger under /private/tmp and ~/projects scanned for `wiki_call` rows newer than the run's
+start: zero. Negative control: the same run with the guard removed wrote 12 rows into six shared
+ledgers, so the scan can see them. Mutants for the harness mark and the absolute-path guard each
+fail a test.
 
-### D-005 — Instrumentation streams gone silent, cause unknown
-**Found:** 2026-07-28 · **Severity:** LOW (was MEDIUM) · **Partially resolved 2026-08-02**
-**Evidence:** hours since last event as of 2026-07-28: `tv_review_verdict` 167,
-`tv_fleet_spawn` 167, `tv_review_requested` 167, `tv_codex_dispatch` 165, `tv_maintenance` 122.
-
-**RESOLVED for `tv_codex_dispatch` (2026-08-02):** the emitter is healthy. Over 30 days there
-were 4 `dispatch_codex` plus 2 `dispatch_codex_worktree` MCP calls, and exactly 6
-`tv_codex_dispatch` events. 1:1, nothing dropped. The stream is quiet because the path has
-not been invoked since 2026-07-22, not because it broke. Recent project work
-(`deliverability-control-plane`, 2026-07-30) was research and design, not code: 40
-`gemini-search`, 12 `gemini-check-research`, 10 `gemini-deep-research`, 0 dispatches.
-
-**Still open:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`, `tv_maintenance`.
-The same cross-check is available for these — compare event counts against the corresponding
-`$mcp_tool_call` counts — but review and fleet calls are too sparse (1-2 in 30 days) for the
-comparison to prove anything yet.
-**Why it matters:** a stream at zero is ambiguous between "path idle" and "emitter broken",
-and the two demand opposite responses.
-**Check:** for each remaining stream, exercise the path once and confirm the event lands.
-**Tile:** "Instrumentation freshness — dead signal or quiet one?" (dashboard 1886865).
-
-### D-006 — agy health probe has never exercised its failure branch
-**Found:** 2026-07-28 · **Severity:** MEDIUM
-**Evidence:** 1783 `tv_agy_health` probes over 30 days, 100% `ok/ok/healthy`, zero failures.
-**Why it matters:** a monitor that has never fired has been run, not tested. We do not know
-that it can report unhealthy, and it is one of the few live signals we have.
-**Check:** force the backend unhealthy and confirm the probe reports it.
-**Tile:** "agy health probe — has its failure path ever run?" (dashboard 1886865).
-
-### D-007 — agy is running past its version pin, warn-only
-**Found:** 2026-07-28 · **Severity:** MEDIUM
-**Evidence:** installed 1.1.8 against a pinned expected 1.1.5. Two daemons booted drifted on
-2026-07-28. Drift proceeds unless `TRIUMVIRATE_AGY_STRICT_VERSION=true`.
-**Why it matters:** every dispatch runs against an unvalidated binary.
-**Check:** either validate 1.1.8 and move the pin, or set strict mode and pin down.
-**Tile:** "agy version drift — what the pin says vs what is installed" (dashboard 1886865).
-
-### D-008 — 2026-05-25 session/ask intermittent failure, hypotheses 1/3/4/5 unresolved
-**Found:** 2026-05-25 · **Severity:** MEDIUM
-**Evidence:** `2026-05-25-daemon-session-ask-intermittent-failure.md`. Hypothesis #2
-(swallowed error cause) is fixed as of 2026-07-28. The Gemini-subprocess hang, session reuse
-poisoning, worker-pool exhaustion, and multi-client race hypotheses were never tested.
-**Why it matters:** unknown whether the original symptom still exists. It may have been
-entirely hypothesis #2 misreading a timeout, which is now impossible.
-**Check:** next occurrence will produce a classified error naming the real cause. Until one
-occurs, this is untested rather than fixed.
-
-### D-009 — No detection for a guard that is installed but inert
-**Found:** 2026-07-28 · **Severity:** MEDIUM
-**Evidence:** git hooks were dead on this machine from 2026-05-10 to 2026-07-29 in **two
-independent ways**, and fixing the first did not fix the hooks:
-1. Both symlinks in `.git/hooks/` pointed at `/Users/mikeboscia/...`, a username that does
-   not exist here. `ls -la` showed hooks present; `head` on them said No such file or
-   directory. Repointed 2026-07-28.
-2. `core.hooksPath` in `.git/config` was ALSO set to `/Users/mikeboscia/projects/triumvirate/.git/hooks`.
-   When that config is set, git uses it **exclusively** and never looks in `.git/hooks/`, so
-   repointing the symlinks changed nothing. Unset 2026-07-29.
-**Why it matters:** the same failure class as everything above, applied to our own tooling.
-It also shows the verification trap: on 2026-07-28 the fix was "verified" by executing the
-hook script by hand, which proves the script works and says nothing about whether git calls
-it. Only a real `git push` distinguishes those.
-**Check:** a startup or CI step that pushes a throwaway ref (or otherwise triggers each
-guard through its real entry point) and fails if the guard produces no output. Verifying the
-artifact is not verifying the path.
-
----
-
-### D-011 - codex argv is assembled on four surfaces and only two have a binary oracle
-**Found:** 2026-09-12 · **Severity:** MEDIUM
-**Evidence:** codex 0.154.0 removed `--full-auto` from `exec`. Four places build codex argv:
-`mcp-tools/src/abe.rs` (`build_worker_argv`, `build_worktree_worker_argv`),
-`triumvirate/src/agent_exec.rs` (consult, the `should_use_full_auto` branch), and
-`fleet/src/orchestrator.rs`. Three of the four emitted a flag the binary rejects (`--full-auto`,
-`--ask-for-approval never`, `--message`), and every test stayed green because the tests assert
-what Triumvirate builds, not what the installed binary parses. All three were fixed 2026-09-12.
-Only the two ABE builders got a parse oracle (`abe_binary_oracle_tests`); the consult and
-fleet argv are built inline inside spawn code and have no oracle.
-**Why it matters:** the next removed flag goes red on two surfaces and ships on two. This is
-the "fix lands on one surface" shape again, with a test that certifies half the class.
-**Fix shape:** lift each inline codex argv into a pure builder, then one table-driven test that
-runs every builder's output through `codex <args> --help` on the installed binary.
-**Check:** temporarily push a bogus flag into the consult or fleet argv; `cargo test` must fail.
-
-### D-014 - agy quota detectors over-match glog noise
-**Found:** 2026-09-13 (Grok, review of recovery step 4) · **Severity:** LOW
-**Evidence:** `classify_failure_message` matches any "429" (glog thread ids hit it,
-`conversation_manager.go` 2026-08-20) and any "quota" (`doRefreshQuota`,
-`retrieveUserQuotaSummary` health lines classify as capacity/quota). `quota_signal_in_line` is
-the narrower detector and still shares the "429" substring. A false quota classification now
-also triggers the step 4 backoff and feeds the breaker.
-**Why it matters:** a benign log line can back off a healthy call by 60s and nudge the breaker.
-**Fix shape:** anchor "429" to `code 429` / `HTTP 429` / `(429)` and "quota" to
-`RESOURCE_EXHAUSTED` / `quota exceeded` / `capacity`; add the two glog lines as negative fixtures.
-**Check:** the 2026-08-20 thread-id line and a `doRefreshQuota` line classify AuthOrExec.
-
-### D-015 - fleet task ids collide across fleets in the same repo
-**Found:** 2026-09-13 (audit) · **Severity:** MEDIUM
-**Evidence:** `tasks.task_id` is the PRIMARY KEY of the ledger's tasks table and the
-orchestrator names tasks `T-001`, `T-002`, ... per fleet (`orchestrator.rs`, `format!("T-{:03}")`).
-The second `fleet_spawn` in the audit repo failed at once: `UNIQUE constraint failed:
-tasks.task_id`, recorded in `fleets.failure_reason`. One fleet per repo, ever, unless the
-ledger is wiped.
-**Why it matters:** the second fleet in any project fails before it spawns anything.
-**Fix shape:** key tasks on (fleet_id, task_id), or name tasks `<fleet_id>-T-001`. The merge
-queue, branch names (`fleet/<fleet_id>/T-001`) and worktree names read the task id, so the
-change has to land on all of them together; not a one-line fix.
-**Check:** two consecutive `fleet_spawn` calls in one repo both reach `running`.
-
-### D-016 - fleet_status cannot find a fleet after a daemon restart
-**Found:** 2026-09-13 (Codex, review of the recovery commits) · **Severity:** MEDIUM
-**Evidence:** `fleet_status` looks the fleet up in the daemon's in-memory map first and only
-then refreshes from the ledger; the map is empty after a restart, and the ledger it would
-read lives under a `project_root` that only the map knew. `FleetStatusRequest` carries only
-`fleet_id`. The `fleets` table already has `source_project_root`, but the daemon does not know
-which repo's ledger to open.
-**Fix shape:** a daemon-level index `~/.triumvirate/fleets.json` mapping fleet_id to
-project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
-**Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
-
-### D-018 - a PostHog quota rejection is dropped without a single log line
-**Found:** 2026-09-19 · **Severity:** MEDIUM (was HIGH before the cause was known)
-**Cause: KNOWN, not a Triumvirate bug.** The PostHog account has been out of quota for several
-days (owner, 2026-09-19). The missing events are explained; this row is about how that
-absence presented.
-**Evidence:** no `tv_*` event since 2026-09-16, ~280/day before it. The daemon has
-`POSTHOG_HOST` and `POSTHOG_API_KEY` set, so `capture_as` was posting. Two daemon restarts on
-2026-09-19 produced no `tv_daemon_started` and **not one line mentioning posthog in the log**:
-no warning, no status code, no "quota". The last `posthog POST failed` warning is 2026-09-15
-20:00, before the quota ran out.
-**Why it matters:** this is D-002's shape one layer up. A provider refusing our data is a
-condition the daemon can see and did not report, so "no events" was indistinguishable from
-"nothing happened" for three days, and diagnosing it took a query against PostHog itself. The
-first suspicion was that the newly added `tv_jury_seat` instrumentation was broken.
-**Check:** point the daemon at a token that will be refused and confirm the log carries the
-status and the provider's reason. Quota exhaustion must be loud.
-**The contrast that makes this a defect and not just an outage (2026-09-19):** two exporters
-in this daemon post to the same host while the account is out of quota. The OTLP log exporter
-has written **4,266** error lines today (see D-002). The event path, `posthog::capture_as`
-posting to `/i/v0/e/`, has written **zero**. One screams thousands of times, the other is
-silent, and the silent one is the path every `tv_*` event takes.
-**Consequence, so nothing is overclaimed:** the `tv_jury_seat` events added with `ask_jury`
-have never been observed landing. That instrumentation is written and unverified until the
-quota is restored.
+### 2026-09-19: agy ran past its version pin on every dispatch (D-007)
+The pin was 1.1.5 in `~/.claude.json` and 1.0.2 as the code default, while 1.2.7 was installed
+and serving every call, so the mismatch warning fired on every agy dispatch. A warning that
+fires unconditionally is furniture: nobody acts on it, and it trains the reader to skip the
+line where a real mismatch would one day appear.
+Owner's decision (2026-09-19): move the pin to what is installed and stay warn-only. Set to
+1.2.7 in both places, and the doc comment that called the default "the last version verified
+against the live binary" was corrected, because it was no longer true.
+**Recorded plainly, so the pin is not read as more than it is:** the REQ-060-064 verification
+battery was NOT re-run for 1.2.7. This pin now means "the version we run", not "a validated
+version". Making it mean the second requires running that battery and updating the comment.
+**CHECK PASSED:** the daemon restarted with `TRIUMVIRATE_AGY_EXPECTED_VERSION=1.2.7` against
+an installed 1.2.7 emits no version-mismatch warning.
 
 
-## Closed
+### 2026-09-19: agy quota detectors matched benign glog noise (D-014)
+`classify_failure_message` matched ANY occurrence of `429` and ANY occurrence of `quota`, so a
+glog thread id containing `429` and a health line containing `doRefreshQuota` both classified
+as capacity/quota. A false quota is not free: it triggers the retry backoff AND feeds the
+circuit breaker, so benign log noise could back off a healthy call and nudge the breaker
+toward shedding real traffic.
+
+Fixed by a Codex worker in an isolated worktree (task `d014-agy-quota-anchors`, commit
+22db81d, cherry-picked as 58766d2). Both detectors now go through
+`contains_anchored_phrase`, which requires the match not to be embedded in an identifier or a
+longer numeric token, over the markers `RESOURCE_EXHAUSTED`, `quota exceeded`, `code 429`,
+`HTTP 429`, `(429)` and `capacity`.
+
+**CHECK PASSED:** `quota_detectors_ignore_benign_glog_tokens` classifies the real 2026-08-20
+thread-id line and a `doRefreshQuota` line as `AuthOrExec`, and
+`quota_detectors_preserve_anchored_positive_signals` keeps every real quota form classifying
+as `Quota`. Verified independently of the worker's own report: I ran both tests, then reverted
+the anchoring by hand and confirmed the negative test goes red.
+
+
+### 2026-09-19: the daemon had no shutdown path at all (D-001)
+Fourteen months of `tv_daemon_started` with no matching stop, because `axum::serve` was called
+with no `with_graceful_shutdown` and no signal handler existed anywhere. SIGTERM killed the
+process outright, so there was nothing to emit and nothing to log. A crash and a clean restart
+were the same evidence, which is the exact case the defect dashboard was built to catch.
+
+Added `await_shutdown_signal`, which resolves on SIGTERM or SIGINT and NAMES which one:
+"the daemon stopped" is half an answer, and a row that cannot tell an operator restart from a
+person at a terminal cannot tell a deployment from an interruption. SIGKILL is deliberately
+absent and cannot be caught, so an exit with no line still means something specific: killed
+outright or died, which should read differently from a clean stop.
+
+The LOG LINE is the evidence and the event is the nice-to-have, which is the opposite of how
+this would have been built yesterday. D-018 established that PostHog answers 200 OK for events
+it discards, so an exit recorded only in telemetry may leave no trace at all.
+`record_daemon_stopped` is also the one capture here that is AWAITED rather than
+fire-and-forget: every other event goes through `handle.spawn`, which is right for a running
+daemon and useless on the exit path, where the spawned task is still queued when the process
+goes away.
+
+**REGRESSION INTRODUCED BY THIS FIX, found and fixed the same day.** The graceful path made
+axum wait for every open connection after the signal, and a connection that never drains (one
+stuck mid-request, a WebSocket) kept the process alive forever: it logged the line below, closed
+its listener, and never exited. The check above passed only because that daemon had been up 3
+seconds with nothing open. It went unnoticed for the rest of the day because `start-daemon.sh`
+escalates an ignored SIGTERM to SIGKILL, so every restart LOOKED clean while the real sequence was
+TERM, hang, KILL. When a restart bypassed that escalation (its output piped to `head -1`, which
+killed the script by SIGPIPE before it could escalate), the daemon went down: listening on
+nothing, holding its pid. Fixed by bounding the drain: after the signal, a watchdog exits the
+process after `TRIUMVIRATE_SHUTDOWN_DRAIN_SECS` (default 10). Reproduced before fixing, on a
+throwaway daemon on its own port and home: the pre-fix binary was still running 25s after SIGTERM
+with one stuck connection; the fixed build exited at the 3s limit. Now a permanent guard,
+`scripts/verify-shutdown.py` (`verify-live-agents.sh shutdown`), which runs the binary directly
+and never escalates, because the escalation is what hid this.
+
+**CHECK PASSED, live, 2026-09-19:** SIGTERM to the running daemon produced
+`WARN daemon shutting down reason=SIGTERM uptime_seconds=3`, followed by
+`INFO tv_daemon_stopped posted status=200 OK`. Per D-018 that 200 says nothing about
+delivery, which is why the warning above it is the thing that closes this row.
+
 
 ### 2026-09-19: three rows were stale, the defects were already fixed
 Checked during the ask_jury work, each against the CHECK its own row demanded. None of the
@@ -338,4 +276,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-19 (every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
+**Last reviewed:** 2026-09-19 (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)

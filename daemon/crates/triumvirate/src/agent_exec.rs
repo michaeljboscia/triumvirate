@@ -312,7 +312,182 @@ pub(crate) fn persist_deepseek_err_tokens(
         agent.model = tracing::field::Empty
     )
 )]
+/// Every ask call, whatever its caller, goes through here and leaves exactly one ledger event.
+///
+/// `execute_ask_agent` has callers all over: the MCP entry, named sessions, streaming, the Gemini
+/// query tools, and mandatory peer review (in process). Emitting from inside it would mean one
+/// emission point per return path (success, degraded, rejected, failed), which is the
+/// two-surfaces defect this codebase keeps reproducing. Wrapping the function gives one seam,
+/// and every outcome, including failures, passes through it. (wiki-usage brief, step one.)
 pub(crate) async fn execute_ask_agent(
+    req: &AskAgentRequest,
+    progress: Option<ProgressEmitter>,
+) -> Result<AskAgentResponse, String> {
+    let started = Instant::now();
+    let outcome = Box::pin(execute_ask_agent_inner(req, progress)).await;
+    record_ask_call_event(req, &outcome, started.elapsed());
+    outcome
+}
+
+/// Write one raw-evidence `wiki_call` event for this call to the project ledger, and return the
+/// database it went to. Best effort: a ledger failure is logged and never fails the call.
+///
+/// RAW EVIDENCE ONLY, by the jury's consensus (brief, "Jury on the design"): no classification is
+/// stored, so the rules that interpret it can improve and be re-run over old events. And NO TEXT:
+/// no prompt, no response, and no error string, because a failure's error can quote the rejected
+/// reply verbatim (the sight gate appends up to 600 characters of it).
+///
+/// The ledger is chosen exactly as the call's own work chose it: `resolve_context` on the same
+/// request fields, then the canonical project root the peer-review ledger also uses. A call with
+/// no `cwd` runs in `.`, the DAEMON's working directory, and its event lands there; that is why
+/// the path is returned and logged rather than assumed.
+pub(crate) fn record_ask_call_event(
+    req: &AskAgentRequest,
+    outcome: &Result<AskAgentResponse, String>,
+    latency: Duration,
+) -> Option<PathBuf> {
+    // D-019: the test suite drives this function hundreds of times with stand-in agents, and
+    // its calls landed in real shared ledgers (`/private/tmp/project`, this crate's tracked
+    // `.triumvirate/ledger.db`), where the first report counted them as peer calls. A test build
+    // records only when a test opts in; the `wiki_call_*` tests do, and nothing else writes.
+    if cfg!(test) && std::env::var_os("TRIUMVIRATE_TEST_RECORD_WIKI_CALL").is_none() {
+        return None;
+    }
+    let (resolved_cwd, _, _) =
+        core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
+    let exec_cwd = resolved_cwd.unwrap_or_else(|| ".".to_string());
+    let root = resolve_absolute_project_root(&exec_cwd).ok()?;
+
+    let agent_requested = mcp_bridge::normalize_agent_name(&req.agent);
+    let mut payload = serde_json::json!({
+        "schema": 2,
+        "agent_requested": agent_requested,
+        "required_sources": req.required_sources,
+        "is_peer_review": req.is_peer_review.unwrap_or(false),
+        "strict_agent": req.strict_agent.unwrap_or(false),
+        "latency_ms": latency.as_millis() as u64,
+    });
+    // One event per call, keyed on the call. `session_id = request_id` with sequence 1 is unique by
+    // construction. The fleet crate's `MAX(sequence) + 1` is a read-then-write race, and under
+    // `UNIQUE(session_id, event_type, sequence)` a lost race is a failed INSERT, i.e. a lost event.
+    let session_id = match outcome {
+        Ok(resp) => {
+            let answered_by = resp
+                .answered_by_agent
+                .clone()
+                .unwrap_or_else(|| agent_requested.clone());
+            payload["outcome"] = "answered".into();
+            payload["request_id"] = resp.request_id.clone().into();
+            payload["answered_by_agent"] = mcp_bridge::normalize_agent_name(&answered_by).into();
+            payload["answered_by_backend"] = serde_json::json!(resp.answered_by_backend);
+            payload["degraded_from_backend"] = serde_json::json!(resp.degraded_from_backend);
+            payload["degradation_reason"] = serde_json::json!(resp.degradation_reason);
+            payload["model"] = serde_json::json!(resp.model);
+            payload["strict_agent_honored"] = serde_json::json!(resp.strict_agent_honored);
+            payload["tool_calls_made"] = serde_json::json!(resp.tool_calls_made);
+            payload["response_chars"] = (resp.response.chars().count() as u64).into();
+            payload["evidence"] = resp.wiki_evidence.clone().unwrap_or_else(|| "missing".into());
+            resp.request_id.clone()
+        }
+        // No request id survives a failure to this seam, so the event gets its own. The error text
+        // is deliberately not stored (see above).
+        Err(_) => {
+            payload["outcome"] = "failed".into();
+            format!("failed-{}", Uuid::new_v4())
+        }
+    };
+
+    let write = || -> anyhow::Result<()> {
+        std::fs::create_dir_all(root.join(".triumvirate").join("spool"))?;
+        let store = LedgerStore::open(root.clone())?;
+        store.ingest_event(shared_types::RawEvent {
+            session_id,
+            event_type: "wiki_call".to_string(),
+            sequence: 1,
+            // The real time. The fleet crate writes a hardcoded "2030-01-01T00:00:00Z" here, which
+            // is a fabricated value; retention keys on `created_at`, so it does not break the
+            // sweep, but it is not copied.
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            payload_json: payload.to_string(),
+        })
+    };
+    let db = root.join(".triumvirate").join("ledger.db");
+    match write() {
+        Ok(()) => {
+            tracing::debug!(ledger = %db.display(), "wiki_call event recorded");
+            Some(db)
+        }
+        Err(e) => {
+            tracing::warn!(ledger = %db.display(), error = %e, "wiki_call event NOT recorded");
+            None
+        }
+    }
+}
+
+/// Wiki-usage evidence for one answered turn: raw ids and flags, never a verdict and never text.
+///
+/// Built at BOTH answered exits of `execute_ask_agent_inner` (direct and degraded) from the same
+/// function, so the two paths cannot drift. A response that reaches the ledger without it is
+/// recorded as `"evidence": "missing"` by `record_ask_call_event`, not scored as zero use.
+///
+/// `pages_opened` reuses the sight gate's matcher (`tool_call_touched_source`), so every adapter
+/// is judged by the one implementation that already decides whether a named source was read. It
+/// is `null`, not `[]`, when the parser cannot tell a read from anything else: an empty list
+/// from a blind parser would read as "opened nothing" (Grok, jury 2026-09-19).
+pub(crate) fn wiki_evidence(
+    parsed: &ParsedAgentResult,
+    backend: &str,
+    prompt: &str,
+    cwd: &str,
+) -> serde_json::Value {
+    let mode = parsed.parser_mode.as_str();
+    let reads_classified = PARSER_MODES_THAT_CLASSIFY_READS.contains(&mode);
+    let mut ev = serde_json::json!({
+        "parser_mode": mode,
+        "backend": backend,
+        "tool_records": PARSER_MODES_WITH_TOOL_RECORDS.contains(&mode),
+        "reads_classified": reads_classified,
+        "prompt_paths": crate::wiki_usage::paths_in(prompt),
+    });
+    // The test suite drives this same function with stand-in agents, and some of its calls land
+    // in shared directories (`/private/tmp/project`, this crate's own `.triumvirate/`). The
+    // first real report counted eleven of them as peer calls. Marked here so the report can
+    // hold them apart; the field is absent from every production event.
+    if cfg!(test) {
+        ev["harness"] = "cargo-test".into();
+    }
+    match crate::wiki_usage::wiki_dir().and_then(|dir| crate::wiki_usage::load_wiki(&dir)) {
+        Ok(wiki) => {
+            ev["wiki"] = serde_json::json!({
+                "dir": wiki.dir.display().to_string(),
+                "generated": wiki.generated,
+                "pages": wiki.pages.len(),
+                "map_bytes": wiki.map_bytes,
+            });
+            ev["text_ids"] =
+                serde_json::json!(crate::wiki_usage::page_ids_in(&parsed.response_text, &wiki.pages));
+            ev["prompt_ids"] = serde_json::json!(crate::wiki_usage::page_ids_in(prompt, &wiki.pages));
+            ev["pages_opened"] = if reads_classified {
+                let opened: Vec<&String> = wiki
+                    .pages
+                    .iter()
+                    .filter(|id| {
+                        let page = wiki.dir.join(format!("{id}.md"));
+                        tool_call_touched_source(&parsed.tool_calls, &page.to_string_lossy(), cwd)
+                    })
+                    .collect();
+                serde_json::json!(opened)
+            } else {
+                serde_json::Value::Null
+            };
+        }
+        // No page list, so no ids can be scored. Say so; an absent `text_ids` is not zero.
+        Err(e) => ev["wiki"] = serde_json::json!({ "error": e }),
+    }
+    ev
+}
+
+async fn execute_ask_agent_inner(
     req: &AskAgentRequest,
     progress: Option<ProgressEmitter>,
 ) -> Result<AskAgentResponse, String> {
@@ -1004,6 +1179,12 @@ pub(crate) async fn execute_ask_agent(
                     (None, None, None, None)
                 };
                 let tool_calls_made = cast_usize_to_u32(parsed.tool_calls.len());
+                // Named here, not left to the wire's `answered_by_backend`, which is omitted on
+                // the direct path: step one's live run recorded `None` for a direct agy call.
+                let backend = gemini_backend_selected
+                    .map(GeminiBackend::as_str)
+                    .unwrap_or(agent.as_str());
+                let evidence = wiki_evidence(&parsed, backend, &req.message, &exec_cwd);
                 let mut resp = AskAgentResponse::direct(
                     request_id,
                     agent.clone(),
@@ -1021,6 +1202,7 @@ pub(crate) async fn execute_ask_agent(
                 // SessionState, rather than the worker registry inferring it from (agent, cwd).
                 // That inference is what let two named sessions resume each other.
                 resp.cli_session_id = next_session_id.clone();
+                resp.wiki_evidence = Some(evidence);
                 return Ok(resp);
             }
             Err(e) => {
@@ -1405,6 +1587,8 @@ pub(crate) async fn execute_ask_agent(
                         return Err(err);
                     }
                     let tool_calls_made = cast_usize_to_u32(parsed.tool_calls.len());
+                    let evidence =
+                        wiki_evidence(&parsed, hop.backend, &req.message, &exec_cwd);
                     return Ok(AskAgentResponse {
                         // NOT the degraded hop's session id. A gemini session that degraded to
                         // codex would otherwise have its authoritative id overwritten with a
@@ -1429,6 +1613,7 @@ pub(crate) async fn execute_ask_agent(
                         model: None,
                         // The DEGRADED hop's count, since the degraded hop is what answered.
                         tool_calls_made: Some(tool_calls_made),
+                        wiki_evidence: Some(evidence),
                     });
                 }
                 Ok(Err(e)) => {
@@ -2188,6 +2373,39 @@ fn args_name_path(args: &str, path: &str) -> bool {
         from = start + 1;
     }
     false
+}
+
+/// Prove the sight gate still REJECTS, at startup (D-009).
+///
+/// A guard that is installed but inert looks exactly like a guard that is working, because
+/// both are silent on a clean run. So the gate is handed a GENUINE violation, a review that read
+/// nothing at all against a source that exists, through the same `enforce_reviewer_sight` real
+/// dispatches use. It is not told this is a test and nothing in it is special-cased: a canary
+/// that takes a different path from real data is a canary that can pass while the gate is dead.
+///
+/// `Ok(())` means the gate rejected it, which is the healthy outcome. The owner's call
+/// (2026-09-19): an inert gate is logged LOUDLY and the daemon still serves, so a bug in the
+/// canary can never become an outage.
+pub(crate) fn sight_gate_canary() -> Result<(), String> {
+    let dir = std::env::temp_dir().join(format!("triumvirate-sight-canary-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("canary could not create its source: {e}"))?;
+    let source = dir.join("canary-source.md");
+    std::fs::write(&source, "a file a reviewer was required to read\n")
+        .map_err(|e| format!("canary could not write its source: {e}"))?;
+    let source = source.to_string_lossy().into_owned();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut lifecycle = Vec::new();
+    // Zero tool calls, one named source: the reviewer that "reviewed" without opening anything.
+    let verdict = enforce_reviewer_sight("Canary", &[], "codex-exec-json", &[source], &cwd, &mut lifecycle);
+    let _ = std::fs::remove_dir_all(&dir);
+    match verdict {
+        Err(_) => Ok(()),
+        Ok(()) => Err(
+            "the sight gate ACCEPTED a review that read nothing. It is installed and inert: every \
+             source-gated review since it stopped rejecting is unverified."
+                .to_string(),
+        ),
+    }
 }
 
 fn enforce_reviewer_sight(
@@ -8731,5 +8949,17 @@ mod strict_agent_tests {
             "the error must be agy's own, not a later hop's; got: {err}"
         );
         assert!(!fx.codex_ran.exists(), "no other agent may even be spawned under strict_agent");
+    }
+}
+
+#[cfg(test)]
+mod sight_gate_canary_tests {
+    use super::*;
+
+    /// The canary itself. RED IF: it reports a healthy gate as inert, which would put a false
+    /// alarm in the log on every boot and train the reader to ignore the real one.
+    #[test]
+    fn the_canary_passes_while_the_gate_rejects() {
+        sight_gate_canary().expect("a working gate rejects a review that read nothing");
     }
 }

@@ -27,4 +27,5 @@ uuid.workspace = true
 regex-lite = "0.1"
 
 [dev-dependencies]
+rusqlite = "0.32"
 tempfile = "3"

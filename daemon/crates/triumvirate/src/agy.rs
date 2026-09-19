@@ -179,16 +179,33 @@ pub(crate) enum AgyFailureClass {
 /// biases ambiguous *repeated* failures toward quota separately (Slice 3b).
 pub(crate) fn classify_failure_message(msg: &str) -> AgyFailureClass {
     let lower = msg.to_lowercase();
-    if lower.contains("capacity/quota")
-        || lower.contains("resource_exhausted")
-        || lower.contains("429")
-        || lower.contains("rate limit")
-        || lower.contains("rate_limit")
+    if anchored_quota_signal(&lower) || lower.contains("rate limit") || lower.contains("rate_limit")
     {
         AgyFailureClass::Quota
     } else {
         AgyFailureClass::AuthOrExec
     }
+}
+
+/// Match a phrase only when it is not embedded in an identifier or numeric token.
+fn contains_anchored_phrase(haystack: &str, phrase: &str) -> bool {
+    haystack.match_indices(phrase).any(|(start, matched)| {
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[start + matched.len()..].chars().next();
+        let is_token_char = |character: char| character.is_alphanumeric() || character == '_';
+
+        !before.is_some_and(is_token_char) && !after.is_some_and(is_token_char)
+    })
+}
+
+/// Conservative quota markers shared by surfaced failures and raw log scanning.
+fn anchored_quota_signal(lower: &str) -> bool {
+    contains_anchored_phrase(lower, "resource_exhausted")
+        || contains_anchored_phrase(lower, "quota exceeded")
+        || contains_anchored_phrase(lower, "code 429")
+        || contains_anchored_phrase(lower, "http 429")
+        || lower.contains("(429)")
+        || contains_anchored_phrase(lower, "capacity")
 }
 
 /// One hop of the degraded route: which agent answers and the backend label for the
@@ -1162,22 +1179,14 @@ fn extract_quoted_label(line: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Conservative quota/429 detector (REQ-051). Strong markers always match; the weaker
-/// `quota`/`capacity` markers are suppressed on the benign startup auth line, which
-/// always contains `quotaProject=`/`authMethod=`. The exact lockout string is still
-/// unsampled (REQ-064) — captured on the first real event.
+/// Conservative quota/429 detector (REQ-051). Quota and status-code markers are
+/// anchored so benign identifiers and glog thread IDs do not trigger backoff.
 fn quota_signal_in_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    if lower.contains("resource_exhausted")
-        || lower.contains("429")
+    anchored_quota_signal(&lower)
         || lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("ratelimit")
-    {
-        return true;
-    }
-    let benign_auth = lower.contains("quotaproject=") || lower.contains("authmethod=");
-    !benign_auth && (lower.contains("quota") || lower.contains("capacity"))
 }
 
 /// Classify a non-zero agy exit into a user-visible error (REQ-034/051/052). Quota
@@ -1305,6 +1314,54 @@ pub(crate) mod tests {
         ));
         assert!(quota_signal_in_line("Error: RESOURCE_EXHAUSTED quota exceeded"));
         assert!(quota_signal_in_line("got HTTP 429 rate limit"));
+    }
+
+    /// RED IF: benign glog identifiers containing `429` or `Quota` feed quota backoff.
+    #[test]
+    fn quota_detectors_ignore_benign_glog_tokens() {
+        let benign_lines = [
+            "I0820 14:21:09.184291 1429123 conversation_manager.go:240] conversation healthy",
+            "I0820 14:21:09.184291 123 health.go:88] doRefreshQuota retrieveUserQuotaSummary",
+            "capacityPlanner initialized successfully",
+            "éresource_exhaustedβ is an identifier",
+        ];
+
+        for line in benign_lines {
+            assert_eq!(
+                classify_failure_message(line),
+                AgyFailureClass::AuthOrExec,
+                "unexpected quota classification for {line:?}"
+            );
+            assert!(
+                !quota_signal_in_line(line),
+                "unexpected quota log signal for {line:?}"
+            );
+        }
+    }
+
+    /// RED IF: anchoring a noisy marker suppresses a supported quota failure form.
+    #[test]
+    fn quota_detectors_preserve_anchored_positive_signals() {
+        let quota_lines = [
+            "Error: RESOURCE_EXHAUSTED quota exceeded",
+            "quota exceeded",
+            "code 429",
+            "HTTP 429",
+            "request failed (429)",
+            "backend capacity unavailable",
+        ];
+
+        for line in quota_lines {
+            assert_eq!(
+                classify_failure_message(line),
+                AgyFailureClass::Quota,
+                "missed quota classification for {line:?}"
+            );
+            assert!(
+                quota_signal_in_line(line),
+                "missed quota log signal for {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -1867,5 +1924,45 @@ mod breaker_probe_tests {
         assert_eq!(out.outcome, "ok", "health still calls a live process ok; detail: {}", out.detail);
         assert!(!out.closed_by_probe, "but it is not the answer, so traffic must not resume");
         assert_eq!(agy_breaker_snapshot().phase, "open");
+    }
+
+    /// D-006. 1,783 health probes over 30 days, 100% healthy, zero failures: a monitor that has
+    /// never fired has been RUN, not TESTED. This forces each failure branch and reads the thing
+    /// `/health` actually reports, not the probe's return value.
+    /// RED IF: a failing agy is reported healthy, or a silent capture drop is reported healthy.
+    #[tokio::test]
+    #[ignore = "mutates the process-global agy env; run with scripts/verify-live-agents.sh strict"]
+    async fn probe_05_the_health_probe_reports_both_failure_branches() {
+        use mcp_bridge::agy_resilience::agy_health_snapshot;
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = tests::ENV_LOCK.lock().await;
+
+        // Branch 1: the backend fails outright (non-zero exit).
+        {
+            let _fx = setup("echo 'fatal: agy backend unavailable' 1>&2; exit 3");
+            health_probe().await;
+            let h = agy_health_snapshot();
+            assert_eq!(h.backend_health, "failed", "a failing agy must read as failed: {h:?}");
+            assert!(h.last_probe_unix_ms.is_some(), "and the probe must be recorded as having run");
+        }
+
+        // Branch 2: exit 0 with NOTHING on stdout, the silent capture drop that real traffic
+        // cannot tell apart from a legitimate empty answer. This is the branch that exists to
+        // catch a regression nobody would otherwise see.
+        {
+            let _fx = setup("exit 0");
+            health_probe().await;
+            let h = agy_health_snapshot();
+            assert_eq!(h.capture_health, "degraded", "an empty exit-0 must read as degraded: {h:?}");
+        }
+
+        // Control: a healthy agy reads healthy, so the two assertions above are not simply what
+        // this snapshot always says.
+        {
+            let _fx = setup("printf '{\"event\":\"init\",\"conversation_id\":\"c1\",\"init\":{}}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"4\"}}\n'");
+            health_probe().await;
+            let h = agy_health_snapshot();
+            assert_eq!((h.capture_health.as_str(), h.backend_health.as_str()), ("ok", "ok"), "{h:?}");
+        }
     }
 }

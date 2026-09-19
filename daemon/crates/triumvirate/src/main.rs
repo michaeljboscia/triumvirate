@@ -127,6 +127,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_exec;
+mod wiki_usage;
 mod blind_validate;
 mod agy;
 mod streaming;
@@ -2308,6 +2309,13 @@ async fn run_daemon() -> anyhow::Result<()> {
             body["agy_health_detail"] = serde_json::json!(h.detail);
             body["agy_health_last_probe_unix_ms"] = serde_json::json!(h.last_probe_unix_ms);
         }
+        // D-018 / D-003: whether telemetry is actually ARRIVING. "untrusted" means every tv_*
+        // absence in the current window is meaningless, which is the marker D-003 asked for.
+        let t = mcp_bridge::telemetry_delivery::delivery_snapshot();
+        body["telemetry_delivery"] = serde_json::json!(t.trust.as_str());
+        body["telemetry_delivery_detail"] = serde_json::json!(t.detail);
+        body["telemetry_delivery_consecutive_misses"] = serde_json::json!(t.consecutive_misses);
+        body["telemetry_delivery_last_check_unix_ms"] = serde_json::json!(t.last_check_unix_ms);
         Ok(AxumJson(body))
     }
 
@@ -2743,6 +2751,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         info!(backend = resolved_backend, %agy_bin, agy_max_concurrent, agy_max_rpm, "daemon config resolved");
     }
     mcp_bridge::posthog::record_daemon_started(resolved_backend, &agy_bin, agy_max_concurrent, agy_max_rpm);
+    // D-009: prove the sight gate can still say no, before any review relies on it. Loud, and
+    // never fatal: an inert gate is serious, but a canary bug must not take the daemon down.
+    match agent_exec::sight_gate_canary() {
+        Ok(()) => tracing::info!("sight gate armed: it rejected the startup canary"),
+        Err(why) => tracing::error!(canary = %why, "SIGHT GATE INERT"),
+    }
 
     // Probe the codex binary so agent_exec can make version-aware flag-injection
     // decisions. Fire-and-forget is fine — if it hasn't completed by the first
@@ -3008,6 +3022,18 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
         });
     }
+    // D-018: PostHog answers 200 OK for events it discards, so the only way to know whether
+    // telemetry is arriving is to read a sentinel back from the other side. Runs whatever the
+    // backend, because every tv_* stream depends on it. The first check waits one interval
+    // rather than firing at boot, so a restart loop cannot turn into a sentinel storm.
+    tokio::spawn(async {
+        let interval = mcp_bridge::telemetry_delivery::sentinel_interval();
+        let wait = mcp_bridge::telemetry_delivery::ingestion_wait();
+        loop {
+            tokio::time::sleep(interval).await;
+            mcp_bridge::telemetry_delivery::check_and_record(wait).await;
+        }
+    });
     tokio::spawn({
         let scanner_bus = observability_bus.clone();
         async move {
@@ -3024,8 +3050,91 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
         }
     });
-    axum::serve(listener, app).await?;
+    // D-001: the daemon had no shutdown path at all. `axum::serve` ran until the process was
+    // killed, so a SIGTERM produced no event and no log line, and fourteen months of
+    // `tv_daemon_started` had no matching stop. A crash and a clean restart were the same
+    // evidence, which is precisely the case the defect dashboard was built to catch.
+    let started_at = std::time::Instant::now();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let reason = await_shutdown_signal().await;
+            let uptime = started_at.elapsed().as_secs();
+            // THE LOG LINE IS THE EVIDENCE, and the event is the nice-to-have. D-018
+            // established that PostHog answers 200 OK for events it then discards, so an
+            // exit recorded only in telemetry is an exit that may leave no trace at all.
+            tracing::warn!(
+                reason = %reason,
+                uptime_seconds = uptime,
+                "daemon shutting down"
+            );
+            mcp_bridge::posthog::record_daemon_stopped(&reason, uptime).await;
+            // BOUND THE DRAIN. Returning from this future closes the listener and makes axum wait
+            // for every open connection to finish, and a long-lived one (a WebSocket, a stuck
+            // request) never does. On 2026-09-19 a daemon took the SIGTERM, logged this line,
+            // stopped listening, and never exited: it held its pid while serving nothing, so the
+            // start script saw a live daemon and every client saw a dead one. That was a
+            // regression introduced by adding this graceful path at all; before it, SIGTERM
+            // killed the process at once. Short requests still get their window.
+            let limit = shutdown_drain_limit();
+            tokio::spawn(async move {
+                tokio::time::sleep(limit).await;
+                tracing::warn!(
+                    drain_limit_secs = limit.as_secs(),
+                    "open connections did not drain in time; exiting anyway"
+                );
+                std::process::exit(0);
+            });
+        })
+        .await?;
     Ok(())
+}
+
+/// How long in-flight requests get to finish after a stop signal before the process exits
+/// anyway. `TRIUMVIRATE_SHUTDOWN_DRAIN_SECS`, default 10.
+fn shutdown_drain_limit() -> std::time::Duration {
+    std::env::var("TRIUMVIRATE_SHUTDOWN_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(10))
+}
+
+/// Resolve when the process is asked to stop, naming WHICH signal asked.
+///
+/// "The daemon stopped" is half an answer. `SIGTERM` is an operator or a restart script;
+/// `SIGINT` is a person at a terminal. A row that cannot tell them apart cannot tell a
+/// deployment from an interruption, and an unexplained stop from either.
+///
+/// SIGKILL is deliberately absent and cannot be caught. An exit with no line from here is
+/// therefore still meaningful: it means the daemon was killed outright or died, which is a
+/// different fact from a clean stop and should read differently.
+async fn await_shutdown_signal() -> String {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only ctrl-c will stop this daemon cleanly");
+                let _ = tokio::signal::ctrl_c().await;
+                return "SIGINT".to_string();
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM".to_string(),
+            res = tokio::signal::ctrl_c() => match res {
+                Ok(()) => "SIGINT".to_string(),
+                Err(e) => format!("ctrl_c listener failed: {e}"),
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "SIGINT".to_string(),
+            Err(e) => format!("ctrl_c listener failed: {e}"),
+        }
+    }
 }
 
 async fn run_breaker_probe(
@@ -4013,6 +4122,380 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
+        Ok(())
+    }
+
+    /// Every `wiki_call` event in the ledger under `root`, as (session_id, payload).
+    /// Opts one `wiki_call_*` test into ledger writes (D-019), and opts back out on drop.
+    /// Hold `env_lock` for as long as this lives.
+    struct RecordWikiCalls;
+    impl RecordWikiCalls {
+        fn on() -> Self {
+            // SAFETY: callers hold the binary-wide env lock.
+            unsafe { std::env::set_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL", "1") };
+            Self
+        }
+    }
+    impl Drop for RecordWikiCalls {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL") };
+        }
+    }
+
+    fn wiki_call_events(root: &std::path::Path) -> Vec<(String, serde_json::Value)> {
+        let db = root.join(".triumvirate").join("ledger.db");
+        let conn = rusqlite::Connection::open(&db).expect("open the ledger the call wrote to");
+        let mut stmt = conn
+            .prepare("SELECT session_id, payload_json FROM events WHERE event_type = 'wiki_call'")
+            .expect("prepare");
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .expect("query")
+            .map(|r| {
+                let (sid, payload) = r.expect("row");
+                (sid, serde_json::from_str(&payload).expect("payload is JSON"))
+            })
+            .collect()
+    }
+
+    /// THE SINK PROOF (wiki-usage brief, step one): a real call through the real
+    /// `execute_ask_agent` leaves exactly one event, in the ledger of the project the call ran in,
+    /// read back out of that database, with no prompt or response text in it.
+    /// RED IF: the ask path stops writing, writes twice, writes to a different ledger, or writes text.
+    #[tokio::test]
+    async fn wiki_call_01_one_answered_call_leaves_one_textless_event_in_its_own_ledger() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
+        let project = tempfile::tempdir()?;
+        let codex = write_mock_agent_script("codex", 0.0)?;
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+        let prompt = "SECRET-PROMPT-TOKEN-7731 please answer";
+        let outcome = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: prompt.to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_BIN") };
+        let _ = fs::remove_file(&codex);
+        let resp = outcome.map_err(anyhow::Error::msg)?;
+
+        let root = fs::canonicalize(project.path())?;
+        eprintln!("wiki_call ledger: {}", root.join(".triumvirate").join("ledger.db").display());
+        let events = wiki_call_events(&root);
+        assert_eq!(events.len(), 1, "exactly one event per call: {events:?}");
+        let (session_id, p) = &events[0];
+        assert_eq!(session_id, &resp.request_id, "keyed on the call it describes");
+        assert_eq!(p["outcome"], "answered");
+        assert_eq!(p["agent_requested"], "codex");
+        assert_eq!(p["answered_by_agent"], "codex", "the seat that ANSWERED, always recorded");
+        assert_eq!(p["response_chars"], serde_json::json!(resp.response.chars().count()));
+
+        let raw = p.to_string();
+        assert!(!raw.contains("SECRET-PROMPT-TOKEN-7731"), "prompt text reached the ledger: {raw}");
+        assert!(!raw.contains(&resp.response), "response text reached the ledger: {raw}");
+        Ok(())
+    }
+
+    /// STEP TWO (wiki-usage brief): the event carries the raw evidence, from the real codex parser
+    /// and the sight gate's own read matcher. A page the agent READ is `pages_opened`; a page it
+    /// NAMED is `text_ids`; a path-embedded near miss is neither; a page the PROMPT named is
+    /// `prompt_ids`, kept apart because "read this page" is obedience, not map use.
+    /// RED IF: opens stop being seen, the detector drifts from the Python one, the direct path
+    /// loses its backend, or ids are taken from inside paths.
+    #[tokio::test]
+    async fn wiki_call_03_evidence_names_pages_opened_named_and_prompted() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
+        let project = tempfile::tempdir()?;
+        let wiki = tempfile::tempdir()?;
+        fs::write(wiki.path().join("_menu.json"), r#"{"_comment":"x","alpha-page":{},"beta-page":{},"gamma-page":{}}"#)?;
+        fs::write(wiki.path().join("_index.md"), "# test wiki index (3 pages, generated 2026-09-19)\n")?;
+        let alpha = wiki.path().join("alpha-page.md");
+        fs::write(&alpha, "the alpha page\n")?;
+        let alpha = alpha.display().to_string();
+        let codex = write_codex_custom_script(&format!(
+            "printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\"}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\",\"exit_code\":0}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"Per alpha-page. research/beta-page-notes.md is not a citation.\"}}}}'"
+        ))?;
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+            std::env::set_var("TRIUMVIRATE_WIKI_DIR", wiki.path());
+        }
+        let outcome = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: "Use gamma-page, not /tmp/x/beta-page.md".to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
+        }
+        let _ = fs::remove_file(&codex);
+        outcome.map_err(anyhow::Error::msg)?;
+
+        let events = wiki_call_events(&fs::canonicalize(project.path())?);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let p = &events[0].1;
+        assert_eq!(p["schema"], 2);
+        let ev = &p["evidence"];
+        assert_eq!(ev["parser_mode"], "codex-exec-json", "{ev}");
+        assert_eq!(ev["backend"], "codex", "the direct path names its backend: {ev}");
+        assert_eq!(ev["tool_records"], true);
+        assert_eq!(ev["reads_classified"], true);
+        assert_eq!(ev["pages_opened"], serde_json::json!(["alpha-page"]), "{ev}");
+        assert_eq!(ev["text_ids"], serde_json::json!(["alpha-page"]), "a path is not a citation: {ev}");
+        assert_eq!(ev["prompt_ids"], serde_json::json!(["gamma-page"]), "{ev}");
+        assert_eq!(ev["prompt_paths"], serde_json::json!(["/tmp/x/beta-page.md"]));
+        assert_eq!(ev["wiki"]["pages"], 3);
+        assert_eq!(ev["wiki"]["generated"], "2026-09-19");
+        assert_eq!(ev["harness"], "cargo-test", "a test-suite call must say so: {ev}");
+        let raw = p.to_string();
+        assert!(!raw.contains("not a citation") && !raw.contains("Use gamma-page"), "text leaked: {raw}");
+        Ok(())
+    }
+
+    /// No wiki, no ids: the event says the page list could not be loaded instead of recording
+    /// empty lists, which a report would read as "the peer used nothing".
+    /// RED IF: a missing wiki produces `text_ids: []` or `pages_opened: []`.
+    #[tokio::test]
+    async fn wiki_call_04_a_missing_wiki_is_an_error_not_zero_use() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
+        let project = tempfile::tempdir()?;
+        let codex = write_mock_agent_script("codex", 0.0)?;
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+            std::env::set_var("TRIUMVIRATE_WIKI_DIR", project.path().join("no-wiki-here"));
+        }
+        let outcome = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: "hello".to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
+        }
+        let _ = fs::remove_file(&codex);
+        outcome.map_err(anyhow::Error::msg)?;
+        let events = wiki_call_events(&fs::canonicalize(project.path())?);
+        let ev = &events[0].1["evidence"];
+        assert!(ev["wiki"]["error"].is_string(), "{ev}");
+        assert!(ev.get("text_ids").is_none() && ev.get("pages_opened").is_none(), "{ev}");
+        Ok(())
+    }
+
+    /// A FAILED call is a call too, and its error is the most dangerous text of all: a sight-gate
+    /// rejection quotes the rejected reply. One event, outcome failed, no error string.
+    /// RED IF: failures stop being recorded, or the error text leaks into the ledger.
+    #[tokio::test]
+    async fn wiki_call_02_a_failed_call_still_leaves_one_event_without_its_error_text() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
+        let project = tempfile::tempdir()?;
+        let failing = write_failing_agent_script("codex")?;
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", failing.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::set_var("TRIUMVIRATE_HOME", project.path().join("home"));
+        }
+        let err = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: "SECRET-PROMPT-TOKEN-4419".to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("the failing stand-in must fail the call");
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_HOME");
+        }
+        let _ = fs::remove_file(&failing);
+
+        let events = wiki_call_events(&fs::canonicalize(project.path())?);
+        assert_eq!(events.len(), 1, "a failure is still one call: {events:?}");
+        let raw = events[0].1.to_string();
+        assert_eq!(events[0].1["outcome"], "failed");
+        assert!(!raw.contains("SECRET-PROMPT-TOKEN-4419"), "prompt leaked: {raw}");
+        let err_head: String = err.chars().take(40).collect();
+        assert!(!raw.contains(&err_head), "the error string leaked into the ledger: {raw}");
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // D-011: every codex argv surface, checked against the INSTALLED binary.
+    //
+    // Four places build a codex argv. In 2026-09 three of them emitted a flag codex rejects
+    // (`--full-auto`, `--ask-for-approval never`, `--message`) and every test stayed green,
+    // because the tests asserted what Triumvirate BUILDS, not what codex PARSES. Only the two
+    // ABE builders had an oracle. This covers the other two in one table.
+    //
+    // The consult argv is not rebuilt here: it is CAPTURED from the real dispatch path by a
+    // codex stand-in that records its own argv, so the oracle sees exactly what production
+    // spawns, env-driven flags included. Rebuilding it in a test would be a second copy of the
+    // logic, which is the defect this exists to close.
+    // ---------------------------------------------------------------------------------------
+
+    fn codex_oracle_skip_requested() -> bool {
+        std::env::var_os("TRIUMVIRATE_SKIP_CODEX_ORACLE").is_some_and(|v| v == "1")
+    }
+
+    /// The real codex, found on PATH BEFORE any test points TRIUMVIRATE_CODEX_BIN at a stand-in.
+    fn codex_oracle_installed() -> String {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|d| d.join("codex"))
+            .find(|p| {
+                fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .expect(
+                "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it \
+                 exists to close. Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
+            )
+    }
+
+    /// Does the installed codex PARSE this argv?
+    ///
+    /// `--help` goes immediately before `--` (or at the end), so every flag precedes it. clap
+    /// stops validating at `--help`: `codex --bogus --help` exits 0. Put it first and the
+    /// oracle certifies anything, which is why the negative control below exists.
+    fn codex_argv_parses(bin: &str, args: &[String]) -> Result<(), String> {
+        let mut probe: Vec<String> = args.to_vec();
+        let at = probe.iter().position(|a| a == "--").unwrap_or(probe.len());
+        probe.insert(at, "--help".to_string());
+        let out = std::process::Command::new(bin)
+            .args(&probe)
+            .output()
+            .map_err(|e| format!("could not run {bin}: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "codex rejected the argv (exit {:?}): {}\nargv: {args:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    /// NEGATIVE CONTROL. RED IF: the oracle accepts a flag codex is known to reject, which would
+    /// mean `--help` landed before the flags and every positive case below proves nothing.
+    #[test]
+    fn codex_argv_oracle_00_rejects_a_flag_codex_removed() {
+        if codex_oracle_skip_requested() {
+            eprintln!("TRIUMVIRATE_SKIP_CODEX_ORACLE=1: oracle skipped on request");
+            return;
+        }
+        let bin = codex_oracle_installed();
+        let bad = vec!["exec".to_string(), "--full-auto".to_string(), "--".to_string(), "x".to_string()];
+        assert!(
+            codex_argv_parses(&bin, &bad).is_err(),
+            "oracle accepted --full-auto, which codex 0.154 removed: the probe is not validating flags"
+        );
+    }
+
+    /// The FLEET surface. RED IF: the fleet member argv emits a flag the installed codex rejects.
+    #[test]
+    fn codex_argv_oracle_01_fleet_member_argv_parses() {
+        if codex_oracle_skip_requested() {
+            return;
+        }
+        let bin = codex_oracle_installed();
+        let args = fleet::orchestrator::fleet_codex_argv("a task prompt");
+        codex_argv_parses(&bin, &args).unwrap();
+        // And a prompt that starts with a dash stays a prompt, which is what the `--` is for.
+        codex_argv_parses(&bin, &fleet::orchestrator::fleet_codex_argv("--looks-like-a-flag")).unwrap();
+    }
+
+    /// The CONSULT surface, captured from the real dispatch path.
+    /// RED IF: `execute_ask_agent` spawns codex with any flag the installed binary rejects.
+    #[tokio::test]
+    async fn codex_argv_oracle_02_consult_argv_parses_as_actually_spawned() -> anyhow::Result<()> {
+        if codex_oracle_skip_requested() {
+            return Ok(());
+        }
+        // Resolve the REAL binary first: the stand-in below replaces TRIUMVIRATE_CODEX_BIN.
+        let real_codex = codex_oracle_installed();
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let test_home = tempfile::tempdir()?;
+        let args_file = test_home.path().join("codex-args.txt");
+        // NUL-separated, not line-separated. The shared `write_codex_args_capture_script`
+        // writes one argv element per LINE, which splits a multi-line prompt into several
+        // elements; the first run of this test reported codex rejecting "unexpected argument"
+        // for what was really one prompt cut in half by the capture. The oracle must see the
+        // argv exactly as spawned, so elements are delimited by the one byte they cannot contain.
+        let stand_in = test_home.path().join("codex-nul-capture.sh");
+        fs::write(
+            &stand_in,
+            format!(
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{}\"\nIFS= read -r _line\n\
+                 echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"captured\"}}}}'\n",
+                args_file.display()
+            ),
+        )?;
+        let mut perms = fs::metadata(&stand_in)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stand_in, perms)?;
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe {
+            std::env::set_var("HOME", test_home.path());
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", stand_in.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+        let req = AskAgentRequest {
+            agent: "codex".to_string(),
+            message: "oracle probe".to_string(),
+            cwd: Some(test_home.path().display().to_string()),
+            ..Default::default()
+        };
+        let outcome = execute_ask_agent(&req, None).await;
+        // Restore BEFORE asserting, so a failure cannot leave the stand-in installed.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("HOME");
+        }
+        outcome.map_err(anyhow::Error::msg)?;
+
+        let captured: Vec<String> = fs::read(&args_file)?
+            .split(|b| *b == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        assert!(
+            captured.first().map(String::as_str) == Some("exec"),
+            "the stand-in did not record a codex exec argv, so there is nothing to check: {captured:?}"
+        );
+        codex_argv_parses(&real_codex, &captured).map_err(anyhow::Error::msg)?;
         Ok(())
     }
 

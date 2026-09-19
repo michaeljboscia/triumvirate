@@ -17,6 +17,8 @@ pub mod grok;
 pub mod agy_resilience;
 /// Shared PostHog telemetry. Every crate that dispatches an agent emits through this.
 pub mod posthog;
+/// Whether that telemetry actually ARRIVES, which the sending side cannot tell (D-018).
+pub mod telemetry_delivery;
 
 // T-002 (REQ-DS-002/003/015): authoritative env-config loader for the DeepSeek sibling.
 pub mod deepseek_config;
@@ -393,12 +395,19 @@ impl GeminiBackend {
     }
 }
 
-/// The verified-good agy version the backend expects (REQ-059). Defaults to the
-/// last version verified against the live binary (1.0.2). On mismatch the backend
-/// warns, or refuses under `agy_strict_version()`.
+/// The agy version the backend expects (REQ-059). Defaults to the version installed and run
+/// in production (1.2.7), which is NOT the same as a validated version: see the note in the
+/// body. On mismatch the backend warns, or refuses under `agy_strict_version()`.
 #[instrument(skip_all)]
 pub fn agy_expected_version() -> String {
-    std::env::var("TRIUMVIRATE_AGY_EXPECTED_VERSION").unwrap_or_else(|_| "1.0.2".to_string())
+    // 2026-09-19 (D-007): 1.2.7 is what is installed and what every dispatch actually runs.
+    // The old default said 1.0.2 and the env said 1.1.5, so the pin warned on EVERY agy call
+    // and the warning became furniture. A pin nobody can act on is not a pin.
+    //
+    // Honest about what this records: the REQ-060-064 verification battery was NOT re-run for
+    // 1.2.7. This pin says "this is the version we run", not "this version was validated".
+    // Moving it to mean the second thing requires running that battery and saying so here.
+    std::env::var("TRIUMVIRATE_AGY_EXPECTED_VERSION").unwrap_or_else(|_| "1.2.7".to_string())
 }
 
 /// Whether an agy version mismatch refuses the backend (vs. warn only). REQ-059.

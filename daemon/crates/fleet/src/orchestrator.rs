@@ -79,14 +79,7 @@ impl AgentLauncher for DaemonAgentLauncher {
         }
 
         let (cmd, args): (String, Vec<String>) = match agent {
-            "codex" => (
-                "codex".to_string(),
-                // `codex exec` takes the prompt as a positional argument. `--message` is not a
-                // flag it accepts (usage error on 0.154.0, verified 2026-09-12), so this spawn
-                // died at argv parse before running any task.
-                // `--` so a prompt that begins with a dash is a prompt, not a flag.
-                vec!["exec".to_string(), "--".to_string(), task_prompt.to_string()],
-            ),
+            "codex" => ("codex".to_string(), fleet_codex_argv(task_prompt)),
             "gemini" => match mcp_bridge::gemini_backend() {
                 // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
                 // Under agy it spawns the shared sandbox-exec invocation (single-turn,
@@ -268,7 +261,23 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         let mut worktree_paths = Vec::new();
         let mut running_agents = Vec::new();
         for (idx, agent) in agents.iter().enumerate() {
-            let task_id = format!("T-{:03}", idx + 1);
+            // D-015: task ids must be unique across fleets, not just within one. `tasks.task_id`
+            // is the ledger's PRIMARY KEY, so the bare `T-001` made the SECOND fleet in any repo
+            // die at once on `UNIQUE constraint failed: tasks.task_id`. One fleet per repo, ever.
+            //
+            // The fleet id goes INTO the task id rather than into a composite key, on Grok's
+            // analysis of the whole change surface. A composite (fleet_id, task_id) key closes
+            // only the INSERT: every `WHERE task_id = ?1` (claim, complete, four fail paths,
+            // dependency checks) would then silently update EVERY fleet's `T-001` at once, the
+            // MCP claim request carries no fleet_id, and `CREATE TABLE IF NOT EXISTS` would never
+            // rebuild an existing ledger.db, so real repos would keep the old key. Making the
+            // string unique keeps every one of those statements correct as written.
+            //
+            // Path-safe on purpose: a `/` here would nest directories under `Path::join`.
+            // The worktree name becomes `{fleet_id}-{fleet_id}-T-001-{agent}`. That repetition is
+            // ugly and CORRECT. Do not tidy it by dropping the leading `{fleet_id}-` unless the
+            // formula below, `fleet_ledger_snapshot`, and recovery's prefix match change together.
+            let task_id = format!("{fleet_id}-T-{:03}", idx + 1);
             let branch = format!("fleet/{fleet_id}/{task_id}");
             let worktree_path = base.join(format!("{fleet_id}-{task_id}-{agent}"));
             task_store.insert_task(&task_id, &fleet_id, &task_id, &[])?;
@@ -1117,6 +1126,21 @@ pub fn mark_fleet_cancelled(project_root: &Path, fleet_id: &str, reason: &str) -
     .is_ok()
 }
 
+
+/// The argv a fleet member's codex is spawned with. Pure, so it can be checked against the
+/// installed binary (D-011).
+///
+/// `codex exec` takes the prompt as a positional argument. `--message` is not a flag it accepts
+/// (usage error on 0.154.0, verified 2026-09-12), so the spawn once died at argv parse before
+/// running any task. `--` so a prompt that begins with a dash is a prompt, not a flag.
+///
+/// This was an inline tuple inside the spawn match, which is why it had no parse oracle: three
+/// of four codex argv surfaces emitted a flag the binary rejected in 2026-09 and every test
+/// stayed green, because the tests asserted what Triumvirate built, not what codex parses.
+pub fn fleet_codex_argv(task_prompt: &str) -> Vec<String> {
+    vec!["exec".to_string(), "--".to_string(), task_prompt.to_string()]
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
@@ -1349,17 +1373,21 @@ mod tests {
             .await
             .expect("spawn");
 
+        // The REAL id the spawn wrote. This used to be the literal "T-001": after D-015 that
+        // names a task that does not exist and a branch nobody created, and the mock gitops
+        // would still report the merge as a success. Green merge, wrong ref (Grok, D-015 review).
+        let task_id = format!("{}-T-001", spawned.fleet_id);
         let tasks = FleetTaskStore::new(project_root.clone()).expect("task store");
-        tasks.complete_task("T-001").expect("complete");
+        tasks.complete_task(&task_id).expect("complete");
 
         let mut merge = MergeCoordinator::new(MockGitOps {
             touched: Arc::new(Mutex::new(Vec::new())),
         })
         .with_project_root(project_root.clone());
-        merge.enqueue_completed("T-001", format!("fleet/{}/T-001", spawned.fleet_id));
-        merge.set_review_status("T-001", ReviewGateState::Approved, None);
+        merge.enqueue_completed(&task_id, format!("fleet/{}/{task_id}", spawned.fleet_id));
+        merge.set_review_status(&task_id, ReviewGateState::Approved, None);
         let merged = merge.merge_next().await.expect("merge");
-        assert_eq!(merged.as_deref(), Some("T-001"));
+        assert_eq!(merged.as_deref(), Some(task_id.as_str()));
 
         let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
             .expect("open sqlite");
@@ -1380,6 +1408,115 @@ mod tests {
                 .expect("count lifecycle event");
             assert!(count >= 1, "missing event type: {event_type}");
         }
+    }
+
+    /// Shared setup for the D-015 class checks: one project, one ledger, a recording launcher.
+    fn d015_project() -> (tempfile::TempDir, PathBuf, FleetOrchestrator<MockGitOps, RecordingLauncher>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) },
+            RecordingLauncher::default(),
+        );
+        (temp, project_root, orchestrator)
+    }
+
+    async fn d015_spawn(
+        orchestrator: &FleetOrchestrator<MockGitOps, RecordingLauncher>,
+        project_root: &Path,
+        agents: &[&str],
+    ) -> String {
+        orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.to_path_buf(),
+                agents: agents.iter().map(|a| a.to_string()).collect(),
+                dry_run: false,
+                wait: Some(true),
+                task_description: "d015".to_string(),
+            })
+            .await
+            .expect("a second fleet in the same repo must spawn")
+            .fleet_id
+    }
+
+    fn d015_rows(project_root: &Path) -> Vec<(String, String, String)> {
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+            .expect("open sqlite");
+        let mut stmt = conn
+            .prepare("SELECT fleet_id, task_id, state FROM tasks ORDER BY fleet_id, task_id")
+            .expect("prepare");
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect()
+    }
+
+    /// D-015, THE NAMED CASE, asserted as the class: two fleets in one repo BOTH keep their rows.
+    ///
+    /// The defect's own check ("two consecutive spawns both reach running") is not enough on
+    /// its own. The existing two-spawn test below returns before it looks at the ledger, so a
+    /// fix that let the second INSERT win by overwriting the first would still pass it.
+    /// RED IF: the task id loses its fleet prefix.
+    #[tokio::test]
+    async fn d015_two_fleets_in_one_repo_both_keep_every_row() {
+        let (_temp, root, orchestrator) = d015_project();
+        let a = d015_spawn(&orchestrator, &root, &["codex", "claude"]).await;
+        let b = d015_spawn(&orchestrator, &root, &["codex", "claude"]).await;
+        assert_ne!(a, b);
+
+        let rows = d015_rows(&root);
+        assert_eq!(rows.len(), 4, "two fleets of two tasks each must leave four rows: {rows:?}");
+        for fleet in [&a, &b] {
+            let mine: Vec<&(String, String, String)> = rows.iter().filter(|r| &r.0 == fleet).collect();
+            assert_eq!(mine.len(), 2, "fleet {fleet} lost rows: {rows:?}");
+            for r in mine {
+                assert!(r.1.starts_with(&format!("{fleet}-")), "task id is not scoped to its fleet: {r:?}");
+            }
+        }
+    }
+
+    /// The part of the class the named check never reaches. Every mutating statement in this
+    /// crate is `WHERE task_id = ?1`; if two fleets could hold the same id, finishing a task in
+    /// one would silently finish it in the other.
+    /// RED IF: completing fleet B's first task changes fleet A's first task.
+    #[tokio::test]
+    async fn d015_finishing_one_fleets_task_does_not_touch_the_other_fleet() {
+        let (_temp, root, orchestrator) = d015_project();
+        let a = d015_spawn(&orchestrator, &root, &["codex"]).await;
+        let b = d015_spawn(&orchestrator, &root, &["codex"]).await;
+        let before_a: Vec<_> = d015_rows(&root).into_iter().filter(|r| r.0 == a).collect();
+
+        FleetTaskStore::new(root.clone())
+            .expect("task store")
+            .complete_task(&format!("{b}-T-001"))
+            .expect("complete B's task");
+
+        let after = d015_rows(&root);
+        let after_a: Vec<_> = after.iter().filter(|r| r.0 == a).cloned().collect();
+        assert_eq!(after_a, before_a, "completing fleet B's task changed fleet A: {after:?}");
+        assert!(
+            after.iter().any(|r| r.0 == b && r.2 == "done"),
+            "and B's own task really did complete: {after:?}"
+        );
+    }
+
+    /// A ledger written BEFORE this change holds a bare `T-001`. That row must not block a new
+    /// fleet, and must survive it. This is the operator's real case: nobody wipes the ledger.
+    /// RED IF: a legacy bare-id row collides with or is overwritten by a new fleet.
+    #[tokio::test]
+    async fn d015_a_ledger_with_a_legacy_bare_task_id_still_takes_a_new_fleet() {
+        let (_temp, root, orchestrator) = d015_project();
+        let store = FleetTaskStore::new(root.clone()).expect("task store");
+        store.insert_fleet("fleet-legacy", "written before D-015").expect("legacy fleet");
+        store.insert_task("T-001", "fleet-legacy", "T-001", &[]).expect("legacy bare-id row");
+
+        let fresh = d015_spawn(&orchestrator, &root, &["codex"]).await;
+
+        let rows = d015_rows(&root);
+        assert!(rows.iter().any(|r| r.0 == "fleet-legacy" && r.1 == "T-001"), "legacy row lost: {rows:?}");
+        assert!(rows.iter().any(|r| r.0 == fresh), "new fleet has no rows: {rows:?}");
     }
 
     #[tokio::test]
