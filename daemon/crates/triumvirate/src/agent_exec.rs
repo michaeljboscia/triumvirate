@@ -312,7 +312,111 @@ pub(crate) fn persist_deepseek_err_tokens(
         agent.model = tracing::field::Empty
     )
 )]
+/// Every ask call, whatever its caller, goes through here and leaves exactly one ledger event.
+///
+/// `execute_ask_agent` has callers all over: the MCP entry, named sessions, streaming, the Gemini
+/// query tools, and mandatory peer review (in process). Emitting from inside it would mean one
+/// emission point per return path (success, degraded, rejected, failed), which is the
+/// two-surfaces defect this codebase keeps reproducing. Wrapping the function gives one seam,
+/// and every outcome, including failures, passes through it. (wiki-usage brief, step one.)
 pub(crate) async fn execute_ask_agent(
+    req: &AskAgentRequest,
+    progress: Option<ProgressEmitter>,
+) -> Result<AskAgentResponse, String> {
+    let started = Instant::now();
+    let outcome = Box::pin(execute_ask_agent_inner(req, progress)).await;
+    record_ask_call_event(req, &outcome, started.elapsed());
+    outcome
+}
+
+/// Write one raw-evidence `wiki_call` event for this call to the project ledger, and return the
+/// database it went to. Best effort: a ledger failure is logged and never fails the call.
+///
+/// RAW EVIDENCE ONLY, by the jury's consensus (brief, "Jury on the design"): no classification is
+/// stored, so the rules that interpret it can improve and be re-run over old events. And NO TEXT:
+/// no prompt, no response, and no error string, because a failure's error can quote the rejected
+/// reply verbatim (the sight gate appends up to 600 characters of it).
+///
+/// The ledger is chosen exactly as the call's own work chose it: `resolve_context` on the same
+/// request fields, then the canonical project root the peer-review ledger also uses. A call with
+/// no `cwd` runs in `.`, the DAEMON's working directory, and its event lands there; that is why
+/// the path is returned and logged rather than assumed.
+pub(crate) fn record_ask_call_event(
+    req: &AskAgentRequest,
+    outcome: &Result<AskAgentResponse, String>,
+    latency: Duration,
+) -> Option<PathBuf> {
+    let (resolved_cwd, _, _) =
+        core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
+    let exec_cwd = resolved_cwd.unwrap_or_else(|| ".".to_string());
+    let root = resolve_absolute_project_root(&exec_cwd).ok()?;
+
+    let agent_requested = mcp_bridge::normalize_agent_name(&req.agent);
+    let mut payload = serde_json::json!({
+        "schema": 1,
+        "agent_requested": agent_requested,
+        "required_sources": req.required_sources,
+        "is_peer_review": req.is_peer_review.unwrap_or(false),
+        "strict_agent": req.strict_agent.unwrap_or(false),
+        "latency_ms": latency.as_millis() as u64,
+    });
+    // One event per call, keyed on the call. `session_id = request_id` with sequence 1 is unique by
+    // construction. The fleet crate's `MAX(sequence) + 1` is a read-then-write race, and under
+    // `UNIQUE(session_id, event_type, sequence)` a lost race is a failed INSERT, i.e. a lost event.
+    let session_id = match outcome {
+        Ok(resp) => {
+            let answered_by = resp
+                .answered_by_agent
+                .clone()
+                .unwrap_or_else(|| agent_requested.clone());
+            payload["outcome"] = "answered".into();
+            payload["request_id"] = resp.request_id.clone().into();
+            payload["answered_by_agent"] = mcp_bridge::normalize_agent_name(&answered_by).into();
+            payload["answered_by_backend"] = serde_json::json!(resp.answered_by_backend);
+            payload["degraded_from_backend"] = serde_json::json!(resp.degraded_from_backend);
+            payload["degradation_reason"] = serde_json::json!(resp.degradation_reason);
+            payload["model"] = serde_json::json!(resp.model);
+            payload["strict_agent_honored"] = serde_json::json!(resp.strict_agent_honored);
+            payload["tool_calls_made"] = serde_json::json!(resp.tool_calls_made);
+            payload["response_chars"] = (resp.response.chars().count() as u64).into();
+            resp.request_id.clone()
+        }
+        // No request id survives a failure to this seam, so the event gets its own. The error text
+        // is deliberately not stored (see above).
+        Err(_) => {
+            payload["outcome"] = "failed".into();
+            format!("failed-{}", Uuid::new_v4())
+        }
+    };
+
+    let write = || -> anyhow::Result<()> {
+        std::fs::create_dir_all(root.join(".triumvirate").join("spool"))?;
+        let store = LedgerStore::open(root.clone())?;
+        store.ingest_event(shared_types::RawEvent {
+            session_id,
+            event_type: "wiki_call".to_string(),
+            sequence: 1,
+            // The real time. The fleet crate writes a hardcoded "2030-01-01T00:00:00Z" here, which
+            // is a fabricated value; retention keys on `created_at`, so it does not break the
+            // sweep, but it is not copied.
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            payload_json: payload.to_string(),
+        })
+    };
+    let db = root.join(".triumvirate").join("ledger.db");
+    match write() {
+        Ok(()) => {
+            tracing::debug!(ledger = %db.display(), "wiki_call event recorded");
+            Some(db)
+        }
+        Err(e) => {
+            tracing::warn!(ledger = %db.display(), error = %e, "wiki_call event NOT recorded");
+            None
+        }
+    }
+}
+
+async fn execute_ask_agent_inner(
     req: &AskAgentRequest,
     progress: Option<ProgressEmitter>,
 ) -> Result<AskAgentResponse, String> {

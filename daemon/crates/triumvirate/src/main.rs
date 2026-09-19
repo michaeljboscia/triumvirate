@@ -4124,6 +4124,109 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    /// Every `wiki_call` event in the ledger under `root`, as (session_id, payload).
+    fn wiki_call_events(root: &std::path::Path) -> Vec<(String, serde_json::Value)> {
+        let db = root.join(".triumvirate").join("ledger.db");
+        let conn = rusqlite::Connection::open(&db).expect("open the ledger the call wrote to");
+        let mut stmt = conn
+            .prepare("SELECT session_id, payload_json FROM events WHERE event_type = 'wiki_call'")
+            .expect("prepare");
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .expect("query")
+            .map(|r| {
+                let (sid, payload) = r.expect("row");
+                (sid, serde_json::from_str(&payload).expect("payload is JSON"))
+            })
+            .collect()
+    }
+
+    /// THE SINK PROOF (wiki-usage brief, step one): a real call through the real
+    /// `execute_ask_agent` leaves exactly one event, in the ledger of the project the call ran in,
+    /// read back out of that database, with no prompt or response text in it.
+    /// RED IF: the ask path stops writing, writes twice, writes to a different ledger, or writes text.
+    #[tokio::test]
+    async fn wiki_call_01_one_answered_call_leaves_one_textless_event_in_its_own_ledger() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir()?;
+        let codex = write_mock_agent_script("codex", 0.0)?;
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+        let prompt = "SECRET-PROMPT-TOKEN-7731 please answer";
+        let outcome = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: prompt.to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_BIN") };
+        let _ = fs::remove_file(&codex);
+        let resp = outcome.map_err(anyhow::Error::msg)?;
+
+        let root = fs::canonicalize(project.path())?;
+        eprintln!("wiki_call ledger: {}", root.join(".triumvirate").join("ledger.db").display());
+        let events = wiki_call_events(&root);
+        assert_eq!(events.len(), 1, "exactly one event per call: {events:?}");
+        let (session_id, p) = &events[0];
+        assert_eq!(session_id, &resp.request_id, "keyed on the call it describes");
+        assert_eq!(p["outcome"], "answered");
+        assert_eq!(p["agent_requested"], "codex");
+        assert_eq!(p["answered_by_agent"], "codex", "the seat that ANSWERED, always recorded");
+        assert_eq!(p["response_chars"], serde_json::json!(resp.response.chars().count()));
+
+        let raw = p.to_string();
+        assert!(!raw.contains("SECRET-PROMPT-TOKEN-7731"), "prompt text reached the ledger: {raw}");
+        assert!(!raw.contains(&resp.response), "response text reached the ledger: {raw}");
+        Ok(())
+    }
+
+    /// A FAILED call is a call too, and its error is the most dangerous text of all: a sight-gate
+    /// rejection quotes the rejected reply. One event, outcome failed, no error string.
+    /// RED IF: failures stop being recorded, or the error text leaks into the ledger.
+    #[tokio::test]
+    async fn wiki_call_02_a_failed_call_still_leaves_one_event_without_its_error_text() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir()?;
+        let failing = write_failing_agent_script("codex")?;
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", failing.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::set_var("TRIUMVIRATE_HOME", project.path().join("home"));
+        }
+        let err = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: "SECRET-PROMPT-TOKEN-4419".to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("the failing stand-in must fail the call");
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_HOME");
+        }
+        let _ = fs::remove_file(&failing);
+
+        let events = wiki_call_events(&fs::canonicalize(project.path())?);
+        assert_eq!(events.len(), 1, "a failure is still one call: {events:?}");
+        let raw = events[0].1.to_string();
+        assert_eq!(events[0].1["outcome"], "failed");
+        assert!(!raw.contains("SECRET-PROMPT-TOKEN-4419"), "prompt leaked: {raw}");
+        let err_head: String = err.chars().take(40).collect();
+        assert!(!raw.contains(&err_head), "the error string leaked into the ledger: {raw}");
+        Ok(())
+    }
+
     // ---------------------------------------------------------------------------------------
     // D-011: every codex argv surface, checked against the INSTALLED binary.
     //
