@@ -65,6 +65,11 @@ pub struct AiGeneration<'a> {
     /// The actual prompt and completion. See CallTelemetry::input/output.
     pub input: Option<&'a str>,
     pub output: Option<&'a str>,
+    /// Why the call failed, or why a gate declined it (D-004). Emitted as `$ai_error` on an error
+    /// outcome and as `tv_detail` whenever present. The cause used to be captured by the guard and
+    /// then sent only to a separate `$exception`, so the generation itself said "error" and never
+    /// said what.
+    pub error: Option<&'a str>,
 }
 
 /// Reduce an absolute repo path to its bounded, readable name. Anything that is already a
@@ -288,6 +293,7 @@ impl Drop for CallTelemetry {
             repo: self.repo.as_deref(),
             input: self.input.as_deref(),
             output: self.output.as_deref(),
+            error: self.detail.as_deref(),
         });
 
         // A failure is also an issue in error tracking. ONLY on a real failure:
@@ -1240,7 +1246,34 @@ pub fn record_dispatch_generation(
         repo: repo_basename.as_deref(),
         input: Some(told),
         output: Some(produced),
+        // The second surface that emits failed generations. Fixing only the guard above would
+        // have closed the named case and left every failed dispatch causeless.
+        error: is_error.then_some(produced),
     });
+}
+
+/// The cause text for an error generation. Never empty.
+fn error_text(outcome: &str, detail: Option<&str>) -> String {
+    match detail.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d.to_string(),
+        None => match outcome {
+            "cancelled" => "cancelled by the caller before the call finished (client-side \
+                            timeout or disconnect); no provider error was received"
+                .to_string(),
+            "unreported" => "the call ended without recording any outcome".to_string(),
+            other => format!("the call ended with outcome '{other}' and no recorded cause"),
+        },
+    }
+}
+
+/// Bounded so a long failure chain cannot push the event toward PostHog's 1MB drop limit.
+/// PostHog's Errors tab normalizes and groups on this text, so the head is what matters.
+fn cap_error_text(text: &str) -> String {
+    const MAX: usize = 2000;
+    match text.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_string(),
+    }
 }
 
 /// Build the `$ai_generation` property bag. Split out from `record_ai_generation` so the exact
@@ -1323,6 +1356,17 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
     // the object entirely when it is Some(Value) (verified live: set_input ran, the tel held the
     // input at Drop, yet $ai_input never reached PostHog). Inserting into the Value::Object is
     // unambiguous: the key is present exactly when we have content.
+    // D-004. An event marked `$ai_is_error` ALWAYS carries a non-empty `$ai_error`: that is the
+    // whole check, so it holds by construction rather than by every caller remembering. A call
+    // that ends with no recorded cause (a caller-side cancel, an unclassified exit) says so in
+    // words instead of shipping silence, because "error, reason unknown" and "error" read the
+    // same on a dashboard and only one of them is honest.
+    if let Some(detail) = g.error {
+        props["tv_detail"] = json!(cap_error_text(detail));
+    }
+    if is_error {
+        props["$ai_error"] = json!(cap_error_text(&error_text(g.outcome, g.error)));
+    }
     if let Some(s) = g.input {
         props["$ai_input"] = json!([{ "role": "user", "content": mask_and_cap_content(s) }]);
     }
@@ -1382,8 +1426,83 @@ mod tests {
             t.outcome, "failure",
             "only `failure` raises AgentCallFailed in Drop; a working gate must not page"
         );
-        // The detail is still carried, so the rejection is inspectable in the generation.
-        assert!(t.detail.is_some(), "the reason must survive for charting");
+        // The detail must reach the EMITTED generation, not merely the guard's struct. This
+        // assertion used to be `t.detail.is_some()`, which checked the holder and passed while
+        // the event itself never carried the reason at all (D-004).
+        let props = ai_generation_props(&AiGeneration {
+            agent: "codex", model: None, outcome: t.effective_outcome(), trace_id: "t",
+            input_tokens: None, output_tokens: None, cached_tokens: None, thinking_tokens: None,
+            tool_calls: None, duration_ms: 1, cost_usd: None, billing: "subscription",
+            backend: None, attempts: 1, repo: None, input: None, output: None,
+            error: t.detail.as_deref(),
+        });
+        assert_eq!(props["tv_detail"], serde_json::json!("never opened the named source"));
+        assert!(props.get("$ai_error").is_none(), "a declined turn is not an error: {props}");
+    }
+
+    fn generation(outcome: &str, error: Option<&str>) -> serde_json::Value {
+        ai_generation_props(&AiGeneration {
+            agent: "codex", model: None, outcome, trace_id: "t", input_tokens: None,
+            output_tokens: None, cached_tokens: None, thinking_tokens: None, tool_calls: None,
+            duration_ms: 1, cost_usd: None, billing: "subscription", backend: None, attempts: 1,
+            repo: None, input: None, output: None, error,
+        })
+    }
+
+    /// D-004's check, for every outcome that is an error: the generation carries a cause string.
+    /// RED IF: any error generation ships `$ai_is_error: true` with no `$ai_error`, or an empty one.
+    #[test]
+    fn every_error_generation_carries_a_non_empty_cause() {
+        let with_cause = generation("failure", Some("agy capacity/quota: RESOURCE_EXHAUSTED"));
+        assert_eq!(with_cause["$ai_is_error"], serde_json::json!(true));
+        assert_eq!(with_cause["$ai_error"], serde_json::json!("agy capacity/quota: RESOURCE_EXHAUSTED"));
+
+        // The cases with NO recorded detail. These are exactly the 2026-07-28 and 2026-08-06
+        // generations that reached PostHog as an error with nothing else on them.
+        for outcome in ["cancelled", "unreported", "failure"] {
+            for detail in [None, Some(""), Some("   ")] {
+                let g = generation(outcome, detail);
+                let cause = g["$ai_error"].as_str().unwrap_or_default();
+                assert!(!cause.trim().is_empty(), "{outcome}/{detail:?} shipped no cause: {g}");
+            }
+        }
+        assert!(
+            generation("cancelled", None)["$ai_error"].as_str().unwrap_or_default().contains("cancelled by the caller"),
+            "a cancel must say it was a cancel, not that the provider failed"
+        );
+    }
+
+    /// Successes and declined turns are not errors and must not look like them.
+    #[test]
+    fn non_errors_carry_no_ai_error() {
+        for outcome in ["success", "degraded_success", "policy_rejected"] {
+            assert!(generation(outcome, Some("x")).get("$ai_error").is_none(), "{outcome} is not an error");
+        }
+    }
+
+    /// Long failure chains are capped, not dropped, and the head survives.
+    #[test]
+    fn a_long_cause_is_capped_not_lost() {
+        let long = format!("agy attempt 1/1: quota -> {}", "x".repeat(10_000));
+        let cause = generation("failure", Some(&long))["$ai_error"].as_str().unwrap_or_default().to_string();
+        assert!(cause.starts_with("agy attempt 1/1: quota"), "the head is what the Errors tab groups on");
+        assert!(cause.chars().count() <= 2003);
+    }
+
+    /// The SECOND surface: dispatched codex workers emit failed generations too.
+    /// RED IF: a failed dispatch generation ships without its diagnosis.
+    #[test]
+    fn a_failed_dispatch_generation_carries_its_diagnosis() {
+        // `record_dispatch_generation` passes `produced` as the error on failure; mirror its call.
+        let produced = "worker exited 1: cargo test failed in daemon/crates/fleet";
+        let g = ai_generation_props(&AiGeneration {
+            agent: "codex", model: None, outcome: "failure", trace_id: "t", input_tokens: None,
+            output_tokens: None, cached_tokens: None, thinking_tokens: None, tool_calls: None,
+            duration_ms: 1, cost_usd: None, billing: "subscription",
+            backend: Some("dispatch_codex_worktree"), attempts: 0, repo: None,
+            input: Some("told"), output: Some(produced), error: true.then_some(produced),
+        });
+        assert_eq!(g["$ai_error"], serde_json::json!(produced));
     }
 
     /// The reclassification must not have made real failures silent.
@@ -1510,6 +1629,7 @@ mod tests {
             repo: None,
             input: Some("my api_key: sk-livedeadbeef0123456789"),
             output: Some("done"),
+            error: None,
         };
         let ev = ai_generation_props(&g);
         assert_eq!(ev["$ai_input"][0]["role"], serde_json::json!("user"));
@@ -1570,6 +1690,7 @@ mod tests {
             repo: None,
             input: None,
             output: None,
+            error: None,
         };
         let ev = ai_generation_props(&g);
         assert_eq!(ev["tv_outcome"], serde_json::json!("cancelled"));

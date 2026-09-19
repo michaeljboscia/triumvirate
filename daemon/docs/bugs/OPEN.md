@@ -19,24 +19,30 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-### D-004 — Failed generations carry no error text
-**Found:** 2026-07-28 · **Severity:** MEDIUM · **Partially resolved 2026-08-07**
-**Evidence:** the three failed `$ai_generation` events of 2026-07-28 carry
-`tv_outcome = "unreported"` and nothing else. `$ai_error` does not exist in this project's
-taxonomy. Recurred 2026-08-06: three more DeepSeek dispatches (`180.001s`, `68.083s`,
-`180.0s`; `model=unknown`, one primary attempt, metered) landed as `unreported`.
-
-**RESOLVED (the outcome half, 2026-08-07):** those drops were the caller's client-side
-`ask_agent` ceiling (180s) cancelling the daemon's `execute_ask_agent` future before any
-classify() arm ran, so `CallTelemetry` emitted its `unreported` default. `CallTelemetry` now
-arms on dispatch (`begin_dispatch`) and, on a drop with no recorded outcome while in-flight,
-emits `tv_outcome = "cancelled"` (an error outcome, visible to outcome-based monitoring). The
-`unreported` sentinel is retained for a genuinely unclassified *synchronous* exit. DeepSeek is
-the prone path: its absolute SLA is 1800s, far past the 180s client ceiling.
-
-**Still open (the cause-string half):** a `cancelled`/`failure` generation still carries no
-provider cause string — `$ai_error` does not exist in the taxonomy.
-**Check:** a failed generation in PostHog carries a cause string.
+### D-004 - Failed generations carry no error text
+**Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
+**Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried
+`tv_outcome` and nothing else; `$ai_error` did not exist in this project's taxonomy. The outcome
+half was resolved 2026-08-07 (`cancelled` instead of `unreported`).
+**What was actually wrong (found 2026-09-19):** the cause WAS captured. `CallTelemetry::failure`
+stored it in `self.detail`, and it was then sent only to a separate `$exception` event: the
+`AiGeneration` struct had no field for it, so the generation itself said "error" and never said
+what. An existing test claimed "the rejection is inspectable in the generation" and asserted
+`t.detail.is_some()`, which checked the holder and passed while the event never carried it.
+**Fixed:** `AiGeneration` carries `error`, emitted as PostHog's documented `$ai_error` ("the error
+message or object", confirmed against posthog.com/docs/ai-observability/generations) on every
+error outcome, and as `tv_detail` whenever present. BY CONSTRUCTION an event marked
+`$ai_is_error: true` now always carries a non-empty `$ai_error`: a caller-side cancel or an
+unclassified exit says so in words rather than shipping silence. Covered on BOTH surfaces that
+emit failed generations, the telemetry guard and `record_dispatch_generation`; fixing only the
+first would have left every failed dispatch causeless. The misleading test now asserts on the
+emitted payload. Removing the fallback cause turns `every_error_generation_carries_a_non_empty_cause` red.
+**Why it is not closed:** the check is "a failed generation IN POSTHOG carries a cause string",
+and nothing lands in PostHog while the account is over quota (D-018 measured it). The payload
+is proven; its arrival is not, and closing on the payload would be closing on reasoning.
+**Unblocks:** 2026-09-20 14:03 ET.
+**Check:** with `/health` reporting `telemetry_delivery: trusted`, force one failed dispatch and
+find its `$ai_error` in PostHog.
 
 ### D-005 - Instrumentation streams gone silent, cause unknown
 **Found:** 2026-07-28 · **Severity:** LOW · **Blocked on an external reset, NOT fixed**
