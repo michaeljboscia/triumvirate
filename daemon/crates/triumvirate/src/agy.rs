@@ -1925,4 +1925,44 @@ mod breaker_probe_tests {
         assert!(!out.closed_by_probe, "but it is not the answer, so traffic must not resume");
         assert_eq!(agy_breaker_snapshot().phase, "open");
     }
+
+    /// D-006. 1,783 health probes over 30 days, 100% healthy, zero failures: a monitor that has
+    /// never fired has been RUN, not TESTED. This forces each failure branch and reads the thing
+    /// `/health` actually reports, not the probe's return value.
+    /// RED IF: a failing agy is reported healthy, or a silent capture drop is reported healthy.
+    #[tokio::test]
+    #[ignore = "mutates the process-global agy env; run with scripts/verify-live-agents.sh strict"]
+    async fn probe_05_the_health_probe_reports_both_failure_branches() {
+        use mcp_bridge::agy_resilience::agy_health_snapshot;
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = tests::ENV_LOCK.lock().await;
+
+        // Branch 1: the backend fails outright (non-zero exit).
+        {
+            let _fx = setup("echo 'fatal: agy backend unavailable' 1>&2; exit 3");
+            health_probe().await;
+            let h = agy_health_snapshot();
+            assert_eq!(h.backend_health, "failed", "a failing agy must read as failed: {h:?}");
+            assert!(h.last_probe_unix_ms.is_some(), "and the probe must be recorded as having run");
+        }
+
+        // Branch 2: exit 0 with NOTHING on stdout, the silent capture drop that real traffic
+        // cannot tell apart from a legitimate empty answer. This is the branch that exists to
+        // catch a regression nobody would otherwise see.
+        {
+            let _fx = setup("exit 0");
+            health_probe().await;
+            let h = agy_health_snapshot();
+            assert_eq!(h.capture_health, "degraded", "an empty exit-0 must read as degraded: {h:?}");
+        }
+
+        // Control: a healthy agy reads healthy, so the two assertions above are not simply what
+        // this snapshot always says.
+        {
+            let _fx = setup("printf '{\"event\":\"init\",\"conversation_id\":\"c1\",\"init\":{}}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"4\"}}\n'");
+            health_probe().await;
+            let h = agy_health_snapshot();
+            assert_eq!((h.capture_health.as_str(), h.backend_health.as_str()), ("ok", "ok"), "{h:?}");
+        }
+    }
 }

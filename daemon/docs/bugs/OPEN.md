@@ -55,14 +55,6 @@ what this file forbids.
 **Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
 stream once and find the event in PostHog.
 
-### D-006 — agy health probe has never exercised its failure branch
-**Found:** 2026-07-28 · **Severity:** MEDIUM
-**Evidence:** 1783 `tv_agy_health` probes over 30 days, 100% `ok/ok/healthy`, zero failures.
-**Why it matters:** a monitor that has never fired has been run, not tested. We do not know
-that it can report unhealthy, and it is one of the few live signals we have.
-**Check:** force the backend unhealthy and confirm the probe reports it.
-**Tile:** "agy health probe — has its failure path ever run?" (dashboard 1886865).
-
 ### D-008 — 2026-05-25 session/ask intermittent failure, hypotheses 1/3/4/5 unresolved
 **Found:** 2026-05-25 · **Severity:** MEDIUM
 **Evidence:** `2026-05-25-daemon-session-ask-intermittent-failure.md`. Hypothesis #2
