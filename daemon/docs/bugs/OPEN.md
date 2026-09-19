@@ -90,14 +90,6 @@ that it can report unhealthy, and it is one of the few live signals we have.
 **Check:** force the backend unhealthy and confirm the probe reports it.
 **Tile:** "agy health probe — has its failure path ever run?" (dashboard 1886865).
 
-### D-007 — agy is running past its version pin, warn-only
-**Found:** 2026-07-28 · **Severity:** MEDIUM
-**Evidence:** installed 1.1.8 against a pinned expected 1.1.5. Two daemons booted drifted on
-2026-07-28. Drift proceeds unless `TRIUMVIRATE_AGY_STRICT_VERSION=true`.
-**Why it matters:** every dispatch runs against an unvalidated binary.
-**Check:** either validate 1.1.8 and move the pin, or set strict mode and pin down.
-**Tile:** "agy version drift — what the pin says vs what is installed" (dashboard 1886865).
-
 ### D-008 — 2026-05-25 session/ask intermittent failure, hypotheses 1/3/4/5 unresolved
 **Found:** 2026-05-25 · **Severity:** MEDIUM
 **Evidence:** `2026-05-25-daemon-session-ask-intermittent-failure.md`. Hypothesis #2
@@ -208,6 +200,21 @@ landing and cannot be until quota is restored. It is written and unverified.
 
 
 ## Closed
+
+### 2026-09-19: agy ran past its version pin on every dispatch (D-007)
+The pin was 1.1.5 in `~/.claude.json` and 1.0.2 as the code default, while 1.2.7 was installed
+and serving every call, so the mismatch warning fired on every agy dispatch. A warning that
+fires unconditionally is furniture: nobody acts on it, and it trains the reader to skip the
+line where a real mismatch would one day appear.
+Owner's decision (2026-09-19): move the pin to what is installed and stay warn-only. Set to
+1.2.7 in both places, and the doc comment that called the default "the last version verified
+against the live binary" was corrected, because it was no longer true.
+**Recorded plainly, so the pin is not read as more than it is:** the REQ-060-064 verification
+battery was NOT re-run for 1.2.7. This pin now means "the version we run", not "a validated
+version". Making it mean the second requires running that battery and updating the comment.
+**CHECK PASSED:** the daemon restarted with `TRIUMVIRATE_AGY_EXPECTED_VERSION=1.2.7` against
+an installed 1.2.7 emits no version-mismatch warning.
+
 
 ### 2026-09-19: agy quota detectors matched benign glog noise (D-014)
 `classify_failure_message` matched ANY occurrence of `429` and ANY occurrence of `quota`, so a
