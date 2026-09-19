@@ -1722,7 +1722,11 @@ mod breaker_probe_tests {
         let fx = ProbeFixture {
             _bin: tests::set_env_scoped("TRIUMVIRATE_AGY_BIN", Some(mock.to_str().expect("utf8"))),
             _args: tests::set_env_scoped("TRIUMVIRATE_AGY_ARGS", None),
-            _backoff: tests::set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some("")),
+            // ONE backoff entry, like production ("15,45"), with a zero wait. An EMPTY schedule
+            // hides the runner's own `record_quota` call, which only fires when a backoff
+            // remains. The first version of this fixture used "" and probe_02 passed while
+            // production would have ratcheted the cooldown on every failed probe.
+            _backoff: tests::set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some("0")),
             mock,
         };
         // Open the real breaker. Looped rather than counted so a threshold override still opens it.

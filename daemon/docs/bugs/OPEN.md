@@ -258,6 +258,22 @@ project_root, written at spawn, read on a miss; or an optional `project_root` on
 
 ## Closed
 
+### 2026-09-19: the agy health probe ratcheted an open breaker to the five hour cap
+`BreakerState::record_quota` and `record_other` kept counting while the breaker was already
+open. The 300s health probe goes through `run_agy_cli_process_with_session`, which calls
+`agy_breaker_record_quota` on a quota exit whenever a backoff remains, so every third probe
+re-tripped the open breaker, doubled the cooldown, and pushed `open_until` out from now. A
+healthy probe closed nothing: only `execute_ask_agent` calls `record_success`. This is why
+the 2026-09-19 quota reset did not close the breaker. Fixed in
+`mcp-bridge::agy_resilience`: a failure while Open is ignored; only a failed half-open probe
+extends the cooldown. `breaker_probe` (MCP tool, `POST /agy/breaker/probe`) closes it on
+demand. Check passed: `failures_while_open_never_extend_the_cooldown` (unit, 40 failures,
+`open_until` unmoved), and `probe_02` against the real global breaker with a
+production-shaped backoff went RED at `open_count` 4 before the fix and green after.
+NOT done, owner's call: the scheduled health probe still does not CLOSE the breaker on
+success. That comment says it stays away from request traffic on purpose.
+
+
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"
 The codex read classifier allowed `cat`/`head`/`nl`; codex-cli 0.145.0 reads files as
 `sed -n 'N,Mp' FILE` windows and `nl -ba FILE | sed -n`, so 4 of 4 gated reviews that day
@@ -308,4 +324,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-03
+**Last reviewed:** 2026-09-19
