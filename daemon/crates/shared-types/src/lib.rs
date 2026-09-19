@@ -158,6 +158,19 @@ pub struct AskAgentRequest {
     /// HardProvider(400) from DeepSeek; no client-side validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_model: Option<String>,
+
+    /// Never let another agent or backend answer for the one that was asked.
+    ///
+    /// The degraded route exists for Q&A, where an answer from codex beats no answer from
+    /// gemini. For a vote it is a corruption: on 2026-09-19 the mneme jury's gemini seat hit
+    /// its agy quota and seven parts came back answered by codex, with success status and a
+    /// warning prefix. A "unanimous" verdict there is codex agreeing with itself.
+    ///
+    /// When true the degraded route is skipped entirely, including the same-agent gemini-cli
+    /// hop, and the call fails with the requested backend's own error. Degradation becomes the
+    /// caller's decision. `ask_jury` always sets it. `None`/`false` keeps today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_agent: Option<bool>,
 }
 
 /// A REVIEW dispatch. Sight is not optional here, which is the entire point of the type.

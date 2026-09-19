@@ -18,6 +18,7 @@
 #   bash scripts/verify-live-agents.sh grok
 #   bash scripts/verify-live-agents.sh codex
 #   bash scripts/verify-live-agents.sh review   # mandatory peer review, mock reviewer, no network
+#   bash scripts/verify-live-agents.sh strict   # strict_agent never substitutes, mock binaries, no network
 #
 # Exit non-zero if any guard fails. Safe to wire into a scheduled job.
 
@@ -62,6 +63,24 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "review" ]; then
         echo "PASS  mandatory review end to end"
     else
         echo "FAIL  mandatory review end to end"
+        FAILED=1
+    fi
+fi
+
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "strict" ]; then
+    # strict_agent, end to end, with MOCK agy and codex binaries. No network, no quota.
+    #
+    # Single-threaded and opt-in for the same reason as the review guards: the mocks replace
+    # the agy and codex binaries for every dispatch in that test binary.
+    #
+    # strict_01 is the negative control. It proves the fixture really does substitute codex
+    # when strict is off, so strict_02 cannot be green merely because nothing degraded.
+    echo "RUN   strict_agent never substitutes"
+    if cargo test -p triumvirate --bin triumvirate strict_agent_tests \
+        -- --ignored --test-threads=1 2>&1 | tail -12; then
+        echo "PASS  strict_agent never substitutes"
+    else
+        echo "FAIL  strict_agent never substitutes"
         FAILED=1
     fi
 fi

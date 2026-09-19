@@ -1182,7 +1182,19 @@ pub(crate) async fn execute_ask_agent(
     // hard-failed (auth/exec/quota). Quota-class failures skip gemini-cli (shared
     // quota pool) and go straight to codex. The public agent stays `gemini`; a
     // successful hop returns with substitution-honesty fields + a one-line prefix.
-    if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+    //
+    // `strict_agent` skips the whole route. The caller asked for THIS seat, so the honest
+    // result of an unavailable backend is a failure naming that backend, not codex's answer.
+    let strict_agent = req.strict_agent.unwrap_or(false);
+    if strict_agent && matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+        let detail = "strict_agent: degraded route skipped, no other agent or backend may answer";
+        lifecycle.push(LifecycleEvent {
+            state: "STRICT_NO_SUBSTITUTION".to_string(),
+            detail: detail.to_string(),
+        });
+        failure_chain.push(detail.to_string());
+    }
+    if !strict_agent && matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
         let reason = last_err
             .clone()
             .unwrap_or_else(|| "agy backend failed".to_string());
@@ -8354,5 +8366,127 @@ mod grok_shell_read_gate_tests {
         let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
             .expect_err("wc is not a read");
         assert!(err.contains("never successfully opened"), "got: {err}");
+    }
+}
+
+/// `strict_agent`, end to end through `execute_ask_agent` with mock agy and codex binaries.
+///
+/// `#[ignore]` for the same reason as `mandatory_review_tests`: these point
+/// `TRIUMVIRATE_AGY_BIN` and `TRIUMVIRATE_CODEX_BIN` at mocks, which changes every dispatch in
+/// this binary. Run them with `scripts/verify-live-agents.sh strict`.
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)]
+mod strict_agent_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const ENV_KEYS: [&str; 6] = [
+        "TRIUMVIRATE_HOME",
+        "TRIUMVIRATE_GEMINI_BACKEND",
+        "TRIUMVIRATE_AGY_BIN",
+        "TRIUMVIRATE_AGY_ARGS",
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS",
+    ];
+
+    /// Cleanup lives in Drop so a failing assertion cannot leave the mocks installed.
+    struct StrictFixture {
+        dir: tempfile::TempDir,
+        codex_ran: PathBuf,
+    }
+
+    impl Drop for StrictFixture {
+        fn drop(&mut self) {
+            for key in ENV_KEYS {
+                unsafe { std::env::remove_var(key) };
+            }
+            // The quota exit below feeds the process-global breaker. Leave it closed.
+            mcp_bridge::agy_resilience::agy_breaker_record_success();
+        }
+    }
+
+    fn write_script(path: &std::path::Path, body: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write mock");
+        let mut perms = std::fs::metadata(path).expect("mock meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("chmod mock");
+    }
+
+    /// agy always fails on quota. codex always answers, and leaves a file saying it ran.
+    fn setup() -> StrictFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_ran = dir.path().join("codex-ran");
+        let agy = dir.path().join("mock-agy");
+        let codex = dir.path().join("mock-codex");
+        write_script(&agy, "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2");
+        write_script(
+            &codex,
+            &format!(
+                "touch '{}'\nIFS= read -r _line\necho '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"codex verdict\"}}}}'",
+                codex_ran.display()
+            ),
+        );
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        // SAFETY: serialised by the binary-wide env lock, cleared in Drop.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", dir.path().join("home"));
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "agy");
+            std::env::set_var("TRIUMVIRATE_AGY_BIN", &agy);
+            std::env::remove_var("TRIUMVIRATE_AGY_ARGS");
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", &codex);
+            std::env::set_var("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", "");
+        }
+        StrictFixture { dir, codex_ran }
+    }
+
+    fn request(fx: &StrictFixture, strict: Option<bool>) -> AskAgentRequest {
+        AskAgentRequest {
+            agent: "gemini".to_string(),
+            message: "label this part".to_string(),
+            cwd: Some(fx.dir.path().to_string_lossy().into_owned()),
+            strict_agent: strict,
+            ..Default::default()
+        }
+    }
+
+    /// THE NEGATIVE CONTROL. Without `strict_agent` this fixture substitutes codex, which is
+    /// the 2026-09-19 failure. If this stops passing, `strict_02` proves nothing: it would be
+    /// green because the fixture never reaches the degraded route at all.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
+    async fn strict_01_without_strict_the_fixture_substitutes_codex() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _agy = crate::agy::tests::ENV_LOCK.lock().await;
+        let fx = setup();
+
+        let out = execute_ask_agent(&request(&fx, None), None)
+            .await
+            .expect("the degraded route answers when strict is off");
+
+        assert_eq!(out.agent, "gemini");
+        assert_eq!(out.answered_by_agent.as_deref(), Some("codex"));
+        assert!(fx.codex_ran.exists(), "codex must have been spawned for the control to mean anything");
+    }
+
+    /// RED IF: the `strict_agent` gate is removed from the degraded route. codex answers, the
+    /// call returns Ok, and the marker file appears.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
+    async fn strict_02_strict_fails_with_the_seats_own_error_and_never_spawns_codex() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _agy = crate::agy::tests::ENV_LOCK.lock().await;
+        let fx = setup();
+
+        let err = execute_ask_agent(&request(&fx, Some(true)), None)
+            .await
+            .expect_err("an unavailable backend under strict_agent is a failure, not codex's answer");
+
+        assert!(err.contains("STRICT_NO_SUBSTITUTION"), "the lifecycle must say why; got: {err}");
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("quota") || lower.contains("capacity"),
+            "the error must be agy's own, not a later hop's; got: {err}"
+        );
+        assert!(!fx.codex_ran.exists(), "no other agent may even be spawned under strict_agent");
     }
 }
