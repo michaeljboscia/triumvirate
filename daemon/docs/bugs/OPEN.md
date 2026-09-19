@@ -116,6 +116,21 @@ fire-and-forget: every other event goes through `handle.spawn`, which is right f
 daemon and useless on the exit path, where the spawned task is still queued when the process
 goes away.
 
+**REGRESSION INTRODUCED BY THIS FIX, found and fixed the same day.** The graceful path made
+axum wait for every open connection after the signal, and a connection that never drains (one
+stuck mid-request, a WebSocket) kept the process alive forever: it logged the line below, closed
+its listener, and never exited. The check above passed only because that daemon had been up 3
+seconds with nothing open. It went unnoticed for the rest of the day because `start-daemon.sh`
+escalates an ignored SIGTERM to SIGKILL, so every restart LOOKED clean while the real sequence was
+TERM, hang, KILL. When a restart bypassed that escalation (its output piped to `head -1`, which
+killed the script by SIGPIPE before it could escalate), the daemon went down: listening on
+nothing, holding its pid. Fixed by bounding the drain: after the signal, a watchdog exits the
+process after `TRIUMVIRATE_SHUTDOWN_DRAIN_SECS` (default 10). Reproduced before fixing, on a
+throwaway daemon on its own port and home: the pre-fix binary was still running 25s after SIGTERM
+with one stuck connection; the fixed build exited at the 3s limit. Now a permanent guard,
+`scripts/verify-shutdown.py` (`verify-live-agents.sh shutdown`), which runs the binary directly
+and never escalates, because the escalation is what hid this.
+
 **CHECK PASSED, live, 2026-09-19:** SIGTERM to the running daemon produced
 `WARN daemon shutting down reason=SIGTERM uptime_seconds=3`, followed by
 `INFO tv_daemon_stopped posted status=200 OK`. Per D-018 that 200 says nothing about

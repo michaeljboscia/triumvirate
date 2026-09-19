@@ -3067,9 +3067,35 @@ async fn run_daemon() -> anyhow::Result<()> {
                 "daemon shutting down"
             );
             mcp_bridge::posthog::record_daemon_stopped(&reason, uptime).await;
+            // BOUND THE DRAIN. Returning from this future closes the listener and makes axum wait
+            // for every open connection to finish, and a long-lived one (a WebSocket, a stuck
+            // request) never does. On 2026-09-19 a daemon took the SIGTERM, logged this line,
+            // stopped listening, and never exited: it held its pid while serving nothing, so the
+            // start script saw a live daemon and every client saw a dead one. That was a
+            // regression introduced by adding this graceful path at all; before it, SIGTERM
+            // killed the process at once. Short requests still get their window.
+            let limit = shutdown_drain_limit();
+            tokio::spawn(async move {
+                tokio::time::sleep(limit).await;
+                tracing::warn!(
+                    drain_limit_secs = limit.as_secs(),
+                    "open connections did not drain in time; exiting anyway"
+                );
+                std::process::exit(0);
+            });
         })
         .await?;
     Ok(())
+}
+
+/// How long in-flight requests get to finish after a stop signal before the process exits
+/// anyway. `TRIUMVIRATE_SHUTDOWN_DRAIN_SECS`, default 10.
+fn shutdown_drain_limit() -> std::time::Duration {
+    std::env::var("TRIUMVIRATE_SHUTDOWN_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(10))
 }
 
 /// Resolve when the process is asked to stop, naming WHICH signal asked.
