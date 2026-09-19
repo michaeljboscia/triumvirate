@@ -483,6 +483,53 @@ fn capture_as(distinct_id: &str, event: &str, properties: serde_json::Value) {
     });
 }
 
+/// Emit `tv_daemon_stopped` and WAIT for it, because the process is about to exit (D-001).
+///
+/// Every other event here is fire-and-forget through `handle.spawn`, which is right for a
+/// running daemon and useless at shutdown: the spawned task is still queued when the process
+/// goes away. A shutdown event that races `exit()` is worse than none, because its absence
+/// then means nothing.
+///
+/// The caller must ALSO log the shutdown. This event is best effort by nature, and D-018
+/// established that PostHog answers 200 OK for events it discards, so the log line is the
+/// evidence that actually survives. This is the nice-to-have half.
+pub async fn record_daemon_stopped(reason: &str, uptime_seconds: u64) {
+    let (Ok(host), Ok(key)) = (
+        std::env::var("POSTHOG_HOST"),
+        std::env::var("POSTHOG_API_KEY"),
+    ) else {
+        return;
+    };
+    let body = json!({
+        "api_key": key,
+        "event": "tv_daemon_stopped",
+        "distinct_id": "triumvirate-daemon",
+        "properties": {
+            "tv_reason": reason,
+            "tv_uptime_seconds": uptime_seconds,
+            "tv_version": env!("CARGO_PKG_VERSION"),
+        },
+    });
+    // A short timeout: this is on the exit path and must not hold the process open. Two
+    // seconds is enough for a local POST and short enough that a hung network does not turn
+    // a clean stop into a hang, which is its own incident.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "posthog client build failed on the shutdown path");
+            return;
+        }
+    };
+    let url = format!("{}/i/v0/e/", host.trim_end_matches('/'));
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) => tracing::info!(status = %resp.status(), "tv_daemon_stopped posted"),
+        Err(e) => tracing::warn!(error = %e, "tv_daemon_stopped POST failed"),
+    }
+}
+
 /// Report a failed agent call to PostHog **error tracking** (the `$exception` event).
 ///
 /// PostHog's docs say never to hand-build `$exception` because "the exception event schema

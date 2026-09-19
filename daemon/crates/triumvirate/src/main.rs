@@ -3024,8 +3024,65 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
         }
     });
-    axum::serve(listener, app).await?;
+    // D-001: the daemon had no shutdown path at all. `axum::serve` ran until the process was
+    // killed, so a SIGTERM produced no event and no log line, and fourteen months of
+    // `tv_daemon_started` had no matching stop. A crash and a clean restart were the same
+    // evidence, which is precisely the case the defect dashboard was built to catch.
+    let started_at = std::time::Instant::now();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let reason = await_shutdown_signal().await;
+            let uptime = started_at.elapsed().as_secs();
+            // THE LOG LINE IS THE EVIDENCE, and the event is the nice-to-have. D-018
+            // established that PostHog answers 200 OK for events it then discards, so an
+            // exit recorded only in telemetry is an exit that may leave no trace at all.
+            tracing::warn!(
+                reason = %reason,
+                uptime_seconds = uptime,
+                "daemon shutting down"
+            );
+            mcp_bridge::posthog::record_daemon_stopped(&reason, uptime).await;
+        })
+        .await?;
     Ok(())
+}
+
+/// Resolve when the process is asked to stop, naming WHICH signal asked.
+///
+/// "The daemon stopped" is half an answer. `SIGTERM` is an operator or a restart script;
+/// `SIGINT` is a person at a terminal. A row that cannot tell them apart cannot tell a
+/// deployment from an interruption, and an unexplained stop from either.
+///
+/// SIGKILL is deliberately absent and cannot be caught. An exit with no line from here is
+/// therefore still meaningful: it means the daemon was killed outright or died, which is a
+/// different fact from a clean stop and should read differently.
+async fn await_shutdown_signal() -> String {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only ctrl-c will stop this daemon cleanly");
+                let _ = tokio::signal::ctrl_c().await;
+                return "SIGINT".to_string();
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM".to_string(),
+            res = tokio::signal::ctrl_c() => match res {
+                Ok(()) => "SIGINT".to_string(),
+                Err(e) => format!("ctrl_c listener failed: {e}"),
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "SIGINT".to_string(),
+            Err(e) => format!("ctrl_c listener failed: {e}"),
+        }
+    }
 }
 
 async fn run_breaker_probe(

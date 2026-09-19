@@ -19,19 +19,6 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-### D-001 — The daemon has no shutdown event
-**Found:** 2026-07-28 · **Severity:** HIGH
-**Evidence:** `tv_daemon_started` fired 14 times in 30 days. There is no corresponding stop
-event. Two SIGTERMs sent on 2026-07-28 (22:08, 22:29 EDT) produced no record at all.
-**Why it matters:** a daemon that ends is visible only later, by the absence of traffic. A
-crash and a clean restart are the same evidence. This is the specific case the defect
-dashboard was built to catch, and it catches nothing because nothing is emitted.
-**Check:** kill the daemon, then find an event or log line naming the shutdown and its cause.
-**RE-CHECKED 2026-09-19, STILL OPEN:** the daemon was SIGTERMed and restarted four times
-during the ask_jury work. `grep -icE 'shutdown|sigterm|stopping|graceful'` over the log:
-**zero**. Fourteen months of births, no deaths, and four more today.
-**Tile:** "Daemon restarts — births with no recorded deaths" (dashboard 1886865).
-
 ### D-002 — OTLP export failures ship with an empty body
 **Found:** 2026-07-28 · **Severity:** HIGH
 **Evidence:** `BatchLogProcessor.ExportError` rows in PostHog carry `body: ""`. The cause
@@ -233,6 +220,32 @@ landing and cannot be until quota is restored. It is written and unverified.
 
 
 ## Closed
+
+### 2026-09-19: the daemon had no shutdown path at all (D-001)
+Fourteen months of `tv_daemon_started` with no matching stop, because `axum::serve` was called
+with no `with_graceful_shutdown` and no signal handler existed anywhere. SIGTERM killed the
+process outright, so there was nothing to emit and nothing to log. A crash and a clean restart
+were the same evidence, which is the exact case the defect dashboard was built to catch.
+
+Added `await_shutdown_signal`, which resolves on SIGTERM or SIGINT and NAMES which one:
+"the daemon stopped" is half an answer, and a row that cannot tell an operator restart from a
+person at a terminal cannot tell a deployment from an interruption. SIGKILL is deliberately
+absent and cannot be caught, so an exit with no line still means something specific: killed
+outright or died, which should read differently from a clean stop.
+
+The LOG LINE is the evidence and the event is the nice-to-have, which is the opposite of how
+this would have been built yesterday. D-018 established that PostHog answers 200 OK for events
+it discards, so an exit recorded only in telemetry may leave no trace at all.
+`record_daemon_stopped` is also the one capture here that is AWAITED rather than
+fire-and-forget: every other event goes through `handle.spawn`, which is right for a running
+daemon and useless on the exit path, where the spawned task is still queued when the process
+goes away.
+
+**CHECK PASSED, live, 2026-09-19:** SIGTERM to the running daemon produced
+`WARN daemon shutting down reason=SIGTERM uptime_seconds=3`, followed by
+`INFO tv_daemon_stopped posted status=200 OK`. Per D-018 that 200 says nothing about
+delivery, which is why the warning above it is the thing that closes this row.
+
 
 ### 2026-09-19: three rows were stale, the defects were already fixed
 Checked during the ask_jury work, each against the CHECK its own row demanded. None of the
