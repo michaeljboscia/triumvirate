@@ -193,30 +193,43 @@ which repo's ledger to open.
 project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
 **Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
 
-### D-018 - a PostHog quota rejection is dropped without a single log line
-**Found:** 2026-09-19 · **Severity:** MEDIUM (was HIGH before the cause was known)
-**Cause: KNOWN, not a Triumvirate bug.** The PostHog account has been out of quota for several
-days (owner, 2026-09-19). The missing events are explained; this row is about how that
-absence presented.
-**Evidence:** no `tv_*` event since 2026-09-16, ~280/day before it. The daemon has
-`POSTHOG_HOST` and `POSTHOG_API_KEY` set, so `capture_as` was posting. Two daemon restarts on
-2026-09-19 produced no `tv_daemon_started` and **not one line mentioning posthog in the log**:
-no warning, no status code, no "quota". The last `posthog POST failed` warning is 2026-09-15
-20:00, before the quota ran out.
-**Why it matters:** this is D-002's shape one layer up. A provider refusing our data is a
-condition the daemon can see and did not report, so "no events" was indistinguishable from
-"nothing happened" for three days, and diagnosing it took a query against PostHog itself. The
-first suspicion was that the newly added `tv_jury_seat` instrumentation was broken.
-**Check:** point the daemon at a token that will be refused and confirm the log carries the
-status and the provider's reason. Quota exhaustion must be loud.
-**The contrast that makes this a defect and not just an outage (2026-09-19):** two exporters
-in this daemon post to the same host while the account is out of quota. The OTLP log exporter
-has written **4,266** error lines today (see D-002). The event path, `posthog::capture_as`
-posting to `/i/v0/e/`, has written **zero**. One screams thousands of times, the other is
-silent, and the silent one is the path every `tv_*` event takes.
-**Consequence, so nothing is overclaimed:** the `tv_jury_seat` events added with `ask_jury`
-have never been observed landing. That instrumentation is written and unverified until the
-quota is restored.
+### D-018 - PostHog answers 200 OK for events it discards, so delivery is unknowable from here
+**Found:** 2026-09-19 · **Severity:** HIGH (was MEDIUM; raised once the cause was measured)
+**Supersedes the first version of this row, which was WRONG.** I wrote it as "a quota rejection
+is dropped without a single log line", which assumed a rejection existed and the daemon was
+failing to log it. There is no rejection.
+
+**Evidence, measured 2026-09-19 while the account was over quota:**
+```
+POST https://us.i.posthog.com/i/v0/e/   ->   HTTP 200   {"status":"Ok"}
+SELECT ... FROM events WHERE event = 'tv_quota_probe' ...   ->   0 rows
+```
+The event was accepted, acknowledged as Ok, and discarded server side. `capture_as` in
+`mcp-bridge/src/posthog.rs` handles this correctly for everything it can see: it warns on a
+non-2xx and on a transport error, and logs the 2xx at `debug!`. There was nothing to warn
+about. The daemon is not failing to report a failure; it is being told it succeeded.
+
+**Why it matters:** the sending side cannot answer "did my telemetry arrive". A delivered
+event and a discarded one are byte-identical from here. That is why three days of dead
+telemetry looked like "nothing happened", and why the first suspicion fell on newly added
+instrumentation rather than on the account.
+
+**This collapses four rows into one problem.** D-002 (export failures ship an empty body),
+D-003 (no gap marker for windows when logs did not ship) and D-005 (streams gone silent, cause
+unknown) are all the same question asked from the same blind side. D-005 asked whether a quiet
+stream means "path idle" or "emitter broken"; the answer needs evidence that does not come
+from the emitter.
+
+**Fix shape (the only one that actually answers it):** a delivery round trip. Emit a sentinel
+event on a timer, then READ IT BACK through the PostHog query API (a `phx_` personal key,
+separate from the ingest key). Delivery confirmed = the window is trustworthy. Sentinel not
+returned within N intervals = mark the window UNTRUSTED and say so loudly, which is exactly
+what D-003 asks for. Nothing short of a round trip distinguishes the two states, because the
+ingest endpoint reports Ok for both.
+**Check:** with the account over quota, the daemon reports telemetry as UNTRUSTED within one
+sentinel interval, rather than reporting nothing.
+**Consequence meanwhile:** `tv_jury_seat`, added with `ask_jury`, has never been observed
+landing and cannot be until quota is restored. It is written and unverified.
 
 
 ## Closed
