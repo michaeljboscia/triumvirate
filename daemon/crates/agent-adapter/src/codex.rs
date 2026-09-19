@@ -452,6 +452,17 @@ pub fn command_reads_file_contents_pub(command: &str) -> bool {
 }
 
 pub(crate) fn command_reads_file_contents(command: &str) -> bool {
+    // Per `&&` segment (D-017). This is the THIRD parser with the same blanket refusal, and
+    // the one that actually decided the live rejections: it runs in `shell_read_kind`, so a
+    // chained read stayed `ToolKind::Bash`, and the gate's coverage check filters on
+    // `ToolKind::ReadFile` before any of the other parsers are consulted. Fixing the two
+    // downstream parsers changed nothing while this one classified the call out of the set.
+    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+        .into_iter()
+        .any(segment_reads_file_contents)
+}
+
+fn segment_reads_file_contents(command: &str) -> bool {
     // A ranged read is a read. Checked first because its pipeline form would otherwise be
     // refused by the compound-command rule below, which exists for commands where the reader
     // may not be the part that touched the named path. Here both stages are constrained.
@@ -827,8 +838,10 @@ mod command_classification_tests {
         assert!(command_reads_file_contents("/bin/sh -lic 'tail -n 5 /repo/a.rs'"));
         // The wrapper must not launder a non-reader.
         assert!(!command_reads_file_contents("/bin/zsh -lc 'ls /repo'"));
-        // Nor a compound script: the reader may not be what touched the named path.
-        assert!(!command_reads_file_contents("/bin/zsh -lc 'ls /repo && cat /repo/a.rs'"));
+        // A compound script IS unwrapped and split, and its reader classifies it (D-017). The
+        // operand binding, not the refusal, is what keeps the decoy out; see codex_03b.
+        assert!(command_reads_file_contents("/bin/zsh -lc 'ls /repo && cat /repo/a.rs'"));
+        assert!(!command_reads_file_contents("/bin/zsh -lc 'ls /repo ; cat /repo/a.rs'"));
         // A shell without a -c form is left alone and fails closed.
         assert!(!command_reads_file_contents("/bin/zsh script.sh"));
     }
@@ -993,12 +1006,20 @@ mod command_classification_tests {
     }
 
     /// Fail closed on anything the classifier cannot reason about.
-    /// RED IF: compound commands, pipes or redirections start being classified, where the
-    /// reader may not be the part that touched the named path, or the command writes.
+    /// RED IF: pipes or redirections start being classified, where the reader may not be the
+    /// part that touched the named path, or the command writes.
+    ///
+    /// `&&` was on this list until D-017 and is no longer, because the concern it was carrying
+    /// is now carried structurally. "Does this command read a file" and "WHICH file did it
+    /// read" are different questions, and the second is answered by the operand binding
+    /// (`codex_03b` below), not by refusing to look at the command. Refusing the whole chain
+    /// threw away real reviews: codex reads with `wc -l F && sed -n '1,240p' F`.
+    /// `;` and `||` stay refused, because both exit zero on a read that failed.
     #[test]
     fn codex_03_compound_and_writing_commands_fail_closed() {
         for c in [
-            "ls /repo && cat /repo/a.rs",
+            "ls /repo ; cat /repo/a.rs",
+            "ls /repo || cat /repo/a.rs",
             "cat /repo/a.rs | grep x",
             "cat /repo/a.rs > /tmp/copy",
             "sed -i '' 's/a/b/' /repo/a.rs",
@@ -1010,6 +1031,24 @@ mod command_classification_tests {
         ] {
             assert!(!command_reads_file_contents(c), "must fail closed: {c}");
         }
+    }
+
+    /// D-017. An `&&` chain containing a read IS a read, and it is a read of the file the
+    /// READER opened, never of a path a sibling link happened to mention.
+    /// RED IF: a chain stops being classified, or a decoy in one link collects another's credit.
+    #[test]
+    fn codex_03b_a_chain_is_classified_by_its_reader_and_bound_to_that_readers_file() {
+        assert!(command_reads_file_contents("ls /repo && cat /repo/a.rs"), "the cat is a read");
+        assert!(command_reads_file_contents("wc -l /repo/a.rs && sed -n '1,240p' /repo/a.rs"));
+
+        // The old rationale for refusing chains, now enforced where it belongs. `a.rs` is
+        // named by the chain and read by nothing in it.
+        assert_eq!(whole_file_read_operands("ls /repo/a.rs && cat /repo/b.rs"), vec!["/repo/b.rs"]);
+        assert!(command_read_ranges("wc -l /repo/a.rs && sed -n '1,9p' /repo/b.rs")
+            .iter()
+            .all(|r| r.operand == "/repo/b.rs"));
+        // And a chain whose every link is a non-reader stays closed.
+        assert!(!command_reads_file_contents("ls /repo && wc -l /repo/a.rs"));
     }
 
     /// The parser must actually apply the classification, not just define it.

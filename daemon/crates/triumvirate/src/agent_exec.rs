@@ -8366,11 +8366,18 @@ mod grok_shell_read_gate_tests {
         }
     }
 
+    /// The kind is DERIVED, exactly as every adapter derives it, never asserted.
+    ///
+    /// Hardcoding `ToolKind::ReadFile` here is what let three tests pass against a gate that
+    /// was still rejecting the same command live: the real classifier left a chained read as
+    /// `Bash`, and the coverage check drops anything that is not `ReadFile` before the parsers
+    /// this file tests are ever reached. A helper that skips the step under test is not a test.
     fn codex_shell(command: &str) -> ToolCallRecord {
+        let args = serde_json::json!({ "command": command });
         ToolCallRecord {
             id: None,
             tool: "command_execution".to_string(),
-            kind: ToolKind::ReadFile,
+            kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
             success: Some(true),
             duration_ms: None,
             args_json: Some(serde_json::json!({ "command": command }).to_string()),
@@ -8439,19 +8446,18 @@ mod grok_shell_read_gate_tests {
         let other = other.to_string_lossy().into_owned();
 
         // The tool name codex actually reports is `Bash`, not `command_execution`.
+        let args = serde_json::json!({
+            "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
+        });
         let call = ToolCallRecord {
             id: None,
             tool: "Bash".to_string(),
-            kind: ToolKind::ReadFile,
+            kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
             success: Some(true),
             duration_ms: None,
-            args_json: Some(
-                serde_json::json!({
-                    "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
-                })
-                .to_string(),
-            ),
+            args_json: Some(args.to_string()),
         };
+        assert_eq!(call.kind, ToolKind::ReadFile, "the classifier must see a chained read at all");
         let sources = vec![src.clone()];
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
@@ -8471,18 +8477,16 @@ mod grok_shell_read_gate_tests {
 
         // A chain that reads the source only PARTLY, so the turn is rejected and the receipt
         // is the only thing telling the caller which window it got.
+        let args = serde_json::json!({
+            "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
+        });
         let call = ToolCallRecord {
             id: None,
             tool: "Bash".to_string(),
-            kind: ToolKind::ReadFile,
+            kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
             success: Some(true),
             duration_ms: None,
-            args_json: Some(
-                serde_json::json!({
-                    "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
-                })
-                .to_string(),
-            ),
+            args_json: Some(args.to_string()),
         };
         let sources = vec![src.clone()];
         let mut lifecycle = Vec::new();
