@@ -161,3 +161,62 @@ database.
 Scoring whether the peer's answer was better for having the map. That is the paired regeneration,
 and the Graphiti side has already shown it is the method that works and the ablation is the one that
 does not. It needs a use signal first, which is what this brief produces.
+
+## Findings from the two free controls (2026-09-19), run before any Rust
+
+Run by `scripts/wiki-controls.py` over successful `$ai_generation` rows in
+`posthog.ai_events.output_choices`. Report: `reports/wiki-usage/controls-2026-09-19.md`. The
+detector imports its page list from `mneme-bosciamem/ops/usage_events.py:page_ids` and uses that
+file's bare-id pattern character for character, and it passed a seven-case positive control
+(two citations, three near misses, a recited map, a no-page response) before any zero was read.
+
+**The negative control FAILED on its first run, and that was the most useful result of the day.**
+14 Grok responses from before 15:47 UTC named page ids, 5 of them recitations. Every page id cited
+was absent from its prompt, and several were produced on 2026-09-06 and 2026-09-08, before the
+strings were even committed to the mneme repo (first commit 2026-09-17). The cause is a population
+this brief did not model:
+
+**Calls whose SUBJECT is the wiki.** The mneme blind-labeler jury ("You are a blind labeler. Read
+.../mneme-bosciamem/gold/LABELING-BRIEF.md, then BATCH-2.md") returns JSON whose `label` field IS a
+page id. The wiki bootstrap review had Grok reading the taxonomy files. In both, naming page ids is
+the job. The ids came from files the peer opened, so the prompt string held only a path and an
+echo check against the prompt found nothing.
+
+| seat | pre-map calls | wiki-is-the-subject | hits | hits that were wiki-subject |
+|---|---|---|---|---|
+| grok | 434 | 230 (53%) | 14 | 14 |
+| gemini | 458 | 188 (41%) | 7 | 7 |
+| codex | 270 | 2 | 0 | 0 |
+
+With that population excluded, **the negative control is zero** (Grok, 204 ordinary calls) and
+**the coincidence floor is zero** for every seat (Codex 268, Gemini 270 ordinary calls). The
+detector was right; the control failed on an unmodeled population.
+
+Consequences for the design, before a line of Rust:
+
+1. **`call_subject` is a required field, and wiki-subject calls are excluded from every rate.**
+   Without it the measurement is roughly half contaminated for Grok and 40% for Gemini, and the
+   contamination is all in one direction: it manufactures use. Today's rule is a prompt match on
+   the wiki's own repo and build artifacts (`WIKI_SUBJECT` in `scripts/wiki-controls.py`). At the
+   response seam it can be made exact: a call is wiki-subject if its required sources or its
+   opened files are under the wiki's repo.
+2. **"Grok cannot open files at all" is wrong.** It read the labeling brief, the batch files and
+   the taxonomy files here, and made 80 file-reading tool calls in one review the same day.
+3. **"Their own file reads never reach Triumvirate" is wrong, and this is the good news.** The
+   sight gate works precisely because they do: `ToolCallRecord` carries each read's arguments,
+   and a receipt the same day read `bound to [lines 1-260 of .../ask-jury-brief.md]`. So the
+   UNFORGEABLE signal this brief assumed only the Claude side had, a tool call that opens
+   `<wiki repo>/<page-id>.md`, is available for the peers at the response seam, wherever the
+   parser records tool calls (`PARSER_MODES_WITH_TOOL_RECORDS`). Proposal: `pages_opened` as the
+   primary use signal, with the text match demoted to a secondary one. That also removes most of
+   the recitation problem, since reciting the map does not open a page.
+4. **Echo must be judged against what the peer read, not only against the prompt string.** A page
+   id that arrives in an opened file and leaves in the response is echo, and the prompt-only check
+   cannot see it.
+5. **A zero floor makes the signal strong.** Ordinary pre-map calls named a page id zero times in
+   742 calls across three seats, so after the exclusions above any reference in a delivered call
+   is unlikely to be coincidence.
+
+**Not yet measurable:** the DELIVERED arm. Almost nothing reached PostHog after the map start
+times, because the account has been over quota since 2026-09-16 (D-018). The controls are
+unaffected because every row they use predates the outage.
