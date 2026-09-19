@@ -548,6 +548,46 @@ pub(crate) async fn doctor_probe() -> Result<String, String> {
 /// the silent stdout-drop regression that real traffic cannot detect (an empty answer
 /// is legitimate on the request path but a red flag for a known-non-empty probe).
 pub(crate) async fn health_probe() {
+    let _ = run_health_probe().await;
+}
+
+/// Re-test agy NOW and close the breaker if it answers, instead of waiting out the cooldown.
+///
+/// 2026-09-19: the agy quota reset overnight and the breaker stayed open, because it runs on
+/// its own clock (up to `BREAKER_MAX_COOLDOWN`) and the scheduled health probe above is kept
+/// away from request traffic on purpose. A caller who knows the quota came back had no way to
+/// say so.
+///
+/// Only a clean `Ok` closes the breaker. A capture-degraded probe means real turns would come
+/// back empty, so routing traffic at it helps nobody. A FAILED probe changes nothing: feeding
+/// it to `record_quota` would re-trip and double the cooldown, punishing the caller for asking.
+pub(crate) async fn breaker_probe() -> shared_types::BreakerProbeResponse {
+    use mcp_bridge::agy_resilience::{AgyProbeOutcome, agy_breaker_record_success, agy_breaker_snapshot};
+
+    let before = agy_breaker_snapshot();
+    let (outcome, detail) = run_health_probe().await;
+    if outcome == AgyProbeOutcome::Ok {
+        agy_breaker_record_success();
+    }
+    let after = agy_breaker_snapshot();
+    shared_types::BreakerProbeResponse {
+        backend: "agy".to_string(),
+        closed_by_probe: before.phase != "closed" && after.phase == "closed",
+        before,
+        after,
+        outcome: match outcome {
+            AgyProbeOutcome::Ok => "ok",
+            AgyProbeOutcome::CaptureDegraded => "capture_degraded",
+            AgyProbeOutcome::BackendFailed => "backend_failed",
+        }
+        .to_string(),
+        detail,
+    }
+}
+
+/// One probe dispatch, classified and recorded. Shared by the scheduled health probe and the
+/// on-demand breaker probe so the two cannot drift apart.
+async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, String) {
     use mcp_bridge::agy_resilience::{AgyProbeOutcome, agy_record_health};
 
     let now_ms = std::time::SystemTime::now()
@@ -557,7 +597,7 @@ pub(crate) async fn health_probe() {
     let (bin, args) = mcp_bridge::agy_command();
     let cwd = std::env::temp_dir().to_string_lossy().into_owned();
 
-    match run_agy_cli_process_with_session(
+    let (outcome, detail) = match run_agy_cli_process_with_session(
         &bin,
         &args,
         "What is 2+2? Reply with only the digit.",
@@ -570,29 +610,28 @@ pub(crate) async fn health_probe() {
     .await
     {
         Ok(parsed) if parsed.response_text.contains('4') => {
-            agy_record_health(AgyProbeOutcome::Ok, "probe returned 4", now_ms);
+            (AgyProbeOutcome::Ok, "probe returned 4".to_string())
         }
-        Ok(parsed) => {
-            // Non-empty but unexpected — backend alive, capture working.
-            agy_record_health(
-                AgyProbeOutcome::Ok,
-                format!("probe alive (unexpected text: {:.40})", parsed.response_text),
-                now_ms,
-            );
-        }
+        // Non-empty but unexpected: backend alive, capture working.
+        Ok(parsed) => (
+            AgyProbeOutcome::Ok,
+            format!("probe alive (unexpected text: {:.40})", parsed.response_text),
+        ),
         Err(e) => {
             let msg = e.to_string();
             // run_agy_cli_process_with_session surfaces a persistent exit-0-empty as
-            // "empty output" after its retry → a capture-drop regression (REQ-024/056).
+            // "empty output" after its retry, which is a capture-drop regression (REQ-024/056).
             if msg.contains("empty output") {
-                tracing::warn!("agy health: capture DEGRADED — {msg}");
-                agy_record_health(AgyProbeOutcome::CaptureDegraded, msg, now_ms);
+                tracing::warn!("agy health: capture DEGRADED: {msg}");
+                (AgyProbeOutcome::CaptureDegraded, msg)
             } else {
-                tracing::warn!("agy health: backend FAILED — {msg}");
-                agy_record_health(AgyProbeOutcome::BackendFailed, msg, now_ms);
+                tracing::warn!("agy health: backend FAILED: {msg}");
+                (AgyProbeOutcome::BackendFailed, msg)
             }
         }
-    }
+    };
+    agy_record_health(outcome, detail.clone(), now_ms);
+    (outcome, detail)
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,5 +1683,98 @@ mod quota_backoff_and_route_default_tests {
         let _env = super::tests::set_env_scoped("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", None);
         let hops = plan_degraded_route(&degraded_route_env(), AgyFailureClass::AuthOrExec);
         assert_eq!(hops.iter().map(|h| h.backend).collect::<Vec<_>>(), vec!["codex"]);
+    }
+}
+
+/// `breaker_probe` against the real process-global breaker and a mock agy binary.
+///
+/// `#[ignore]` because it sets `TRIUMVIRATE_AGY_BIN` and opens the global breaker, both of which
+/// change every agy dispatch in this binary. Run with `scripts/verify-live-agents.sh strict`.
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::await_holding_lock)]
+mod breaker_probe_tests {
+    use super::*;
+    use mcp_bridge::agy_resilience::{agy_breaker_record_quota, agy_breaker_record_success, agy_breaker_snapshot};
+
+    /// Restores the env and closes the breaker on every exit path, including a panic.
+    struct ProbeFixture {
+        mock: std::path::PathBuf,
+        _bin: tests::EnvRestore,
+        _args: tests::EnvRestore,
+        _backoff: tests::EnvRestore,
+    }
+
+    impl Drop for ProbeFixture {
+        fn drop(&mut self) {
+            agy_breaker_record_success();
+            let _ = std::fs::remove_file(&self.mock);
+        }
+    }
+
+    fn setup(mock_body: &str) -> ProbeFixture {
+        use std::os::unix::fs::PermissionsExt;
+        let mock = std::env::temp_dir().join(format!("mock-agy-probe-{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(&mock, format!("#!/bin/sh\n{mock_body}\n")).expect("write mock agy");
+        let mut perms = std::fs::metadata(&mock).expect("mock meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&mock, perms).expect("chmod mock");
+
+        let fx = ProbeFixture {
+            _bin: tests::set_env_scoped("TRIUMVIRATE_AGY_BIN", Some(mock.to_str().expect("utf8"))),
+            _args: tests::set_env_scoped("TRIUMVIRATE_AGY_ARGS", None),
+            _backoff: tests::set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some("")),
+            mock,
+        };
+        // Open the real breaker. Looped rather than counted so a threshold override still opens it.
+        agy_breaker_record_success();
+        for _ in 0..16 {
+            if agy_breaker_snapshot().phase == "open" {
+                break;
+            }
+            agy_breaker_record_quota();
+        }
+        assert_eq!(agy_breaker_snapshot().phase, "open", "the fixture must start with an OPEN breaker");
+        fx
+    }
+
+    /// RED IF: a healthy probe stops closing the breaker, which is 2026-09-19 again: quota is
+    /// back, the daemon can see that it is back, and the seat stays dark for hours.
+    #[tokio::test]
+    #[ignore = "mutates the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn probe_01_a_healthy_probe_closes_an_open_breaker() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = tests::ENV_LOCK.lock().await;
+        let _fx = setup("printf '{\"event\":\"init\",\"conversation_id\":\"c1\",\"init\":{}}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"4\"}}\n'");
+
+        let out = breaker_probe().await;
+
+        assert_eq!(out.outcome, "ok", "detail: {}", out.detail);
+        assert_eq!(out.before.phase, "open");
+        assert_eq!(out.after.phase, "closed");
+        assert!(out.closed_by_probe);
+        assert_eq!(agy_breaker_snapshot().phase, "closed", "the GLOBAL breaker, not just the report");
+    }
+
+    /// RED IF: a failed probe is fed back into the breaker. `record_quota` would re-trip it,
+    /// bump `open_count`, and double the cooldown, so checking would make the outage longer.
+    #[tokio::test]
+    #[ignore = "mutates the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn probe_02_a_failed_probe_leaves_the_breaker_exactly_as_it_was() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = tests::ENV_LOCK.lock().await;
+        let _fx = setup("echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2");
+
+        // Repeated, because ONE stray `record_quota` on an open breaker only bumps a counter.
+        // It takes a threshold's worth to re-trip, so a single probe could not catch the bug.
+        let first = breaker_probe().await;
+        let mut last = first.clone();
+        for _ in 0..8 {
+            last = breaker_probe().await;
+        }
+
+        assert_eq!(first.outcome, "backend_failed");
+        assert!(!last.closed_by_probe);
+        assert_eq!(last.after.phase, "open");
+        assert_eq!(last.after.open_count, first.before.open_count, "probing must never extend the cooldown");
     }
 }

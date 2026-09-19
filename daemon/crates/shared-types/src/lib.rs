@@ -173,6 +173,41 @@ pub struct AskAgentRequest {
     pub strict_agent: Option<bool>,
 }
 
+/// The agy circuit breaker as a caller can see it. Read-only: taking one never moves the breaker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BreakerSnapshot {
+    /// `closed`, `open`, or `half_open`.
+    pub phase: String,
+    /// Seconds until the breaker would let a probe through on its own timer. Zero unless open.
+    pub cooldown_remaining_s: u64,
+    /// How many times in a row the breaker has opened. Each one doubles the cooldown.
+    pub open_count: u32,
+    /// Calls refused during the current open epoch.
+    pub shed: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct BreakerProbeRequest {
+    /// Which backend to probe. Only `agy` has a breaker today, and it is the default.
+    pub backend: Option<String>,
+}
+
+/// Result of asking the daemon to re-test a backend now instead of waiting out the cooldown.
+///
+/// 2026-09-19: the agy quota reset and the breaker stayed open, because the breaker runs on
+/// its own clock (up to five hours) and nothing a caller could do would make it look again.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BreakerProbeResponse {
+    pub backend: String,
+    pub before: BreakerSnapshot,
+    pub after: BreakerSnapshot,
+    /// `ok`, `capture_degraded`, or `backend_failed`.
+    pub outcome: String,
+    pub detail: String,
+    /// True only when this probe moved the breaker from not-closed to closed.
+    pub closed_by_probe: bool,
+}
+
 /// A REVIEW dispatch. Sight is not optional here, which is the entire point of the type.
 ///
 /// `ask_agent` carries `require_sight` as a flag, and a flag defaults to off and gets forgotten.

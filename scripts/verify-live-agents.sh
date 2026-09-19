@@ -83,6 +83,17 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "strict" ]; then
         echo "FAIL  strict_agent never substitutes"
         FAILED=1
     fi
+
+    # breaker_probe against the REAL process-global breaker: a healthy probe closes an open
+    # breaker, and repeated failed probes never extend its cooldown.
+    echo "RUN   breaker_probe closes on health, never extends on failure"
+    if cargo test -p triumvirate --bin triumvirate breaker_probe_tests \
+        -- --ignored --test-threads=1 2>&1 | tail -12; then
+        echo "PASS  breaker_probe closes on health, never extends on failure"
+    else
+        echo "FAIL  breaker_probe closes on health, never extends on failure"
+        FAILED=1
+    fi
 fi
 
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "agy" ]; then

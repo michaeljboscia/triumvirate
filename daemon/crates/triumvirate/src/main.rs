@@ -1078,6 +1078,27 @@ impl McpBridge {
         ))
     }
 
+    #[tool(
+        description = "Re-test a backend NOW and close its circuit breaker if it answers, instead \
+                       of waiting out the breaker's own cooldown (up to five hours). Use after a \
+                       quota reset. Spends one small live turn. Only agy has a breaker. A failed \
+                       probe leaves the breaker exactly as it was; it never extends the cooldown."
+    )]
+    async fn breaker_probe(
+        &self,
+        Parameters(req): Parameters<shared_types::BreakerProbeRequest>,
+    ) -> Result<Json<shared_types::BreakerProbeResponse>, String> {
+        // The breaker is a static in the DAEMON process. Probing from the bridge process would
+        // close a breaker nothing routes through.
+        if mcp_daemon_proxy_enabled() {
+            return daemon_http::fetch_daemon_breaker_probe(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("breaker_probe via daemon failed: {e:#}"));
+        }
+        run_breaker_probe(&req).await.map(Json)
+    }
+
     #[tool(description = "Request a peer review and receive assigned reviewer + review_id.")]
     async fn review_request(
         &self,
@@ -1311,6 +1332,7 @@ fn infer_mcp_intent(tool_name: &str, params: Option<&serde_json::Value>) -> Stri
         | "review_request" | "review_submit" => {
             "Requesting or submitting a code review".to_string()
         }
+        "breaker_probe" => "Re-testing a backend so its circuit breaker can close".to_string(),
         "blind_validate" => {
             "Blind-validating a worktree: a different agent writes the tests".to_string()
         }
@@ -2577,6 +2599,20 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(SessionListResponse { sessions: out }))
     }
 
+    async fn breaker_probe_route(
+        State(state): State<DaemonRuntimeState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<shared_types::BreakerProbeRequest>,
+    ) -> Result<AxumJson<shared_types::BreakerProbeResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
+        }
+        run_breaker_probe(&req)
+            .await
+            .map(AxumJson)
+            .map_err(|e| (StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": e }))))
+    }
+
     async fn abe_task_complete_route(
         State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
@@ -2914,6 +2950,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/ask", post(session_ask_route))
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
+        .route("/agy/breaker/probe", post(breaker_probe_route))
         .route("/abe/task-complete", post(abe_task_complete_route))
         .nest_service("/mcp", {
             let mcp_bridge = McpBridge::new();
@@ -2967,6 +3004,15 @@ async fn run_daemon() -> anyhow::Result<()> {
     });
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_breaker_probe(
+    req: &shared_types::BreakerProbeRequest,
+) -> Result<shared_types::BreakerProbeResponse, String> {
+    match req.backend.as_deref().unwrap_or("agy") {
+        "agy" | "antigravity" | "gemini" => Ok(agy::breaker_probe().await),
+        other => Err(format!("breaker_probe: '{other}' has no circuit breaker; only agy does")),
+    }
 }
 
 fn spawn_dead_drop(

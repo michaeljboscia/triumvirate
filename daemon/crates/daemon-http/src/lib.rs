@@ -21,7 +21,7 @@ use fallback_outbox::{
 };
 use ledger::LedgerStore;
 use mcp_bridge::{
-    daemon_ask_agent_url, daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
+    daemon_ask_agent_url, daemon_breaker_probe_url, daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
     daemon_autostart_enabled, daemon_health_url, daemon_memory_read_url, daemon_memory_write_url,
     daemon_lesson_add_url, daemon_lesson_list_url, daemon_lesson_query_url, daemon_lesson_validate_url,
     daemon_ledger_gc_url, daemon_ledger_query_url, daemon_ledger_record_url, daemon_ledger_session_url,
@@ -511,6 +511,13 @@ pub async fn fetch_daemon_status_snapshot() -> anyhow::Result<DaemonStatusSnapsh
 
 pub async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<AskAgentResponse> {
     daemon_post_json_with_timeout::<AskAgentRequest, AskAgentResponse>(daemon_ask_agent_url(), req, daemon_ask_timeout()).await
+}
+
+/// A probe is one live agy turn, so it gets the ask timeout, not the short control-plane one.
+pub async fn fetch_daemon_breaker_probe(
+    req: &shared_types::BreakerProbeRequest,
+) -> anyhow::Result<shared_types::BreakerProbeResponse> {
+    daemon_post_json_with_timeout(daemon_breaker_probe_url(), req, daemon_ask_timeout()).await
 }
 
 pub async fn fetch_daemon_session_spawn(req: &SpawnSessionRequest) -> anyhow::Result<String> {

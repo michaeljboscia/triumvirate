@@ -198,6 +198,12 @@ pub fn daemon_session_dismiss_url() -> String {
 }
 
 #[instrument(skip_all)]
+pub fn daemon_breaker_probe_url() -> String {
+    std::env::var("TRIUMVIRATE_DAEMON_BREAKER_PROBE_URL")
+        .unwrap_or_else(|_| format!("{}/agy/breaker/probe", daemon_base_url()))
+}
+
+#[instrument(skip_all)]
 pub fn daemon_session_list_url() -> String {
     std::env::var("TRIUMVIRATE_DAEMON_SESSION_LIST_URL")
         .unwrap_or_else(|_| format!("{}/session/list", daemon_base_url()))
