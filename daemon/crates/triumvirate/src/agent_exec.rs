@@ -1924,32 +1924,70 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             if !candidates.iter().any(|cand| args_name_path(args, cand)) {
                 return None;
             }
-            let window = serde_json::from_str::<serde_json::Value>(args)
+            // ONLY the windows over THIS source, and all of them. Reporting the command's
+            // first window told a caller who read lines 1-50 of the source, in a chain that
+            // also read lines 1-240 of something else, that they had read "lines 1-240". A
+            // receipt that names a range the reader never took of this file is worse than no
+            // receipt: it is a false statement in the one place the caller goes to argue.
+            let windows: Vec<String> = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
                 .and_then(|v| agent_adapter::codex::shell_command_from_value(Some(&v)))
                 .map(|cmd| agent_adapter::codex::command_read_ranges(&cmd))
-                .filter(|reads| !reads.is_empty())
-                // The evidence line reports the FIRST window of the command; the coverage
-                // check above unions all of them. Reporting one of several is a cosmetic
-                // shortfall in a rejection message, not a gate decision.
-                .map(|reads| reads[0].range);
-            Some(match window {
-                Some(r) => match r.end {
-                    Some(e) => format!("lines {}-{}", r.start, e),
-                    None => format!("lines {}-$", r.start),
-                },
-                None => {
-                    let mut a = args.to_string();
-                    if a.len() > 160 {
-                        a.truncate(160);
-                        a.push_str("...");
-                    }
-                    a
-                }
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| candidates.iter().any(|cand| cand == &r.operand))
+                .map(|r| match r.range.end {
+                    Some(e) => format!("lines {}-{} of {}", r.range.start, e, r.operand),
+                    None => format!("lines {}-$ of {}", r.range.start, r.operand),
+                })
+                .collect();
+            Some(if windows.is_empty() {
+                describe_what_the_read_bound(args)
+            } else {
+                windows.join(", ")
             })
         })
         .collect();
     format!("{source} has {total}; read this turn as [{}]", reads.join(", "))
+}
+
+/// What the read parsers made of a call's arguments, for a rejection receipt.
+///
+/// The receipt used to print the raw arguments truncated at 160 characters, which is shorter
+/// than the commands agents actually send: a real rejection read
+/// `sed -n '1,240p' A.md && sed -n '1,320p' /Users/.../triumvira...` and the reason it did not
+/// count was in the part that had been cut off. A gate whose evidence cannot explain its own
+/// decision sends the reader to guess, and the guess was wrong twice.
+///
+/// So report the BINDING, which is what the decision is actually made on: the operand each
+/// reader opened and the window it took. Falls back to the arguments, at a length that fits a
+/// real command, when nothing parsed as a read at all.
+fn describe_what_the_read_bound(args: &str) -> String {
+    let Some(cmd) = agent_adapter::codex::shell_command_from_args_json(args) else {
+        return truncate_for_receipt(args);
+    };
+    let mut bound: Vec<String> = agent_adapter::codex::whole_file_read_operands(&cmd)
+        .into_iter()
+        .map(|op| format!("whole read of {op}"))
+        .collect();
+    bound.extend(agent_adapter::codex::command_read_ranges(&cmd).into_iter().map(|r| {
+        match r.range.end {
+            Some(e) => format!("lines {}-{} of {}", r.range.start, e, r.operand),
+            None => format!("lines {}-$ of {}", r.range.start, r.operand),
+        }
+    }));
+    if bound.is_empty() {
+        return format!("no read the parser recognises in: {}", truncate_for_receipt(&cmd));
+    }
+    format!("bound to [{}]", bound.join("; "))
+}
+
+fn truncate_for_receipt(text: &str) -> String {
+    const MAX: usize = 500;
+    match text.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_string(),
+    }
 }
 
 /// The receipt for a NEVER-OPENED rejection: every recorded tool call, of any kind and any
@@ -1969,12 +2007,7 @@ fn describe_attempts_on_source(tool_calls: &[ToolCallRecord], source: &str, cwd:
                 Some(false) => "FAILED",
                 None => "no exit status",
             };
-            let mut a = args.to_string();
-            if a.len() > 160 {
-                a.truncate(160);
-                a.push_str("...");
-            }
-            Some(format!("{:?} {outcome} {a}", c.kind))
+            Some(format!("{:?} {outcome} {}", c.kind, describe_what_the_read_bound(args)))
         })
         .collect();
     if attempts.is_empty() {
@@ -8381,9 +8414,87 @@ mod grok_shell_read_gate_tests {
             format!("sed -n '1,50p' {src} && sed -n '51,97p' {src}"),
             // Three links, the read in the middle.
             format!("pwd && cat {src} && echo done"),
+            // THE WRAPPED FORM, which is what codex actually emits. The bare command above
+            // proves the splitter; this proves the splitter runs on the unwrapped text.
+            format!("/bin/zsh -lc \"wc -l {src} && sed -n '1,240p' {src}\""),
+            // The window overshoots the file's real length, as a reader that does not know
+            // the line count will always do.
+            format!("wc -l {src} && sed -n '1,99999p' {src}"),
         ] {
             gate_codex(&[&cmd], &src, &cwd).unwrap_or_else(|e| panic!("must count as a read: {cmd}\n  gate said: {e}"));
         }
+    }
+
+    /// THE EXACT LIVE SHAPE, from the second `ask_jury` run after the first fix. Codex read
+    /// two DIFFERENT files in one chain and the gate still said "never opened":
+    ///   /bin/zsh -lc "sed -n '1,240p' OTHER.md && sed -n '1,320p' BRIEF.md"
+    /// Every earlier test chained reads of ONE file, so none of them covered this.
+    /// RED IF: a read stops binding to its source because a sibling link read another file.
+    #[test]
+    fn d017_a_chain_that_reads_two_different_files_binds_each_to_its_own() {
+        let (dir, src) = source_file(97);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let other = dir.path().join("other.md");
+        std::fs::write(&other, "unrelated\n".repeat(40)).expect("write other");
+        let other = other.to_string_lossy().into_owned();
+
+        // The tool name codex actually reports is `Bash`, not `command_execution`.
+        let call = ToolCallRecord {
+            id: None,
+            tool: "Bash".to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(
+                serde_json::json!({
+                    "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
+                })
+                .to_string(),
+            ),
+        };
+        let sources = vec![src.clone()];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
+            .expect("the window over the SOURCE must count, whatever the other link read");
+    }
+
+    /// A rejection must explain itself. The receipt that sent me hunting printed the command
+    /// truncated at 160 characters, so the operand that failed to bind was cut off.
+    /// RED IF: the receipt goes back to dumping raw arguments instead of the binding.
+    #[test]
+    fn a_rejection_receipt_names_the_operand_and_window_each_read_bound_to() {
+        let (dir, src) = source_file(400);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let other = dir.path().join("other-with-a-deliberately-long-name-to-push-past-the-old-limit.md");
+        std::fs::write(&other, "x\n".repeat(40)).expect("write other");
+        let other = other.to_string_lossy().into_owned();
+
+        // A chain that reads the source only PARTLY, so the turn is rejected and the receipt
+        // is the only thing telling the caller which window it got.
+        let call = ToolCallRecord {
+            id: None,
+            tool: "Bash".to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(
+                serde_json::json!({
+                    "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
+                })
+                .to_string(),
+            ),
+        };
+        let sources = vec![src.clone()];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
+            .expect_err("50 of 400 lines is not the source");
+
+        assert!(err.contains("lines 1-50"), "the receipt must name the window it got: {err}");
+        assert!(err.contains(&src), "and the operand it bound to: {err}");
+        assert!(
+            !err.contains("/bin/zsh"),
+            "the raw command is not the evidence; the binding is: {err}"
+        );
     }
 
     /// The controls. Splitting on `&&` must not reopen anything D-010 closed, and must not
