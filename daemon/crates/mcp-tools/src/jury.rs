@@ -158,27 +158,63 @@ impl VerdictExtractor {
         }
     }
 
-    /// The normalized verdict, or `None` when this reply does not carry one.
-    pub fn extract(&self, reply: &str) -> Option<String> {
-        let raw = match self {
-            Self::JsonPointer(pointer) => json_objects_in(reply).iter().rev().find_map(|value| {
-                match value.pointer(pointer)? {
+    /// The verdict, or why there is not one.
+    ///
+    /// AMBIGUITY IS NOT A VERDICT. Every candidate the reader finds is normalized and they must
+    /// agree. Picking one of several was tried both ways and both are wrong:
+    ///
+    /// - First match: a seat that restates the question ("verdict: approve or reject... I
+    ///   choose REJECT") votes for the echo. Antigravity found it.
+    /// - Last match: a seat that answers correctly and then explains itself votes for a word in
+    ///   its own prose. Grok answered "YES\n17 is a prime number because it has **no** positive
+    ///   divisors", and last-match recorded `no`. Found on the first live run, in the fix for
+    ///   the first bug.
+    ///
+    /// So the reader reports what it can prove. One distinct value is the vote; two is a reply
+    /// that supports two readings, and the seat casts nothing, visibly, with the reason
+    /// attached. The caller's answer is a regex that matches one thing, such as
+    /// `(?m)^VERDICT:\s*(\w+)$`.
+    pub fn extract(&self, reply: &str) -> (Option<String>, Option<String>) {
+        let candidates: Vec<String> = match self {
+            Self::JsonPointer(pointer) => json_objects_in(reply)
+                .iter()
+                .filter_map(|value| match value.pointer(pointer)? {
                     serde_json::Value::String(s) => Some(s.clone()),
                     serde_json::Value::Bool(b) => Some(b.to_string()),
                     serde_json::Value::Number(n) => Some(n.to_string()),
                     _ => None,
-                }
-            })?,
-            // The LAST match. A seat that echoes the question back ("you asked for VERDICT:
-            // approve or reject") matches first on the prompt, and the first match would turn
-            // that echo into a vote. The decision comes after the restatement.
-            Self::Regex(re) => {
-                let caps = re.captures_iter(reply).last()?;
-                caps.get(1).or_else(|| caps.get(0))?.as_str().to_string()
-            }
-            Self::FirstLine => reply.lines().find(|l| !l.trim().is_empty())?.to_string(),
+                })
+                .collect(),
+            Self::Regex(re) => re
+                .captures_iter(reply)
+                .filter_map(|caps| Some(caps.get(1).or_else(|| caps.get(0))?.as_str().to_string()))
+                .collect(),
+            Self::FirstLine => reply.lines().find(|l| !l.trim().is_empty()).map(str::to_string).into_iter().collect(),
         };
-        normalize_verdict(&raw)
+
+        let mut distinct: Vec<String> = Vec::new();
+        for value in candidates.iter().filter_map(|c| normalize_verdict(c)) {
+            if !distinct.contains(&value) {
+                distinct.push(value);
+            }
+        }
+        match distinct.len() {
+            1 => (distinct.pop(), None),
+            0 => (
+                None,
+                Some(format!("the {} reader found no verdict in this reply", self.source())),
+            ),
+            _ => (
+                None,
+                Some(format!(
+                    "ambiguous: the {} reader found {} different verdicts in one reply ({}). \
+                     Nothing is counted. Narrow the pattern so it matches exactly one.",
+                    self.source(),
+                    distinct.len(),
+                    distinct.join(", ")
+                )),
+            ),
+        }
     }
 }
 
@@ -366,7 +402,7 @@ pub fn classify_seat(
     }
 
     seat.status = STATUS_ANSWERED.to_string();
-    seat.verdict = extractor.extract(&resp.response);
+    (seat.verdict, seat.verdict_note) = extractor.extract(&resp.response);
     seat.response = Some(resp.response);
     seat
 }
@@ -1231,24 +1267,30 @@ mod tests {
         }
     }
 
+    fn verdict_of(e: &VerdictExtractor, reply: &str) -> Option<String> {
+        e.extract(reply).0
+    }
+
     #[test]
     fn verdicts_are_read_three_ways_and_normalized_once() {
         let first = VerdictExtractor::FirstLine;
-        assert_eq!(first.extract("\n  **APPROVE.**\nbecause reasons").as_deref(), Some("approve"));
-        assert_eq!(first.extract("   \n\n"), None);
+        assert_eq!(verdict_of(&first, "\n  **APPROVE.**\nbecause reasons").as_deref(), Some("approve"));
+        assert_eq!(verdict_of(&first, "   \n\n"), None);
 
         let mut req = jury(&[]);
         req.verdict_regex = Some(r"(?m)^VERDICT:\s*(\w+)".to_string());
         let re = VerdictExtractor::from_request(&req).expect("regex");
-        assert_eq!(re.extract("I looked at it.\nVERDICT: Reject\n").as_deref(), Some("reject"));
-        assert_eq!(re.extract("no verdict line here"), None);
+        assert_eq!(verdict_of(&re, "I looked at it.\nVERDICT: Reject\n").as_deref(), Some("reject"));
+        assert_eq!(verdict_of(&re, "no verdict line here"), None);
+        // The same answer twice is one answer, not an ambiguity.
+        assert_eq!(verdict_of(&re, "VERDICT: reject\nTo restate, VERDICT: REJECT.").as_deref(), Some("reject"));
 
         req.verdict_json_pointer = Some("/label".to_string());
         let ptr = VerdictExtractor::from_request(&req).expect("pointer wins over regex");
         assert_eq!(ptr.source(), "json_pointer");
-        assert_eq!(ptr.extract(r#"{"label":"NONE","n":3}"#).as_deref(), Some("none"));
-        assert_eq!(ptr.extract("Here you go:\n{\"label\": \"Person\"}\nthanks").as_deref(), Some("person"));
-        assert_eq!(ptr.extract(r#"{"label":["a"]}"#), None, "a non-scalar is not a verdict");
+        assert_eq!(verdict_of(&ptr, r#"{"label":"NONE","n":3}"#).as_deref(), Some("none"));
+        assert_eq!(verdict_of(&ptr, "Here you go:\n{\"label\": \"Person\"}\nthanks").as_deref(), Some("person"));
+        assert_eq!(verdict_of(&ptr, r#"{"label":["a"]}"#), None, "a non-scalar is not a verdict");
     }
 
     /// ANTIGRAVITY'S FINDINGS on extraction. Each one silently changed a tally.
@@ -1261,19 +1303,37 @@ mod tests {
         // Two objects: brace-to-brace spanned them both and parsed as nothing, so a cast vote
         // vanished and the tally reported a false split.
         let two = "{\"thinking\":\"weighing it up\"}\n{\"verdict\":\"APPROVE\"}";
-        assert_eq!(ptr.extract(two).as_deref(), Some("approve"), "the vote must survive a preamble object");
-        // The LAST object that carries the pointer wins: a seat that reconsiders votes once.
-        let revised = "{\"verdict\":\"APPROVE\"}\nOn reflection:\n{\"verdict\":\"REJECT\"}";
-        assert_eq!(ptr.extract(revised).as_deref(), Some("reject"));
-        assert_eq!(ptr.extract("{\"thinking\":\"no verdict anywhere\"}"), None);
+        assert_eq!(verdict_of(&ptr, two).as_deref(), Some("approve"), "the vote must survive a preamble object");
+        assert_eq!(verdict_of(&ptr, "{\"thinking\":\"no verdict anywhere\"}"), None);
 
-        // A regex matching the ECHOED PROMPT, which is the false-unanimity shape: every seat
-        // restates the question, so first-match makes every seat vote the same way.
+        // Two DIFFERENT verdicts in one reply. Neither is the answer: the seat said both.
+        let revised = "{\"verdict\":\"APPROVE\"}\nOn reflection:\n{\"verdict\":\"REJECT\"}";
+        let (v, note) = ptr.extract(revised);
+        assert_eq!(v, None, "a reply that supports two readings casts nothing");
+        assert!(note.unwrap_or_default().contains("ambiguous"));
+
+        // THE ECHOED PROMPT (Antigravity): first-match voted for the restatement.
         req.verdict_json_pointer = None;
         req.verdict_regex = Some(r"(?i)verdict:\s*(approve|reject)".to_string());
-        let re = VerdictExtractor::from_request(&req).expect("regex");
+        let loose = VerdictExtractor::from_request(&req).expect("regex");
         let echo = "You asked for verdict: approve or reject.\nMy answer: VERDICT: Reject";
-        assert_eq!(re.extract(echo).as_deref(), Some("reject"), "the decision follows the restatement");
+        assert_eq!(verdict_of(&loose, echo), None, "approve and reject both appear; guessing is what broke this");
+
+        // THE LIVE CASE, verbatim from grok on the first real jury run. Last-match, the fix for
+        // the echoed prompt, read the `no` in "no positive divisors" and recorded a NO against
+        // a correct YES, turning a unanimous jury into a false majority.
+        req.verdict_regex = Some(r"(?i)\b(YES|NO)\b".to_string());
+        let sloppy = VerdictExtractor::from_request(&req).expect("regex");
+        let grok = "YES\n17 is a prime number because it has no positive divisors other than 1 and itself.";
+        let (v, note) = sloppy.extract(grok);
+        assert_eq!(v, None, "a pattern this loose cannot tell the vote from the prose");
+        assert!(note.clone().unwrap_or_default().contains("yes"), "{note:?}");
+        assert!(note.unwrap_or_default().contains("no"));
+
+        // And the documented answer: a pattern that matches one thing reads it correctly.
+        req.verdict_regex = Some(r"(?m)^\s*(YES|NO)\s*$".to_string());
+        let anchored = VerdictExtractor::from_request(&req).expect("regex");
+        assert_eq!(verdict_of(&anchored, grok).as_deref(), Some("yes"), "anchor it and the same reply is clear");
     }
 
     /// The reason a seat failed is the DAEMON'S text, and the daemon quotes what it rejected.

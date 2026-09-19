@@ -275,6 +275,13 @@ pub struct JurySeat {
     /// The normalized verdict this seat cast, when one could be extracted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
+    /// Why an ANSWERED seat cast no verdict. Absent when it cast one.
+    ///
+    /// Without this, a seat that answered and a seat whose answer could not be read were the
+    /// same empty field, and a jury that lost half its votes to a bad regex looked like a jury
+    /// whose members had nothing to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls_made: Option<u32>,
     pub duration_ms: u64,
