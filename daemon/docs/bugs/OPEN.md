@@ -256,31 +256,6 @@ which repo's ledger to open.
 project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
 **Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
 
-### D-017 - the sight gate discards codex reviews that did read the sources
-**Found:** 2026-09-19 · **Severity:** HIGH · **Partially fixed 2026-09-19, NOT closed**
-**Evidence:** on the first live `ask_jury` run, codex read a 97-line brief with
-`wc -l F && sed -n '1,240p' F`, which shows every line, and the gate rejected the turn as
-"never successfully opened". Its answer was correct and was thrown away. On the second run,
-after the fix below, codex was rejected again with
-`sed -n '1,240p' OTHER.md && sed -n '1,320p' BRIEF.md`.
-**FIXED so far:** both read parsers refused any command containing `&&`, which is what closed
-the D-010 decoy attacks. That refusal is right about the attacks and wrong about a chain, where
-each link is its own command. `agent-adapter::codex::and_chain_segments` splits on `&&` only,
-honoring quotes, consumed at all five gate sites through plural
-`whole_file_read_operands` / `command_read_ranges`. `;` and `||` mask a failed read and stay
-refused whole, as does an unterminated quote, which is a parse error that runs nothing.
-`command_reads_whole_file` is per-segment too: it took the FIRST token as the program, so
-`wc -l F && cat F` was a "partial" read of a command that cats the file.
-**STILL OPEN:** the exact two-file chain above passes as a unit test and was still rejected
-live. Either the live command differs from that reconstruction in a way the receipt hid, or
-there is a second cause. The receipt truncated the command at 160 characters, below the length
-of a real one, so it could not be diagnosed; that is fixed separately (it now reports the
-operand and window each read bound to), and the next live rejection should say which.
-**Do not close on the unit tests.** They pass now and the live path does not.
-**Check:** run a sight-gated `ask_jury` over a source and confirm the codex seat ANSWERS.
-**Note, separate from this defect:** codex sometimes returns zero tool calls because it opens
-by asking whether to use Pythia. That rejection is correct and is not evidence about D-017.
-
 ### D-018 - a PostHog quota rejection is dropped without a single log line
 **Found:** 2026-09-19 · **Severity:** MEDIUM (was HIGH before the cause was known)
 **Cause: KNOWN, not a Triumvirate bug.** The PostHog account has been out of quota for several
@@ -303,6 +278,48 @@ quota is restored.
 
 
 ## Closed
+
+### 2026-09-19: the sight gate discarded codex reviews that had read the sources
+Codex reads with a chain (`wc -l F && sed -n '1,240p' F`, or two files in one command) and
+the gate rejected those turns as "never successfully opened", throwing away correct reviews.
+Two of three jury seats were lost on the first live run with no disagreement between them.
+
+THREE parsers carried the same blanket refusal of any `&&`, which is what closed the D-010
+decoy attacks. The refusal is right about the attacks and wrong about a chain, where each
+link is its own command. Fixed with `agent-adapter::codex::and_chain_segments` (splits on
+`&&` only, honoring quotes) applied in `command_reads_file_contents`,
+`command_reads_whole_file`, and plural `whole_file_read_operands` / `command_read_ranges`,
+consumed at all five gate sites. `;` and `||` stay refused because both exit zero on a read
+that failed, as does an unterminated quote, which is a parse error that runs nothing. Every
+segment still goes through the unchanged strict parser.
+
+The one that actually mattered was `command_reads_file_contents`: it runs inside
+`shell_read_kind`, so a chained read stayed `ToolKind::Bash` and the coverage check, which
+filters on `ToolKind::ReadFile`, dropped the call before the other parsers were consulted.
+Fixing the two downstream parsers changed nothing live, and it took three failed live runs to
+find because the test helper hardcoded `kind: ToolKind::ReadFile` and so skipped the step
+under test. The helper now derives the kind through `shell_read_kind` as the adapters do.
+
+Two assertions in `codex_03` / `codex_05` were changed deliberately: they required
+`ls /repo && cat /repo/a.rs` to fail closed because "the reader may not be the part that
+touched the named path". That concern is now carried structurally. Classification answers
+"does this read a file" and operand binding answers "which file", and `codex_03b` asserts the
+decoy directly (`ls /repo/a.rs && cat /repo/b.rs` binds `b.rs` only). Mutation DETECTION is
+unaffected: it filters on `WriteFile`/`EditFile` kinds and has always been blind to codex
+shell commands, where the read-only sandbox is what holds.
+
+Diagnosis was blocked for two rounds by the gate's own receipt, which truncated the command
+at 160 characters, below the length of a real one. It now reports the binding: the operand
+each reader opened and the window it took. Writing that test exposed the PART receipt
+reporting the command's FIRST window whatever file it covered, so a reader who took lines
+1-50 of the source was told it had read "lines 1-240" of another file's window.
+
+**CHECK PASSED, live, 2026-09-19:** a sight-gated `ask_jury` over the brief returned
+`codex: {status: answered, answered_by_agent: codex, tool_calls_made: 2, verdict: ready}`,
+3 of 3 seats answered, where the three previous runs on the same brief lost that seat.
+Offline: 96 adapter, 570 lib and 278 binary tests, and reverting the classifier turns the
+new tests red where they previously passed straight through the bug.
+
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"
 The codex read classifier allowed `cat`/`head`/`nl`; codex-cli 0.145.0 reads files as
