@@ -19,29 +19,6 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-### D-002 — OTLP export failures ship with an empty body
-**Found:** 2026-07-28 · **Severity:** HIGH
-**Evidence:** `BatchLogProcessor.ExportError` rows in PostHog carry `body: ""`. The cause
-(`dns error: failed to lookup address information`, `TimedOut`) exists in `fields.error` in
-`~/.triumvirate/daemon.log` and does not survive into PostHog.
-**Why it matters:** the one signal that tells you telemetry is broken arrives carrying no
-information about how it is broken.
-**Check:** trigger an export failure (block DNS to us.i.posthog.com), confirm the PostHog row
-carries the cause string.
-**RE-CHECKED 2026-09-19, STILL OPEN, and it is not rare:** today's log holds **4,266**
-`BatchLogProcessor.ExportError` lines. The newest still carries `body: ""`, with the cause
-(`url: ".../i/v1/logs", source: TimedOut`) only in `fields.error`, exactly as first recorded
-on 2026-07-28. Whatever volume was needed to make this worth fixing, it has arrived.
-
-### D-003 — No gap marker for windows when logs did not ship
-**Found:** 2026-07-28 · **Severity:** HIGH · **Depends on:** D-002
-**Evidence:** during the DNS-failure windows on 2026-07-28, logs generated locally never
-reached PostHog. Nothing marks those windows as untrusted.
-**Why it matters:** absence of a log currently proves nothing. A quiet hour and a broken hour
-render identically, which makes every "nothing happened" conclusion unsound.
-**Check:** after an export outage, the affected window is explicitly marked as untrusted
-rather than simply empty.
-
 ### D-004 — Failed generations carry no error text
 **Found:** 2026-07-28 · **Severity:** MEDIUM · **Partially resolved 2026-08-07**
 **Evidence:** the three failed `$ai_generation` events of 2026-07-28 carry
@@ -61,26 +38,22 @@ the prone path: its absolute SLA is 1800s, far past the 180s client ceiling.
 provider cause string — `$ai_error` does not exist in the taxonomy.
 **Check:** a failed generation in PostHog carries a cause string.
 
-### D-005 — Instrumentation streams gone silent, cause unknown
-**Found:** 2026-07-28 · **Severity:** LOW (was MEDIUM) · **Partially resolved 2026-08-02**
-**Evidence:** hours since last event as of 2026-07-28: `tv_review_verdict` 167,
-`tv_fleet_spawn` 167, `tv_review_requested` 167, `tv_codex_dispatch` 165, `tv_maintenance` 122.
-
-**RESOLVED for `tv_codex_dispatch` (2026-08-02):** the emitter is healthy. Over 30 days there
-were 4 `dispatch_codex` plus 2 `dispatch_codex_worktree` MCP calls, and exactly 6
-`tv_codex_dispatch` events. 1:1, nothing dropped. The stream is quiet because the path has
-not been invoked since 2026-07-22, not because it broke. Recent project work
-(`deliverability-control-plane`, 2026-07-30) was research and design, not code: 40
-`gemini-search`, 12 `gemini-check-research`, 10 `gemini-deep-research`, 0 dispatches.
-
-**Still open:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`, `tv_maintenance`.
-The same cross-check is available for these — compare event counts against the corresponding
-`$mcp_tool_call` counts — but review and fleet calls are too sparse (1-2 in 30 days) for the
-comparison to prove anything yet.
-**Why it matters:** a stream at zero is ambiguous between "path idle" and "emitter broken",
-and the two demand opposite responses.
-**Check:** for each remaining stream, exercise the path once and confirm the event lands.
-**Tile:** "Instrumentation freshness — dead signal or quiet one?" (dashboard 1886865).
+### D-005 - Instrumentation streams gone silent, cause unknown
+**Found:** 2026-07-28 · **Severity:** LOW · **Blocked on an external reset, NOT fixed**
+**Remaining streams:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`,
+`tv_maintenance`. (`tv_codex_dispatch` was shown healthy on 2026-08-02.)
+**What changed 2026-09-19:** this row could never be resolved because nothing could tell "path
+idle" from "emitter broken". That question now has an instrument. The delivery round trip
+(`mcp_bridge::telemetry_delivery`, D-018) reports whether events are arriving AT ALL, so a
+quiet stream is interpretable: while `/health` says `telemetry_delivery: untrusted`, no stream's
+silence means anything; while it says `trusted`, a silent stream is an idle path.
+**Why it is still open:** its own check is "exercise each path once and confirm the event
+lands", and nothing lands while the PostHog account is over quota. Closing it on the new
+instrument alone would be closing it on reasoning rather than on its check, which is exactly
+what this file forbids.
+**Unblocks:** 2026-09-20 14:03 ET, when the quota resets.
+**Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
+stream once and find the event in PostHog.
 
 ### D-006 — agy health probe has never exercised its failure branch
 **Found:** 2026-07-28 · **Severity:** MEDIUM
@@ -159,47 +132,6 @@ which repo's ledger to open.
 **Fix shape:** a daemon-level index `~/.triumvirate/fleets.json` mapping fleet_id to
 project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
 **Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
-
-### D-018 - PostHog answers 200 OK for events it discards, so delivery is unknowable from here
-**Found:** 2026-09-19 · **Severity:** HIGH (was MEDIUM; raised once the cause was measured)
-**Supersedes the first version of this row, which was WRONG.** I wrote it as "a quota rejection
-is dropped without a single log line", which assumed a rejection existed and the daemon was
-failing to log it. There is no rejection.
-
-**Evidence, measured 2026-09-19 while the account was over quota:**
-```
-POST https://us.i.posthog.com/i/v0/e/   ->   HTTP 200   {"status":"Ok"}
-SELECT ... FROM events WHERE event = 'tv_quota_probe' ...   ->   0 rows
-```
-The event was accepted, acknowledged as Ok, and discarded server side. `capture_as` in
-`mcp-bridge/src/posthog.rs` handles this correctly for everything it can see: it warns on a
-non-2xx and on a transport error, and logs the 2xx at `debug!`. There was nothing to warn
-about. The daemon is not failing to report a failure; it is being told it succeeded.
-
-**Why it matters:** the sending side cannot answer "did my telemetry arrive". A delivered
-event and a discarded one are byte-identical from here. That is why three days of dead
-telemetry looked like "nothing happened", and why the first suspicion fell on newly added
-instrumentation rather than on the account.
-
-**This collapses four rows into one problem.** D-002 (export failures ship an empty body),
-D-003 (no gap marker for windows when logs did not ship) and D-005 (streams gone silent, cause
-unknown) are all the same question asked from the same blind side. D-005 asked whether a quiet
-stream means "path idle" or "emitter broken"; the answer needs evidence that does not come
-from the emitter.
-
-**Fix shape (the only one that actually answers it):** a delivery round trip. Emit a sentinel
-event on a timer, then READ IT BACK through the PostHog query API (a `phx_` personal key,
-separate from the ingest key). Delivery confirmed = the window is trustworthy. Sentinel not
-returned within N intervals = mark the window UNTRUSTED and say so loudly, which is exactly
-what D-003 asks for. Nothing short of a round trip distinguishes the two states, because the
-ingest endpoint reports Ok for both.
-**Check:** with the account over quota, the daemon reports telemetry as UNTRUSTED within one
-sentinel interval, rather than reporting nothing.
-**Consequence meanwhile:** `tv_jury_seat`, added with `ask_jury`, has never been observed
-landing and cannot be until quota is restored. It is written and unverified.
-
-
-## Closed
 
 ### 2026-09-19: agy ran past its version pin on every dispatch (D-007)
 The pin was 1.1.5 in `~/.claude.json` and 1.0.2 as the code default, while 1.2.7 was installed

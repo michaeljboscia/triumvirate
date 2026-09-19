@@ -17,6 +17,8 @@ pub mod grok;
 pub mod agy_resilience;
 /// Shared PostHog telemetry. Every crate that dispatches an agent emits through this.
 pub mod posthog;
+/// Whether that telemetry actually ARRIVES, which the sending side cannot tell (D-018).
+pub mod telemetry_delivery;
 
 // T-002 (REQ-DS-002/003/015): authoritative env-config loader for the DeepSeek sibling.
 pub mod deepseek_config;

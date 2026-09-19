@@ -2308,6 +2308,13 @@ async fn run_daemon() -> anyhow::Result<()> {
             body["agy_health_detail"] = serde_json::json!(h.detail);
             body["agy_health_last_probe_unix_ms"] = serde_json::json!(h.last_probe_unix_ms);
         }
+        // D-018 / D-003: whether telemetry is actually ARRIVING. "untrusted" means every tv_*
+        // absence in the current window is meaningless, which is the marker D-003 asked for.
+        let t = mcp_bridge::telemetry_delivery::delivery_snapshot();
+        body["telemetry_delivery"] = serde_json::json!(t.trust.as_str());
+        body["telemetry_delivery_detail"] = serde_json::json!(t.detail);
+        body["telemetry_delivery_consecutive_misses"] = serde_json::json!(t.consecutive_misses);
+        body["telemetry_delivery_last_check_unix_ms"] = serde_json::json!(t.last_check_unix_ms);
         Ok(AxumJson(body))
     }
 
@@ -3008,6 +3015,18 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
         });
     }
+    // D-018: PostHog answers 200 OK for events it discards, so the only way to know whether
+    // telemetry is arriving is to read a sentinel back from the other side. Runs whatever the
+    // backend, because every tv_* stream depends on it. The first check waits one interval
+    // rather than firing at boot, so a restart loop cannot turn into a sentinel storm.
+    tokio::spawn(async {
+        let interval = mcp_bridge::telemetry_delivery::sentinel_interval();
+        let wait = mcp_bridge::telemetry_delivery::ingestion_wait();
+        loop {
+            tokio::time::sleep(interval).await;
+            mcp_bridge::telemetry_delivery::check_and_record(wait).await;
+        }
+    });
     tokio::spawn({
         let scanner_bus = observability_bus.clone();
         async move {
