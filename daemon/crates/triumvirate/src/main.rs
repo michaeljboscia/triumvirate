@@ -4222,9 +4222,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let alpha = wiki.path().join("alpha-page.md");
         fs::write(&alpha, "the alpha page\n")?;
         let alpha = alpha.display().to_string();
+        let wiki_dir = wiki.path().display().to_string();
         let codex = write_codex_custom_script(&format!(
             "printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\"}}}}'\n\
              printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\",\"exit_code\":0}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\"}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\",\"exit_code\":0}}}}'\n\
              printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"Per alpha-page. research/beta-page-notes.md is not a citation.\"}}}}'"
         ))?;
         unsafe {
@@ -4253,7 +4256,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let events = wiki_call_events(&fs::canonicalize(project.path())?);
         assert_eq!(events.len(), 1, "{events:?}");
         let p = &events[0].1;
-        assert_eq!(p["schema"], 2);
+        assert_eq!(p["schema"], 3);
         let ev = &p["evidence"];
         assert_eq!(ev["parser_mode"], "codex-exec-json", "{ev}");
         assert_eq!(ev["backend"], "codex", "the direct path names its backend: {ev}");
@@ -4266,6 +4269,15 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(ev["wiki"]["pages"], 3);
         assert_eq!(ev["wiki"]["generated"], "2026-09-19");
         assert_eq!(ev["harness"], "cargo-test", "a test-suite call must say so: {ev}");
+        // The read AND the search of the wiki both count here; only the read names a page.
+        assert_eq!(
+            ev["wiki_tool_calls"],
+            serde_json::json!([
+                {"kind": "read_file", "pages": ["alpha-page"], "index": false},
+                {"kind": "bash", "pages": [], "index": false},
+            ]),
+            "{ev}"
+        );
         let raw = p.to_string();
         assert!(!raw.contains("not a citation") && !raw.contains("Use gamma-page"), "text leaked: {raw}");
         Ok(())

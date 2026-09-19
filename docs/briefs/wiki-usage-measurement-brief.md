@@ -312,3 +312,49 @@ through the bridge, so the bridge cannot withhold or swap it for one call. That 
 injection mechanism, which is a separate brief. Until those exist no rate is believable, and
 the report says so at the top. Also still open: the brief's `skip_reason: stale` check belongs to
 that injection mechanism for the same reason.
+
+## The rate, and the finding that changed its definition (2026-09-19)
+
+Owner's decision: the map stays in the peers' own instruction files, so there is no holdout and no
+placebo. The floor comes from construction instead: page files did not exist before 2026-09-17, a
+peer without the map has no way to know a page path, and prompt-named pages are excluded. The
+positive control is a set of ceiling probes, `scripts/wiki-probes.py`: six questions whose answers
+live in one page body and in no instruction file (checked before a call is spent, and the check
+refuses a probe whose answer is reachable without a lookup). Each runs `hinted` ("check the
+knowledge base listed in your instructions") and `unhinted`.
+
+**The first probe run killed the original definition.** "Opened a wiki page" was the proposed use
+signal. Grok answered SIX of six hinted probes correctly with zero pages opened, and Gemini five of
+six with two. They were not reading pages: they were running `grep` and shell commands against the
+wiki directory and answering from the search output. A page-open rate would have reported zero use
+for seats that used the wiki on nearly every call. That is the same shape as the D-018 lesson: the
+instrument measured something adjacent to the question.
+
+So the event now records `wiki_tool_calls` (schema 3): every successful tool call whose arguments
+name the wiki, with its kind, the page files its arguments name, and whether it touched the index.
+File names only. **Use is now "consulted the wiki", any tool call touching it; opening a page is one
+kind of consultation and is still reported separately.** A seat's rate is published only when a
+HINTED probe shows the instrument SEEING that seat consult the wiki. Requiring a page open there
+would have failed Grok for using the wiki the way Grok uses it.
+
+Second run, on the instrumented binary (12 probes per seat per variant, two runs):
+
+| seat | variant | consult observable | consulted | opened target | answer matched |
+|---|---|---:|---:|---:|---:|
+| gemini | hinted | 8 | 6 | 2 | 10/12 |
+| gemini | unhinted | 6 | 2 | 0 | 7/12 |
+| grok | hinted | 6 | 5 | 0 | 12/12 |
+| grok | unhinted | 6 | 1 | 0 | 8/12 |
+
+Both instruments are proven. Organic rates are still 0/0: the only organic schema-2 calls predate
+`wiki_tool_calls`, and a legacy row counts as unobservable rather than as zero use. The rate accrues
+from here. Codex probes wait on its quota reset (2026-09-20 14:03 ET).
+
+**What the probes say beyond the instrument.** Hinted beats unhinted on every seat, which is the
+known shape: peers consult when told to, and mostly do not otherwise. Grounded search on how others
+drive consultation (run 2026-09-19, LOW grounding: 2 sources, 3% coverage, so its numbers are not
+cited here) offers one durable pattern that matches this evidence: retrieval gets used when it is a
+TOOL whose description says when to call it, not a file tree the agent may search. That is already
+option 5 in `mneme-bosciamem/research/2026-09-19-consumption.md` (a `wiki_search` tool, the Letta
+archival pattern), it is the one option never built, and the probes show peers reaching for exactly
+that shape by hand with `grep`.

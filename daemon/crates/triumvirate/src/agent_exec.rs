@@ -360,7 +360,7 @@ pub(crate) fn record_ask_call_event(
 
     let agent_requested = mcp_bridge::normalize_agent_name(&req.agent);
     let mut payload = serde_json::json!({
-        "schema": 2,
+        "schema": 3,
         "agent_requested": agent_requested,
         "required_sources": req.required_sources,
         "is_peer_review": req.is_peer_review.unwrap_or(false),
@@ -442,10 +442,11 @@ pub(crate) fn wiki_evidence(
 ) -> serde_json::Value {
     let mode = parsed.parser_mode.as_str();
     let reads_classified = PARSER_MODES_THAT_CLASSIFY_READS.contains(&mode);
+    let tool_records = PARSER_MODES_WITH_TOOL_RECORDS.contains(&mode);
     let mut ev = serde_json::json!({
         "parser_mode": mode,
         "backend": backend,
-        "tool_records": PARSER_MODES_WITH_TOOL_RECORDS.contains(&mode),
+        "tool_records": tool_records,
         "reads_classified": reads_classified,
         "prompt_paths": crate::wiki_usage::paths_in(prompt),
     });
@@ -467,6 +468,41 @@ pub(crate) fn wiki_evidence(
             ev["text_ids"] =
                 serde_json::json!(crate::wiki_usage::page_ids_in(&parsed.response_text, &wiki.pages));
             ev["prompt_ids"] = serde_json::json!(crate::wiki_usage::page_ids_in(prompt, &wiki.pages));
+            // Every tool call whose arguments mention the wiki: its kind, the page files its
+            // arguments name, and whether it touched the map's own index. `pages_opened` sees
+            // only whole-page READS it can match to a page path, and the first ceiling probes
+            // showed that is not how peers use the wiki: Grok answered six of six hinted probes
+            // from `grep` and shell output with no page opened, and Gemini made a `read_file`
+            // that matched no page. Consulting the wiki is any of these; opening a page is one
+            // kind of it. Matched on the directory's NAME so `~/`, relative and absolute forms
+            // all count. File names only, never output.
+            ev["wiki_tool_calls"] = if tool_records {
+                let marker = wiki
+                    .dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let calls: Vec<serde_json::Value> = parsed
+                    .tool_calls
+                    .iter()
+                    .filter(|call| call.success != Some(false))
+                    .filter_map(|call| {
+                        let args = call.args_json.as_deref()?;
+                        (!marker.is_empty() && args.contains(&marker)).then(|| {
+                            let pages: Vec<&String> =
+                                wiki.pages.iter().filter(|id| args.contains(&format!("{id}.md"))).collect();
+                            serde_json::json!({
+                                "kind": serde_json::to_value(&call.kind).unwrap_or_else(|_| "unknown".into()),
+                                "pages": pages,
+                                "index": args.contains("_index"),
+                            })
+                        })
+                    })
+                    .collect();
+                serde_json::json!(calls)
+            } else {
+                serde_json::Value::Null
+            };
             ev["pages_opened"] = if reads_classified {
                 let opened: Vec<&String> = wiki
                     .pages
