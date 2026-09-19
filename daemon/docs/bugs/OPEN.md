@@ -27,6 +27,9 @@ event. Two SIGTERMs sent on 2026-07-28 (22:08, 22:29 EDT) produced no record at 
 crash and a clean restart are the same evidence. This is the specific case the defect
 dashboard was built to catch, and it catches nothing because nothing is emitted.
 **Check:** kill the daemon, then find an event or log line naming the shutdown and its cause.
+**RE-CHECKED 2026-09-19, STILL OPEN:** the daemon was SIGTERMed and restarted four times
+during the ask_jury work. `grep -icE 'shutdown|sigterm|stopping|graceful'` over the log:
+**zero**. Fourteen months of births, no deaths, and four more today.
 **Tile:** "Daemon restarts — births with no recorded deaths" (dashboard 1886865).
 
 ### D-002 — OTLP export failures ship with an empty body
@@ -38,6 +41,10 @@ dashboard was built to catch, and it catches nothing because nothing is emitted.
 information about how it is broken.
 **Check:** trigger an export failure (block DNS to us.i.posthog.com), confirm the PostHog row
 carries the cause string.
+**RE-CHECKED 2026-09-19, STILL OPEN, and it is not rare:** today's log holds **4,266**
+`BatchLogProcessor.ExportError` lines. The newest still carries `body: ""`, with the cause
+(`url: ".../i/v1/logs", source: TimedOut`) only in `fields.error`, exactly as first recorded
+on 2026-07-28. Whatever volume was needed to make this worth fixing, it has arrived.
 
 ### D-003 — No gap marker for windows when logs did not ship
 **Found:** 2026-07-28 · **Severity:** HIGH · **Depends on:** D-002
@@ -202,6 +209,11 @@ condition the daemon can see and did not report, so "no events" was indistinguis
 first suspicion was that the newly added `tv_jury_seat` instrumentation was broken.
 **Check:** point the daemon at a token that will be refused and confirm the log carries the
 status and the provider's reason. Quota exhaustion must be loud.
+**The contrast that makes this a defect and not just an outage (2026-09-19):** two exporters
+in this daemon post to the same host while the account is out of quota. The OTLP log exporter
+has written **4,266** error lines today (see D-002). The event path, `posthog::capture_as`
+posting to `/i/v0/e/`, has written **zero**. One screams thousands of times, the other is
+silent, and the silent one is the path every `tv_*` event takes.
 **Consequence, so nothing is overclaimed:** the `tv_jury_seat` events added with `ask_jury`
 have never been observed landing. That instrumentation is written and unverified until the
 quota is restored.
@@ -326,4 +338,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-19 (D-017, D-018 added from the first live ask_jury run)
+**Last reviewed:** 2026-09-19 (every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
