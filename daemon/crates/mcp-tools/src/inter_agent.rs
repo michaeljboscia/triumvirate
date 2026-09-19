@@ -46,7 +46,7 @@ pub type ExecuteAskAgentFn = for<'a> fn(
 /// continuously for four days: the real cause was the 180s client ceiling on a dispatch
 /// that needed 424s. An unverified remediation is worse than none, because it reads like a
 /// diagnosis and closes the investigation.
-fn describe_ask_agent_failure(err: &anyhow::Error) -> String {
+pub(crate) fn describe_ask_agent_failure(err: &anyhow::Error) -> String {
     let detail = format!("ask_agent failed: {err:#}");
     match err.downcast_ref::<DaemonRequestError>().map(|e| e.failure) {
         Some(DaemonRequestFailure::Unreachable) => {

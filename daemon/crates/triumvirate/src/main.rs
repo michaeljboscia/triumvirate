@@ -585,6 +585,27 @@ impl McpBridge {
             .await
     }
 
+    #[tool(
+        description = "Put ONE brief to several agents at once and tally their verdicts (default \
+                       seats: codex, grok, gemini). Unlike ask_agent, a seat is NEVER answered by \
+                       another agent or backend: a seat whose backend is down comes back \
+                       `unavailable`, and a reply that something else answered comes back \
+                       `invalid` with its text withheld. `unanimous` means EVERY requested seat \
+                       answered and agreed, so two of three is a `majority`. Verdicts are read \
+                       with `verdict_json_pointer`, else `verdict_regex`, else the first \
+                       non-empty line. `outputs` maps a seat to the file it was told to write; \
+                       only counts come back, never contents. Use this, not parallel ask_agent \
+                       calls, whenever agreement between agents is the result."
+    )]
+    async fn ask_jury(
+        &self,
+        Parameters(req): Parameters<shared_types::AskJuryRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<shared_types::AskJuryResponse>, String> {
+        let local_test_execution_allowed = cfg!(test) && !mcp_daemon_proxy_enabled();
+        mcp_tools::jury::ask_jury(&req, &context, local_test_execution_allowed, execute_ask_agent_boxed).await
+    }
+
     #[tool(description = "Create a persistent named session for an agent.")]
     async fn spawn_session(
         &self,
@@ -1332,6 +1353,7 @@ fn infer_mcp_intent(tool_name: &str, params: Option<&serde_json::Value>) -> Stri
         | "review_request" | "review_submit" => {
             "Requesting or submitting a code review".to_string()
         }
+        "ask_jury" => "Putting one brief to several agents and tallying their verdicts".to_string(),
         "breaker_probe" => "Re-testing a backend so its circuit breaker can close".to_string(),
         "blind_validate" => {
             "Blind-validating a worktree: a different agent writes the tests".to_string()

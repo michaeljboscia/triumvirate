@@ -13,11 +13,16 @@
 //! The fan-out lives here in the bridge and rides the existing `ask_agent` path per seat. There
 //! is no daemon-side jury endpoint, on purpose: one implementation, not two.
 
-use crate::ProgressEmitter;
-use mcp_bridge::{display_agent_name, is_supported_agent_name, normalize_agent_name};
+use crate::{ProgressEmitter, inter_agent::{ExecuteAskAgentFn, describe_ask_agent_failure}};
+use daemon_http::{daemon_ask_timeout_secs, fetch_daemon_ask_agent, fetch_daemon_ledger_record};
+use mcp_bridge::{caller_driver_identity, display_agent_name, is_supported_agent_name, normalize_agent_name};
+use rmcp::{
+    Json,
+    service::{RequestContext, RoleServer},
+};
 use shared_types::{
-    AskAgentRequest, AskAgentResponse, AskJuryRequest, JuryMajority, JuryOutputCheck, JurySeat,
-    JuryTally,
+    AskAgentRequest, AskAgentResponse, AskJuryRequest, AskJuryResponse, JuryMajority,
+    JuryOutputCheck, JurySeat, JuryTally, ManualRecord, OutboxEvent,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -430,6 +435,149 @@ where
 
     let tally = tally(seat_names.len(), &seats, extractor.source());
     Ok(JuryRun { seats, tally })
+}
+
+/// The MCP tool. Seats ride the same path `ask_agent` does: the daemon when proxying, in
+/// process otherwise.
+pub async fn ask_jury(
+    req: &AskJuryRequest,
+    context: &RequestContext<RoleServer>,
+    local_test_execution_allowed: bool,
+    execute_ask_agent: ExecuteAskAgentFn,
+) -> Result<Json<AskJuryResponse>, String> {
+    let jury_id = format!("jury-{}", uuid::Uuid::new_v4());
+    let emitter = ProgressEmitter::from_context(context);
+    let caller = caller_driver_identity();
+    let cwd = req.cwd.clone();
+
+    let run = run_jury(
+        req,
+        caller.as_deref(),
+        Some(&emitter),
+        Duration::from_secs(daemon_ask_timeout_secs()),
+        move |seat_req: AskAgentRequest| async move {
+            if local_test_execution_allowed {
+                execute_ask_agent(&seat_req, None).await
+            } else {
+                fetch_daemon_ask_agent(&seat_req).await.map_err(|e| describe_ask_agent_failure(&e))
+            }
+        },
+        |seat| journal_seat(&jury_id, seat, &cwd),
+    )
+    .await?;
+
+    let record = ledger_record_for(&jury_id, &run);
+    let ledger = write_ledger(record, req.cwd.as_deref(), !local_test_execution_allowed).await;
+    if let Err(e) = &ledger {
+        tracing::warn!(jury_id, error = %e, "ask_jury: ledger record failed; the verdicts stand");
+    }
+    Ok(Json(AskJuryResponse {
+        jury_id,
+        seats: run.seats,
+        tally: run.tally,
+        ledger_recorded: ledger.is_ok(),
+        ledger_error: ledger.err(),
+    }))
+}
+
+/// One outbox line and one PostHog event per seat, as that seat lands.
+fn journal_seat(jury_id: &str, seat: &JurySeat, cwd: &Option<String>) {
+    let detail = match (&seat.reason, &seat.output) {
+        (Some(reason), _) => reason.clone(),
+        (None, Some(out)) => format!("output rows={:?} written_this_call={}", out.rows, out.written_this_call),
+        (None, None) => format!("answered by {}", seat.answered_by_agent.as_deref().unwrap_or(&seat.agent)),
+    };
+    if let Err(e) = fallback_outbox::append_outbox_event(&OutboxEvent {
+        ts_ms: daemon_core::unix_time_ms(),
+        request_id: jury_id.to_string(),
+        tool: "ask_jury".to_string(),
+        status: format!("SEAT_{}", seat.status.to_uppercase()),
+        agent: Some(seat.agent.clone()),
+        detail,
+        cwd: cwd.clone(),
+        repo: None,
+        branch: None,
+        working_state: None,
+        token_usage: None,
+        tool_name: None,
+    }) {
+        tracing::warn!("failed to append outbox event: {e}");
+    }
+    mcp_bridge::posthog::record_jury_seat(
+        jury_id,
+        &seat.agent,
+        &seat.status,
+        seat.answered_by_agent.as_deref(),
+        seat.answered_by_backend.as_deref(),
+        seat.duration_ms,
+    );
+}
+
+/// Provenance and counts. No reply text and no verdict text: for a labelling jury the verdict
+/// IS the label, and the ledger is not where labels belong.
+fn ledger_record_for(jury_id: &str, run: &JuryRun) -> ManualRecord {
+    let t = &run.tally;
+    let seats: Vec<serde_json::Value> = run
+        .seats
+        .values()
+        .map(|s| {
+            serde_json::json!({
+                "agent": s.agent,
+                "status": s.status,
+                "reason": s.reason,
+                "answered_by_agent": s.answered_by_agent,
+                "answered_by_backend": s.answered_by_backend,
+                "request_id": s.request_id,
+                "cast_a_verdict": s.verdict.is_some(),
+                "output_rows": s.output.as_ref().and_then(|o| o.rows),
+                "output_written_this_call": s.output.as_ref().map(|o| o.written_this_call),
+            })
+        })
+        .collect();
+    ManualRecord {
+        session_id: Some(jury_id.to_string()),
+        title: format!("ask_jury {}: {} of {} seats answered", t.outcome, t.seats_answered, t.seats_requested),
+        narrative: format!(
+            "Jury {jury_id}: outcome {}, {} of {} seats answered, {} verdicts cast (read by {}). Seats: {}.",
+            t.outcome,
+            t.seats_answered,
+            t.seats_requested,
+            t.verdicts_cast,
+            t.verdict_source,
+            run.seats.values().map(|s| format!("{}={}", s.agent, s.status)).collect::<Vec<_>>().join(", ")
+        ),
+        facts_json: Some(
+            serde_json::json!({
+                "jury_id": jury_id,
+                "outcome": t.outcome,
+                "unanimous": t.unanimous,
+                "split": t.split,
+                "majority_count": t.majority.as_ref().map(|m| m.count),
+                "seats_requested": t.seats_requested,
+                "seats_answered": t.seats_answered,
+                "verdicts_cast": t.verdicts_cast,
+                "seats": seats,
+            })
+            .to_string(),
+        ),
+        concepts_json: None,
+        affected_files_json: None,
+        summary_type: "jury".to_string(),
+    }
+}
+
+async fn write_ledger(record: ManualRecord, cwd: Option<&str>, via_daemon: bool) -> Result<(), String> {
+    if via_daemon {
+        return fetch_daemon_ledger_record(&record).await.map(|_| ()).map_err(|e| format!("{e:#}"));
+    }
+    let root = match cwd {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::env::current_dir().map_err(|e| format!("no current directory: {e}"))?,
+    };
+    ledger::LedgerStore::open(root)
+        .and_then(|store| store.record(record))
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]
