@@ -425,6 +425,25 @@ pub fn seat_request(req: &AskJuryRequest, agent: &str) -> AskAgentRequest {
 pub struct JuryRun {
     pub seats: BTreeMap<String, JurySeat>,
     pub tally: JuryTally,
+    /// The probe this run attempted, if any, and which seats it bought back.
+    pub breaker_probe: Option<shared_types::BreakerProbeResponse>,
+    pub seats_retried_after_probe: Vec<String>,
+}
+
+/// Would a breaker probe plausibly fix this seat's failure?
+///
+/// Only the agy-backed `gemini` seat has a breaker. The 2026-09-19 addendum to the brief: the
+/// breaker outlived the outage, so `agy --print` worked by hand while the bridge still refused,
+/// and a jury would have reported a reachable seat as unavailable. A probe is one small live
+/// call, so it is spent only on a failure a probe could actually clear.
+fn a_probe_could_fix(seat: &JurySeat) -> bool {
+    if seat.agent != "gemini" || seat.status != STATUS_UNAVAILABLE {
+        return false;
+    }
+    let reason = seat.reason.as_deref().unwrap_or_default().to_lowercase();
+    ["circuit breaker", "capacity/quota", "quota", "resource_exhausted", "429"]
+        .iter()
+        .any(|needle| reason.contains(needle))
 }
 
 /// Dispatch every seat at once and judge each as it lands.
@@ -432,17 +451,20 @@ pub struct JuryRun {
 /// `on_seat` fires as each seat finishes, in completion order, BEFORE the slow seats are done.
 /// That is the journal: if the caller's own client ceiling cancels this future, the seats that
 /// had already reported are on disk rather than lost with the call.
-pub async fn run_jury<F, Fut>(
+pub async fn run_jury<F, Fut, P, PFut>(
     req: &AskJuryRequest,
     caller: Option<&str>,
     emitter: Option<&ProgressEmitter>,
     default_timeout: Duration,
     run_seat: F,
+    probe_breaker: P,
     mut on_seat: impl FnMut(&JurySeat),
 ) -> Result<JuryRun, String>
 where
     F: Fn(AskAgentRequest) -> Fut,
     Fut: Future<Output = Result<AskAgentResponse, String>> + Send + 'static,
+    P: Fn() -> PFut,
+    PFut: Future<Output = Result<shared_types::BreakerProbeResponse, String>>,
 {
     if req.message.trim().is_empty() {
         return Err("ask_jury: message is empty".to_string());
@@ -522,8 +544,40 @@ where
         finish(seat, &mut seats);
     }
 
+    // THE BRIEF'S 2026-09-19 ADDENDUM. A seat is not called unavailable until a probe has had
+    // one chance to disprove it. Once per RUN, not once per seat: three seats failing on the
+    // same breaker is one outage, and three probes would spend three live calls to learn it.
+    let mut breaker_probe = None;
+    let mut seats_retried_after_probe: Vec<String> = Vec::new();
+    let probe_candidates: Vec<String> =
+        seats.values().filter(|s| a_probe_could_fix(s)).map(|s| s.agent.clone()).collect();
+    if !probe_candidates.is_empty() {
+        if let Some(e) = emitter {
+            e.emit("→ jury: a seat failed on the breaker; probing before calling it unavailable").await;
+        }
+        match probe_breaker().await {
+            Ok(probe) => {
+                if probe.closed_by_probe {
+                    for agent in probe_candidates {
+                        let started = Instant::now();
+                        let outcome = match run_seat(seat_request(req, &agent)).await {
+                            Ok(resp) => SeatOutcome::Replied(Box::new(resp)),
+                            Err(e) => SeatOutcome::Failed(e),
+                        };
+                        let seat = classify_seat(&agent, outcome, started.elapsed().as_millis() as u64, &extractor);
+                        seats_retried_after_probe.push(agent);
+                        finish(seat, &mut seats);
+                    }
+                }
+                breaker_probe = Some(probe);
+            }
+            // A probe that cannot run leaves the seat exactly as it was. The jury still returns.
+            Err(e) => tracing::warn!(error = %e, "ask_jury: breaker probe failed; seat stays unavailable"),
+        }
+    }
+
     let tally = tally(seat_names.len(), &seats, extractor.source());
-    Ok(JuryRun { seats, tally })
+    Ok(JuryRun { seats, tally, breaker_probe, seats_retried_after_probe })
 }
 
 /// The MCP tool. Seats ride the same path `ask_agent` does: the daemon when proxying, in
@@ -551,6 +605,15 @@ pub async fn ask_jury(
                 fetch_daemon_ask_agent(&seat_req).await.map_err(|e| describe_ask_agent_failure(&e))
             }
         },
+        || async {
+            if local_test_execution_allowed {
+                Err("breaker probe runs in the daemon".to_string())
+            } else {
+                daemon_http::fetch_daemon_breaker_probe(&shared_types::BreakerProbeRequest::default())
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            }
+        },
         |seat| journal_seat(&jury_id, seat, &cwd),
     )
     .await?;
@@ -564,6 +627,8 @@ pub async fn ask_jury(
         jury_id,
         seats: run.seats,
         tally: run.tally,
+        breaker_probe: run.breaker_probe,
+        seats_retried_after_probe: run.seats_retried_after_probe,
         ledger_recorded: ledger.is_ok(),
         ledger_error: ledger.err(),
     }))
@@ -743,6 +808,7 @@ mod tests {
                 let script = script.clone();
                 async move { script(&r) }
             },
+            || async { Err("no probe expected in this test".to_string()) },
             |_| {},
         )
         .await
@@ -923,6 +989,7 @@ mod tests {
                 }
                 Ok(reply(&r.agent, "REJECT"))
             },
+            || async { Err("no probe expected in this test".to_string()) },
             |seat| journal.lock().expect("journal").push((seat.agent.clone(), seat.status.clone())),
         )
         .await
@@ -936,6 +1003,146 @@ mod tests {
         assert_eq!(order.len(), 3);
     }
 
+    fn probe_result(closed: bool) -> shared_types::BreakerProbeResponse {
+        let open = shared_types::BreakerSnapshot {
+            phase: "open".to_string(),
+            cooldown_remaining_s: 9000,
+            open_count: 4,
+            shed: 12,
+        };
+        let after = if closed {
+            shared_types::BreakerSnapshot { phase: "closed".to_string(), cooldown_remaining_s: 0, open_count: 0, shed: 0 }
+        } else {
+            open.clone()
+        };
+        shared_types::BreakerProbeResponse {
+            backend: "agy".to_string(),
+            before: open,
+            after,
+            outcome: if closed { "ok" } else { "backend_failed" }.to_string(),
+            detail: "test probe".to_string(),
+            closed_by_probe: closed,
+        }
+    }
+
+    /// Runs a jury with a scripted seat runner AND a scripted probe, counting both.
+    async fn run_with_probe(
+        req: &AskJuryRequest,
+        script: impl Fn(&AskAgentRequest, usize) -> Result<AskAgentResponse, String> + Send + Sync + 'static,
+        probe: Result<shared_types::BreakerProbeResponse, String>,
+    ) -> (JuryRun, usize) {
+        let script = std::sync::Arc::new(script);
+        let dispatches = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let probes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let probe = std::sync::Arc::new(probe);
+        let seen = dispatches.clone();
+        let counted = probes.clone();
+        let run = run_jury(
+            req,
+            None,
+            None,
+            Duration::from_secs(5),
+            move |r: AskAgentRequest| {
+                let script = script.clone();
+                let seen = seen.clone();
+                let nth = {
+                    let mut n = seen.lock().expect("count");
+                    *n += 1;
+                    *n
+                };
+                async move { script(&r, nth) }
+            },
+            move || {
+                let probe = probe.clone();
+                let counted = counted.clone();
+                async move {
+                    *counted.lock().expect("count") += 1;
+                    (*probe).clone()
+                }
+            },
+            |_| {},
+        )
+        .await
+        .expect("jury runs");
+        let n = *probes.lock().expect("count");
+        (run, n)
+    }
+
+    /// THE BRIEF'S 2026-09-19 ADDENDUM. The breaker outlived the outage: agy answered by hand
+    /// while the bridge still refused, so a reachable seat would have been reported dead.
+    /// RED IF: a breaker-shaped failure is reported unavailable without a probe having tried.
+    #[tokio::test]
+    async fn a_breaker_failure_is_probed_before_the_seat_is_called_unavailable() {
+        let (run, probes) = run_with_probe(
+            &jury(&[]),
+            |r, nth| match (r.agent.as_str(), nth) {
+                // The gemini seat fails on the open breaker, then succeeds once it is closed.
+                ("gemini", n) if n <= 3 => Err("agy capacity/quota: circuit breaker open".to_string()),
+                (agent, _) => Ok(reply(agent, "APPROVE")),
+            },
+            Ok(probe_result(true)),
+        )
+        .await;
+
+        assert_eq!(probes, 1, "exactly one probe: three seats failing on one breaker is one outage");
+        assert_eq!(run.seats["gemini"].status, STATUS_ANSWERED, "{:?}", run.seats["gemini"]);
+        assert_eq!(run.seats_retried_after_probe, vec!["gemini".to_string()]);
+        assert_eq!(run.breaker_probe.as_ref().map(|p| p.closed_by_probe), Some(true));
+        assert!(run.tally.unanimous, "the recovered seat counts: {:?}", run.tally);
+    }
+
+    /// A probe is a live call. RED IF: it is spent on a failure it could not possibly fix.
+    #[tokio::test]
+    async fn no_probe_is_spent_on_a_failure_a_probe_cannot_fix() {
+        for (agent, reason) in [
+            // Not the breaker.
+            ("gemini", "prompt too large for agy (900000 bytes > 400000 limit)"),
+            // A genuinely quota-shaped failure, on an agent that HAS NO BREAKER. The first
+            // version of this case said "at capacity", which the reason filter rejects on its
+            // own, so removing the agent guard changed nothing and the mutant lived.
+            ("codex", "codex connector failed: quota exceeded (429), try again later"),
+        ] {
+            let failing = agent.to_string();
+            let (run, probes) = run_with_probe(
+                &jury(&[]),
+                move |r, _| {
+                    if r.agent == failing { Err(reason.to_string()) } else { Ok(reply(&r.agent, "APPROVE")) }
+                },
+                Ok(probe_result(true)),
+            )
+            .await;
+            assert_eq!(probes, 0, "{agent} / {reason}");
+            assert_eq!(run.seats[agent].status, STATUS_UNAVAILABLE);
+            assert!(run.breaker_probe.is_none());
+        }
+    }
+
+    /// RED IF: a probe that did not close the breaker triggers a retry anyway, or a probe that
+    /// could not run at all takes the jury down with it.
+    #[tokio::test]
+    async fn a_probe_that_does_not_close_leaves_the_seat_unavailable() {
+        for probe in [Ok(probe_result(false)), Err("daemon unreachable".to_string())] {
+            let reported = probe.is_ok();
+            let (run, probes) = run_with_probe(
+                &jury(&[]),
+                |r, _| {
+                    if r.agent == "gemini" {
+                        Err("agy capacity/quota: circuit breaker open".to_string())
+                    } else {
+                        Ok(reply(&r.agent, "APPROVE"))
+                    }
+                },
+                probe,
+            )
+            .await;
+            assert_eq!(probes, 1);
+            assert_eq!(run.seats["gemini"].status, STATUS_UNAVAILABLE);
+            assert!(run.seats_retried_after_probe.is_empty());
+            assert_eq!(run.breaker_probe.is_some(), reported, "a probe that ran is reported either way");
+            assert_eq!(run.tally.outcome, "majority");
+        }
+    }
+
     #[tokio::test]
     async fn the_caller_cannot_sit_on_its_own_jury() {
         let out = run_jury(
@@ -947,6 +1154,7 @@ mod tests {
                 assert_ne!(r.agent, "codex", "the caller's own seat must never be dispatched");
                 Ok(reply(&r.agent, "APPROVE"))
             },
+            || async { Err("no probe expected in this test".to_string()) },
             |_| {},
         )
         .await
@@ -1091,6 +1299,8 @@ mod tests {
         // wrote the reason verbatim to the outbox and the ledger both survived.
         let outbox = seat_detail(&seat);
         let run = JuryRun {
+            breaker_probe: None,
+            seats_retried_after_probe: Vec::new(),
             tally: tally(3, &BTreeMap::from([("grok".to_string(), seat)]), "first_line"),
             seats: BTreeMap::from([("grok".to_string(), classify_seat("grok", SeatOutcome::Failed(rejection.clone()), 1, &first))]),
         };

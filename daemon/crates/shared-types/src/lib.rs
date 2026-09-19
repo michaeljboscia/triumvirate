@@ -319,6 +319,14 @@ pub struct AskJuryResponse {
     pub seats: std::collections::BTreeMap<String, JurySeat>,
     #[serde(flatten)]
     pub tally: JuryTally,
+    /// The breaker probe this run attempted, when a seat failed in a way a probe could fix.
+    ///
+    /// Absent means no seat failed that way and nothing was spent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaker_probe: Option<BreakerProbeResponse>,
+    /// Seats re-run after a probe closed the breaker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats_retried_after_probe: Vec<String>,
     /// False when the ledger write failed. The verdicts stand either way.
     pub ledger_recorded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
