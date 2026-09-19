@@ -194,12 +194,16 @@ detector was right; the control failed on an unmodeled population.
 
 Consequences for the design, before a line of Rust:
 
-1. **`call_subject` is a required field, and wiki-subject calls are excluded from every rate.**
-   Without it the measurement is roughly half contaminated for Grok and 40% for Gemini, and the
-   contamination is all in one direction: it manufactures use. Today's rule is a prompt match on
-   the wiki's own repo and build artifacts (`WIKI_SUBJECT` in `scripts/wiki-controls.py`). At the
-   response seam it can be made exact: a call is wiki-subject if its required sources or its
-   opened files are under the wiki's repo.
+1. **Wiki-subject calls must be excluded from every rate** (CORRECTED below: not as a field
+   stored at emit time). Without the exclusion the measurement is roughly half contaminated for
+   Grok and 40% for Gemini, and the contamination is all in one direction: it manufactures use.
+   Today's rule is a match on the USER TASK: the prompt names the wiki's own repo or build
+   artifacts (`WIKI_SUBJECT` in `scripts/wiki-controls.py`).
+   **RETRACTED:** this item first said the rule could be made "exact" at the response seam as
+   "wiki-subject if its required sources or its OPENED FILES are under the wiki's repo". That is
+   circular and would have zeroed the metric by construction: opening a page IS the use signal,
+   so every genuine lookup would classify as wiki-subject and be excluded. Gemini and Grok each
+   found it independently. Subject must be read from the task, never from opened pages.
 2. **"Grok cannot open files at all" is wrong.** It read the labeling brief, the batch files and
    the taxonomy files here, and made 80 file-reading tool calls in one review the same day.
 3. **"Their own file reads never reach Triumvirate" is wrong, and this is the good news.** The
@@ -220,3 +224,50 @@ Consequences for the design, before a line of Rust:
 **Not yet measurable:** the DELIVERED arm. Almost nothing reached PostHog after the map start
 times, because the account has been over quota since 2026-09-16 (D-018). The controls are
 unaffected because every row they use predates the outage.
+
+## Jury on the design, 2026-09-19: all three answering peers said "neither A nor B"
+
+Asked through `ask_jury` (codex, grok, gemini, deepseek), with a self-contained brief laying out
+Position A (PAGES_OPENED primary, `call_subject` frozen at emit time) and Position B (TEXT
+primary, classify at report time), and asking what BOTH missed. Outcome `majority`, 3 of 4 seats,
+all three voting **C**. Codex was reported `unavailable` rather than substituted: its weekly usage
+limit resets 2026-09-20 14:03.
+
+**Where they agreed.** Store the raw evidence at emit time and classify at report time (B was
+right about that, and it is the one decision that cannot be undone later). Do not publish a rate
+yet. Promote neither signal on today's evidence.
+
+**What they found that I had missed, each checked where it could be checked:**
+- **The circular rule above.** Retracted.
+- **The subject regex matched the map's own first line.** `bosciamem wiki` is in both. The rule
+  reads only the user's prompt today, and peers get the map from instruction files, so no
+  historical result changed; but the moment the map is delivered through the prompt, every
+  delivered call would classify as wiki-subject and the delivered arm would vanish. The term is
+  removed, `scripts/wiki-controls.py` now refuses to run if any rule term matches the map, and
+  restoring the term makes it refuse. Re-run after the change: identical classifications.
+- **TEXT was validated for a regime that no longer exists** (DeepSeek, Grok). The controls prove
+  the regex does not fire when the map is ABSENT. Once all 20 ids sit in context permanently,
+  naming one or two of them is map echo, and the five-id recitation rule does not catch that.
+  So "TEXT is the only validated instrument" overstated it: it is validated for specificity
+  before delivery, not for anything after.
+- **No positive control, no ceiling** (DeepSeek). Nothing shows either signal FIRES when a peer
+  definitely uses a page. Without that, a near-zero rate cannot tell "peers ignore the wiki" from
+  "the instrument is dead". Proposed: a placebo map (no useful content) and a task answerable
+  only from a page's body.
+- **An empty tool-call list is unobservable, not zero** (Grok). A parser that records no tool
+  calls reports zero opens for every call it serves, which reads as "use dropped to zero". The
+  event must store `parser_mode` and whether tool records were present.
+- **Prompt-mandated opens are a third class** (Grok). "Read this page" is obedience, not
+  map-driven lookup, and neither position modelled it.
+- **PAGES_OPENED does have baselines** (all three, differently): the page files did not exist
+  before 2026-09-17, so opens were zero by construction; a call with `tv_tool_calls = 0` has zero
+  opens exactly; and going forward, a holdout that withholds the map from a share of calls gives a
+  contemporaneous floor. DeepSeek adds a per-peer canary id, which no prior knowledge, recitation
+  or file echo can produce.
+
+**Where they disagreed.** Whether the 230-versus-14 scale rescues the fitted rule: Gemini says
+completely; Grok says it rescues it from tautology but not enough to freeze it (Codex, at n=2, is
+not a holdout); DeepSeek says it proves precision and says nothing about recall. And on the
+eventual primary signal: Gemini favours PAGES_OPENED, Grok would make it the use definition only
+where tool records exist, DeepSeek would promote neither until a placebo and a canary have run.
+

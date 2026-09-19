@@ -42,8 +42,14 @@ RECITATION_DISTINCT = 5  # the brief's rule: five or more distinct page ids is a
 # run: all 14 Grok hits before the map existed, and all 7 Gemini floor hits, were the mneme blind-
 # labeler jury and the wiki bootstrap review, whose prompts point at the wiki's own repo. The page
 # ids were in FILES the peer opened, so the prompt string held only a path to them.
+#
+# NEVER let a term of this rule appear in the map itself. The first version included
+# `bosciamem wiki`, and the map's first line is `# bosciamem wiki index`: the moment the map is
+# delivered through the prompt, every delivered call would classify as wiki-subject and the entire
+# delivered arm would vanish from the measurement. Grok found it in review. `main` now refuses to
+# run if any term here matches the map.
 WIKI_SUBJECT = re.compile(
-    r"mneme-bosciamem|CLAUDE-WIKI|WIKI-BRAIN|/gold/|LABELING-BRIEF|bosciamem wiki", re.I)
+    r"mneme-bosciamem|CLAUDE-WIKI|WIKI-BRAIN|/gold/|LABELING-BRIEF", re.I)
 
 sys.path.insert(0, str(MNEME / "ops"))
 from usage_events import page_ids  # noqa: E402  single source for the page list
@@ -203,6 +209,12 @@ def main() -> int:
     if len(pages) != 20:
         print(f"WARNING: expected 20 wiki pages, the menu lists {len(pages)}")
     bare = detector(pages)
+
+    map_text = (MNEME / "_index.md").read_text()
+    if WIKI_SUBJECT.search(map_text):
+        print(f"SUBJECT RULE MATCHES THE MAP ITSELF ({WIKI_SUBJECT.search(map_text).group(0)!r}). "
+              "Delivering the map through a prompt would erase the delivered arm. Refusing to run.")
+        return 2
 
     failures = positive_control(bare, pages)
     if failures:
