@@ -32,20 +32,26 @@ Read out of the tree on 2026-09-19, not from memory:
 - `daemon/crates/ledger/src/lib.rs:54`, `LedgerStore::ingest_event(RawEvent)`. `RawEvent` is `{session_id, event_type, sequence, timestamp, payload_json}`, defined at `daemon/crates/shared-types/src/ledger.rs:5`.
 - `daemon/crates/ledger/src/store.rs:166`, the database path: `<project_root>/.triumvirate/ledger.db`.
 
-## The finding that changes the order of work: the event sink is dark
+## The finding that changes the order of work: the ask path has never written an event
 
-There are 13 ledger databases on this machine, and the `events` table has zero rows in every one of
-them, while `summaries`, `sessions`, `lessons`, `reviews` and `health` all carry rows in the two
-that are actually in use. So `ingest_event` is a working API with no live producer.
+Corrected 2026-09-19, same day, after a first version of this brief overstated it. The first pass
+said the ledger's event sink had no producer at all, on the evidence that the `events` table is
+empty in all 13 ledger databases on this machine. That evidence was too weak for the claim. Here is
+what is actually true, from the tree:
 
-That matters because "just emit an event into the existing ledger" sounds like a one-line change and
-is not. **Step one is to prove the sink**: write one event from the daemon's own runtime, read it
-back from the database the daemon actually opened, and confirm which project root that was. A
-measurement built on an unproven sink is the exact failure this whole effort exists to catch, a
-system that reports success while recording nothing.
+- `ingest_event` **does** have production callers, in `daemon/crates/fleet/src/orchestrator.rs` and `daemon/crates/fleet/src/recovery.rs`. The sink works and is exercised.
+- What it does not have is a caller on the **ask path**. `agent_exec.rs` uses the ledger for records, summaries and reviews, and never writes an event. So the exact path this brief needs is the one path that has never written to the sink.
+- The table reads empty today for two ordinary reasons, not a defect: fleet runs are rare, and `gc.rs` deletes events older than `EVENT_RETENTION_DAYS`, which is 30. The repo's own ledger shows an events autoincrement high-water mark of 15 against 0 current rows, which is exactly what retention looks like after the fact.
 
-If the sink turns out not to be viable, the fallback is a JSONL file next to the daemon log, the
-same shape the Claude side uses. Do not add a new database.
+The practical instruction is unchanged and the reason for it is now sharper. **Step one is still to
+prove the sink from the ask path**: write one event during a real `ask_agent` call, then read it back
+out of the database the daemon actually opened, and print which project root that was. Do not infer
+that it works because the fleet crate's calls compile.
+
+Two consequences worth carrying into the design:
+
+- **Retention is 30 days.** A measurement that wants a before-and-after across a longer window cannot live only in `events`. Either summarise into a table gc does not sweep, or write the report artifact to disk on each run, which is what the Claude side does.
+- **An empty table is not evidence of a missing producer.** This brief made that mistake in its first version. Check `sqlite_sequence` for whether a table ever held a row, and check the retention rule, before concluding anything from a zero.
 
 ## The signal, and why it is weaker here than on the Claude side
 
@@ -142,7 +148,7 @@ database.
 ## Acceptance
 
 - One event per call reaches the ledger the daemon actually opened, proven by reading it back, with the database path named in the run output.
-- The reader finds all 13 ledgers and says how many it found.
+- The reader finds all 13 ledgers and says how many it found, and does not treat an empty events table as evidence of anything without checking sqlite_sequence and the 30 day retention rule.
 - The detector returns zero on Grok before injection is switched on.
 - A response that recites the map is labelled `recitation` and does not appear in the use numerator.
 - A degraded call is keyed to the seat that answered and is excluded from both seats' rates.
