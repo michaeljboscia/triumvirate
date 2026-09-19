@@ -358,3 +358,44 @@ TOOL whose description says when to call it, not a file tree the agent may searc
 option 5 in `mneme-bosciamem/research/2026-09-19-consumption.md` (a `wiki_search` tool, the Letta
 archival pattern), it is the one option never built, and the probes show peers reaching for exactly
 that shape by hand with `grep`.
+
+## `wiki_search`, and what building it measured (2026-09-19)
+
+The probes said peers reach for a search interface by hand, so they got one: `wiki_search`, an MCP
+tool on the existing bridge (`daemon/crates/triumvirate/src/wiki_search.rs`). Not a new server:
+codex, gemini and grok already have the Triumvirate MCP server registered, so the tool reaches all
+three with no config change. Term matching over 20 markdown files, no index and no embedding
+service to go stale. The description names its trigger ("CALL THIS FIRST, before answering
+anything about how things are done here... do NOT grep or ls the wiki directory"), because a
+description that only says what a tool IS does not get called.
+
+**The first live call was ranked wrong, and it showed the bug.** "langfuse port homebox" returned a
+1050-line page of the word "supports" above the page holding the answer: substring matching, so
+`port` matched `supports`, and volume beat relevance. Now terms match on word boundaries (the same
+rule as the page-id detector) and pages rank by how many distinct query terms they cover before
+any volume count. Both are pinned by tests built from that failure.
+
+**Three measurement defects, all found live, all silent:**
+1. A confirmed peer `wiki_search` call recorded as NO wiki touch. Grok records every MCP call
+   under a generic name (`search_tool`, `use_tool`) and puts the real tool name in the ARGUMENTS.
+   The filter read the name field only. Both places are now checked.
+2. Nothing on this side could say why. The event now carries `tools`, every tool name in the turn
+   with a count, names only. A measurement that cannot be debugged from its own output is the
+   failure this brief exists to prevent.
+3. The server-side journal silently wrote nothing for peer calls, because the write error was
+   swallowed. Made loud, and the log then named the cause in one line: Grok SANDBOXES the MCP
+   server it spawns, so a write to `~/.triumvirate/` returns "Operation not permitted". The
+   journal is therefore best-effort and structurally blind to sandboxed peers; the ledger evidence
+   is the authoritative count.
+
+**Adoption so far: zero unprompted.** Twelve fresh probes (facts never asked before, because Grok
+keeps per-session memory and the first probe set is burned for adoption testing) across grok and
+gemini: every answer correct, `wiki_search` called zero times. Both seats still grep. Told to call
+it explicitly, both do, and the answers are real (Grok's returned line numbers matched the tool's
+output exactly). So the tool works and is reachable; nothing yet TELLS the peers it exists, because
+the map in their instruction files describes a directory of files, not a search tool.
+
+**The next lever, not taken here:** one line in the map that names `wiki_search` as the way to look
+something up. That is a change to `ops/build_index.py` in the mneme repo, which owns the map, and
+is the owner's call. The instrument is now in place to measure whether it works: `via wiki_search`
+is a column in the report.

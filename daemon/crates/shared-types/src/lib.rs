@@ -428,6 +428,16 @@ pub enum GrokDepthOverride {
     Deep,
 }
 
+/// Parameters for the `wiki_search` MCP tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WikiSearchParams {
+    /// What to look for, in the words expected on the page.
+    pub query: String,
+    /// How many pages to return (1 to 10, default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pages: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AskAgentResponse {
     pub request_id: String,

@@ -131,6 +131,12 @@ def consulted(ev: dict) -> bool | None:
     return bool(calls) or bool(opened)
 
 
+def used_wiki_search(ev: dict) -> bool:
+    """Did this call reach the wiki through the `wiki_search` MCP tool rather than by hand?"""
+    calls = ev.get("wiki_tool_calls")
+    return isinstance(calls, list) and any(isinstance(c, dict) and c.get("wiki_search") for c in calls)
+
+
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     if n == 0:
         return (0.0, 1.0)
@@ -175,6 +181,7 @@ def classify(e: dict, probes: dict | None = None) -> dict:
     out["text_ids"] = ev.get("text_ids") or []
     out["opened"] = ev.get("pages_opened")  # None = the parser cannot see reads
     out["consulted"] = consulted(ev)
+    out["via_search"] = used_wiki_search(ev)
     if probe:
         out["exclusion"] = "ceiling probe"
         return out
@@ -202,11 +209,11 @@ def classify(e: dict, probes: dict | None = None) -> dict:
 def summarise(classified: list[dict]) -> dict:
     groups: dict[tuple, dict] = collections.defaultdict(lambda: {
         "calls": 0, "text_cited": 0, "page_refs": 0, "opens_observable": 0, "opened_any": 0,
-        "consult_observable": 0, "consulted": 0, "pages": collections.Counter()})
+        "consult_observable": 0, "consulted": 0, "via_search": 0, "pages": collections.Counter()})
     excluded = collections.Counter()
     ceiling: dict[tuple, dict] = collections.defaultdict(lambda: {
         "probes": 0, "opens_observable": 0, "opened_target": 0, "opened_any": 0, "answer_matched": 0,
-        "consult_observable": 0, "consulted": 0})
+        "consult_observable": 0, "consulted": 0, "via_search": 0})
     for c in classified:
         if c.get("probe") and c["exclusion"] == "ceiling probe":
             pr = c["probe"]
@@ -216,6 +223,7 @@ def summarise(classified: list[dict]) -> dict:
             if c["consulted"] is not None:
                 k["consult_observable"] += 1
                 k["consulted"] += bool(c["consulted"])
+                k["via_search"] += bool(c["via_search"])
             if c["opened"] is not None:
                 k["opens_observable"] += 1
                 k["opened_any"] += bool(c["opened"])
@@ -228,6 +236,7 @@ def summarise(classified: list[dict]) -> dict:
         if c["consulted"] is not None:
             g["consult_observable"] += 1
             g["consulted"] += bool(c["consulted"])
+            g["via_search"] += bool(c["via_search"])
         if c["text_ids"]:
             g["text_cited"] += 1
             g["page_refs"] += len(c["text_ids"])
@@ -246,6 +255,7 @@ def summarise(classified: list[dict]) -> dict:
         n = sum(g["consult_observable"] for g in pool)
         k = sum(g["consulted"] for g in pool)
         rates[seat] = {"proven": proven, "n": n, "k": k,
+                       "via_search": sum(g["via_search"] for g in pool),
                        "opened_n": sum(g["opens_observable"] for g in pool),
                        "opened_k": sum(g["opened_any"] for g in pool),
                        "text_n": sum(g["calls"] for g in pool), "text_k": sum(g["text_cited"] for g in pool)}
@@ -261,28 +271,28 @@ def rate_section(summary: dict) -> list[str]:
                   "saw it consult the wiki, so for every seat a zero here could be a blind instrument.", ""]
     lines += ["Floor: 0 by construction (no page files before 2026-09-17; without the map a peer cannot",
               "know a page path; prompt-named pages are excluded). Interval: Wilson 95%.", "",
-              "| seat | instrument proven | consulted | rate | 95% interval | of which opened a page | text-cited (secondary, includes map echo) |",
-              "|---|---|---:|---:|---|---:|---:|"]
+              "| seat | instrument proven | consulted | rate | 95% interval | via wiki_search | of which opened a page | text-cited (secondary, includes map echo) |",
+              "|---|---|---:|---:|---|---:|---:|---:|"]
     for seat, r in sorted(rates.items()):
         text = f"{r['text_k']}/{r['text_n']}"
         opened = f"{r['opened_k']}/{r['opened_n']}"
         if r["proven"] and r["n"]:
             lo, hi = wilson(r["k"], r["n"])
-            lines.append(f"| {seat} | yes | {r['k']}/{r['n']} | {r['k'] / r['n']:.1%} | {lo:.1%} to {hi:.1%} | {opened} | {text} |")
+            lines.append(f"| {seat} | yes | {r['k']}/{r['n']} | {r['k'] / r['n']:.1%} | {lo:.1%} to {hi:.1%} | {r['via_search']} | {opened} | {text} |")
         elif r["proven"]:
-            lines.append(f"| {seat} | yes | 0/0 | no eligible calls yet | | {opened} | {text} |")
+            lines.append(f"| {seat} | yes | 0/0 | no eligible calls yet | | {r['via_search']} | {opened} | {text} |")
         else:
-            lines.append(f"| {seat} | NO | {r['k']}/{r['n']} | not published | | {opened} | {text} |")
+            lines.append(f"| {seat} | NO | {r['k']}/{r['n']} | not published | | {r['via_search']} | {opened} | {text} |")
     ceiling = summary["ceiling"]
     lines += ["", "## Ceiling probes (held apart from the rate)", "",
               "Questions answerable only from one page body, page never named. `hinted` tells the peer to",
               "check its knowledge base and is the positive control; `unhinted` is need alone. An answer",
               "can also come from a peer's other memory tools, so `answer matched` is not proof of a page read.", "",
-              "| seat | variant | probes | consult observable | consulted wiki | opened target page | answer matched |",
-              "|---|---|---:|---:|---:|---:|---:|"]
+              "| seat | variant | probes | consult observable | consulted wiki | via wiki_search | opened target page | answer matched |",
+              "|---|---|---:|---:|---:|---:|---:|---:|"]
     for (seat, variant), k in sorted(ceiling.items()):
         lines.append(f"| {seat} | {variant} | {k['probes']} | {k['consult_observable']} | {k['consulted']} "
-                     f"| {k['opened_target']} | {k['answer_matched']} |")
+                     f"| {k['via_search']} | {k['opened_target']} | {k['answer_matched']} |")
     if not ceiling:
         lines.append("| (none run) | | 0 | | | | |")
     return lines

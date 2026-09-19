@@ -61,6 +61,19 @@ PROBES = [
     ("jira-description-cap", "Roughly how many words does our Jira economy gate allow in an issue description?",
      "jira-and-work-tracking", r"\b450\b"),
 ]
+# A second set, added after `wiki_search` shipped, on facts NEVER asked before. The first set is
+# burned for adoption testing: Grok keeps per-session memory and has now been told those answers,
+# so a correct answer there no longer proves a lookup happened.
+PROBES_FRESH = [
+    ("ssm-push-limit", "What size limit did our SSM push blow, and what was the workaround?",
+     "database-and-sql-operations", r"97\s?KB|97,?000"),
+    ("instantly-bearer", "How is the Bearer token formed for the Instantly v2 API in our setup?",
+     "cold-email-and-outbound", r"orgId\s*:\s*apiKey|org.?id.{0,3}:.{0,3}api.?key"),
+    ("clickhouse-datetime", "Which ClickHouse function do we prefer over toDateTime for ISO-8601 timestamps with fractional seconds?",
+     "database-and-sql-operations", r"parseDateTimeBestEffort"),
+]
+PROBE_SETS = {"original": PROBES, "fresh": PROBES_FRESH}
+
 VARIANTS = {
     "unhinted": "Question about our own setup: {q} If you do not know, reply UNKNOWN. Answer in one line.",
     "hinted": "Question about our own setup: {q} Before answering, check the knowledge base listed in "
@@ -70,11 +83,11 @@ VARIANTS = {
 _journal_lock = threading.Lock()
 
 
-def preflight() -> list[str]:
+def preflight(probes=None) -> list[str]:
     """Refuse to spend a call on a probe that cannot test anything."""
     problems = []
     context = "\n".join(p.read_text(errors="replace") for p in INSTRUCTION_FILES if p.is_file())
-    for pid, q, page, pattern in PROBES:
+    for pid, q, page, pattern in (probes if probes is not None else PROBES):
         body = (WIKI / f"{page}.md")
         if not body.is_file():
             problems.append(f"{pid}: page {body} is missing")
@@ -119,8 +132,10 @@ def run_one(seat: str, probe: tuple, variant: str, token: str) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seats", nargs="+", default=SEATS, choices=SEATS)
+    ap.add_argument("--set", dest="probe_set", default="original", choices=sorted(PROBE_SETS))
     args = ap.parse_args()
-    problems = preflight()
+    probes = PROBE_SETS[args.probe_set]
+    problems = preflight(probes)
     if problems:
         print("PREFLIGHT FAILED, no calls made:")
         for p in problems:
@@ -129,7 +144,7 @@ def main() -> int:
     token = TOKEN.read_text().strip()
     PROBE_ROOT.mkdir(parents=True, exist_ok=True)
     JOURNAL.parent.mkdir(parents=True, exist_ok=True)
-    jobs = [(s, p, v) for s in args.seats for p in PROBES for v in VARIANTS]
+    jobs = [(s, p, v) for s in args.seats for p in probes for v in VARIANTS]
     print(f"{len(jobs)} probe calls across {', '.join(args.seats)}; journal {JOURNAL}")
     # One worker per seat: a seat's calls run in order, seats run side by side.
     by_seat = {s: [j for j in jobs if j[0] == s] for s in args.seats}

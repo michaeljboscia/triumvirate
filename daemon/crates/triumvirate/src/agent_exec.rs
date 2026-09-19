@@ -434,6 +434,21 @@ pub(crate) fn record_ask_call_event(
 /// is judged by the one implementation that already decides whether a named source was read. It
 /// is `null`, not `[]`, when the parser cannot tell a read from anything else: an empty list
 /// from a blind parser would read as "opened nothing" (Grok, jury 2026-09-19).
+/// Every tool name in a turn, with a count. Names only, never arguments.
+///
+/// A peer called `triumvirate__wiki_search` live and the evidence recorded NOTHING, and nothing
+/// on this side could say why: the wiki filter matches on the tool name, and the name the parser
+/// actually recorded was invisible from here. A measurement that cannot be debugged from its own
+/// output is the shape this brief exists to avoid.
+fn tools_by_name(calls: &[ToolCallRecord]) -> serde_json::Value {
+    let mut by_name = serde_json::Map::new();
+    for call in calls {
+        let n = by_name.entry(call.tool.clone()).or_insert_with(|| 0.into());
+        *n = (n.as_u64().unwrap_or(0) + 1).into();
+    }
+    serde_json::Value::Object(by_name)
+}
+
 pub(crate) fn wiki_evidence(
     parsed: &ParsedAgentResult,
     backend: &str,
@@ -449,6 +464,7 @@ pub(crate) fn wiki_evidence(
         "tool_records": tool_records,
         "reads_classified": reads_classified,
         "prompt_paths": crate::wiki_usage::paths_in(prompt),
+        "tools": tools_by_name(&parsed.tool_calls),
     });
     // The test suite drives this same function with stand-in agents, and some of its calls land
     // in shared directories (`/private/tmp/project`, this crate's own `.triumvirate/`). The
@@ -487,14 +503,24 @@ pub(crate) fn wiki_evidence(
                     .iter()
                     .filter(|call| call.success != Some(false))
                     .filter_map(|call| {
-                        let args = call.args_json.as_deref()?;
-                        (!marker.is_empty() && args.contains(&marker)).then(|| {
+                        let args = call.args_json.as_deref().unwrap_or("");
+                        // The `wiki_search` MCP tool is a wiki touch whose ARGUMENTS are a
+                        // query, not a path, so a path match cannot see it. Nor is the name
+                        // reliably in the name field: Grok records every MCP call as
+                        // `search_tool`/`use_tool` and puts the real tool name in the arguments
+                        // (measured live, 2026-09-19, when a confirmed wiki_search call recorded
+                        // as no wiki touch at all). Both places are checked.
+                        let searched = call.tool.contains("wiki_search") || args.contains("wiki_search");
+                        let path_named = !marker.is_empty() && args.contains(&marker);
+                        (searched || path_named).then(|| {
                             let pages: Vec<&String> =
                                 wiki.pages.iter().filter(|id| args.contains(&format!("{id}.md"))).collect();
                             serde_json::json!({
+                                "tool": call.tool,
                                 "kind": serde_json::to_value(&call.kind).unwrap_or_else(|_| "unknown".into()),
                                 "pages": pages,
                                 "index": args.contains("_index"),
+                                "wiki_search": searched,
                             })
                         })
                     })
@@ -5854,6 +5880,73 @@ mod deepseek_dispatch_tests {
 #[cfg(test)]
 mod sight_gate_tests {
     use super::*;
+
+    /// A `wiki_search` MCP call is a wiki touch, and its arguments are a QUERY, so nothing in
+    /// them names the wiki. Before the tool existed the filter matched paths only, which would
+    /// have scored the very behaviour the tool was built to produce as "did not consult".
+    /// RED IF: the tool-name match is dropped, or the wiki_search flag stops being recorded.
+    #[test]
+    fn wiki_evidence_counts_a_wiki_search_call_whose_args_name_no_path() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("_menu.json"), r#"{"_c": "x", "home-infra": {}}"#).unwrap();
+        std::fs::write(dir.path().join("_index.md"), "# map (1 page, generated 2026-09-19)\n").unwrap();
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe { std::env::set_var("TRIUMVIRATE_WIKI_DIR", dir.path()) };
+        let parsed = ParsedAgentResult {
+            response_text: "port 3300".to_string(),
+            parser_mode: "grok-streaming-json".to_string(),
+            tool_calls: vec![ToolCallRecord {
+                id: None,
+                tool: "triumvirate__wiki_search".to_string(),
+                kind: ToolKind::Unknown,
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(r#"{"query":"langfuse port homebox"}"#.to_string()),
+            }],
+            ..Default::default()
+        };
+        let ev = wiki_evidence(&parsed, "grok", "what port is langfuse on", "/tmp");
+        unsafe { std::env::remove_var("TRIUMVIRATE_WIKI_DIR") };
+        assert_eq!(ev["wiki_tool_calls"][0]["wiki_search"], true, "{ev}");
+        assert_eq!(ev["wiki_tool_calls"][0]["tool"], "triumvirate__wiki_search", "{ev}");
+        // It opened no page, and that is not the same as not consulting the wiki.
+        assert_eq!(ev["pages_opened"], serde_json::json!([]), "{ev}");
+    }
+
+    /// Grok records every MCP call under a generic name (`search_tool`, `use_tool`) and puts the
+    /// real tool name in the ARGUMENTS. Measured live: a confirmed `wiki_search` call recorded as
+    /// no wiki touch at all, because the filter only read the name field.
+    /// RED IF: the argument match is dropped and the name field becomes the only source.
+    #[test]
+    fn wiki_evidence_sees_a_wiki_search_hidden_behind_a_generic_tool_name() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("_menu.json"), r#"{"_c": "x", "home-infra": {}}"#).unwrap();
+        std::fs::write(dir.path().join("_index.md"), "# map (1 page, generated 2026-09-19)\n").unwrap();
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe { std::env::set_var("TRIUMVIRATE_WIKI_DIR", dir.path()) };
+        let parsed = ParsedAgentResult {
+            response_text: "port 3300".to_string(),
+            parser_mode: "grok-streaming-json".to_string(),
+            tool_calls: vec![ToolCallRecord {
+                id: None,
+                tool: "use_tool".to_string(),
+                kind: ToolKind::Unknown,
+                success: None,
+                duration_ms: None,
+                args_json: Some(
+                    r#"{"server":"triumvirate","tool":"wiki_search","arguments":{"query":"langfuse port"}}"#
+                        .to_string(),
+                ),
+            }],
+            ..Default::default()
+        };
+        let ev = wiki_evidence(&parsed, "grok", "what port is langfuse on", "/tmp");
+        unsafe { std::env::remove_var("TRIUMVIRATE_WIKI_DIR") };
+        assert_eq!(ev["wiki_tool_calls"][0]["wiki_search"], true, "{ev}");
+        assert_eq!(ev["tools"], serde_json::json!({"use_tool": 1}), "{ev}");
+    }
 
     fn calls(kinds: &[ToolKind]) -> Vec<ToolCallRecord> {
         kinds
