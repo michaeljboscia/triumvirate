@@ -274,7 +274,19 @@ pub fn persist_json_file<T: Serialize>(path: &Path, value: &T) -> anyhow::Result
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(value)?)?;
+    // Write-then-rename (D-008, hypothesis 5). A plain `fs::write` truncates first and writes
+    // second, so a crash in between left `sessions.json` torn, and the next startup loaded a
+    // file that was neither the old state nor the new one. A rename replaces the directory
+    // entry in one step on the same filesystem, so a reader sees the old file or the new one.
+    //
+    // The temp name carries the pid, so two processes persisting the same path cannot write
+    // into each other's temp file.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -931,5 +943,30 @@ mod tests {
             "0.0.0.0:9000"
         );
         assert_eq!(super::daemon_bind_addr(Some("   ")), "127.0.0.1:8080");
+    }
+}
+
+#[cfg(test)]
+mod persist_json_atomic_tests {
+    use super::persist_json_file;
+
+    /// RED IF: persisting goes back to truncate-then-write, or leaves its temp file behind.
+    #[test]
+    fn persisting_replaces_the_file_whole_and_leaves_no_temp_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        persist_json_file(&path, &serde_json::json!({"a": 1})).expect("first write");
+        persist_json_file(&path, &serde_json::json!({"a": 2, "b": [1, 2, 3]})).expect("second write");
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("valid json");
+        assert_eq!(back, serde_json::json!({"a": 2, "b": [1, 2, 3]}));
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
     }
 }

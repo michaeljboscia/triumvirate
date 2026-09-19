@@ -61,18 +61,6 @@ what this file forbids.
 **Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
 stream once and find the event in PostHog.
 
-### D-008 — 2026-05-25 session/ask intermittent failure, hypotheses 1/3/4/5 unresolved
-**Found:** 2026-05-25 · **Severity:** MEDIUM
-**Evidence:** `2026-05-25-daemon-session-ask-intermittent-failure.md`. Hypothesis #2
-(swallowed error cause) is fixed as of 2026-07-28. The Gemini-subprocess hang, session reuse
-poisoning, worker-pool exhaustion, and multi-client race hypotheses were never tested.
-**Why it matters:** unknown whether the original symptom still exists. It may have been
-entirely hypothesis #2 misreading a timeout, which is now impossible.
-**Check:** next occurrence will produce a classified error naming the real cause. Until one
-occurs, this is untested rather than fixed.
-
----
-
 ### 2026-09-19: agy ran past its version pin on every dispatch (D-007)
 The pin was 1.1.5 in `~/.claude.json` and 1.0.2 as the code default, while 1.2.7 was installed
 and serving every call, so the mismatch warning fired on every agy dispatch. A warning that
