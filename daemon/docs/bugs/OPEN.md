@@ -27,6 +27,9 @@ event. Two SIGTERMs sent on 2026-07-28 (22:08, 22:29 EDT) produced no record at 
 crash and a clean restart are the same evidence. This is the specific case the defect
 dashboard was built to catch, and it catches nothing because nothing is emitted.
 **Check:** kill the daemon, then find an event or log line naming the shutdown and its cause.
+**RE-CHECKED 2026-09-19, STILL OPEN:** the daemon was SIGTERMed and restarted four times
+during the ask_jury work. `grep -icE 'shutdown|sigterm|stopping|graceful'` over the log:
+**zero**. Fourteen months of births, no deaths, and four more today.
 **Tile:** "Daemon restarts — births with no recorded deaths" (dashboard 1886865).
 
 ### D-002 — OTLP export failures ship with an empty body
@@ -38,6 +41,10 @@ dashboard was built to catch, and it catches nothing because nothing is emitted.
 information about how it is broken.
 **Check:** trigger an export failure (block DNS to us.i.posthog.com), confirm the PostHog row
 carries the cause string.
+**RE-CHECKED 2026-09-19, STILL OPEN, and it is not rare:** today's log holds **4,266**
+`BatchLogProcessor.ExportError` lines. The newest still carries `body: ""`, with the cause
+(`url: ".../i/v1/logs", source: TimedOut`) only in `fields.error`, exactly as first recorded
+on 2026-07-28. Whatever volume was needed to make this worth fixing, it has arrived.
 
 ### D-003 — No gap marker for windows when logs did not ship
 **Found:** 2026-07-28 · **Severity:** HIGH · **Depends on:** D-002
@@ -134,31 +141,6 @@ artifact is not verifying the path.
 
 ---
 
-### D-010 - sight gate cannot see a grok shell read, and its own message recommends one
-**CLOSED 2026-09-13 23:5x ET:** codex seat reviewed the recovery commits (five findings, four fixed in the follow-up commit, one is D-016); full audit on the final daemon passes every probe except the retired Gemini CLI and the by-design Antigravity session resume.
-**Found:** 2026-09-12 · **Severity:** MEDIUM
-**Status 2026-09-13:** fixed in the working tree and live on the daemon. `shell_read_kind`
-(codex.rs) classifies a shell command that reads a file as ReadFile, applied in the grok, agy,
-claude and gemini adapters, so the class is closed and not the grok case. The gate binds a shell
-read to its operand (`whole_file_read_operand`): a pipe, redirect, comment, subshell, or second
-operand does not count, and a `description` naming the source does not match. Live: a grok
-`cat` of a named source passes; `head -5` is rejected as PART. Panel: antigravity and grok
-reviewed, antigravity's three bypasses closed; codex seat pending quota. Close after that pass.
-**Evidence:** three `ask_agent` grok dispatches with `required_sources` on a 199-line diff
-were rejected. Attempt three did what the rejection text asked and ran `cat <path>` in one
-shell command. `agent-adapter/src/grok.rs:104` maps every `run_terminal_command` to
-`ToolKind::Bash`; `tool_call_touched_source` (`agent_exec.rs`) counts only `ToolKind::ReadFile`.
-The codex adapter classifies `cat` and `sed -n` reads (`codex.rs:104`) and the gate unions
-codex sed windows; grok has neither. Attempt two used `read_file` and was also rejected as
-"never opened", cause not yet established (the grok unified log records no arguments).
-**Why it matters:** the rejection reads as "the reviewer did not open the file" when the
-reviewer opened it. A gate that blames the reader for the instrument's blind spot trains the
-operator to route around the gate, which is the rubber stamp it was built to end.
-**Workaround:** dispatch grok with `require_sight` only and no `required_sources`, which is
-what the gate's own parser-mode message recommends. Used 2026-09-12 for the codex 0.154 review.
-**Check:** dispatch grok with `required_sources=[<file>]` and instruct it to `cat` the file;
-the turn must pass. Then instruct it to `head -5` the file; the turn must be rejected as PART.
-
 ### D-011 - codex argv is assembled on four surfaces and only two have a binary oracle
 **Found:** 2026-09-12 · **Severity:** MEDIUM
 **Evidence:** codex 0.154.0 removed `--full-auto` from `exec`. Four places build codex argv:
@@ -174,51 +156,6 @@ the "fix lands on one surface" shape again, with a test that certifies half the 
 **Fix shape:** lift each inline codex argv into a pure builder, then one table-driven test that
 runs every builder's output through `codex <args> --help` on the installed binary.
 **Check:** temporarily push a bogus flag into the consult or fleet argv; `cargo test` must fail.
-
-### D-012 - a failed gemini request reports the fallback hop's error and hides its own
-**CLOSED 2026-09-13 23:5x ET:** codex seat reviewed the recovery commits (five findings, four fixed in the follow-up commit, one is D-016); full audit on the final daemon passes every probe except the retired Gemini CLI and the by-design Antigravity session resume.
-**Found:** 2026-09-13 · **Severity:** HIGH (misdiagnosis in the field)
-**Status 2026-09-13:** fixed in the working tree and live on the daemon. `execute_ask_agent`
-collects a `failure_chain` and formats it oldest first; the chain reaches the 502 body, the
-FAILED lifecycle and outbox event, and the dead-drop `reason`. Codex's stdout JSON error
-events and stderr tail are in the connector error. Antigravity's empty result carries
-`status`, `permission_requests`, and `tool_calls`. The bridge's four 300-byte body cuts are a
-2000-char excerpt. Verified live: a Codex quota failure now reads "codex said: You've hit your
-usage limit ... try again at 7:03 PM" on all three surfaces. Panel: antigravity and grok
-reviewed; codex's seat pending its own quota reset. Close after the codex pass.
-**Evidence:** an `ask_agent {agent: "gemini"}` review from the masterFFL session at 18:03Z was
-served by agy (log: "gemini dispatch served by agy backend"). agy completed in 15s and again in
-12s with "stream-json result carried no response text". The daemon then walked the default
-degraded route `gemini-cli,codex`; the codex hop hit the 180s connector timeout. The 502 the
-caller received said only `codex connector timed out`, and the dead drop's `reason:` says the
-same. The calling session concluded "Gemini alias is mis-routing to Codex" and rerouted its
-work. No mis-routing occurred; the original failure was never surfaced.
-Two gaps compound it: (1) the agy parser reads `result.status` (`agy_stream.rs:175`) but the
-WARN at `no response text` does not log it, and `RequestUserInput` tool events are not logged,
-so whether agy stopped on a permission prompt or an error is unrecoverable; (2) agy's
-`--log-file` is deleted after the run. A text-only replay of the same prompt on 2026-09-13
-returned SUCCESS, so it is not a content refusal; it fails when agy tries to act.
-**Why it matters:** an error that names the wrong component sends the operator to fix the
-wrong thing. Same class as the closed 2026-07-28 "timeout misreported as a dead daemon".
-**Fix shape:** the terminal error must carry the chain: `agy: empty response (status=X)` then
-`degraded codex: connector timed out`. Log `status` and any `RequestUserInput` event at WARN on
-the empty-response path. Keep the agy log on failure.
-**Check:** force agy to return empty (e.g. a prompt that needs a permission it cannot get) and
-read the 502 body: it must name agy first and codex second.
-
-### D-013 - a child's exit code was the whole error; the quota message was thrown away
-**CLOSED 2026-09-13 23:5x ET:** codex seat reviewed the recovery commits (five findings, four fixed in the follow-up commit, one is D-016); full audit on the final daemon passes every probe except the retired Gemini CLI and the by-design Antigravity session resume.
-**Found:** 2026-09-13 · **Severity:** HIGH
-**Evidence:** Codex over its usage limit. Every dispatch: "codex connector failed: exited with
-status 1". The reason was on codex's stdout as `{"type":"error","message":"You've hit your
-usage limit ..."}`, parsed by `CodexExecParser`, never surfaced. Stderr was drained to
-`tracing::debug`. The claude connector already included stderr in its message
-(`agent_exec.rs`, "Include the stderr"); codex and the two Antigravity connectors did not.
-**Status:** codex fixed with D-012 (`codex_error_tail`, drain awaited, 300 chars per line,
-fixture test from the real binary). The two Antigravity connector bails
-(`agent_exec.rs` "Antigravity connector failed: exited with status") still carry no output;
-they are the dead gemini-cli path and are left for step 5 of the recovery plan.
-**Check:** exhaust a quota or revoke auth, dispatch, read the 502: the child's own words are in it.
 
 ### D-014 - agy quota detectors over-match glog noise
 **Found:** 2026-09-13 (Grok, review of recovery step 4) · **Severity:** LOW
@@ -256,7 +193,100 @@ which repo's ledger to open.
 project_root, written at spawn, read on a miss; or an optional `project_root` on the request.
 **Check:** spawn a fleet, restart the daemon, `fleet_status` returns the ledger state.
 
+### D-018 - a PostHog quota rejection is dropped without a single log line
+**Found:** 2026-09-19 · **Severity:** MEDIUM (was HIGH before the cause was known)
+**Cause: KNOWN, not a Triumvirate bug.** The PostHog account has been out of quota for several
+days (owner, 2026-09-19). The missing events are explained; this row is about how that
+absence presented.
+**Evidence:** no `tv_*` event since 2026-09-16, ~280/day before it. The daemon has
+`POSTHOG_HOST` and `POSTHOG_API_KEY` set, so `capture_as` was posting. Two daemon restarts on
+2026-09-19 produced no `tv_daemon_started` and **not one line mentioning posthog in the log**:
+no warning, no status code, no "quota". The last `posthog POST failed` warning is 2026-09-15
+20:00, before the quota ran out.
+**Why it matters:** this is D-002's shape one layer up. A provider refusing our data is a
+condition the daemon can see and did not report, so "no events" was indistinguishable from
+"nothing happened" for three days, and diagnosing it took a query against PostHog itself. The
+first suspicion was that the newly added `tv_jury_seat` instrumentation was broken.
+**Check:** point the daemon at a token that will be refused and confirm the log carries the
+status and the provider's reason. Quota exhaustion must be loud.
+**The contrast that makes this a defect and not just an outage (2026-09-19):** two exporters
+in this daemon post to the same host while the account is out of quota. The OTLP log exporter
+has written **4,266** error lines today (see D-002). The event path, `posthog::capture_as`
+posting to `/i/v0/e/`, has written **zero**. One screams thousands of times, the other is
+silent, and the silent one is the path every `tv_*` event takes.
+**Consequence, so nothing is overclaimed:** the `tv_jury_seat` events added with `ask_jury`
+have never been observed landing. That instrumentation is written and unverified until the
+quota is restored.
+
+
 ## Closed
+
+### 2026-09-19: three rows were stale, the defects were already fixed
+Checked during the ask_jury work, each against the CHECK its own row demanded. None of the
+three had been re-run since the fix landed, which is the failure mode this file exists to
+prevent: a list nobody trusts is a list nobody reads.
+
+**D-010 (sight gate cannot see a grok shell read).** Check was "dispatch grok with
+`required_sources=[<file>]` and instruct it to `cat` the file". Run live 2026-09-19: grok made
+49 tool calls, read the named source, and the gate ACCEPTED the turn. The shell-read
+classification (`codex::shell_read_kind`, applied by every adapter) is what fixed it, and
+`a_grok_cat_of_the_named_source_passes` guards it offline.
+
+**D-012 (a failed gemini request reports the fallback hop's error and hides its own).** Check
+was "force agy to return empty and confirm the error names agy, not the fallback hop".
+Observed live this session, in the strict_agent tests and in a real dispatch: the terminal
+error is now the whole chain, oldest first, `agy attempt 1/1: agy capacity/quota error (exit
+2): Error: RESOURCE_EXHAUSTED quota exceeded -> degraded codex: no result.text message`. agy's
+own failure leads. Fixed by `failure_chain` in `agent_exec.rs`.
+
+**D-013 (a child's exit code was the whole error; the quota message was thrown away).** Check
+was "exhaust a quota, dispatch, read the 502: the child's own words are in it". Happened
+unprompted on 2026-09-19 while dispatching a peer review: `codex connector failed: exited with
+status exit status: 1; codex said: Selected model is at capacity. Please try a different
+model.` The child's words are carried verbatim.
+
+
+### 2026-09-19: the sight gate discarded codex reviews that had read the sources
+Codex reads with a chain (`wc -l F && sed -n '1,240p' F`, or two files in one command) and
+the gate rejected those turns as "never successfully opened", throwing away correct reviews.
+Two of three jury seats were lost on the first live run with no disagreement between them.
+
+THREE parsers carried the same blanket refusal of any `&&`, which is what closed the D-010
+decoy attacks. The refusal is right about the attacks and wrong about a chain, where each
+link is its own command. Fixed with `agent-adapter::codex::and_chain_segments` (splits on
+`&&` only, honoring quotes) applied in `command_reads_file_contents`,
+`command_reads_whole_file`, and plural `whole_file_read_operands` / `command_read_ranges`,
+consumed at all five gate sites. `;` and `||` stay refused because both exit zero on a read
+that failed, as does an unterminated quote, which is a parse error that runs nothing. Every
+segment still goes through the unchanged strict parser.
+
+The one that actually mattered was `command_reads_file_contents`: it runs inside
+`shell_read_kind`, so a chained read stayed `ToolKind::Bash` and the coverage check, which
+filters on `ToolKind::ReadFile`, dropped the call before the other parsers were consulted.
+Fixing the two downstream parsers changed nothing live, and it took three failed live runs to
+find because the test helper hardcoded `kind: ToolKind::ReadFile` and so skipped the step
+under test. The helper now derives the kind through `shell_read_kind` as the adapters do.
+
+Two assertions in `codex_03` / `codex_05` were changed deliberately: they required
+`ls /repo && cat /repo/a.rs` to fail closed because "the reader may not be the part that
+touched the named path". That concern is now carried structurally. Classification answers
+"does this read a file" and operand binding answers "which file", and `codex_03b` asserts the
+decoy directly (`ls /repo/a.rs && cat /repo/b.rs` binds `b.rs` only). Mutation DETECTION is
+unaffected: it filters on `WriteFile`/`EditFile` kinds and has always been blind to codex
+shell commands, where the read-only sandbox is what holds.
+
+Diagnosis was blocked for two rounds by the gate's own receipt, which truncated the command
+at 160 characters, below the length of a real one. It now reports the binding: the operand
+each reader opened and the window it took. Writing that test exposed the PART receipt
+reporting the command's FIRST window whatever file it covered, so a reader who took lines
+1-50 of the source was told it had read "lines 1-240" of another file's window.
+
+**CHECK PASSED, live, 2026-09-19:** a sight-gated `ask_jury` over the brief returned
+`codex: {status: answered, answered_by_agent: codex, tool_calls_made: 2, verdict: ready}`,
+3 of 3 seats answered, where the three previous runs on the same brief lost that seat.
+Offline: 96 adapter, 570 lib and 278 binary tests, and reverting the classifier turns the
+new tests red where they previously passed straight through the bug.
+
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"
 The codex read classifier allowed `cat`/`head`/`nl`; codex-cli 0.145.0 reads files as
@@ -308,4 +338,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-03
+**Last reviewed:** 2026-09-19 (every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)

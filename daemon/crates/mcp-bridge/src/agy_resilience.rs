@@ -271,7 +271,18 @@ impl BreakerState {
 
     /// Quota/429 failure: trip immediately on a failed half-open probe, else trip at
     /// the threshold.
+    ///
+    /// A failure observed while ALREADY OPEN is ignored. Open means no request traffic gets
+    /// through, so the only failures that arrive are from things that bypass the breaker: the
+    /// 300s health probe, `breaker_probe`, and stragglers that were in flight when it tripped.
+    /// Counting them re-tripped an open breaker every third health probe, doubling the cooldown
+    /// and pushing `open_until` out from NOW each time. With quota exhausted that ratchets to
+    /// the five hour cap and holds it there, which is why the 2026-09-19 quota reset did not
+    /// close anything. Only a failed HALF-OPEN probe may extend the cooldown.
     fn record_quota(&mut self, now: Instant, threshold: u32, base: Duration) {
+        if self.phase == BreakerPhase::Open {
+            return;
+        }
         if self.phase == BreakerPhase::HalfOpen {
             self.trip(now, base);
             return;
@@ -282,9 +293,31 @@ impl BreakerState {
         }
     }
 
+    /// What a caller may see. Never mutates: unlike `should_skip`, reading the breaker after
+    /// its cooldown elapsed does not claim the half-open probe slot.
+    fn snapshot(&self, now: Instant) -> shared_types::BreakerSnapshot {
+        shared_types::BreakerSnapshot {
+            phase: match self.phase {
+                BreakerPhase::Closed => "closed",
+                BreakerPhase::Open => "open",
+                BreakerPhase::HalfOpen => "half_open",
+            }
+            .to_string(),
+            cooldown_remaining_s: match (self.phase, self.open_until) {
+                (BreakerPhase::Open, Some(until)) => until.saturating_duration_since(now).as_secs(),
+                _ => 0,
+            },
+            open_count: self.open_count,
+            shed: self.shed,
+        }
+    }
+
     /// Ambiguous/other failure: a failed half-open probe re-opens; otherwise bias
     /// toward OPEN with a slightly higher bar than quota (REQ-103).
     fn record_other(&mut self, now: Instant, threshold: u32, base: Duration) {
+        if self.phase == BreakerPhase::Open {
+            return;
+        }
         if self.phase == BreakerPhase::HalfOpen {
             self.trip(now, base);
             return;
@@ -373,6 +406,11 @@ pub fn agy_breaker_record_success() {
             Some(shed),
         );
     }
+}
+
+/// The breaker as it stands, for `breaker_probe` and any other read-only surface.
+pub fn agy_breaker_snapshot() -> shared_types::BreakerSnapshot {
+    breaker().lock().expect("agy breaker poisoned").snapshot(Instant::now())
 }
 
 /// Record a quota/429 agy failure (REQ-101).
@@ -516,6 +554,49 @@ mod tests {
         assert!(b.try_take(now).is_none(), "first token granted");
         let wait = b.try_take(now).expect("second token throttled");
         assert!(wait > Duration::ZERO && wait <= Duration::from_secs(1));
+    }
+
+    /// RED IF: reading the breaker starts claiming the half-open slot. A dashboard poll would
+    /// then consume the one probe the cooldown grants, and real traffic would keep skipping.
+    #[test]
+    fn snapshot_reports_the_cooldown_and_never_moves_the_breaker() {
+        let now = Instant::now();
+        let base = Duration::from_secs(120);
+        let mut s = BreakerState::new();
+        assert_eq!(s.snapshot(now).phase, "closed");
+        for _ in 0..3 {
+            s.record_quota(now, 3, base);
+        }
+        let open = s.snapshot(now + Duration::from_secs(20));
+        assert_eq!((open.phase.as_str(), open.cooldown_remaining_s, open.open_count), ("open", 100, 1));
+
+        let later = now + Duration::from_secs(121);
+        assert_eq!(s.snapshot(later).phase, "open", "a read past the cooldown must not half-open");
+        assert!(!s.should_skip(later, HALF_OPEN_LEASE_MIN), "the probe slot is still there for real traffic");
+        assert_eq!(s.snapshot(later).phase, "half_open");
+    }
+
+    /// RED IF: failures count while the breaker is already open. That is the ratchet: the
+    /// daemon's own health probe kept an open breaker at the five hour cap all night.
+    #[test]
+    fn failures_while_open_never_extend_the_cooldown() {
+        let now = Instant::now();
+        let base = Duration::from_secs(120);
+        let mut s = BreakerState::new();
+        for _ in 0..3 {
+            s.record_quota(now, 3, base);
+        }
+        let opened = s.snapshot(now);
+        assert_eq!((opened.phase.as_str(), opened.open_count), ("open", 1));
+
+        let t = now + Duration::from_secs(10);
+        for _ in 0..20 {
+            s.record_quota(t, 3, base);
+            s.record_other(t, 3, base);
+        }
+        let after = s.snapshot(t);
+        assert_eq!(after.open_count, 1, "still the first open epoch");
+        assert_eq!(after.cooldown_remaining_s, 110, "open_until did not move");
     }
 
     #[test]

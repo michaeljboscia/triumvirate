@@ -616,6 +616,42 @@ pub fn record_breaker_event(event: &str, agent: &str, detail: &str, shed_count: 
     );
 }
 
+/// Emit `tv_jury_seat`, one per seat of an `ask_jury` run.
+///
+/// This is what makes degradation a chart instead of a warning prefix. `tv_seat_status` is
+/// `answered | unavailable | timeout | invalid`, and `invalid` is the one to alert on: it means
+/// something other than the asked agent answered, which a current daemon should make
+/// impossible. Carries who answered and on what backend, never what was said.
+pub fn record_jury_seat(
+    jury_id: &str,
+    agent: &str,
+    status: &str,
+    answered_by_agent: Option<&str>,
+    answered_by_backend: Option<&str>,
+    duration_ms: u64,
+) {
+    // Bucketed for the same reason as `tv_rate_limit_wait`: a raw millisecond value mints a
+    // distinct property value per call and makes a breakdown unusable.
+    let bucket = match duration_ms {
+        0..=9_999 => "<10s",
+        10_000..=59_999 => "10-60s",
+        60_000..=299_999 => "1-5m",
+        _ => ">5m",
+    };
+    capture(
+        "tv_jury_seat",
+        json!({
+            "tv_jury_id":             jury_id,
+            "tv_agent":               agent,
+            "tv_agent_display":       crate::display_agent_name(agent),
+            "tv_seat_status":         status,
+            "tv_answered_by_agent":   answered_by_agent,
+            "tv_answered_by_backend": answered_by_backend,
+            "tv_duration_bucket":     bucket,
+        }),
+    );
+}
+
 /// Emit `tv_rate_limit_wait` when OUR OWN limiter delays an agy call.
 ///
 /// This is self-inflicted latency, and it is the early-warning signal for provider quota

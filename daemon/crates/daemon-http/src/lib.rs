@@ -21,7 +21,7 @@ use fallback_outbox::{
 };
 use ledger::LedgerStore;
 use mcp_bridge::{
-    daemon_ask_agent_url, daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
+    daemon_ask_agent_url, daemon_breaker_probe_url, daemon_fallback_ack_url, daemon_fallback_gc_url, daemon_fallback_list_url,
     daemon_autostart_enabled, daemon_health_url, daemon_memory_read_url, daemon_memory_write_url,
     daemon_lesson_add_url, daemon_lesson_list_url, daemon_lesson_query_url, daemon_lesson_validate_url,
     daemon_ledger_gc_url, daemon_ledger_query_url, daemon_ledger_record_url, daemon_ledger_session_url,
@@ -513,6 +513,13 @@ pub async fn fetch_daemon_ask_agent(req: &AskAgentRequest) -> anyhow::Result<Ask
     daemon_post_json_with_timeout::<AskAgentRequest, AskAgentResponse>(daemon_ask_agent_url(), req, daemon_ask_timeout()).await
 }
 
+/// A probe is one live agy turn, so it gets the ask timeout, not the short control-plane one.
+pub async fn fetch_daemon_breaker_probe(
+    req: &shared_types::BreakerProbeRequest,
+) -> anyhow::Result<shared_types::BreakerProbeResponse> {
+    daemon_post_json_with_timeout(daemon_breaker_probe_url(), req, daemon_ask_timeout()).await
+}
+
 pub async fn fetch_daemon_session_spawn(req: &SpawnSessionRequest) -> anyhow::Result<String> {
     let json =
         daemon_post_json::<SpawnSessionRequest, serde_json::Value>(daemon_session_spawn_url(), req).await?;
@@ -961,6 +968,17 @@ pub async fn token_by_session_route(
     Ok(AxumJson(response))
 }
 
+/// The queue an `ask_agent` call waits in. One per project, unless the call asked for its
+/// agent's own lane (`own_lane`, set by every `ask_jury` seat).
+pub fn ask_agent_queue_key(req: &AskAgentRequest) -> String {
+    let project = core_project_queue_key(req.cwd.as_ref(), req.repo.as_ref());
+    if req.own_lane.unwrap_or(false) {
+        format!("{project}#agent:{}", mcp_bridge::normalize_agent_name(&req.agent))
+    } else {
+        project
+    }
+}
+
 // This span is what the remote parent gets attached to. Without a span of its own,
 // `Span::current()` here is disabled and `set_parent` silently does nothing, the traceparent
 // would be extracted and thrown away, which is exactly the bug this comment exists to prevent.
@@ -982,9 +1000,7 @@ pub async fn ask_agent_route(
     // ask_agent over there, with nothing tying them together.
     adopt_remote_trace_parent(&headers);
     // Serialize agent execution per project to keep ordering predictable for concurrent bridges.
-    let queue =
-        core_acquire_project_queue(&state.queues, core_project_queue_key(req.cwd.as_ref(), req.repo.as_ref()))
-            .await;
+    let queue = core_acquire_project_queue(&state.queues, ask_agent_queue_key(&req)).await;
     let _guard = queue.lock().await;
     let started = Instant::now();
     let result = (state.ask_agent_executor)(&req).await;
@@ -1924,6 +1940,48 @@ fn body_excerpt(body: &str) -> &str {
     match body.char_indices().nth(MAX_CHARS) {
         Some((idx, _)) => &body[..idx],
         None => body,
+    }
+}
+
+#[cfg(test)]
+mod ask_agent_queue_tests {
+    use super::*;
+
+    fn req(agent: &str, own_lane: Option<bool>) -> AskAgentRequest {
+        AskAgentRequest {
+            agent: agent.to_string(),
+            cwd: Some("/work/mneme".to_string()),
+            own_lane,
+            ..Default::default()
+        }
+    }
+
+    /// RED IF: jury seats go back to sharing the project's one queue. They then run one after
+    /// another, and the last seat's timeout is spent waiting behind the first two.
+    #[tokio::test]
+    async fn jury_seats_in_one_project_do_not_wait_on_each_other() {
+        let queues: QueueRegistry = Default::default();
+        let codex = core_acquire_project_queue(&queues, ask_agent_queue_key(&req("codex", Some(true)))).await;
+        let gemini = core_acquire_project_queue(&queues, ask_agent_queue_key(&req("antigravity", Some(true)))).await;
+
+        let _codex_running = codex.lock().await;
+        assert!(gemini.try_lock().is_ok(), "the gemini seat must not queue behind the codex seat");
+    }
+
+    /// The default is untouched, and a lane is per AGENT, so it stays bounded and the same CLI
+    /// is never run twice at once in one directory.
+    #[tokio::test]
+    async fn plain_calls_still_serialize_and_a_lane_is_per_agent() {
+        let queues: QueueRegistry = Default::default();
+        let a = core_acquire_project_queue(&queues, ask_agent_queue_key(&req("codex", None))).await;
+        let b = core_acquire_project_queue(&queues, ask_agent_queue_key(&req("grok", None))).await;
+        let _a_running = a.lock().await;
+        assert!(b.try_lock().is_err(), "without own_lane the project still runs one call at a time");
+
+        let alias_one = ask_agent_queue_key(&req("gemini", Some(true)));
+        let alias_two = ask_agent_queue_key(&req("agy", Some(true)));
+        assert_eq!(alias_one, alias_two, "aliases of one agent share its lane");
+        assert_eq!(alias_one, "cwd:/work/mneme#agent:gemini");
     }
 }
 

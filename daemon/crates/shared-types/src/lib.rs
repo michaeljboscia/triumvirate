@@ -158,6 +158,221 @@ pub struct AskAgentRequest {
     /// HardProvider(400) from DeepSeek; no client-side validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_model: Option<String>,
+
+    /// Never let another agent or backend answer for the one that was asked.
+    ///
+    /// The degraded route exists for Q&A, where an answer from codex beats no answer from
+    /// gemini. For a vote it is a corruption: on 2026-09-19 the mneme jury's gemini seat hit
+    /// its agy quota and seven parts came back answered by codex, with success status and a
+    /// warning prefix. A "unanimous" verdict there is codex agreeing with itself.
+    ///
+    /// When true the degraded route is skipped entirely, including the same-agent gemini-cli
+    /// hop, and the call fails with the requested backend's own error. Degradation becomes the
+    /// caller's decision. `ask_jury` always sets it. `None`/`false` keeps today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_agent: Option<bool>,
+
+    /// Queue this call on its AGENT's lane within the project, not the project's single lane.
+    ///
+    /// The daemon runs one `ask_agent` at a time per project, to keep ordering predictable
+    /// for concurrent bridges. A jury sends every seat with the same `cwd`, so its "parallel"
+    /// seats ran one after another, and the last seat's timeout was spent waiting in the queue
+    /// behind the others. Found in review, in a draft the sight gate rejected.
+    ///
+    /// A bool and not a free-form lane name on purpose: the queue registry is never pruned,
+    /// so a caller-chosen key would leak an entry per call. Lanes are bounded by the agent
+    /// list, and two calls to the SAME agent in one project still run one at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_lane: Option<bool>,
+}
+
+/// One brief, N seats, no substitution. See `docs/briefs/ask-jury-brief.md`.
+///
+/// `context` is not a field: the bridge injects it into every tool's schema and strips it
+/// before dispatch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AskJuryRequest {
+    /// The same message goes to every seat, verbatim.
+    pub message: String,
+    pub cwd: Option<String>,
+    /// Which agents sit. Default `codex`, `grok`, `gemini`. At least two, and no agent twice:
+    /// `gemini` and `antigravity` are ONE seat, and asking both is one agent voting twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats: Vec<String>,
+    /// Same meaning and type as on `ask_agent`. Implied by a non-empty `required_sources`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_sight: Option<bool>,
+    /// Absolute paths every seat must actually open. Same field as on `ask_agent`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_sources: Vec<String>,
+    /// Applied to the grok seat only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_depth: Option<GrokDepthOverride>,
+    /// Seat name to the file that seat was told to write. Verified after the seat returns.
+    /// Counts only are reported, never contents.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub outputs: std::collections::BTreeMap<String, String>,
+    /// When true, an output file that holds no parseable JSON is reported as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_json: Option<bool>,
+    /// Extracts the verdict from a reply: capture group 1 if there is one, else the whole match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_regex: Option<String>,
+    /// RFC 6901 pointer into a JSON reply, for example `/verdict`. Wins over `verdict_regex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_json_pointer: Option<String>,
+    /// Per seat. A seat that runs past it is reported `timeout`; the others are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+}
+
+/// What became of one output file. Counts and flags only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JuryOutputCheck {
+    pub path: String,
+    pub exists: bool,
+    /// The file changed while this call ran. It does NOT prove THIS seat changed it.
+    ///
+    /// Named `written_this_call` at first, which claimed the stronger thing. All seats share a
+    /// `cwd`, so seat A can touch seat B's path and B's check would pass on A's write
+    /// (Antigravity). What this does catch, and what it is for, is the common case: a file left
+    /// behind by an earlier run, which exists and parses and says nothing about this one.
+    /// Blindness between seats is the caller's to arrange.
+    pub changed_during_call: bool,
+    /// `json`, `jsonl`, or `embedded_json` (an array or object inside surrounding prose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Array length, JSONL line count, or 1 for a single object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct JurySeat {
+    /// The canonical agent that was asked.
+    pub agent: String,
+    /// `answered`: this agent answered. `unavailable`: its backend could not, and nobody was
+    /// asked in its place. `timeout`: it ran past `timeout_s`. `invalid`: something other than
+    /// this agent answered, so the reply is withheld from the tally.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Always set on an answered or invalid seat, even though `ask_agent` omits it on the
+    /// normal path. A reader should never have to infer who voted from an absent field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by_backend: Option<String>,
+    /// Not reported by `ask_agent` today, so absent. Never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    /// The normalized verdict this seat cast, when one could be extracted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// Why an ANSWERED seat cast no verdict. Absent when it cast one.
+    ///
+    /// Without this, a seat that answered and a seat whose answer could not be read were the
+    /// same empty field, and a jury that lost half its votes to a bad regex looked like a jury
+    /// whose members had nothing to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_made: Option<u32>,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<JuryOutputCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JuryMajority {
+    pub verdict: String,
+    pub count: usize,
+}
+
+/// Every tally lands on exactly one `outcome`. All counts are against seats REQUESTED, so a
+/// jury that lost a seat cannot look more agreed than it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JuryTally {
+    pub seats_requested: usize,
+    /// Seats whose own agent answered.
+    pub seats_answered: usize,
+    /// Answered seats a verdict could be extracted from.
+    pub verdicts_cast: usize,
+    /// `unanimous`, `majority`, `split`, or `no_quorum`.
+    pub outcome: String,
+    /// EVERY requested seat answered, cast a verdict, and they all match. Two agreeing seats
+    /// out of three is a majority, never unanimity.
+    pub unanimous: bool,
+    /// A verdict held by more than half of the seats requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub majority: Option<JuryMajority>,
+    /// Two or more verdicts were cast and none has a majority.
+    pub split: bool,
+    /// How verdicts were read: `json_pointer`, `regex`, or `first_line`.
+    pub verdict_source: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AskJuryResponse {
+    /// Carried in the ledger record, which is a summary and not a session row: find the run
+    /// with `ledger_query`, not `ledger_session`.
+    pub jury_id: String,
+    pub seats: std::collections::BTreeMap<String, JurySeat>,
+    #[serde(flatten)]
+    pub tally: JuryTally,
+    /// The breaker probe this run attempted, when a seat failed in a way a probe could fix.
+    ///
+    /// Absent means no seat failed that way and nothing was spent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaker_probe: Option<BreakerProbeResponse>,
+    /// Seats re-run after a probe closed the breaker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats_retried_after_probe: Vec<String>,
+    /// False when the ledger write failed. The verdicts stand either way.
+    pub ledger_recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_error: Option<String>,
+}
+
+/// The agy circuit breaker as a caller can see it. Read-only: taking one never moves the breaker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BreakerSnapshot {
+    /// `closed`, `open`, or `half_open`.
+    pub phase: String,
+    /// Seconds until the breaker would let a probe through on its own timer. Zero unless open.
+    pub cooldown_remaining_s: u64,
+    /// How many times in a row the breaker has opened. Each one doubles the cooldown.
+    pub open_count: u32,
+    /// Calls refused during the current open epoch.
+    pub shed: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct BreakerProbeRequest {
+    /// Which backend to probe. Only `agy` has a breaker today, and it is the default.
+    pub backend: Option<String>,
+}
+
+/// Result of asking the daemon to re-test a backend now instead of waiting out the cooldown.
+///
+/// 2026-09-19: the agy quota reset and the breaker stayed open, because the breaker runs on
+/// its own clock (up to five hours) and nothing a caller could do would make it look again.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BreakerProbeResponse {
+    pub backend: String,
+    pub before: BreakerSnapshot,
+    pub after: BreakerSnapshot,
+    /// `ok`, `capture_degraded`, or `backend_failed`.
+    pub outcome: String,
+    pub detail: String,
+    /// True only when this probe moved the breaker from not-closed to closed.
+    pub closed_by_probe: bool,
 }
 
 /// A REVIEW dispatch. Sight is not optional here, which is the entire point of the type.
@@ -253,6 +468,24 @@ pub struct AskAgentResponse {
     pub shadow_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_latency_ms: Option<u64>,
+    /// The daemon ACKNOWLEDGES that it honored `strict_agent` on this turn.
+    ///
+    /// The no-substitution defence used to rest on an absence: no `answered_by_agent` meant the
+    /// asked agent answered. Codex: "absence must be treated as unverifiable." A daemon that
+    /// never heard of `strict_agent` ignores the unknown field, substitutes, and if it also
+    /// omits the provenance fields the vote reads as clean. Silence cannot be the proof.
+    ///
+    /// This is the positive signal. Only a daemon that took the strict path sets it, so a
+    /// caller can tell "verified" from "I cannot tell", which are different answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_agent_honored: Option<bool>,
+    /// Which MODEL produced this answer, when the dispatch chose one.
+    ///
+    /// The gemini-cli backend walks a faildown chain, so `gemini` can answer on any of four
+    /// models and every reply looked identical. A jury could not see which voter it got (Grok).
+    /// `None` means the dispatch named no model, not that the model is unknowable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// How many tool calls the agent made producing this answer. The receipt.
     ///
     /// Always populated, not just when `require_sight` is set, because the count is the
@@ -284,6 +517,8 @@ impl AskAgentResponse {
             shadow_response: None,
             shadow_error: None,
             shadow_latency_ms: None,
+            strict_agent_honored: None,
+            model: None,
             tool_calls_made: None,
         }
     }

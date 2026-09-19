@@ -585,6 +585,27 @@ impl McpBridge {
             .await
     }
 
+    #[tool(
+        description = "Put ONE brief to several agents at once and tally their verdicts (default \
+                       seats: codex, grok, gemini). Unlike ask_agent, a seat is NEVER answered by \
+                       another agent or backend: a seat whose backend is down comes back \
+                       `unavailable`, and a reply that something else answered comes back \
+                       `invalid` with its text withheld. `unanimous` means EVERY requested seat \
+                       answered and agreed, so two of three is a `majority`. Verdicts are read \
+                       with `verdict_json_pointer`, else `verdict_regex`, else the first \
+                       non-empty line. `outputs` maps a seat to the file it was told to write; \
+                       only counts come back, never contents. Use this, not parallel ask_agent \
+                       calls, whenever agreement between agents is the result."
+    )]
+    async fn ask_jury(
+        &self,
+        Parameters(req): Parameters<shared_types::AskJuryRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<shared_types::AskJuryResponse>, String> {
+        let local_test_execution_allowed = cfg!(test) && !mcp_daemon_proxy_enabled();
+        mcp_tools::jury::ask_jury(&req, &context, local_test_execution_allowed, execute_ask_agent_boxed).await
+    }
+
     #[tool(description = "Create a persistent named session for an agent.")]
     async fn spawn_session(
         &self,
@@ -1078,6 +1099,27 @@ impl McpBridge {
         ))
     }
 
+    #[tool(
+        description = "Re-test a backend NOW and close its circuit breaker if it answers, instead \
+                       of waiting out the breaker's own cooldown (up to five hours). Use after a \
+                       quota reset. Spends one small live turn. Only agy has a breaker. A failed \
+                       probe leaves the breaker exactly as it was; it never extends the cooldown."
+    )]
+    async fn breaker_probe(
+        &self,
+        Parameters(req): Parameters<shared_types::BreakerProbeRequest>,
+    ) -> Result<Json<shared_types::BreakerProbeResponse>, String> {
+        // The breaker is a static in the DAEMON process. Probing from the bridge process would
+        // close a breaker nothing routes through.
+        if mcp_daemon_proxy_enabled() {
+            return daemon_http::fetch_daemon_breaker_probe(&req)
+                .await
+                .map(Json)
+                .map_err(|e| format!("breaker_probe via daemon failed: {e:#}"));
+        }
+        run_breaker_probe(&req).await.map(Json)
+    }
+
     #[tool(description = "Request a peer review and receive assigned reviewer + review_id.")]
     async fn review_request(
         &self,
@@ -1311,6 +1353,8 @@ fn infer_mcp_intent(tool_name: &str, params: Option<&serde_json::Value>) -> Stri
         | "review_request" | "review_submit" => {
             "Requesting or submitting a code review".to_string()
         }
+        "ask_jury" => "Putting one brief to several agents and tallying their verdicts".to_string(),
+        "breaker_probe" => "Re-testing a backend so its circuit breaker can close".to_string(),
         "blind_validate" => {
             "Blind-validating a worktree: a different agent writes the tests".to_string()
         }
@@ -2577,6 +2621,20 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(AxumJson(SessionListResponse { sessions: out }))
     }
 
+    async fn breaker_probe_route(
+        State(state): State<DaemonRuntimeState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<shared_types::BreakerProbeRequest>,
+    ) -> Result<AxumJson<shared_types::BreakerProbeResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
+            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
+        }
+        run_breaker_probe(&req)
+            .await
+            .map(AxumJson)
+            .map_err(|e| (StatusCode::BAD_REQUEST, AxumJson(serde_json::json!({ "error": e }))))
+    }
+
     async fn abe_task_complete_route(
         State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
@@ -2914,6 +2972,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/session/ask", post(session_ask_route))
         .route("/session/dismiss", post(session_dismiss_route))
         .route("/session/list", get(session_list_route))
+        .route("/agy/breaker/probe", post(breaker_probe_route))
         .route("/abe/task-complete", post(abe_task_complete_route))
         .nest_service("/mcp", {
             let mcp_bridge = McpBridge::new();
@@ -2967,6 +3026,15 @@ async fn run_daemon() -> anyhow::Result<()> {
     });
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_breaker_probe(
+    req: &shared_types::BreakerProbeRequest,
+) -> Result<shared_types::BreakerProbeResponse, String> {
+    match req.backend.as_deref().unwrap_or("agy") {
+        "agy" | "antigravity" | "gemini" => Ok(agy::breaker_probe().await),
+        other => Err(format!("breaker_probe: '{other}' has no circuit breaker; only agy does")),
+    }
 }
 
 fn spawn_dead_drop(
@@ -3718,6 +3786,102 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
             std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
         }
+        Ok(())
+    }
+
+    /// `ask_jury` through the real MCP surface, with mock codex and gemini-cli binaries.
+    ///
+    /// The unit tests in `mcp_tools::jury` drive `run_jury` with a scripted runner. This is the
+    /// one that proves the TOOL exists, that its flattened response survives rmcp's output
+    /// schema, and that a run really writes its ledger record. Grok has its own runner and
+    /// ignores a mock connector, so the jury here is two seats.
+    #[tokio::test]
+    async fn ask_jury_runs_two_mock_seats_end_to_end() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir()?;
+        let codex_bin = write_mock_agent_script("codex", 0.0)?;
+        let gemini_bin = write_mock_agent_script("gemini", 0.0)?;
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", root.path().join("home"));
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex_bin.as_os_str());
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", gemini_bin.as_os_str());
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
+            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(16384);
+        let server_handle = tokio::spawn(async move {
+            McpBridge::new_ephemeral().serve(server_transport).await?.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = NoopClient.serve(client_transport).await?;
+
+        let listed = client.list_all_tools().await?;
+        assert!(listed.iter().any(|t| t.name == "ask_jury"), "ask_jury must be advertised");
+        assert!(listed.iter().any(|t| t.name == "breaker_probe"), "breaker_probe must be advertised");
+
+        let args = serde_json::json!({
+            "message": "cast a verdict",
+            "seats": ["codex", "gemini"],
+            "cwd": root.path().display().to_string(),
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("ask_jury")
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await;
+
+        // Cleanup BEFORE the assertions, so a failure cannot leave the mocks installed.
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_HOME");
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
+        }
+        let _ = fs::remove_file(codex_bin);
+        let _ = fs::remove_file(gemini_bin);
+
+        let result = result?;
+        let raw_text = result
+            .content
+            .first()
+            .and_then(|c| c.raw.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        let out: serde_json::Value = serde_json::from_str(&raw_text)
+            .map_err(|e| anyhow::anyhow!("ask_jury did not return JSON ({e}): {raw_text}"))?;
+
+        assert!(out["jury_id"].as_str().unwrap_or_default().starts_with("jury-"), "{out}");
+        for (agent, said) in [("codex", "codex done"), ("gemini", "gemini done")] {
+            let seat = &out["seats"][agent];
+            assert_eq!(seat["status"], "answered", "{agent}: {out}");
+            assert_eq!(seat["answered_by_agent"], agent, "{agent}: {out}");
+            assert_eq!(seat["response"], said, "{agent}: {out}");
+        }
+        // The mocks say different things, so this is a real split, read off the FLATTENED tally.
+        assert_eq!(out["outcome"], "split", "{out}");
+        assert_eq!(out["unanimous"], false, "{out}");
+        assert_eq!(out["seats_requested"], 2, "{out}");
+        assert_eq!(out["seats_answered"], 2, "{out}");
+        assert_eq!(out["ledger_recorded"], true, "{out}");
+
+        let store = LedgerStore::open(root.path().to_path_buf())?;
+        // A manual record creates a SUMMARY, not a session row, so it is found by query. The
+        // first version of this test used get_session and failed: "session not found".
+        let found = store.query("jury", 10)?;
+        let jury_id = out["jury_id"].as_str().unwrap_or_default();
+        assert!(
+            format!("{found:?}").contains(jury_id) && format!("{found:?}").contains("ask_jury split"),
+            "the ledger must hold this run, findable by query and carrying its jury_id; got: {found:?}"
+        );
+
+        client.cancel().await?;
+        server_handle.await??;
         Ok(())
     }
 

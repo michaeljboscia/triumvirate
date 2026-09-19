@@ -593,7 +593,11 @@ pub(crate) async fn execute_ask_agent(
     // --model and runs its own internal retry); for deepseek, a single attempt
     // (REQ-DS-008 / T-013 — the runner owns its scoped in-flight retries, the
     // outer execute loop must NOT retry); for others, 3 retries.
-    let attempt_schedule = attempt_schedule_for(&agent, gemini_backend_selected, sight_required(req));
+    // Read once, up here: it decides the attempt schedule, the degraded route, and the
+    // acknowledgement the caller needs in order to trust any of it.
+    let strict_agent = req.strict_agent.unwrap_or(false);
+    let attempt_schedule =
+        attempt_schedule_for(&agent, gemini_backend_selected, sight_required(req), strict_agent);
     let verbosity = agent_verbosity();
     let mut last_err: Option<String> = None;
     // Every failure on the way to the terminal error, oldest first. `last_err` alone is what
@@ -1009,6 +1013,10 @@ pub(crate) async fn execute_ask_agent(
                 .with_shadow(sh_backend, sh_resp, sh_err, sh_ms);
                 // The receipt, returned on every call and not only on reviews.
                 resp.tool_calls_made = Some(tool_calls_made);
+                // Which model actually answered, when the dispatch named one, and the
+                // acknowledgement that makes the no-substitution guarantee checkable.
+                resp.model = model_override.map(|m| m.to_string());
+                resp.strict_agent_honored = strict_agent.then_some(true);
                 // Hand the CLI session id back so a NAMED session can own it in its own
                 // SessionState, rather than the worker registry inferring it from (agent, cwd).
                 // That inference is what let two named sessions resume each other.
@@ -1182,7 +1190,18 @@ pub(crate) async fn execute_ask_agent(
     // hard-failed (auth/exec/quota). Quota-class failures skip gemini-cli (shared
     // quota pool) and go straight to codex. The public agent stays `gemini`; a
     // successful hop returns with substitution-honesty fields + a one-line prefix.
-    if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+    //
+    // `strict_agent` skips the whole route. The caller asked for THIS seat, so the honest
+    // result of an unavailable backend is a failure naming that backend, not codex's answer.
+    if strict_agent && matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
+        let detail = "strict_agent: degraded route skipped, no other agent or backend may answer";
+        lifecycle.push(LifecycleEvent {
+            state: "STRICT_NO_SUBSTITUTION".to_string(),
+            detail: detail.to_string(),
+        });
+        failure_chain.push(detail.to_string());
+    }
+    if !strict_agent && matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
         let reason = last_err
             .clone()
             .unwrap_or_else(|| "agy backend failed".to_string());
@@ -1404,6 +1423,10 @@ pub(crate) async fn execute_ask_agent(
                         shadow_response: None,
                         shadow_error: None,
                         shadow_latency_ms: None,
+                        // A degraded turn is unreachable under strict, so it claims no
+                        // acknowledgement, and the hop named no model.
+                        strict_agent_honored: None,
+                        model: None,
                         // The DEGRADED hop's count, since the degraded hop is what answered.
                         tool_calls_made: Some(tool_calls_made),
                     });
@@ -1831,20 +1854,24 @@ fn codex_ranged_reads_cover_source(
                 && matches!(c.kind, ToolKind::ReadFile)
                 && c.success == Some(true)
         })
-        .filter_map(|c| {
-            let args = c.args_json.as_deref()?;
-            let command = agent_adapter::codex::shell_command_from_args_json(args)?;
-            let read = agent_adapter::codex::command_read_range(&command)?;
-            // Bound to the operand the reader opened, not to a path string anywhere in the
-            // command. Codex, round 3: a decoy operand embedding the source path used to
-            // collect the source's coverage.
-            if !candidates.iter().any(|cand| cand == &read.operand) {
-                return None;
-            }
-            if read.via_nl && nl_drops_lines {
-                return None;
-            }
-            Some(read.range)
+        .flat_map(|c| {
+            // EVERY window in the command. One codex call can walk a file in `&&`-chained
+            // windows, and taking only the first reported partial coverage of a whole read
+            // (D-017).
+            let ranges = c
+                .args_json
+                .as_deref()
+                .and_then(agent_adapter::codex::shell_command_from_args_json)
+                .map(|command| agent_adapter::codex::command_read_ranges(&command))
+                .unwrap_or_default();
+            ranges.into_iter().filter(|read| {
+                // Bound to the operand the reader opened, not to a path string anywhere in the
+                // command. Codex, round 3: a decoy operand embedding the source path used to
+                // collect the source's coverage.
+                candidates.iter().any(|cand| cand == &read.operand)
+                    && !(read.via_nl && nl_drops_lines)
+            })
+            .map(|read| read.range)
         })
         .collect();
     if ranges.is_empty() {
@@ -1897,27 +1924,70 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             if !candidates.iter().any(|cand| args_name_path(args, cand)) {
                 return None;
             }
-            let window = serde_json::from_str::<serde_json::Value>(args)
+            // ONLY the windows over THIS source, and all of them. Reporting the command's
+            // first window told a caller who read lines 1-50 of the source, in a chain that
+            // also read lines 1-240 of something else, that they had read "lines 1-240". A
+            // receipt that names a range the reader never took of this file is worse than no
+            // receipt: it is a false statement in the one place the caller goes to argue.
+            let windows: Vec<String> = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
                 .and_then(|v| agent_adapter::codex::shell_command_from_value(Some(&v)))
-                .and_then(|cmd| agent_adapter::codex::command_read_range(&cmd).map(|x| x.range));
-            Some(match window {
-                Some(r) => match r.end {
-                    Some(e) => format!("lines {}-{}", r.start, e),
-                    None => format!("lines {}-$", r.start),
-                },
-                None => {
-                    let mut a = args.to_string();
-                    if a.len() > 160 {
-                        a.truncate(160);
-                        a.push_str("...");
-                    }
-                    a
-                }
+                .map(|cmd| agent_adapter::codex::command_read_ranges(&cmd))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| candidates.iter().any(|cand| cand == &r.operand))
+                .map(|r| match r.range.end {
+                    Some(e) => format!("lines {}-{} of {}", r.range.start, e, r.operand),
+                    None => format!("lines {}-$ of {}", r.range.start, r.operand),
+                })
+                .collect();
+            Some(if windows.is_empty() {
+                describe_what_the_read_bound(args)
+            } else {
+                windows.join(", ")
             })
         })
         .collect();
     format!("{source} has {total}; read this turn as [{}]", reads.join(", "))
+}
+
+/// What the read parsers made of a call's arguments, for a rejection receipt.
+///
+/// The receipt used to print the raw arguments truncated at 160 characters, which is shorter
+/// than the commands agents actually send: a real rejection read
+/// `sed -n '1,240p' A.md && sed -n '1,320p' /Users/.../triumvira...` and the reason it did not
+/// count was in the part that had been cut off. A gate whose evidence cannot explain its own
+/// decision sends the reader to guess, and the guess was wrong twice.
+///
+/// So report the BINDING, which is what the decision is actually made on: the operand each
+/// reader opened and the window it took. Falls back to the arguments, at a length that fits a
+/// real command, when nothing parsed as a read at all.
+fn describe_what_the_read_bound(args: &str) -> String {
+    let Some(cmd) = agent_adapter::codex::shell_command_from_args_json(args) else {
+        return truncate_for_receipt(args);
+    };
+    let mut bound: Vec<String> = agent_adapter::codex::whole_file_read_operands(&cmd)
+        .into_iter()
+        .map(|op| format!("whole read of {op}"))
+        .collect();
+    bound.extend(agent_adapter::codex::command_read_ranges(&cmd).into_iter().map(|r| {
+        match r.range.end {
+            Some(e) => format!("lines {}-{} of {}", r.range.start, e, r.operand),
+            None => format!("lines {}-$ of {}", r.range.start, r.operand),
+        }
+    }));
+    if bound.is_empty() {
+        return format!("no read the parser recognises in: {}", truncate_for_receipt(&cmd));
+    }
+    format!("bound to [{}]", bound.join("; "))
+}
+
+fn truncate_for_receipt(text: &str) -> String {
+    const MAX: usize = 500;
+    match text.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_string(),
+    }
 }
 
 /// The receipt for a NEVER-OPENED rejection: every recorded tool call, of any kind and any
@@ -1937,12 +2007,7 @@ fn describe_attempts_on_source(tool_calls: &[ToolCallRecord], source: &str, cwd:
                 Some(false) => "FAILED",
                 None => "no exit status",
             };
-            let mut a = args.to_string();
-            if a.len() > 160 {
-                a.truncate(160);
-                a.push_str("...");
-            }
-            Some(format!("{:?} {outcome} {a}", c.kind))
+            Some(format!("{:?} {outcome} {}", c.kind, describe_what_the_read_bound(args)))
         })
         .collect();
     if attempts.is_empty() {
@@ -2016,11 +2081,16 @@ fn record_names_source(c: &ToolCallRecord, cand: &str) -> bool {
         let Some(cmd) = agent_adapter::codex::shell_command_from_args_json(args) else {
             return false;
         };
-        if let Some(op) = agent_adapter::codex::whole_file_read_operand(&cmd) {
-            return op == cand;
+        // Plural: a read may sit in any segment of an `&&` chain (D-017). When the command
+        // contains reads but none of them opened THIS source, the answer is still false, as
+        // before; the fall-through below is only for a command with no parseable read at all.
+        let whole = agent_adapter::codex::whole_file_read_operands(&cmd);
+        if !whole.is_empty() {
+            return whole.iter().any(|op| op == cand);
         }
-        if let Some(read) = agent_adapter::codex::command_read_range(&cmd) {
-            return read.operand == cand;
+        let ranged = agent_adapter::codex::command_read_ranges(&cmd);
+        if !ranged.is_empty() {
+            return ranged.iter().any(|read| read.operand == cand);
         }
         // A peek (`head -5 SRC`, `tail -1 SRC`) is neither whole nor ranged, but it DID open
         // the source, and the gate reports a peek ("only read PART") differently from a miss
@@ -2048,9 +2118,10 @@ fn record_read_source_whole(c: &ToolCallRecord, cand: &str) -> bool {
         return false;
     };
     if is_shell_read_tool(&c.tool) {
+        // Plural: the whole-file read may be any link of an `&&` chain (D-017).
         return agent_adapter::codex::shell_command_from_args_json(args)
-            .and_then(|cmd| agent_adapter::codex::whole_file_read_operand(&cmd))
-            .is_some_and(|op| op == cand);
+            .map(|cmd| agent_adapter::codex::whole_file_read_operands(&cmd))
+            .is_some_and(|ops| ops.iter().any(|op| op == cand));
     }
     args_name_path(args, cand) && !read_args_are_partial(&c.tool, args)
 }
@@ -2797,6 +2868,8 @@ async fn run_gemini_shadow(
             // the shadow can mutate the reviewed tree and only writes to the comparison log.
             crate::agy::run_agy_cli_process_with_session(
                 &bin, &args, prompt, cwd, None, None, read_only,
+                // What the doc comment above always claimed and the code did not do.
+                crate::agy::BreakerRole::Observer,
             )
             .await
         }
@@ -3990,6 +4063,10 @@ pub(crate) fn attempt_schedule_for(
     agent: &str,
     gemini_backend_selected: Option<GeminiBackend>,
     review: bool,
+    // `strict_agent`: the caller wants the agent it asked for, which means the MODEL it asked
+    // for too. The gemini-cli faildown chain answers as `gemini` on any of four models, and a
+    // jury seat has no way to see which one voted. Under strict there is no chain to hide in.
+    strict: bool,
 ) -> Vec<(Duration, Option<&'static str>)> {
     // A sight-gated review reads files and runs commands, and gets `review_timeout()` for it.
     // It is ONE attempt: three retries of a review that timed out are three more reviews that
@@ -4001,6 +4078,8 @@ pub(crate) fn attempt_schedule_for(
     if agent == "gemini" {
         if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
             vec![(Duration::ZERO, None)]
+        } else if strict {
+            vec![(Duration::ZERO, Some(GEMINI_MODEL_FAILDOWN[0]))]
         } else {
             GEMINI_MODEL_FAILDOWN
                 .iter()
@@ -4638,6 +4717,7 @@ async fn run_agent_process_with_session(
                 // is the only thing stopping a reviewer from editing what it reviews.
                 crate::agy::run_agy_cli_process_with_session(
                     &agy_bin, &agy_args, message, cwd, session_id, events_tx, read_only,
+                    crate::agy::BreakerRole::Traffic,
                 )
                 .await
             }
@@ -5116,23 +5196,32 @@ mod deepseek_dispatch_tests {
     fn attempt_schedule_is_single_for_metered_and_context_heavy_agents() {
         use super::attempt_schedule_for;
         // Single attempt: the runner owns its retries, or a retry is genuinely expensive.
-        assert_eq!(attempt_schedule_for("deepseek", None, false).len(), 1,
+        assert_eq!(attempt_schedule_for("deepseek", None, false, false).len(), 1,
             "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)");
-        assert_eq!(attempt_schedule_for("grok", None, false).len(), 1,
+        assert_eq!(attempt_schedule_for("grok", None, false, false).len(), 1,
             "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)");
-        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false).len(), 1,
+        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false, false).len(), 1,
             "agy runs its own internal retry (REQ-013)");
 
         // Everything else keeps the generic ladder. This is the regression guard: adding a
         // single-attempt agent must not silently convert the default.
-        assert_eq!(attempt_schedule_for("codex", None, false).len(), 3);
+        assert_eq!(attempt_schedule_for("codex", None, false, false).len(), 3);
         // A sight-gated review is one attempt for every agent: a review that timed out is
         // not improved by two more, and the first failure would be buried under the last.
         for agent in ["codex", "claude", "gemini", "grok"] {
-            assert_eq!(attempt_schedule_for(agent, None, true).len(), 1, "{agent} review must be one attempt");
+            assert_eq!(attempt_schedule_for(agent, None, true, false).len(), 1, "{agent} review must be one attempt");
         }
-        assert_eq!(attempt_schedule_for("claude", None, false).len(), 3);
-        assert!(attempt_schedule_for("gemini", None, false).len() > 1,
+        assert_eq!(attempt_schedule_for("claude", None, false, false).len(), 3);
+
+        // STRICT pins the model. The gemini-cli chain answers as `gemini` on any of four
+        // models, so a seat that asked for one voter could get a different one and no field
+        // said so (Grok). RED IF: strict keeps the faildown chain.
+        let loose = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, false);
+        assert_eq!(loose.len(), 4, "the chain is still there for ordinary Q&A");
+        let strict = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, true);
+        assert_eq!(strict.len(), 1, "strict is one attempt, no faildown");
+        assert_eq!(strict[0].1, loose[0].1, "and it is the PRIMARY model, not some other one");
+        assert!(attempt_schedule_for("gemini", None, false, false).len() > 1,
             "gemini-cli uses the model faildown chain");
     }
 
@@ -8277,6 +8366,172 @@ mod grok_shell_read_gate_tests {
         }
     }
 
+    /// The kind is DERIVED, exactly as every adapter derives it, never asserted.
+    ///
+    /// Hardcoding `ToolKind::ReadFile` here is what let three tests pass against a gate that
+    /// was still rejecting the same command live: the real classifier left a chained read as
+    /// `Bash`, and the coverage check drops anything that is not `ReadFile` before the parsers
+    /// this file tests are ever reached. A helper that skips the step under test is not a test.
+    fn codex_shell(command: &str) -> ToolCallRecord {
+        let args = serde_json::json!({ "command": command });
+        ToolCallRecord {
+            id: None,
+            tool: "command_execution".to_string(),
+            kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(serde_json::json!({ "command": command }).to_string()),
+        }
+    }
+
+    /// A real file on disk, because the coverage check reads it to learn its line count.
+    fn source_file(lines: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("brief.md");
+        let body: String = (1..=lines).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&path, body).expect("write source");
+        let p = path.to_string_lossy().into_owned();
+        (dir, p)
+    }
+
+    fn gate_codex(cmds: &[&str], source: &str, cwd: &str) -> Result<(), String> {
+        let tools: Vec<ToolCallRecord> = cmds.iter().map(|c| codex_shell(c)).collect();
+        let sources = vec![source.to_string()];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &sources, cwd, &mut lifecycle)
+    }
+
+    /// D-017, THE LIVE CASE. On the first real `ask_jury` run, codex read a 97-line brief with
+    /// `wc -l F && sed -n '1,240p' F`, which shows every line of it, and the gate threw the
+    /// turn away as "never successfully opened". Its answer was correct and was lost.
+    ///
+    /// RED IF: a read stops counting because something else shares its `&&` chain.
+    #[test]
+    fn d017_a_whole_file_read_still_counts_when_it_shares_an_and_chain() {
+        let (dir, src) = source_file(97);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        for cmd in [
+            // The live command, verbatim in shape.
+            format!("wc -l {src} && sed -n '1,240p' {src}"),
+            // The chain in the other order.
+            format!("sed -n '1,240p' {src} && wc -l {src}"),
+            // A whole-file reader rather than a window.
+            format!("wc -l {src} && cat {src}"),
+            // Walked in windows across the chain: neither covers it alone.
+            format!("sed -n '1,50p' {src} && sed -n '51,97p' {src}"),
+            // Three links, the read in the middle.
+            format!("pwd && cat {src} && echo done"),
+            // THE WRAPPED FORM, which is what codex actually emits. The bare command above
+            // proves the splitter; this proves the splitter runs on the unwrapped text.
+            format!("/bin/zsh -lc \"wc -l {src} && sed -n '1,240p' {src}\""),
+            // The window overshoots the file's real length, as a reader that does not know
+            // the line count will always do.
+            format!("wc -l {src} && sed -n '1,99999p' {src}"),
+        ] {
+            gate_codex(&[&cmd], &src, &cwd).unwrap_or_else(|e| panic!("must count as a read: {cmd}\n  gate said: {e}"));
+        }
+    }
+
+    /// THE EXACT LIVE SHAPE, from the second `ask_jury` run after the first fix. Codex read
+    /// two DIFFERENT files in one chain and the gate still said "never opened":
+    ///   /bin/zsh -lc "sed -n '1,240p' OTHER.md && sed -n '1,320p' BRIEF.md"
+    /// Every earlier test chained reads of ONE file, so none of them covered this.
+    /// RED IF: a read stops binding to its source because a sibling link read another file.
+    #[test]
+    fn d017_a_chain_that_reads_two_different_files_binds_each_to_its_own() {
+        let (dir, src) = source_file(97);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let other = dir.path().join("other.md");
+        std::fs::write(&other, "unrelated\n".repeat(40)).expect("write other");
+        let other = other.to_string_lossy().into_owned();
+
+        // The tool name codex actually reports is `Bash`, not `command_execution`.
+        let args = serde_json::json!({
+            "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
+        });
+        let call = ToolCallRecord {
+            id: None,
+            tool: "Bash".to_string(),
+            kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(args.to_string()),
+        };
+        assert_eq!(call.kind, ToolKind::ReadFile, "the classifier must see a chained read at all");
+        let sources = vec![src.clone()];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
+            .expect("the window over the SOURCE must count, whatever the other link read");
+    }
+
+    /// A rejection must explain itself. The receipt that sent me hunting printed the command
+    /// truncated at 160 characters, so the operand that failed to bind was cut off.
+    /// RED IF: the receipt goes back to dumping raw arguments instead of the binding.
+    #[test]
+    fn a_rejection_receipt_names_the_operand_and_window_each_read_bound_to() {
+        let (dir, src) = source_file(400);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let other = dir.path().join("other-with-a-deliberately-long-name-to-push-past-the-old-limit.md");
+        std::fs::write(&other, "x\n".repeat(40)).expect("write other");
+        let other = other.to_string_lossy().into_owned();
+
+        // A chain that reads the source only PARTLY, so the turn is rejected and the receipt
+        // is the only thing telling the caller which window it got.
+        let args = serde_json::json!({
+            "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
+        });
+        let call = ToolCallRecord {
+            id: None,
+            tool: "Bash".to_string(),
+            kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(args.to_string()),
+        };
+        let sources = vec![src.clone()];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
+            .expect_err("50 of 400 lines is not the source");
+
+        assert!(err.contains("lines 1-50"), "the receipt must name the window it got: {err}");
+        assert!(err.contains(&src), "and the operand it bound to: {err}");
+        assert!(
+            !err.contains("/bin/zsh"),
+            "the raw command is not the evidence; the binding is: {err}"
+        );
+    }
+
+    /// The controls. Splitting on `&&` must not reopen anything D-010 closed, and must not
+    /// turn a peek into a whole read.
+    /// RED IF: any of these starts passing.
+    #[test]
+    fn d017_the_and_chain_split_reopens_nothing() {
+        let (dir, src) = source_file(97);
+        let cwd = dir.path().to_string_lossy().into_owned();
+        for (cmd, why) in [
+            (format!("wc -l {src} && head -5 {src}"), "a peek in a chain is still only PART"),
+            (format!("sed -n '1,50p' {src} && wc -l {src}"), "half the file in a chain is still PART"),
+            (format!("cat /dev/null < {src} && wc -l {src}"), "a redirect still reads nothing"),
+            (format!("cat /etc/hostname # {src} && wc -l {src}"), "a comment still names nothing"),
+            // `;` and `||` mask a failed read: both exit zero having read nothing, so the
+            // success flag the gate trusts would be a lie. They stay refused whole.
+            (format!("cat /nonexistent ; cat {src}"), "a semicolon chain is still refused"),
+            (format!("cat /nonexistent || cat {src}"), "an or-chain is still refused"),
+            (format!("echo {src} && cat /etc/hostname"), "naming the file is not reading it"),
+            // An UNTERMINATED quote is a parse error for the whole line, so the shell runs
+            // NOTHING, including the read that precedes it. Splitting would credit a read that
+            // never happened. (The mirror case, `echo 'oops && cat SRC`, needs no guard: the
+            // scanner is inside the quote when it reaches the `&&`, so it never splits there.)
+            (format!("cat {src} && echo 'oops"), "an unterminated quote runs nothing"),
+        ] {
+            let err = gate_codex(&[&cmd], &src, &cwd).expect_err(&format!("must NOT pass: {why}\n  {cmd}"));
+            assert!(
+                err.contains("never successfully opened") || err.contains("only read PART"),
+                "{why}: unexpected rejection text: {err}"
+            );
+        }
+    }
+
     /// D-010. Three grok reviews were rejected "never opened" after doing exactly what the
     /// rejection text asked: `cat` the file. RED IF: a grok whole-file `cat` stops satisfying a
     /// named source.
@@ -8354,5 +8609,127 @@ mod grok_shell_read_gate_tests {
         let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
             .expect_err("wc is not a read");
         assert!(err.contains("never successfully opened"), "got: {err}");
+    }
+}
+
+/// `strict_agent`, end to end through `execute_ask_agent` with mock agy and codex binaries.
+///
+/// `#[ignore]` for the same reason as `mandatory_review_tests`: these point
+/// `TRIUMVIRATE_AGY_BIN` and `TRIUMVIRATE_CODEX_BIN` at mocks, which changes every dispatch in
+/// this binary. Run them with `scripts/verify-live-agents.sh strict`.
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)]
+mod strict_agent_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const ENV_KEYS: [&str; 6] = [
+        "TRIUMVIRATE_HOME",
+        "TRIUMVIRATE_GEMINI_BACKEND",
+        "TRIUMVIRATE_AGY_BIN",
+        "TRIUMVIRATE_AGY_ARGS",
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS",
+    ];
+
+    /// Cleanup lives in Drop so a failing assertion cannot leave the mocks installed.
+    struct StrictFixture {
+        dir: tempfile::TempDir,
+        codex_ran: PathBuf,
+    }
+
+    impl Drop for StrictFixture {
+        fn drop(&mut self) {
+            for key in ENV_KEYS {
+                unsafe { std::env::remove_var(key) };
+            }
+            // The quota exit below feeds the process-global breaker. Leave it closed.
+            mcp_bridge::agy_resilience::agy_breaker_record_success();
+        }
+    }
+
+    fn write_script(path: &std::path::Path, body: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write mock");
+        let mut perms = std::fs::metadata(path).expect("mock meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("chmod mock");
+    }
+
+    /// agy always fails on quota. codex always answers, and leaves a file saying it ran.
+    fn setup() -> StrictFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_ran = dir.path().join("codex-ran");
+        let agy = dir.path().join("mock-agy");
+        let codex = dir.path().join("mock-codex");
+        write_script(&agy, "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2");
+        write_script(
+            &codex,
+            &format!(
+                "touch '{}'\nIFS= read -r _line\necho '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"codex verdict\"}}}}'",
+                codex_ran.display()
+            ),
+        );
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        // SAFETY: serialised by the binary-wide env lock, cleared in Drop.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", dir.path().join("home"));
+            std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "agy");
+            std::env::set_var("TRIUMVIRATE_AGY_BIN", &agy);
+            std::env::remove_var("TRIUMVIRATE_AGY_ARGS");
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", &codex);
+            std::env::set_var("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", "");
+        }
+        StrictFixture { dir, codex_ran }
+    }
+
+    fn request(fx: &StrictFixture, strict: Option<bool>) -> AskAgentRequest {
+        AskAgentRequest {
+            agent: "gemini".to_string(),
+            message: "label this part".to_string(),
+            cwd: Some(fx.dir.path().to_string_lossy().into_owned()),
+            strict_agent: strict,
+            ..Default::default()
+        }
+    }
+
+    /// THE NEGATIVE CONTROL. Without `strict_agent` this fixture substitutes codex, which is
+    /// the 2026-09-19 failure. If this stops passing, `strict_02` proves nothing: it would be
+    /// green because the fixture never reaches the degraded route at all.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
+    async fn strict_01_without_strict_the_fixture_substitutes_codex() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _agy = crate::agy::tests::ENV_LOCK.lock().await;
+        let fx = setup();
+
+        let out = execute_ask_agent(&request(&fx, None), None)
+            .await
+            .expect("the degraded route answers when strict is off");
+
+        assert_eq!(out.agent, "gemini");
+        assert_eq!(out.answered_by_agent.as_deref(), Some("codex"));
+        assert!(fx.codex_ran.exists(), "codex must have been spawned for the control to mean anything");
+    }
+
+    /// RED IF: the `strict_agent` gate is removed from the degraded route. codex answers, the
+    /// call returns Ok, and the marker file appears.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
+    async fn strict_02_strict_fails_with_the_seats_own_error_and_never_spawns_codex() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _agy = crate::agy::tests::ENV_LOCK.lock().await;
+        let fx = setup();
+
+        let err = execute_ask_agent(&request(&fx, Some(true)), None)
+            .await
+            .expect_err("an unavailable backend under strict_agent is a failure, not codex's answer");
+
+        assert!(err.contains("STRICT_NO_SUBSTITUTION"), "the lifecycle must say why; got: {err}");
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("quota") || lower.contains("capacity"),
+            "the error must be agy's own, not a later hop's; got: {err}"
+        );
+        assert!(!fx.codex_ran.exists(), "no other agent may even be spawned under strict_agent");
     }
 }
