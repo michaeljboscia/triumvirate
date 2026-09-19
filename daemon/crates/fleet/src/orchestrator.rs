@@ -79,14 +79,7 @@ impl AgentLauncher for DaemonAgentLauncher {
         }
 
         let (cmd, args): (String, Vec<String>) = match agent {
-            "codex" => (
-                "codex".to_string(),
-                // `codex exec` takes the prompt as a positional argument. `--message` is not a
-                // flag it accepts (usage error on 0.154.0, verified 2026-09-12), so this spawn
-                // died at argv parse before running any task.
-                // `--` so a prompt that begins with a dash is a prompt, not a flag.
-                vec!["exec".to_string(), "--".to_string(), task_prompt.to_string()],
-            ),
+            "codex" => ("codex".to_string(), fleet_codex_argv(task_prompt)),
             "gemini" => match mcp_bridge::gemini_backend() {
                 // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
                 // Under agy it spawns the shared sandbox-exec invocation (single-turn,
@@ -1115,6 +1108,21 @@ pub fn mark_fleet_cancelled(project_root: &Path, fleet_id: &str, reason: &str) -
         rusqlite::params![fleet_id, reason],
     )
     .is_ok()
+}
+
+
+/// The argv a fleet member's codex is spawned with. Pure, so it can be checked against the
+/// installed binary (D-011).
+///
+/// `codex exec` takes the prompt as a positional argument. `--message` is not a flag it accepts
+/// (usage error on 0.154.0, verified 2026-09-12), so the spawn once died at argv parse before
+/// running any task. `--` so a prompt that begins with a dash is a prompt, not a flag.
+///
+/// This was an inline tuple inside the spawn match, which is why it had no parse oracle: three
+/// of four codex argv surfaces emitted a flag the binary rejected in 2026-09 and every test
+/// stayed green, because the tests asserted what Triumvirate built, not what codex parses.
+pub fn fleet_codex_argv(task_prompt: &str) -> Vec<String> {
+    vec!["exec".to_string(), "--".to_string(), task_prompt.to_string()]
 }
 
 #[cfg(test)]

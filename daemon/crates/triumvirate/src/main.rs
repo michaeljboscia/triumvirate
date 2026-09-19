@@ -4092,6 +4092,155 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    // ---------------------------------------------------------------------------------------
+    // D-011: every codex argv surface, checked against the INSTALLED binary.
+    //
+    // Four places build a codex argv. In 2026-09 three of them emitted a flag codex rejects
+    // (`--full-auto`, `--ask-for-approval never`, `--message`) and every test stayed green,
+    // because the tests asserted what Triumvirate BUILDS, not what codex PARSES. Only the two
+    // ABE builders had an oracle. This covers the other two in one table.
+    //
+    // The consult argv is not rebuilt here: it is CAPTURED from the real dispatch path by a
+    // codex stand-in that records its own argv, so the oracle sees exactly what production
+    // spawns, env-driven flags included. Rebuilding it in a test would be a second copy of the
+    // logic, which is the defect this exists to close.
+    // ---------------------------------------------------------------------------------------
+
+    fn codex_oracle_skip_requested() -> bool {
+        std::env::var_os("TRIUMVIRATE_SKIP_CODEX_ORACLE").is_some_and(|v| v == "1")
+    }
+
+    /// The real codex, found on PATH BEFORE any test points TRIUMVIRATE_CODEX_BIN at a stand-in.
+    fn codex_oracle_installed() -> String {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|d| d.join("codex"))
+            .find(|p| {
+                fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .expect(
+                "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it \
+                 exists to close. Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
+            )
+    }
+
+    /// Does the installed codex PARSE this argv?
+    ///
+    /// `--help` goes immediately before `--` (or at the end), so every flag precedes it. clap
+    /// stops validating at `--help`: `codex --bogus --help` exits 0. Put it first and the
+    /// oracle certifies anything, which is why the negative control below exists.
+    fn codex_argv_parses(bin: &str, args: &[String]) -> Result<(), String> {
+        let mut probe: Vec<String> = args.to_vec();
+        let at = probe.iter().position(|a| a == "--").unwrap_or(probe.len());
+        probe.insert(at, "--help".to_string());
+        let out = std::process::Command::new(bin)
+            .args(&probe)
+            .output()
+            .map_err(|e| format!("could not run {bin}: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "codex rejected the argv (exit {:?}): {}\nargv: {args:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    /// NEGATIVE CONTROL. RED IF: the oracle accepts a flag codex is known to reject, which would
+    /// mean `--help` landed before the flags and every positive case below proves nothing.
+    #[test]
+    fn codex_argv_oracle_00_rejects_a_flag_codex_removed() {
+        if codex_oracle_skip_requested() {
+            eprintln!("TRIUMVIRATE_SKIP_CODEX_ORACLE=1: oracle skipped on request");
+            return;
+        }
+        let bin = codex_oracle_installed();
+        let bad = vec!["exec".to_string(), "--full-auto".to_string(), "--".to_string(), "x".to_string()];
+        assert!(
+            codex_argv_parses(&bin, &bad).is_err(),
+            "oracle accepted --full-auto, which codex 0.154 removed: the probe is not validating flags"
+        );
+    }
+
+    /// The FLEET surface. RED IF: the fleet member argv emits a flag the installed codex rejects.
+    #[test]
+    fn codex_argv_oracle_01_fleet_member_argv_parses() {
+        if codex_oracle_skip_requested() {
+            return;
+        }
+        let bin = codex_oracle_installed();
+        let args = fleet::orchestrator::fleet_codex_argv("a task prompt");
+        codex_argv_parses(&bin, &args).unwrap();
+        // And a prompt that starts with a dash stays a prompt, which is what the `--` is for.
+        codex_argv_parses(&bin, &fleet::orchestrator::fleet_codex_argv("--looks-like-a-flag")).unwrap();
+    }
+
+    /// The CONSULT surface, captured from the real dispatch path.
+    /// RED IF: `execute_ask_agent` spawns codex with any flag the installed binary rejects.
+    #[tokio::test]
+    async fn codex_argv_oracle_02_consult_argv_parses_as_actually_spawned() -> anyhow::Result<()> {
+        if codex_oracle_skip_requested() {
+            return Ok(());
+        }
+        // Resolve the REAL binary first: the stand-in below replaces TRIUMVIRATE_CODEX_BIN.
+        let real_codex = codex_oracle_installed();
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let test_home = tempfile::tempdir()?;
+        let args_file = test_home.path().join("codex-args.txt");
+        // NUL-separated, not line-separated. The shared `write_codex_args_capture_script`
+        // writes one argv element per LINE, which splits a multi-line prompt into several
+        // elements; the first run of this test reported codex rejecting "unexpected argument"
+        // for what was really one prompt cut in half by the capture. The oracle must see the
+        // argv exactly as spawned, so elements are delimited by the one byte they cannot contain.
+        let stand_in = test_home.path().join("codex-nul-capture.sh");
+        fs::write(
+            &stand_in,
+            format!(
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{}\"\nIFS= read -r _line\n\
+                 echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"captured\"}}}}'\n",
+                args_file.display()
+            ),
+        )?;
+        let mut perms = fs::metadata(&stand_in)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stand_in, perms)?;
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe {
+            std::env::set_var("HOME", test_home.path());
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", stand_in.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+        let req = AskAgentRequest {
+            agent: "codex".to_string(),
+            message: "oracle probe".to_string(),
+            cwd: Some(test_home.path().display().to_string()),
+            ..Default::default()
+        };
+        let outcome = execute_ask_agent(&req, None).await;
+        // Restore BEFORE asserting, so a failure cannot leave the stand-in installed.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("HOME");
+        }
+        outcome.map_err(anyhow::Error::msg)?;
+
+        let captured: Vec<String> = fs::read(&args_file)?
+            .split(|b| *b == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        assert!(
+            captured.first().map(String::as_str) == Some("exec"),
+            "the stand-in did not record a codex exec argv, so there is nothing to check: {captured:?}"
+        );
+        codex_argv_parses(&real_codex, &captured).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ask_agent_codex_auto_approve_writes_ledger_record() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);

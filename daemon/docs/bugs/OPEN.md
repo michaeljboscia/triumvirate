@@ -93,22 +93,6 @@ artifact is not verifying the path.
 
 ---
 
-### D-011 - codex argv is assembled on four surfaces and only two have a binary oracle
-**Found:** 2026-09-12 · **Severity:** MEDIUM
-**Evidence:** codex 0.154.0 removed `--full-auto` from `exec`. Four places build codex argv:
-`mcp-tools/src/abe.rs` (`build_worker_argv`, `build_worktree_worker_argv`),
-`triumvirate/src/agent_exec.rs` (consult, the `should_use_full_auto` branch), and
-`fleet/src/orchestrator.rs`. Three of the four emitted a flag the binary rejects (`--full-auto`,
-`--ask-for-approval never`, `--message`), and every test stayed green because the tests assert
-what Triumvirate builds, not what the installed binary parses. All three were fixed 2026-09-12.
-Only the two ABE builders got a parse oracle (`abe_binary_oracle_tests`); the consult and
-fleet argv are built inline inside spawn code and have no oracle.
-**Why it matters:** the next removed flag goes red on two surfaces and ships on two. This is
-the "fix lands on one surface" shape again, with a test that certifies half the class.
-**Fix shape:** lift each inline codex argv into a pure builder, then one table-driven test that
-runs every builder's output through `codex <args> --help` on the installed binary.
-**Check:** temporarily push a bogus flag into the consult or fleet argv; `cargo test` must fail.
-
 ### D-015 - fleet task ids collide across fleets in the same repo
 **Found:** 2026-09-13 (audit) · **Severity:** MEDIUM
 **Evidence:** `tasks.task_id` is the PRIMARY KEY of the ledger's tasks table and the
