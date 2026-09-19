@@ -2809,6 +2809,8 @@ async fn run_gemini_shadow(
             // the shadow can mutate the reviewed tree and only writes to the comparison log.
             crate::agy::run_agy_cli_process_with_session(
                 &bin, &args, prompt, cwd, None, None, read_only,
+                // What the doc comment above always claimed and the code did not do.
+                crate::agy::BreakerRole::Observer,
             )
             .await
         }
@@ -4650,6 +4652,7 @@ async fn run_agent_process_with_session(
                 // is the only thing stopping a reviewer from editing what it reviews.
                 crate::agy::run_agy_cli_process_with_session(
                     &agy_bin, &agy_args, message, cwd, session_id, events_tx, read_only,
+                    crate::agy::BreakerRole::Traffic,
                 )
                 .await
             }

@@ -259,20 +259,25 @@ project_root, written at spawn, read on a miss; or an optional `project_root` on
 ## Closed
 
 ### 2026-09-19: the agy health probe ratcheted an open breaker to the five hour cap
-`BreakerState::record_quota` and `record_other` kept counting while the breaker was already
-open. The 300s health probe goes through `run_agy_cli_process_with_session`, which calls
-`agy_breaker_record_quota` on a quota exit whenever a backoff remains, so every third probe
-re-tripped the open breaker, doubled the cooldown, and pushed `open_until` out from now. A
-healthy probe closed nothing: only `execute_ask_agent` calls `record_success`. This is why
-the 2026-09-19 quota reset did not close the breaker. Fixed in
-`mcp-bridge::agy_resilience`: a failure while Open is ignored; only a failed half-open probe
-extends the cooldown. `breaker_probe` (MCP tool, `POST /agy/breaker/probe`) closes it on
-demand. Check passed: `failures_while_open_never_extend_the_cooldown` (unit, 40 failures,
-`open_until` unmoved), and `probe_02` against the real global breaker with a
-production-shaped backoff went RED at `open_count` 4 before the fix and green after.
+The 300s health probe shares `run_agy_cli_process_with_session` with request traffic. On a
+quota exit that runner called `agy_breaker_record_quota`, and its retry called
+`agy_breaker_should_skip`, which mutates. Two ratchets came out of that. While Open, failures
+still counted, so every third probe re-tripped and doubled the cooldown. Past the cooldown, the
+probe's retry claimed the single half-open slot, failed as the half-open probe, and re-tripped:
+with a 120s base cooldown and a 300s interval that is EVERY probe. A healthy probe closed
+nothing, because only `execute_ask_agent` calls `record_success`. This is why the 2026-09-19
+quota reset did not close the breaker.
+The first fix (a failure while Open is ignored) closed only the first ratchet and was written
+up here as done. Grok's review found the second. The fix that closes the class is
+`agy::BreakerRole`: the health probe, `breaker_probe`, `doctor_probe` and shadow-compare run
+as `Observer` and never read or write the breaker. `breaker_probe` (MCP tool,
+`POST /agy/breaker/probe`) closes it on demand, and only on the exact expected answer.
+Check passed: `probe_03` (breaker past its cooldown, five failed probes, `open_count` and
+phase unmoved) is RED with the probe dispatched as Traffic and green as Observer. `probe_04`
+(a quota sentence on a zero exit) is RED when any non-empty reply closes. Unit:
+`failures_while_open_never_extend_the_cooldown`.
 NOT done, owner's call: the scheduled health probe still does not CLOSE the breaker on
-success. That comment says it stays away from request traffic on purpose.
-
+success. Its comment says it stays away from request traffic on purpose.
 
 ### 2026-09-03: sight gate rejected every source-gated codex review as "never opened"
 The codex read classifier allowed `cat`/`head`/`nl`; codex-cli 0.145.0 reads files as

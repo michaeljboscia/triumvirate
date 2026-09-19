@@ -78,6 +78,11 @@ pub fn resolve_outputs(
         if !seats.contains(&canonical) {
             return Err(format!("ask_jury: outputs names '{name}', which is not one of the seats {seats:?}"));
         }
+        // Two seats, one file: each would read as "exists, parses, written this call" on the
+        // strength of the OTHER seat's write, and the later writer erases the earlier vote.
+        if let Some((other, _)) = resolved.iter().find(|(_, p)| *p == path) {
+            return Err(format!("ask_jury: the {other} and {canonical} seats are both told to write {path}"));
+        }
         if resolved.insert(canonical.clone(), path.clone()).is_some() {
             return Err(format!("ask_jury: outputs names the {canonical} seat twice"));
         }
@@ -808,6 +813,8 @@ mod tests {
         let seats = vec!["codex".to_string(), "gemini".to_string()];
         let typo = BTreeMap::from([("grokk".to_string(), "/tmp/x".to_string())]);
         assert!(resolve_outputs(&typo, &seats).unwrap_err().contains("not one of the seats"));
+        let shared = BTreeMap::from([("codex".to_string(), "/tmp/x".to_string()), ("gemini".to_string(), "/tmp/x".to_string())]);
+        assert!(resolve_outputs(&shared, &seats).unwrap_err().contains("both told to write"));
         let alias = BTreeMap::from([("agy".to_string(), "/tmp/x".to_string())]);
         assert_eq!(resolve_outputs(&alias, &seats).expect("alias").keys().collect::<Vec<_>>(), vec!["gemini"]);
 

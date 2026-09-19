@@ -295,7 +295,8 @@ pub struct JuryTally {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AskJuryResponse {
-    /// Also the ledger record's `session_id`, so the run can be found with `ledger_session`.
+    /// Carried in the ledger record, which is a summary and not a session row: find the run
+    /// with `ledger_query`, not `ledger_session`.
     pub jury_id: String,
     pub seats: std::collections::BTreeMap<String, JurySeat>,
     #[serde(flatten)]

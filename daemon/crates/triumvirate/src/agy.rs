@@ -258,6 +258,25 @@ pub(crate) fn degraded_total_budget() -> Duration {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Whether a dispatch is request traffic or something WATCHING the backend.
+///
+/// The breaker protects request traffic from a backend that is refusing it. A health probe,
+/// the on-demand breaker probe, the doctor check and shadow-compare are not that traffic, and
+/// they share this runner. Left unmarked they did two things to the breaker they were only
+/// supposed to watch: their quota exits were counted, and their RETRY called
+/// `agy_breaker_should_skip`, which mutates. Past the cooldown that call claims the single
+/// half-open slot, so the observer BECAME the half-open probe and its failure re-tripped the
+/// breaker and doubled the cooldown. With a 120s base cooldown and a 300s probe interval that
+/// was every probe. Grok found it, in review of a fix that had only closed the while-Open case.
+///
+/// An `Observer` never reads or writes the breaker. Anything it learns is applied by its
+/// caller, deliberately, as `breaker_probe` does on a clean answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakerRole {
+    Traffic,
+    Observer,
+}
+
 /// Run a single-turn agy dispatch for the `gemini` agent. Mirrors the shape of
 /// `run_gemini_cli_process_with_session` but bypasses `GeminiStreamParser` (no
 /// stream-json) and returns plain ANSI-stripped text (REQ-010–026, 040–042).
@@ -269,7 +288,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
     session_id: Option<&str>,
     events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
     read_only: bool,
+    breaker: BreakerRole,
 ) -> anyhow::Result<ParsedAgentResult> {
+    let feeds_breaker = breaker == BreakerRole::Traffic;
     // REQ-058: fail loud over ARG_MAX — there is no in-band workaround (no stdin/@file).
     if message.len() > agy_max_prompt_bytes() {
         anyhow::bail!(
@@ -320,7 +341,7 @@ pub(crate) async fn run_agy_cli_process_with_session(
             break;
         }
         // A retry after the breaker opened would only burn quota the breaker is protecting.
-        if attempt_idx > 0 && mcp_bridge::agy_resilience::agy_breaker_should_skip() {
+        if attempt_idx > 0 && feeds_breaker && mcp_bridge::agy_resilience::agy_breaker_should_skip() {
             last_err = Some(anyhow::anyhow!("agy capacity/quota: circuit breaker opened during backoff"));
             break;
         }
@@ -378,7 +399,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
                     // (Codex, review of this change: this branch ignored the signal). The
                     // breaker sees it whether or not a backoff remains.
                     if let Some(signal) = quota_signal.as_deref() {
-                        mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                        if feeds_breaker {
+                            mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                        }
                         if let Some(wait) = quota_backoffs.next() {
                             tracing::warn!(wait_s = wait.as_secs(), quota = signal, "agy empty stdout on a quota/429 signal (attempt {attempt}); backing off");
                             last_err = Some(anyhow::anyhow!("agy capacity/quota: empty output, signal: {signal}"));
@@ -438,7 +461,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
                                 ));
                                 // The breaker must see every 429, not only the one that ends
                                 // the call, or it opens later than before this change.
-                                mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                                if feeds_breaker {
+                                    mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                                }
                                 budget += 1;
                                 // Bounded by the overall deadline (Codex, review of this change).
                                 tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
@@ -497,7 +522,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
                             "agy quota/429 (attempt {attempt}); backing off before retry"
                         );
                         last_err = Some(err);
-                        mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                        if feeds_breaker {
+                            mcp_bridge::agy_resilience::agy_breaker_record_quota();
+                        }
                         budget += 1;
                         // Bounded by the overall deadline (Codex, review of this change).
                         tokio::time::sleep(wait.min(overall_deadline.saturating_duration_since(std::time::Instant::now()))).await;
@@ -532,6 +559,7 @@ pub(crate) async fn doctor_probe() -> Result<String, String> {
         None,
         // The doctor probe is a readiness check, not a review.
         false,
+        BreakerRole::Observer,
     )
     .await
     .map(|p| p.response_text)
@@ -558,15 +586,18 @@ pub(crate) async fn health_probe() {
 /// away from request traffic on purpose. A caller who knows the quota came back had no way to
 /// say so.
 ///
-/// Only a clean `Ok` closes the breaker. A capture-degraded probe means real turns would come
-/// back empty, so routing traffic at it helps nobody. A FAILED probe changes nothing: feeding
-/// it to `record_quota` would re-trip and double the cooldown, punishing the caller for asking.
+/// Only the EXACT expected answer closes the breaker. The health classification calls any
+/// non-empty reply `Ok`, which is right for "is the process alive" and wrong for "may traffic
+/// resume": a quota sentence printed on a zero exit is non-empty, and "429" even contains a 4.
+///
+/// A failed probe changes nothing, and that holds in every phase because the dispatch runs as
+/// `BreakerRole::Observer`: it neither feeds the breaker nor claims the half-open slot.
 pub(crate) async fn breaker_probe() -> shared_types::BreakerProbeResponse {
     use mcp_bridge::agy_resilience::{AgyProbeOutcome, agy_breaker_record_success, agy_breaker_snapshot};
 
     let before = agy_breaker_snapshot();
-    let (outcome, detail) = run_health_probe().await;
-    if outcome == AgyProbeOutcome::Ok {
+    let (outcome, detail, answered_exactly) = run_health_probe().await;
+    if outcome == AgyProbeOutcome::Ok && answered_exactly {
         agy_breaker_record_success();
     }
     let after = agy_breaker_snapshot();
@@ -587,7 +618,10 @@ pub(crate) async fn breaker_probe() -> shared_types::BreakerProbeResponse {
 
 /// One probe dispatch, classified and recorded. Shared by the scheduled health probe and the
 /// on-demand breaker probe so the two cannot drift apart.
-async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, String) {
+///
+/// The third value is whether the reply was EXACTLY the expected digit. Health does not use
+/// it; `breaker_probe` closes on nothing less.
+async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, String, bool) {
     use mcp_bridge::agy_resilience::{AgyProbeOutcome, agy_record_health};
 
     let now_ms = std::time::SystemTime::now()
@@ -597,6 +631,7 @@ async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, Str
     let (bin, args) = mcp_bridge::agy_command();
     let cwd = std::env::temp_dir().to_string_lossy().into_owned();
 
+    let mut answered_exactly = false;
     let (outcome, detail) = match run_agy_cli_process_with_session(
         &bin,
         &args,
@@ -606,10 +641,12 @@ async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, Str
         None,
         // Readiness probe, not a review.
         false,
+        BreakerRole::Observer,
     )
     .await
     {
         Ok(parsed) if parsed.response_text.contains('4') => {
+            answered_exactly = parsed.response_text.trim().trim_end_matches('.') == "4";
             (AgyProbeOutcome::Ok, "probe returned 4".to_string())
         }
         // Non-empty but unexpected: backend alive, capture working.
@@ -631,7 +668,7 @@ async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, Str
         }
     };
     agy_record_health(outcome, detail.clone(), now_ms);
-    (outcome, detail)
+    (outcome, detail, answered_exactly)
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,6 +1473,7 @@ pub(crate) mod tests {
             session,
             None,
             false,
+            BreakerRole::Traffic,
         )
         .await;
         let _ = std::fs::remove_file(&mock);
@@ -1562,8 +1600,8 @@ pub(crate) mod tests {
         let bin = mock.to_str().unwrap().to_string();
         let cwd = std::env::temp_dir().to_str().unwrap().to_string();
         let (a, b) = tokio::join!(
-            run_agy_cli_process_with_session(&bin, &[], "q1", &cwd, Some("inbound-a"), None, false),
-            run_agy_cli_process_with_session(&bin, &[], "q2", &cwd, Some("inbound-b"), None, false),
+            run_agy_cli_process_with_session(&bin, &[], "q1", &cwd, Some("inbound-a"), None, false, BreakerRole::Traffic),
+            run_agy_cli_process_with_session(&bin, &[], "q2", &cwd, Some("inbound-b"), None, false, BreakerRole::Traffic),
         );
         let _ = std::fs::remove_file(&mock);
         let a = a.expect("dispatch a");
@@ -1652,6 +1690,7 @@ pub(crate) mod tests {
             None,
             None,
             false,
+            BreakerRole::Traffic,
         )
         .await
         .expect("real agy dispatch");
@@ -1702,6 +1741,7 @@ mod breaker_probe_tests {
         _bin: tests::EnvRestore,
         _args: tests::EnvRestore,
         _backoff: tests::EnvRestore,
+        _cooldown: tests::EnvRestore,
     }
 
     impl Drop for ProbeFixture {
@@ -1712,6 +1752,12 @@ mod breaker_probe_tests {
     }
 
     fn setup(mock_body: &str) -> ProbeFixture {
+        setup_with_cooldown(mock_body, None)
+    }
+
+    /// `cooldown_secs` of "0" opens a breaker whose cooldown has ALREADY elapsed, which is the
+    /// state every scheduled health probe finds it in (120s base cooldown, 300s interval).
+    fn setup_with_cooldown(mock_body: &str, cooldown_secs: Option<&str>) -> ProbeFixture {
         use std::os::unix::fs::PermissionsExt;
         let mock = std::env::temp_dir().join(format!("mock-agy-probe-{}.sh", uuid::Uuid::new_v4()));
         std::fs::write(&mock, format!("#!/bin/sh\n{mock_body}\n")).expect("write mock agy");
@@ -1727,6 +1773,7 @@ mod breaker_probe_tests {
             // remains. The first version of this fixture used "" and probe_02 passed while
             // production would have ratcheted the cooldown on every failed probe.
             _backoff: tests::set_env_scoped("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", Some("0")),
+            _cooldown: tests::set_env_scoped("TRIUMVIRATE_AGY_BREAKER_COOLDOWN_SECS", cooldown_secs),
             mock,
         };
         // Open the real breaker. Looped rather than counted so a threshold override still opens it.
@@ -1780,5 +1827,45 @@ mod breaker_probe_tests {
         assert!(!last.closed_by_probe);
         assert_eq!(last.after.phase, "open");
         assert_eq!(last.after.open_count, first.before.open_count, "probing must never extend the cooldown");
+    }
+
+    /// GROK'S FINDING. probe_02 probes inside the cooldown, where the retry is simply skipped.
+    /// PAST the cooldown the runner's retry used to call `should_skip`, claim the half-open
+    /// slot, fail as the half-open probe, and re-trip. RED IF: the probe dispatch stops being
+    /// `BreakerRole::Observer`. `open_count` climbs and the phase leaves `open`.
+    #[tokio::test]
+    #[ignore = "mutates the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn probe_03_a_failed_probe_past_the_cooldown_still_changes_nothing() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = tests::ENV_LOCK.lock().await;
+        let _fx = setup_with_cooldown("echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2", Some("0"));
+        let start = agy_breaker_snapshot();
+        assert_eq!(start.cooldown_remaining_s, 0, "the fixture must be PAST its cooldown");
+
+        let mut last = breaker_probe().await;
+        for _ in 0..4 {
+            last = breaker_probe().await;
+        }
+
+        assert_eq!(last.outcome, "backend_failed");
+        assert_eq!(last.after.open_count, start.open_count, "an observer must never re-trip the breaker");
+        assert_eq!(last.after.phase, "open", "an observer must never claim the half-open slot");
+    }
+
+    /// GROK'S SECOND FINDING. A quota sentence on a ZERO exit is a non-empty reply, the health
+    /// classification calls that `ok`, and "429" contains a 4. RED IF: anything short of the
+    /// exact expected answer closes the breaker.
+    #[tokio::test]
+    #[ignore = "mutates the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn probe_04_a_quota_message_on_a_zero_exit_does_not_close_the_breaker() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = tests::ENV_LOCK.lock().await;
+        let _fx = setup("printf '{\"event\":\"init\",\"conversation_id\":\"c1\",\"init\":{}}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"Error 429: quota exhausted, retry later\"}}\n'");
+
+        let out = breaker_probe().await;
+
+        assert_eq!(out.outcome, "ok", "health still calls a live process ok; detail: {}", out.detail);
+        assert!(!out.closed_by_probe, "but it is not the answer, so traffic must not resume");
+        assert_eq!(agy_breaker_snapshot().phase, "open");
     }
 }

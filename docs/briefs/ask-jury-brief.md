@@ -45,3 +45,32 @@ ask_jury({
 
 ## Where the code lives
 Degradation and the circuit breaker: `daemon/crates/triumvirate/src/agent_exec.rs` (fields `answered_by_agent`, `degraded_from_backend`, breaker states); shared result types in `daemon/crates/shared-types/src/lib.rs`. The Antigravity backend integration notes are in `daemon/docs/specs/agy-integration-HANDOFF.md`.
+
+## As built (2026-09-19, branch feat/ask-jury)
+
+Where the build departs from the draft above, and why. The draft is left as written.
+
+**Shape.** `ask_jury` is a bridge-side fan-out over the existing `ask_agent` path, one strict call per seat. There is no daemon-side jury endpoint, so there is one implementation. The defence is two layers: every seat is dispatched `strict_agent: true`, and every reply is checked for who answered. The second layer is what survives version skew: a daemon older than `strict_agent` ignores the unknown field and substitutes, and that reply lands as `invalid` with its text withheld.
+
+**Deviations.**
+- `unanimous` means EVERY requested seat answered, cast a verdict, and agreed. Item 3 ("all valid seats") and the first acceptance line contradicted each other on two of three; acceptance wins. Two of three is `majority`.
+- `outcome` is one of `unanimous`, `majority`, `split`, `no_quorum`, counted against seats REQUESTED. The draft's `split` ("all different") left two disagreeing seats and a lone answer with no name.
+- `require_sight?: [...paths]` became `require_sight: bool` plus `required_sources: [paths]`, the same two fields with the same types as `ask_agent`. A non-empty `required_sources` implies the gate.
+- `verdict_json_pointer` (RFC 6901) was added beside `verdict_regex` and wins over it. `verdict_source` in the result says which reader was used, so a false split from the first-line default is diagnosable.
+- `ledger_id` became `jury_id`. `ledger_record` returns the string "ok", not an id. The id is carried in the record; find a run with `ledger_query`, not `ledger_session`.
+- `context` is not a field. The bridge injects it into every tool and strips it before dispatch.
+- `grok_depth` is `fast|deep`, the existing enum, not `quick|deep`.
+- Status `timeout` was added beside `unavailable` and `invalid`.
+- Outputs report `written_this_call`. A file left by an earlier run exists and parses, and says nothing about this seat. Two seats told to write the same path is rejected before anything is spent, as is one seat named twice through an alias.
+- The ledger record and the `tv_jury_seat` PostHog event carry provenance and counts only. No reply text and no verdict text: for a labelling jury the verdict IS the label.
+
+**The probe.** `breaker_probe` (MCP tool, `POST /agy/breaker/probe`) closes the agy breaker only on the exact expected answer, and a failed probe changes nothing in any phase. Building it surfaced the real cause of "the quota reset did not close the breaker": see the 2026-09-19 entry in `daemon/docs/bugs/OPEN.md`.
+
+**Known limits, not closed.**
+- `model` is always absent. `ask_agent` does not report it, and it is not guessed. So a same-agent vote cast by a different MODEL (the gemini-cli faildown chain) is invisible to the jury. Closing it needs `AskAgentResponse` to carry the model.
+- An absent `answered_by_agent` is read as "the asked agent answered", because that is what `ask_agent` sends on the normal path. The check catches substitution the daemon admits to.
+- All seats share one `cwd`. Nothing stops seat A reading a file seat B already wrote. Blindness between seats is the caller's to arrange (separate directories, or outputs checked after all seats return).
+- A mandatory-peer-review rejection surfaces as `unavailable`. It does not rewrite a vote, but it can cost a quorum.
+- The scheduled 300s health probe still does not close the breaker on success. Owner's call.
+
+**Not yet deployed.** The running daemon is the old binary until `scripts/install.sh`. Until then `ask_jury` is not callable and live `ask_agent` still substitutes.
