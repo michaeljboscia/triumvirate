@@ -493,6 +493,13 @@ pub struct AskAgentResponse {
     /// question that needed no tools is perfectly normal; zero on a review is the finding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls_made: Option<u32>,
+    /// Wiki-usage evidence for this turn (parser mode, backend, pages opened, page ids named),
+    /// recorded to the ledger by the daemon and never sent on the wire. `None` means the path
+    /// that built this response did not collect it, which the ledger event says out loud
+    /// rather than scoring as zero use.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub wiki_evidence: Option<serde_json::Value>,
 }
 
 impl AskAgentResponse {
@@ -520,6 +527,7 @@ impl AskAgentResponse {
             strict_agent_honored: None,
             model: None,
             tool_calls_made: None,
+            wiki_evidence: None,
         }
     }
 

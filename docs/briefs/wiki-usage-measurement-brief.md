@@ -271,3 +271,44 @@ not a holdout); DeepSeek says it proves precision and says nothing about recall.
 eventual primary signal: Gemini favours PAGES_OPENED, Grok would make it the use definition only
 where tool records exist, DeepSeek would promote neither until a placebo and a canary have run.
 
+
+## As built, step two (2026-09-19)
+
+Every answered ask call's `wiki_call` event (schema 2) carries an `evidence` object. Ids and
+flags only, no text, and no judgement: all classification is in the report.
+
+- `parser_mode`, `tool_records`, `reads_classified`: whether this call's parser could see a read
+  at all (Grok, jury). `pages_opened` is `null`, not `[]`, when it could not.
+- `backend`: named on the direct path too. Step one's live run had `None` for a direct agy call.
+- `pages_opened`: pages read, judged by the sight gate's own matcher (`tool_call_touched_source`),
+  so every adapter goes through the one implementation that already decides "was this source
+  read". Not a second parser per adapter.
+- `text_ids`, `prompt_ids`: page ids in the response and in the prompt, from
+  `daemon/crates/triumvirate/src/wiki_usage.rs`. The Python and Rust detectors are both checked
+  against `scripts/fixtures/wiki-detector-cases.json` (13 cases); drifting either one fails.
+- `prompt_paths`: absolute paths in the prompt, so the wiki-subject rule runs at report time
+  without storing the prompt.
+- `wiki`: dir, map date, page count, map bytes; or `{"error": ...}` when the page list cannot
+  load, which the report holds apart rather than scoring as zero use.
+
+`scripts/wiki-usage-report.py` finds every ledger (21 today, listed with rows ever written from
+sqlite_sequence so pruning is not read as silence), keys on the seat that answered, and holds
+apart: failed, schema 1, missing evidence, unloadable wiki, test harness, degraded, prompt named
+a page, wiki is the subject, recitation. It prints counts per seat, arm and class, and **publishes
+no rate**. Positive control: `scripts/test_wiki_usage_report.py`, 16 fixture calls in two
+ledgers, fails on any wrong or zero count. Every guard was mutation-tested.
+
+**Live proof:** a direct agy call recorded `backend: agy`; a Grok call told to read
+`verify-by-reading-back.md` recorded it in `pages_opened` and `text_ids` through the real
+`grok-streaming-json` parser. A repeat on the reinstalled binary (`aws-operations`) matched and
+carried no harness mark.
+
+**Found on the way:** D-019, the test suite writing events into real ledgers. Closed; see
+`daemon/docs/bugs/OPEN.md`.
+
+**Not built, and why.** The jury's placebo map, canary id and holdout all need control over
+WHAT MAP a peer receives, per call. Peers get the map from their own instruction files, not
+through the bridge, so the bridge cannot withhold or swap it for one call. That needs the
+injection mechanism, which is a separate brief. Until those exist no rate is believable, and
+the report says so at the top. Also still open: the brief's `skip_reason: stale` check belongs to
+that injection mechanism for the same reason.

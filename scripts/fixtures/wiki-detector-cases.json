@@ -1,0 +1,89 @@
+{
+ "_comment": "Shared by the Python detector (scripts/wiki-controls.py) and the Rust one (daemon/crates/triumvirate/src/wiki_usage.rs). Both must return `want` exactly, so the two cannot silently disagree about what a page id is. Page ids here are real ids from the wiki's _menu.json.",
+ "cases": [
+  {
+   "label": "clean citation",
+   "text": "See verify-by-reading-back for the rule.",
+   "want": [
+    "verify-by-reading-back"
+   ]
+  },
+  {
+   "label": "two citations, order kept",
+   "text": "aws-operations and verify-by-reading-back both apply.",
+   "want": [
+    "aws-operations",
+    "verify-by-reading-back"
+   ]
+  },
+  {
+   "label": "repeat counts twice",
+   "text": "verify-by-reading-back, then verify-by-reading-back again",
+   "want": [
+    "verify-by-reading-back",
+    "verify-by-reading-back"
+   ]
+  },
+  {
+   "label": "path-embedded near miss",
+   "text": "research/verify-by-reading-back-notes.md is not a citation",
+   "want": []
+  },
+  {
+   "label": "slash-prefixed near miss",
+   "text": "mneme-bosciamem/verify-by-reading-back.md",
+   "want": []
+  },
+  {
+   "label": "hyphen-suffixed near miss",
+   "text": "verify-by-reading-back-extended",
+   "want": []
+  },
+  {
+   "label": "hyphen-prefixed near miss",
+   "text": "pre-verify-by-reading-back",
+   "want": []
+  },
+  {
+   "label": "underscore glued near miss",
+   "text": "verify-by-reading-back_v2",
+   "want": []
+  },
+  {
+   "label": "dot after id is a citation",
+   "text": "read verify-by-reading-back.",
+   "want": [
+    "verify-by-reading-back"
+   ]
+  },
+  {
+   "label": "backticked id is a citation",
+   "text": "`verify-by-reading-back`",
+   "want": [
+    "verify-by-reading-back"
+   ]
+  },
+  {
+   "label": "unicode letter before is a near miss",
+   "text": "éverify-by-reading-back",
+   "want": []
+  },
+  {
+   "label": "recited map",
+   "text": "how-mike-works writing-rules-no-dashes-no-timelines graphiti-memory-operations peer-review-and-delegation verify-by-reading-back aws-operations",
+   "want": [
+    "how-mike-works",
+    "writing-rules-no-dashes-no-timelines",
+    "graphiti-memory-operations",
+    "peer-review-and-delegation",
+    "verify-by-reading-back",
+    "aws-operations"
+   ]
+  },
+  {
+   "label": "no page at all",
+   "text": "a response about something else entirely",
+   "want": []
+  }
+ ]
+}

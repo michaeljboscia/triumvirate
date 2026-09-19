@@ -127,6 +127,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_exec;
+mod wiki_usage;
 mod blind_validate;
 mod agy;
 mod streaming;
@@ -4125,6 +4126,22 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     }
 
     /// Every `wiki_call` event in the ledger under `root`, as (session_id, payload).
+    /// Opts one `wiki_call_*` test into ledger writes (D-019), and opts back out on drop.
+    /// Hold `env_lock` for as long as this lives.
+    struct RecordWikiCalls;
+    impl RecordWikiCalls {
+        fn on() -> Self {
+            // SAFETY: callers hold the binary-wide env lock.
+            unsafe { std::env::set_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL", "1") };
+            Self
+        }
+    }
+    impl Drop for RecordWikiCalls {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL") };
+        }
+    }
+
     fn wiki_call_events(root: &std::path::Path) -> Vec<(String, serde_json::Value)> {
         let db = root.join(".triumvirate").join("ledger.db");
         let conn = rusqlite::Connection::open(&db).expect("open the ledger the call wrote to");
@@ -4147,6 +4164,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn wiki_call_01_one_answered_call_leaves_one_textless_event_in_its_own_ledger() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
         let project = tempfile::tempdir()?;
         let codex = write_mock_agent_script("codex", 0.0)?;
         // SAFETY: serialised by the binary-wide env lock and restored below.
@@ -4187,12 +4205,117 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    /// STEP TWO (wiki-usage brief): the event carries the raw evidence, from the real codex parser
+    /// and the sight gate's own read matcher. A page the agent READ is `pages_opened`; a page it
+    /// NAMED is `text_ids`; a path-embedded near miss is neither; a page the PROMPT named is
+    /// `prompt_ids`, kept apart because "read this page" is obedience, not map use.
+    /// RED IF: opens stop being seen, the detector drifts from the Python one, the direct path
+    /// loses its backend, or ids are taken from inside paths.
+    #[tokio::test]
+    async fn wiki_call_03_evidence_names_pages_opened_named_and_prompted() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
+        let project = tempfile::tempdir()?;
+        let wiki = tempfile::tempdir()?;
+        fs::write(wiki.path().join("_menu.json"), r#"{"_comment":"x","alpha-page":{},"beta-page":{},"gamma-page":{}}"#)?;
+        fs::write(wiki.path().join("_index.md"), "# test wiki index (3 pages, generated 2026-09-19)\n")?;
+        let alpha = wiki.path().join("alpha-page.md");
+        fs::write(&alpha, "the alpha page\n")?;
+        let alpha = alpha.display().to_string();
+        let codex = write_codex_custom_script(&format!(
+            "printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\"}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\",\"exit_code\":0}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"Per alpha-page. research/beta-page-notes.md is not a citation.\"}}}}'"
+        ))?;
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+            std::env::set_var("TRIUMVIRATE_WIKI_DIR", wiki.path());
+        }
+        let outcome = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: "Use gamma-page, not /tmp/x/beta-page.md".to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
+        }
+        let _ = fs::remove_file(&codex);
+        outcome.map_err(anyhow::Error::msg)?;
+
+        let events = wiki_call_events(&fs::canonicalize(project.path())?);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let p = &events[0].1;
+        assert_eq!(p["schema"], 2);
+        let ev = &p["evidence"];
+        assert_eq!(ev["parser_mode"], "codex-exec-json", "{ev}");
+        assert_eq!(ev["backend"], "codex", "the direct path names its backend: {ev}");
+        assert_eq!(ev["tool_records"], true);
+        assert_eq!(ev["reads_classified"], true);
+        assert_eq!(ev["pages_opened"], serde_json::json!(["alpha-page"]), "{ev}");
+        assert_eq!(ev["text_ids"], serde_json::json!(["alpha-page"]), "a path is not a citation: {ev}");
+        assert_eq!(ev["prompt_ids"], serde_json::json!(["gamma-page"]), "{ev}");
+        assert_eq!(ev["prompt_paths"], serde_json::json!(["/tmp/x/beta-page.md"]));
+        assert_eq!(ev["wiki"]["pages"], 3);
+        assert_eq!(ev["wiki"]["generated"], "2026-09-19");
+        assert_eq!(ev["harness"], "cargo-test", "a test-suite call must say so: {ev}");
+        let raw = p.to_string();
+        assert!(!raw.contains("not a citation") && !raw.contains("Use gamma-page"), "text leaked: {raw}");
+        Ok(())
+    }
+
+    /// No wiki, no ids: the event says the page list could not be loaded instead of recording
+    /// empty lists, which a report would read as "the peer used nothing".
+    /// RED IF: a missing wiki produces `text_ids: []` or `pages_opened: []`.
+    #[tokio::test]
+    async fn wiki_call_04_a_missing_wiki_is_an_error_not_zero_use() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
+        let project = tempfile::tempdir()?;
+        let codex = write_mock_agent_script("codex", 0.0)?;
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", codex.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+            std::env::set_var("TRIUMVIRATE_WIKI_DIR", project.path().join("no-wiki-here"));
+        }
+        let outcome = execute_ask_agent(
+            &AskAgentRequest {
+                agent: "codex".to_string(),
+                message: "hello".to_string(),
+                cwd: Some(project.path().display().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
+            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
+        }
+        let _ = fs::remove_file(&codex);
+        outcome.map_err(anyhow::Error::msg)?;
+        let events = wiki_call_events(&fs::canonicalize(project.path())?);
+        let ev = &events[0].1["evidence"];
+        assert!(ev["wiki"]["error"].is_string(), "{ev}");
+        assert!(ev.get("text_ids").is_none() && ev.get("pages_opened").is_none(), "{ev}");
+        Ok(())
+    }
+
     /// A FAILED call is a call too, and its error is the most dangerous text of all: a sight-gate
     /// rejection quotes the rejected reply. One event, outcome failed, no error string.
     /// RED IF: failures stop being recorded, or the error text leaks into the ledger.
     #[tokio::test]
     async fn wiki_call_02_a_failed_call_still_leaves_one_event_without_its_error_text() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _record = RecordWikiCalls::on();
         let project = tempfile::tempdir()?;
         let failing = write_failing_agent_script("codex")?;
         unsafe {

@@ -61,6 +61,28 @@ what this file forbids.
 **Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
 stream once and find the event in PostHog.
 
+### 2026-09-19: the test suite wrote wiki_call events into real shared ledgers (D-019)
+
+Found by the first real run of `scripts/wiki-usage-report.py`: 11 rows said "wiki not loadable
+at call time" although the real wiki loaded fine on every live call. Traced to my own
+`cargo test` run. The suite drives `execute_ask_agent` with stand-in agents, some of its calls
+use shared directories (`/private/tmp/project`, `/private/tmp/worker-reuse`, and with no cwd this
+crate's git-tracked `.triumvirate/ledger.db`), and step one's recorder wrote a `wiki_call` event
+for each. The report counted them as peer calls. A test that clears HOME also made the wiki path
+relative, which is the "not loadable" text.
+
+Fixed three ways: a test build records only when a test opts in
+(`TRIUMVIRATE_TEST_RECORD_WIKI_CALL`, set by the four `wiki_call_*` tests alone); every
+test-build event carries `evidence.harness = "cargo-test"`, which the report holds apart; and
+`wiki_dir()` refuses a relative path. The 11 pre-fix rows stay in place, held apart as
+unloadable.
+
+**CHECK PASSED, 2026-09-19:** full `cargo test -p triumvirate --bin triumvirate` (296 passed), then
+every ledger under /private/tmp and ~/projects scanned for `wiki_call` rows newer than the run's
+start: zero. Negative control: the same run with the guard removed wrote 12 rows into six shared
+ledgers, so the scan can see them. Mutants for the harness mark and the absolute-path guard each
+fail a test.
+
 ### 2026-09-19: agy ran past its version pin on every dispatch (D-007)
 The pin was 1.1.5 in `~/.claude.json` and 1.0.2 as the code default, while 1.2.7 was installed
 and serving every call, so the mismatch warning fired on every agy dispatch. A warning that
@@ -254,4 +276,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-19 (every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
+**Last reviewed:** 2026-09-19 (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)

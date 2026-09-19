@@ -346,6 +346,13 @@ pub(crate) fn record_ask_call_event(
     outcome: &Result<AskAgentResponse, String>,
     latency: Duration,
 ) -> Option<PathBuf> {
+    // D-019: the test suite drives this function hundreds of times with stand-in agents, and
+    // its calls landed in real shared ledgers (`/private/tmp/project`, this crate's tracked
+    // `.triumvirate/ledger.db`), where the first report counted them as peer calls. A test build
+    // records only when a test opts in; the `wiki_call_*` tests do, and nothing else writes.
+    if cfg!(test) && std::env::var_os("TRIUMVIRATE_TEST_RECORD_WIKI_CALL").is_none() {
+        return None;
+    }
     let (resolved_cwd, _, _) =
         core_resolve_context(req.cwd.as_ref(), req.repo.as_ref(), req.branch.as_ref());
     let exec_cwd = resolved_cwd.unwrap_or_else(|| ".".to_string());
@@ -353,7 +360,7 @@ pub(crate) fn record_ask_call_event(
 
     let agent_requested = mcp_bridge::normalize_agent_name(&req.agent);
     let mut payload = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "agent_requested": agent_requested,
         "required_sources": req.required_sources,
         "is_peer_review": req.is_peer_review.unwrap_or(false),
@@ -379,6 +386,7 @@ pub(crate) fn record_ask_call_event(
             payload["strict_agent_honored"] = serde_json::json!(resp.strict_agent_honored);
             payload["tool_calls_made"] = serde_json::json!(resp.tool_calls_made);
             payload["response_chars"] = (resp.response.chars().count() as u64).into();
+            payload["evidence"] = resp.wiki_evidence.clone().unwrap_or_else(|| "missing".into());
             resp.request_id.clone()
         }
         // No request id survives a failure to this seam, so the event gets its own. The error text
@@ -414,6 +422,69 @@ pub(crate) fn record_ask_call_event(
             None
         }
     }
+}
+
+/// Wiki-usage evidence for one answered turn: raw ids and flags, never a verdict and never text.
+///
+/// Built at BOTH answered exits of `execute_ask_agent_inner` (direct and degraded) from the same
+/// function, so the two paths cannot drift. A response that reaches the ledger without it is
+/// recorded as `"evidence": "missing"` by `record_ask_call_event`, not scored as zero use.
+///
+/// `pages_opened` reuses the sight gate's matcher (`tool_call_touched_source`), so every adapter
+/// is judged by the one implementation that already decides whether a named source was read. It
+/// is `null`, not `[]`, when the parser cannot tell a read from anything else: an empty list
+/// from a blind parser would read as "opened nothing" (Grok, jury 2026-09-19).
+pub(crate) fn wiki_evidence(
+    parsed: &ParsedAgentResult,
+    backend: &str,
+    prompt: &str,
+    cwd: &str,
+) -> serde_json::Value {
+    let mode = parsed.parser_mode.as_str();
+    let reads_classified = PARSER_MODES_THAT_CLASSIFY_READS.contains(&mode);
+    let mut ev = serde_json::json!({
+        "parser_mode": mode,
+        "backend": backend,
+        "tool_records": PARSER_MODES_WITH_TOOL_RECORDS.contains(&mode),
+        "reads_classified": reads_classified,
+        "prompt_paths": crate::wiki_usage::paths_in(prompt),
+    });
+    // The test suite drives this same function with stand-in agents, and some of its calls land
+    // in shared directories (`/private/tmp/project`, this crate's own `.triumvirate/`). The
+    // first real report counted eleven of them as peer calls. Marked here so the report can
+    // hold them apart; the field is absent from every production event.
+    if cfg!(test) {
+        ev["harness"] = "cargo-test".into();
+    }
+    match crate::wiki_usage::wiki_dir().and_then(|dir| crate::wiki_usage::load_wiki(&dir)) {
+        Ok(wiki) => {
+            ev["wiki"] = serde_json::json!({
+                "dir": wiki.dir.display().to_string(),
+                "generated": wiki.generated,
+                "pages": wiki.pages.len(),
+                "map_bytes": wiki.map_bytes,
+            });
+            ev["text_ids"] =
+                serde_json::json!(crate::wiki_usage::page_ids_in(&parsed.response_text, &wiki.pages));
+            ev["prompt_ids"] = serde_json::json!(crate::wiki_usage::page_ids_in(prompt, &wiki.pages));
+            ev["pages_opened"] = if reads_classified {
+                let opened: Vec<&String> = wiki
+                    .pages
+                    .iter()
+                    .filter(|id| {
+                        let page = wiki.dir.join(format!("{id}.md"));
+                        tool_call_touched_source(&parsed.tool_calls, &page.to_string_lossy(), cwd)
+                    })
+                    .collect();
+                serde_json::json!(opened)
+            } else {
+                serde_json::Value::Null
+            };
+        }
+        // No page list, so no ids can be scored. Say so; an absent `text_ids` is not zero.
+        Err(e) => ev["wiki"] = serde_json::json!({ "error": e }),
+    }
+    ev
 }
 
 async fn execute_ask_agent_inner(
@@ -1108,6 +1179,12 @@ async fn execute_ask_agent_inner(
                     (None, None, None, None)
                 };
                 let tool_calls_made = cast_usize_to_u32(parsed.tool_calls.len());
+                // Named here, not left to the wire's `answered_by_backend`, which is omitted on
+                // the direct path: step one's live run recorded `None` for a direct agy call.
+                let backend = gemini_backend_selected
+                    .map(GeminiBackend::as_str)
+                    .unwrap_or(agent.as_str());
+                let evidence = wiki_evidence(&parsed, backend, &req.message, &exec_cwd);
                 let mut resp = AskAgentResponse::direct(
                     request_id,
                     agent.clone(),
@@ -1125,6 +1202,7 @@ async fn execute_ask_agent_inner(
                 // SessionState, rather than the worker registry inferring it from (agent, cwd).
                 // That inference is what let two named sessions resume each other.
                 resp.cli_session_id = next_session_id.clone();
+                resp.wiki_evidence = Some(evidence);
                 return Ok(resp);
             }
             Err(e) => {
@@ -1509,6 +1587,8 @@ async fn execute_ask_agent_inner(
                         return Err(err);
                     }
                     let tool_calls_made = cast_usize_to_u32(parsed.tool_calls.len());
+                    let evidence =
+                        wiki_evidence(&parsed, hop.backend, &req.message, &exec_cwd);
                     return Ok(AskAgentResponse {
                         // NOT the degraded hop's session id. A gemini session that degraded to
                         // codex would otherwise have its authoritative id overwritten with a
@@ -1533,6 +1613,7 @@ async fn execute_ask_agent_inner(
                         model: None,
                         // The DEGRADED hop's count, since the degraded hop is what answered.
                         tool_calls_made: Some(tool_calls_made),
+                        wiki_evidence: Some(evidence),
                     });
                 }
                 Ok(Err(e)) => {
