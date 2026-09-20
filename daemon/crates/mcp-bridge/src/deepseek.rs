@@ -1374,7 +1374,12 @@ async fn consume_stream(
         events: Vec::new(),
         tool_calls: Vec::new(),
         token_usage: Some(to_adapter_token_usage(&usage)),
-        cli_version: None,
+        // D-021: the RESOLVED model this request actually ran on, which is the same string
+        // sent in the request body and written to the per-request log above. Reporting it is
+        // what lets `$ai_model` be something other than "unknown" on this seat, and DeepSeek
+        // is the one metered sibling, so it is also what lets D-020 price a call at all: with
+        // no model, `billing_for` now correctly refuses to guess and emits no cost.
+        cli_version: Some(cfg.model.clone()),
         // DeepSeek is metered per token and its cost is computed from the price table, not
         // self-reported by the agent.
         self_reported_cost_usd: None,

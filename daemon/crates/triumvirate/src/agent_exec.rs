@@ -1128,23 +1128,39 @@ async fn execute_ask_agent_inner(
                 // with failure(). The guard emits only ONCE, on drop, with whatever the final
                 // outcome turned out to be — which is precisely the bug that made the old
                 // "emit here" version report success for a call that then returned Err.
-                // The agy connector reports the model it CHOSE at runtime ("Gemini 3.1 Pro
-                // (High)") and stashes it in cli_version (agy.rs::build_result). Without
-                // this, $ai_model falls back to the agent key and every Antigravity call
-                // charts as the model "gemini", which cannot answer which model ran.
-                if agent == "gemini" {
-                    match parsed.cli_version.as_deref() {
-                        Some(model) if !model.trim().is_empty() => {
-                            tel.set_model(model);
-                            span.record("agent.model", model);
-                        }
-                        // Record "unknown" rather than leaving the field Empty. An absent
-                        // field is indistinguishable from a span that never reached here, so
-                        // silence would hide the very parse regression worth catching: agy
-                        // changing its log format and us quietly losing the model forever.
-                        _ => {
-                            span.record("agent.model", "unknown");
-                        }
+                // Whichever connector knows the model it ran, report it. `cli_version` is the
+                // carrier every parser fills with the concrete model when it has one: agy
+                // reports the model it CHOSE at runtime ("Gemini 3.1 Pro (High)",
+                // agy.rs::build_result), the codex app-server reports it off the JSON-RPC
+                // result (codex_app_server.rs), and deepseek reports the model it resolved
+                // and sent. Without this, $ai_model falls back to the agent key and a call
+                // charts as the model "gemini" or "codex", which cannot answer which model ran.
+                //
+                // D-021: this was gated behind `if agent == "gemini"`, the single call site of
+                // `set_model` in the workspace, so 1,062 of 1,690 live rows (63%) could not say
+                // which model answered. Codex was the worst of it: the heaviest seat on the
+                // board at 64.5M input tokens, 100% unknown, while its parser had been
+                // capturing the model the whole time and the LOCAL ledger was already
+                // recording it ungated (`TokenRecord.model`, above in this same file). Only
+                // the PostHog path threw it away. The gate was the defect, not a missing
+                // source.
+                //
+                // Residual, deliberately not papered over: grok's parser sets `cli_version:
+                // None`, so grok rows stay "unknown" after this change. `grok_model()` reads
+                // an environment variable, which reports what we INTENDED to run rather than
+                // what ran, and charting intent as fact is the same class of defect as D-020.
+                // Tracked as the open half of D-021.
+                match parsed.cli_version.as_deref() {
+                    Some(model) if !model.trim().is_empty() => {
+                        tel.set_model(model);
+                        span.record("agent.model", model);
+                    }
+                    // Record "unknown" rather than leaving the field Empty. An absent
+                    // field is indistinguishable from a span that never reached here, so
+                    // silence would hide the very parse regression worth catching: a
+                    // connector changing its log format and us quietly losing the model forever.
+                    _ => {
+                        span.record("agent.model", "unknown");
                     }
                 }
                 tel.success(parsed.token_usage.clone());
