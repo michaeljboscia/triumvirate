@@ -335,21 +335,34 @@ enum Billing {
 /// listed here we return UnknownPrice and emit no cost, a wrong cost is worse than no cost.
 fn billing_for(agent: &str, model: Option<&str>) -> Billing {
     match agent {
-        // Subscription-backed: ChatGPT OAuth (codex), Max plan (claude), Google plan (gemini/agy).
-        "codex" | "claude" | "gemini" => Billing::Subscription,
-        "deepseek" => match model.unwrap_or("deepseek-v4-flash") {
-            // deepseek-chat / deepseek-reasoner are the legacy aliases of v4-flash.
-            "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => Billing::Metered {
-                cache_hit_in: 0.0028,
-                cache_miss_in: 0.14,
-                output: 0.28,
+        // Subscription-backed: ChatGPT OAuth (codex), Max plan (claude), Google plan (gemini/agy),
+        // SuperGrok plan (grok). D-023: `grok` was missing here, so 535 rows reported
+        // `tv_billing = unknown` and carried NO cost across 27.6M input tokens. "Unknown" claims we
+        // could not price the seat; the truth is that one more call on a fixed plan costs zero.
+        "codex" | "claude" | "gemini" | "grok" => Billing::Subscription,
+        // D-020: an ABSENT model is not a cheap model. This arm used to read
+        // `model.unwrap_or("deepseek-v4-flash")`, which silently priced every unattributed call at
+        // the FLOOR: 127 rows carried a real dollar figure over 98,900 input tokens while the only
+        // rows that named a model were all v4-pro at 3.1x that rate. The `_ => UnknownPrice` arm
+        // below already honours this function's own rule for an UNRECOGNISED model; the
+        // `unwrap_or` quietly exempted an absent one. Refusing to price is the honest answer, and
+        // it stays the honest answer until D-021 makes `$ai_model` reliable on this seat.
+        "deepseek" => match model {
+            None => Billing::UnknownPrice,
+            Some(model) => match model {
+                // deepseek-chat / deepseek-reasoner are the legacy aliases of v4-flash.
+                "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => Billing::Metered {
+                    cache_hit_in: 0.0028,
+                    cache_miss_in: 0.14,
+                    output: 0.28,
+                },
+                "deepseek-v4-pro" => Billing::Metered {
+                    cache_hit_in: 0.003625,
+                    cache_miss_in: 0.435,
+                    output: 0.87,
+                },
+                _ => Billing::UnknownPrice,
             },
-            "deepseek-v4-pro" => Billing::Metered {
-                cache_hit_in: 0.003625,
-                cache_miss_in: 0.435,
-                output: 0.87,
-            },
-            _ => Billing::UnknownPrice,
         },
         _ => Billing::UnknownPrice,
     }
@@ -404,11 +417,22 @@ fn cost_usd(
 }
 
 /// Map an agent to the provider PostHog expects in `$ai_provider`.
+/// Every agent in `supported_agent_names()` MUST have an arm here. D-022: `grok` AND `claude` were
+/// both missing, so two of the five supported seats fell through to "unknown" (535 live grok rows;
+/// claude had none only because that seat was unexercised, which would have made it a second
+/// surprise later rather than one fix now). `every_supported_agent_has_a_provider` walks the
+/// canonical list so a sixth seat cannot be added without answering this question.
+///
+/// The slugs are OpenRouter's, because PostHog matches `$ai_provider` + `$ai_model` against
+/// OpenRouter's pricing data first (posthog.com/docs/ai-observability/calculating-costs, checked
+/// 2026-09-20). That is why gemini maps to "google" and not "gemini", and why xAI is "x-ai".
 fn provider_for(agent: &str) -> &'static str {
     match agent {
         "gemini" => "google",
         "codex" => "openai",
         "deepseek" => "deepseek",
+        "grok" => "x-ai",
+        "claude" => "anthropic",
         _ => "unknown",
     }
 }
@@ -1533,9 +1557,16 @@ mod tests {
 
     /// Pins DeepSeek's published prices (api-docs.deepseek.com, 2026-07-12):
     /// v4-flash = $0.0028 hit / $0.14 miss / $0.28 out, per 1M tokens.
+    ///
+    /// The model is now named EXPLICITLY. This test used to pass `None` and assert flash pricing,
+    /// which read as "flash is priced correctly" while actually asserting the D-020 defect: that
+    /// an ABSENT model resolves to the cheapest one. It is the D-004 shape again, a test whose
+    /// name describes an intention its assertion does not check, and it is why the defect survived
+    /// a green suite. What this test is FOR is the published price table; naming the model keeps
+    /// that and drops the accidental blessing of the default.
     #[test]
     fn deepseek_flash_is_priced_from_the_published_table() {
-        let (usd, billing) = cost_usd("deepseek", None, 256, 46, Some(45));
+        let (usd, billing) = cost_usd("deepseek", Some("deepseek-v4-flash"), 256, 46, Some(45));
         assert_eq!(billing, "metered");
         let expected =
             (256.0 / 1e6) * 0.0028 + (46.0 / 1e6) * 0.14 + (45.0 / 1e6) * 0.28;
@@ -1716,5 +1747,187 @@ mod tests {
     fn synchronous_unclassified_exit_stays_unreported_canary() {
         let tel = CallTelemetry::new("deepseek", "trace-sync", None);
         assert_eq!(tel.effective_outcome(), "unreported");
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Agent attribution. D-020 through D-023.
+    //
+    // All four defects below are the SAME shape: a match statement that enumerates agents, and an
+    // agent that was never added to it. Adding the missing arm fixes today; walking
+    // `supported_agent_names()` is what stops it recurring. That function is the canonical roster
+    // and its own doc comment forbids a literal list in a second place, so these tests derive
+    // their coverage from it rather than restating it.
+    // ----------------------------------------------------------------------------------------
+
+    /// Every supported seat must map to a real provider.
+    ///
+    /// D-022: `grok` and `claude` both fell through `_ => "unknown"`. Grok had 535 live rows;
+    /// claude had none only because the seat was unexercised, so the same defect was sitting
+    /// armed for whenever it was first used.
+    ///
+    /// RED IF: any arm is deleted from `provider_for`, or a seat is added to
+    /// `supported_agent_names()` without one.
+    #[test]
+    fn every_supported_agent_has_a_provider() {
+        for agent in crate::supported_agent_names() {
+            let provider = provider_for(agent);
+            assert_ne!(
+                provider, "unknown",
+                "{agent} has no arm in provider_for, so its rows chart as an unattributed provider"
+            );
+            assert!(!provider.is_empty(), "{agent} maps to an empty provider");
+        }
+    }
+
+    /// Aliases must resolve to the same provider as the canonical key.
+    ///
+    /// `provider_for` matches on the CANONICAL name, so a raw alias reaching it would report
+    /// "unknown" while looking like a supported seat. `normalize_agent_name` is the boundary that
+    /// prevents that, and this pins the two together.
+    ///
+    /// RED IF: normalization stops being applied before telemetry, or an alias is added to
+    /// `normalize_agent_name` that maps to a key with no provider arm.
+    #[test]
+    fn agent_aliases_resolve_to_the_same_provider() {
+        for (alias, canonical) in [
+            ("antigravity", "gemini"),
+            ("agy", "gemini"),
+            ("supergrok", "grok"),
+            ("grok-build", "grok"),
+            ("xai", "grok"),
+        ] {
+            let normalized = crate::normalize_agent_name(alias);
+            assert_eq!(normalized, canonical, "{alias} must normalize to {canonical}");
+            assert_eq!(
+                provider_for(&normalized),
+                provider_for(canonical),
+                "{alias} must chart under the same provider as {canonical}"
+            );
+        }
+    }
+
+    /// Every supported seat must be CLASSIFIED as either subscription-backed or metered.
+    ///
+    /// The table below is a second list, which `supported_agent_names()` warns against, so it is
+    /// made safe the only way a second list can be: the test asserts it covers the canonical
+    /// roster EXACTLY. Add a sixth seat and this test fails with "no billing expectation", which
+    /// forces the question "how is this one paid for?" to be answered in code review rather than
+    /// discovered in a cost dashboard months later.
+    ///
+    /// RED IF: `grok` is removed from the subscription arm (D-023), or a seat is added to the
+    /// roster without a billing decision.
+    #[test]
+    fn every_supported_agent_has_a_billing_classification() {
+        // (agent, a model that seat is known to run). `None` means the seat is billed by
+        // subscription, where the model cannot change the price.
+        let expectations: &[(&str, Option<&str>)] = &[
+            ("gemini", None),
+            ("codex", None),
+            ("claude", None),
+            ("grok", None),
+            ("deepseek", Some("deepseek-v4-pro")),
+        ];
+
+        let roster: std::collections::BTreeSet<&str> =
+            crate::supported_agent_names().iter().copied().collect();
+        let covered: std::collections::BTreeSet<&str> =
+            expectations.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            roster, covered,
+            "this table must cover supported_agent_names() exactly: a seat with no billing \
+             expectation is a seat whose cost nobody decided"
+        );
+
+        for (agent, model) in expectations {
+            match billing_for(agent, *model) {
+                Billing::Subscription => assert!(
+                    model.is_none(),
+                    "{agent} is subscription-backed, so the table should not pin a model to it"
+                ),
+                Billing::Metered { .. } => assert!(
+                    model.is_some(),
+                    "{agent} is metered, so the table must name the model it was priced with"
+                ),
+                Billing::UnknownPrice => panic!(
+                    "{agent} has no billing classification: its rows report tv_billing=unknown, \
+                     which claims we could not price the seat rather than stating what it costs"
+                ),
+            }
+        }
+    }
+
+    /// Grok is a fixed-plan seat, so one more call costs a REAL zero, not an unknown.
+    ///
+    /// D-023 in full: 535 rows reported `tv_billing = unknown` with no cost at all, across 27.6M
+    /// input tokens. "Unknown" and "free" are different claims, and the seat was absent from every
+    /// cost view while reading as unpriceable.
+    ///
+    /// RED IF: `grok` leaves the subscription arm.
+    #[test]
+    fn grok_is_a_subscription_seat_priced_at_a_real_zero() {
+        let (usd, label) = cost_usd("grok", None, 1_000_000, 26_597_794, Some(3_644_973));
+        assert_eq!(label, "subscription");
+        assert_eq!(
+            usd,
+            Some(0.0),
+            "a fixed plan's marginal cost is a known 0.0; None would mean we could not price it"
+        );
+    }
+
+    /// An ABSENT model on the metered seat must NOT be priced at the cheapest rate.
+    ///
+    /// D-020, and the most consequential of the four because it is the only one that emits a
+    /// WRONG number rather than an absent one. `billing_for` used to read
+    /// `model.unwrap_or("deepseek-v4-flash")`, so 127 live rows carried a real dollar figure over
+    /// 98,900 input tokens that was derived from an assumption, while the only 15 rows that named
+    /// a model were all v4-pro at 3.1x that rate. This function's own doc comment states the rule
+    /// it broke: "a wrong cost is worse than no cost".
+    ///
+    /// RED IF: the `unwrap_or` default is restored, or any other default model is introduced.
+    #[test]
+    fn an_absent_deepseek_model_is_not_priced_at_the_floor() {
+        assert!(
+            matches!(billing_for("deepseek", None), Billing::UnknownPrice),
+            "an absent model must refuse to price, not silently resolve to the cheapest model"
+        );
+
+        let (usd, label) = cost_usd("deepseek", None, 0, 98_900, Some(0));
+        assert_eq!(usd, None, "no cost may be emitted for a call we cannot price");
+        assert_eq!(label, "unknown");
+
+        // The floor it used to silently resolve to, and the rate the rows that DO name a model
+        // are actually billed at. That this pair differs by ~3x is the whole defect.
+        let (flash, _) = cost_usd("deepseek", Some("deepseek-v4-flash"), 0, 98_900, Some(0));
+        let (pro, _) = cost_usd("deepseek", Some("deepseek-v4-pro"), 0, 98_900, Some(0));
+        let (flash, pro) = (flash.expect("flash prices"), pro.expect("pro prices"));
+        assert!(
+            pro > flash * 3.0,
+            "pro is >3x flash ({pro} vs {flash}); defaulting to flash understates by that factor"
+        );
+    }
+
+    /// A recognised model still prices, so D-020 refuses only what it cannot know.
+    ///
+    /// RED IF: the None guard is widened into something that swallows valid models too.
+    #[test]
+    fn a_named_deepseek_model_still_prices() {
+        for model in ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro"] {
+            let (usd, label) = cost_usd("deepseek", Some(model), 0, 1_000_000, Some(1_000_000));
+            assert_eq!(label, "metered", "{model} is a known price");
+            assert!(usd.unwrap_or(0.0) > 0.0, "{model} must produce a real cost");
+        }
+    }
+
+    /// An agent nobody supports is still refused, in both mappings.
+    ///
+    /// The negative control for the two tests above: they assert the roster is covered, and this
+    /// asserts the catch-all arms still exist to catch anything off it. Without this, deleting
+    /// `_ => "unknown"` in favour of a blanket default would leave both roster tests green.
+    #[test]
+    fn an_unsupported_agent_is_refused_not_guessed() {
+        assert!(!crate::is_supported_agent_name("llama"));
+        assert_eq!(provider_for("llama"), "unknown");
+        assert!(matches!(billing_for("llama", None), Billing::UnknownPrice));
+        assert_eq!(cost_usd("llama", None, 0, 500, Some(500)), (None, "unknown"));
     }
 }
