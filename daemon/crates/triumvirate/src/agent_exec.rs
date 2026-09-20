@@ -1150,18 +1150,7 @@ async fn execute_ask_agent_inner(
                 // an environment variable, which reports what we INTENDED to run rather than
                 // what ran, and charting intent as fact is the same class of defect as D-020.
                 // Tracked as the open half of D-021.
-                // D-021, codex: its exec stream names no model, so the model comes from the
-                // thread's rollout file. Read here, not in the parser: it is a filesystem lookup
-                // and the parsers are pure over the stream. See `mcp_bridge::codex_rollout`.
-                let rollout_model = if parsed.cli_version.is_none() && agent == "codex" {
-                    parsed
-                        .session_id
-                        .as_deref()
-                        .and_then(mcp_bridge::codex_rollout::model_for_session)
-                } else {
-                    None
-                };
-                match parsed.cli_version.as_deref().or(rollout_model.as_deref()) {
+                match parsed.cli_version.as_deref() {
                     Some(model) if !model.trim().is_empty() => {
                         tel.set_model(model);
                         span.record("agent.model", model);
@@ -4336,6 +4325,18 @@ async fn run_codex_cli_process_with_session(
     }
     if parsed.session_id.is_none() {
         parsed.session_id = session_id.map(ToString::to_string);
+    }
+    // D-021: codex's exec stream names no model, so read the one it recorded for this thread.
+    // Resolved HERE, at the connector, and not at the telemetry guard: two consumers read
+    // `cli_version` (the PostHog generation AND `persist_daemon_token_record`, which writes the
+    // local ledger), and the first draft of this fix resolved it below the ledger write. That
+    // gave PostHog the model and left the ledger unattributed, which is the two-surface defect
+    // this repo is worst for. One source, above both readers. See `mcp_bridge::codex_rollout`.
+    if parsed.cli_version.is_none()
+        && let Some(sid) = parsed.session_id.as_deref()
+        && let Some(model) = mcp_bridge::codex_rollout::model_for_session(sid)
+    {
+        parsed.cli_version = Some(model);
     }
 
     if should_use_full_auto {
