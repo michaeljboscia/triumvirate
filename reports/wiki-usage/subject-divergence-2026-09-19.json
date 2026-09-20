@@ -1,0 +1,40 @@
+{
+  "scored": 1610,
+  "both": 470,
+  "neither": 1136,
+  "text_only": [
+    {
+      "uuid": "01a0babd-9756-7414-bcbb-7f3b6317aa68",
+      "ts": "2026-09-19T13:36:22.358000-04:00",
+      "agent": "codex",
+      "chars": 4578,
+      "term": "mneme-bosciamem",
+      "context": "floor zero. - The exclusion rule is a regex on the PROMPT (`mneme-bosciamem|CLAUDE-WIKI|WIKI-BRAIN|/gold/|LABELING-BRIEF|bosciamem wiki"
+    },
+    {
+      "uuid": "01a0babd-ee1e-7c3a-9267-566b23ba3857",
+      "ts": "2026-09-19T13:36:44.574000-04:00",
+      "agent": "deepseek",
+      "chars": 4578,
+      "term": "mneme-bosciamem",
+      "context": "floor zero. - The exclusion rule is a regex on the PROMPT (`mneme-bosciamem|CLAUDE-WIKI|WIKI-BRAIN|/gold/|LABELING-BRIEF|bosciamem wiki"
+    },
+    {
+      "uuid": "01a0babe-1bed-79a1-9c43-73359ecdd80c",
+      "ts": "2026-09-19T13:36:56.301000-04:00",
+      "agent": "gemini",
+      "chars": 4578,
+      "term": "mneme-bosciamem",
+      "context": "floor zero. - The exclusion rule is a regex on the PROMPT (`mneme-bosciamem|CLAUDE-WIKI|WIKI-BRAIN|/gold/|LABELING-BRIEF|bosciamem wiki"
+    },
+    {
+      "uuid": "01a0bac0-ab05-711f-b2ec-569a574b28da",
+      "ts": "2026-09-19T13:39:44.005000-04:00",
+      "agent": "grok",
+      "chars": 4578,
+      "term": "mneme-bosciamem",
+      "context": "floor zero. - The exclusion rule is a regex on the PROMPT (`mneme-bosciamem|CLAUDE-WIKI|WIKI-BRAIN|/gold/|LABELING-BRIEF|bosciamem wiki"
+    }
+  ],
+  "paths_only": []
+}

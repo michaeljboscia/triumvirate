@@ -1,3 +1,15 @@
+> **SUPERSEDED on 2026-09-20 by `/Users/michaelboscia/projects/triumvirate/docs/HANDOFF-2026-09-20.md`.**
+>
+> The "Next actions in priority order" section below is **withdrawn**. Item 2, the wiki-subject
+> classifier, was rejected by a three-seat peer panel: the design would have erased the arm it was
+> measuring. Item 2 also assumes the classifier "runs offline over rows already stored", and the
+> local ledgers store no prompt text, so it could not have run as written. The reference sheet
+> quoted here is wrong in three places (`choice` takes `criteria` and not `options`; an official
+> Python SDK exists; `jtsang4/jev-cli` does not reject the official API).
+>
+> What survives from this document: the verified API facts, the key location, and the constraints
+> section. Read the 2026-09-20 handoff before acting on anything below.
+
 # Handoff, 2026-09-19: start the Jev integration, and where this session left everything
 
 **Session:** `cde0e0e1-427d-4738-a00b-84043d279a67`
