@@ -19,6 +19,84 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-020 - DeepSeek metered cost is computed from an ASSUMED model
+**Found:** 2026-09-20 · **Severity:** HIGH · **NOT FIXED**
+**Evidence:** 127 of 142 deepseek rows carry `$ai_model = unknown`, `tv_billing = metered`, and a real
+dollar figure (`sum($ai_total_cost_usd) = 0.1781` over 98,900 input tokens). Measured in PostHog
+2026-09-20 over `distinct_id = 'triumvirate-daemon'`, 180 days.
+**Root cause:** `daemon/crates/mcp-bridge/src/posthog.rs:341`, `billing_for` reads
+`model.unwrap_or("deepseek-v4-flash")`. An ABSENT model silently becomes the CHEAPEST model.
+`deepseek-v4-pro` is 3.1x flash on both input (0.435 vs 0.14) and output (0.87 vs 0.28), and the
+15 rows that DO name a model are all v4-pro. So the priced-by-assumption set is 4x the token
+volume of the only set we can price honestly, and it is priced at the floor.
+**Why this is the worst of the five:** the function's own doc comment states the rule it breaks:
+"If a model is not listed here we return UnknownPrice and emit no cost, a wrong cost is worse than
+no cost." The `_ => Billing::UnknownPrice` arm honours that for an UNRECOGNISED model. The
+`unwrap_or` bypasses it for an ABSENT one. A missing cost reads as a gap; a wrong cost reads as a
+fact, and nothing downstream can tell it was guessed.
+**Check:** `billing_for("deepseek", None)` returns `UnknownPrice`, and a deepseek generation with no
+model emits NO `$ai_total_cost_usd`. Mutation: restore the `unwrap_or` default and the test goes red.
+
+### D-021 - `$ai_model` is `unknown` on 63% of rows; set_model is gated to one seat
+**Found:** 2026-09-20 · **Severity:** HIGH · **NOT FIXED**
+**Evidence:** 1,062 of 1,690 rows cannot say which model answered. By seat: codex 399 of 399
+(100%), grok 535 of 535 (100%), deepseek 127 of 142 (89%), gemini 69 of 613 (11%).
+**Scale note that reorders the priority:** codex is the HEAVIEST seat on the board by input tokens
+(64.5M, against grok 27.6M and gemini 16.6M) and not one of its rows names a model. The
+2026-09-20 handoff ranked this behind the two grok match arms; by token volume it is the largest
+hole in the dataset.
+**Root cause:** `daemon/crates/triumvirate/src/agent_exec.rs:1135` reads `if agent == "gemini"`.
+`set_model` has exactly ONE call site in the workspace and it sits inside that branch. Every other
+seat falls back to the agent key, which cannot answer "which model ran".
+**Known non-answer:** `grok_model()` at `daemon/crates/mcp-bridge/src/grok.rs:115` reads an env var
+rather than parsing what the CLI actually used, so it reports intent, not fact. Each seat needs its
+own source for the model it really ran.
+**Coupling:** while this is open, D-020 cannot be closed by pricing correctly, only by refusing to
+price. Attribution has to land before metered cost can be trusted.
+**Check:** a codex, grok and deepseek generation each carry a non-`unknown` `$ai_model` in PostHog.
+
+### D-022 - `$ai_provider` is `unknown` for grok AND claude
+**Found:** 2026-09-20 · **Severity:** MEDIUM · **NOT FIXED**
+**Evidence:** 536 rows report `$ai_provider = unknown` (535 grok plus the one malformed row of D-023).
+**Root cause:** `daemon/crates/mcp-bridge/src/posthog.rs:407`, `provider_for` matches `gemini`,
+`codex`, `deepseek` and falls through `_ => "unknown"`. There is no `grok` arm.
+**Wider than the handoff recorded:** `claude` is ALSO absent. `supported_agent_names()` returns
+`["gemini", "codex", "deepseek", "claude", "grok"]`, so TWO of five supported seats map to
+"unknown". `claude` shows no rows today only because that seat has not been exercised, which means
+this defect would have appeared later as a second surprise rather than being fixed once.
+**Check:** for EVERY agent in `supported_agent_names()`, `provider_for` returns a value that is not
+"unknown". Mutation: delete any one arm and the test goes red.
+
+### D-023 - `tv_billing` is `unknown` for grok, and cost is omitted
+**Found:** 2026-09-20 · **Severity:** MEDIUM · **NOT FIXED**
+**Evidence:** 535 grok rows carry `tv_billing = unknown` and NO `$ai_total_cost_usd`, across 27.6M
+input and 3.6M output tokens. The heaviest-but-one seat is absent from every cost and billing view.
+**Root cause:** `daemon/crates/mcp-bridge/src/posthog.rs:336`, `billing_for` matches
+`"codex" | "claude" | "gemini" => Subscription`, then `deepseek`, then `_ => UnknownPrice`. No `grok`
+arm.
+**The correct value is known, not unknowable:** grok runs on a SuperGrok subscription, so
+`tv_billing` is `subscription` and the marginal cost is a real `0.0`. Reporting `unknown` says "we
+could not price it" when the truth is "it is free", which is a different and worse claim.
+**Same shape as D-022:** both are a missing arm in a match that enumerates agents, and both were
+introduced by adding a seat without a test that walks the canonical list.
+**Check:** for EVERY agent in `supported_agent_names()`, `billing_for(agent, None)` is not
+`UnknownPrice`. Mutation: delete any one arm and the test goes red.
+
+### D-024 - One row carries a seat name containing a quote and a newline
+**Found:** 2026-09-20 · **Severity:** LOW · **NOT ROOT-CAUSED**
+**Evidence:** one row has `tv_agent` = `gemini">\n` (literal `">` then a newline). It also reports
+`$ai_input_tokens = 0`, `$ai_output_tokens = 0`, and unknown on model, provider and billing, so it
+is inert in every aggregate except as a phantom sixth seat in a `GROUP BY tv_agent`.
+**Why it is ranked last and still filed:** it is one row, but the shape (`">` plus a newline)
+suggests something interpolating an unescaped value into a quoted string on the write path. If that
+path is shared, other fields on other rows may be affected without being obvious, because only a
+value that happens to contain a quote reveals it.
+**Open question, not an assumption:** whether the mangling happens at the call site that names the
+agent, in the telemetry struct, or in JSON assembly. None has been ruled out.
+**Check:** the source of the malformed value is identified in code, and a test feeds a
+quote-and-newline-bearing agent name through the write path and asserts the emitted `tv_agent` is
+either clean or rejected. Until then this row stays open.
+
 ### D-004 - Failed generations carry no error text
 **Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
 **Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried
@@ -276,4 +354,6 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-19 (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
+**Last reviewed:** 2026-09-20 (D-020 through D-024 added: five telemetry attribution defects, all measured live in PostHog before filing, none fixed at time of filing. D-020 was NOT in the handoff that prompted the review and is ranked highest: it is the only one of the five that emits a WRONG number rather than an absent one.)
+
+**Superseded line:** **Last reviewed:** 2026-09-19 (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
