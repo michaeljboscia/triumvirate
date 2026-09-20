@@ -75,16 +75,44 @@ pricing, so its name claimed it pinned published prices while its assertion bles
 That is the D-004 shape. It now names the model explicitly.
 
 ### D-021 - `$ai_model` is `unknown` on 63% of rows; set_model is gated to one seat
-**Found:** 2026-09-20 · **Severity:** HIGH · **FIXED 2026-09-20. Open ONLY on the codex live check, which is blocked until 14:03 ET.**
+**Found:** 2026-09-20 · **Severity:** HIGH · **3 of 4 seats FIXED and verified live. OPEN on codex, and the reason is now known: the CLI does not report it.**
 **Fix landed (`407001a`):** the `if agent == "gemini"` gate is gone, so any connector that knows its
 model reports it. deepseek additionally fills `cli_version` with the model it resolved and sent.
 **VERIFIED LIVE, deepseek:** 2026-09-20 09:42 ET, daemon pid 46068 on the freshly installed binary, a deepseek generation carried
 `$ai_model = deepseek-v4-flash` where every unattributed row before it said `unknown`.
-**NOT VERIFIED, codex:** codex is quota-exhausted until 2026-09-20 14:03 ET. The live call made at
-09:42 failed on quota before any model was returned, so its row is a `failure` with 0 tokens and
-`$ai_model = unknown`, which proves nothing either way. `CodexAppServerParser` demonstrably
-captures the model off the JSON-RPC result, and the local ledger has been recording it ungated all
-along, so the expectation is strong, but the check has NOT been run.
+**CHECK RUN 2026-09-20 14:04 ET, codex: IT FAILED, and the expectation recorded here was wrong.**
+The call succeeded (6,612ms, a real answer) and still charted `$ai_model = unknown`. Ungating
+`set_model` did NOT fix codex.
+
+**Why, established by capture rather than by reading code:**
+1. `codex_protocol()` defaults to `"exec"` and `TRIUMVIRATE_CODEX_PROTOCOL` is not set on this
+   daemon, so the live parser is `CodexExecParser`, which hardcodes `cli_version: None`
+   (`crates/agent-adapter/src/codex.rs:769`). `CodexAppServerParser`, the one that reads
+   `result.model`, never runs.
+2. The exec stream does not carry the model AT ALL. A real capture from the installed
+   codex-cli 0.154.0 (`codex exec --json`, 2026-09-20) is five events:
+   `thread.started` (thread_id only), `turn.started`, two `item.completed`, and `turn.completed`
+   carrying `usage` alone. No model field anywhere in the stream.
+3. The app-server escape hatch does not exist on this version. `codex app-server --help` on
+   0.154.0 is a tooling NAMESPACE (`daemon`, `proxy`, `generate-ts`, `generate-json-schema`),
+   not the JSON-RPC-over-stdio server `CodexAppServerParser` was written against. This is exactly
+   what `crates/mcp-bridge/src/codex_capabilities.rs` predicted for 0.121+.
+
+**So `CodexAppServerParser`'s model capture is effectively dead code against the installed CLI,**
+and its only test asserts a HAND-WRITTEN payload (`codex_app_server.rs:233`,
+`{"result":{"model":"codex-app-server"}}`), not a real capture. That is why it read as a working
+source: a green test on an invented payload for a protocol shape that no longer exists. The grok
+half of this defect was fixed from REAL fixtures for exactly this reason.
+
+**Rejected, and why:** `--model` / `-c model=` are INPUT flags, and `~/.codex/config.toml` is
+configuration. Both say what we asked for, not what served the turn. Using either would be D-020's
+defect, an absent value replaced by a plausible one, and it would be worse here than a blank,
+because codex is the heaviest seat on the board and the number would look authoritative.
+
+**What would actually close this,** none of it attempted here: confirm whether any codex 0.154
+surface reports the served model (the `proxy`/`daemon` subcommands are unexamined), or wait for the
+CLI to report it. Until one of those exists, `unknown` on codex is the HONEST value and this row
+stays open rather than being closed with a guess.
 **FIXED AND VERIFIED LIVE, grok (`3a3ddd5`):** at 09:42 grok still returned `unknown`; it now does
 not. The CLI had been reporting the answer on every single turn and nothing read it. grok's `end`
 event carries a `modelUsage` map KEYED BY MODEL NAME, present in all four real 1.0.13 fixtures
@@ -104,8 +132,10 @@ nobody runs, and it fails silently back to "unknown" with every test green. A re
 1.0.30 was taken 2026-09-20 and committed as
 `daemon/crates/agent-adapter/tests/fixtures/grok-streaming-1.0.30-20260920.jsonl`. That fixture is
 the drift alarm for the next grok release.
-**Remaining check, the ONLY thing holding this row open:** after 14:03 ET, one codex call carries a
-non-`unknown` `$ai_model` in PostHog.
+**Remaining check:** one codex call carries a non-`unknown` `$ai_model` in PostHog, sourced from
+what the CLI actually served. Blocked on codex having such a surface at all, which it does not
+today. Re-run the capture in step 2 above after any codex upgrade: if `turn.completed` or
+`thread.started` gains a model field, this becomes a small parser change.
 
 **Original diagnosis, kept for the record:**
 **Evidence:** 1,062 of 1,690 rows cannot say which model answered. By seat: codex 399 of 399
@@ -485,6 +515,6 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-20. D-021 grok half FIXED and verified live at 11:11 ET (grok-4.6-build), leaving only the codex live check, blocked until 14:03 ET. D-020 through D-024 added (five telemetry attribution defects, all measured live in PostHog before filing). D-020, D-022, D-023 and D-024 then FIXED and CHECK PASSED against live PostHog rows the same day, on a freshly installed binary and a restarted daemon. D-021 is PARTIALLY fixed: deepseek verified live, codex blocked on its own quota until 14:03 ET, grok genuinely still open with no model source. D-004 CLOSED, its check passed on a real failure encountered during that verification. D-005 unblocked but NOT worked. D-025 added (an intermittent test, cause not established). The blocker recorded on D-004 and D-005, "nothing lands in PostHog until 14:03", was WRONG: ingestion was healthy all morning and 14:03 is Codex's unrelated usage quota.
+**Last reviewed:** 2026-09-20. D-021 codex check RUN at 14:04 ET and it FAILED: ungating set_model did not fix codex, because codex-cli 0.154.0 does not report the served model on any live surface (established by real capture, not by reading code). 3 of 4 seats fixed and verified. D-021 grok half FIXED and verified live at 11:11 ET (grok-4.6-build), leaving only the codex live check, blocked until 14:03 ET. D-020 through D-024 added (five telemetry attribution defects, all measured live in PostHog before filing). D-020, D-022, D-023 and D-024 then FIXED and CHECK PASSED against live PostHog rows the same day, on a freshly installed binary and a restarted daemon. D-021 is PARTIALLY fixed: deepseek verified live, codex blocked on its own quota until 14:03 ET, grok genuinely still open with no model source. D-004 CLOSED, its check passed on a real failure encountered during that verification. D-005 unblocked but NOT worked. D-025 added (an intermittent test, cause not established). The blocker recorded on D-004 and D-005, "nothing lands in PostHog until 14:03", was WRONG: ingestion was healthy all morning and 14:03 is Codex's unrelated usage quota.
 
 **Superseded line:** **Last reviewed:** 2026-09-19 (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
