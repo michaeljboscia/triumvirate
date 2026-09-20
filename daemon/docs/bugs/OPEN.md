@@ -85,7 +85,7 @@ model reports it. deepseek additionally fills `cli_version` with the model it re
 `$ai_model = unknown`, which proves nothing either way. `CodexAppServerParser` demonstrably
 captures the model off the JSON-RPC result, and the local ledger has been recording it ungated all
 along, so the expectation is strong, but the check has NOT been run.
-**FIXED AND VERIFIED LIVE, grok (`ec9d0ec`):** at 09:42 grok still returned `unknown`; it now does
+**FIXED AND VERIFIED LIVE, grok (`3a3ddd5`):** at 09:42 grok still returned `unknown`; it now does
 not. The CLI had been reporting the answer on every single turn and nothing read it. grok's `end`
 event carries a `modelUsage` map KEYED BY MODEL NAME, present in all four real 1.0.13 fixtures
 already committed here, and `grep -rn modelUsage` over the workspace returned nothing.
