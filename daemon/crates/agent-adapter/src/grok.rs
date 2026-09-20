@@ -96,7 +96,8 @@ pub struct GrokStreamParser {
     total_cost_usd: Option<f64>,
     /// The CONCRETE model that served this turn, read from `end.modelUsage`. D-021.
     ///
-    /// Grok was the last seat that could not say which model answered it, so every grok row
+    /// Grok was ONE OF TWO seats that could not say which model answered it (codex was the
+    /// other, and was fixed after this), so every grok row
     /// charted `$ai_model = unknown`. The CLI had been reporting the answer all along: the `end`
     /// event carries a `modelUsage` map KEYED BY MODEL NAME, present in all four 1.0.13 fixtures
     /// and confirmed live on 1.0.30 (`grok-4.6-build`, 2026-09-20). Nothing in the workspace read

@@ -383,7 +383,10 @@ fn billing_for(agent: &str, model: Option<&str>) -> Billing {
 fn normalize_prompt(agent: &str, input: u64, cached: u64) -> (u64, u64, u64) {
     if agent == "deepseek" {
         // disjoint: input IS the miss count
-        (input + cached, cached, input)
+        // saturating: this runs while CallTelemetry is DROPPING. An overflow-checked
+        // build would panic here on a malformed provider usage payload, turning a call that
+        // already succeeded into a panic. Codex, panel review.
+        (input.saturating_add(cached), cached, input)
     } else {
         // subset: cached is part of input
         let hit = cached.min(input);
@@ -624,8 +627,13 @@ pub fn record_exception(agent: &str, kind: &str, message: &str, trace_id: &str) 
             // Issue for every single failure and bury the UI. Pin the grouping to the pair we
             // actually want to reason about ("how often does codex fail?") and let the message
             // stay detailed for the human reading the Issue.
-            "$exception_fingerprint": [agent, kind],
-            "tv_agent":     agent,
+            // D-024, second surface. `chart_agent` bounded $ai_generation's tv_agent and this
+            // event was left raw, so the 2026-08-26 malformed seat would still have landed here,
+            // and in the FINGERPRINT, which mints a distinct Issue in error tracking for every
+            // junk agent string a caller sends. Found by Grok on the panel: closing a defect on
+            // the event it was noticed on is not closing the defect.
+            "$exception_fingerprint": [chart_agent(agent), kind],
+            "tv_agent":     chart_agent(agent),
             "$ai_trace_id": trace_id,   // joins the exception to its $ai_generation
         }),
     );
@@ -681,7 +689,7 @@ pub fn record_fleet_task(
     capture(
         "tv_fleet_task",
         json!({
-            "tv_agent":         agent,
+            "tv_agent":         chart_agent(agent),
             "tv_agent_display": crate::display_agent_name(agent),
             "tv_backend":       backend,
             // success | failed | degraded_success | timeout | skipped_breaker_open | launch_failed
@@ -709,7 +717,7 @@ pub fn record_breaker_event(event: &str, agent: &str, detail: &str, shed_count: 
     capture(
         "tv_quota_breaker",
         json!({
-            "tv_agent":         agent,
+            "tv_agent":         chart_agent(agent),
             "tv_agent_display": crate::display_agent_name(agent),
             // opened_shedding | half_open_probe | tripped_quota | tripped_other | recovered
             "tv_breaker_event": event,
@@ -745,10 +753,11 @@ pub fn record_jury_seat(
         "tv_jury_seat",
         json!({
             "tv_jury_id":             jury_id,
-            "tv_agent":               agent,
+            "tv_agent":               chart_agent(agent),
             "tv_agent_display":       crate::display_agent_name(agent),
             "tv_seat_status":         status,
-            "tv_answered_by_agent":   answered_by_agent,
+            // Bounded like tv_agent: this is a seat name too, and it reaches the same charts.
+            "tv_answered_by_agent":   answered_by_agent.map(chart_agent),
             "tv_answered_by_backend": answered_by_backend,
             "tv_duration_bucket":     bucket,
         }),
@@ -822,7 +831,7 @@ pub fn record_session_invalidated(agent: &str, backend: Option<&str>, repo: Opti
     capture(
         "tv_session_invalidated",
         json!({
-            "tv_agent":         agent,
+            "tv_agent":         chart_agent(agent),
             "tv_agent_display": crate::display_agent_name(agent),
             "tv_backend":       backend,
             "tv_repo":          repo.map(repo_name),
@@ -1376,7 +1385,9 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
             "tv_tool_calls":       g.tool_calls.unwrap_or(0),
             "tv_duration_ms":      g.duration_ms,
             // The scarce unit on a subscription. Dollars can't move; this can.
-            "tv_total_tokens":     g.input_tokens.unwrap_or(0) + g.output_tokens.unwrap_or(0),
+            // saturating for the same reason as `normalize_prompt`: this is built on the Drop
+            // path, and a panic there loses a successful call over a telemetry detail.
+            "tv_total_tokens":     g.input_tokens.unwrap_or(0).saturating_add(g.output_tokens.unwrap_or(0)),
             // WHICH backend served this. agy and the retired gemini-cli report the same
             // agent and provider, so every chart treated them as one thing while the daemon
             // quietly ran gemini-cli for four days against a config that said agy. Absent
@@ -1983,6 +1994,62 @@ mod tests {
         let charted = g["tv_agent"].as_str().unwrap_or_default();
         assert!(!charted.contains('"'), "a quote in a chart dimension is caller text leaking");
         assert!(!charted.contains('\n'), "a newline in a chart dimension is caller text leaking");
+    }
+
+    /// EVERY event that carries a caller-supplied seat name bounds it, not just the one the
+    /// defect was noticed on.
+    ///
+    /// D-024 was closed on `$ai_generation` and left open on five sibling events. Grok found it on
+    /// the panel. `$exception` was the worst of them: it shipped the raw string as `tv_agent` AND
+    /// as part of `$exception_fingerprint`, which is the GROUPING KEY, so a junk agent name mints
+    /// its own Issue in error tracking and buries the UI, which is precisely what that
+    /// fingerprint was introduced to prevent.
+    ///
+    /// This test reads the SOURCE rather than calling the emitters, because they are
+    /// fire-and-forget over the network and return nothing to assert on. Structural, therefore,
+    /// and deliberately so: the failure it guards against is someone adding a sixth event with a
+    /// raw `"tv_agent": agent`, which is exactly a source-level pattern.
+    ///
+    /// RED IF: a `tv_agent` (or `tv_answered_by_agent`) is emitted from a variable without
+    /// passing through `chart_agent`.
+    #[test]
+    fn every_event_that_carries_a_seat_name_bounds_it() {
+        let src = include_str!("posthog.rs");
+        let mut raw = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim();
+            if !(t.starts_with("\"tv_agent\"") || t.starts_with("\"tv_answered_by_agent\"")) {
+                continue;
+            }
+            let value = t.splitn(2, ':').nth(1).unwrap_or("").trim().trim_end_matches(',');
+            // A string literal is bounded by construction; anything else must be bounded by us.
+            let bounded = value.starts_with('"') || value.contains("chart_agent");
+            if !bounded {
+                raw.push(format!("line {}: {t}", i + 1));
+            }
+        }
+        assert!(
+            raw.is_empty(),
+            "these emit a seat name without bounding it, so caller text reaches a chart \
+             dimension:\n{}",
+            raw.join("\n")
+        );
+    }
+
+    /// The exception fingerprint is a GROUPING KEY, so it is bounded too.
+    ///
+    /// RED IF: the raw agent string goes back into `$exception_fingerprint`.
+    #[test]
+    fn the_exception_fingerprint_is_bounded() {
+        let src = include_str!("posthog.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("\"$exception_fingerprint\""))
+            .expect("the fingerprint is still emitted");
+        assert!(
+            line.contains("chart_agent"),
+            "a junk agent name in the fingerprint mints a new error-tracking Issue per caller: {line}"
+        );
     }
 
     /// The dimension is bounded: nothing a caller sends can widen it.

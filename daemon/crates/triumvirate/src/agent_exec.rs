@@ -593,7 +593,16 @@ async fn execute_ask_agent_inner(
     let mut tel = mcp_bridge::posthog::CallTelemetry::new(
         &req.agent,
         &request_id,
-        req.deepseek_model.as_deref(),
+        // `deepseek_model` is a DeepSeek-only request field, but this seeds telemetry for EVERY
+        // agent. A codex or claude request that carried it, and whose connector reported no model
+        // of its own, charted that call under the DeepSeek model the caller named: a model that
+        // provably did not serve it. Same class as D-020, a plausible value standing in for an
+        // absent one. Codex, panel review.
+        if mcp_bridge::normalize_agent_name(&req.agent) == "deepseek" {
+            req.deepseek_model.as_deref()
+        } else {
+            None
+        },
     );
 
     if !is_supported_agent(req) {
@@ -1145,11 +1154,11 @@ async fn execute_ask_agent_inner(
                 // the PostHog path threw it away. The gate was the defect, not a missing
                 // source.
                 //
-                // Residual, deliberately not papered over: grok's parser sets `cli_version:
-                // None`, so grok rows stay "unknown" after this change. `grok_model()` reads
-                // an environment variable, which reports what we INTENDED to run rather than
-                // what ran, and charting intent as fact is the same class of defect as D-020.
-                // Tracked as the open half of D-021.
+                // Every seat now fills `cli_version`: agy and the codex app-server off their own
+                // output, grok off `end.modelUsage`, deepseek off the model it resolved, and the
+                // codex exec path off the thread's rollout (resolved at the connector). None of
+                // them uses an env var or a request flag, which would report what we INTENDED to
+                // run rather than what ran.
                 match parsed.cli_version.as_deref() {
                     Some(model) if !model.trim().is_empty() => {
                         tel.set_model(model);

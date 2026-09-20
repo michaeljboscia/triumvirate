@@ -120,13 +120,39 @@ pub fn model_for_session(session_id: &str) -> Option<String> {
     /// even on a file codex wrote itself. 32 MiB is far above any real rollout and far below
     /// anything that would hurt. Reading the first N bytes is safe for this job: `turn_context`
     /// records appear early in each turn, and a truncated final line simply fails to parse.
+    /// A file LARGER than this is refused outright rather than read in part: see below.
     const MAX_ROLLOUT_BYTES: u64 = 32 * 1024 * 1024;
 
     let path = rollout_for(session_id)?;
-    let file = std::fs::File::open(&path).ok()?;
-    // Re-check through the OPEN handle, not the path, so the answer cannot change between the
-    // check and the read.
-    if !file.metadata().ok()?.is_file() {
+
+    // O_NOFOLLOW, because the entry check and this open are separate syscalls. Codex found the
+    // remaining race on the panel: `DirEntry::file_type()` describes the entry as it was, and if
+    // the file is swapped for a symlink to a FIFO before this line, a plain `File::open` follows
+    // it and BLOCKS, after the agent call has already succeeded. O_NOFOLLOW makes the kernel
+    // refuse the open instead, which closes the window rather than narrowing it.
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .ok()?
+    };
+    // Re-check through the OPEN handle, not the path, so a directory or device that slipped
+    // through cannot be read as a transcript.
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    // A rollout ABOVE the cap must report nothing, not something.
+    //
+    // The first version of this cap read the first 32 MiB and returned the last turn_context
+    // inside that prefix. On a reused thread that outgrew the cap, the newest turn sits beyond
+    // the boundary and the PREVIOUS model gets attributed to the current call: a wrong value
+    // presented as fact, which is D-020's defect reintroduced by its own fix. Codex caught it on
+    // the panel. Refusing is the honest answer, and it keeps the one invariant this module has:
+    // it may say "I do not know", never "it was X" when it was not.
+    if meta.len() > MAX_ROLLOUT_BYTES {
         return None;
     }
     let mut raw = String::new();
