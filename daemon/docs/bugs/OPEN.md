@@ -143,6 +143,33 @@ two probes. The grok half went right because its fixtures are REAL captures, whi
 1.0.13 to 1.0.30 drift check was possible. Every test added for this fix is built from a verbatim
 real rollout line for that reason.
 
+**The first version of this fix was itself a two-surface defect (`d985f8f`, corrected in
+`81abb87`).** It resolved the rollout model inside the telemetry guard. Two consumers read
+`parsed.cli_version`, and the other is `persist_daemon_token_record`, which writes the local
+token-economics ledger and runs THIRTY LINES EARLIER in the same function (a third read sits in the
+rejected-no-sight arm, earlier still). So PostHog got `gpt-5.6-sol` and the ledger kept writing an
+empty model for the same call, from the same field. It is now resolved at the codex connector,
+above every consumer, and the telemetry guard's codex special case is deleted because the generic
+path covers it.
+
+**VERIFIED ON ALL THREE SURFACES, 2026-09-20 16:43 ET, one codex call, daemon pid 7612:**
+
+| Surface | Value |
+|---|---|
+| `token-economics.db` | `codex \| gpt-5.6-sol \| 01a0c08e-e7d7-78d0-8e23-8c948193c72d \| 23539` |
+| daemon span | `agent.model = gpt-5.6-sol` |
+| PostHog `$ai_generation` | `$ai_model = gpt-5.6-sol`, provider `openai`, billing `subscription` |
+
+Checking only the surface just fixed is how the first version passed. A fix closes on its own
+check, and the check has to cover every surface the value reaches.
+
+**Related, NOT merged, recorded so nobody "consolidates" it by accident:** `token-economics`
+already scans `~/.codex/sessions` and extracts a model, via a recursive search for any key named
+`model`/`model_name`/`modelId` across three agents' formats
+(`scanner.rs::extract_model`). That is deliberately loose because it reconstructs historical spend
+from whatever it finds. `codex_rollout::model_for_session` is deliberately strict: `turn_context`
+records only, newest wins. Two readers, two jobs. Merging them would make one of them wrong.
+
 **And one of those new tests had the same defect.** The hostile-session-id test stayed GREEN when
 the path validation was deleted, because those ids match no file either way: it checked the holder,
 not the guard. Mutation testing caught it. It now plants a rollout that a non-id WOULD resolve to,
