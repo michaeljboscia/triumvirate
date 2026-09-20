@@ -8,6 +8,7 @@ use agent_adapter::AgentVerbosity;
 use tracing::instrument;
 
 pub mod codex_capabilities;
+pub mod codex_rollout;
 pub use codex_capabilities::{
     CodexCapabilities, codex_capabilities, probe_and_cache_codex_capabilities,
 };

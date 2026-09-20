@@ -1150,7 +1150,18 @@ async fn execute_ask_agent_inner(
                 // an environment variable, which reports what we INTENDED to run rather than
                 // what ran, and charting intent as fact is the same class of defect as D-020.
                 // Tracked as the open half of D-021.
-                match parsed.cli_version.as_deref() {
+                // D-021, codex: its exec stream names no model, so the model comes from the
+                // thread's rollout file. Read here, not in the parser: it is a filesystem lookup
+                // and the parsers are pure over the stream. See `mcp_bridge::codex_rollout`.
+                let rollout_model = if parsed.cli_version.is_none() && agent == "codex" {
+                    parsed
+                        .session_id
+                        .as_deref()
+                        .and_then(mcp_bridge::codex_rollout::model_for_session)
+                } else {
+                    None
+                };
+                match parsed.cli_version.as_deref().or(rollout_model.as_deref()) {
                     Some(model) if !model.trim().is_empty() => {
                         tel.set_model(model);
                         span.record("agent.model", model);
