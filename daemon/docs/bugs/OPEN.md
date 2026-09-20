@@ -75,7 +75,7 @@ pricing, so its name claimed it pinned published prices while its assertion bles
 That is the D-004 shape. It now names the model explicitly.
 
 ### D-021 - `$ai_model` is `unknown` on 63% of rows; set_model is gated to one seat
-**Found:** 2026-09-20 · **Severity:** HIGH · **PARTIALLY FIXED 2026-09-20. Two thirds verified, one third open.**
+**Found:** 2026-09-20 · **Severity:** HIGH · **FIXED 2026-09-20. Open ONLY on the codex live check, which is blocked until 14:03 ET.**
 **Fix landed (`407001a`):** the `if agent == "gemini"` gate is gone, so any connector that knows its
 model reports it. deepseek additionally fills `cli_version` with the model it resolved and sent.
 **VERIFIED LIVE, deepseek:** 2026-09-20 09:42 ET, daemon pid 46068 on the freshly installed binary, a deepseek generation carried
@@ -85,12 +85,27 @@ model reports it. deepseek additionally fills `cli_version` with the model it re
 `$ai_model = unknown`, which proves nothing either way. `CodexAppServerParser` demonstrably
 captures the model off the JSON-RPC result, and the local ledger has been recording it ungated all
 along, so the expectation is strong, but the check has NOT been run.
-**STILL OPEN, grok:** confirmed live at 09:42, grok returned `$ai_model = unknown`. Its parser sets
-`cli_version: None` and nothing else on that path knows the model. `grok_model()` reads an
-environment variable, which is what we INTENDED to run, not what ran; charting intent as fact is
-the same class of defect as D-020 and must not be used to make this row look closed.
-**Remaining check:** after 14:03 ET, one codex call carries a non-`unknown` `$ai_model`; and grok
-gains a real source for the model it ran.
+**FIXED AND VERIFIED LIVE, grok (`ec9d0ec`):** at 09:42 grok still returned `unknown`; it now does
+not. The CLI had been reporting the answer on every single turn and nothing read it. grok's `end`
+event carries a `modelUsage` map KEYED BY MODEL NAME, present in all four real 1.0.13 fixtures
+already committed here, and `grep -rn modelUsage` over the workspace returned nothing.
+`GrokStreamParser::finish()` returned a hardcoded `cli_version: None` while the value sat one field
+away in an event it was already parsing for `total_cost_usd`.
+**CHECK PASSED 2026-09-20 11:11:43 ET**, daemon pid 64103: a live grok generation carried
+`$ai_model = grok-4.6-build`, `$ai_provider = x-ai`, `tv_billing = subscription`, cost `0.0`, over
+12,646 input tokens. Every attribution field on the heaviest subscription seat is now populated.
+**Deliberately NOT `grok_model()`,** which the previous handoff nominated as the candidate source.
+It reads `TRIUMVIRATE_GROK_MODEL`: the model we ASKED for, empty by default, so it reports intent
+rather than fact and says nothing at all in the common case. Charting intent as fact is D-020's
+class of defect.
+**Version drift was checked, not assumed.** The fixtures are grok 1.0.13 from 2026-08-30; the
+installed binary is 1.0.30. A fix validated only against old captures is a fix against a format
+nobody runs, and it fails silently back to "unknown" with every test green. A real capture from
+1.0.30 was taken 2026-09-20 and committed as
+`daemon/crates/agent-adapter/tests/fixtures/grok-streaming-1.0.30-20260920.jsonl`. That fixture is
+the drift alarm for the next grok release.
+**Remaining check, the ONLY thing holding this row open:** after 14:03 ET, one codex call carries a
+non-`unknown` `$ai_model` in PostHog.
 
 **Original diagnosis, kept for the record:**
 **Evidence:** 1,062 of 1,690 rows cannot say which model answered. By seat: codex 399 of 399
@@ -470,6 +485,6 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-20. D-020 through D-024 added (five telemetry attribution defects, all measured live in PostHog before filing). D-020, D-022, D-023 and D-024 then FIXED and CHECK PASSED against live PostHog rows the same day, on a freshly installed binary and a restarted daemon. D-021 is PARTIALLY fixed: deepseek verified live, codex blocked on its own quota until 14:03 ET, grok genuinely still open with no model source. D-004 CLOSED, its check passed on a real failure encountered during that verification. D-005 unblocked but NOT worked. D-025 added (an intermittent test, cause not established). The blocker recorded on D-004 and D-005, "nothing lands in PostHog until 14:03", was WRONG: ingestion was healthy all morning and 14:03 is Codex's unrelated usage quota.
+**Last reviewed:** 2026-09-20. D-021 grok half FIXED and verified live at 11:11 ET (grok-4.6-build), leaving only the codex live check, blocked until 14:03 ET. D-020 through D-024 added (five telemetry attribution defects, all measured live in PostHog before filing). D-020, D-022, D-023 and D-024 then FIXED and CHECK PASSED against live PostHog rows the same day, on a freshly installed binary and a restarted daemon. D-021 is PARTIALLY fixed: deepseek verified live, codex blocked on its own quota until 14:03 ET, grok genuinely still open with no model source. D-004 CLOSED, its check passed on a real failure encountered during that verification. D-005 unblocked but NOT worked. D-025 added (an intermittent test, cause not established). The blocker recorded on D-004 and D-005, "nothing lands in PostHog until 14:03", was WRONG: ingestion was healthy all morning and 14:03 is Codex's unrelated usage quota.
 
 **Superseded line:** **Last reviewed:** 2026-09-19 (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
