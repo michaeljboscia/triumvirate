@@ -437,6 +437,32 @@ fn provider_for(agent: &str) -> &'static str {
     }
 }
 
+/// Bound `tv_agent` to the known roster. D-024.
+///
+/// `tv_agent` is a CHART DIMENSION whose value arrives from the caller, and `CallTelemetry` is
+/// constructed from the RAW request string before `is_supported_agent` has run (agent_exec.rs),
+/// so a rejected call emits a generation carrying whatever text the caller sent. On 2026-08-26 one
+/// did: `tv_agent = gemini">` with a trailing newline, evidently a fragment of an HTML attribute
+/// (`value="gemini">`) that some caller built its agent string out of.
+///
+/// The write path was not at fault. It charted, faithfully, the garbage it was handed. That is the
+/// defect: an unbounded caller-controlled dimension means any caller can mint a phantom seat that
+/// appears in every `GROUP BY tv_agent` from then on, and ships arbitrary caller text to a SaaS.
+/// This file already applies exactly this reasoning to `repo_name` ("cardinality garbage AND would
+/// leak the operator's home directory"); it was never applied to the agent name.
+///
+/// So the emitted value is always a member of `supported_agent_names()` or the single sentinel
+/// `"unsupported"`. The rejected name is NOT shipped: it is already in the error returned to the
+/// caller and in the daemon's logs, which is where an unbounded string belongs.
+fn chart_agent(agent: &str) -> String {
+    let normalized = crate::normalize_agent_name(agent);
+    if crate::supported_agent_names().contains(&normalized.as_str()) {
+        normalized
+    } else {
+        "unsupported".to_string()
+    }
+}
+
 /// Emit a `$ai_generation` event. No-op unless POSTHOG_HOST and POSTHOG_API_KEY are both set.
 /// POST one event to PostHog. Fire-and-forget; every error is swallowed, because a
 /// telemetry failure must never be able to fail an agent call.
@@ -1340,8 +1366,9 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
             // and saved insight built on historical rows silently splits in two. tv_agent_display
             // is the product name an operator should actually read ("Antigravity"). A dashboard
             // is a human surface, so it gets the human label; the key stays for continuity.
-            "tv_agent":            g.agent,
-            "tv_agent_display":    crate::display_agent_name(g.agent),
+            // D-024: bounded to the roster, never the raw caller string. See `chart_agent`.
+            "tv_agent":            chart_agent(g.agent),
+            "tv_agent_display":    crate::display_agent_name(&chart_agent(g.agent)),
             "tv_outcome":          g.outcome,            // incl. "degraded_success"
             "tv_billing":          g.billing,            // metered | subscription | unknown
             "tv_cached_tokens":    g.cached_tokens.unwrap_or(0),
@@ -1929,5 +1956,87 @@ mod tests {
         assert_eq!(provider_for("llama"), "unknown");
         assert!(matches!(billing_for("llama", None), Billing::UnknownPrice));
         assert_eq!(cost_usd("llama", None, 0, 500, Some(500)), (None, "unknown"));
+    }
+
+    /// The exact malformed value that reached PostHog on 2026-08-26 must not chart as a seat.
+    ///
+    /// D-024. `tv_agent = gemini">` with a trailing newline, `tv_agent_display = Gemini">`, on a
+    /// row with 0ms duration and no backend: a call rejected before dispatch, whose telemetry
+    /// guard had been built from the raw request string. It became a phantom sixth seat in every
+    /// breakdown of `tv_agent`.
+    ///
+    /// RED IF: `chart_agent` stops bounding the value, and caller text can reach the dimension.
+    #[test]
+    fn the_malformed_seat_name_from_2026_08_26_does_not_chart_as_an_agent() {
+        let malformed = "gemini\">\n";
+        assert_eq!(chart_agent(malformed), "unsupported");
+
+        let g = ai_generation_props(&AiGeneration {
+            agent: malformed, model: None, outcome: "failure", trace_id: "t",
+            input_tokens: None, output_tokens: None, cached_tokens: None, thinking_tokens: None,
+            tool_calls: None, duration_ms: 0, cost_usd: None, billing: "unknown",
+            attempts: 1, backend: None, repo: None, error: Some("unsupported agent"),
+            input: None, output: None,
+        });
+        assert_eq!(g["tv_agent"], "unsupported");
+        assert_eq!(g["tv_agent_display"], "Unsupported");
+        let charted = g["tv_agent"].as_str().unwrap_or_default();
+        assert!(!charted.contains('"'), "a quote in a chart dimension is caller text leaking");
+        assert!(!charted.contains('\n'), "a newline in a chart dimension is caller text leaking");
+    }
+
+    /// The dimension is bounded: nothing a caller sends can widen it.
+    ///
+    /// The point is not that these five strings are handled, it is that the OUTPUT SET is closed.
+    /// An unbounded caller-controlled dimension is a cardinality hazard first and a SaaS data leak
+    /// second, which is the reasoning `repo_name` was already written under.
+    ///
+    /// RED IF: any caller string can produce a `tv_agent` outside the roster.
+    #[test]
+    fn tv_agent_is_bounded_to_the_roster_whatever_the_caller_sends() {
+        let mut allowed: Vec<String> = crate::supported_agent_names()
+            .iter().map(|s| s.to_string()).collect();
+        allowed.push("unsupported".to_string());
+
+        for hostile in [
+            "gemini\">\n",
+            "<option value=\"gemini\">",
+            "'; DROP TABLE events; --",
+            "gemini\u{0}",
+            "",
+            "   ",
+            "a".repeat(5000).as_str(),
+            "GEMINI",
+            "AgY",
+        ] {
+            let charted = chart_agent(hostile);
+            assert!(
+                allowed.contains(&charted),
+                "{hostile:?} produced the unbounded dimension value {charted:?}"
+            );
+        }
+    }
+
+    /// Bounding must not rewrite legitimate seats, including alias forms.
+    ///
+    /// `supergrok` is a billing tier and `agy`/`antigravity` are client names; all three are real
+    /// callers whose rows must land on the canonical key, not on the sentinel. A fix that bounded
+    /// the dimension by discarding real traffic would be worse than the defect.
+    ///
+    /// RED IF: normalization is dropped from `chart_agent`, or a real seat maps to "unsupported".
+    #[test]
+    fn bounding_preserves_every_real_seat_and_its_aliases() {
+        for agent in crate::supported_agent_names() {
+            assert_eq!(chart_agent(agent), *agent, "{agent} is a real seat");
+        }
+        for (alias, canonical) in [
+            ("antigravity", "gemini"),
+            ("agy", "gemini"),
+            ("supergrok", "grok"),
+            ("xai", "grok"),
+            ("Codex", "codex"),
+        ] {
+            assert_eq!(chart_agent(alias), canonical, "{alias} must chart as {canonical}");
+        }
     }
 }
