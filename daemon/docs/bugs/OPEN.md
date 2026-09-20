@@ -19,8 +19,30 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-025 - `u_grok_06` fails intermittently in a full-suite run
+**Found:** 2026-09-20 · **Severity:** LOW · **NOT FIXED**
+**Evidence:** `cargo test -p mcp-bridge --lib` failed once on
+`tests::u_grok_06_command_resolves_to_the_grok_binary_by_default`. The same test passes when run
+alone, and the same full suite then passed on three consecutive runs (185 tests each). One failure
+in roughly five full runs.
+**Not caused by the change it appeared during.** It first showed while D-020/D-022/D-023 were in
+the tree, so the obvious suspicion was the six tests added alongside them. Those tests touch no
+environment variable and no process-global state. The pristine tree was re-tested to confirm the
+suite was green without them, which it was, so the added tests changed test SCHEDULING and exposed
+something already there rather than introducing it.
+**Suspected mechanism, NOT confirmed:** the test takes `env_lock()` with
+`.expect("env lock poisoned")` while the test immediately below it takes the same lock with
+`.unwrap_or_else(|e| e.into_inner())`, which tolerates poisoning. A sibling panicking while holding
+that lock would fail this test and not its neighbour. Which sibling, and whether poisoning is
+actually the mechanism, has NOT been established. Do not write the fix from this paragraph.
+**Why it is filed rather than shrugged off:** an intermittently red suite teaches people to re-run
+until green, which is how a real regression gets waved through. This repo has hit process-global
+test state before.
+**Check:** the cause is identified, and `cargo test -p mcp-bridge --lib` passes 20 consecutive full
+runs with no re-runs.
+
 ### D-020 - DeepSeek metered cost is computed from an ASSUMED model
-**Found:** 2026-09-20 · **Severity:** HIGH · **NOT FIXED**
+**Found:** 2026-09-20 · **Severity:** HIGH · **CHECK PASSED 2026-09-20. RESOLVED, see Resolution at the end of this row.**
 **Evidence:** 127 of 142 deepseek rows carry `$ai_model = unknown`, `tv_billing = metered`, and a real
 dollar figure (`sum($ai_total_cost_usd) = 0.1781` over 98,900 input tokens). Measured in PostHog
 2026-09-20 over `distinct_id = 'triumvirate-daemon'`, 180 days.
@@ -37,8 +59,40 @@ fact, and nothing downstream can tell it was guessed.
 **Check:** `billing_for("deepseek", None)` returns `UnknownPrice`, and a deepseek generation with no
 model emits NO `$ai_total_cost_usd`. Mutation: restore the `unwrap_or` default and the test goes red.
 
+**Resolution (`c1526bf`):** the deepseek arm no longer defaults an absent model. `None` returns
+`UnknownPrice` and emits no cost, which is what this function's own doc comment already required.
+**CHECK PASSED 2026-09-20:** `billing_for("deepseek", None)` returns `UnknownPrice` and
+`cost_usd("deepseek", None, ..)` returns `(None, "unknown")`, asserted by
+`an_absent_deepseek_model_is_not_priced_at_the_floor`. Mutation: restoring the floor default turns
+that test red, confirmed by running it.
+**Live consequence, observed 2026-09-20 09:42 ET:** a deepseek call now carries
+`$ai_model = deepseek-v4-flash` and `$ai_total_cost_usd = 4.82384e-05` computed from the model that
+actually ran, not from a default. The refusal path is the safety net, not the normal case, because
+D-021 gave this seat a real model source in the same session.
+**Note on what was fixed:** the pre-existing test `deepseek_flash_is_priced_from_the_published_table`
+was holding this defect in place. It called `cost_usd("deepseek", None, ..)` and asserted flash
+pricing, so its name claimed it pinned published prices while its assertion blessed the default.
+That is the D-004 shape. It now names the model explicitly.
+
 ### D-021 - `$ai_model` is `unknown` on 63% of rows; set_model is gated to one seat
-**Found:** 2026-09-20 · **Severity:** HIGH · **NOT FIXED**
+**Found:** 2026-09-20 · **Severity:** HIGH · **PARTIALLY FIXED 2026-09-20. Two thirds verified, one third open.**
+**Fix landed (`407001a`):** the `if agent == "gemini"` gate is gone, so any connector that knows its
+model reports it. deepseek additionally fills `cli_version` with the model it resolved and sent.
+**VERIFIED LIVE, deepseek:** 2026-09-20 09:42 ET, daemon pid 46068 on the freshly installed binary, a deepseek generation carried
+`$ai_model = deepseek-v4-flash` where every unattributed row before it said `unknown`.
+**NOT VERIFIED, codex:** codex is quota-exhausted until 2026-09-20 14:03 ET. The live call made at
+09:42 failed on quota before any model was returned, so its row is a `failure` with 0 tokens and
+`$ai_model = unknown`, which proves nothing either way. `CodexAppServerParser` demonstrably
+captures the model off the JSON-RPC result, and the local ledger has been recording it ungated all
+along, so the expectation is strong, but the check has NOT been run.
+**STILL OPEN, grok:** confirmed live at 09:42, grok returned `$ai_model = unknown`. Its parser sets
+`cli_version: None` and nothing else on that path knows the model. `grok_model()` reads an
+environment variable, which is what we INTENDED to run, not what ran; charting intent as fact is
+the same class of defect as D-020 and must not be used to make this row look closed.
+**Remaining check:** after 14:03 ET, one codex call carries a non-`unknown` `$ai_model`; and grok
+gains a real source for the model it ran.
+
+**Original diagnosis, kept for the record:**
 **Evidence:** 1,062 of 1,690 rows cannot say which model answered. By seat: codex 399 of 399
 (100%), grok 535 of 535 (100%), deepseek 127 of 142 (89%), gemini 69 of 613 (11%).
 **Scale note that reorders the priority:** codex is the HEAVIEST seat on the board by input tokens
@@ -56,7 +110,7 @@ price. Attribution has to land before metered cost can be trusted.
 **Check:** a codex, grok and deepseek generation each carry a non-`unknown` `$ai_model` in PostHog.
 
 ### D-022 - `$ai_provider` is `unknown` for grok AND claude
-**Found:** 2026-09-20 · **Severity:** MEDIUM · **NOT FIXED**
+**Found:** 2026-09-20 · **Severity:** MEDIUM · **CHECK PASSED 2026-09-20. RESOLVED, see Resolution at the end of this row.**
 **Evidence:** 536 rows report `$ai_provider = unknown` (535 grok plus the one malformed row of D-023).
 **Root cause:** `daemon/crates/mcp-bridge/src/posthog.rs:407`, `provider_for` matches `gemini`,
 `codex`, `deepseek` and falls through `_ => "unknown"`. There is no `grok` arm.
@@ -67,8 +121,16 @@ this defect would have appeared later as a second surprise rather than being fix
 **Check:** for EVERY agent in `supported_agent_names()`, `provider_for` returns a value that is not
 "unknown". Mutation: delete any one arm and the test goes red.
 
+**Resolution (`c1526bf`):** `grok => "x-ai"` and `claude => "anthropic"` added. Slugs are
+OpenRouter's, because PostHog matches `$ai_provider` + `$ai_model` against OpenRouter pricing first
+(posthog.com/docs/ai-observability/calculating-costs, checked 2026-09-20).
+**CHECK PASSED 2026-09-20 09:42 ET:** a live grok generation carried `$ai_provider = x-ai` where
+every grok row before it said `unknown`. `every_supported_agent_has_a_provider` walks
+`supported_agent_names()` so a sixth seat cannot be added without answering this. Mutation:
+deleting the grok arm turns it red, confirmed by running it.
+
 ### D-023 - `tv_billing` is `unknown` for grok, and cost is omitted
-**Found:** 2026-09-20 · **Severity:** MEDIUM · **NOT FIXED**
+**Found:** 2026-09-20 · **Severity:** MEDIUM · **CHECK PASSED 2026-09-20. RESOLVED, see Resolution at the end of this row.**
 **Evidence:** 535 grok rows carry `tv_billing = unknown` and NO `$ai_total_cost_usd`, across 27.6M
 input and 3.6M output tokens. The heaviest-but-one seat is absent from every cost and billing view.
 **Root cause:** `daemon/crates/mcp-bridge/src/posthog.rs:336`, `billing_for` matches
@@ -82,8 +144,22 @@ introduced by adding a seat without a test that walks the canonical list.
 **Check:** for EVERY agent in `supported_agent_names()`, `billing_for(agent, None)` is not
 `UnknownPrice`. Mutation: delete any one arm and the test goes red.
 
+**Resolution (`c1526bf`):** `grok` added to the subscription arm.
+**CHECK PASSED 2026-09-20 09:42 ET:** a live grok generation carried `tv_billing = subscription`
+and `$ai_total_cost_usd = 0.0` across 12,529 input tokens, where every grok row before it said
+`unknown` and carried no cost at all. Mutation: removing grok from the arm turns both
+`grok_is_a_subscription_seat_priced_at_a_real_zero` and
+`every_supported_agent_has_a_billing_classification` red, confirmed by running them.
+
 ### D-024 - One row carries a seat name containing a quote and a newline
-**Found:** 2026-09-20 · **Severity:** LOW · **NOT ROOT-CAUSED**
+**Found:** 2026-09-20 · **Severity:** LOW · **ROOT-CAUSED AND CHECK PASSED 2026-09-20. RESOLVED, see Resolution at the end of this row.**
+**The hypothesis in this row was WRONG.** It guessed "an escaping defect somewhere on the write
+path". There is no escaping defect. `CallTelemetry::new` is built from the RAW request string at
+`agent_exec.rs:593`; `is_supported_agent` rejects at 598; `tel.set_agent(normalized)` sits at 615
+and is never reached. The guard emitted on drop carrying exactly what the caller sent, and
+`tv_agent_display = Gemini">` confirms it: `display_agent_name` ran on an already-malformed value
+and fell through to its generic capitaliser. The write path worked. It charted, faithfully, the
+garbage it was handed.
 **Evidence:** one row has `tv_agent` = `gemini">\n` (literal `">` then a newline). It also reports
 `$ai_input_tokens = 0`, `$ai_output_tokens = 0`, and unknown on model, provider and billing, so it
 is inert in every aggregate except as a phantom sixth seat in a `GROUP BY tv_agent`.
@@ -96,6 +172,26 @@ agent, in the telemetry struct, or in JSON assembly. None has been ruled out.
 **Check:** the source of the malformed value is identified in code, and a test feeds a
 quote-and-newline-bearing agent name through the write path and asserts the emitted `tv_agent` is
 either clean or rejected. Until then this row stays open.
+
+**Resolution (`3e29e79`):** `chart_agent` bounds `tv_agent` to `supported_agent_names()` plus the
+single sentinel `"unsupported"`, applied at `ai_generation_props` so BOTH emitting surfaces are
+covered rather than only the one that produced the known row. Aliases still resolve to canonical
+keys, so supergrok/agy/antigravity traffic lands on its real seat. The rejected name is not
+shipped: it is already in the error returned to the caller and in the daemon logs, which is where
+an unbounded string belongs.
+**CHECK PASSED 2026-09-20 09:42:59 ET:** the exact 2026-08-26 value (`gemini">` plus a newline) was
+sent live to `ask_agent`. It was rejected pre-dispatch and its generation charted as
+`tv_agent = unsupported` / `tv_agent_display = Unsupported`, with the diagnostic preserved in
+`$ai_error` ("ask_agent supports only: gemini, codex, deepseek, claude, grok"). No quote and no
+newline reached the dimension. Mutation: bypassing `chart_agent` at the emit site turns
+`the_malformed_seat_name_from_2026_08_26_does_not_chart_as_an_agent` red; dropping normalization
+inside it turns `bounding_preserves_every_real_seat_and_its_aliases` red. Both confirmed by running
+them.
+**The real defect class, for the next person:** `tv_agent` was an unbounded caller-controlled CHART
+DIMENSION. Any caller could mint a phantom seat that appears in every `GROUP BY tv_agent` from then
+on, and ship arbitrary caller text to a SaaS. This file already applies that reasoning to
+`repo_name` ("cardinality garbage AND would leak the operator's home directory"); it had never been
+applied to the agent name. Check any other caller-supplied value that becomes a PostHog dimension.
 
 ### D-004 - Failed generations carry no error text
 **Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
@@ -122,6 +218,20 @@ is proven; its arrival is not, and closing on the payload would be closing on re
 **Check:** with `/health` reporting `telemetry_delivery: trusted`, force one failed dispatch and
 find its `$ai_error` in PostHog.
 
+**CHECK PASSED 2026-09-20 09:42:38 ET. RESOLVED.** A live `ask_agent` to codex failed on quota and
+its `$ai_generation` arrived in PostHog carrying the full cause in `$ai_error`: the complete
+three-attempt faildown chain, "codex attempt 1/3: codex connector failed: exited with status exit
+status: 1; codex said: You've hit your usage limit ... -> codex attempt 2/3 ... -> codex attempt
+3/3 ...". Not forced: it was a genuine failure encountered while verifying D-021.
+**On the `/health` precondition:** this row waited on `telemetry_delivery: trusted` as a proxy for
+"events are arriving". The row's own arrival is the direct measurement that proxy stands in for, so
+the check is satisfied in substance by stronger evidence than it asked for.
+**The blocker recorded here was wrong.** This row and D-005 both said nothing lands in PostHog
+until the quota reset at 2026-09-20 14:03 ET. Ingestion was measured healthy at 09:38 ET that
+morning: latest event 09:38:47, 701 events in the preceding hour, 19,185 in 12 hours. The 14:03
+reset belongs to CODEX's usage quota, which is a different account and a different limit. Two
+unrelated quotas were conflated, and a defect sat blocked on a condition that had already cleared.
+
 ### D-005 - Instrumentation streams gone silent, cause unknown
 **Found:** 2026-07-28 · **Severity:** LOW · **Blocked on an external reset, NOT fixed**
 **Remaining streams:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`,
@@ -135,9 +245,15 @@ silence means anything; while it says `trusted`, a silent stream is an idle path
 lands", and nothing lands while the PostHog account is over quota. Closing it on the new
 instrument alone would be closing it on reasoning rather than on its check, which is exactly
 what this file forbids.
-**Unblocks:** 2026-09-20 14:03 ET, when the quota resets.
-**Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
-stream once and find the event in PostHog.
+**Unblocks:** NOTHING. This row is no longer blocked, as of 2026-09-20.
+**The blocker was wrong, same error as D-004.** PostHog ingestion was measured healthy at 09:38 ET
+on 2026-09-20 (latest event 09:38:47, 701 in the preceding hour) and `$ai_generation` events from
+this session landed within seconds. The 14:03 reset is CODEX's usage quota, an unrelated account
+and limit. This row can be worked whenever someone chooses to.
+**Check (unchanged, and now runnable):** exercise `tv_review_verdict`, `tv_review_requested`,
+`tv_fleet_spawn` and `tv_maintenance` once each and find each event in PostHog. NOT done in this
+session: the telemetry work here covered `$ai_generation` only, and claiming these four by
+association would be exactly the "we think it's fine now" close this file forbids.
 
 ### 2026-09-19: the test suite wrote wiki_call events into real shared ledgers (D-019)
 
@@ -354,6 +470,6 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ---
 
-**Last reviewed:** 2026-09-20 (D-020 through D-024 added: five telemetry attribution defects, all measured live in PostHog before filing, none fixed at time of filing. D-020 was NOT in the handoff that prompted the review and is ranked highest: it is the only one of the five that emits a WRONG number rather than an absent one.)
+**Last reviewed:** 2026-09-20. D-020 through D-024 added (five telemetry attribution defects, all measured live in PostHog before filing). D-020, D-022, D-023 and D-024 then FIXED and CHECK PASSED against live PostHog rows the same day, on a freshly installed binary and a restarted daemon. D-021 is PARTIALLY fixed: deepseek verified live, codex blocked on its own quota until 14:03 ET, grok genuinely still open with no model source. D-004 CLOSED, its check passed on a real failure encountered during that verification. D-005 unblocked but NOT worked. D-025 added (an intermittent test, cause not established). The blocker recorded on D-004 and D-005, "nothing lands in PostHog until 14:03", was WRONG: ingestion was healthy all morning and 14:03 is Codex's unrelated usage quota.
 
 **Superseded line:** **Last reviewed:** 2026-09-19 (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
