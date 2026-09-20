@@ -47,10 +47,12 @@ fn day_dirs(sessions: &PathBuf) -> Vec<PathBuf> {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
+        // `file_type()` comes from the directory entry and does NOT follow symlinks, unlike
+        // `Path::is_dir()`. A symlinked directory here would let the walk leave codex's own tree.
         let mut out: Vec<PathBuf> = rd
             .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
             .collect();
         out.sort();
         out.reverse();
@@ -89,7 +91,14 @@ fn rollout_for(session_id: &str) -> Option<PathBuf> {
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if name.starts_with("rollout-") && name.ends_with(&suffix) {
+            // Regular files only, and again via the entry so a symlink is not followed. Found by
+            // Codex in review: `read_to_string` on a FIFO here would BLOCK FOREVER, on the
+            // telemetry path of a call that has already succeeded, which is a worse outcome than
+            // the missing model this whole module exists to fix.
+            if name.starts_with("rollout-")
+                && name.ends_with(&suffix)
+                && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            {
                 return Some(path);
             }
         }
@@ -106,8 +115,25 @@ fn rollout_for(session_id: &str) -> Option<PathBuf> {
 /// Every failure returns `None` and the row charts `unknown`, which is honest and legible. This
 /// runs on the telemetry path, so it must never fail a call that already succeeded.
 pub fn model_for_session(session_id: &str) -> Option<String> {
+    /// A rollout is a transcript, so it grows with the session and has no natural bound. This is
+    /// the telemetry path of an ALREADY SUCCESSFUL call, so an unbounded read is not acceptable
+    /// even on a file codex wrote itself. 32 MiB is far above any real rollout and far below
+    /// anything that would hurt. Reading the first N bytes is safe for this job: `turn_context`
+    /// records appear early in each turn, and a truncated final line simply fails to parse.
+    const MAX_ROLLOUT_BYTES: u64 = 32 * 1024 * 1024;
+
     let path = rollout_for(session_id)?;
-    let raw = std::fs::read_to_string(path).ok()?;
+    let file = std::fs::File::open(&path).ok()?;
+    // Re-check through the OPEN handle, not the path, so the answer cannot change between the
+    // check and the read.
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut raw = String::new();
+    {
+        use std::io::Read as _;
+        file.take(MAX_ROLLOUT_BYTES).read_to_string(&mut raw).ok()?;
+    }
     let mut newest: Option<String> = None;
     for line in raw.lines() {
         let line = line.trim();
@@ -160,7 +186,7 @@ mod tests {
     }
 
     /// Write a rollout where codex would, and read the model back out of it.
-    fn write_rollout(home: &PathBuf, day: &str, session_id: &str, lines: &[&str]) {
+    fn write_rollout(home: &std::path::Path, day: &str, session_id: &str, lines: &[&str]) {
         let dir = home.join("sessions").join("2026").join("09").join(day);
         std::fs::create_dir_all(&dir).expect("session dir");
         let f = dir.join(format!("rollout-2026-09-{day}T14-04-27-{session_id}.jsonl"));
@@ -268,6 +294,44 @@ mod tests {
         });
     }
 
+    /// Only a REGULAR FILE is read, and the check does not follow symlinks.
+    ///
+    /// Found by Codex in review. `Path::is_dir()` and `read_to_string()` both follow symlinks and
+    /// neither requires a regular file, so a matching symlink, or a FIFO, could send this reader
+    /// somewhere it was never meant to go. On a FIFO `read_to_string` BLOCKS FOREVER, and it would
+    /// do so on the telemetry path of a call that has ALREADY SUCCEEDED, which is a worse outcome
+    /// than the missing model this module exists to supply.
+    ///
+    /// The symlink case is asserted rather than the FIFO case on purpose: removing the guard makes
+    /// this test FAIL, whereas a FIFO test would HANG, and a test that hangs on regression is not
+    /// a usable signal.
+    ///
+    /// RED IF: the `file_type().is_file()` check is dropped, or the walk starts following links.
+    #[test]
+    fn a_symlinked_rollout_is_not_followed() {
+        let home = scratch("symlink");
+        let id = "01a0c086-e405-7551-9139-5e33ef5018cf";
+
+        // A real rollout, with valid content, parked OUTSIDE the sessions tree.
+        let elsewhere = home.join("elsewhere.jsonl");
+        std::fs::write(&elsewhere, REAL_TURN_CONTEXT).expect("bait");
+
+        // ...and a correctly-named symlink to it, where the walk will find it.
+        let dir = home.join("sessions").join("2026").join("09").join("20");
+        std::fs::create_dir_all(&dir).expect("session dir");
+        let link = dir.join(format!("rollout-2026-09-20T14-04-27-{id}.jsonl"));
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+
+        temp_env_codex_home(&home, || {
+            assert_eq!(
+                model_for_session(id),
+                None,
+                "a symlink is not a rollout: without the file_type guard this returns \
+                 gpt-5.6-sol, which is how we know the guard is doing the work"
+            );
+        });
+    }
+
     /// `CODEX_HOME` is honoured, because an operator who moved codex's state has not moved codex.
     #[test]
     fn codex_home_overrides_the_default_location() {
@@ -286,7 +350,7 @@ mod tests {
     /// module against itself and against nothing else.
     static CODEX_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn temp_env_codex_home(home: &PathBuf, f: impl FnOnce()) {
+    fn temp_env_codex_home(home: &std::path::Path, f: impl FnOnce()) {
         let _guard = CODEX_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("CODEX_HOME").ok();
         // SAFETY: serialised by CODEX_HOME_LOCK; restored before the guard drops.
