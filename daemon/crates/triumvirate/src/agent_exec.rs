@@ -593,7 +593,16 @@ async fn execute_ask_agent_inner(
     let mut tel = mcp_bridge::posthog::CallTelemetry::new(
         &req.agent,
         &request_id,
-        req.deepseek_model.as_deref(),
+        // `deepseek_model` is a DeepSeek-only request field, but this seeds telemetry for EVERY
+        // agent. A codex or claude request that carried it, and whose connector reported no model
+        // of its own, charted that call under the DeepSeek model the caller named: a model that
+        // provably did not serve it. Same class as D-020, a plausible value standing in for an
+        // absent one. Codex, panel review.
+        if mcp_bridge::normalize_agent_name(&req.agent) == "deepseek" {
+            req.deepseek_model.as_deref()
+        } else {
+            None
+        },
     );
 
     if !is_supported_agent(req) {
@@ -1128,23 +1137,39 @@ async fn execute_ask_agent_inner(
                 // with failure(). The guard emits only ONCE, on drop, with whatever the final
                 // outcome turned out to be — which is precisely the bug that made the old
                 // "emit here" version report success for a call that then returned Err.
-                // The agy connector reports the model it CHOSE at runtime ("Gemini 3.1 Pro
-                // (High)") and stashes it in cli_version (agy.rs::build_result). Without
-                // this, $ai_model falls back to the agent key and every Antigravity call
-                // charts as the model "gemini", which cannot answer which model ran.
-                if agent == "gemini" {
-                    match parsed.cli_version.as_deref() {
-                        Some(model) if !model.trim().is_empty() => {
-                            tel.set_model(model);
-                            span.record("agent.model", model);
-                        }
-                        // Record "unknown" rather than leaving the field Empty. An absent
-                        // field is indistinguishable from a span that never reached here, so
-                        // silence would hide the very parse regression worth catching: agy
-                        // changing its log format and us quietly losing the model forever.
-                        _ => {
-                            span.record("agent.model", "unknown");
-                        }
+                // Whichever connector knows the model it ran, report it. `cli_version` is the
+                // carrier every parser fills with the concrete model when it has one: agy
+                // reports the model it CHOSE at runtime ("Gemini 3.1 Pro (High)",
+                // agy.rs::build_result), the codex app-server reports it off the JSON-RPC
+                // result (codex_app_server.rs), and deepseek reports the model it resolved
+                // and sent. Without this, $ai_model falls back to the agent key and a call
+                // charts as the model "gemini" or "codex", which cannot answer which model ran.
+                //
+                // D-021: this was gated behind `if agent == "gemini"`, the single call site of
+                // `set_model` in the workspace, so 1,062 of 1,690 live rows (63%) could not say
+                // which model answered. Codex was the worst of it: the heaviest seat on the
+                // board at 64.5M input tokens, 100% unknown, while its parser had been
+                // capturing the model the whole time and the LOCAL ledger was already
+                // recording it ungated (`TokenRecord.model`, above in this same file). Only
+                // the PostHog path threw it away. The gate was the defect, not a missing
+                // source.
+                //
+                // Every seat now fills `cli_version`: agy and the codex app-server off their own
+                // output, grok off `end.modelUsage`, deepseek off the model it resolved, and the
+                // codex exec path off the thread's rollout (resolved at the connector). None of
+                // them uses an env var or a request flag, which would report what we INTENDED to
+                // run rather than what ran.
+                match parsed.cli_version.as_deref() {
+                    Some(model) if !model.trim().is_empty() => {
+                        tel.set_model(model);
+                        span.record("agent.model", model);
+                    }
+                    // Record "unknown" rather than leaving the field Empty. An absent
+                    // field is indistinguishable from a span that never reached here, so
+                    // silence would hide the very parse regression worth catching: a
+                    // connector changing its log format and us quietly losing the model forever.
+                    _ => {
+                        span.record("agent.model", "unknown");
                     }
                 }
                 tel.success(parsed.token_usage.clone());
@@ -4309,6 +4334,18 @@ async fn run_codex_cli_process_with_session(
     }
     if parsed.session_id.is_none() {
         parsed.session_id = session_id.map(ToString::to_string);
+    }
+    // D-021: codex's exec stream names no model, so read the one it recorded for this thread.
+    // Resolved HERE, at the connector, and not at the telemetry guard: two consumers read
+    // `cli_version` (the PostHog generation AND `persist_daemon_token_record`, which writes the
+    // local ledger), and the first draft of this fix resolved it below the ledger write. That
+    // gave PostHog the model and left the ledger unattributed, which is the two-surface defect
+    // this repo is worst for. One source, above both readers. See `mcp_bridge::codex_rollout`.
+    if parsed.cli_version.is_none()
+        && let Some(sid) = parsed.session_id.as_deref()
+        && let Some(model) = mcp_bridge::codex_rollout::model_for_session(sid)
+    {
+        parsed.cli_version = Some(model);
     }
 
     if should_use_full_auto {

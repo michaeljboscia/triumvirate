@@ -335,21 +335,34 @@ enum Billing {
 /// listed here we return UnknownPrice and emit no cost, a wrong cost is worse than no cost.
 fn billing_for(agent: &str, model: Option<&str>) -> Billing {
     match agent {
-        // Subscription-backed: ChatGPT OAuth (codex), Max plan (claude), Google plan (gemini/agy).
-        "codex" | "claude" | "gemini" => Billing::Subscription,
-        "deepseek" => match model.unwrap_or("deepseek-v4-flash") {
-            // deepseek-chat / deepseek-reasoner are the legacy aliases of v4-flash.
-            "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => Billing::Metered {
-                cache_hit_in: 0.0028,
-                cache_miss_in: 0.14,
-                output: 0.28,
+        // Subscription-backed: ChatGPT OAuth (codex), Max plan (claude), Google plan (gemini/agy),
+        // SuperGrok plan (grok). D-023: `grok` was missing here, so 535 rows reported
+        // `tv_billing = unknown` and carried NO cost across 27.6M input tokens. "Unknown" claims we
+        // could not price the seat; the truth is that one more call on a fixed plan costs zero.
+        "codex" | "claude" | "gemini" | "grok" => Billing::Subscription,
+        // D-020: an ABSENT model is not a cheap model. This arm used to read
+        // `model.unwrap_or("deepseek-v4-flash")`, which silently priced every unattributed call at
+        // the FLOOR: 127 rows carried a real dollar figure over 98,900 input tokens while the only
+        // rows that named a model were all v4-pro at 3.1x that rate. The `_ => UnknownPrice` arm
+        // below already honours this function's own rule for an UNRECOGNISED model; the
+        // `unwrap_or` quietly exempted an absent one. Refusing to price is the honest answer, and
+        // it stays the honest answer until D-021 makes `$ai_model` reliable on this seat.
+        "deepseek" => match model {
+            None => Billing::UnknownPrice,
+            Some(model) => match model {
+                // deepseek-chat / deepseek-reasoner are the legacy aliases of v4-flash.
+                "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => Billing::Metered {
+                    cache_hit_in: 0.0028,
+                    cache_miss_in: 0.14,
+                    output: 0.28,
+                },
+                "deepseek-v4-pro" => Billing::Metered {
+                    cache_hit_in: 0.003625,
+                    cache_miss_in: 0.435,
+                    output: 0.87,
+                },
+                _ => Billing::UnknownPrice,
             },
-            "deepseek-v4-pro" => Billing::Metered {
-                cache_hit_in: 0.003625,
-                cache_miss_in: 0.435,
-                output: 0.87,
-            },
-            _ => Billing::UnknownPrice,
         },
         _ => Billing::UnknownPrice,
     }
@@ -370,7 +383,10 @@ fn billing_for(agent: &str, model: Option<&str>) -> Billing {
 fn normalize_prompt(agent: &str, input: u64, cached: u64) -> (u64, u64, u64) {
     if agent == "deepseek" {
         // disjoint: input IS the miss count
-        (input + cached, cached, input)
+        // saturating: this runs while CallTelemetry is DROPPING. An overflow-checked
+        // build would panic here on a malformed provider usage payload, turning a call that
+        // already succeeded into a panic. Codex, panel review.
+        (input.saturating_add(cached), cached, input)
     } else {
         // subset: cached is part of input
         let hit = cached.min(input);
@@ -404,12 +420,49 @@ fn cost_usd(
 }
 
 /// Map an agent to the provider PostHog expects in `$ai_provider`.
+/// Every agent in `supported_agent_names()` MUST have an arm here. D-022: `grok` AND `claude` were
+/// both missing, so two of the five supported seats fell through to "unknown" (535 live grok rows;
+/// claude had none only because that seat was unexercised, which would have made it a second
+/// surprise later rather than one fix now). `every_supported_agent_has_a_provider` walks the
+/// canonical list so a sixth seat cannot be added without answering this question.
+///
+/// The slugs are OpenRouter's, because PostHog matches `$ai_provider` + `$ai_model` against
+/// OpenRouter's pricing data first (posthog.com/docs/ai-observability/calculating-costs, checked
+/// 2026-09-20). That is why gemini maps to "google" and not "gemini", and why xAI is "x-ai".
 fn provider_for(agent: &str) -> &'static str {
     match agent {
         "gemini" => "google",
         "codex" => "openai",
         "deepseek" => "deepseek",
+        "grok" => "x-ai",
+        "claude" => "anthropic",
         _ => "unknown",
+    }
+}
+
+/// Bound `tv_agent` to the known roster. D-024.
+///
+/// `tv_agent` is a CHART DIMENSION whose value arrives from the caller, and `CallTelemetry` is
+/// constructed from the RAW request string before `is_supported_agent` has run (agent_exec.rs),
+/// so a rejected call emits a generation carrying whatever text the caller sent. On 2026-08-26 one
+/// did: `tv_agent = gemini">` with a trailing newline, evidently a fragment of an HTML attribute
+/// (`value="gemini">`) that some caller built its agent string out of.
+///
+/// The write path was not at fault. It charted, faithfully, the garbage it was handed. That is the
+/// defect: an unbounded caller-controlled dimension means any caller can mint a phantom seat that
+/// appears in every `GROUP BY tv_agent` from then on, and ships arbitrary caller text to a SaaS.
+/// This file already applies exactly this reasoning to `repo_name` ("cardinality garbage AND would
+/// leak the operator's home directory"); it was never applied to the agent name.
+///
+/// So the emitted value is always a member of `supported_agent_names()` or the single sentinel
+/// `"unsupported"`. The rejected name is NOT shipped: it is already in the error returned to the
+/// caller and in the daemon's logs, which is where an unbounded string belongs.
+fn chart_agent(agent: &str) -> String {
+    let normalized = crate::normalize_agent_name(agent);
+    if crate::supported_agent_names().contains(&normalized.as_str()) {
+        normalized
+    } else {
+        "unsupported".to_string()
     }
 }
 
@@ -574,8 +627,13 @@ pub fn record_exception(agent: &str, kind: &str, message: &str, trace_id: &str) 
             // Issue for every single failure and bury the UI. Pin the grouping to the pair we
             // actually want to reason about ("how often does codex fail?") and let the message
             // stay detailed for the human reading the Issue.
-            "$exception_fingerprint": [agent, kind],
-            "tv_agent":     agent,
+            // D-024, second surface. `chart_agent` bounded $ai_generation's tv_agent and this
+            // event was left raw, so the 2026-08-26 malformed seat would still have landed here,
+            // and in the FINGERPRINT, which mints a distinct Issue in error tracking for every
+            // junk agent string a caller sends. Found by Grok on the panel: closing a defect on
+            // the event it was noticed on is not closing the defect.
+            "$exception_fingerprint": [chart_agent(agent), kind],
+            "tv_agent":     chart_agent(agent),
             "$ai_trace_id": trace_id,   // joins the exception to its $ai_generation
         }),
     );
@@ -631,7 +689,7 @@ pub fn record_fleet_task(
     capture(
         "tv_fleet_task",
         json!({
-            "tv_agent":         agent,
+            "tv_agent":         chart_agent(agent),
             "tv_agent_display": crate::display_agent_name(agent),
             "tv_backend":       backend,
             // success | failed | degraded_success | timeout | skipped_breaker_open | launch_failed
@@ -659,7 +717,7 @@ pub fn record_breaker_event(event: &str, agent: &str, detail: &str, shed_count: 
     capture(
         "tv_quota_breaker",
         json!({
-            "tv_agent":         agent,
+            "tv_agent":         chart_agent(agent),
             "tv_agent_display": crate::display_agent_name(agent),
             // opened_shedding | half_open_probe | tripped_quota | tripped_other | recovered
             "tv_breaker_event": event,
@@ -695,10 +753,11 @@ pub fn record_jury_seat(
         "tv_jury_seat",
         json!({
             "tv_jury_id":             jury_id,
-            "tv_agent":               agent,
+            "tv_agent":               chart_agent(agent),
             "tv_agent_display":       crate::display_agent_name(agent),
             "tv_seat_status":         status,
-            "tv_answered_by_agent":   answered_by_agent,
+            // Bounded like tv_agent: this is a seat name too, and it reaches the same charts.
+            "tv_answered_by_agent":   answered_by_agent.map(chart_agent),
             "tv_answered_by_backend": answered_by_backend,
             "tv_duration_bucket":     bucket,
         }),
@@ -772,7 +831,7 @@ pub fn record_session_invalidated(agent: &str, backend: Option<&str>, repo: Opti
     capture(
         "tv_session_invalidated",
         json!({
-            "tv_agent":         agent,
+            "tv_agent":         chart_agent(agent),
             "tv_agent_display": crate::display_agent_name(agent),
             "tv_backend":       backend,
             "tv_repo":          repo.map(repo_name),
@@ -1316,8 +1375,9 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
             // and saved insight built on historical rows silently splits in two. tv_agent_display
             // is the product name an operator should actually read ("Antigravity"). A dashboard
             // is a human surface, so it gets the human label; the key stays for continuity.
-            "tv_agent":            g.agent,
-            "tv_agent_display":    crate::display_agent_name(g.agent),
+            // D-024: bounded to the roster, never the raw caller string. See `chart_agent`.
+            "tv_agent":            chart_agent(g.agent),
+            "tv_agent_display":    crate::display_agent_name(&chart_agent(g.agent)),
             "tv_outcome":          g.outcome,            // incl. "degraded_success"
             "tv_billing":          g.billing,            // metered | subscription | unknown
             "tv_cached_tokens":    g.cached_tokens.unwrap_or(0),
@@ -1325,7 +1385,9 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
             "tv_tool_calls":       g.tool_calls.unwrap_or(0),
             "tv_duration_ms":      g.duration_ms,
             // The scarce unit on a subscription. Dollars can't move; this can.
-            "tv_total_tokens":     g.input_tokens.unwrap_or(0) + g.output_tokens.unwrap_or(0),
+            // saturating for the same reason as `normalize_prompt`: this is built on the Drop
+            // path, and a panic there loses a successful call over a telemetry detail.
+            "tv_total_tokens":     g.input_tokens.unwrap_or(0).saturating_add(g.output_tokens.unwrap_or(0)),
             // WHICH backend served this. agy and the retired gemini-cli report the same
             // agent and provider, so every chart treated them as one thing while the daemon
             // quietly ran gemini-cli for four days against a config that said agy. Absent
@@ -1533,9 +1595,16 @@ mod tests {
 
     /// Pins DeepSeek's published prices (api-docs.deepseek.com, 2026-07-12):
     /// v4-flash = $0.0028 hit / $0.14 miss / $0.28 out, per 1M tokens.
+    ///
+    /// The model is now named EXPLICITLY. This test used to pass `None` and assert flash pricing,
+    /// which read as "flash is priced correctly" while actually asserting the D-020 defect: that
+    /// an ABSENT model resolves to the cheapest one. It is the D-004 shape again, a test whose
+    /// name describes an intention its assertion does not check, and it is why the defect survived
+    /// a green suite. What this test is FOR is the published price table; naming the model keeps
+    /// that and drops the accidental blessing of the default.
     #[test]
     fn deepseek_flash_is_priced_from_the_published_table() {
-        let (usd, billing) = cost_usd("deepseek", None, 256, 46, Some(45));
+        let (usd, billing) = cost_usd("deepseek", Some("deepseek-v4-flash"), 256, 46, Some(45));
         assert_eq!(billing, "metered");
         let expected =
             (256.0 / 1e6) * 0.0028 + (46.0 / 1e6) * 0.14 + (45.0 / 1e6) * 0.28;
@@ -1716,5 +1785,325 @@ mod tests {
     fn synchronous_unclassified_exit_stays_unreported_canary() {
         let tel = CallTelemetry::new("deepseek", "trace-sync", None);
         assert_eq!(tel.effective_outcome(), "unreported");
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Agent attribution. D-020 through D-023.
+    //
+    // All four defects below are the SAME shape: a match statement that enumerates agents, and an
+    // agent that was never added to it. Adding the missing arm fixes today; walking
+    // `supported_agent_names()` is what stops it recurring. That function is the canonical roster
+    // and its own doc comment forbids a literal list in a second place, so these tests derive
+    // their coverage from it rather than restating it.
+    // ----------------------------------------------------------------------------------------
+
+    /// Every supported seat must map to a real provider.
+    ///
+    /// D-022: `grok` and `claude` both fell through `_ => "unknown"`. Grok had 535 live rows;
+    /// claude had none only because the seat was unexercised, so the same defect was sitting
+    /// armed for whenever it was first used.
+    ///
+    /// RED IF: any arm is deleted from `provider_for`, or a seat is added to
+    /// `supported_agent_names()` without one.
+    #[test]
+    fn every_supported_agent_has_a_provider() {
+        for agent in crate::supported_agent_names() {
+            let provider = provider_for(agent);
+            assert_ne!(
+                provider, "unknown",
+                "{agent} has no arm in provider_for, so its rows chart as an unattributed provider"
+            );
+            assert!(!provider.is_empty(), "{agent} maps to an empty provider");
+        }
+    }
+
+    /// Aliases must resolve to the same provider as the canonical key.
+    ///
+    /// `provider_for` matches on the CANONICAL name, so a raw alias reaching it would report
+    /// "unknown" while looking like a supported seat. `normalize_agent_name` is the boundary that
+    /// prevents that, and this pins the two together.
+    ///
+    /// RED IF: normalization stops being applied before telemetry, or an alias is added to
+    /// `normalize_agent_name` that maps to a key with no provider arm.
+    #[test]
+    fn agent_aliases_resolve_to_the_same_provider() {
+        for (alias, canonical) in [
+            ("antigravity", "gemini"),
+            ("agy", "gemini"),
+            ("supergrok", "grok"),
+            ("grok-build", "grok"),
+            ("xai", "grok"),
+        ] {
+            let normalized = crate::normalize_agent_name(alias);
+            assert_eq!(normalized, canonical, "{alias} must normalize to {canonical}");
+            assert_eq!(
+                provider_for(&normalized),
+                provider_for(canonical),
+                "{alias} must chart under the same provider as {canonical}"
+            );
+        }
+    }
+
+    /// Every supported seat must be CLASSIFIED as either subscription-backed or metered.
+    ///
+    /// The table below is a second list, which `supported_agent_names()` warns against, so it is
+    /// made safe the only way a second list can be: the test asserts it covers the canonical
+    /// roster EXACTLY. Add a sixth seat and this test fails with "no billing expectation", which
+    /// forces the question "how is this one paid for?" to be answered in code review rather than
+    /// discovered in a cost dashboard months later.
+    ///
+    /// RED IF: `grok` is removed from the subscription arm (D-023), or a seat is added to the
+    /// roster without a billing decision.
+    #[test]
+    fn every_supported_agent_has_a_billing_classification() {
+        // (agent, a model that seat is known to run). `None` means the seat is billed by
+        // subscription, where the model cannot change the price.
+        let expectations: &[(&str, Option<&str>)] = &[
+            ("gemini", None),
+            ("codex", None),
+            ("claude", None),
+            ("grok", None),
+            ("deepseek", Some("deepseek-v4-pro")),
+        ];
+
+        let roster: std::collections::BTreeSet<&str> =
+            crate::supported_agent_names().iter().copied().collect();
+        let covered: std::collections::BTreeSet<&str> =
+            expectations.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            roster, covered,
+            "this table must cover supported_agent_names() exactly: a seat with no billing \
+             expectation is a seat whose cost nobody decided"
+        );
+
+        for (agent, model) in expectations {
+            match billing_for(agent, *model) {
+                Billing::Subscription => assert!(
+                    model.is_none(),
+                    "{agent} is subscription-backed, so the table should not pin a model to it"
+                ),
+                Billing::Metered { .. } => assert!(
+                    model.is_some(),
+                    "{agent} is metered, so the table must name the model it was priced with"
+                ),
+                Billing::UnknownPrice => panic!(
+                    "{agent} has no billing classification: its rows report tv_billing=unknown, \
+                     which claims we could not price the seat rather than stating what it costs"
+                ),
+            }
+        }
+    }
+
+    /// Grok is a fixed-plan seat, so one more call costs a REAL zero, not an unknown.
+    ///
+    /// D-023 in full: 535 rows reported `tv_billing = unknown` with no cost at all, across 27.6M
+    /// input tokens. "Unknown" and "free" are different claims, and the seat was absent from every
+    /// cost view while reading as unpriceable.
+    ///
+    /// RED IF: `grok` leaves the subscription arm.
+    #[test]
+    fn grok_is_a_subscription_seat_priced_at_a_real_zero() {
+        let (usd, label) = cost_usd("grok", None, 1_000_000, 26_597_794, Some(3_644_973));
+        assert_eq!(label, "subscription");
+        assert_eq!(
+            usd,
+            Some(0.0),
+            "a fixed plan's marginal cost is a known 0.0; None would mean we could not price it"
+        );
+    }
+
+    /// An ABSENT model on the metered seat must NOT be priced at the cheapest rate.
+    ///
+    /// D-020, and the most consequential of the four because it is the only one that emits a
+    /// WRONG number rather than an absent one. `billing_for` used to read
+    /// `model.unwrap_or("deepseek-v4-flash")`, so 127 live rows carried a real dollar figure over
+    /// 98,900 input tokens that was derived from an assumption, while the only 15 rows that named
+    /// a model were all v4-pro at 3.1x that rate. This function's own doc comment states the rule
+    /// it broke: "a wrong cost is worse than no cost".
+    ///
+    /// RED IF: the `unwrap_or` default is restored, or any other default model is introduced.
+    #[test]
+    fn an_absent_deepseek_model_is_not_priced_at_the_floor() {
+        assert!(
+            matches!(billing_for("deepseek", None), Billing::UnknownPrice),
+            "an absent model must refuse to price, not silently resolve to the cheapest model"
+        );
+
+        let (usd, label) = cost_usd("deepseek", None, 0, 98_900, Some(0));
+        assert_eq!(usd, None, "no cost may be emitted for a call we cannot price");
+        assert_eq!(label, "unknown");
+
+        // The floor it used to silently resolve to, and the rate the rows that DO name a model
+        // are actually billed at. That this pair differs by ~3x is the whole defect.
+        let (flash, _) = cost_usd("deepseek", Some("deepseek-v4-flash"), 0, 98_900, Some(0));
+        let (pro, _) = cost_usd("deepseek", Some("deepseek-v4-pro"), 0, 98_900, Some(0));
+        let (flash, pro) = (flash.expect("flash prices"), pro.expect("pro prices"));
+        assert!(
+            pro > flash * 3.0,
+            "pro is >3x flash ({pro} vs {flash}); defaulting to flash understates by that factor"
+        );
+    }
+
+    /// A recognised model still prices, so D-020 refuses only what it cannot know.
+    ///
+    /// RED IF: the None guard is widened into something that swallows valid models too.
+    #[test]
+    fn a_named_deepseek_model_still_prices() {
+        for model in ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro"] {
+            let (usd, label) = cost_usd("deepseek", Some(model), 0, 1_000_000, Some(1_000_000));
+            assert_eq!(label, "metered", "{model} is a known price");
+            assert!(usd.unwrap_or(0.0) > 0.0, "{model} must produce a real cost");
+        }
+    }
+
+    /// An agent nobody supports is still refused, in both mappings.
+    ///
+    /// The negative control for the two tests above: they assert the roster is covered, and this
+    /// asserts the catch-all arms still exist to catch anything off it. Without this, deleting
+    /// `_ => "unknown"` in favour of a blanket default would leave both roster tests green.
+    #[test]
+    fn an_unsupported_agent_is_refused_not_guessed() {
+        assert!(!crate::is_supported_agent_name("llama"));
+        assert_eq!(provider_for("llama"), "unknown");
+        assert!(matches!(billing_for("llama", None), Billing::UnknownPrice));
+        assert_eq!(cost_usd("llama", None, 0, 500, Some(500)), (None, "unknown"));
+    }
+
+    /// The exact malformed value that reached PostHog on 2026-08-26 must not chart as a seat.
+    ///
+    /// D-024. `tv_agent = gemini">` with a trailing newline, `tv_agent_display = Gemini">`, on a
+    /// row with 0ms duration and no backend: a call rejected before dispatch, whose telemetry
+    /// guard had been built from the raw request string. It became a phantom sixth seat in every
+    /// breakdown of `tv_agent`.
+    ///
+    /// RED IF: `chart_agent` stops bounding the value, and caller text can reach the dimension.
+    #[test]
+    fn the_malformed_seat_name_from_2026_08_26_does_not_chart_as_an_agent() {
+        let malformed = "gemini\">\n";
+        assert_eq!(chart_agent(malformed), "unsupported");
+
+        let g = ai_generation_props(&AiGeneration {
+            agent: malformed, model: None, outcome: "failure", trace_id: "t",
+            input_tokens: None, output_tokens: None, cached_tokens: None, thinking_tokens: None,
+            tool_calls: None, duration_ms: 0, cost_usd: None, billing: "unknown",
+            attempts: 1, backend: None, repo: None, error: Some("unsupported agent"),
+            input: None, output: None,
+        });
+        assert_eq!(g["tv_agent"], "unsupported");
+        assert_eq!(g["tv_agent_display"], "Unsupported");
+        let charted = g["tv_agent"].as_str().unwrap_or_default();
+        assert!(!charted.contains('"'), "a quote in a chart dimension is caller text leaking");
+        assert!(!charted.contains('\n'), "a newline in a chart dimension is caller text leaking");
+    }
+
+    /// EVERY event that carries a caller-supplied seat name bounds it, not just the one the
+    /// defect was noticed on.
+    ///
+    /// D-024 was closed on `$ai_generation` and left open on five sibling events. Grok found it on
+    /// the panel. `$exception` was the worst of them: it shipped the raw string as `tv_agent` AND
+    /// as part of `$exception_fingerprint`, which is the GROUPING KEY, so a junk agent name mints
+    /// its own Issue in error tracking and buries the UI, which is precisely what that
+    /// fingerprint was introduced to prevent.
+    ///
+    /// This test reads the SOURCE rather than calling the emitters, because they are
+    /// fire-and-forget over the network and return nothing to assert on. Structural, therefore,
+    /// and deliberately so: the failure it guards against is someone adding a sixth event with a
+    /// raw `"tv_agent": agent`, which is exactly a source-level pattern.
+    ///
+    /// RED IF: a `tv_agent` (or `tv_answered_by_agent`) is emitted from a variable without
+    /// passing through `chart_agent`.
+    #[test]
+    fn every_event_that_carries_a_seat_name_bounds_it() {
+        let src = include_str!("posthog.rs");
+        let mut raw = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim();
+            if !(t.starts_with("\"tv_agent\"") || t.starts_with("\"tv_answered_by_agent\"")) {
+                continue;
+            }
+            let value = t.splitn(2, ':').nth(1).unwrap_or("").trim().trim_end_matches(',');
+            // A string literal is bounded by construction; anything else must be bounded by us.
+            let bounded = value.starts_with('"') || value.contains("chart_agent");
+            if !bounded {
+                raw.push(format!("line {}: {t}", i + 1));
+            }
+        }
+        assert!(
+            raw.is_empty(),
+            "these emit a seat name without bounding it, so caller text reaches a chart \
+             dimension:\n{}",
+            raw.join("\n")
+        );
+    }
+
+    /// The exception fingerprint is a GROUPING KEY, so it is bounded too.
+    ///
+    /// RED IF: the raw agent string goes back into `$exception_fingerprint`.
+    #[test]
+    fn the_exception_fingerprint_is_bounded() {
+        let src = include_str!("posthog.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("\"$exception_fingerprint\""))
+            .expect("the fingerprint is still emitted");
+        assert!(
+            line.contains("chart_agent"),
+            "a junk agent name in the fingerprint mints a new error-tracking Issue per caller: {line}"
+        );
+    }
+
+    /// The dimension is bounded: nothing a caller sends can widen it.
+    ///
+    /// The point is not that these five strings are handled, it is that the OUTPUT SET is closed.
+    /// An unbounded caller-controlled dimension is a cardinality hazard first and a SaaS data leak
+    /// second, which is the reasoning `repo_name` was already written under.
+    ///
+    /// RED IF: any caller string can produce a `tv_agent` outside the roster.
+    #[test]
+    fn tv_agent_is_bounded_to_the_roster_whatever_the_caller_sends() {
+        let mut allowed: Vec<String> = crate::supported_agent_names()
+            .iter().map(|s| s.to_string()).collect();
+        allowed.push("unsupported".to_string());
+
+        for hostile in [
+            "gemini\">\n",
+            "<option value=\"gemini\">",
+            "'; DROP TABLE events; --",
+            "gemini\u{0}",
+            "",
+            "   ",
+            "a".repeat(5000).as_str(),
+            "GEMINI",
+            "AgY",
+        ] {
+            let charted = chart_agent(hostile);
+            assert!(
+                allowed.contains(&charted),
+                "{hostile:?} produced the unbounded dimension value {charted:?}"
+            );
+        }
+    }
+
+    /// Bounding must not rewrite legitimate seats, including alias forms.
+    ///
+    /// `supergrok` is a billing tier and `agy`/`antigravity` are client names; all three are real
+    /// callers whose rows must land on the canonical key, not on the sentinel. A fix that bounded
+    /// the dimension by discarding real traffic would be worse than the defect.
+    ///
+    /// RED IF: normalization is dropped from `chart_agent`, or a real seat maps to "unsupported".
+    #[test]
+    fn bounding_preserves_every_real_seat_and_its_aliases() {
+        for agent in crate::supported_agent_names() {
+            assert_eq!(chart_agent(agent), *agent, "{agent} is a real seat");
+        }
+        for (alias, canonical) in [
+            ("antigravity", "gemini"),
+            ("agy", "gemini"),
+            ("supergrok", "grok"),
+            ("xai", "grok"),
+            ("Codex", "codex"),
+        ] {
+            assert_eq!(chart_agent(alias), canonical, "{alias} must chart as {canonical}");
+        }
     }
 }

@@ -47,6 +47,42 @@ pub enum Termination {
     Stopped,
 }
 
+/// The model that served a turn, from an event's `modelUsage` map. D-021.
+///
+/// `modelUsage` is a MAP keyed by model name, so it can in principle name more than one model for
+/// a single turn. Observed shape, in every fixture and in a live 1.0.30 capture, is exactly one
+/// key:
+///
+/// ```json
+/// "modelUsage": { "grok-4.6-build": { "inputTokens": 15708, "modelCalls": 1, ... } }
+/// ```
+///
+/// `$ai_model` is a single identifier, so a multi-model turn has to reduce to one. The rule is
+/// most `modelCalls`, then most `outputTokens`, then name order, and it is a stated REDUCTION of
+/// real data rather than a guess at a missing value: every candidate here actually ran. The name
+/// tie-break exists so the same input can never produce two different answers, which a map
+/// iteration order would otherwise allow.
+///
+/// Returns `None` when the field is absent or empty, because "we do not know" is the honest
+/// answer and `unknown` is a legible slice on a dashboard.
+fn model_from_usage(json: &Value) -> Option<String> {
+    let map = json.get("modelUsage")?.as_object()?;
+    let mut best: Option<(u64, u64, &str)> = None;
+    for (name, stats) in map {
+        if name.trim().is_empty() {
+            continue;
+        }
+        let calls = stats.get("modelCalls").and_then(Value::as_u64).unwrap_or(0);
+        let out = stats.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
+        let candidate = (calls, out, name.as_str());
+        best = match best {
+            Some(cur) if cur >= candidate => Some(cur),
+            _ => Some(candidate),
+        };
+    }
+    best.map(|(_, _, name)| name.to_string())
+}
+
 #[derive(Debug, Default)]
 pub struct GrokStreamParser {
     session_id: Option<String>,
@@ -58,6 +94,20 @@ pub struct GrokStreamParser {
     /// AND self-reporting, so this is a usage signal rather than a bill: on a flat plan the
     /// marginal dollar cost of a call is zero. Captured because quota burn is otherwise invisible.
     total_cost_usd: Option<f64>,
+    /// The CONCRETE model that served this turn, read from `end.modelUsage`. D-021.
+    ///
+    /// Grok was ONE OF TWO seats that could not say which model answered it (codex was the
+    /// other, and was fixed after this), so every grok row
+    /// charted `$ai_model = unknown`. The CLI had been reporting the answer all along: the `end`
+    /// event carries a `modelUsage` map KEYED BY MODEL NAME, present in all four 1.0.13 fixtures
+    /// and confirmed live on 1.0.30 (`grok-4.6-build`, 2026-09-20). Nothing in the workspace read
+    /// it.
+    ///
+    /// This is deliberately NOT `grok_model()`, which reads `TRIUMVIRATE_GROK_MODEL`. That is the
+    /// model we ASKED for, and it is empty by default, so it reports intent rather than fact and
+    /// says nothing at all in the common case. Charting intent as fact is the same class of defect
+    /// as D-020, where an absent value was silently replaced by a plausible one.
+    model: Option<String>,
     termination: Termination,
     /// Verbatim `end.stopReason`, so the runner can explain WHY without re-parsing.
     stop_reason: Option<String>,
@@ -359,6 +409,11 @@ impl GrokStreamParser {
                 if let Some(c) = json.get("total_cost_usd").and_then(Value::as_f64) {
                     self.total_cost_usd = Some(c);
                 }
+                // D-021: read alongside the cost, because both live on the same events and a
+                // future event that gains one will almost certainly carry the other.
+                if let Some(m) = model_from_usage(&json) {
+                    self.model = Some(m);
+                }
                 None
             }
 
@@ -379,6 +434,11 @@ impl GrokStreamParser {
                 }
                 if let Some(c) = json.get("total_cost_usd").and_then(Value::as_f64) {
                     self.total_cost_usd = Some(c);
+                }
+                // D-021: read alongside the cost, because both live on the same events and a
+                // future event that gains one will almost certainly carry the other.
+                if let Some(m) = model_from_usage(&json) {
+                    self.model = Some(m);
                 }
                 let detail = json
                     .get("stopReason")
@@ -521,7 +581,12 @@ impl GrokStreamParser {
             // grok's own `end.total_cost_usd`. The runner used to persist `cost_usd: None`
             // while this value sat here unused, so quota burn was under-recorded.
             self_reported_cost_usd: self.total_cost_usd,
-            cli_version: None,
+            // D-021: the model grok reported for this turn. `cli_version` is the carrier every
+            // sibling parser uses for the concrete model, and `agent_exec.rs` now reads it for
+            // every agent rather than only gemini, so filling it here is what moves this seat off
+            // `$ai_model = unknown`. This sat as a hardcoded `None` while the CLI was reporting
+            // the answer on every single turn.
+            cli_version: self.model,
             parser_mode: "grok-streaming-json".to_string(),
         }
     }
@@ -1091,4 +1156,134 @@ mod shell_read_classification_tests {
         assert_eq!(r.tool_calls[0].kind, ToolKind::ReadFile);
         assert!(r.tool_calls[0].args_json.as_deref().unwrap_or("").contains("cat /repo/probe.txt"));
     }
+}
+
+/// D-021: which model actually served a grok turn.
+///
+/// Grok was the last seat charting `$ai_model = unknown` on every row. The answer was in the
+/// stream the whole time, in `end.modelUsage`, and nothing read it.
+#[cfg(test)]
+mod model_attribution_tests {
+    use super::*;
+
+    /// Every REAL capture names its model, and the parser surfaces it.
+        ///
+        /// Grok was the last seat charting `$ai_model = unknown` (535 of 535 live rows). The CLI had
+        /// been answering the question on every turn the whole time: `end.modelUsage` is a map keyed
+        /// by model name. Nothing in the workspace read it, and `finish()` returned a hardcoded
+        /// `cli_version: None`.
+        ///
+        /// All four of these are real `grok 1.0.13` captures, not hand-written.
+        ///
+        /// RED IF: `modelUsage` stops being parsed, or `cli_version` goes back to a hardcoded None.
+        #[test]
+        fn every_real_capture_reports_the_model_that_served_it() {
+            for (name, raw) in [
+                ("plain", include_str!("../tests/fixtures/grok-streaming-20260830.jsonl")),
+                ("tools", include_str!("../tests/fixtures/grok-streaming-tools-20260830.jsonl")),
+                ("isolated", include_str!("../tests/fixtures/grok-streaming-isolated-20260830.jsonl")),
+                ("lean", include_str!("../tests/fixtures/grok-streaming-lean-20260830.jsonl")),
+            ] {
+                let mut p = GrokStreamParser::default();
+                for line in raw.lines() {
+                    p.parse_line(line);
+                }
+                assert_eq!(
+                    p.finish().cli_version.as_deref(),
+                    Some("grok-4.6-build"),
+                    "{name} capture must name the model that served it"
+                );
+            }
+        }
+
+        /// The format did not drift between the version the fixtures came from and the one installed.
+        ///
+        /// The 1.0.13 fixtures are from 2026-08-30; the binary on this machine is 1.0.30. A fix built
+        /// only against old captures would be a fix against a format nobody runs any more, and the way
+        /// that failure presents is `$ai_model` quietly returning to "unknown" with every test green.
+        /// So this is a REAL capture from the installed binary, taken 2026-09-20.
+        ///
+        /// RED IF: a future grok drops or renames `modelUsage`, which is exactly the regression worth
+        /// being told about rather than discovering on a dashboard months later.
+        #[test]
+        fn the_installed_grok_version_still_reports_modelusage() {
+            const LIVE: &str = include_str!("../tests/fixtures/grok-streaming-1.0.30-20260920.jsonl");
+            let mut p = GrokStreamParser::default();
+            for line in LIVE.lines() {
+                p.parse_line(line);
+            }
+            let parsed = p.finish();
+            assert_eq!(parsed.cli_version.as_deref(), Some("grok-4.6-build"));
+            assert_eq!(parsed.parser_mode, "grok-streaming-json");
+        }
+
+        /// No `modelUsage` means we say we do not know, rather than inventing something plausible.
+        ///
+        /// The whole point of D-021 is that `$ai_model` should answer "which model ran". A fallback to
+        /// the agent key ("grok"), or to `TRIUMVIRATE_GROK_MODEL` (what we ASKED for, and empty by
+        /// default), would make the field look populated while answering a different question. D-020
+        /// is what that costs: an absent value replaced by a plausible one, charted as fact.
+        ///
+        /// RED IF: any default or fallback model is introduced.
+        #[test]
+        fn a_turn_that_never_names_a_model_reports_none_not_a_guess() {
+            let mut p = GrokStreamParser::default();
+            p.parse_line(r#"{"type":"end","stopReason":"end_turn","sessionId":"s1","total_cost_usd":0.01}"#);
+            assert_eq!(p.finish().cli_version, None);
+
+            // Present but empty, and a blank key, are both "we do not know" too.
+            for raw in [
+                r#"{"type":"end","stopReason":"end_turn","modelUsage":{}}"#,
+                r#"{"type":"end","stopReason":"end_turn","modelUsage":{"   ":{"modelCalls":9}}}"#,
+            ] {
+                let mut p = GrokStreamParser::default();
+                p.parse_line(raw);
+                assert_eq!(p.finish().cli_version, None, "{raw}");
+            }
+        }
+
+        /// A multi-model turn reduces by a STATED rule, and does so deterministically.
+        ///
+        /// `modelUsage` is a map, so more than one model can appear even though every capture so far
+        /// holds exactly one. `$ai_model` is a single identifier, so the turn has to reduce to one
+        /// name. This is a reduction of real data, not a guess at a missing value: both models below
+        /// genuinely ran. Most `modelCalls`, then most `outputTokens`, then name order.
+        ///
+        /// The name tie-break is the load-bearing part. Without it the answer depends on map iteration
+        /// order, which would make the SAME turn chart as two different models on two different runs,
+        /// and that is unfalsifiable on a dashboard.
+        ///
+        /// RED IF: the ordering rule changes, or ties stop being broken deterministically.
+        #[test]
+        fn a_multi_model_turn_reduces_by_calls_then_output_then_name() {
+            let by_calls = r#"{"type":"end","stopReason":"end_turn","modelUsage":{
+                "grok-4.6-build":{"modelCalls":1,"outputTokens":900},
+                "grok-4.6-heavy":{"modelCalls":7,"outputTokens":3}}}"#;
+            let mut p = GrokStreamParser::default();
+            p.parse_line(&by_calls.replace('\n', " "));
+            assert_eq!(p.finish().cli_version.as_deref(), Some("grok-4.6-heavy"), "calls win first");
+
+            let by_output = r#"{"type":"end","stopReason":"end_turn","modelUsage":{
+                "grok-4.6-build":{"modelCalls":2,"outputTokens":900},
+                "grok-4.6-heavy":{"modelCalls":2,"outputTokens":3}}}"#;
+            let mut p = GrokStreamParser::default();
+            p.parse_line(&by_output.replace('\n', " "));
+            assert_eq!(p.finish().cli_version.as_deref(), Some("grok-4.6-build"), "output breaks a calls tie");
+
+            // Fully tied: the answer must be stable across runs, not map-order dependent.
+            let tied = r#"{"type":"end","stopReason":"end_turn","modelUsage":{
+                "grok-4.6-build":{"modelCalls":2,"outputTokens":5},
+                "grok-4.6-alpha":{"modelCalls":2,"outputTokens":5}}}"#;
+            let first = {
+                let mut p = GrokStreamParser::default();
+                p.parse_line(&tied.replace('\n', " "));
+                p.finish().cli_version
+            };
+            for _ in 0..25 {
+                let mut p = GrokStreamParser::default();
+                p.parse_line(&tied.replace('\n', " "));
+                assert_eq!(p.finish().cli_version, first, "a tie must resolve the same way every time");
+            }
+            assert_eq!(first.as_deref(), Some("grok-4.6-build"));
+        }
 }

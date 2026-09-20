@@ -399,3 +399,30 @@ the map in their instruction files describes a directory of files, not a search 
 something up. That is a change to `ops/build_index.py` in the mneme repo, which owns the map, and
 is the owner's call. The instrument is now in place to measure whether it works: `via wiki_search`
 is a column in the report.
+
+## The map line, and the adoption it bought (2026-09-19)
+
+One sentence added to the peers' map block (and ONLY the peers': `_index.md`, which Claude imports,
+is untouched, because the Claude-side scanner measures use by page OPENS and pointing Claude at a
+search tool would blind its own instrument):
+
+> To look something up here, call the `wiki_search` tool (Triumvirate MCP) with the words you expect
+> on the page... Prefer it over grepping or listing this directory, and call it before answering
+> from memory or saying you do not know.
+
+Written by `ops/build_index.py` in the mneme repo, so the nightly keeps it in place. Measured on a
+THIRD probe set, three facts never asked before (each set is single-use for adoption: a peer that
+already knows the answer has no reason to look anything up):
+
+| seat | before, 12 fresh probes | after, 6 calls | answers correct |
+|---|---:|---:|---:|
+| grok | 0 used `wiki_search` | **6 of 6** | 6 of 6 |
+| gemini | 0 used `wiki_search` | **1 of 6** | 4 of 6 |
+
+Grok switched completely, unhinted as well as hinted. Gemini mostly did not, and it is the seat that
+already opened pages, so its route to the wiki was never the one the line argued against. Both
+numbers come from the bridge's own record of the peers' tool calls, not from what the peers said.
+
+Worth stating plainly: nothing here yet shows the wiki made an answer BETTER. It shows delivery
+(the map reaches them), route (which mechanism they use), and that naming a tool in the instructions
+moved one seat from zero to always. Quality is the next question and it is not instrumented.

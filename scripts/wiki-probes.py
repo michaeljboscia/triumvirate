@@ -72,7 +72,17 @@ PROBES_FRESH = [
     ("clickhouse-datetime", "Which ClickHouse function do we prefer over toDateTime for ISO-8601 timestamps with fractional seconds?",
      "database-and-sql-operations", r"parseDateTimeBestEffort"),
 ]
-PROBE_SETS = {"original": PROBES, "fresh": PROBES_FRESH}
+# A third set, for the ADOPTION test after the map began naming `wiki_search` (2026-09-19). Each
+# set is single-use for adoption: a peer that already knows the answer has no reason to look it up.
+PROBES_ADOPTION = [
+    ("builtwith-429", "What does an HTTP 429 from the BuiltWith free screen tell us to do before spending credits?",
+     "web-scraping-and-site-fetching", r"rate.?limit|backoff"),
+    ("sample-size-200", "How many production records do we consider enough to judge attribute population rates?",
+     "data-quality-and-validation", r"\b200\b"),
+    ("nearest-neighbour-cv", "What coefficient of variation did nearest-neighbour matches show versus direct hits?",
+     "data-quality-and-validation", r"107\s?%|\b107\b"),
+]
+PROBE_SETS = {"original": PROBES, "fresh": PROBES_FRESH, "adoption": PROBES_ADOPTION}
 
 VARIANTS = {
     "unhinted": "Question about our own setup: {q} If you do not know, reply UNKNOWN. Answer in one line.",

@@ -21,6 +21,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 futures-util = "0.3"
 tokio = { workspace = true, features = ["process", "time", "sync", "macros", "rt", "net", "io-util"] }
 tracing.workspace = true
+# O_NOFOLLOW when opening a codex rollout: the entry check and the open are separate syscalls,
+# and a plain open would follow a symlink swapped in between them (Codex, panel review).
+libc.workspace = true
 
 [dev-dependencies]
 # T-009 test-only: real cost calculation against the seeded price table to
