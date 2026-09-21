@@ -19,6 +19,17 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-027 - Codex silently answered in the Gemini seat whenever agy failed
+**Found:** 2026-09-21 · **Severity:** HIGH (a "three peer" panel was sometimes two peers, one twice) · **FIXED IN CODE, NOT YET LIVE**
+**Cause:** three substitution points, on two surfaces.
+1. Ask path: `degraded_route_env()` defaulted `TRIUMVIRATE_GEMINI_DEGRADED_ROUTE` to `codex` (commit `f908ccb`). Nothing set the env var, so every agy quota/auth/exec failure, and every call while the breaker was open, was answered by Codex.
+2. Fleet, breaker open: launched `codex` in place of gemini, hardcoded, never read the env var.
+3. Fleet, failed agy task: relaunched as `codex`, hardcoded.
+**Fix:** one reader, `mcp_bridge::agy_resilience::degraded_route_env()`, default `fail`. Fleet gates both swaps on `degraded_route_allows_codex()`. Substitution now needs an explicit `TRIUMVIRATE_GEMINI_DEGRADED_ROUTE=codex`.
+**Pins:** `agy::quota_backoff_and_route_default_tests::default_degraded_route_substitutes_nobody`, `strict_agent_tests::strict_00_default_route_never_substitutes_codex` (ignored, run by `scripts/verify-live-agents.sh strict`), `orchestrator::tests::failed_gemini_task_is_not_relaunched_as_codex_by_default`. Each has a negative control that opts in and still sees codex. Putting the `codex` default back turned all three red (mutation run, 2026-09-21).
+**Not covered:** fleet breaker-open fail path has no test (needs the global breaker opened in the fleet test binary).
+**CHECK to close:** binary installed via `scripts/install.sh` (done 2026-09-21) AND the daemon restarted on it, then `bash scripts/verify-live-agents.sh strict` passes.
+
 ### D-004 - Failed generations carry no error text
 **Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
 **Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried

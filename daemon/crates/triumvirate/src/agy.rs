@@ -243,13 +243,13 @@ pub(crate) fn plan_degraded_route(route_env: &str, class: AgyFailureClass) -> Ve
     hops
 }
 
-/// The degraded route value (`TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`, default
-/// `codex`; `fail` disables). REQ-053.
+/// The degraded route value (`TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`, default `fail`; set
+/// `codex` to opt in to substitution). REQ-053. Read from `mcp_bridge` so fleet uses the
+/// same default.
 pub(crate) fn degraded_route_env() -> String {
-    // Default was `gemini-cli,codex`. Google retired the Gemini CLI's individual tier on or
-    // before 2026-09-13 (`IneligibleTierError` on every auth), so that hop failed every time
-    // before codex got its turn. Operators with a tier can still set the env var.
-    std::env::var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE").unwrap_or_else(|_| "codex".to_string())
+    // Default was `gemini-cli,codex`, then `codex` after Google retired the Gemini CLI tier
+    // (2026-09-13). Both silently put Codex in the Gemini seat. Now `fail` (2026-09-21).
+    mcp_bridge::agy_resilience::degraded_route_env()
 }
 
 /// Waits before retrying agy after a quota/429 signal, in order. `TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS`
@@ -1772,13 +1772,27 @@ mod quota_backoff_and_route_default_tests {
         assert_eq!(quota_backoff_schedule(), vec![Duration::from_secs(15), Duration::from_secs(45)]);
     }
 
-    /// RED IF: the dead gemini-cli hop comes back into the default route.
+    /// RED IF: any hop comes back into the default route. Codex answering in the Gemini seat
+    /// by default is the defect this pins.
     #[tokio::test]
-    async fn default_degraded_route_has_no_gemini_cli_hop() {
+    async fn default_degraded_route_substitutes_nobody() {
         let _lock = super::tests::ENV_LOCK.lock().await;
         let _env = super::tests::set_env_scoped("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", None);
+        for class in [AgyFailureClass::AuthOrExec, AgyFailureClass::Quota] {
+            assert!(plan_degraded_route(&degraded_route_env(), class).is_empty(), "{class:?}");
+        }
+        assert!(!mcp_bridge::agy_resilience::degraded_route_allows_codex());
+    }
+
+    /// Negative control: the opt-in still works, so the test above is not passing on a
+    /// route that can never substitute.
+    #[tokio::test]
+    async fn explicit_codex_route_still_substitutes() {
+        let _lock = super::tests::ENV_LOCK.lock().await;
+        let _env = super::tests::set_env_scoped("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", Some("codex"));
         let hops = plan_degraded_route(&degraded_route_env(), AgyFailureClass::AuthOrExec);
         assert_eq!(hops.iter().map(|h| h.backend).collect::<Vec<_>>(), vec!["codex"]);
+        assert!(mcp_bridge::agy_resilience::degraded_route_allows_codex());
     }
 }
 

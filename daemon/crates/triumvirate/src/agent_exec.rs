@@ -8970,7 +8970,8 @@ mod strict_agent_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    const ENV_KEYS: [&str; 6] = [
+    const ENV_KEYS: [&str; 7] = [
+        "TRIUMVIRATE_GEMINI_DEGRADED_ROUTE",
         "TRIUMVIRATE_HOME",
         "TRIUMVIRATE_GEMINI_BACKEND",
         "TRIUMVIRATE_AGY_BIN",
@@ -9025,6 +9026,8 @@ mod strict_agent_tests {
             std::env::remove_var("TRIUMVIRATE_AGY_ARGS");
             std::env::set_var("TRIUMVIRATE_CODEX_BIN", &codex);
             std::env::set_var("TRIUMVIRATE_AGY_QUOTA_BACKOFF_SECS", "");
+            // The default route is `fail`. These tests exercise an operator who opted in.
+            std::env::set_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", "codex");
         }
         StrictFixture { dir, codex_ran }
     }
@@ -9037,6 +9040,23 @@ mod strict_agent_tests {
             strict_agent: strict,
             ..Default::default()
         }
+    }
+
+    /// RED IF: the default route substitutes again. No `strict_agent`, no route env: agy fails,
+    /// the call fails, and codex is never spawned. This is the 2026-09-21 fix end to end.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
+    async fn strict_00_default_route_never_substitutes_codex() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _agy = crate::agy::tests::ENV_LOCK.lock().await;
+        let fx = setup();
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
+
+        execute_ask_agent(&request(&fx, None), None)
+            .await
+            .expect_err("an unavailable Gemini backend is a failure by default, not codex's answer");
+
+        assert!(!fx.codex_ran.exists(), "codex must not be spawned under the default route");
     }
 
     /// THE NEGATIVE CONTROL. Without `strict_agent` this fixture substitutes codex, which is

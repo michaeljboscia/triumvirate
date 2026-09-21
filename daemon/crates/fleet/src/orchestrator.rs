@@ -386,6 +386,47 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     // "blocked_call" for every caller. Emitting again would double-count
                     // fleet's shed traffic against the ask path's.
                 }
+                // No substitution unless the operator opted in. Launching codex here put Codex
+                // in the Gemini seat and recorded it as a success.
+                if breaker_open && !mcp_bridge::agy_resilience::degraded_route_allows_codex() {
+                    tracing::error!(
+                        fleet_id = %fleet_id,
+                        task_id = %task_id,
+                        agent = %agent_name,
+                        "agy circuit breaker OPEN and TRIUMVIRATE_GEMINI_DEGRADED_ROUTE does not allow codex; failing task"
+                    );
+                    mcp_bridge::posthog::record_fleet_task(
+                        &agent_name,
+                        backend_label,
+                        "skipped_breaker_open",
+                        task_started.elapsed().as_millis() as u64,
+                        &fleet_id,
+                        &task_id,
+                    );
+                    if let Ok(conn) = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")) {
+                        let _ = conn.execute(
+                            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
+                            rusqlite::params![task_id.as_str()],
+                        );
+                    }
+                    if let Ok(store) = LedgerStore::open(project_root.clone()) {
+                        let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed").unwrap_or(1);
+                        let _ = store.ingest_event(RawEvent {
+                            session_id: fleet_id.clone(),
+                            event_type: "task_failed".to_string(),
+                            sequence,
+                            timestamp: "2030-01-01T00:00:00Z".to_string(),
+                            payload_json: serde_json::json!({
+                                "task_id": task_id,
+                                "agent": agent_name,
+                                "requested_agent": agent_name,
+                                "error": "agy circuit breaker open; substitution disabled",
+                            })
+                            .to_string(),
+                        });
+                    }
+                    return;
+                }
                 // Route around agy for real. Emitting "skipped" and then launching agy
                 // anyway would be a lying event, which is the failure mode this whole pass
                 // exists to kill. codex is a different provider (different quota pool), and
@@ -545,7 +586,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 // A SIGTERM from fleet_cancel is a non-zero exit too. Without this
                                 // check, cancelling an agy worker launched a codex replacement
                                 // (Codex, review of step 6).
-                                if use_agy && !fleet_is_cancelled(&fleet_id) {
+                                if use_agy
+                                    && !fleet_is_cancelled(&fleet_id)
+                                    && mcp_bridge::agy_resilience::degraded_route_allows_codex()
+                                {
                                     tracing::warn!(
                                         fleet_id = %fleet_id,
                                         task_id = %task_id,
@@ -1239,6 +1283,78 @@ mod tests {
         ) -> anyhow::Result<Child> {
             anyhow::bail!("launcher failure");
         }
+    }
+
+    /// Records every agent launched. gemini exits 1 (agy down); anything else exits 0.
+    #[derive(Debug, Clone, Default)]
+    struct GeminiDownLauncher {
+        launched: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl AgentLauncher for GeminiDownLauncher {
+        async fn launch(
+            &self,
+            agent: &str,
+            _project_root: &Path,
+            _worktree_path: &Path,
+            _task_prompt: &str,
+        ) -> anyhow::Result<Child> {
+            self.launched.lock().await.push(agent.to_string());
+            let code = if agent == "gemini" { "exit 1" } else { "exit 0" };
+            Ok(Command::new("sh").arg("-c").arg(code).spawn()?)
+        }
+    }
+
+    /// Serialises the two tests below: both set the route env and feed the global breaker.
+    static ROUTE_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    async fn launched_for_failing_gemini(route: Option<&str>) -> Vec<String> {
+        let _lock = ROUTE_ENV_LOCK.lock().await;
+        // SAFETY: serialised by ROUTE_ENV_LOCK; restored before the lock drops.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
+            match route {
+                Some(r) => std::env::set_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", r),
+                None => std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE"),
+            }
+        }
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+        let launcher = GeminiDownLauncher::default();
+        let launched = launcher.launched.clone();
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) },
+            launcher,
+        );
+        orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root,
+                agents: vec!["gemini".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "gemini seat task".to_string(),
+            })
+            .await
+            .expect("spawn");
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        launched.lock().await.clone()
+    }
+
+    /// RED IF: a failed gemini fleet task relaunches as codex under the default route.
+    #[tokio::test]
+    async fn failed_gemini_task_is_not_relaunched_as_codex_by_default() {
+        assert_eq!(launched_for_failing_gemini(None).await, vec!["gemini"]);
+    }
+
+    /// Negative control: with the opt-in, the fixture really does reach the codex relaunch.
+    #[tokio::test]
+    async fn failed_gemini_task_relaunches_as_codex_only_when_opted_in() {
+        assert_eq!(launched_for_failing_gemini(Some("codex")).await, vec!["gemini", "codex"]);
     }
 
     #[tokio::test]

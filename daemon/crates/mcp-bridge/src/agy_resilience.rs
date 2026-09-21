@@ -20,6 +20,23 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 // Env knobs
 // ---------------------------------------------------------------------------
 
+/// The degraded route value (`TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`). Default `fail`: when the
+/// Gemini seat's backend is down, the ask FAILS naming that backend. It is never answered by
+/// another agent unless an operator opts in (`codex`). The old `codex` default meant a Gemini
+/// review was sometimes Codex's review, so a "three peer" panel was two peers, one twice.
+/// One reader for the ask path and fleet, so the two surfaces cannot drift.
+pub fn degraded_route_env() -> String {
+    std::env::var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE").unwrap_or_else(|_| "fail".to_string())
+}
+
+/// True only when the operator put `codex` in the degraded route. Fleet reads this before
+/// either of its codex substitutions (breaker open, and a failed agy task).
+pub fn degraded_route_allows_codex() -> bool {
+    degraded_route_env()
+        .split(',')
+        .any(|t| t.trim().eq_ignore_ascii_case("codex"))
+}
+
 fn agy_max_concurrent() -> usize {
     std::env::var("TRIUMVIRATE_AGY_MAX_CONCURRENT")
         .ok()
