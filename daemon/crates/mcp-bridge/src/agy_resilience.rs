@@ -6,10 +6,15 @@
 //!   wastes quota; verified concurrency-safe at the default of 3.
 //! - **Rate limit (REQ-102):** a token-bucket RPM ceiling throttles Triumvirate's
 //!   own agy call rate to avoid self-inflicted 429s.
-//! - **Circuit breaker (REQ-101):** on repeated quota/429, OPEN the circuit so the
-//!   caller routes gemini-sibling work to codex (a different quota pool); a half-open
-//!   probe is allowed after an exponential-backoff cooldown capped at the ~5-hr Ultra
-//!   reset window. Per REQ-103, ambiguous repeated failures also bias toward OPEN.
+//! - **Circuit breaker (REQ-101):** on repeated quota/429, OPEN the circuit so the caller
+//!   stops spending requests on a backend that is refusing them; a half-open probe is allowed
+//!   after an exponential-backoff cooldown capped at the ~5-hr Ultra reset window. Per REQ-103,
+//!   ambiguous repeated failures also bias toward OPEN.
+//!
+//!   An open circuit means the gemini seat is UNAVAILABLE, and by default (D-027) that is what
+//!   the caller reports. It does not mean "send it to codex": answering as a seat that was not
+//!   asked for is opt-in via `TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`. This paragraph used to say
+//!   the opposite, which is how the default got set to `codex` in the first place.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -360,8 +365,9 @@ fn breaker() -> &'static Mutex<BreakerState> {
     B.get_or_init(|| Mutex::new(BreakerState::new()))
 }
 
-/// True if the agy attempt should be short-circuited (caller routes straight to the
-/// degraded route / codex). Transitions OPEN→half-open when the cooldown elapses.
+/// True if the agy attempt should be short-circuited. The caller then takes the degraded
+/// route, which by default (D-027) has no hops and fails naming this backend. Transitions
+/// OPEN→half-open when the cooldown elapses.
 pub fn agy_breaker_should_skip() -> bool {
     let lease = half_open_lease();
     let (skip, phase, shed) = {

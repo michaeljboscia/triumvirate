@@ -94,6 +94,32 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "guards" ]; then
     fi
 fi
 
+# Run a guard and require that it actually RAN something.
+#
+# `cargo test <filter>` exits 0 when the filter matches NOTHING: "0 passed; 0 failed". Rename or
+# delete a guard and this script printed PASS for a test that no longer exists (Grok, panel
+# review of the D-027 fix). Absence reported as success is the exact shape these guards exist to
+# catch, so the guard runner must not have it.
+run_guard() {
+    label="$1"
+    shift
+    echo "RUN   $label"
+    out="$("$@" 2>&1)"
+    status=$?
+    echo "$out" | tail -12
+    if [ "$status" -ne 0 ]; then
+        echo "FAIL  $label"
+        FAILED=1
+        return
+    fi
+    if ! echo "$out" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
+        echo "FAIL  $label (no test actually ran: filter matched nothing)"
+        FAILED=1
+        return
+    fi
+    echo "PASS  $label"
+}
+
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "strict" ]; then
     # strict_agent, end to end, with MOCK agy and codex binaries. No network, no quota.
     #
@@ -102,37 +128,19 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "strict" ]; then
     #
     # strict_01 is the negative control. It proves the fixture really does substitute codex
     # when strict is off, so strict_02 cannot be green merely because nothing degraded.
-    echo "RUN   strict_agent never substitutes"
-    if cargo test -p triumvirate --bin triumvirate strict_agent_tests \
-        -- --ignored --test-threads=1 2>&1 | tail -12; then
-        echo "PASS  strict_agent never substitutes"
-    else
-        echo "FAIL  strict_agent never substitutes"
-        FAILED=1
-    fi
+    run_guard "strict_agent never substitutes" \
+        cargo test -p triumvirate --bin triumvirate strict_agent_tests -- --ignored --test-threads=1
 
     # The fleet surface of the same rule: a breaker-open gemini task must launch NOBODY, and
     # must still drive its fleet to a terminal state. Opens the process-global breaker, so it
     # cannot run beside the parallel fleet tests.
-    echo "RUN   fleet substitutes nobody and never strands a fleet"
-    if cargo test -p fleet breaker_open_gemini \
-        -- --ignored --test-threads=1 2>&1 | tail -12; then
-        echo "PASS  fleet substitutes nobody and never strands a fleet"
-    else
-        echo "FAIL  fleet substitutes nobody and never strands a fleet"
-        FAILED=1
-    fi
+    run_guard "fleet substitutes nobody and never strands a fleet" \
+        cargo test -p fleet breaker_open_gemini -- --ignored --test-threads=1
 
     # breaker_probe against the REAL process-global breaker: a healthy probe closes an open
     # breaker, and repeated failed probes never extend its cooldown.
-    echo "RUN   breaker_probe closes on health, never extends on failure"
-    if cargo test -p triumvirate --bin triumvirate breaker_probe_tests \
-        -- --ignored --test-threads=1 2>&1 | tail -12; then
-        echo "PASS  breaker_probe closes on health, never extends on failure"
-    else
-        echo "FAIL  breaker_probe closes on health, never extends on failure"
-        FAILED=1
-    fi
+    run_guard "breaker_probe closes on health, never extends on failure" \
+        cargo test -p triumvirate --bin triumvirate breaker_probe_tests -- --ignored --test-threads=1
 fi
 
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "agy" ]; then

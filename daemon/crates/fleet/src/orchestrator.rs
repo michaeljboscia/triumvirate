@@ -349,13 +349,16 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         })?;
 
         // Launch all agent processes in parallel and monitor completion.
-        let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut join_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
         for (task_prompt, task_id, agent_name) in running_agents {
             let launcher = self.launcher.clone();
             let orchestrator = self.clone();
             let project_root = project_root.clone();
             let fleet_id = fleet_id.clone();
             let worktree_path = worktree_paths[join_handles.len()].clone();
+            // Cloned BEFORE the move: the join arm needs the id to mark a panicked worker's
+            // task failed, and the spawned body takes ownership of the original.
+            let joined_task_id = task_id.clone();
             let jh = tokio::spawn(async move {
                 tracing::info!(fleet_id = %fleet_id, task_id = %task_id, agent = %agent_name, "launching fleet agent subprocess");
                 let task_started = std::time::Instant::now();
@@ -480,6 +483,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             rusqlite::params![task_id.as_str()],
                         );
                     }
+                    // This return is a worker exit too (Grok, panel review): cancelling
+                    // between the in-memory flag and the ledger write left the fleet
+                    // `running` with nothing left to drive it terminal.
+                    orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
                     return;
                 }
                 let launch_result = launcher
@@ -809,11 +816,32 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
 
                 orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
             });
-            join_handles.push(jh);
+            join_handles.push((joined_task_id, jh));
         }
-        // Await all agent completions
-        for jh in join_handles {
-            let _ = jh.await;
+        // Await all agent completions. A panicking worker body reaches NONE of its own exits,
+        // so its task row stays `in_progress` and every other worker's terminal count sees it
+        // as pending: the fleet never merges and never fails (Grok, panel review). The
+        // JoinError is the only place that panic is visible, and it used to be discarded.
+        for (task_id, jh) in join_handles {
+            if let Err(join_err) = jh.await {
+                tracing::error!(
+                    fleet_id = %fleet_id,
+                    task_id = %task_id,
+                    error = %join_err,
+                    "fleet worker panicked or was aborted; marking its task failed"
+                );
+                match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+                    .and_then(|conn| {
+                        conn.execute(
+                            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
+                            rusqlite::params![task_id.as_str()],
+                        )
+                    }) {
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "panicked worker's task row not marked failed"),
+                }
+                self.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
+            }
         }
         Ok(worktree_paths)
     }
@@ -832,7 +860,12 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     |row| row.get::<_, i64>(0),
                 )
             })
-            .unwrap_or(1);
+            .unwrap_or_else(|e| {
+                // Failing closed is right (never merge on an unknown count), but doing it
+                // SILENTLY is how a fleet sits in `running` with nobody able to say why.
+                tracing::error!(fleet_id = %fleet_id, error = %e, "fleet terminal count failed; treating fleet as still pending");
+                1
+            });
         if pending == 0 {
             tracing::info!(fleet_id = %fleet_id, "all fleet agents complete, starting merge phase");
             let _ = self.complete_fleet(fleet_id, project_root).await;
@@ -1381,13 +1414,35 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
     async fn breaker_open_gemini_task_launches_nobody_and_still_finishes_the_fleet() {
+        let launched = breaker_open_launched(None).await;
+        assert!(
+            launched.is_empty(),
+            "breaker open with substitution disabled must launch NOBODY, not codex: {launched:?}"
+        );
+    }
+
+    /// Negative control for the test above: with the opt-in, the breaker-open path really does
+    /// reach the codex launch. Without this, a `degraded_route_allows_codex()` that always
+    /// returned false would leave that test green (Grok, panel review).
+    #[tokio::test]
+    #[ignore = "opens the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn breaker_open_gemini_task_launches_codex_only_when_opted_in() {
+        let launched = breaker_open_launched(Some("codex")).await;
+        assert_eq!(launched, vec!["codex"], "the opt-in must still substitute");
+    }
+
+    /// Trips the process-global breaker, runs one gemini fleet task, returns what was launched.
+    /// Also asserts the fleet finished: the terminal check is the half the D-027 fix broke.
+    async fn breaker_open_launched(route: Option<&str>) -> Vec<String> {
         let _lock = ROUTE_ENV_LOCK.lock().await;
         // SAFETY: serialised by ROUTE_ENV_LOCK; cleared before the lock drops.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE");
+            match route {
+                Some(r) => std::env::set_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", r),
+                None => std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE"),
+            }
         }
-        // Trip the shared breaker: threshold consecutive quota failures.
         mcp_bridge::agy_resilience::agy_breaker_record_success();
         for _ in 0..8 {
             mcp_bridge::agy_resilience::agy_breaker_record_quota();
@@ -1414,13 +1469,10 @@ mod tests {
             .await
             .expect("spawn");
 
-        // Close the breaker again before any assertion can abort the test.
+        // Restore global state BEFORE any assertion can abort this helper.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
         mcp_bridge::agy_resilience::agy_breaker_record_success();
 
-        assert!(
-            launched.lock().await.is_empty(),
-            "breaker open with substitution disabled must launch NOBODY, not codex"
-        );
         let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
             .expect("open sqlite");
         let pending: i64 = conn
@@ -1430,14 +1482,17 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count pending tasks");
-        assert_eq!(pending, 0, "the blocked task must be terminal, not left in_progress");
+        assert_eq!(pending, 0, "the task must be terminal, not left in_progress");
         let fleet_state: String = conn
             .query_row("SELECT state FROM fleets LIMIT 1", [], |row| row.get(0))
             .expect("read fleet state");
-        assert_ne!(
-            fleet_state, "running",
-            "the fleet must not be stranded in `running` with no merge phase"
+        // `assert_ne!(state, "running")` passed on a fleet stuck in `merging` (Grok, panel
+        // review). Name the states that mean the terminal check actually ran to completion.
+        assert!(
+            matches!(fleet_state.as_str(), "done" | "failed" | "merged"),
+            "fleet must reach a terminal state, got `{fleet_state}`"
         );
+        launched.lock().await.clone()
     }
 
     /// RED IF: a failed gemini fleet task relaunches as codex under the default route.
