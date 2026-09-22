@@ -111,6 +111,18 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "strict" ]; then
         FAILED=1
     fi
 
+    # The fleet surface of the same rule: a breaker-open gemini task must launch NOBODY, and
+    # must still drive its fleet to a terminal state. Opens the process-global breaker, so it
+    # cannot run beside the parallel fleet tests.
+    echo "RUN   fleet substitutes nobody and never strands a fleet"
+    if cargo test -p fleet breaker_open_gemini \
+        -- --ignored --test-threads=1 2>&1 | tail -12; then
+        echo "PASS  fleet substitutes nobody and never strands a fleet"
+    else
+        echo "FAIL  fleet substitutes nobody and never strands a fleet"
+        FAILED=1
+    fi
+
     # breaker_probe against the REAL process-global breaker: a healthy probe closes an open
     # breaker, and repeated failed probes never extend its cooldown.
     echo "RUN   breaker_probe closes on health, never extends on failure"

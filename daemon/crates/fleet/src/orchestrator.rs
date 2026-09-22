@@ -403,11 +403,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         &fleet_id,
                         &task_id,
                     );
-                    if let Ok(conn) = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")) {
-                        let _ = conn.execute(
-                            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
-                            rusqlite::params![task_id.as_str()],
-                        );
+                    // A silently dropped UPDATE leaves the row `in_progress` forever, and the
+                    // fleet terminal check below counts it as still pending. Log it loud.
+                    match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+                        .and_then(|conn| {
+                            conn.execute(
+                                "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
+                                rusqlite::params![task_id.as_str()],
+                            )
+                        }) {
+                        Ok(0) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, "breaker-blocked task row not marked failed: no row matched"),
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "breaker-blocked task row not marked failed"),
                     }
                     if let Ok(store) = LedgerStore::open(project_root.clone()) {
                         let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed").unwrap_or(1);
@@ -416,15 +423,24 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             event_type: "task_failed".to_string(),
                             sequence,
                             timestamp: "2030-01-01T00:00:00Z".to_string(),
+                            // No agent ran, so there is no answering `agent` to name. Everywhere
+                            // else in this file `agent` means who ANSWERED; writing the requested
+                            // seat there would claim gemini ran and failed (Codex, panel review).
                             payload_json: serde_json::json!({
                                 "task_id": task_id,
-                                "agent": agent_name,
+                                "agent": serde_json::Value::Null,
+                                "attempted_agent": agent_name,
                                 "requested_agent": agent_name,
                                 "error": "agy circuit breaker open; substitution disabled",
                             })
                             .to_string(),
                         });
                     }
+                    // Every exit from this worker MUST pass through the fleet terminal check.
+                    // Returning straight out left the fleet in `running` forever when this was
+                    // the last worker to finish: no merge phase, no fleet_failed (Codex, panel
+                    // review of this fix).
+                    orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
                     return;
                 }
                 // Route around agy for real. Emitting "skipped" and then launching agy
@@ -791,21 +807,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     }
                 }
 
-                let db_path = project_root.join(".triumvirate").join("ledger.db");
-                let pending = rusqlite::Connection::open(db_path)
-                    .and_then(|conn| {
-                        conn.query_row(
-                            "SELECT COUNT(*) FROM tasks
-                             WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed')",
-                            [fleet_id.as_str()],
-                            |row| row.get::<_, i64>(0),
-                        )
-                    })
-                    .unwrap_or(1);
-                if pending == 0 {
-                    tracing::info!(fleet_id = %fleet_id, "all fleet agents complete, starting merge phase");
-                    let _ = orchestrator.complete_fleet(&fleet_id, &project_root).await;
-                }
+                orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
             });
             join_handles.push(jh);
         }
@@ -814,6 +816,27 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let _ = jh.await;
         }
         Ok(worktree_paths)
+    }
+
+    /// Start the merge phase once no task of this fleet is still pending. Every worker exit
+    /// path calls this, including the ones that never launch a child: a fleet whose last
+    /// worker returns early otherwise stays `running` with no merge and no failure event.
+    async fn finalize_if_all_tasks_terminal(&self, fleet_id: &str, project_root: &Path) {
+        let db_path = project_root.join(".triumvirate").join("ledger.db");
+        let pending = rusqlite::Connection::open(db_path)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tasks
+                     WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed')",
+                    [fleet_id],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(1);
+        if pending == 0 {
+            tracing::info!(fleet_id = %fleet_id, "all fleet agents complete, starting merge phase");
+            let _ = self.complete_fleet(fleet_id, project_root).await;
+        }
     }
 
     async fn complete_fleet(&self, fleet_id: &str, project_root: &Path) -> anyhow::Result<()> {
@@ -1343,6 +1366,78 @@ mod tests {
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
         mcp_bridge::agy_resilience::agy_breaker_record_success();
         launched.lock().await.clone()
+    }
+
+    /// RED IF: a breaker-open gemini task either launches codex, or strands its fleet.
+    ///
+    /// `#[ignore]` because the agy breaker is PROCESS-GLOBAL. Opening it here blocked the agy
+    /// task of a test running in parallel, and that test's `record_success` closed it back
+    /// under this one: they failed each other, in both directions. A local lock cannot fix
+    /// that, since the other tests do not take it.
+    ///
+    /// Both halves matter. The substitution half is the defect this pass exists to kill; the
+    /// terminal half is the one the fix INTRODUCED, by returning out of the worker before the
+    /// fleet completion check (Codex, panel review). A fleet left `running` never merges.
+    #[tokio::test]
+    #[ignore = "opens the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn breaker_open_gemini_task_launches_nobody_and_still_finishes_the_fleet() {
+        let _lock = ROUTE_ENV_LOCK.lock().await;
+        // SAFETY: serialised by ROUTE_ENV_LOCK; cleared before the lock drops.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
+            std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE");
+        }
+        // Trip the shared breaker: threshold consecutive quota failures.
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        for _ in 0..8 {
+            mcp_bridge::agy_resilience::agy_breaker_record_quota();
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+        let launcher = GeminiDownLauncher::default();
+        let launched = launcher.launched.clone();
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) },
+            launcher,
+        );
+        orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.clone(),
+                agents: vec!["gemini".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "gemini seat task, breaker open".to_string(),
+            })
+            .await
+            .expect("spawn");
+
+        // Close the breaker again before any assertion can abort the test.
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+
+        assert!(
+            launched.lock().await.is_empty(),
+            "breaker open with substitution disabled must launch NOBODY, not codex"
+        );
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+            .expect("open sqlite");
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE state NOT IN ('done', 'failed')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count pending tasks");
+        assert_eq!(pending, 0, "the blocked task must be terminal, not left in_progress");
+        let fleet_state: String = conn
+            .query_row("SELECT state FROM fleets LIMIT 1", [], |row| row.get(0))
+            .expect("read fleet state");
+        assert_ne!(
+            fleet_state, "running",
+            "the fleet must not be stranded in `running` with no merge phase"
+        );
     }
 
     /// RED IF: a failed gemini fleet task relaunches as codex under the default route.
