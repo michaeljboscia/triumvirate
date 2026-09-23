@@ -419,26 +419,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         Ok(_) => {}
                         Err(e) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "breaker-blocked task row not marked failed"),
                     }
-                    if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                        let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed").unwrap_or(1);
-                        let _ = store.ingest_event(RawEvent {
-                            session_id: fleet_id.clone(),
-                            event_type: "task_failed".to_string(),
-                            sequence,
-                            timestamp: "2030-01-01T00:00:00Z".to_string(),
-                            // No agent ran, so there is no answering `agent` to name. Everywhere
-                            // else in this file `agent` means who ANSWERED; writing the requested
-                            // seat there would claim gemini ran and failed (Codex, panel review).
-                            payload_json: serde_json::json!({
-                                "task_id": task_id,
-                                "agent": serde_json::Value::Null,
-                                "attempted_agent": agent_name,
-                                "requested_agent": agent_name,
-                                "error": "agy circuit breaker open; substitution disabled",
-                            })
-                            .to_string(),
-                        });
-                    }
+                    // No agent ran, so there is no answering `agent` to name. Everywhere
+                    // else in this file `agent` means who ANSWERED; writing the requested
+                    // seat there would claim gemini ran and failed (Codex, panel review).
+                    let payload = serde_json::json!({
+                        "task_id": task_id,
+                        "agent": serde_json::Value::Null,
+                        "attempted_agent": agent_name,
+                        "requested_agent": agent_name,
+                        "error": "agy circuit breaker open; substitution disabled",
+                    })
+                    .to_string();
+                    ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
                     // Every exit from this worker MUST pass through the fleet terminal check.
                     // Returning straight out left the fleet in `running` forever when this was
                     // the last worker to finish: no merge phase, no fleet_failed (Codex, panel
@@ -543,27 +535,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                                     let _ = task_store.complete_task(&task_id);
                                 }
-                                if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                    let seq = event_sequence_for(&project_root, &fleet_id, "task_completed")
-                                        .unwrap_or(1);
-                                    let _ = store.ingest_event(RawEvent {
-                                        session_id: fleet_id.clone(),
-                                        event_type: "task_completed".to_string(),
-                                        sequence: seq,
-                                        timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                        // The agent that DID the work, plus what was asked
-                                        // for when they differ. Recording the requested agent
-                                        // alone would credit gemini for a codex commit once
-                                        // the breaker degrades a task, and the ledger is the
-                                        // record we reason about later.
-                                        payload_json: serde_json::json!({
-                                            "task_id": task_id,
-                                            "agent": launch_agent,
-                                            "requested_agent": agent_name,
-                                            "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
-                                        }).to_string(),
-                                    });
-                                }
+                                // The agent that DID the work, plus what was asked
+                                // for when they differ. Recording the requested agent
+                                // alone would credit gemini for a codex commit once
+                                // the breaker degrades a task, and the ledger is the
+                                // record we reason about later.
+                                let payload = serde_json::json!({
+                                    "task_id": task_id,
+                                    "agent": launch_agent,
+                                    "requested_agent": agent_name,
+                                    "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
+                                }).to_string();
+                                ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
                                 if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.clone()) {
                                     // author_agent must be whoever actually wrote the code, or
                                     // peer review can hand a codex diff back to codex to review
@@ -659,16 +642,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                                             let _ = task_store.complete_task(&task_id);
                                         }
-                                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                            let seq = event_sequence_for(&project_root, &fleet_id, "task_completed").unwrap_or(1);
-                                            let _ = store.ingest_event(RawEvent {
-                                                session_id: fleet_id.clone(),
-                                                event_type: "task_completed".to_string(),
-                                                sequence: seq,
-                                                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                                payload_json: serde_json::json!({"task_id": task_id, "agent": "codex", "degraded_from": "agy"}).to_string(),
-                                            });
-                                        }
+                                        let payload = serde_json::json!({"task_id": task_id, "agent": "codex", "degraded_from": "agy"}).to_string();
+                                        ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
                                     }
                                 }
 
@@ -695,26 +670,17 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             [task_id.as_str()],
                                         );
                                     }
-                                    if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                        let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                            .unwrap_or(1);
-                                        let _ = store.ingest_event(RawEvent {
-                                            session_id: fleet_id.clone(),
-                                            event_type: "task_failed".to_string(),
-                                            sequence,
-                                            timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                            // Without the agent, a task_failed row cannot tell
-                                            // a degraded codex failure from the requested
-                                            // gemini failing: the two demand opposite fixes.
-                                            payload_json: serde_json::json!({
-                                                "task_id": task_id,
-                                                "agent": launch_agent,
-                                                "requested_agent": agent_name,
-                                                "error": format!("agent exited with status {:?}", status.code()),
-                                            })
-                                            .to_string(),
-                                        });
-                                    }
+                                    // Without the agent, a task_failed row cannot tell
+                                    // a degraded codex failure from the requested
+                                    // gemini failing: the two demand opposite fixes.
+                                    let payload = serde_json::json!({
+                                        "task_id": task_id,
+                                        "agent": launch_agent,
+                                        "requested_agent": agent_name,
+                                        "error": format!("agent exited with status {:?}", status.code()),
+                                    })
+                                    .to_string();
+                                    ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
                                 }
                             }
                             Err(err) => {
@@ -748,23 +714,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         [task_id.as_str()],
                                     );
                                 }
-                                if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                    let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                        .unwrap_or(1);
-                                    let _ = store.ingest_event(RawEvent {
-                                        session_id: fleet_id.clone(),
-                                        event_type: "task_failed".to_string(),
-                                        sequence,
-                                        timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                        payload_json: serde_json::json!({
-                                            "task_id": task_id,
-                                            "agent": launch_agent,
-                                            "requested_agent": agent_name,
-                                            "error": err.to_string()
-                                        })
-                                        .to_string(),
-                                    });
-                                }
+                                let payload = serde_json::json!({
+                                    "task_id": task_id,
+                                    "agent": launch_agent,
+                                    "requested_agent": agent_name,
+                                    "error": err.to_string()
+                                })
+                                .to_string();
+                                ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
                             }
                         }
                     }
@@ -794,23 +751,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 [task_id.as_str()],
                             );
                         }
-                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                            let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                .unwrap_or(1);
-                            let _ = store.ingest_event(RawEvent {
-                                session_id: fleet_id.clone(),
-                                event_type: "task_failed".to_string(),
-                                sequence,
-                                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                payload_json: serde_json::json!({
-                                    "task_id": task_id,
-                                    "agent": launch_agent,
-                                    "requested_agent": agent_name,
-                                    "error": err.to_string()
-                                })
-                                .to_string(),
-                            });
-                        }
+                        let payload = serde_json::json!({
+                            "task_id": task_id,
+                            "agent": launch_agent,
+                            "requested_agent": agent_name,
+                            "error": err.to_string()
+                        })
+                        .to_string();
+                        ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
                     }
                 }
 
@@ -1007,6 +955,45 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         }
         Ok(())
     }
+}
+
+/// Append a fleet event, allocating its sequence and retrying when another worker took it.
+///
+/// `event_sequence_for` reads `MAX(sequence)` on its own connection, outside any transaction,
+/// and the ledger holds `UNIQUE(session_id, event_type, sequence)`. Workers that finish at the
+/// same instant read the same number and one insert is rejected. Every call site discarded the
+/// result (`let _ =`), so the losing event simply vanished: the fleet's own record of what
+/// happened, dropped, silently. The concurrency is not hypothetical, the agy circuit breaker is
+/// process-global, so when it opens EVERY gemini worker takes the blocked path in the same
+/// moment (Antigravity, panel review).
+///
+/// Still best-effort by design: the ledger is a record, not the control path, and a fleet must
+/// not hang because it could not write one. But it retries now, and says so when it gives up.
+fn ingest_fleet_event(project_root: &Path, fleet_id: &str, event_type: &str, payload_json: String) {
+    let Ok(store) = LedgerStore::open(project_root.to_path_buf()) else {
+        tracing::error!(fleet_id = %fleet_id, event_type = %event_type, "fleet event dropped: ledger would not open");
+        return;
+    };
+    let mut last_err = None;
+    for _ in 0..8 {
+        let sequence = event_sequence_for(project_root, fleet_id, event_type).unwrap_or(1);
+        match store.ingest_event(RawEvent {
+            session_id: fleet_id.to_string(),
+            event_type: event_type.to_string(),
+            sequence,
+            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            payload_json: payload_json.clone(),
+        }) {
+            Ok(_) => return,
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    tracing::error!(
+        fleet_id = %fleet_id,
+        event_type = %event_type,
+        error = last_err.unwrap_or_default(),
+        "fleet event dropped after 8 sequence collisions"
+    );
 }
 
 fn event_sequence_for(

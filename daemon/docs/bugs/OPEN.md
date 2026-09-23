@@ -19,6 +19,12 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-031 - A failed codex substitution is recorded as the gemini seat's failure
+**Found:** 2026-09-23 (D-027 panel, Antigravity) · **Severity:** MEDIUM · **NOT FIXED**
+**Evidence:** `fleet/src/orchestrator.rs` degraded path. When the agy task fails and the opted-in codex relaunch ALSO fails, the final `task_failed` event writes `agent: launch_agent` and `error: format!("agent exited with status {:?}", status.code())`. `launch_agent` is bound before the degrade and `status` is the FIRST attempt's exit status, so codex's failure is invisible: the row says gemini failed, with gemini's exit code. The comment directly above it claims this field is what distinguishes "a degraded codex failure" from "the requested gemini failing".
+**Second finding, same review:** the `JoinError` handler added for panicking workers lives in `spawn_fleet_members`' await loop. With `wait: true` that loop runs in the caller's task, so a dropped request (client cancel, connection drop) takes the loop with it while the `tokio::spawn`ed workers keep running detached. A worker that panics after that point is unobserved again, and its task stays `in_progress`. Pre-existing for every other exit too; the handler narrows the window, it does not close it.
+**CHECK to close:** a failed degraded relaunch is recorded with the agent that actually failed and that agent's error; a worker panicking after its caller was cancelled still reaches a terminal task state.
+
 ### D-030 - A review verdict cannot say who answered, so a substituted reviewer is accepted
 **Found:** 2026-09-22 (D-027 panel, Codex and Grok independently) · **Severity:** HIGH · **NOT FIXED**
 **Evidence:** four surfaces drop or fake reviewer identity.
@@ -316,4 +322,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-09-22 (D-027 found, fixed, verified live and closed; its peer panel added D-028, D-029, D-030) (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
+**Last reviewed:** 2026-09-22 (D-027 found, fixed, verified live and closed; its three-seat peer panel added D-028 through D-031) (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
