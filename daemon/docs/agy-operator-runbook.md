@@ -83,8 +83,8 @@ TRIUMVIRATE_GEMINI_SHADOW=on              # also run agy on every gemini request
 
 ## 3. Resilience behavior (what happens on failure)
 
-- **Degraded route** (`TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`, default `gemini-cli,codex`;
-  set to `fail` to disable): when the agy primary hard-fails, the request is retried
+- **Degraded route** (`TRIUMVIRATE_GEMINI_DEGRADED_ROUTE`, default `fail` since 2026-09-21,
+  D-027; set `codex` to opt in to substitution): when the agy primary hard-fails, the request is retried
   on the next backend in the chain. **Quota/429 failures skip gemini-cli** (it shares
   agy's exhausted pool) and go straight to **codex**. gemini-cli auto-drops out of the
   chain by failing its exec once the binary retires — no date logic. A codex answer is
@@ -132,7 +132,7 @@ Last verified-good version: **1.0.2** (2026-05-24).
 | `TRIUMVIRATE_AGY_BIN` / `_ARGS` | `agy` / — | binary path + extra args |
 | `TRIUMVIRATE_AGY_CAPTURE` | `pipe` | `pty` is reserved (fails loud — not yet implemented) |
 | `TRIUMVIRATE_AGY_CONNECTOR_TIMEOUT_SECS` | `900` | agy timeout; also passed to `--print-timeout` |
-| `TRIUMVIRATE_GEMINI_DEGRADED_ROUTE` | `gemini-cli,codex` | fallback chain; `fail` disables |
+| `TRIUMVIRATE_GEMINI_DEGRADED_ROUTE` | `fail` | fallback chain; `codex` opts in to substitution (D-027) |
 | `TRIUMVIRATE_GEMINI_DEGRADED_TOTAL_TIMEOUT_SECS` | `900` | total wall-clock budget for the degraded route |
 | `TRIUMVIRATE_AGY_MAX_CONCURRENT` | `3` | global cap on simultaneous agy children |
 | `TRIUMVIRATE_AGY_MAX_RPM` | `30` | token-bucket call-rate ceiling |

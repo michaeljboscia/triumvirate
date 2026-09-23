@@ -349,13 +349,16 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         })?;
 
         // Launch all agent processes in parallel and monitor completion.
-        let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut join_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
         for (task_prompt, task_id, agent_name) in running_agents {
             let launcher = self.launcher.clone();
             let orchestrator = self.clone();
             let project_root = project_root.clone();
             let fleet_id = fleet_id.clone();
             let worktree_path = worktree_paths[join_handles.len()].clone();
+            // Cloned BEFORE the move: the join arm needs the id to mark a panicked worker's
+            // task failed, and the spawned body takes ownership of the original.
+            let joined_task_id = task_id.clone();
             let jh = tokio::spawn(async move {
                 tracing::info!(fleet_id = %fleet_id, task_id = %task_id, agent = %agent_name, "launching fleet agent subprocess");
                 let task_started = std::time::Instant::now();
@@ -385,6 +388,55 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     // No breaker event emitted here: agy_breaker_should_skip() already emits
                     // "blocked_call" for every caller. Emitting again would double-count
                     // fleet's shed traffic against the ask path's.
+                }
+                // No substitution unless the operator opted in. Launching codex here put Codex
+                // in the Gemini seat and recorded it as a success.
+                if breaker_open && !mcp_bridge::agy_resilience::degraded_route_allows_codex() {
+                    tracing::error!(
+                        fleet_id = %fleet_id,
+                        task_id = %task_id,
+                        agent = %agent_name,
+                        "agy circuit breaker OPEN and TRIUMVIRATE_GEMINI_DEGRADED_ROUTE does not allow codex; failing task"
+                    );
+                    mcp_bridge::posthog::record_fleet_task(
+                        &agent_name,
+                        backend_label,
+                        "skipped_breaker_open",
+                        task_started.elapsed().as_millis() as u64,
+                        &fleet_id,
+                        &task_id,
+                    );
+                    // A silently dropped UPDATE leaves the row `in_progress` forever, and the
+                    // fleet terminal check below counts it as still pending. Log it loud.
+                    match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+                        .and_then(|conn| {
+                            conn.execute(
+                                "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
+                                rusqlite::params![task_id.as_str()],
+                            )
+                        }) {
+                        Ok(0) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, "breaker-blocked task row not marked failed: no row matched"),
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "breaker-blocked task row not marked failed"),
+                    }
+                    // No agent ran, so there is no answering `agent` to name. Everywhere
+                    // else in this file `agent` means who ANSWERED; writing the requested
+                    // seat there would claim gemini ran and failed (Codex, panel review).
+                    let payload = serde_json::json!({
+                        "task_id": task_id,
+                        "agent": serde_json::Value::Null,
+                        "attempted_agent": agent_name,
+                        "requested_agent": agent_name,
+                        "error": "agy circuit breaker open; substitution disabled",
+                    })
+                    .to_string();
+                    ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
+                    // Every exit from this worker MUST pass through the fleet terminal check.
+                    // Returning straight out left the fleet in `running` forever when this was
+                    // the last worker to finish: no merge phase, no fleet_failed (Codex, panel
+                    // review of this fix).
+                    orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
+                    return;
                 }
                 // Route around agy for real. Emitting "skipped" and then launching agy
                 // anyway would be a lying event, which is the failure mode this whole pass
@@ -423,6 +475,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             rusqlite::params![task_id.as_str()],
                         );
                     }
+                    // This return is a worker exit too (Grok, panel review): cancelling
+                    // between the in-memory flag and the ledger write left the fleet
+                    // `running` with nothing left to drive it terminal.
+                    orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
                     return;
                 }
                 let launch_result = launcher
@@ -479,27 +535,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                                     let _ = task_store.complete_task(&task_id);
                                 }
-                                if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                    let seq = event_sequence_for(&project_root, &fleet_id, "task_completed")
-                                        .unwrap_or(1);
-                                    let _ = store.ingest_event(RawEvent {
-                                        session_id: fleet_id.clone(),
-                                        event_type: "task_completed".to_string(),
-                                        sequence: seq,
-                                        timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                        // The agent that DID the work, plus what was asked
-                                        // for when they differ. Recording the requested agent
-                                        // alone would credit gemini for a codex commit once
-                                        // the breaker degrades a task, and the ledger is the
-                                        // record we reason about later.
-                                        payload_json: serde_json::json!({
-                                            "task_id": task_id,
-                                            "agent": launch_agent,
-                                            "requested_agent": agent_name,
-                                            "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
-                                        }).to_string(),
-                                    });
-                                }
+                                // The agent that DID the work, plus what was asked
+                                // for when they differ. Recording the requested agent
+                                // alone would credit gemini for a codex commit once
+                                // the breaker degrades a task, and the ledger is the
+                                // record we reason about later.
+                                let payload = serde_json::json!({
+                                    "task_id": task_id,
+                                    "agent": launch_agent,
+                                    "requested_agent": agent_name,
+                                    "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
+                                }).to_string();
+                                ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
                                 if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.clone()) {
                                     // author_agent must be whoever actually wrote the code, or
                                     // peer review can hand a codex diff back to codex to review
@@ -545,7 +592,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 // A SIGTERM from fleet_cancel is a non-zero exit too. Without this
                                 // check, cancelling an agy worker launched a codex replacement
                                 // (Codex, review of step 6).
-                                if use_agy && !fleet_is_cancelled(&fleet_id) {
+                                if use_agy
+                                    && !fleet_is_cancelled(&fleet_id)
+                                    && mcp_bridge::agy_resilience::degraded_route_allows_codex()
+                                {
                                     tracing::warn!(
                                         fleet_id = %fleet_id,
                                         task_id = %task_id,
@@ -592,16 +642,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                                             let _ = task_store.complete_task(&task_id);
                                         }
-                                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                            let seq = event_sequence_for(&project_root, &fleet_id, "task_completed").unwrap_or(1);
-                                            let _ = store.ingest_event(RawEvent {
-                                                session_id: fleet_id.clone(),
-                                                event_type: "task_completed".to_string(),
-                                                sequence: seq,
-                                                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                                payload_json: serde_json::json!({"task_id": task_id, "agent": "codex", "degraded_from": "agy"}).to_string(),
-                                            });
-                                        }
+                                        let payload = serde_json::json!({"task_id": task_id, "agent": "codex", "degraded_from": "agy"}).to_string();
+                                        ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
                                     }
                                 }
 
@@ -628,26 +670,17 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             [task_id.as_str()],
                                         );
                                     }
-                                    if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                        let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                            .unwrap_or(1);
-                                        let _ = store.ingest_event(RawEvent {
-                                            session_id: fleet_id.clone(),
-                                            event_type: "task_failed".to_string(),
-                                            sequence,
-                                            timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                            // Without the agent, a task_failed row cannot tell
-                                            // a degraded codex failure from the requested
-                                            // gemini failing: the two demand opposite fixes.
-                                            payload_json: serde_json::json!({
-                                                "task_id": task_id,
-                                                "agent": launch_agent,
-                                                "requested_agent": agent_name,
-                                                "error": format!("agent exited with status {:?}", status.code()),
-                                            })
-                                            .to_string(),
-                                        });
-                                    }
+                                    // Without the agent, a task_failed row cannot tell
+                                    // a degraded codex failure from the requested
+                                    // gemini failing: the two demand opposite fixes.
+                                    let payload = serde_json::json!({
+                                        "task_id": task_id,
+                                        "agent": launch_agent,
+                                        "requested_agent": agent_name,
+                                        "error": format!("agent exited with status {:?}", status.code()),
+                                    })
+                                    .to_string();
+                                    ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
                                 }
                             }
                             Err(err) => {
@@ -681,23 +714,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         [task_id.as_str()],
                                     );
                                 }
-                                if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                                    let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                        .unwrap_or(1);
-                                    let _ = store.ingest_event(RawEvent {
-                                        session_id: fleet_id.clone(),
-                                        event_type: "task_failed".to_string(),
-                                        sequence,
-                                        timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                        payload_json: serde_json::json!({
-                                            "task_id": task_id,
-                                            "agent": launch_agent,
-                                            "requested_agent": agent_name,
-                                            "error": err.to_string()
-                                        })
-                                        .to_string(),
-                                    });
-                                }
+                                let payload = serde_json::json!({
+                                    "task_id": task_id,
+                                    "agent": launch_agent,
+                                    "requested_agent": agent_name,
+                                    "error": err.to_string()
+                                })
+                                .to_string();
+                                ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
                             }
                         }
                     }
@@ -727,49 +751,73 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 [task_id.as_str()],
                             );
                         }
-                        if let Ok(store) = LedgerStore::open(project_root.clone()) {
-                            let sequence = event_sequence_for(&project_root, &fleet_id, "task_failed")
-                                .unwrap_or(1);
-                            let _ = store.ingest_event(RawEvent {
-                                session_id: fleet_id.clone(),
-                                event_type: "task_failed".to_string(),
-                                sequence,
-                                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                                payload_json: serde_json::json!({
-                                    "task_id": task_id,
-                                    "agent": launch_agent,
-                                    "requested_agent": agent_name,
-                                    "error": err.to_string()
-                                })
-                                .to_string(),
-                            });
-                        }
+                        let payload = serde_json::json!({
+                            "task_id": task_id,
+                            "agent": launch_agent,
+                            "requested_agent": agent_name,
+                            "error": err.to_string()
+                        })
+                        .to_string();
+                        ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
                     }
                 }
 
-                let db_path = project_root.join(".triumvirate").join("ledger.db");
-                let pending = rusqlite::Connection::open(db_path)
-                    .and_then(|conn| {
-                        conn.query_row(
-                            "SELECT COUNT(*) FROM tasks
-                             WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed')",
-                            [fleet_id.as_str()],
-                            |row| row.get::<_, i64>(0),
-                        )
-                    })
-                    .unwrap_or(1);
-                if pending == 0 {
-                    tracing::info!(fleet_id = %fleet_id, "all fleet agents complete, starting merge phase");
-                    let _ = orchestrator.complete_fleet(&fleet_id, &project_root).await;
-                }
+                orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
             });
-            join_handles.push(jh);
+            join_handles.push((joined_task_id, jh));
         }
-        // Await all agent completions
-        for jh in join_handles {
-            let _ = jh.await;
+        // Await all agent completions. A panicking worker body reaches NONE of its own exits,
+        // so its task row stays `in_progress` and every other worker's terminal count sees it
+        // as pending: the fleet never merges and never fails (Grok, panel review). The
+        // JoinError is the only place that panic is visible, and it used to be discarded.
+        for (task_id, jh) in join_handles {
+            if let Err(join_err) = jh.await {
+                tracing::error!(
+                    fleet_id = %fleet_id,
+                    task_id = %task_id,
+                    error = %join_err,
+                    "fleet worker panicked or was aborted; marking its task failed"
+                );
+                match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+                    .and_then(|conn| {
+                        conn.execute(
+                            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
+                            rusqlite::params![task_id.as_str()],
+                        )
+                    }) {
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "panicked worker's task row not marked failed"),
+                }
+                self.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
+            }
         }
         Ok(worktree_paths)
+    }
+
+    /// Start the merge phase once no task of this fleet is still pending. Every worker exit
+    /// path calls this, including the ones that never launch a child: a fleet whose last
+    /// worker returns early otherwise stays `running` with no merge and no failure event.
+    async fn finalize_if_all_tasks_terminal(&self, fleet_id: &str, project_root: &Path) {
+        let db_path = project_root.join(".triumvirate").join("ledger.db");
+        let pending = rusqlite::Connection::open(db_path)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tasks
+                     WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed')",
+                    [fleet_id],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or_else(|e| {
+                // Failing closed is right (never merge on an unknown count), but doing it
+                // SILENTLY is how a fleet sits in `running` with nobody able to say why.
+                tracing::error!(fleet_id = %fleet_id, error = %e, "fleet terminal count failed; treating fleet as still pending");
+                1
+            });
+        if pending == 0 {
+            tracing::info!(fleet_id = %fleet_id, "all fleet agents complete, starting merge phase");
+            let _ = self.complete_fleet(fleet_id, project_root).await;
+        }
     }
 
     async fn complete_fleet(&self, fleet_id: &str, project_root: &Path) -> anyhow::Result<()> {
@@ -907,6 +955,45 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         }
         Ok(())
     }
+}
+
+/// Append a fleet event, allocating its sequence and retrying when another worker took it.
+///
+/// `event_sequence_for` reads `MAX(sequence)` on its own connection, outside any transaction,
+/// and the ledger holds `UNIQUE(session_id, event_type, sequence)`. Workers that finish at the
+/// same instant read the same number and one insert is rejected. Every call site discarded the
+/// result (`let _ =`), so the losing event simply vanished: the fleet's own record of what
+/// happened, dropped, silently. The concurrency is not hypothetical, the agy circuit breaker is
+/// process-global, so when it opens EVERY gemini worker takes the blocked path in the same
+/// moment (Antigravity, panel review).
+///
+/// Still best-effort by design: the ledger is a record, not the control path, and a fleet must
+/// not hang because it could not write one. But it retries now, and says so when it gives up.
+fn ingest_fleet_event(project_root: &Path, fleet_id: &str, event_type: &str, payload_json: String) {
+    let Ok(store) = LedgerStore::open(project_root.to_path_buf()) else {
+        tracing::error!(fleet_id = %fleet_id, event_type = %event_type, "fleet event dropped: ledger would not open");
+        return;
+    };
+    let mut last_err = None;
+    for _ in 0..8 {
+        let sequence = event_sequence_for(project_root, fleet_id, event_type).unwrap_or(1);
+        match store.ingest_event(RawEvent {
+            session_id: fleet_id.to_string(),
+            event_type: event_type.to_string(),
+            sequence,
+            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            payload_json: payload_json.clone(),
+        }) {
+            Ok(_) => return,
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    tracing::error!(
+        fleet_id = %fleet_id,
+        event_type = %event_type,
+        error = last_err.unwrap_or_default(),
+        "fleet event dropped after 8 sequence collisions"
+    );
 }
 
 fn event_sequence_for(
@@ -1239,6 +1326,172 @@ mod tests {
         ) -> anyhow::Result<Child> {
             anyhow::bail!("launcher failure");
         }
+    }
+
+    /// Records every agent launched. gemini exits 1 (agy down); anything else exits 0.
+    #[derive(Debug, Clone, Default)]
+    struct GeminiDownLauncher {
+        launched: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl AgentLauncher for GeminiDownLauncher {
+        async fn launch(
+            &self,
+            agent: &str,
+            _project_root: &Path,
+            _worktree_path: &Path,
+            _task_prompt: &str,
+        ) -> anyhow::Result<Child> {
+            self.launched.lock().await.push(agent.to_string());
+            let code = if agent == "gemini" { "exit 1" } else { "exit 0" };
+            Ok(Command::new("sh").arg("-c").arg(code).spawn()?)
+        }
+    }
+
+    /// Serialises the two tests below: both set the route env and feed the global breaker.
+    static ROUTE_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    async fn launched_for_failing_gemini(route: Option<&str>) -> Vec<String> {
+        let _lock = ROUTE_ENV_LOCK.lock().await;
+        // SAFETY: serialised by ROUTE_ENV_LOCK; restored before the lock drops.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
+            match route {
+                Some(r) => std::env::set_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", r),
+                None => std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE"),
+            }
+        }
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+        let launcher = GeminiDownLauncher::default();
+        let launched = launcher.launched.clone();
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) },
+            launcher,
+        );
+        orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root,
+                agents: vec!["gemini".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "gemini seat task".to_string(),
+            })
+            .await
+            .expect("spawn");
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        launched.lock().await.clone()
+    }
+
+    /// RED IF: a breaker-open gemini task either launches codex, or strands its fleet.
+    ///
+    /// `#[ignore]` because the agy breaker is PROCESS-GLOBAL. Opening it here blocked the agy
+    /// task of a test running in parallel, and that test's `record_success` closed it back
+    /// under this one: they failed each other, in both directions. A local lock cannot fix
+    /// that, since the other tests do not take it.
+    ///
+    /// Both halves matter. The substitution half is the defect this pass exists to kill; the
+    /// terminal half is the one the fix INTRODUCED, by returning out of the worker before the
+    /// fleet completion check (Codex, panel review). A fleet left `running` never merges.
+    #[tokio::test]
+    #[ignore = "opens the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn breaker_open_gemini_task_launches_nobody_and_still_finishes_the_fleet() {
+        let launched = breaker_open_launched(None).await;
+        assert!(
+            launched.is_empty(),
+            "breaker open with substitution disabled must launch NOBODY, not codex: {launched:?}"
+        );
+    }
+
+    /// Negative control for the test above: with the opt-in, the breaker-open path really does
+    /// reach the codex launch. Without this, a `degraded_route_allows_codex()` that always
+    /// returned false would leave that test green (Grok, panel review).
+    #[tokio::test]
+    #[ignore = "opens the process-global agy breaker; run with scripts/verify-live-agents.sh strict"]
+    async fn breaker_open_gemini_task_launches_codex_only_when_opted_in() {
+        let launched = breaker_open_launched(Some("codex")).await;
+        assert_eq!(launched, vec!["codex"], "the opt-in must still substitute");
+    }
+
+    /// Trips the process-global breaker, runs one gemini fleet task, returns what was launched.
+    /// Also asserts the fleet finished: the terminal check is the half the D-027 fix broke.
+    async fn breaker_open_launched(route: Option<&str>) -> Vec<String> {
+        let _lock = ROUTE_ENV_LOCK.lock().await;
+        // SAFETY: serialised by ROUTE_ENV_LOCK; cleared before the lock drops.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
+            match route {
+                Some(r) => std::env::set_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", r),
+                None => std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE"),
+            }
+        }
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        for _ in 0..8 {
+            mcp_bridge::agy_resilience::agy_breaker_record_quota();
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
+        let _ = ledger::LedgerStore::open(project_root.clone()).expect("open ledger");
+        let launcher = GeminiDownLauncher::default();
+        let launched = launcher.launched.clone();
+        let orchestrator = FleetOrchestrator::with_launcher(
+            MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) },
+            launcher,
+        );
+        orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.clone(),
+                agents: vec!["gemini".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "gemini seat task, breaker open".to_string(),
+            })
+            .await
+            .expect("spawn");
+
+        // Restore global state BEFORE any assertion can abort this helper.
+        unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+            .expect("open sqlite");
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE state NOT IN ('done', 'failed')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count pending tasks");
+        assert_eq!(pending, 0, "the task must be terminal, not left in_progress");
+        let fleet_state: String = conn
+            .query_row("SELECT state FROM fleets LIMIT 1", [], |row| row.get(0))
+            .expect("read fleet state");
+        // `assert_ne!(state, "running")` passed on a fleet stuck in `merging` (Grok, panel
+        // review). Name the states that mean the terminal check actually ran to completion.
+        assert!(
+            matches!(fleet_state.as_str(), "done" | "failed" | "merged"),
+            "fleet must reach a terminal state, got `{fleet_state}`"
+        );
+        launched.lock().await.clone()
+    }
+
+    /// RED IF: a failed gemini fleet task relaunches as codex under the default route.
+    #[tokio::test]
+    async fn failed_gemini_task_is_not_relaunched_as_codex_by_default() {
+        assert_eq!(launched_for_failing_gemini(None).await, vec!["gemini"]);
+    }
+
+    /// Negative control: with the opt-in, the fixture really does reach the codex relaunch.
+    #[tokio::test]
+    async fn failed_gemini_task_relaunches_as_codex_only_when_opted_in() {
+        assert_eq!(launched_for_failing_gemini(Some("codex")).await, vec!["gemini", "codex"]);
     }
 
     #[tokio::test]
