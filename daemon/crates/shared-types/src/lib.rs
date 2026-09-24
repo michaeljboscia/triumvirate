@@ -368,7 +368,7 @@ pub struct BreakerProbeResponse {
     pub backend: String,
     pub before: BreakerSnapshot,
     pub after: BreakerSnapshot,
-    /// `ok`, `capture_degraded`, or `backend_failed`.
+    /// `ok`, `capture_degraded`, `backend_failed`, or `auth_required`.
     pub outcome: String,
     pub detail: String,
     /// True only when this probe moved the breaker from not-closed to closed.
