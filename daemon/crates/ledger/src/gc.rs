@@ -39,7 +39,10 @@ pub(crate) fn has_active_fleets(store: &LedgerStore) -> anyhow::Result<bool> {
             "SELECT EXISTS(
                 SELECT 1
                 FROM fleets
-                WHERE state NOT IN ('done', 'failed')
+                -- `blocked_on_review` is waiting on a HUMAN verdict, not on a worker, so it
+                -- is not active work. Counting it as active meant one blocked fleet skipped
+                -- startup GC forever (Codex, D-031 panel review).
+                WHERE state NOT IN ('done', 'failed', 'blocked_on_review')
             )",
             [],
             |row| row.get(0),

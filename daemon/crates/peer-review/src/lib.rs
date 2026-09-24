@@ -32,6 +32,9 @@ pub struct ReviewRecord {
     pub comments: Option<String>,
     pub state: String,
     pub dispatch_owned: bool,
+    /// When the verdict was recorded. `None` until one is. Fleet orders by this: a reviewer
+    /// who rejected and later approved must not be blocked forever by the older verdict.
+    pub reviewed_at: Option<String>,
 }
 
 /// The default panel, overridable with `TRIUMVIRATE_PEER_REVIEWERS` (comma separated).
@@ -129,8 +132,17 @@ impl PeerReviewEngine {
 
     pub fn request_review(&self, req: ReviewRequest) -> anyhow::Result<ReviewRecord> {
         let reviewer = self.next_reviewer(&req.author_agent)?;
-        if reviewer.eq_ignore_ascii_case(&req.author_agent) {
-            anyhow::bail!("author cannot review own output");
+        // D-030: compared RAW, so `author_agent: "antigravity"` was not equal to the roster's
+        // `gemini` and the author was handed its own output to review. Dispatch canonicalizes
+        // aliases (`antigravity`/`agy` -> `gemini`, `xai`/`supergrok` -> `grok`); this check
+        // did not, so the two disagreed about who the reviewer WAS.
+        if shared_types::normalize_agent_name(&reviewer)
+            == shared_types::normalize_agent_name(&req.author_agent)
+        {
+            anyhow::bail!(
+                "author cannot review own output (`{reviewer}` and `{}` are the same agent)",
+                req.author_agent
+            );
         }
         let review_id = format!("review-{}", Uuid::new_v4());
         let conn = self.open_conn()?;
@@ -303,7 +315,7 @@ impl PeerReviewEngine {
         let conn = self.open_conn()?;
         conn.query_row(
             "SELECT review_id, fleet_id, author_agent, reviewer_agent, verdict, comments, state,
-                    COALESCE(dispatch_owned, 0)
+                    COALESCE(dispatch_owned, 0), reviewed_at
              FROM reviews
              WHERE review_id = ?1",
             [review_id],
@@ -317,11 +329,44 @@ impl PeerReviewEngine {
                     comments: row.get(5)?,
                     state: row.get(6)?,
                     dispatch_owned: row.get::<_, i64>(7)? != 0,
+                    reviewed_at: row.get(8)?,
                 })
             },
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Every review recorded against `artifact`. Fleet needs this to answer "was this task
+    /// actually reviewed?" before it merges: it holds the artifact name, never the review id.
+    pub fn reviews_for_artifact(&self, artifact: &str) -> anyhow::Result<Vec<ReviewRecord>> {
+        let conn = self.open_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT review_id, fleet_id, author_agent, reviewer_agent, verdict, comments, state,
+                    COALESCE(dispatch_owned, 0), reviewed_at
+             FROM reviews
+             WHERE artifact = ?1
+             -- rowid breaks the tie: reviewed_at is datetime('now'), whose resolution is ONE
+             -- SECOND, so a reject and a follow-up approval recorded in the same second sort
+             -- arbitrarily and the older verdict could win. Insertion order cannot tie.
+             ORDER BY reviewed_at DESC NULLS LAST, rowid DESC",
+        )?;
+        let rows = stmt
+            .query_map([artifact], |row| {
+                Ok(ReviewRecord {
+                    review_id: row.get(0)?,
+                    fleet_id: row.get(1)?,
+                    author_agent: row.get(2)?,
+                    reviewer_agent: row.get(3)?,
+                    verdict: row.get(4)?,
+                    comments: row.get(5)?,
+                    state: row.get(6)?,
+                    dispatch_owned: row.get::<_, i64>(7)? != 0,
+                    reviewed_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn fail_timed_out_reviews(&self, timeout_seconds: u64) -> anyhow::Result<usize> {
@@ -337,10 +382,12 @@ impl PeerReviewEngine {
     }
 
     fn next_reviewer(&self, author_agent: &str) -> anyhow::Result<String> {
+        // Exclude the author by CANONICAL identity, not by spelling (D-030).
+        let author_canonical = shared_types::normalize_agent_name(author_agent);
         let candidates = self
             .reviewers
             .iter()
-            .filter(|name| !name.eq_ignore_ascii_case(author_agent))
+            .filter(|name| shared_types::normalize_agent_name(name) != author_canonical)
             .cloned()
             .collect::<Vec<_>>();
         if candidates.is_empty() {
@@ -674,6 +721,44 @@ mod submit_authority_tests {
             .expect("request review");
         let reviewer = review.reviewer_agent.clone().expect("reviewer assigned");
         (engine, review.review_id, reviewer)
+    }
+
+    /// D-030. An alias of the author is the author: `antigravity` resolves to `gemini` at
+    /// dispatch, so gemini must never be handed antigravity's work to review.
+    ///
+    /// Uses the DEFAULT roster deliberately. An earlier version set TRIUMVIRATE_PEER_REVIEWERS,
+    /// which every other test in this binary reads without taking the lock, and five of them
+    /// failed under it. Process-global state does not become safe because one side locks.
+    /// RED IF: either comparison goes back to raw string equality.
+    #[test]
+    fn d030_an_alias_of_the_author_is_never_chosen_as_its_reviewer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _ = ledger::LedgerStore::open(temp.path().to_path_buf()).expect("ledger");
+        let engine = PeerReviewEngine::new(temp.path().to_path_buf()).expect("engine");
+
+        let record = engine
+            .request_review(ReviewRequest {
+                fleet_id: None,
+                author_agent: "antigravity".to_string(),
+                artifact: "diff-alias".to_string(),
+                review_type: "code".to_string(),
+                dispatch_owned: false,
+            })
+            .expect("a non-author reviewer exists in the default roster");
+        let reviewer = record.reviewer_agent.clone().unwrap_or_default();
+        assert_ne!(
+            shared_types::normalize_agent_name(&reviewer),
+            "gemini",
+            "antigravity IS gemini; it was assigned its own output (reviewer `{reviewer}`)"
+        );
+
+        // NEGATIVE CONTROL: gemini IS in the default roster and is selectable for a different
+        // author, so the assertion above cannot pass merely because gemini never gets picked.
+        let reviewers = engine.reviewer_names();
+        assert!(
+            reviewers.iter().any(|r| shared_types::normalize_agent_name(r) == "gemini"),
+            "{reviewers:?}"
+        );
     }
 
     fn force_state(engine: &PeerReviewEngine, review_id: &str, state: &str) {

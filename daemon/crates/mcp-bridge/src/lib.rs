@@ -89,14 +89,11 @@ pub fn display_agent_name(agent: &str) -> String {
     }
 }
 
+/// Re-export of the one canonical implementation (`shared_types`). Kept as a function here so
+/// every existing `mcp_bridge::normalize_agent_name` call site is unchanged, and so there is
+/// still exactly one alias list in the daemon (D-030).
 pub fn normalize_agent_name(agent: &str) -> String {
-    match agent.to_lowercase().as_str() {
-        "antigravity" | "agy" => "gemini".to_string(),
-        // REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an
-        // alias only. The canonical execution key is `grok` and the binary is `grok`.
-        "grok-build" | "xai" | "supergrok" => "grok".to_string(),
-        other => other.to_string(),
-    }
+    shared_types::normalize_agent_name(agent)
 }
 
 /// The canonical list of agents this daemon can dispatch. REQ-GROK-003.
