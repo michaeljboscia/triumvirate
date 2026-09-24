@@ -362,14 +362,17 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let guard_root = project_root.clone();
             let guard_fleet = fleet_id.clone();
             let guard_task = task_id.clone();
+            let guard_orchestrator = orchestrator.clone();
             let jh = tokio::spawn(async move {
-                // Armed for the whole worker body. See WorkerTerminalGuard: this is what keeps
-                // a panicking or aborted worker from stranding its fleet when the caller's
-                // await loop is gone (D-031).
-                let _terminal_guard = WorkerTerminalGuard {
+                // Armed for the whole worker body, disarmed at its end. See
+                // WorkerTerminalGuard: this is what keeps a panicking or aborted worker from
+                // stranding its fleet when the caller's await loop is gone (D-031).
+                let mut terminal_guard = WorkerTerminalGuard {
+                    orchestrator: guard_orchestrator,
                     project_root: guard_root,
                     fleet_id: guard_fleet,
                     task_id: guard_task,
+                    armed: true,
                 };
                 tracing::info!(fleet_id = %fleet_id, task_id = %task_id, agent = %agent_name, "launching fleet agent subprocess");
                 let task_started = std::time::Instant::now();
@@ -447,6 +450,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     // the last worker to finish: no merge phase, no fleet_failed (Codex, panel
                     // review of this fix).
                     orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
+                    terminal_guard.disarm();
                     return;
                 }
                 // Route around agy for real. Emitting "skipped" and then launching agy
@@ -479,6 +483,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 // review of step 6: cancel between the in-memory insert and the background
                 // spawn returned `canceled: true` and the workers launched anyway).
                 if fleet_is_cancelled(&fleet_id) {
+                    terminal_guard.disarm();
                     tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, "fleet cancelled before worker launch; skipping");
                     if let Ok(conn) = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")) {
                         let _ = conn.execute(
@@ -804,6 +809,9 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 }
 
                 orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
+                // Reached the end of the worker body: every path above recorded its own
+                // outcome, so the guard has nothing to rescue.
+                terminal_guard.disarm();
             });
             join_handles.push((joined_task_id, jh));
         }
@@ -865,9 +873,12 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         let db_path = project_root.join(".triumvirate").join("ledger.db");
         let conn = rusqlite::Connection::open(&db_path)?;
         let updated = conn.execute(
+            // `blocked_on_review` is admitted so an approval can be acted on: without it the
+            // blocked state was a DEAD END, and a fleet whose reviewer later approved could
+            // never merge (Codex, panel review).
             "UPDATE fleets
              SET state = 'merging'
-             WHERE fleet_id = ?1 AND state IN ('spawning', 'running')",
+             WHERE fleet_id = ?1 AND state IN ('spawning', 'running', 'blocked_on_review')",
             [fleet_id],
         )?;
         if updated == 0 {
@@ -944,13 +955,17 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         // merge. Fleet queues a review for a human or an agent to pick up over MCP
         // (`dispatch_owned: false`) and conducts none itself, so the gate that exists to stop
         // a merge was being set by the code that wanted to merge, with `None` for the comment.
-        // A review that never ran was recorded as a passed review (Grok, D-027 panel).
         //
-        // The gate now reads the real review rows. Default behaviour is unchanged for a task
-        // nobody reviewed, because blocking there would strand every fleet on a workflow step
-        // that nothing drives today; what changes is that the record stops claiming a review
-        // happened, and an explicit verdict is now obeyed instead of overwritten.
-        let review_engine = peer_review::PeerReviewEngine::new(project_root.to_path_buf()).ok();
+        // The first version of this fix read `ReviewRecord.state` for "approved" and
+        // "changes_requested". `submit_review` writes NEITHER: it sets `state = 'done'` and
+        // puts the decision in `verdict` (approve | concerns | reject | indeterminate). So a
+        // real REJECT matched no branch and fell through to auto-approve, and the merge went
+        // ahead labelled "no reviewer ran" while a reviewer had run and said no. Codex and
+        // Grok both caught it; the test that "proved" the fix wrote `changes_requested` by
+        // hand, a state production never writes, so it validated an invented state machine.
+        //
+        // Read the verdict. A review is only ANSWERED when its state is done.
+        let review_engine = peer_review::PeerReviewEngine::new(project_root.to_path_buf());
         let require_review = std::env::var("TRIUMVIRATE_FLEET_REQUIRE_REVIEW")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
@@ -958,47 +973,45 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         for task_id in task_ids {
             let artifact = format!("fleet/{fleet_id}/{task_id}");
             coordinator.enqueue_completed(task_id.clone(), artifact.clone());
-            let reviews = review_engine
-                .as_ref()
-                .and_then(|e| e.reviews_for_artifact(&artifact).ok())
-                .unwrap_or_default();
-            let approved = reviews.iter().any(|r| r.state.eq_ignore_ascii_case("approved"));
-            let rejected = reviews.iter().find(|r| {
-                matches!(r.state.to_lowercase().as_str(), "changes_requested" | "rejected" | "failed")
-            });
-            if let Some(r) = rejected {
-                // An actual verdict. Overwriting this with `Approved` was the worst case of
-                // the old behaviour: a reviewer said no and the merge happened anyway.
-                coordinator.set_review_status(task_id.clone(), ReviewGateState::RequestChanges, r.comments.clone());
-                blocked.push(format!("{task_id} ({}, review {})", r.state, r.review_id));
-            } else if approved {
-                coordinator.set_review_status(task_id.clone(), ReviewGateState::Approved, None);
-            } else if require_review {
-                coordinator.set_review_status(task_id.clone(), ReviewGateState::Pending, None);
-                blocked.push(format!("{task_id} (no review conducted)"));
-            } else {
-                // Say what this is, in the row itself, so nobody reads it later as a review.
-                coordinator.set_review_status(
-                    task_id.clone(),
-                    ReviewGateState::Approved,
-                    Some("auto-approved by complete_fleet: no reviewer ran. Set TRIUMVIRATE_FLEET_REQUIRE_REVIEW=1 to block instead.".to_string()),
-                );
-                tracing::warn!(
-                    fleet_id = %fleet_id,
-                    task_id = %task_id,
-                    "merging a task no reviewer ever reviewed (auto-approved)"
-                );
-                ingest_fleet_event(
-                    project_root,
-                    fleet_id,
-                    "review_auto_approved",
-                    serde_json::json!({
-                        "task_id": task_id,
-                        "artifact": artifact,
-                        "reason": "no reviewer ran; TRIUMVIRATE_FLEET_REQUIRE_REVIEW is off",
-                    })
-                    .to_string(),
-                );
+
+            // FAIL CLOSED. The gate's own storage failing is not evidence that nobody
+            // objected (Codex, panel review).
+            let reviews = match review_engine.as_ref() {
+                Ok(engine) => engine.reviews_for_artifact(&artifact).map_err(|e| e.to_string()),
+                Err(e) => Err(format!("review store unavailable: {e}")),
+            };
+            match review_gate_decision(reviews, require_review) {
+                GateDecision::Approved(comment) => {
+                    coordinator.set_review_status(task_id.clone(), ReviewGateState::Approved, comment);
+                }
+                GateDecision::Blocked(reason) => {
+                    coordinator.set_review_status(task_id.clone(), ReviewGateState::RequestChanges, Some(reason.clone()));
+                    blocked.push(format!("{task_id} ({reason})"));
+                }
+                GateDecision::AutoApproved => {
+                    // Say what this is, in the row itself, so nobody reads it later as a review.
+                    coordinator.set_review_status(
+                        task_id.clone(),
+                        ReviewGateState::Approved,
+                        Some("auto-approved by complete_fleet: no verdict was recorded. Set TRIUMVIRATE_FLEET_REQUIRE_REVIEW=1 to block instead.".to_string()),
+                    );
+                    tracing::warn!(
+                        fleet_id = %fleet_id,
+                        task_id = %task_id,
+                        "merging a task no reviewer ever reviewed (auto-approved)"
+                    );
+                    ingest_fleet_event(
+                        project_root,
+                        fleet_id,
+                        "review_auto_approved",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "artifact": artifact,
+                            "reason": "no verdict recorded; TRIUMVIRATE_FLEET_REQUIRE_REVIEW is off",
+                        })
+                        .to_string(),
+                    );
+                }
             }
         }
         if !blocked.is_empty() {
@@ -1084,70 +1097,138 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
 /// what the old blanket-approve produced. `blocked_on_review` is the honest third state, and it
 /// is terminal for the merge phase, so nothing here can strand a caller waiting on a merge that
 /// is never coming.
-/// Marks a fleet worker's task terminal however that worker ends, INCLUDING a panic or an
-/// abort, and then re-checks whether the fleet can finish.
+/// Marks a fleet worker's task terminal when that worker ends WITHOUT recording an outcome,
+/// which is what a panic or an abort looks like from the outside.
 ///
 /// D-031: the `JoinError` arm that catches a panicking worker lives in the caller's await loop.
 /// With `wait: true` that loop runs in the caller's task, so a dropped request takes the loop
-/// with it while the `tokio::spawn`ed workers keep running detached. A worker that panics after
-/// that point is observed by nobody, its row stays `in_progress`, and the fleet can never
-/// finish. `Drop` runs inside the worker's own task, so it survives both.
+/// with it while the `tokio::spawn`ed workers keep running detached. `Drop` runs inside the
+/// worker's own task, so it survives both.
 ///
-/// Deliberately idempotent: the UPDATE is a no-op once the task is terminal, so the normal
-/// success and failure paths reach Drop having already written their own state, and this only
-/// bites for an exit that wrote nothing.
-struct WorkerTerminalGuard {
+/// ARMED/DISARMED, not idempotent-and-always-firing. The first version ran its whole body on
+/// every exit, so the last SUCCESSFUL worker of every fleet emitted `fleet_worker_abandoned`
+/// and warned that the fleet needed rescuing (Antigravity and Codex, both seats, independently).
+/// It also keyed only on `task_id`, so a stale guard from an aborted attempt could fail a
+/// legitimate retry of the same task. A worker that completes normally disarms this, and a
+/// disarmed guard touches nothing.
+struct WorkerTerminalGuard<G: GitOps + Clone + 'static, L: AgentLauncher> {
+    orchestrator: FleetOrchestrator<G, L>,
     project_root: PathBuf,
     fleet_id: String,
     task_id: String,
+    armed: bool,
 }
 
-impl Drop for WorkerTerminalGuard {
+impl<G: GitOps + Clone + 'static, L: AgentLauncher> WorkerTerminalGuard<G, L> {
+    /// The worker reached one of its own exits and recorded its outcome.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<G: GitOps + Clone + 'static, L: AgentLauncher> Drop for WorkerTerminalGuard<G, L> {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let db = self.project_root.join(".triumvirate").join("ledger.db");
         let updated = rusqlite::Connection::open(&db).and_then(|conn| {
+            // A busy timeout, because this runs when many workers may be finishing at once and
+            // a lost update here strands the fleet (Codex, panel review).
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
             conn.execute(
                 "UPDATE tasks SET state = 'failed'
                  WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
                 rusqlite::params![self.task_id.as_str()],
             )
         });
-        match updated {
-            // The common case: the worker already recorded its own outcome.
-            Ok(0) => {}
-            Ok(_) => tracing::error!(
-                fleet_id = %self.fleet_id,
-                task_id = %self.task_id,
-                "fleet worker ended without recording an outcome (panic or abort); marked failed"
-            ),
-            Err(e) => tracing::error!(fleet_id = %self.fleet_id, task_id = %self.task_id, error = %e, "worker guard could not mark its task failed"),
+        let rescued = match updated {
+            Ok(0) => false,
+            Ok(_) => {
+                tracing::error!(
+                    fleet_id = %self.fleet_id,
+                    task_id = %self.task_id,
+                    "fleet worker ended without recording an outcome (panic or abort); marked failed"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(fleet_id = %self.fleet_id, task_id = %self.task_id, error = %e, "worker guard could not mark its task failed");
+                false
+            }
+        };
+        if !rescued {
+            return;
         }
-        // The fleet still has to be told it can finish. Drop cannot await, and there may be no
-        // runtime left at shutdown, so this is best-effort by construction.
+        // The fleet still has to be driven to its terminal state, which the first version did
+        // NOT do: it counted pending tasks, emitted an event, and left the fleet `running`,
+        // so the exact scenario this guard exists for stayed broken (Codex, panel review).
+        // Drop cannot await, and at shutdown there may be no runtime, so this is best-effort
+        // by construction.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let orchestrator = self.orchestrator.clone();
             let project_root = self.project_root.clone();
             let fleet_id = self.fleet_id.clone();
+            let task_id = self.task_id.clone();
             handle.spawn(async move {
-                let pending = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
-                    .and_then(|conn| {
-                        conn.query_row(
-                            "SELECT COUNT(*) FROM tasks WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed')",
-                            [fleet_id.as_str()],
-                            |row| row.get::<_, i64>(0),
-                        )
+                ingest_fleet_event(
+                    &project_root,
+                    &fleet_id,
+                    "task_failed",
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "agent": serde_json::Value::Null,
+                        "error": "worker ended without recording an outcome (panic or abort)",
                     })
-                    .unwrap_or(1);
-                if pending == 0 {
-                    tracing::warn!(fleet_id = %fleet_id, "fleet finished via worker guard; merge phase must be driven by an operator or recovery");
-                    ingest_fleet_event(
-                        &project_root,
-                        &fleet_id,
-                        "fleet_worker_abandoned",
-                        serde_json::json!({ "fleet_id": fleet_id, "reason": "a worker ended without recording an outcome" }).to_string(),
-                    );
-                }
+                    .to_string(),
+                );
+                orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
             });
         }
+    }
+}
+
+/// What the review gate says about one task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    /// A reviewer approved (or raised non-blocking concerns). Carries their comment.
+    Approved(Option<String>),
+    /// Do not merge. Carries the reason, for the operator.
+    Blocked(String),
+    /// Nobody recorded a verdict, and TRIUMVIRATE_FLEET_REQUIRE_REVIEW is off.
+    AutoApproved,
+}
+
+/// Decide the gate from the review rows, or from the failure to read them.
+///
+/// Extracted so the FAIL-CLOSED path is directly testable: it takes the lookup result, not a
+/// database. The first version `.ok()`-ed both the engine and the query, so an unreadable
+/// review store read as "no reviews" and merged (Codex, panel review).
+///
+/// Verdict, not state: `submit_review` writes `state = 'done'` and puts the decision in
+/// `verdict` (approve | concerns | reject | indeterminate). Reading `state` for "approved"
+/// matched nothing production writes, so a real REJECT fell through to auto-approve and
+/// merged. `concerns` is defined by the review protocol as not blocking. `indeterminate`
+/// blocks: a reviewer that could not tell did not approve.
+///
+/// Rows arrive newest verdict first, and the newest ANSWERED row governs: a reviewer who
+/// rejected and then approved must not be blocked by their own older verdict.
+pub(crate) fn review_gate_decision(
+    reviews: Result<Vec<peer_review::ReviewRecord>, String>,
+    require_review: bool,
+) -> GateDecision {
+    let reviews = match reviews {
+        Ok(rows) => rows,
+        Err(e) => return GateDecision::Blocked(format!("review lookup failed: {e}")),
+    };
+    let latest = reviews.iter().find(|r| r.state.eq_ignore_ascii_case("done"));
+    match latest {
+        Some(r) => match r.verdict.as_deref().unwrap_or("indeterminate").to_lowercase().as_str() {
+            "approve" | "concerns" => GateDecision::Approved(r.comments.clone()),
+            other => GateDecision::Blocked(format!("verdict {other}, review {}", r.review_id)),
+        },
+        None if require_review => GateDecision::Blocked("no verdict recorded".to_string()),
+        None => GateDecision::AutoApproved,
     }
 }
 
@@ -1608,98 +1689,106 @@ mod tests {
             .expect("read fleet state")
     }
 
-    /// A launcher whose child cannot be waited on the normal way: it exits instantly, which
-    /// drives the worker down its failure path.
-    use super::WorkerTerminalGuard;
+    use super::{review_gate_decision, GateDecision, WorkerTerminalGuard};
 
-    #[derive(Debug, Clone, Default)]
-    struct InstantFailLauncher;
-
-    #[async_trait]
-    impl AgentLauncher for InstantFailLauncher {
-        async fn launch(
-            &self,
-            _agent: &str,
-            _project_root: &Path,
-            _worktree_path: &Path,
-            _task_prompt: &str,
-        ) -> anyhow::Result<Child> {
-            Ok(Command::new("sh").arg("-c").arg("exit 9").spawn()?)
-        }
-    }
-
-    /// D-031. The guard marks a task terminal even when the worker records nothing itself.
+    /// D-031. An ARMED guard rescues a worker that recorded nothing; a DISARMED one is inert.
     ///
-    /// Driven directly rather than through a real panic, because a panicking tokio task in a
-    /// test aborts the harness's own bookkeeping. What is pinned is the property the guard
-    /// exists for: a worker that ends without writing its outcome leaves the row terminal, so
-    /// the fleet's pending count can reach zero. RED IF: the guard stops writing, or starts
-    /// overwriting an outcome the worker already recorded.
+    /// RED IF: the arm/disarm flag is dropped. The first version ran on every exit, so the last
+    /// successful worker of every fleet emitted `fleet_worker_abandoned` and warned that the
+    /// fleet needed rescuing (Antigravity and Codex, both seats), and a stale guard from an
+    /// aborted attempt could fail a legitimate retry of the same task.
     #[tokio::test]
-    async fn d031_worker_guard_marks_an_unrecorded_task_failed_but_never_overwrites() {
+    async fn d031_the_guard_rescues_only_a_worker_that_recorded_nothing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(project_root.join(".triumvirate")).expect("mkdir");
         let (fleet_id, task_id) = seeded_fleet(&project_root);
         let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
             .expect("open sqlite");
+        let orchestrator = FleetOrchestrator::new(MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) });
 
-        // A task still running when its worker vanishes.
-        conn.execute("UPDATE tasks SET state = 'in_progress' WHERE task_id = ?1", [task_id.as_str()])
-            .expect("set in_progress");
-        drop(WorkerTerminalGuard {
+        let guard = |armed: bool| WorkerTerminalGuard {
+            orchestrator: orchestrator.clone(),
             project_root: project_root.clone(),
             fleet_id: fleet_id.clone(),
             task_id: task_id.clone(),
-        });
+            armed,
+        };
+
+        // ARMED, and the worker vanished mid-flight: the row must not stay in_progress.
+        conn.execute("UPDATE tasks SET state = 'in_progress' WHERE task_id = ?1", [task_id.as_str()])
+            .expect("set in_progress");
+        drop(guard(true));
         let state: String = conn
             .query_row("SELECT state FROM tasks WHERE task_id = ?1", [task_id.as_str()], |r| r.get(0))
             .expect("read task state");
         assert_eq!(state, "failed", "an abandoned task must not stay in_progress");
 
-        // NEGATIVE CONTROL: a worker that DID record success keeps it.
+        // DISARMED: the worker completed normally and owns its own outcome. A retry of the
+        // same task is `in_progress` again, and a stale guard must not touch it.
+        conn.execute("UPDATE tasks SET state = 'in_progress' WHERE task_id = ?1", [task_id.as_str()])
+            .expect("set in_progress");
+        drop(guard(false));
+        let state: String = conn
+            .query_row("SELECT state FROM tasks WHERE task_id = ?1", [task_id.as_str()], |r| r.get(0))
+            .expect("read task state");
+        assert_eq!(state, "in_progress", "a disarmed guard must touch nothing");
+
+        // ARMED but the worker already recorded success: never turn that into a failure.
         conn.execute("UPDATE tasks SET state = 'done' WHERE task_id = ?1", [task_id.as_str()])
             .expect("set done");
-        drop(WorkerTerminalGuard {
-            project_root: project_root.clone(),
-            fleet_id: fleet_id.clone(),
-            task_id: task_id.clone(),
-        });
+        drop(guard(true));
         let state: String = conn
             .query_row("SELECT state FROM tasks WHERE task_id = ?1", [task_id.as_str()], |r| r.get(0))
             .expect("read task state");
         assert_eq!(state, "done", "the guard must never turn a success into a failure");
+
+        // And it must not have cried abandonment for either no-op drop.
+        let abandoned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'fleet_worker_abandoned'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count abandonment events");
+        assert_eq!(abandoned, 0, "no abandonment event for a worker that recorded its outcome");
     }
 
-    /// D-029. A reviewer that asked for changes must STOP the merge.
+    /// Queue a review for this task and record a REAL verdict through the production path.
     ///
-    /// RED IF: complete_fleet goes back to stamping Approved on every task. It did exactly that,
-    /// with `None` for the comment, so a review that never ran (and one that said no) both
-    /// read as a passed review and the merge proceeded (Grok, D-027 panel).
-    #[tokio::test]
-    async fn d029_a_rejected_review_blocks_the_merge() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let project_root = temp.path().join("project");
-        std::fs::create_dir_all(project_root.join(".triumvirate")).expect("mkdir");
-        let (fleet_id, task_id) = seeded_fleet(&project_root);
-
-        let engine = peer_review::PeerReviewEngine::new(project_root.clone()).expect("engine");
+    /// An earlier version of this helper wrote `state = 'changes_requested'` straight into the
+    /// row. Production never writes that: `submit_review` sets `state = 'done'` and puts the
+    /// decision in `verdict`. The test passed against a state machine that did not exist, and
+    /// the fix it "proved" merged rejected code (Codex and Grok, both seats). Go through
+    /// `submit_review` so the test cannot drift from the writer again.
+    fn record_verdict(project_root: &Path, fleet_id: &str, task_id: &str, verdict: &str) {
+        let engine = peer_review::PeerReviewEngine::new(project_root.to_path_buf()).expect("engine");
         let record = engine
             .request_review(peer_review::ReviewRequest {
-                fleet_id: Some(fleet_id.clone()),
+                fleet_id: Some(fleet_id.to_string()),
                 author_agent: "codex".to_string(),
                 artifact: format!("fleet/{fleet_id}/{task_id}"),
                 review_type: "code".to_string(),
                 dispatch_owned: false,
             })
             .expect("request review");
-        rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
-            .expect("open sqlite")
-            .execute(
-                "UPDATE reviews SET state = 'changes_requested', comments = 'no' WHERE review_id = ?1",
-                [record.review_id.as_str()],
-            )
-            .expect("force verdict");
+        engine
+            .submit_review(&record.review_id, verdict, Some("panel"), peer_review::Submitter::Dispatch)
+            .expect("submit verdict");
+    }
+
+    /// D-029. A reviewer that said REJECT must stop the merge.
+    ///
+    /// RED IF: complete_fleet goes back to stamping Approved, or reads the wrong column. It
+    /// read `state` for "approved"/"changes_requested" while submit_review writes `state =
+    /// 'done'` with the decision in `verdict`, so a real REJECT matched nothing and merged.
+    #[tokio::test]
+    async fn d029_a_rejected_review_blocks_the_merge() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate")).expect("mkdir");
+        let (fleet_id, task_id) = seeded_fleet(&project_root);
+        record_verdict(&project_root, &fleet_id, &task_id, "reject");
 
         let orchestrator = FleetOrchestrator::new(MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) });
         orchestrator.complete_fleet(&fleet_id, &project_root).await.expect("complete_fleet");
@@ -1707,13 +1796,106 @@ mod tests {
         assert_eq!(
             fleet_state(&project_root, &fleet_id),
             "blocked_on_review",
-            "a changes_requested review must park the fleet, not merge it"
+            "a reject verdict must park the fleet, not merge it"
         );
     }
 
-    /// NEGATIVE CONTROL for the test above: with no review conducted, the fleet still merges,
-    /// because blocking there would strand every fleet on a step nothing drives today. What
-    /// must be true is that the row SAYS it was auto-approved instead of claiming a review.
+    /// NEGATIVE CONTROL: the same path with an APPROVE verdict merges, so the test above
+    /// cannot pass because nothing ever merges.
+    /// RED IF: a real approval stops being recognised, which would block every reviewed fleet.
+    #[tokio::test]
+    async fn d029_an_approved_review_merges() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate")).expect("mkdir");
+        let (fleet_id, task_id) = seeded_fleet(&project_root);
+        record_verdict(&project_root, &fleet_id, &task_id, "approve");
+
+        let orchestrator = FleetOrchestrator::new(MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) });
+        orchestrator.complete_fleet(&fleet_id, &project_root).await.expect("complete_fleet");
+
+        assert_eq!(fleet_state(&project_root, &fleet_id), "done", "an approved fleet merges");
+    }
+
+    /// A blocked fleet must be able to MERGE once the verdict arrives. Without this the
+    /// blocked state was a dead end and the work was unreachable forever (Codex, panel).
+    #[tokio::test]
+    async fn d029_a_blocked_fleet_can_still_merge_after_approval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate")).expect("mkdir");
+        let (fleet_id, task_id) = seeded_fleet(&project_root);
+        record_verdict(&project_root, &fleet_id, &task_id, "reject");
+
+        let orchestrator = FleetOrchestrator::new(MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) });
+        orchestrator.complete_fleet(&fleet_id, &project_root).await.expect("blocked");
+        assert_eq!(fleet_state(&project_root, &fleet_id), "blocked_on_review");
+
+        // The reviewer comes back and approves.
+        record_verdict(&project_root, &fleet_id, &task_id, "approve");
+        orchestrator.complete_fleet(&fleet_id, &project_root).await.expect("resumed");
+        assert_eq!(
+            fleet_state(&project_root, &fleet_id),
+            "done",
+            "an approval after a block must be actionable"
+        );
+    }
+
+    fn record(verdict: Option<&str>, state: &str, at: Option<&str>) -> peer_review::ReviewRecord {
+        peer_review::ReviewRecord {
+            review_id: "r-1".to_string(),
+            fleet_id: None,
+            author_agent: "codex".to_string(),
+            reviewer_agent: Some("grok".to_string()),
+            verdict: verdict.map(str::to_string),
+            comments: None,
+            state: state.to_string(),
+            dispatch_owned: false,
+            reviewed_at: at.map(str::to_string),
+        }
+    }
+
+    /// A review store that cannot be read is NOT evidence that nobody objected.
+    /// RED IF: the gate goes back to `.ok()`-ing its own storage errors and merging.
+    #[test]
+    fn d029_gate_fails_closed_when_the_review_store_cannot_be_read() {
+        assert_eq!(
+            review_gate_decision(Err("database is locked".to_string()), false),
+            GateDecision::Blocked("review lookup failed: database is locked".to_string()),
+        );
+    }
+
+    /// The verdict column governs, and `done` is the only answered state.
+    /// RED IF: the gate reads `state` for "approved" again, which production never writes.
+    #[test]
+    fn d029_gate_reads_the_verdict_not_the_state() {
+        assert_eq!(
+            review_gate_decision(Ok(vec![record(Some("reject"), "done", Some("2026-09-23 10:00:00"))]), false),
+            GateDecision::Blocked("verdict reject, review r-1".to_string()),
+        );
+        assert!(matches!(
+            review_gate_decision(Ok(vec![record(Some("approve"), "done", Some("2026-09-23 10:00:00"))]), false),
+            GateDecision::Approved(_)
+        ));
+        // `concerns` is explicitly non-blocking in the review protocol; `indeterminate` is not.
+        assert!(matches!(
+            review_gate_decision(Ok(vec![record(Some("concerns"), "done", None)]), false),
+            GateDecision::Approved(_)
+        ));
+        assert!(matches!(
+            review_gate_decision(Ok(vec![record(Some("indeterminate"), "done", None)]), false),
+            GateDecision::Blocked(_)
+        ));
+        // A row still in flight carries no verdict, whatever its verdict column says.
+        assert_eq!(
+            review_gate_decision(Ok(vec![record(Some("approve"), "in_progress", None)]), true),
+            GateDecision::Blocked("no verdict recorded".to_string()),
+        );
+        assert_eq!(review_gate_decision(Ok(vec![]), false), GateDecision::AutoApproved);
+    }
+
+    /// NEGATIVE CONTROL for the auto-approve default: with no verdict at all the fleet still
+    /// merges, and SAYS it was auto-approved.
     /// RED IF: the auto-approval goes silent again, or starts blocking by default.
     #[tokio::test]
     async fn d029_an_unreviewed_task_still_merges_but_says_it_was_auto_approved() {

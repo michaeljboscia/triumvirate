@@ -32,6 +32,9 @@ pub struct ReviewRecord {
     pub comments: Option<String>,
     pub state: String,
     pub dispatch_owned: bool,
+    /// When the verdict was recorded. `None` until one is. Fleet orders by this: a reviewer
+    /// who rejected and later approved must not be blocked forever by the older verdict.
+    pub reviewed_at: Option<String>,
 }
 
 /// The default panel, overridable with `TRIUMVIRATE_PEER_REVIEWERS` (comma separated).
@@ -312,7 +315,7 @@ impl PeerReviewEngine {
         let conn = self.open_conn()?;
         conn.query_row(
             "SELECT review_id, fleet_id, author_agent, reviewer_agent, verdict, comments, state,
-                    COALESCE(dispatch_owned, 0)
+                    COALESCE(dispatch_owned, 0), reviewed_at
              FROM reviews
              WHERE review_id = ?1",
             [review_id],
@@ -326,6 +329,7 @@ impl PeerReviewEngine {
                     comments: row.get(5)?,
                     state: row.get(6)?,
                     dispatch_owned: row.get::<_, i64>(7)? != 0,
+                    reviewed_at: row.get(8)?,
                 })
             },
         )
@@ -339,9 +343,13 @@ impl PeerReviewEngine {
         let conn = self.open_conn()?;
         let mut stmt = conn.prepare(
             "SELECT review_id, fleet_id, author_agent, reviewer_agent, verdict, comments, state,
-                    COALESCE(dispatch_owned, 0)
+                    COALESCE(dispatch_owned, 0), reviewed_at
              FROM reviews
-             WHERE artifact = ?1",
+             WHERE artifact = ?1
+             -- rowid breaks the tie: reviewed_at is datetime('now'), whose resolution is ONE
+             -- SECOND, so a reject and a follow-up approval recorded in the same second sort
+             -- arbitrarily and the older verdict could win. Insertion order cannot tie.
+             ORDER BY reviewed_at DESC NULLS LAST, rowid DESC",
         )?;
         let rows = stmt
             .query_map([artifact], |row| {
@@ -354,6 +362,7 @@ impl PeerReviewEngine {
                     comments: row.get(5)?,
                     state: row.get(6)?,
                     dispatch_owned: row.get::<_, i64>(7)? != 0,
+                    reviewed_at: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

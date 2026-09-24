@@ -289,13 +289,16 @@ def main():
                 ok, s = mcp.tool("fleet_status", {"fleet_id": fid}, timeout=60)
                 last = s
                 low = s.lower()
-                if any(k in low for k in ('"completed"', '"failed"', '"done"', '"error"', '"cancelled"')):
+                # `blocked_on_review` is terminal for the merge phase. Without it this loop
+                # polled to its deadline and then cancelled a fleet that was legitimately
+                # parked awaiting a verdict (Codex, D-031 panel review).
+                if any(k in low for k in ('"completed"', '"failed"', '"done"', '"error"', '"cancelled"', '"blocked_on_review"')):
                     break
                 time.sleep(10)
             # The ledger's terminal success state is "done" (fleet_status reports the ledger
             # since recovery step 6); "completed" was the harness's guess and never matched.
             low = last.lower()
-            good = '"failed"' not in low and '"error"' not in low and ('"done"' in low or '"completed"' in low)
+            good = '"failed"' not in low and '"error"' not in low and ('"done"' in low or '"completed"' in low or '"blocked_on_review"' in low)
             mcp.tool("fleet_cancel", {"fleet_id": fid}, timeout=60)
             return good, f"fleet_id={fid}\n{head(last, 600)}"
         add(f"fleet_spawn.{ag}", "mcp", {"agent": ag, "tool": "fleet_spawn"}, fleet)

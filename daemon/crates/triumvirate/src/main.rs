@@ -7067,7 +7067,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // With `wait: true` the workers have already run (and in this environment they may
         // have failed fast), so the state is whatever the ledger recorded, never `spawning`.
         assert!(
-            ["running", "merging", "done", "failed"].contains(&status.0.state.as_str()),
+            ["running", "merging", "done", "failed", "blocked_on_review"].contains(&status.0.state.as_str()),
             "ledger state: {}",
             status.0.state
         );

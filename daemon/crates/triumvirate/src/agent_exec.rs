@@ -2161,6 +2161,24 @@ fn codex_ranged_reads_cover_source(
     ranges_cover_lines(&ranges, count_lines(&bytes))
 }
 
+/// The FIELDS a structured read tool uses to name the file it is opening.
+///
+/// Matching the path anywhere in the argument blob credited the wrong source: a call carrying
+/// `{"source": "/repo/required.rs", "path": "/repo/other.rs", "offset": 1, "limit": 500}` gave
+/// `required.rs` the coverage that belonged to `other.rs` (Codex, panel review). The shell path
+/// binds ranges to the parsed operand; this is the structured equivalent.
+const READ_OPERAND_KEYS: &[&str] = &[
+    "target_file",
+    "path",
+    "file_path",
+    "filePath",
+    "file",
+    "abs_path",
+    "AbsolutePath",
+    "absolute_path",
+    "filename",
+];
+
 /// The windows a STRUCTURED read tool asked for, as ranges the same union can consume.
 ///
 /// D-028: only shell windows were ever unioned. A reviewer whose read tool takes `offset` and
@@ -2171,8 +2189,11 @@ fn codex_ranged_reads_cover_source(
 /// correctly teaches the operator to drop `require_sight`, which is the only thing standing
 /// between a real review and one written from memory.
 ///
-/// `offset` is the first line (1-based, clamped), `limit` the number of lines. An offset with
-/// no limit runs to the end of the file, which is what such a read returns.
+/// `offset` is the first line (1-based), `limit` the number of lines. KNOWN LIMITATION: this
+/// is what the reviewer ASKED for, not what it received. A tool that silently caps or
+/// truncates its output is credited with the whole window. The record carries arguments and a
+/// success flag, nothing about the returned content, so that gap cannot be closed here (Codex,
+/// panel review); it is filed rather than papered over.
 fn structured_read_ranges(
     tool_calls: &[ToolCallRecord],
     candidates: &[String],
@@ -2186,19 +2207,28 @@ fn structured_read_ranges(
         })
         .filter_map(|c| {
             let args = c.args_json.as_deref()?;
-            // The record must NAME this source, by the same whole-path rule the rest of the
-            // gate uses. A read of a different file contributes nothing to this one.
-            if !candidates.iter().any(|cand| args_name_path(args, cand)) {
+            let value: serde_json::Value = serde_json::from_str(args).ok()?;
+            // The OPERAND must be this source, not merely a string somewhere in the blob.
+            let operand_is_source = READ_OPERAND_KEYS.iter().any(|key| {
+                value
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|operand| candidates.iter().any(|cand| cand == operand))
+            });
+            if !operand_is_source {
                 return None;
             }
-            let value: serde_json::Value = serde_json::from_str(args).ok()?;
             let num = |keys: &[&str]| -> Option<u64> {
                 keys.iter().find_map(|k| value.get(*k).and_then(serde_json::Value::as_u64))
             };
             let start = num(&["offset", "line_offset", "start_line"]).unwrap_or(1).max(1);
             let end = match num(&["limit", "max_lines"]) {
+                // A limit of 0 asks for NOTHING. `start + 0 - 1` saturated back to `start` and
+                // credited a line the reviewer never received; repeated across offsets that
+                // fabricated whole-file coverage (Codex, panel review).
+                Some(0) => return None,
                 // An explicit end_line wins over a count when both are somehow present.
-                Some(limit) => Some(num(&["end_line"]).unwrap_or(start + limit.saturating_sub(1))),
+                Some(limit) => Some(num(&["end_line"]).unwrap_or(start + limit - 1)),
                 None => num(&["end_line"]),
             };
             Some(agent_adapter::codex::LineRange { start, end })
@@ -3065,7 +3095,22 @@ async fn enforce_mandatory_peer_review(
         Ok(resp) => {
             // Belt and braces behind strict_agent: verify who actually answered before the
             // verdict is allowed to count. `answered_by_agent` was never read here.
-            let answered = resp.answered_by_agent.as_deref().unwrap_or(&reviewer);
+            // `None` used to be read as "the assigned reviewer answered", which is an
+            // assumption, not verification (Codex, panel review). The daemon's own
+            // acknowledgement that it honoured strict_agent IS evidence; absent both, this
+            // response carries no identity and cannot be scored.
+            let strict_honored = resp.strict_agent_honored == Some(true);
+            let answered = match resp.answered_by_agent.as_deref() {
+                Some(name) => name,
+                None if strict_honored => &reviewer,
+                None => {
+                    return Err(format!(
+                        "peer review by `{reviewer}` came back with no record of which agent \
+                         answered and no strict-agent acknowledgement. A verdict with no \
+                         identity cannot be counted as that reviewer's."
+                    ));
+                }
+            };
             if normalize_agent_name(answered) != normalize_agent_name(&reviewer) {
                 let detail = format!(
                     "peer review was answered by `{answered}`, not the assigned reviewer \
@@ -6013,7 +6058,7 @@ mod sight_gate_tests {
             structured_read(&src, Some(61), Some(40)),
         ];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &calls, "grok-streaming-json", &[src.clone()], &cwd, &mut lifecycle)
+        enforce_reviewer_sight("Grok", &calls, "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
             .expect("windows 1..60 and 61..100 cover a 100-line file");
 
         // NEGATIVE CONTROL: leave a gap and the gate must still reject.
@@ -6022,7 +6067,7 @@ mod sight_gate_tests {
             structured_read(&src, Some(70), Some(31)),
         ];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &gapped, "grok-streaming-json", &[src.clone()], &cwd, &mut lifecycle)
+        let err = enforce_reviewer_sight("Grok", &gapped, "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
             .expect_err("lines 61..69 were never read");
         assert!(err.contains("read PART"), "{err}");
 
