@@ -670,7 +670,7 @@ async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, Str
         // Non-empty but unexpected: backend alive, capture working.
         Ok(parsed) => (
             AgyProbeOutcome::Ok,
-            format!("probe alive (unexpected text: {:.40})", redact_url_queries(&parsed.response_text)),
+            format!("probe alive (unexpected text: {:.40})", parsed.response_text),
         ),
         Err(e) => {
             let msg = redact_url_queries(&e.to_string());
