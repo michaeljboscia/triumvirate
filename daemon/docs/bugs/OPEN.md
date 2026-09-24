@@ -19,37 +19,6 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-### D-031 - A failed codex substitution is recorded as the gemini seat's failure
-**Found:** 2026-09-23 (D-027 panel, Antigravity) · **Severity:** MEDIUM · **NOT FIXED**
-**Evidence:** `fleet/src/orchestrator.rs` degraded path. When the agy task fails and the opted-in codex relaunch ALSO fails, the final `task_failed` event writes `agent: launch_agent` and `error: format!("agent exited with status {:?}", status.code())`. `launch_agent` is bound before the degrade and `status` is the FIRST attempt's exit status, so codex's failure is invisible: the row says gemini failed, with gemini's exit code. The comment directly above it claims this field is what distinguishes "a degraded codex failure" from "the requested gemini failing".
-**Second finding, same review:** the `JoinError` handler added for panicking workers lives in `spawn_fleet_members`' await loop. With `wait: true` that loop runs in the caller's task, so a dropped request (client cancel, connection drop) takes the loop with it while the `tokio::spawn`ed workers keep running detached. A worker that panics after that point is unobserved again, and its task stays `in_progress`. Pre-existing for every other exit too; the handler narrows the window, it does not close it.
-**CHECK to close:** a failed degraded relaunch is recorded with the agent that actually failed and that agent's error; a worker panicking after its caller was cancelled still reaches a terminal task state.
-
-### D-030 - A review verdict cannot say who answered, so a substituted reviewer is accepted
-**Found:** 2026-09-22 (D-027 panel, Codex and Grok independently) · **Severity:** HIGH · **NOT FIXED**
-**Evidence:** four surfaces drop or fake reviewer identity.
-- `mcp-tools/src/gemini_query.rs:61` dispatches the gemini seat with `..Default::default()`, so `strict_agent` is off, then discards `answered_by_agent` and keyword-scans the text. `:76` defaults to `Clean`. With the route opted in to codex, a codex `Approved.` becomes `QueryGeminiReviewResponse { verdict: Clean }` with no field able to say codex answered. Reached from `main.rs:1040/1052/1064/1076`.
-- Mandatory peer review builds its reviewer request with `..Default::default()` (`agent_exec.rs:2966`) and classifies from `resp.response` only (`:2981`). The `agy -> gemini-cli` hop has NO warning prefix (`:1611`), so a same-agent backend swap is invisible and its `APPROVE` is accepted.
-- `peer-review/src/lib.rs:50` and `:339` compare reviewer names raw, but `normalize_agent_name` (`mcp-bridge/src/lib.rs:92`) maps `antigravity`/`agy` to `gemini`. `author_agent: "antigravity"` is assigned reviewer `gemini`: the author reviews itself. Same for `grok` vs `xai`/`supergrok`. `jury.rs:957` already canonicalizes; peer-review does not.
-- `main.rs:1238/1248` hardcodes `author_agent: "codex"` in legacy `code_review`, so a gemini or grok author is recorded as codex AND stays eligible to review itself.
-**Why it matters:** D-027 made substitution opt-in, but every one of these accepts a substituted or self-reviewing seat without being able to report it. `ask_jury` is the one surface that does this right (`jury.rs:344/445`): strict, plus provenance validation.
-**CHECK to close:** a review response carries the answering agent and backend; a verdict from an agent other than the one asked is rejected, not scored; an alias cannot select the author as reviewer.
-
-### D-029 - complete_fleet approves the review gate itself, then merges
-**Found:** 2026-09-22 (D-027 panel, Grok) · **Severity:** HIGH, and QUIET · **NOT FIXED**
-**Evidence:** a fleet worker queues a review with `dispatch_owned: false` (`fleet/src/orchestrator.rs:564`) and never dispatches a reviewer. `complete_fleet` then calls `set_review_status(task_id, ReviewGateState::Approved, None)` (`:923`) and `merge_next`, which blocks on `Pending` and proceeds on `Approved` (`fleet/src/merge.rs:82`).
-**Result:** fleet state `done`, a `fleet_done` event, review gate `Approved`, comment `None`, and NO reviewer process ever ran. The gate that would have stopped the merge is stamped by the code that wants to merge.
-**Why it is the D-027 shape:** a seat you believe is in the path did nothing, and the operation reported success. No env var, no quota failure needed.
-**CHECK to close:** a task whose reviewer never ran cannot reach `Approved`; merge blocks or the fleet fails, and the ledger says which.
-
-### D-028 - The sight gate rejects a COMPLETE read served as limit/offset windows
-**Found:** 2026-09-22 (twice, on the D-027 panel's grok seat) · **Severity:** MEDIUM, and it discredits the guard · **NOT FIXED**
-**Evidence:** `read_args_are_partial()` (`triumvirate/src/agent_exec.rs:2376`) sends shell reads to `command_reads_whole_file()`, where a coverage UNION over `sed` windows runs (`agent-adapter/src/codex.rs:230`). Every other tool is marked partial if `limit`/`offset`/`start_line`/`end_line`/`line_offset`/`max_lines` is merely present. No union. Coverage is never computed.
-From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[offset 1, limit 750]`, rejected. `orchestrator.rs`, 1844 lines, read as `[1..1000]` + `[1001..1844]`, no gap, rejected.
-**Cost:** two complete grok deep reviews discarded, and the reviewer blamed for a read it performed correctly. The operator's natural response is to drop `require_sight`, which is the guard standing between a real review and one written from memory.
-**Same shape as D-027:** two code paths for one job, and only one of them is right.
-**CHECK to close:** a review whose only reads are adjacent limit/offset windows covering every line of a named source is ACCEPTED; one that leaves a gap is still rejected.
-
 ### D-004 - Failed generations carry no error text
 **Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
 **Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried
@@ -309,6 +278,41 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ## Closed
 
+### D-028 - The sight gate rejects a COMPLETE read served as limit/offset windows
+**Found:** 2026-09-22 (twice, on the D-027 panel's grok seat) · **Severity:** MEDIUM, and it discredits the guard · **CLOSED 2026-09-23**
+**Evidence:** `read_args_are_partial()` (`triumvirate/src/agent_exec.rs:2376`) sends shell reads to `command_reads_whole_file()`, where a coverage UNION over `sed` windows runs (`agent-adapter/src/codex.rs:230`). Every other tool is marked partial if `limit`/`offset`/`start_line`/`end_line`/`line_offset`/`max_lines` is merely present. No union. Coverage is never computed.
+From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[offset 1, limit 750]`, rejected. `orchestrator.rs`, 1844 lines, read as `[1..1000]` + `[1001..1844]`, no gap, rejected.
+**Cost:** two complete grok deep reviews discarded, and the reviewer blamed for a read it performed correctly. The operator's natural response is to drop `require_sight`, which is the guard standing between a real review and one written from memory.
+**Same shape as D-027:** two code paths for one job, and only one of them is right.
+**CHECK to close:** a review whose only reads are adjacent limit/offset windows covering every line of a named source is ACCEPTED; one that leaves a gap is still rejected.
+**Closed 2026-09-23.** `structured_read_ranges` feeds limit/offset windows into the SAME union the shell path uses, so tiled reads covering every line are accepted and a gap is still rejected. Related, and the reason this kept biting: a RELATIVE `required_sources` entry is now refused up front, naming the absolute path to pass, instead of running the review and rejecting it as unread afterwards; candidate expansion is also symmetric now. Pins: `sight_39_structured_windows_that_tile_the_file_are_a_whole_read` (two controls: a gap still rejects, and full coverage of a DIFFERENT file proves nothing), `sight_40_a_relative_required_source_is_rejected_before_the_review_runs`, `sight_41_candidates_expand_in_both_directions`. Mutation-checked: removing the union turns sight_39 red.
+
+### D-029 - complete_fleet approves the review gate itself, then merges
+**Found:** 2026-09-22 (D-027 panel, Grok) · **Severity:** HIGH, and QUIET · **CLOSED 2026-09-23**
+**Evidence:** a fleet worker queues a review with `dispatch_owned: false` (`fleet/src/orchestrator.rs:564`) and never dispatches a reviewer. `complete_fleet` then calls `set_review_status(task_id, ReviewGateState::Approved, None)` (`:923`) and `merge_next`, which blocks on `Pending` and proceeds on `Approved` (`fleet/src/merge.rs:82`).
+**Result:** fleet state `done`, a `fleet_done` event, review gate `Approved`, comment `None`, and NO reviewer process ever ran. The gate that would have stopped the merge is stamped by the code that wants to merge.
+**Why it is the D-027 shape:** a seat you believe is in the path did nothing, and the operation reported success. No env var, no quota failure needed.
+**CHECK to close:** a task whose reviewer never ran cannot reach `Approved`; merge blocks or the fleet fails, and the ledger says which.
+**Closed 2026-09-23.** `complete_fleet` reads the real review rows instead of stamping `Approved`. A `changes_requested`/`rejected` verdict parks the fleet in the new `blocked_on_review` state and it does not merge. An unreviewed task still merges by default (blocking there would strand every fleet on a step nothing drives today) but the row now SAYS it was auto-approved and a `review_auto_approved` event is written; `TRIUMVIRATE_FLEET_REQUIRE_REVIEW=1` blocks instead. Pins: `d029_a_rejected_review_blocks_the_merge` and `d029_an_unreviewed_task_still_merges_but_says_it_was_auto_approved`.
+
+### D-030 - A review verdict cannot say who answered, so a substituted reviewer is accepted
+**Found:** 2026-09-22 (D-027 panel, Codex and Grok independently) · **Severity:** HIGH · **CLOSED 2026-09-23**
+**Evidence:** four surfaces drop or fake reviewer identity.
+- `mcp-tools/src/gemini_query.rs:61` dispatches the gemini seat with `..Default::default()`, so `strict_agent` is off, then discards `answered_by_agent` and keyword-scans the text. `:76` defaults to `Clean`. With the route opted in to codex, a codex `Approved.` becomes `QueryGeminiReviewResponse { verdict: Clean }` with no field able to say codex answered. Reached from `main.rs:1040/1052/1064/1076`.
+- Mandatory peer review builds its reviewer request with `..Default::default()` (`agent_exec.rs:2966`) and classifies from `resp.response` only (`:2981`). The `agy -> gemini-cli` hop has NO warning prefix (`:1611`), so a same-agent backend swap is invisible and its `APPROVE` is accepted.
+- `peer-review/src/lib.rs:50` and `:339` compare reviewer names raw, but `normalize_agent_name` (`mcp-bridge/src/lib.rs:92`) maps `antigravity`/`agy` to `gemini`. `author_agent: "antigravity"` is assigned reviewer `gemini`: the author reviews itself. Same for `grok` vs `xai`/`supergrok`. `jury.rs:957` already canonicalizes; peer-review does not.
+- `main.rs:1238/1248` hardcodes `author_agent: "codex"` in legacy `code_review`, so a gemini or grok author is recorded as codex AND stays eligible to review itself.
+**Why it matters:** D-027 made substitution opt-in, but every one of these accepts a substituted or self-reviewing seat without being able to report it. `ask_jury` is the one surface that does this right (`jury.rs:344/445`): strict, plus provenance validation.
+**CHECK to close:** a review response carries the answering agent and backend; a verdict from an agent other than the one asked is rejected, not scored; an alias cannot select the author as reviewer.
+**Closed 2026-09-23.** `query_gemini_review` and the mandatory peer-review dispatch are now `strict_agent`, and both verify `answered_by_agent` before a verdict counts. `normalize_agent_name` moved to `shared_types` so peer-review and dispatch share ONE alias list, and both the self-review check and reviewer selection compare canonical identities. `code_review` now requires `author_agent` instead of claiming `codex`. Pins: `d030_an_alias_of_the_author_is_never_chosen_as_its_reviewer` (with a control proving gemini is otherwise selectable), plus the alias mapping test asserting authorship survives.
+
+### D-031 - A failed codex substitution is recorded as the gemini seat's failure
+**Found:** 2026-09-23 (D-027 panel, Antigravity) · **Severity:** MEDIUM · **CLOSED 2026-09-23**
+**Evidence:** `fleet/src/orchestrator.rs` degraded path. When the agy task fails and the opted-in codex relaunch ALSO fails, the final `task_failed` event writes `agent: launch_agent` and `error: format!("agent exited with status {:?}", status.code())`. `launch_agent` is bound before the degrade and `status` is the FIRST attempt's exit status, so codex's failure is invisible: the row says gemini failed, with gemini's exit code. The comment directly above it claims this field is what distinguishes "a degraded codex failure" from "the requested gemini failing".
+**Second finding, same review:** the `JoinError` handler added for panicking workers lives in `spawn_fleet_members`' await loop. With `wait: true` that loop runs in the caller's task, so a dropped request (client cancel, connection drop) takes the loop with it while the `tokio::spawn`ed workers keep running detached. A worker that panics after that point is unobserved again, and its task stays `in_progress`. Pre-existing for every other exit too; the handler narrows the window, it does not close it.
+**CHECK to close:** a failed degraded relaunch is recorded with the agent that actually failed and that agent's error; a worker panicking after its caller was cancelled still reaches a terminal task state.
+**Closed 2026-09-23.** The degraded path now records the agent that failed LAST with that attempt's own error, keeping the first attempt's code as `first_attempt_error`. The panic window is closed by `WorkerTerminalGuard`, which lives INSIDE the worker task, so it runs on panic and on abort even when the caller's await loop is gone. Pins: `d031_worker_guard_marks_an_unrecorded_task_failed_but_never_overwrites`, with a control proving the guard never turns a recorded success into a failure.
+
 ### D-027 - Codex silently answered in the Gemini seat whenever agy failed
 **Found:** 2026-09-21 · **Severity:** HIGH (a "three peer" panel was sometimes two peers, one twice) · **CLOSED 2026-09-22**
 **Cause:** three substitution points, on two surfaces.
@@ -322,4 +326,4 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-09-22 (D-027 found, fixed, verified live and closed; its three-seat peer panel added D-028 through D-031) (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
+**Last reviewed:** 2026-09-23 (D-027 closed and verified live; its three-seat panel added D-028 through D-031, all four now closed with pins) (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)

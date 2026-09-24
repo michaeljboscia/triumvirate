@@ -1245,7 +1245,16 @@ impl McpBridge {
         self.review_request(Parameters(ReviewRequestTool {
             project_root: mapped.cwd.clone(),
             fleet_id: None,
-            author_agent: "codex".to_string(),
+            // D-030: this said `"codex"` unconditionally. A gemini or grok author was recorded
+            // as codex, codex was then excluded from reviewing, and the REAL author stayed
+            // eligible to review its own output. Unknown authorship cannot be reviewed safely,
+            // so say so rather than naming someone who was not there.
+            author_agent: mapped.author_agent.clone().ok_or_else(|| {
+                "code_review requires author_agent: which agent wrote this code? The review \
+                 engine excludes the author from reviewing it, so guessing means the author can \
+                 be handed its own work. review_request takes it directly."
+                    .to_string()
+            })?,
             artifact,
             review_type: "code".to_string(),
         }))

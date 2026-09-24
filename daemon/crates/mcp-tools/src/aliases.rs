@@ -97,6 +97,10 @@ pub struct ListScratchpadParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodeReviewParams {
+    /// Who WROTE the code under review. Required: the review engine excludes the author from
+    /// reviewing, and this alias used to hardcode `codex`, which both misattributed authorship
+    /// and left the real author eligible to review its own work (D-030).
+    pub author_agent: Option<String>,
     pub cwd: Option<String>,
     pub uncommitted: Option<bool>,
     pub base_branch: Option<String>,
@@ -156,6 +160,7 @@ pub struct ScratchpadListRequestLike {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewRequestLike {
+    pub author_agent: Option<String>,
     pub cwd: Option<String>,
     pub uncommitted: Option<bool>,
     pub base_branch: Option<String>,
@@ -326,6 +331,7 @@ pub fn map_list_scratchpad_params(
 
 pub fn map_code_review_params(p: CodeReviewParams) -> Result<ReviewRequestLike, AliasMappingError> {
     Ok(ReviewRequestLike {
+        author_agent: p.author_agent,
         cwd: p.cwd,
         uncommitted: p.uncommitted,
         base_branch: p.base_branch,
@@ -563,6 +569,7 @@ mod tests {
     #[test]
     fn u_al_17_code_review_all_fields_passthrough() {
         let p = CodeReviewParams {
+            author_agent: Some("codex".to_string()),
             cwd: Some("/tmp/repo".into()),
             uncommitted: Some(true),
             base_branch: Some("main".into()),
@@ -580,6 +587,7 @@ mod tests {
     #[test]
     fn u_al_18_code_review_has_no_diff_or_context_fields() {
         let p = CodeReviewParams {
+            author_agent: Some("codex".to_string()),
             cwd: None,
             uncommitted: None,
             base_branch: None,
@@ -588,12 +596,14 @@ mod tests {
         };
         let out = map_code_review_params(p).unwrap();
         let ReviewRequestLike {
+            author_agent,
             cwd,
             uncommitted,
             base_branch,
             commit_sha,
             timeout_ms,
         } = out;
+        assert_eq!(author_agent.as_deref(), Some("codex"), "authorship must survive the mapping");
         assert_eq!(cwd, None);
         assert_eq!(uncommitted, None);
         assert_eq!(base_branch, None);
@@ -667,6 +677,7 @@ mod tests {
         }));
         assert_scratchpad_list_type(map_list_scratchpad_params(ListScratchpadParams { cwd: None }));
         assert_review_type(map_code_review_params(CodeReviewParams {
+            author_agent: Some("codex".to_string()),
             cwd: None,
             uncommitted: None,
             base_branch: None,

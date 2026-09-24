@@ -576,6 +576,30 @@ async fn execute_ask_agent_inner(
         })
     }
 
+    // A relative `required_sources` entry cannot be matched against what the agent read, so it
+    // fails AFTER the review has run and been paid for, with a message that reads like the
+    // reviewer's fault. `source_path_candidates` expands absolute -> relative and never the
+    // other way, and an agent that opens the file by absolute path therefore matches nothing.
+    // Reject it here, naming the exact path to use. Fail before the spend, not after.
+    if let Some(rel) = req
+        .required_sources
+        .iter()
+        .find(|src| !std::path::Path::new(src.trim()).is_absolute())
+    {
+        let cwd = req.cwd.clone().unwrap_or_default();
+        let suggestion = if cwd.is_empty() {
+            "an absolute path".to_string()
+        } else {
+            format!("`{}`", std::path::Path::new(&cwd).join(rel.trim()).display())
+        };
+        return Err(format!(
+            "required_sources must be ABSOLUTE paths; `{rel}` is relative. The gate matches \
+             what the reviewer actually opened, and an agent that opens this file by absolute \
+             path would never match a relative entry: the review runs, costs its tokens, and is \
+             then rejected as unread. Pass {suggestion}."
+        ));
+    }
+
     let started = Instant::now();
     let span = Span::current();
 
@@ -2020,6 +2044,14 @@ fn source_path_candidates(source: &str, cwd: &str) -> Vec<String> {
         // false-rejects a genuine read. Antigravity found it.
         candidates.push(format!("./{rel}"));
     }
+
+    // The mirror image, which was missing: a RELATIVE source, read by the agent as an absolute
+    // path, matched nothing. Callers are now rejected up front for naming a relative source,
+    // and this keeps any that arrive by another route from silently failing to match.
+    if !trimmed_cwd.is_empty() && !std::path::Path::new(source).is_absolute() {
+        let rel = source.strip_prefix("./").unwrap_or(source);
+        candidates.push(format!("{trimmed_cwd}/{rel}"));
+    }
     candidates
 }
 
@@ -2121,10 +2153,57 @@ fn codex_ranged_reads_cover_source(
             .map(|read| read.range)
         })
         .collect();
+    let mut ranges = ranges;
+    ranges.extend(structured_read_ranges(tool_calls, candidates));
     if ranges.is_empty() {
         return false;
     }
     ranges_cover_lines(&ranges, count_lines(&bytes))
+}
+
+/// The windows a STRUCTURED read tool asked for, as ranges the same union can consume.
+///
+/// D-028: only shell windows were ever unioned. A reviewer whose read tool takes `offset` and
+/// `limit` was marked partial by `read_args_are_partial` the moment either field appeared, and
+/// no coverage was computed at all, so tiling a large file correctly could NEVER satisfy the
+/// gate. It rejected two complete grok reviews with a message that printed the very windows
+/// proving the file had been read end to end. Blaming a reviewer for a read it performed
+/// correctly teaches the operator to drop `require_sight`, which is the only thing standing
+/// between a real review and one written from memory.
+///
+/// `offset` is the first line (1-based, clamped), `limit` the number of lines. An offset with
+/// no limit runs to the end of the file, which is what such a read returns.
+fn structured_read_ranges(
+    tool_calls: &[ToolCallRecord],
+    candidates: &[String],
+) -> Vec<agent_adapter::codex::LineRange> {
+    tool_calls
+        .iter()
+        .filter(|c| {
+            !is_shell_read_tool(&c.tool)
+                && matches!(c.kind, ToolKind::ReadFile)
+                && c.success == Some(true)
+        })
+        .filter_map(|c| {
+            let args = c.args_json.as_deref()?;
+            // The record must NAME this source, by the same whole-path rule the rest of the
+            // gate uses. A read of a different file contributes nothing to this one.
+            if !candidates.iter().any(|cand| args_name_path(args, cand)) {
+                return None;
+            }
+            let value: serde_json::Value = serde_json::from_str(args).ok()?;
+            let num = |keys: &[&str]| -> Option<u64> {
+                keys.iter().find_map(|k| value.get(*k).and_then(serde_json::Value::as_u64))
+            };
+            let start = num(&["offset", "line_offset", "start_line"]).unwrap_or(1).max(1);
+            let end = match num(&["limit", "max_lines"]) {
+                // An explicit end_line wins over a count when both are somehow present.
+                Some(limit) => Some(num(&["end_line"]).unwrap_or(start + limit.saturating_sub(1))),
+                None => num(&["end_line"]),
+            };
+            Some(agent_adapter::codex::LineRange { start, end })
+        })
+        .collect()
 }
 
 /// The raw bytes of `source`, resolved against `cwd` when relative. `None` when this process
@@ -2973,11 +3052,28 @@ async fn enforce_mandatory_peer_review(
         // knob, so the reviewer is contained as well as checked.
         require_sight: Some(true),
         required_sources: vec![artifact_path_str.clone()],
+        // D-030: the reviewer seat was not strict, so with substitution opted in a gemini
+        // reviewer could be codex, and the agy -> gemini-cli hop carries NO warning prefix at
+        // all. An integrity gate whose reviewer can be silently swapped is not a gate: a
+        // "peer" review by the author's own provider is the failure this whole mechanism
+        // exists to prevent.
+        strict_agent: Some(true),
         ..Default::default()
     };
 
     let (verdict, comments) = match Box::pin(execute_ask_agent(&review_req, None)).await {
         Ok(resp) => {
+            // Belt and braces behind strict_agent: verify who actually answered before the
+            // verdict is allowed to count. `answered_by_agent` was never read here.
+            let answered = resp.answered_by_agent.as_deref().unwrap_or(&reviewer);
+            if normalize_agent_name(answered) != normalize_agent_name(&reviewer) {
+                let detail = format!(
+                    "peer review was answered by `{answered}`, not the assigned reviewer \
+                     `{reviewer}`. A verdict carries the authority of the agent that produced \
+                     it; a substituted reviewer is not that agent."
+                );
+                return Err(detail);
+            }
             let (v, c) = classify_review_verdict(&resp.response);
             // PROOF OF READ. A verdict that cannot quote the nonce did not reach the end of the
             // file, so it is Indeterminate, which blocks. Checked AFTER classification so a
@@ -5880,6 +5976,99 @@ mod deepseek_dispatch_tests {
 #[cfg(test)]
 mod sight_gate_tests {
     use super::*;
+
+    /// Build a successful structured read record for `path` with the given window.
+    fn structured_read(path: &str, offset: Option<u64>, limit: Option<u64>) -> ToolCallRecord {
+        let mut args = serde_json::json!({ "target_file": path });
+        if let Some(o) = offset {
+            args["offset"] = serde_json::json!(o);
+        }
+        if let Some(l) = limit {
+            args["limit"] = serde_json::json!(l);
+        }
+        ToolCallRecord {
+            id: None,
+            tool: "read_file".to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(args.to_string()),
+        }
+    }
+
+    /// D-028. Two adjacent limit/offset windows that tile the whole file ARE a whole read.
+    ///
+    /// RED IF: structured windows stop being unioned. This rejected two complete grok reviews,
+    /// with a message printing the very windows that proved the file had been read end to end.
+    #[test]
+    fn sight_39_structured_windows_that_tile_the_file_are_a_whole_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.rs");
+        std::fs::write(&src, (1..=100).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        let calls = vec![
+            structured_read(&src, Some(1), Some(60)),
+            structured_read(&src, Some(61), Some(40)),
+        ];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Grok", &calls, "grok-streaming-json", &[src.clone()], &cwd, &mut lifecycle)
+            .expect("windows 1..60 and 61..100 cover a 100-line file");
+
+        // NEGATIVE CONTROL: leave a gap and the gate must still reject.
+        let gapped = vec![
+            structured_read(&src, Some(1), Some(60)),
+            structured_read(&src, Some(70), Some(31)),
+        ];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Grok", &gapped, "grok-streaming-json", &[src.clone()], &cwd, &mut lifecycle)
+            .expect_err("lines 61..69 were never read");
+        assert!(err.contains("read PART"), "{err}");
+
+        // NEGATIVE CONTROL 2: a full-coverage window set naming a DIFFERENT file proves nothing.
+        let other = dir.path().join("other.rs").to_string_lossy().into_owned();
+        std::fs::write(&other, "x\n").unwrap();
+        let wrong_file = vec![structured_read(&other, Some(1), Some(100))];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Grok", &wrong_file, "grok-streaming-json", &[src], &cwd, &mut lifecycle)
+            .expect_err("reading another file is not reading this one");
+    }
+
+    /// A relative source is rejected UP FRONT, naming the absolute path to pass instead.
+    ///
+    /// RED IF: the boundary check is dropped. The gate matches what the reviewer opened, and a
+    /// relative entry matches nothing an agent opened by absolute path: the review runs, burns
+    /// its tokens, and is then rejected as unread. Mike hit this repeatedly.
+    #[tokio::test]
+    async fn sight_40_a_relative_required_source_is_rejected_before_the_review_runs() {
+        let req = AskAgentRequest {
+            agent: "codex".to_string(),
+            message: "review this".to_string(),
+            cwd: Some("/Users/someone/repo".to_string()),
+            required_sources: vec!["daemon/src/lib.rs".to_string()],
+            ..Default::default()
+        };
+        let err = execute_ask_agent(&req, None)
+            .await
+            .expect_err("a relative required_source must be refused, not dispatched");
+        assert!(err.contains("must be ABSOLUTE"), "{err}");
+        // It must say WHICH path to use, or the caller is left guessing.
+        assert!(err.contains("/Users/someone/repo/daemon/src/lib.rs"), "{err}");
+    }
+
+    /// Defence in depth for the same bug: candidates now expand relative -> absolute too.
+    /// RED IF: the mirror expansion is removed and a relative source silently matches nothing.
+    #[test]
+    fn sight_41_candidates_expand_in_both_directions() {
+        let abs = source_path_candidates("/repo/a.rs", "/repo");
+        assert!(abs.iter().any(|c| c == "a.rs"), "{abs:?}");
+        assert!(abs.iter().any(|c| c == "./a.rs"), "{abs:?}");
+        let rel = source_path_candidates("a.rs", "/repo");
+        assert!(rel.iter().any(|c| c == "/repo/a.rs"), "{rel:?}");
+        let dotted = source_path_candidates("./a.rs", "/repo");
+        assert!(dotted.iter().any(|c| c == "/repo/a.rs"), "{dotted:?}");
+    }
 
     /// A `wiki_search` MCP call is a wiki touch, and its arguments are a QUERY, so nothing in
     /// them names the wiki. Before the tool existed the filter matched paths only, which would

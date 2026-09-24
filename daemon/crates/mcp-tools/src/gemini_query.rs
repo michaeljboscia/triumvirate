@@ -58,16 +58,34 @@ where
         }
     }
 
+    // D-030: this call used to leave `strict_agent` unset. With substitution opted in, an agy
+    // failure meant CODEX answered, and the code below then threw away `answered_by_agent` and
+    // keyword-scanned the text: a codex "Approved." came back as a CLEAN GEMINI REVIEW, in a
+    // response type with no field able to say otherwise. A verdict attributed to a seat that
+    // did not produce it is worse than no verdict, so this one is strict.
     let response = ask_agent_executor(AskAgentRequest {
             agent: "gemini".to_string(),
             message: prompt,
             cwd: None,
             repo: None,
             branch: None,
+            strict_agent: Some(true),
             ..Default::default()
         })
         .await
         .map_err(|e| format!("query_gemini_review failed: {e}"))?;
+    // Belt and braces: strict_agent should make this impossible, but this function's return
+    // type cannot express "someone else answered", so it must not return at all if one did.
+    if let Some(other) = response.answered_by_agent.as_deref()
+        && !other.eq_ignore_ascii_case("gemini")
+        && !other.eq_ignore_ascii_case("antigravity")
+    {
+        return Err(format!(
+            "query_gemini_review was answered by `{other}`, not the gemini seat. A review verdict \
+             carries the authority of the reviewer that produced it, and this response type \
+             cannot record that the reviewer was substituted."
+        ));
+    }
     let lower = response.response.to_lowercase();
     let verdict = if lower.contains("regression") {
         GeminiReviewVerdict::Regression
