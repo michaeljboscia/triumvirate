@@ -627,6 +627,7 @@ pub(crate) async fn breaker_probe() -> shared_types::BreakerProbeResponse {
             AgyProbeOutcome::Ok => "ok",
             AgyProbeOutcome::CaptureDegraded => "capture_degraded",
             AgyProbeOutcome::BackendFailed => "backend_failed",
+            AgyProbeOutcome::AuthRequired => "auth_required",
         }
         .to_string(),
         detail,
@@ -672,12 +673,15 @@ async fn run_health_probe() -> (mcp_bridge::agy_resilience::AgyProbeOutcome, Str
             format!("probe alive (unexpected text: {:.40})", parsed.response_text),
         ),
         Err(e) => {
-            let msg = e.to_string();
+            let msg = redact_url_queries(&e.to_string());
             // run_agy_cli_process_with_session surfaces a persistent exit-0-empty as
             // "empty output" after its retry, which is a capture-drop regression (REQ-024/056).
             if msg.contains("empty output") {
                 tracing::warn!("agy health: capture DEGRADED: {msg}");
                 (AgyProbeOutcome::CaptureDegraded, msg)
+            } else if is_auth_failure(&msg) {
+                tracing::warn!("agy health: AUTH REQUIRED: {msg}");
+                (AgyProbeOutcome::AuthRequired, msg)
             } else {
                 tracing::warn!("agy health: backend FAILED: {msg}");
                 (AgyProbeOutcome::BackendFailed, msg)
@@ -1192,26 +1196,37 @@ fn quota_signal_in_line(line: &str) -> bool {
 /// Classify a non-zero agy exit into a user-visible error (REQ-034/051/052). Quota
 /// failures name the capacity cause; auth failures name the re-auth remediation;
 /// everything else surfaces the exit code + last stderr line.
+///
+/// Every URL in the surfaced text loses its query string: this message goes to WARN logs,
+/// `/health`, and telemetry, and a lost OAuth token makes agy print a Google sign-in URL.
 fn classify_failure(code: String, stderr: &str, log_info: &AgyLogInfo) -> anyhow::Error {
-    let last = stderr.trim().lines().next_back().unwrap_or("").trim();
+    let last = redact_url_queries(stderr.trim().lines().next_back().unwrap_or("").trim());
 
     if log_info.quota_signal.is_some() || quota_signal_in_line(stderr) {
         let detail = log_info
             .quota_signal
-            .clone()
-            .unwrap_or_else(|| last.to_string());
+            .as_deref()
+            .map_or_else(|| last.clone(), redact_url_queries);
         return anyhow::anyhow!("agy capacity/quota error (exit {code}): {detail}");
     }
 
     let low = stderr.to_lowercase();
+    // A 403 that asks the account owner to verify the account. Re-running `agy` alone does
+    // not clear it, so it gets its own remediation.
+    if low.contains("verify your account") {
+        return anyhow::anyhow!(
+            "{AGY_ACCOUNT_VERIFICATION_ERROR} (exit {code}): {last}. Verify the Google account in a browser, then run `agy` once interactively."
+        );
+    }
     if low.contains("oauth")
         || low.contains("not logged in")
         || low.contains("unauthenticated")
         || low.contains("credential")
         || low.contains("login")
+        || low.contains("accounts.google.com")
     {
         return anyhow::anyhow!(
-            "agy auth error (exit {code}): {last}. Run `agy` once interactively to re-authenticate."
+            "{AGY_AUTH_ERROR} (exit {code}): {last}. Run `agy` once interactively to re-authenticate."
         );
     }
 
@@ -1220,6 +1235,40 @@ fn classify_failure(code: String, stderr: &str, log_info: &AgyLogInfo) -> anyhow
     } else {
         anyhow::anyhow!("agy connector failed (exit {code}): {last}")
     }
+}
+
+const AGY_AUTH_ERROR: &str = "agy auth error";
+const AGY_ACCOUNT_VERIFICATION_ERROR: &str = "agy account verification required";
+
+/// True when a surfaced failure needs a person to sign in again or verify the account.
+/// A retry or a wait does not clear it.
+fn is_auth_failure(msg: &str) -> bool {
+    msg.contains(AGY_AUTH_ERROR) || msg.contains(AGY_ACCOUNT_VERIFICATION_ERROR)
+}
+
+/// Replace the query string and fragment of every `http(s)://` URL in `text` with
+/// `?<redacted>`. Scheme, host, and path stay, so the log still shows where agy sent the user.
+fn redact_url_queries(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = ["https://", "http://"].iter().filter_map(|s| rest.find(s)).min() {
+        out.push_str(&rest[..start]);
+        let url = &rest[start..];
+        let end = url
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
+            .unwrap_or(url.len());
+        let token = &url[..end];
+        match token.find(['?', '#']) {
+            Some(cut) => {
+                out.push_str(&token[..cut]);
+                out.push_str("?<redacted>");
+            }
+            None => out.push_str(token),
+        }
+        rest = &url[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,6 +1434,48 @@ pub(crate) mod tests {
         );
     }
 
+    /// 2026-09-24: with its OAuth token gone, agy exited 1 with a Google sign-in URL as its
+    /// last line. The health probe logged the full URL at WARN every five minutes, as a
+    /// generic connector failure.
+    /// RED IF: the query string reaches the message, or the failure does not read as auth.
+    #[test]
+    fn sign_in_redirect_is_an_auth_error_with_the_query_redacted() {
+        let stderr = "Please sign in:\nhttps://accounts.google.com/signin/continue?sarp=1&plt=SECRET_STATE&flowName=GlifWebSignIn&authuser";
+        let msg = classify_failure("1".to_string(), stderr, &AgyLogInfo::default()).to_string();
+        assert!(!msg.contains("SECRET_STATE") && !msg.contains("sarp="), "query leaked: {msg}");
+        assert!(msg.contains("https://accounts.google.com/signin/continue?<redacted>"), "got: {msg}");
+        assert!(msg.starts_with(AGY_AUTH_ERROR), "got: {msg}");
+        assert!(is_auth_failure(&msg));
+        assert_eq!(classify_failure_message(&msg), AgyFailureClass::AuthOrExec);
+    }
+
+    /// RED IF: the account-verification 403 reads as a generic failure or as quota. Re-running
+    /// `agy` alone does not clear it, so its message must name the verification step.
+    #[test]
+    fn account_verification_403_has_its_own_class() {
+        let stderr = r#"AGY_ERROR: {"short_error":"PERMISSION_DENIED (code 403): Verify your account to continue.","status":"PERMISSION_DENIED","error_code":403,"retryable":false}"#;
+        let msg = classify_failure("3".to_string(), stderr, &AgyLogInfo::default()).to_string();
+        assert!(msg.starts_with(AGY_ACCOUNT_VERIFICATION_ERROR), "got: {msg}");
+        assert!(msg.contains("Verify the Google account"), "got: {msg}");
+        assert!(is_auth_failure(&msg));
+        assert_eq!(classify_failure_message(&msg), AgyFailureClass::AuthOrExec);
+        assert!(!is_auth_failure("agy connector failed (exit 2): something odd"));
+    }
+
+    #[test]
+    fn redact_url_queries_keeps_the_path_and_drops_the_rest() {
+        assert_eq!(redact_url_queries("no url here"), "no url here");
+        assert_eq!(redact_url_queries("see https://example.com/a/b"), "see https://example.com/a/b");
+        assert_eq!(
+            redact_url_queries("go https://a.example/x?k=v&t=1 then http://b.example/y#frag done"),
+            "go https://a.example/x?<redacted> then http://b.example/y?<redacted> done"
+        );
+        assert_eq!(
+            redact_url_queries(r#"{"url":"https://a.example/p?token=abc"}"#),
+            r#"{"url":"https://a.example/p?<redacted>"}"#
+        );
+    }
+
     #[test]
     fn route_plan_quota_skips_gemini_cli() {
         let hops = plan_degraded_route("gemini-cli,codex", AgyFailureClass::Quota);
@@ -1471,7 +1562,6 @@ pub(crate) mod tests {
     // backend targets macOS — C2). The real-binary happy path is covered separately by
     // the verification battery and the #[ignore]d test below.
 
-    #[cfg(target_os = "macos")]
     /// Serializes tests that touch the quota-backoff and degraded-route env vars, and restores
     /// the prior value on drop. Process-global env is the isolation trap this crate has hit
     /// before; the lock is the cure, the restore is the other half.
@@ -1958,6 +2048,16 @@ mod breaker_probe_tests {
             let h = agy_health_snapshot();
             assert_eq!(h.backend_health, "failed", "a failing agy must read as failed: {h:?}");
             assert!(h.last_probe_unix_ms.is_some(), "and the probe must be recorded as having run");
+        }
+
+        // Branch 1b: agy wants an interactive Google sign-in. It needs a person, and the
+        // sign-in state in the URL must not reach `/health`.
+        {
+            let _fx = setup("echo 'https://accounts.google.com/signin/continue?plt=SECRET_STATE' 1>&2; exit 1");
+            health_probe().await;
+            let h = agy_health_snapshot();
+            assert_eq!(h.backend_health, "auth_required", "a sign-in redirect must read as auth: {h:?}");
+            assert!(!h.detail.contains("SECRET_STATE"), "the redirect query must be redacted: {h:?}");
         }
 
         // Branch 2: exit 0 with NOTHING on stdout, the silent capture drop that real traffic

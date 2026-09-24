@@ -501,6 +501,9 @@ pub enum AgyProbeOutcome {
     CaptureDegraded,
     /// Non-zero exit / classified backend error.
     BackendFailed,
+    /// agy needs a person: an interactive sign-in or an account verification. The probe
+    /// keeps failing until someone acts, so it gets its own state instead of `failed`.
+    AuthRequired,
 }
 
 /// Snapshot of the last agy health probe, surfaced via the daemon `/health` endpoint.
@@ -546,6 +549,9 @@ pub fn agy_record_health(outcome: AgyProbeOutcome, detail: impl Into<String>, no
             }
             AgyProbeOutcome::BackendFailed => {
                 h.backend_health = "failed".to_string();
+            }
+            AgyProbeOutcome::AuthRequired => {
+                h.backend_health = "auth_required".to_string();
             }
         }
         (h.capture_health.clone(), h.backend_health.clone(), h.detail.clone())
@@ -715,6 +721,9 @@ mod tests {
 
         agy_record_health(AgyProbeOutcome::BackendFailed, "exit 2", 300);
         assert_eq!(agy_health_snapshot().backend_health, "failed");
+
+        agy_record_health(AgyProbeOutcome::AuthRequired, "agy auth error (exit 1)", 400);
+        assert_eq!(agy_health_snapshot().backend_health, "auth_required");
     }
 
     #[test]

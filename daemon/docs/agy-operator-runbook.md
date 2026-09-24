@@ -27,6 +27,14 @@ The refresh token has no local expiry stamp; persistence is governed by Google-s
 revocation/inactivity. If a dispatch later fails with an auth error, just run `agy`
 once interactively again.
 
+The health probe reports `agy_backend_health = auth_required` when agy needs a person:
+- **`agy auth error`** (for example, agy printed a Google sign-in URL): run `agy` once
+  interactively.
+- **`agy account verification required`** (a 403 that asks you to verify the account):
+  verify the Google account in a browser first, then run `agy` once interactively.
+
+The daemon removes the query string from any URL in these messages before it logs them.
+
 ### 1.2 Pin the binary path (REQ-033)
 Install `agy` at a stable path (a fixed symlink is fine) so updates don't change the
 resolved binary out from under the daemon. Confirm:
