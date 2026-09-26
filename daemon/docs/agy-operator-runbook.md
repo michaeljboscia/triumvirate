@@ -110,7 +110,8 @@ TRIUMVIRATE_GEMINI_SHADOW=on              # also run agy on every gemini request
 
 agy updates frequently. The backend runs `agy --version` once and compares it to
 `TRIUMVIRATE_AGY_EXPECTED_VERSION`:
-- **mismatch + default:** warns, proceeds.
+- **mismatch + default:** proceeds, and reports the drift once per process: one WARN line
+  and one `tv_agy_version_mismatch` event. A restart reports it again.
 - **mismatch + `TRIUMVIRATE_AGY_STRICT_VERSION=true`:** refuses the agy backend.
 
 **On any agy upgrade:** re-run the verification battery (REQ-060–064 — see
@@ -138,7 +139,7 @@ Last verified-good version: **1.0.2** (2026-05-24).
 | `TRIUMVIRATE_AGY_MAX_RPM` | `30` | token-bucket call-rate ceiling |
 | `TRIUMVIRATE_AGY_MAX_PROMPT_BYTES` | `900000` | fail-loud guard (no stdin/`@file` in agy) |
 | `TRIUMVIRATE_AGY_HEALTH_PROBE_SECS` | `300` | health-probe interval |
-| `TRIUMVIRATE_AGY_EXPECTED_VERSION` | `1.0.2` | pinned version |
+| `TRIUMVIRATE_AGY_EXPECTED_VERSION` | `1.2.7` | pinned version |
 | `TRIUMVIRATE_AGY_STRICT_VERSION` | off | refuse on version mismatch |
 | `TRIUMVIRATE_AGY_BREAKER_THRESHOLD` | `3` | consecutive quota failures before the breaker opens |
 | `TRIUMVIRATE_AGY_BREAKER_COOLDOWN_SECS` | `120` | breaker base cooldown (exponential, capped at ~5 hr) |

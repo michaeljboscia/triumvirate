@@ -26,6 +26,13 @@ file is the thing you read to answer "what do we know is broken right now."
 **Why it is filed rather than fixed:** closing it needs the adapters to record how many lines came BACK, which is a parser change per agent, or a per-tool semantics table. Both are larger than the defect. The shell path is unaffected: `sed -n` windows are exact.
 **CHECK to close:** a read whose output was truncated does not satisfy a source; a zero-based reader's windows are credited at their true lines.
 
+### D-033 - D-007 came back within days: agy auto-upgraded past the pin
+**Found:** 2026-09-26 (PostHog logs) · **Severity:** LOW · **CODE FIX ON BRANCH; pin not reconciled**
+**Evidence:** the mismatch WARN came back on 2026-09-22 (installed 1.2.8, pin 1.2.7) and on 2026-09-23 changed to 1.2.9. Since then it fires at about the same daily rate as before D-007. The rate matches the 5-minute health probe, which dispatches through the same path. agy updates itself about every day or two, so a pin goes stale almost immediately. Each dispatch repeated a fact that the non-strict path had cached for the life of the process.
+**Code fix:** warn-only drift now reports once per process (one WARN line and one `tv_agy_version_mismatch` event, both behind the same guard). Strict mode still refuses on every dispatch. Test: `version_drift_reports_once_per_process`.
+**Still open, owner action:** the pin says 1.2.7 and 1.2.9 is installed. Either run the REQ-060-064 battery on 1.2.9 and move the pin (in `~/.claude.json` and the `agy_expected_version` default), or move it as "the version we run" under the D-007 rule. The code fix makes the drift quiet, not correct.
+**CHECK to close:** the daemon restarted on this build logs the mismatch WARN exactly once across at least three health-probe intervals, AND after the pin moves, a restart logs zero.
+
 ### D-004 - Failed generations carry no error text
 **Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
 **Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried
@@ -333,4 +340,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-09-24 (D-028 through D-031 closed; their own panel found the D-029 fix reading the wrong column and the D-031 guard firing on success, both corrected here, and added D-032) (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)
+**Last reviewed:** 2026-09-26 (D-033 added: D-007 recurred after agy auto-upgraded) (2026-09-24: D-028 through D-031 closed; their own panel found the D-029 fix reading the wrong column and the D-031 guard firing on success, both corrected here, and added D-032) (D-019 added and closed during wiki step two; before that, every row re-checked against its own CHECK during the ask_jury work: 3 closed as stale, 3 confirmed still open with fresh evidence, 1 added)

@@ -137,16 +137,9 @@ fn enforce_version_pin() -> anyhow::Result<()> {
                     "agy version {v} != expected {expected}; refusing (TRIUMVIRATE_AGY_STRICT_VERSION). Re-run the verification battery (REQ-060-064) and update TRIUMVIRATE_AGY_EXPECTED_VERSION."
                 );
             }
-            tracing::warn!(
-                "agy version {v} != expected {expected}; proceeding (set TRIUMVIRATE_AGY_STRICT_VERSION=true to refuse)"
-            );
-            // Also surface the drift as a first-class PostHog defect (not just a log): emit ONCE per
-            // process so the dashboard counts drifted daemons, not the per-dispatch warning noise.
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static EMITTED: AtomicBool = AtomicBool::new(false);
-            if !EMITTED.swap(true, Ordering::Relaxed) {
-                mcp_bridge::posthog::record_agy_version_mismatch(v, &expected);
-            }
+            use std::sync::atomic::AtomicBool;
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            report_version_drift_once(v, &expected, &REPORTED);
             Ok(())
         }
         Err(e) => {
@@ -157,6 +150,32 @@ fn enforce_version_pin() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Report warn-only drift ONCE per process: the WARN line and the PostHog defect together.
+///
+/// 2026-09-26 (D-033): agy auto-upgraded twice (1.2.8, then 1.2.9) within four days of D-007
+/// moving the pin to 1.2.7, and the warning was back on every dispatch, the 5-minute health
+/// probe included (~288 lines a day).
+/// Warn-only mode reads the cached version, so every line after the first repeated a fact that
+/// cannot change until restart. That is the furniture D-007 described, and it buries new
+/// warnings. Drift stays visible: one WARN per start, one `tv_agy_version_mismatch` event,
+/// and `triumvirate doctor`. Strict mode is untouched; it refuses on every dispatch.
+///
+/// Returns whether this call reported, so the once-guard is testable without a log capture.
+fn report_version_drift_once(
+    installed: &str,
+    expected: &str,
+    reported: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!(
+        "agy version {installed} != expected {expected}; proceeding (set TRIUMVIRATE_AGY_STRICT_VERSION=true to refuse). Reported once per process."
+    );
+    mcp_bridge::posthog::record_agy_version_mismatch(installed, expected);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,6 +1333,17 @@ pub(crate) mod tests {
         ));
         assert!(quota_signal_in_line("Error: RESOURCE_EXHAUSTED quota exceeded"));
         assert!(quota_signal_in_line("got HTTP 429 rate limit"));
+    }
+
+    /// RED IF: warn-only drift reports on more than the first dispatch, which puts the
+    /// mismatch WARN back on every call and the 5-minute health probe (2026-09-26).
+    #[test]
+    fn version_drift_reports_once_per_process() {
+        let reported = std::sync::atomic::AtomicBool::new(false);
+        assert!(report_version_drift_once("1.2.9", "1.2.7", &reported));
+        for _ in 0..3 {
+            assert!(!report_version_drift_once("1.2.9", "1.2.7", &reported));
+        }
     }
 
     /// RED IF: benign glog identifiers containing `429` or `Quota` feed quota backoff.
