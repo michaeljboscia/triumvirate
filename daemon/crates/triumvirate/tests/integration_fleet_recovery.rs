@@ -110,10 +110,10 @@ fn seed(root: &Path, fleet_id: &str, tasks: &[&str]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn token(pid: u32, wt: &Path, fleet_id: &str, task_id: &str, owner: ProcessIdentity) {
+fn token(pid: u32, root: &Path, fleet_id: &str, task_id: &str, owner: ProcessIdentity) {
     let mut t = WorkerToken::for_spawned_child(pid, fleet_id, task_id, "codex").expect("token");
     t.owner = owner;
-    worker_token::write_token(wt, &t).expect("write token");
+    worker_token::write_token(root, &t).expect("write token");
 }
 
 fn fleet_state(root: &Path, fleet_id: &str) -> (String, Option<String>) {
@@ -159,8 +159,8 @@ fn a_restarted_daemon_stops_orphans_first_then_fails_the_fleet_and_keeps_worktre
     let stubborn = orphan("trap \"\" TERM; while :; do sleep 1; done", &wts[1]);
     let bystander = orphan("sleep 120", &wts[0]);
     cleanup.pids.extend([polite, stubborn, bystander]);
-    token(polite, &wts[0], "fleet-crashed", "fleet-crashed-T-001", owner);
-    token(stubborn, &wts[1], "fleet-crashed", "fleet-crashed-T-002", owner);
+    token(polite, &crashed, "fleet-crashed", "fleet-crashed-T-001", owner);
+    token(stubborn, &crashed, "fleet-crashed", "fleet-crashed-T-002", owner);
 
     // A fleet whose owner is alive (this test process): another session's live fleet.
     let live = dir.path().join("live");
@@ -169,7 +169,7 @@ fn a_restarted_daemon_stops_orphans_first_then_fails_the_fleet_and_keeps_worktre
     worker_token::write_owner_record(&live, "fleet-live", &me).expect("owner record");
     let live_worker = orphan("sleep 120", &live_wts[0]);
     cleanup.pids.push(live_worker);
-    token(live_worker, &live_wts[0], "fleet-live", "fleet-live-T-001", me);
+    token(live_worker, &live, "fleet-live", "fleet-live-T-001", me);
 
     // A fleet from before owner records.
     let old = dir.path().join("old");

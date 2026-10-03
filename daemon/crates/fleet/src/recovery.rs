@@ -93,6 +93,27 @@ pub fn recover_stale_fleets(project_root: &Path, opts: RecoveryOptions) -> anyho
             continue;
         }
 
+        // A task in flight with no token: never launched, or the owner died in the instant between
+        // spawn and the token write. Tokens live outside the worktree, so a worker cannot have
+        // deleted its own. Neither case can be proven here; say so instead of staying silent.
+        let tokened: std::collections::BTreeSet<&str> = tokens
+            .iter()
+            .filter_map(|(_, t)| t.as_ref().ok().map(|t| t.task_id.as_str()))
+            .collect();
+        let untracked: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT task_id FROM tasks WHERE fleet_id = ?1 AND state IN ('claimed', 'in_progress')",
+            )?;
+            let rows = stmt.query_map([&fleet_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|t| !tokened.contains(t.as_str()))
+                .collect()
+        };
+        if !untracked.is_empty() {
+            tracing::warn!(fleet_id = %fleet_id, tasks = ?untracked, "in-flight tasks with no launch token: never launched, or launched in the instant before the owner died");
+        }
+
         let mut problems = Vec::new();
         for (path, token) in &tokens {
             let token = match token {
@@ -407,8 +428,8 @@ mod tests {
         let stubborn = orphan("trap \"\" TERM; while :; do sleep 1; done", &wts[1]);
         let shell = orphan("sleep 60", &wts[0]);
         let _reap = Reap(vec![polite, stubborn, shell]);
-        token_for(polite, &wts[0], "fleet-a", "fleet-a-T-001", owner);
-        token_for(stubborn, &wts[1], "fleet-a", "fleet-a-T-002", owner);
+        token_for(polite, &root, "fleet-a", "fleet-a-T-001", owner);
+        token_for(stubborn, &root, "fleet-a", "fleet-a-T-002", owner);
 
         let report = recover_stale_fleets(&root, OPTS).expect("recover");
 
@@ -435,7 +456,7 @@ mod tests {
         worker_token::write_owner_record(&root, "fleet-live", &me).expect("owner");
         let worker = orphan("sleep 60", &wts[0]);
         let _reap = Reap(vec![worker]);
-        token_for(worker, &wts[0], "fleet-live", "fleet-live-T-001", me);
+        token_for(worker, &root, "fleet-live", "fleet-live-T-001", me);
 
         let report = recover_stale_fleets(&root, OPTS).expect("recover");
 
@@ -456,9 +477,9 @@ mod tests {
         worker_token::write_owner_record(&root, "fleet-reuse", &owner).expect("owner");
         let stranger = orphan("sleep 60", &wts[0]);
         let _reap = Reap(vec![stranger]);
-        let mut t = token_for(stranger, &wts[0], "fleet-reuse", "fleet-reuse-T-001", owner);
+        let mut t = token_for(stranger, &root, "fleet-reuse", "fleet-reuse-T-001", owner);
         t.start_time_us -= 1_000_000;
-        worker_token::write_token(&wts[0], &t).expect("rewrite");
+        worker_token::write_token(&root, &t).expect("rewrite");
 
         let report = recover_stale_fleets(&root, OPTS).expect("recover");
 

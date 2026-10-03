@@ -538,7 +538,6 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         };
                         let worker_ctx = WorkerContext {
                             project_root: &project_root,
-                            worktree: &worktree_path,
                             fleet_id: &fleet_id,
                             task_id: &task_id,
                             agent: &launch_agent,
@@ -667,7 +666,6 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             // cancel (Grok, review of step 6).
                                             let degrade_ctx = WorkerContext {
                                                 project_root: &project_root,
-                                                worktree: &worktree_path,
                                                 fleet_id: &fleet_id,
                                                 task_id: &task_id,
                                                 agent: "codex",
@@ -1409,7 +1407,6 @@ impl Drop for FleetChildRegistration {
 /// Which worker a wait is for: where its token goes and what it is called in the record.
 pub(crate) struct WorkerContext<'a> {
     pub project_root: &'a Path,
-    pub worktree: &'a Path,
     pub fleet_id: &'a str,
     pub task_id: &'a str,
     pub agent: &'a str,
@@ -1453,7 +1450,7 @@ async fn wait_fleet_child(
     if let Some(pid) = child.id() {
         match crate::worker_token::WorkerToken::for_spawned_child(pid, fleet_id, ctx.task_id, ctx.agent) {
             Some(token) => {
-                if let Err(e) = crate::worker_token::write_token(ctx.worktree, &token) {
+                if let Err(e) = crate::worker_token::write_token(ctx.project_root, &token) {
                     tracing::error!(fleet_id, task_id = ctx.task_id, error = %e, "could not write the launch token; stopping the worker");
                     let _ = crate::worker_token::signal_group(pid, libc::SIGKILL);
                     let _ = child.start_kill();
@@ -2691,7 +2688,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = super::WorkerContext {
             project_root: dir.path(),
-            worktree: dir.path(),
             fleet_id: "fleet-silent",
             task_id: "fleet-silent-T-001",
             agent: "stallstub",
@@ -2702,7 +2698,7 @@ mod tests {
         assert!(matches!(&exit.result, Ok(s) if s.success()), "log-only: the worker must not be killed: {:?}", exit.result);
         let silence = exit.longest_silence.as_secs_f64();
         assert!((2.0..=4.0).contains(&silence), "longest silence {silence}s, expected about 3s");
-        let token = crate::worker_token::read_token(dir.path()).expect("read").expect("a token is written for every worker");
+        let token = crate::worker_token::read_token(dir.path(), "fleet-silent", "fleet-silent-T-001").expect("read").expect("a token is written for every worker");
         assert_eq!(token.task_id, "fleet-silent-T-001");
         assert_eq!(token.pgid, token.pid);
     }
@@ -2713,7 +2709,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = super::WorkerContext {
             project_root: dir.path(),
-            worktree: dir.path(),
             fleet_id: "fleet-chatty",
             task_id: "fleet-chatty-T-001",
             agent: "chattystub",

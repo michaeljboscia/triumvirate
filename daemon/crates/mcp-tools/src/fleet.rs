@@ -487,9 +487,9 @@ mod restart_index_tests {
         let stubborn = orphan("trap \"\" TERM; while :; do sleep 1; done", &wt_b);
         let bystander = orphan("sleep 60", &wt_a);
         let _reap = Reap(vec![polite, stubborn, bystander]);
-        for (pid, wt, task) in [(polite, &wt_a, "fleet-cancel-T-001"), (stubborn, &wt_b, "fleet-cancel-T-002")] {
+        for (pid, task) in [(polite, "fleet-cancel-T-001"), (stubborn, "fleet-cancel-T-002")] {
             let t = fleet::worker_token::WorkerToken::for_spawned_child(pid, "fleet-cancel", task, "codex").expect("token");
-            fleet::worker_token::write_token(wt, &t).expect("write token");
+            fleet::worker_token::write_token(&root, &t).expect("write token");
         }
 
         let restarted: Arc<Mutex<HashMap<String, FleetStatusResponse>>> = Arc::default();

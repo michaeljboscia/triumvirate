@@ -5,8 +5,12 @@
 //! operator's shell sitting in the worktree (unanimous across four review seats, 2026-10-03), and
 //! a bare pid can be reused by an unrelated process once the worker exits.
 //!
-//! So each worker gets `.triumvirate/worker.json` in its worktree, written right after spawn: pid,
-//! process group, the OS-reported start time, and the fleet, task and agent. Every later signal
+//! So each worker gets a token at `{project_root}/.triumvirate/fleet-workers/{fleet_id}/{task_id}.json`,
+//! written right after spawn: pid, process group, the OS-reported start time, and the fleet, task
+//! and agent. NOT in the worktree: the worker writes there, so a worker (or a `git clean -fdx` it
+//! runs) could rewrite its token to aim a kill elsewhere, or delete it and hide from recovery
+//! (Codex, review of 57dfd2d). Codex's workspace-write sandbox cannot reach the project's own
+//! `.triumvirate`. Every later signal
 //! (stall, cancel, startup recovery) re-reads the OS immediately before signalling and refuses
 //! loudly on any mismatch. A pid and a start time together name one process, ever.
 //!
@@ -23,9 +27,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-
-/// Where the token lives, relative to the worktree.
-pub const TOKEN_RELATIVE_PATH: &str = ".triumvirate/worker.json";
 
 /// The fleet-level owner record, under the project root, one file per fleet. It exists before any
 /// worker launches, so a fleet that died while still `spawning` (no tokens yet) is recoverable.
@@ -236,18 +237,33 @@ pub fn signal_group(pgid: u32, sig: i32) -> Result<(), String> {
     Err(format!("kill(-{pgid}, {sig}) failed: {err}"))
 }
 
-pub fn token_path(worktree: &Path) -> PathBuf {
-    worktree.join(TOKEN_RELATIVE_PATH)
+fn fleet_token_dir(project_root: &Path, fleet_id: &str) -> io::Result<PathBuf> {
+    check_id(fleet_id)?;
+    Ok(project_root.join(".triumvirate").join("fleet-workers").join(fleet_id))
+}
+
+/// Ids become path components. Generated internally, but a separator or `..` would escape the
+/// token directory, so refuse them rather than trust that.
+fn check_id(id: &str) -> io::Result<()> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id == "." || id == ".." {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unsafe id for a token path: {id:?}")));
+    }
+    Ok(())
+}
+
+pub fn token_path(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Result<PathBuf> {
+    check_id(task_id)?;
+    Ok(fleet_token_dir(project_root, fleet_id)?.join(format!("{task_id}.json")))
 }
 
 /// Write-then-rename, so a reader never sees a torn token.
-pub fn write_token(worktree: &Path, token: &WorkerToken) -> io::Result<()> {
-    write_json_atomically(&token_path(worktree), token)
+pub fn write_token(project_root: &Path, token: &WorkerToken) -> io::Result<()> {
+    write_json_atomically(&token_path(project_root, &token.fleet_id, &token.task_id)?, token)
 }
 
-/// `Ok(None)` when there is no token (the worker never launched, or launched before tokens).
-pub fn read_token(worktree: &Path) -> io::Result<Option<WorkerToken>> {
-    read_json(&token_path(worktree))
+/// `Ok(None)` when there is no token (the worker never launched).
+pub fn read_token(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Result<Option<WorkerToken>> {
+    read_json(&token_path(project_root, fleet_id, task_id)?)
 }
 
 pub fn write_owner_record(project_root: &Path, fleet_id: &str, owner: &ProcessIdentity) -> io::Result<()> {
@@ -275,31 +291,31 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Option<T>>
     }
 }
 
-/// Every worker token under `{project_root}/.triumvirate/worktrees/{fleet_id}-*`, with the
-/// worktree it came from. Unreadable tokens are returned as errors so the caller can refuse to
-/// call the fleet clean.
+/// Every worker token of `fleet_id`, with the file it came from. Unreadable tokens, and tokens
+/// whose contents do not match their file name, are returned as errors so the caller can refuse
+/// to call the fleet clean.
 pub fn fleet_tokens(project_root: &Path, fleet_id: &str) -> Vec<(PathBuf, io::Result<WorkerToken>)> {
-    let base = project_root.join(".triumvirate").join("worktrees");
-    let Ok(entries) = fs::read_dir(&base) else {
+    let Ok(dir) = fleet_token_dir(project_root, fleet_id) else {
         return Vec::new();
     };
-    let prefix = format!("{fleet_id}-");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let matches = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&prefix));
-        if !matches || !path.is_dir() {
-            continue;
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue; // a temp file mid-rename
         }
-        match read_token(&path) {
-            Ok(Some(t)) if t.fleet_id == fleet_id => out.push((path, Ok(t))),
-            // A token for a different fleet in this fleet's directory is not ours to act on.
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        match read_json::<WorkerToken>(&path) {
+            Ok(Some(t)) if t.fleet_id == fleet_id && t.task_id == stem => out.push((path, Ok(t))),
             Ok(Some(t)) => out.push((
                 path,
-                Err(io::Error::other(format!("token names fleet {}, not {fleet_id}", t.fleet_id))),
+                Err(io::Error::other(format!(
+                    "token names fleet {} task {}, not the file it is in",
+                    t.fleet_id, t.task_id
+                ))),
             )),
             Ok(None) => {}
             Err(e) => out.push((path, Err(e))),
@@ -479,8 +495,37 @@ mod tests {
         let s = stub("sleep 30");
         let t = WorkerToken::for_spawned_child(s.0.id(), "fleet-1", "fleet-1-T-001", "grok").expect("token");
         write_token(dir.path(), &t).expect("write");
-        assert_eq!(read_token(dir.path()).expect("read"), Some(t));
-        assert_eq!(read_token(&dir.path().join("none")).expect("read"), None);
+        assert_eq!(read_token(dir.path(), "fleet-1", "fleet-1-T-001").expect("read"), Some(t.clone()));
+        assert_eq!(read_token(dir.path(), "fleet-1", "fleet-1-T-002").expect("read"), None);
+        assert_eq!(fleet_tokens(dir.path(), "fleet-1").len(), 1);
+        assert!(
+            token_path(dir.path(), "fleet-1", "fleet-1-T-001").expect("path").starts_with(dir.path().join(".triumvirate/fleet-workers")),
+            "tokens live in the project's .triumvirate, never in a worktree"
+        );
+    }
+
+    /// RED IF: an id can steer a token path out of the token directory.
+    #[test]
+    fn ids_that_would_escape_the_token_directory_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in ["../x", "a/b", "..", ""] {
+            assert!(token_path(dir.path(), "fleet-1", bad).is_err(), "{bad:?}");
+            assert!(token_path(dir.path(), bad, "t").is_err(), "{bad:?}");
+        }
+    }
+
+    /// A token copied into another task's file is not trusted.
+    #[test]
+    fn a_token_in_the_wrong_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = stub("sleep 30");
+        let t = WorkerToken::for_spawned_child(s.0.id(), "fleet-1", "fleet-1-T-001", "grok").expect("token");
+        let wrong = token_path(dir.path(), "fleet-1", "fleet-1-T-009").expect("path");
+        fs::create_dir_all(wrong.parent().expect("dir")).expect("mkdir");
+        fs::write(&wrong, serde_json::to_vec(&t).expect("json")).expect("write");
+        let tokens = fleet_tokens(dir.path(), "fleet-1");
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0].1.is_err());
     }
 }
 
@@ -520,11 +565,11 @@ pub(crate) mod test_support {
         id
     }
 
-    /// A token for `pid` owned by `owner`, written into `worktree`.
-    pub fn token_for(pid: u32, worktree: &Path, fleet_id: &str, task_id: &str, owner: ProcessIdentity) -> WorkerToken {
+    /// A token for `pid` owned by `owner`, written under `project_root`.
+    pub fn token_for(pid: u32, project_root: &Path, fleet_id: &str, task_id: &str, owner: ProcessIdentity) -> WorkerToken {
         let mut t = WorkerToken::for_spawned_child(pid, fleet_id, task_id, "codex").expect("token");
         t.owner = owner;
-        write_token(worktree, &t).expect("write token");
+        write_token(project_root, &t).expect("write token");
         t
     }
 
