@@ -83,8 +83,13 @@ pub enum Verification {
     Live,
     /// No process with that pid (or only a zombie). Nothing to signal.
     Gone,
-    /// A process holds the pid but it is not ours. Signal NOTHING.
-    Mismatch(String),
+    /// A process holds the pid but started at a different time: the pid was reused, so OUR
+    /// worker is gone. Signal NOTHING; the holder is a stranger.
+    Reused(String),
+    /// Signal nothing, and do NOT conclude the worker is gone: the token is malformed, or the
+    /// pid and start time still match (it IS our worker) but it left the recorded process group
+    /// (a CLI that calls setsid). Recovery must block on this (Codex, review of ee7984c).
+    Refused(String),
 }
 
 /// What a terminate attempt did. `Err` from `terminate` means it may still be running.
@@ -120,19 +125,19 @@ impl WorkerToken {
 
     pub fn verify(&self) -> Verification {
         if self.pgid != self.pid {
-            return Verification::Mismatch(format!(
+            return Verification::Refused(format!(
                 "token names group {} for pid {}: a worker always leads its own group",
                 self.pgid, self.pid
             ));
         }
         match proc_info(self.pid) {
             None => Verification::Gone,
-            Some(i) if i.start_time_us != self.start_time_us => Verification::Mismatch(format!(
+            Some(i) if i.start_time_us != self.start_time_us => Verification::Reused(format!(
                 "pid {} start time is {} but the token says {}: the pid was reused",
                 self.pid, i.start_time_us, self.start_time_us
             )),
-            Some(i) if i.pgid != self.pgid => Verification::Mismatch(format!(
-                "pid {} is in process group {} but the token says {}",
+            Some(i) if i.pgid != self.pgid => Verification::Refused(format!(
+                "pid {} is still our worker but moved to process group {} (token says {})",
                 self.pid, i.pgid, self.pgid
             )),
             Some(_) => Verification::Live,
@@ -144,7 +149,7 @@ impl WorkerToken {
     pub fn signal_verified(&self, sig: i32) -> Result<bool, String> {
         match self.verify() {
             Verification::Gone => Ok(false),
-            Verification::Mismatch(why) => {
+            Verification::Reused(why) | Verification::Refused(why) => {
                 tracing::error!(
                     fleet_id = %self.fleet_id,
                     task_id = %self.task_id,
@@ -171,6 +176,11 @@ impl WorkerToken {
         // process group id cannot be reused while the group has a member, so the group we are
         // about to kill is still the one we verified at SIGTERM. If the leader is still here,
         // verify it again anyway: that is the case the token exists for.
+        //
+        // Residual risk, accepted (Codex, review of ee7984c): between the last poll and this
+        // kill (at most one 50 ms poll), the group could empty AND its id be handed to a new
+        // group. That needs the pid space to wrap inside the window. Closing it fully needs a
+        // pidfd, which macOS does not have.
         if self.verify() != Verification::Gone {
             self.signal_verified(libc::SIGKILL)?;
         } else {
@@ -251,6 +261,23 @@ fn check_id(id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Send `sig` to one process, checking the result. ESRCH (already gone) is not an error.
+pub fn signal_pid(pid: u32, sig: i32) -> Result<(), String> {
+    if pid <= 1 {
+        return Err(format!("refusing to signal pid {pid}"));
+    }
+    // SAFETY: a plain kill(2) on a positive pid.
+    let rc = unsafe { libc::kill(pid as i32, sig) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("kill({pid}, {sig}) failed: {err}"))
+}
+
 pub fn token_path(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Result<PathBuf> {
     check_id(task_id)?;
     Ok(fleet_token_dir(project_root, fleet_id)?.join(format!("{task_id}.json")))
@@ -272,6 +299,38 @@ pub fn write_owner_record(project_root: &Path, fleet_id: &str, owner: &ProcessId
 
 pub fn read_owner_record(project_root: &Path, fleet_id: &str) -> io::Result<Option<ProcessIdentity>> {
     read_json(&owner_record_path(project_root, fleet_id))
+}
+
+/// Written immediately BEFORE a worker is spawned and cleared once its token is on disk (or the
+/// spawn failed). A marker with no token means a worker may be running that no token names: the
+/// owner died between spawn and the token write. Recovery must not reset that task. Without the
+/// marker, "no token" could not tell "never launched" from "launched, untracked" (Codex, review
+/// of ee7984c).
+pub fn launch_marker_path(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Result<PathBuf> {
+    check_id(task_id)?;
+    Ok(fleet_token_dir(project_root, fleet_id)?.join(format!("{task_id}.launching")))
+}
+
+pub fn write_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Result<()> {
+    let path = launch_marker_path(project_root, fleet_id, task_id)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, b"")
+}
+
+pub fn clear_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) {
+    if let Ok(path) = launch_marker_path(project_root, fleet_id, task_id) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => tracing::error!(path = %path.display(), error = %e, "could not clear the launch marker; recovery will treat this task as untracked"),
+        }
+    }
+}
+
+pub fn has_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) -> bool {
+    launch_marker_path(project_root, fleet_id, task_id).is_ok_and(|p| p.exists())
 }
 
 fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -426,7 +485,7 @@ mod tests {
         let mut s = stub("sleep 30");
         let mut t = WorkerToken::for_spawned_child(s.0.id(), "f", "t", "codex").expect("token");
         t.start_time_us += 1;
-        assert!(matches!(t.verify(), Verification::Mismatch(_)));
+        assert!(matches!(t.verify(), Verification::Reused(_)));
         let err = t.terminate(Duration::from_millis(200)).unwrap_err();
         assert!(err.contains("refused"), "{err}");
         assert!(!reaped(&mut s, Duration::from_millis(300)), "the process must still be running");

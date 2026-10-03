@@ -110,11 +110,19 @@ pub fn recover_stale_fleets(project_root: &Path, opts: RecoveryOptions) -> anyho
                 .filter(|t| !tokened.contains(t.as_str()))
                 .collect()
         };
-        if !untracked.is_empty() {
-            tracing::warn!(fleet_id = %fleet_id, tasks = ?untracked, "in-flight tasks with no launch token: never launched, or launched in the instant before the owner died");
+        // With no token, the launch marker decides: present means a spawn began and no token
+        // ever named the process, so a worker may be running; resetting its task would let a
+        // second claimant run it too. Absent means it was never launched.
+        let mut problems: Vec<String> = untracked
+            .iter()
+            .filter(|t| worker_token::has_launch_marker(project_root, &fleet_id, t))
+            .map(|t| format!("{t}: launched but no launch token was written; a worker may still be running"))
+            .collect();
+        let never_launched = untracked.len() - problems.len();
+        if never_launched > 0 {
+            tracing::info!(fleet_id = %fleet_id, never_launched, "in-flight tasks that were never launched");
         }
 
-        let mut problems = Vec::new();
         for (path, token) in &tokens {
             let token = match token {
                 Ok(t) => t,
@@ -123,10 +131,19 @@ pub fn recover_stale_fleets(project_root: &Path, opts: RecoveryOptions) -> anyho
                     continue;
                 }
             };
-            if let Verification::Mismatch(why) = token.verify() {
-                // The pid now belongs to someone else, so OUR worker is gone. Logged, never signalled.
-                tracing::warn!(fleet_id = %fleet_id, task_id = %token.task_id, reason = %why, "launch token no longer matches; the worker is gone and the pid is not ours");
-                continue;
+            match token.verify() {
+                Verification::Reused(why) => {
+                    // The pid now belongs to someone else, so OUR worker is gone. Never signalled.
+                    tracing::warn!(fleet_id = %fleet_id, task_id = %token.task_id, reason = %why, "launch token no longer matches; the worker is gone and the pid is not ours");
+                    continue;
+                }
+                Verification::Refused(why) => {
+                    // Possibly still our worker (it moved groups) or a malformed token: not proof
+                    // that it is gone, so the fleet is not reset.
+                    problems.push(format!("{}: {why}", token.task_id));
+                    continue;
+                }
+                Verification::Live | Verification::Gone => {}
             }
             match token.terminate(opts.grace) {
                 Ok(TerminateOutcome::AlreadyGone) => {}
@@ -518,5 +535,57 @@ mod tests {
         assert_eq!(summary.recovered, vec!["fleet-s".to_string()]);
         assert_eq!(summary.projects_missing, 1);
         assert!(!gone.join(".triumvirate").join("ledger.db").exists(), "recovery must not create a ledger");
+    }
+
+    /// The spawn-to-token window. A marker with no token means a worker may be running that no
+    /// token names. RED IF: recovery resets that task anyway (two claimants for one task).
+    #[test]
+    fn a_launch_marker_without_a_token_blocks_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        seed(&root, "fleet-m", &["T-001"]);
+        worker_token::write_owner_record(&root, "fleet-m", &worker_token::test_support::dead_owner()).expect("owner");
+        worker_token::write_launch_marker(&root, "fleet-m", "fleet-m-T-001").expect("marker");
+
+        let report = recover_stale_fleets(&root, OPTS).expect("recover");
+
+        assert_eq!(report.blocked.len(), 1, "{report:?}");
+        assert!(report.blocked[0].1.contains("no launch token"), "{report:?}");
+        assert_eq!(fleet_row(&root, "fleet-m").0, "running");
+        assert_eq!(task_states(&root, "fleet-m"), vec!["in_progress"]);
+    }
+
+    /// Our worker, same pid and start time, but it moved to another process group (a CLI that
+    /// calls setsid). RED IF: recovery calls it gone and resets its task, or signals anything.
+    #[test]
+    fn a_worker_that_left_its_group_blocks_recovery_and_is_not_signalled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        seed(&root, "fleet-g", &["T-001"]);
+        worker_token::write_owner_record(&root, "fleet-g", &worker_token::test_support::dead_owner()).expect("owner");
+        // A real process that is NOT in the group its token names: a child left in this test's
+        // own group, with a token claiming it leads its own.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().expect("spawn");
+        let pid = child.id();
+        let info = worker_token::proc_info(pid).expect("info");
+        assert_ne!(info.pgid, pid);
+        let t = worker_token::WorkerToken {
+            pid,
+            pgid: pid,
+            start_time_us: info.start_time_us,
+            fleet_id: "fleet-g".to_string(),
+            task_id: "fleet-g-T-001".to_string(),
+            agent: "codex".to_string(),
+            owner: worker_token::test_support::dead_owner(),
+        };
+        worker_token::write_token(&root, &t).expect("token");
+
+        let report = recover_stale_fleets(&root, OPTS).expect("recover");
+
+        assert_eq!(report.blocked.len(), 1, "{report:?}");
+        assert!(alive(pid), "a regrouped worker is never signalled");
+        assert_eq!(task_states(&root, "fleet-g"), vec!["in_progress"]);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

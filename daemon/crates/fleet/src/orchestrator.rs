@@ -518,9 +518,20 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
                     return;
                 }
-                let launch_result = launcher
-                    .launch(&launch_agent, &project_root, &worktree_path, &task_prompt)
-                    .await;
+                // The marker goes down BEFORE the spawn, so a crash between spawn and token write
+                // leaves evidence that a worker may be running. No marker, no launch.
+                let launch_result = match crate::worker_token::write_launch_marker(&project_root, &fleet_id, &task_id) {
+                    Ok(()) => {
+                        let r = launcher
+                            .launch(&launch_agent, &project_root, &worktree_path, &task_prompt)
+                            .await;
+                        if r.is_err() {
+                            crate::worker_token::clear_launch_marker(&project_root, &fleet_id, &task_id);
+                        }
+                        r
+                    }
+                    Err(e) => Err(anyhow::anyhow!("launch marker could not be written: {e}")),
+                };
                 match launch_result {
                     Ok(child) => {
                         // One helper for every fleet child: drain both pipes (a worker that
@@ -656,9 +667,19 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         code = status.code(),
                                         "agy fleet task failed; degrading to codex"
                                     );
-                                    let codex_ok = match launcher
-                                        .launch("codex", &project_root, &worktree_path, &task_prompt)
-                                        .await
+                                    let degrade_launch = match crate::worker_token::write_launch_marker(&project_root, &fleet_id, &task_id) {
+                                        Ok(()) => {
+                                            let r = launcher
+                                                .launch("codex", &project_root, &worktree_path, &task_prompt)
+                                                .await;
+                                            if r.is_err() {
+                                                crate::worker_token::clear_launch_marker(&project_root, &fleet_id, &task_id);
+                                            }
+                                            r
+                                        }
+                                        Err(e) => Err(anyhow::anyhow!("launch marker could not be written: {e}")),
+                                    };
+                                    let codex_ok = match degrade_launch
                                     {
                                         Ok(codex_child) => {
                                             // Same helper as the primary wait: the degrade child
@@ -1450,11 +1471,17 @@ async fn wait_fleet_child(
     if let Some(pid) = child.id() {
         match crate::worker_token::WorkerToken::for_spawned_child(pid, fleet_id, ctx.task_id, ctx.agent) {
             Some(token) => {
-                if let Err(e) = crate::worker_token::write_token(ctx.project_root, &token) {
+                let written = crate::worker_token::write_token(ctx.project_root, &token);
+                if written.is_ok() {
+                    crate::worker_token::clear_launch_marker(ctx.project_root, fleet_id, ctx.task_id);
+                }
+                if let Err(e) = written {
                     tracing::error!(fleet_id, task_id = ctx.task_id, error = %e, "could not write the launch token; stopping the worker");
                     let _ = crate::worker_token::signal_group(pid, libc::SIGKILL);
                     let _ = child.start_kill();
                     let _ = child.wait().await;
+                    // Stopped and reaped: nothing untracked is left running.
+                    crate::worker_token::clear_launch_marker(ctx.project_root, fleet_id, ctx.task_id);
                     return WorkerExit {
                         result: Err(std::io::Error::other(format!("launch token write failed: {e}"))),
                         stdout_tail: String::new(),
@@ -1463,7 +1490,10 @@ async fn wait_fleet_child(
                     };
                 }
             }
-            None if matches!(child.try_wait(), Ok(Some(_))) => {}
+            None if matches!(child.try_wait(), Ok(Some(_))) => {
+                crate::worker_token::clear_launch_marker(ctx.project_root, fleet_id, ctx.task_id);
+            }
+            // The marker stays: this worker runs untracked, and recovery must block on it.
             None => tracing::error!(
                 fleet_id,
                 task_id = ctx.task_id,
@@ -1677,7 +1707,16 @@ pub async fn stop_fleet_workers(
         }
     }
     for pid in extra_pids.into_iter().filter(|p| !covered.contains(p)) {
-        match crate::worker_token::signal_group(pid, libc::SIGTERM) {
+        // A live child of THIS process with no token. Signal its group only when it leads one;
+        // `kill(-pid)` for a non-leader would hit whatever group happens to carry that id
+        // (Codex, review of ee7984c). Otherwise signal the process alone.
+        let leads_group = crate::worker_token::proc_info(pid).is_some_and(|i| i.pgid == pid);
+        let result = if leads_group {
+            crate::worker_token::signal_group(pid, libc::SIGTERM)
+        } else {
+            crate::worker_token::signal_pid(pid, libc::SIGTERM)
+        };
+        match result {
             Ok(()) => report.stopped += 1,
             Err(e) => report.problems.push(e),
         }
@@ -1823,9 +1862,11 @@ mod tests {
                 .lock()
                 .await
                 .push(project_root.to_path_buf());
+            // Own process group, like the production launcher, so the worker gets a token.
             let child = Command::new("sh")
                 .arg("-lc")
                 .arg("exit 0")
+                .process_group(0)
                 .spawn()?;
             Ok(child)
         }
@@ -2768,6 +2809,24 @@ mod tests {
             .expect("read")
             .expect("owner record");
         assert_eq!(owner, crate::worker_token::ProcessIdentity::current().expect("me"));
+        let markers: Vec<_> = std::fs::read_dir(project_root.join(".triumvirate/fleet-workers").join(&spawned.fleet_id))
+            .map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "launching")).collect())
+            .unwrap_or_default();
+        assert!(markers.is_empty(), "a finished launch leaves no marker: {markers:?}");
+    }
+
+    /// A tokenless in-memory child that does NOT lead a process group must be signalled alone.
+    /// RED IF: it is sent `kill(-pid)`, which reaches no group (ESRCH) and leaves it running, or
+    /// worse, a group that happens to carry that id (Codex, review of ee7984c).
+    #[tokio::test]
+    async fn a_tokenless_non_leader_child_is_signalled_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().expect("spawn");
+        let pid = child.id();
+        let report = super::stop_fleet_workers(dir.path(), "fleet-nl", vec![pid], Duration::from_millis(100)).await;
+        assert_eq!(report.stopped, 1, "{report:?}");
+        let status = tokio::task::spawn_blocking(move || child.wait()).await.expect("join").expect("wait");
+        assert!(!status.success(), "the child must have been signalled");
     }
 
     /// A cancel recorded in the LEDGER (by another process) is seen by the owner. RED IF: the

@@ -19,6 +19,17 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-034 - The sight gate does not count `sed` windows chained in one shell command
+**Found:** 2026-10-03 (legacy-fixes review round 2) · **Severity:** MEDIUM (a real review is discarded and re-paid) · **NOT FIXED**
+**Evidence:** Codex read all four sources as `/bin/zsh -lc "sed -n '1,180p' F; sed -n '181,360p' F; ..."` and the gate rejected the turn: "named by [Bash ok no read the parser recognises ...], none counted as a successful whole read". The turn's review was thrown away. Workaround that worked: tell Codex one `sed -n` per tool call.
+**CHECK to close:** a single shell call of `sed -n` windows joined by `;` or `&&` that covers lines 1 to N satisfies the source; a chain that includes a non-read command is still judged per segment.
+
+### D-033 - Antigravity reviews return empty output after making tool calls
+**Found:** 2026-10-03 (legacy-fixes review, three of three attempts) · **Severity:** HIGH (the seat cannot review) · **NOT FIXED**
+**Evidence:** `agy returned empty output (status=SUCCESS, permission_requests=0, tool_calls=N)` with N = 1, 6 and 3 on three `review_agent` dispatches the same day, including one with only about 1,400 lines of sources. 41 such lines in `~/.triumvirate/outbox.jsonl` overall. Dead drops under `~/.triumvirate/dead-drop/*-gemini.md`.
+**Unknown:** whether agy produced an answer the capture lost, or produced none. Not investigated in that session.
+**CHECK to close:** a `review_agent` dispatch to antigravity over one 500-line source returns a non-empty review on three consecutive attempts, and the empty-output rate in the outbox drops.
+
 ### D-032 - The sight gate credits the read a reviewer ASKED for, not the one it received
 **Found:** 2026-09-24 (D-028 panel, Codex) · **Severity:** LOW today, structural · **NOT FIXED**
 **Evidence:** `structured_read_ranges` (`triumvirate/src/agent_exec.rs`) builds coverage from the `offset`/`limit` arguments of a successful read. `ToolCallRecord` carries arguments and a success flag, and nothing about the returned content, so a tool that caps or truncates its output is credited with the whole window it requested. The same record shape means an `offset` with no `limit` is credited to EOF.
