@@ -1502,14 +1502,18 @@ async fn wait_fleet_child(
             ),
         }
     }
-    let _registration = child.id().map(|pid| {
-        register_fleet_child(fleet_id, pid);
+    // Registered with its OS start time, so a cancel can prove the pid still names this child:
+    // the entry outlives the reap in `child.wait()` until this function returns (Codex,
+    // confirmation pass on 3f054d6).
+    let _registration = child.id().and_then(|pid| {
+        let start_time_us = crate::worker_token::proc_info(pid)?.start_time_us;
+        register_fleet_child(fleet_id, crate::worker_token::ProcessIdentity { pid, start_time_us });
         // A cancel that landed between the pre-launch check and this registration would
         // otherwise leave an unregistered, unsignalled worker (Codex, confirmation pass).
         if fleet_cancel_requested(ctx.project_root, fleet_id) {
             let _ = crate::worker_token::signal_group(pid, libc::SIGTERM);
         }
-        FleetChildRegistration { fleet_id: fleet_id.to_string(), pid }
+        Some(FleetChildRegistration { fleet_id: fleet_id.to_string(), pid })
     });
     let window = mcp_bridge::stall::stall_window(ctx.agent);
     let mut longest = std::time::Duration::ZERO;
@@ -1581,12 +1585,13 @@ async fn wait_fleet_child(
 
 /// Live worker pids per fleet, so an in-process `fleet_cancel` can reach the processes even
 /// before a token exists. After a restart this is empty and the launch tokens take over.
-static FLEET_CHILDREN: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u32>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static FLEET_CHILDREN: std::sync::Mutex<
+    std::collections::BTreeMap<String, Vec<crate::worker_token::ProcessIdentity>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-fn register_fleet_child(fleet_id: &str, pid: u32) {
+fn register_fleet_child(fleet_id: &str, id: crate::worker_token::ProcessIdentity) {
     if let Ok(mut m) = FLEET_CHILDREN.lock() {
-        m.entry(fleet_id.to_string()).or_default().push(pid);
+        m.entry(fleet_id.to_string()).or_default().push(id);
     }
 }
 
@@ -1597,7 +1602,7 @@ fn unregister_fleet_child(fleet_id: &str, pid: u32) {
     let Some(v) = m.get_mut(fleet_id) else {
         return;
     };
-    v.retain(|p| *p != pid);
+    v.retain(|p| p.pid != pid);
     if v.is_empty() {
         m.remove(fleet_id);
     }
@@ -1635,7 +1640,7 @@ pub fn fleet_cancel_requested(project_root: &Path, fleet_id: &str) -> bool {
 /// Remember a cancellation in this process and take the in-memory worker pids. Returns them
 /// UNSIGNALLED: `cancel_fleet_workers` signals through the launch tokens and falls back to these
 /// only for a worker that has no token.
-pub fn take_fleet_children_for_cancel(fleet_id: &str) -> Vec<u32> {
+pub fn take_fleet_children_for_cancel(fleet_id: &str) -> Vec<crate::worker_token::ProcessIdentity> {
     if let Ok(mut s) = CANCELLED_FLEETS.lock() {
         s.insert(fleet_id.to_string());
     }
@@ -1674,7 +1679,7 @@ pub fn fleet_kill_grace() -> std::time::Duration {
 pub async fn stop_fleet_workers(
     project_root: &Path,
     fleet_id: &str,
-    extra_pids: Vec<u32>,
+    extra_pids: Vec<crate::worker_token::ProcessIdentity>,
     grace: std::time::Duration,
 ) -> WorkerStopReport {
     let mut report = WorkerStopReport::default();
@@ -1706,11 +1711,17 @@ pub async fn stop_fleet_workers(
             Err(e) => report.problems.push(format!("stop task failed: {e}")),
         }
     }
-    for pid in extra_pids.into_iter().filter(|p| !covered.contains(p)) {
-        // A live child of THIS process with no token. Signal its group only when it leads one;
-        // `kill(-pid)` for a non-leader would hit whatever group happens to carry that id
-        // (Codex, review of ee7984c). Otherwise signal the process alone.
-        let leads_group = crate::worker_token::proc_info(pid).is_some_and(|i| i.pgid == pid);
+    for id in extra_pids.into_iter().filter(|p| !covered.contains(&p.pid)) {
+        // A child of THIS process with no token. Signal it only while pid AND start time still
+        // name it (a reaped child's pid can be reused: Codex, confirmation pass on 3f054d6), and
+        // its group only when it leads one; `kill(-pid)` for a non-leader would hit whatever group
+        // carries that id (Codex, review of ee7984c).
+        let pid = id.pid;
+        let Some(info) = crate::worker_token::proc_info(pid) else { continue };
+        if info.start_time_us != id.start_time_us {
+            continue; // gone; the pid now belongs to someone else
+        }
+        let leads_group = info.pgid == pid;
         let result = if leads_group {
             crate::worker_token::signal_group(pid, libc::SIGTERM)
         } else {
@@ -2815,6 +2826,24 @@ mod tests {
         assert!(markers.is_empty(), "a finished launch leaves no marker: {markers:?}");
     }
 
+    /// RED IF: a registry entry whose pid now names a different process (wrong start time) is
+    /// signalled.
+    #[tokio::test]
+    async fn a_registry_entry_whose_pid_was_reused_is_not_signalled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().expect("spawn");
+        let pid = child.id();
+        let stale = crate::worker_token::ProcessIdentity {
+            pid,
+            start_time_us: crate::worker_token::proc_info(pid).expect("info").start_time_us - 1_000_000,
+        };
+        let report = super::stop_fleet_workers(dir.path(), "fleet-reuse", vec![stale], Duration::from_millis(100)).await;
+        assert_eq!(report.stopped, 0, "{report:?}");
+        assert!(matches!(child.try_wait(), Ok(None)), "the stranger must still be running");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// A tokenless in-memory child that does NOT lead a process group must be signalled alone.
     /// RED IF: it is sent `kill(-pid)`, which reaches no group (ESRCH) and leaves it running, or
     /// worse, a group that happens to carry that id (Codex, review of ee7984c).
@@ -2823,7 +2852,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut child = std::process::Command::new("sleep").arg("30").spawn().expect("spawn");
         let pid = child.id();
-        let report = super::stop_fleet_workers(dir.path(), "fleet-nl", vec![pid], Duration::from_millis(100)).await;
+        let id = crate::worker_token::ProcessIdentity {
+            pid,
+            start_time_us: crate::worker_token::proc_info(pid).expect("info").start_time_us,
+        };
+        let report = super::stop_fleet_workers(dir.path(), "fleet-nl", vec![id], Duration::from_millis(100)).await;
         assert_eq!(report.stopped, 1, "{report:?}");
         let status = tokio::task::spawn_blocking(move || child.wait()).await.expect("join").expect("wait");
         assert!(!status.success(), "the child must have been signalled");

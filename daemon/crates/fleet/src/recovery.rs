@@ -116,7 +116,12 @@ pub fn recover_stale_fleets(project_root: &Path, opts: RecoveryOptions) -> anyho
         let mut problems: Vec<String> = untracked
             .iter()
             .filter(|t| worker_token::has_launch_marker(project_root, &fleet_id, t))
-            .map(|t| format!("{t}: launched but no launch token was written; a worker may still be running"))
+            .map(|t| {
+                format!(
+                    "{t}: launched but no launch token was written; a worker may still be running. \
+                     Once you have confirmed none is, fleet_cancel takes the fleet out of recovery"
+                )
+            })
             .collect();
         let never_launched = untracked.len() - problems.len();
         if never_launched > 0 {
