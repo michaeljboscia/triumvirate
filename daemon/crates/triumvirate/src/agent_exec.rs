@@ -97,6 +97,78 @@ pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
 #[cfg(not(unix))]
 pub(crate) fn kill_process_group(_child: &mut tokio::process::Child) {}
 
+// The ask-path stall kill needs the CLI's process group, and the child is owned deep inside each
+// connector. Each attempt runs its connector future inside this task-local scope, and every
+// connector reports its child here right after spawn, so the wait loop in `execute_ask_agent`
+// can kill the whole group (codex is a node wrapper around a vendor binary: killing only the
+// leader leaves the binary running). A connector run outside a scope (shadow runs, prewarm,
+// the degraded route) reports to nobody, which is correct: nothing there watches for stalls.
+tokio::task_local! {
+    static ATTEMPT_CHILD: Arc<AttemptChild>;
+}
+
+/// The process one ask attempt spawned: pid plus OS start time, so a reused pid is refused.
+#[derive(Default)]
+pub(crate) struct AttemptChild {
+    pid: std::sync::atomic::AtomicU32,
+    start_time_us: std::sync::atomic::AtomicU64,
+}
+
+impl AttemptChild {
+    /// SIGKILL the attempt's process group. `Ok(false)` when no child was reported (an HTTP
+    /// agent such as deepseek: dropping the future cancels it). A pid whose start time or group
+    /// no longer matches is refused and nothing is signalled.
+    #[cfg(unix)]
+    fn kill_group(&self) -> Result<bool, String> {
+        use std::sync::atomic::Ordering;
+        let pid = self.pid.load(Ordering::SeqCst);
+        if pid <= 1 {
+            return Ok(false);
+        }
+        let expected = self.start_time_us.load(Ordering::SeqCst);
+        if let Some(info) = fleet::worker_token::proc_info(pid)
+            && (info.start_time_us != expected || info.pgid != pid)
+        {
+            return Err(format!(
+                "pid {pid} is no longer the process this attempt spawned (start {} vs {expected}, \
+                 group {}); refusing to signal",
+                info.start_time_us, info.pgid
+            ));
+        }
+        // The leader may already be gone while children hold the group; a group id cannot be
+        // reused while it has members, so signalling it reaches only this attempt's survivors.
+        fleet::worker_token::signal_group(pid, libc::SIGKILL).map(|_| true)
+    }
+
+    #[cfg(not(unix))]
+    fn kill_group(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+/// Called by each CLI connector right after it spawns. A no-op outside an attempt scope.
+pub(crate) fn note_attempt_child(child: &tokio::process::Child) {
+    use std::sync::atomic::Ordering;
+    let Some(pid) = child.id() else { return };
+    let start = fleet::worker_token::proc_info(pid).map(|i| i.start_time_us).unwrap_or(0);
+    let _ = ATTEMPT_CHILD.try_with(|c| {
+        c.start_time_us.store(start, Ordering::SeqCst);
+        c.pid.store(pid, Ordering::SeqCst);
+    });
+}
+
+/// When the next stall check is due, given the last real progress. `None` when this agent has
+/// no stall window.
+fn stall_deadline(window: Option<Duration>, last_progress: Instant) -> Option<Instant> {
+    window.map(|w| last_progress + w)
+}
+
+/// Whether `event` is real progress. The stuck detector's own STUCK events are not: counting
+/// them would let the detector keep a silent run alive forever.
+fn is_progress_event(event: &WorkingStateEvent) -> bool {
+    !matches!(event.state, WorkingState::Stuck)
+}
+
 pub(crate) fn emit_working_event(tx: Option<&mpsc::Sender<WorkingStateEvent>>, event: WorkingStateEvent) {
     if let Some(sender) = tx {
         let _ = sender.try_send(event);
@@ -904,6 +976,10 @@ async fn execute_ask_agent_inner(
         failure_chain.push("agy: circuit breaker open (repeated quota)".to_string());
     }
 
+    // Stall kill (design 4a): end an attempt when no real progress event arrives for this
+    // agent's measured window, instead of waiting out the 900 s limit. Read once per call.
+    let stall_window = mcp_bridge::stall::stall_window(&agent);
+
     for (idx, (backoff, model_override)) in attempt_schedule.iter().enumerate() {
         if agy_breaker_open {
             break;
@@ -932,23 +1008,50 @@ async fn execute_ask_agent_inner(
         };
         let (events_tx, mut events_rx) = mpsc::channel::<WorkingStateEvent>(1024);
         let mut stuck_detector = StuckDetector::default();
-        let mut attempt = Box::pin(run_named_agent_with_session_and_model(
-            &agent,
-            &execution_prompt,
-            &exec_cwd,
-            session_for_attempt.as_deref(),
-            Some(events_tx),
-            *model_override,
-            Some(req),
+        let attempt_child = Arc::new(AttemptChild::default());
+        let mut attempt = Box::pin(ATTEMPT_CHILD.scope(
+            attempt_child.clone(),
+            run_named_agent_with_session_and_model(
+                &agent,
+                &execution_prompt,
+                &exec_cwd,
+                session_for_attempt.as_deref(),
+                Some(events_tx),
+                *model_override,
+                Some(req),
+            ),
         ));
         let started = Instant::now();
         let mut next_heartbeat = Duration::from_secs(30);
+        let mut last_progress = started;
+        let mut stalled_secs: Option<u64> = None;
 
         let attempt_result = loop {
             let sleep_duration = next_heartbeat.saturating_sub(started.elapsed());
+            let stall_at = stall_deadline(stall_window, last_progress);
             tokio::select! {
                 result = &mut attempt => break result,
+                // Disabled (never polled) when the agent has no window; the far deadline is
+                // only there because select! still builds the future.
+                _ = tokio::time::sleep_until(stall_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400))),
+                    if stall_at.is_some() =>
+                {
+                    let window = stall_window.unwrap_or_default();
+                    if last_progress.elapsed() >= window {
+                        let secs = window.as_secs();
+                        match attempt_child.kill_group() {
+                            Ok(true) => tracing::warn!(agent = %agent, request_id = %request_id, secs, "stall window expired; SIGKILLed the attempt's process group"),
+                            Ok(false) => tracing::warn!(agent = %agent, request_id = %request_id, secs, "stall window expired; no child process to kill, dropping the attempt"),
+                            Err(e) => tracing::error!(agent = %agent, request_id = %request_id, error = %e, "stall window expired but the kill was refused; dropping the attempt"),
+                        }
+                        stalled_secs = Some(secs);
+                        break Err(anyhow::anyhow!(mcp_bridge::stall::stalled_message(secs)));
+                    }
+                }
                 Some(event) = events_rx.recv() => {
+                    if is_progress_event(&event) {
+                        last_progress = Instant::now();
+                    }
                     let outbox_detail = format_working_state(&event);
                     if let Err(e) = append_outbox_event(&OutboxEvent {
                         ts_ms: core_unix_time_ms(),
@@ -1065,6 +1168,45 @@ async fn execute_ask_agent_inner(
                 }
             }
         };
+
+        // A stall is terminal and non-retryable: no further attempt, no degraded route, no dead
+        // drop. The caller decides what to do with a silent agent. Recorded explicitly, because
+        // the exit status of a killed process carries only the signal.
+        if let Some(secs) = stalled_secs {
+            drop(attempt);
+            let detail = mcp_bridge::stall::stalled_message(secs);
+            lifecycle.push(LifecycleEvent {
+                state: "STALLED".to_string(),
+                detail: format!("{agent_display} {detail}"),
+            });
+            if let Err(e) = append_outbox_event(&OutboxEvent {
+                ts_ms: core_unix_time_ms(),
+                request_id: request_id.clone(),
+                tool: "ask_agent".to_string(),
+                status: "STALLED".to_string(),
+                agent: Some(agent.clone()),
+                detail: detail.clone(),
+                cwd: resolved_cwd.clone(),
+                repo: resolved_repo.clone(),
+                branch: resolved_branch.clone(),
+                working_state: Some("STALLED".to_string()),
+                token_usage: None,
+                tool_name: None,
+            }) {
+                tracing::warn!("failed to append outbox event: {e}");
+            }
+            if let Some(emitter) = progress.as_ref() {
+                emitter.emit(format!("→ {agent_display}: {detail} ✗")).await;
+            }
+            span.record("agent.outcome", "stalled");
+            span.record("agent.tokens", 0_u64);
+            span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+            tel.stalled(detail.clone());
+            return Err(format!(
+                "ask_agent failed after lifecycle {:?}: {detail}",
+                lifecycle.iter().map(|e| e.state.as_str()).collect::<Vec<_>>()
+            ));
+        }
 
         match attempt_result {
             Ok(parsed) => {
@@ -3989,6 +4131,7 @@ async fn run_gemini_cli_process_with_session(
         .kill_on_drop(true);
     configure_process_group(&mut command);
     let mut child = command.spawn()?;
+    note_attempt_child(&child);
 
     let stdout = child
         .stdout
@@ -4303,6 +4446,7 @@ async fn run_codex_cli_process_with_session(
         .kill_on_drop(true);
     configure_process_group(&mut command);
     let mut child = command.spawn()?;
+    note_attempt_child(&child);
 
     let stdout = child
         .stdout
@@ -4632,6 +4776,7 @@ async fn run_grok_cli_process_with_session(
         .kill_on_drop(true);
     configure_process_group(&mut command);
     let mut child = command.spawn()?;
+    note_attempt_child(&child);
 
     let stdout = child
         .stdout
@@ -5010,6 +5155,7 @@ async fn run_claude_cli_process_with_session(
     
     configure_process_group(&mut command);
     let mut child = command.spawn()?;
+    note_attempt_child(&child);
 
     let stdout = child
         .stdout
@@ -9344,5 +9490,183 @@ mod sight_gate_canary_tests {
     #[test]
     fn the_canary_passes_while_the_gate_rejects() {
         sight_gate_canary().expect("a working gate rejects a review that read nothing");
+    }
+}
+
+/// The ask-path stall kill (design 4a), end to end through `execute_ask_agent` with a stub codex.
+///
+/// `#[ignore]` for the same reason as `strict_agent_tests`: these point `TRIUMVIRATE_CODEX_BIN`
+/// at a stub, which changes every codex dispatch in this binary while they run. Run them with
+/// `cargo test -p triumvirate stall_kill_tests -- --ignored --test-threads=1`. No paid calls.
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)]
+mod stall_kill_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const ENV_KEYS: [&str; 3] = ["TRIUMVIRATE_HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_STALL_SECS_CODEX"];
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for key in ENV_KEYS {
+                unsafe { std::env::remove_var(key) };
+            }
+            // Never leave a stub behind, even when an assertion failed.
+            for name in ["leader.pid", "grandchild.pid"] {
+                if let Ok(pid) = fs::read_to_string(self.dir.path().join(name))
+                    && let Ok(pid) = pid.trim().parse::<i32>()
+                {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+
+    /// A stub codex. Every `exec` invocation is logged; it records its own pid and a
+    /// grandchild's (so the test can prove the WHOLE group died), then runs `body`.
+    fn setup(body: &str, window_secs: u64) -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("stub-codex");
+        let d = dir.path().display();
+        let script = format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = exec ] || exit 0\n\
+             echo run >> '{d}/invocations'\n\
+             echo $$ > '{d}/leader.pid'\n\
+             sleep 60 &\n\
+             echo $! > '{d}/grandchild.pid'\n\
+             {body}\n"
+        );
+        fs::write(&stub, script).expect("write stub");
+        let mut perms = fs::metadata(&stub).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stub, perms).expect("chmod");
+        // SAFETY: serialised by the binary-wide env lock, cleared in Drop.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", dir.path().join("home"));
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", &stub);
+            std::env::set_var("TRIUMVIRATE_STALL_SECS_CODEX", window_secs.to_string());
+        }
+        Fixture { dir }
+    }
+
+    fn request(fx: &Fixture) -> AskAgentRequest {
+        AskAgentRequest {
+            agent: "codex".to_string(),
+            message: "say ok".to_string(),
+            cwd: Some(fx.dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn pid_in(fx: &Fixture, name: &str) -> u32 {
+        fs::read_to_string(fx.dir.path().join(name))
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid")
+    }
+
+    fn invocations(fx: &Fixture) -> usize {
+        fs::read_to_string(fx.dir.path().join("invocations"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// RED IF: a silent codex is not killed at its window, is retried, or leaves its
+    /// grandchild running. One progress event, then silence well past a 2 s window.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
+    async fn stall_01_a_silent_codex_is_killed_at_its_window_with_the_stalled_outcome() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fx = setup("echo '{\"type\":\"turn.started\"}'\nsleep 60", 2);
+
+        let started = std::time::Instant::now();
+        let err = execute_ask_agent(&request(&fx), None)
+            .await
+            .expect_err("a silent agent must fail");
+        let elapsed = started.elapsed();
+
+        assert!(err.contains("stalled after 2 s without progress"), "got: {err}");
+        assert!(err.contains("STALLED"), "the lifecycle must name the stall; got: {err}");
+        assert!(!err.contains("RETRY"), "a stall is not retryable; got: {err}");
+        assert!(elapsed >= Duration::from_secs(2), "killed before its window: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "not killed near its window: {elapsed:?}");
+        assert_eq!(invocations(&fx), 1, "exactly one attempt");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for name in ["leader.pid", "grandchild.pid"] {
+            let pid = pid_in(&fx, name);
+            assert!(
+                fleet::worker_token::proc_info(pid).is_none(),
+                "{name} ({pid}) must be dead: the whole group is killed"
+            );
+        }
+    }
+
+    /// The twin. Slow but alive: an event every second for 4 s against a 2 s window, then an
+    /// answer. RED IF: progress events stop resetting the clock (this would be killed at 2 s).
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
+    async fn stall_02_a_slow_codex_inside_its_window_is_not_killed() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fx = setup(
+            "for i in 1 2 3 4; do echo '{\"type\":\"turn.started\"}'; sleep 1; done\n\
+             echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'\n\
+             kill $(cat \"$(dirname \"$0\")/grandchild.pid\")\n\
+             exit 0",
+            2,
+        );
+
+        let out = execute_ask_agent(&request(&fx), None)
+            .await
+            .expect("a run that keeps making progress must complete");
+        assert!(out.response.contains("ok"), "got: {}", out.response);
+        assert!(
+            !out.lifecycle.iter().any(|e| e.state == "STALLED"),
+            "no stall may be recorded"
+        );
+        assert_eq!(invocations(&fx), 1);
+    }
+}
+
+#[cfg(test)]
+mod stall_unit_tests {
+    use super::*;
+
+    fn event(state: WorkingState) -> WorkingStateEvent {
+        WorkingStateEvent {
+            agent: "codex".to_string(),
+            state,
+            detail: String::new(),
+            tool_name: None,
+            tool_args_json: None,
+            token_usage: None,
+            ts_ms: None,
+        }
+    }
+
+    /// RED IF: the detector's own STUCK events count as progress. They fire while a run is
+    /// silent, so counting them would keep a hung run alive forever.
+    #[test]
+    fn stuck_events_are_not_progress() {
+        assert!(!is_progress_event(&event(WorkingState::Stuck)));
+        assert!(is_progress_event(&event(WorkingState::MessageDelta)));
+    }
+
+    #[test]
+    fn no_window_means_no_deadline() {
+        let now = Instant::now();
+        assert_eq!(stall_deadline(None, now), None);
+        assert_eq!(stall_deadline(Some(Duration::from_secs(5)), now), Some(now + Duration::from_secs(5)));
+    }
+
+    /// RED IF: an attempt that reported no child (an HTTP agent) tries to signal something.
+    #[test]
+    fn an_attempt_with_no_child_kills_nothing() {
+        assert_eq!(AttemptChild::default().kill_group(), Ok(false));
     }
 }

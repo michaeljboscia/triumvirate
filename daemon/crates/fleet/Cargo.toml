@@ -16,7 +16,9 @@ daemon-http = { path = "../daemon-http" }
 peer-review = { path = "../peer-review" }
 tokio.workspace = true
 rusqlite = "0.32"
+serde.workspace = true
 serde_json.workspace = true
+libc.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

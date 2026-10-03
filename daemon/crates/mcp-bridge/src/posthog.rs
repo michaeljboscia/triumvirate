@@ -232,6 +232,14 @@ impl CallTelemetry {
         self.detail = Some(detail.into());
     }
 
+    /// The run was KILLED for going silent past its agent's stall window (see `crate::stall`).
+    /// Its own outcome, not "failure": a stall and an agent error demand different fixes, and the
+    /// exit status of a killed process carries only the signal, so the cause must be named here.
+    pub fn stalled(&mut self, detail: impl Into<String>) {
+        self.outcome = "stalled";
+        self.detail = Some(detail.into());
+    }
+
     /// The call was REFUSED BY POLICY, not broken.
     ///
     /// A sight-gate rejection means the agent worked correctly and the turn was declined: it
@@ -305,6 +313,11 @@ impl Drop for CallTelemetry {
         if self.outcome == "failure" {
             let detail = self.detail.as_deref().unwrap_or("unknown error");
             record_exception(&self.agent, "AgentCallFailed", detail, &self.trace_id);
+        }
+        // A stall kill is a real failure too, under its own type so it can be counted apart.
+        if self.outcome == "stalled" {
+            let detail = self.detail.as_deref().unwrap_or("stalled");
+            record_exception(&self.agent, "AgentCallStalled", detail, &self.trace_id);
         }
     }
 }
@@ -876,6 +889,32 @@ pub fn record_token_scan(source: &str, records: u64, tokens: u64, cost_usd: f64,
             "tv_tokens":        tokens,
             "tv_cost_usd":      cost_usd,
             "tv_duration_ms":   duration_ms,
+        }),
+    );
+}
+
+/// Emit `tv_fleet_worker_silence` when a fleet worker exits: its longest stretch without output.
+///
+/// The fleet stall check ships LOG-ONLY. The stall windows were measured on the ask path's event
+/// stream; fleet progress is output growth, a different clock, so killing on it needs its own
+/// measurement first. This event is that measurement. `tv_would_have_stalled` says whether the
+/// ask-path window for this agent would have killed the worker.
+pub fn record_fleet_worker_silence(
+    agent: &str,
+    fleet_id: &str,
+    task_id: &str,
+    longest_silence_ms: u64,
+    window_secs: Option<u64>,
+) {
+    capture(
+        "tv_fleet_worker_silence",
+        json!({
+            "tv_agent":              agent,
+            "tv_fleet_id":           fleet_id,
+            "tv_task_id":            task_id,
+            "tv_longest_silence_ms": longest_silence_ms,
+            "tv_stall_window_secs":  window_secs,
+            "tv_would_have_stalled": window_secs.is_some_and(|w| longest_silence_ms >= w * 1000),
         }),
     );
 }

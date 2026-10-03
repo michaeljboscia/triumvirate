@@ -5,6 +5,8 @@ pub mod tasks;
 pub mod orchestrator;
 pub mod merge;
 pub mod recovery;
+pub mod worker_token;
+pub mod index;
 
 use shared_types::GitOps;
 

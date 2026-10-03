@@ -740,6 +740,7 @@ async fn run_agy_once(
             return AgyRun::SpawnError(anyhow::anyhow!("failed to spawn agy under sandbox-exec: {e}"));
         }
     };
+    crate::agent_exec::note_attempt_child(&child);
 
     // Take the pipes out of the child so the read future never borrows `child`
     // (leaving `child` free for wait()/SIGKILL). Buffers are owned by the future
