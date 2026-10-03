@@ -99,8 +99,13 @@ pub enum TerminateOutcome {
 impl WorkerToken {
     /// Build the token for a just-spawned child, reading its start time and group from the OS.
     /// `None` when the child is already gone or the OS will not say; the caller logs that.
+    /// Also `None` when the child does not lead its own process group: every signal goes to the
+    /// group, and a group the worker merely joined is somebody else's (the spawner's).
     pub fn for_spawned_child(pid: u32, fleet_id: &str, task_id: &str, agent: &str) -> Option<Self> {
         let info = proc_info(pid)?;
+        if info.pgid != pid {
+            return None;
+        }
         Some(Self {
             pid,
             pgid: info.pgid,
@@ -113,6 +118,12 @@ impl WorkerToken {
     }
 
     pub fn verify(&self) -> Verification {
+        if self.pgid != self.pid {
+            return Verification::Mismatch(format!(
+                "token names group {} for pid {}: a worker always leads its own group",
+                self.pgid, self.pid
+            ));
+        }
         match proc_info(self.pid) {
             None => Verification::Gone,
             Some(i) if i.start_time_us != self.start_time_us => Verification::Mismatch(format!(
@@ -405,18 +416,30 @@ mod tests {
         assert!(!reaped(&mut s, Duration::from_millis(300)), "the process must still be running");
     }
 
+    /// RED IF: a tampered token can aim the signal at another group (here the test runner's).
     #[test]
     fn a_wrong_pgid_is_refused() {
         let mut s = stub("sleep 30");
         let mut t = WorkerToken::for_spawned_child(s.0.id(), "f", "t", "codex").expect("token");
-        t.pgid = std::process::id();
+        // SAFETY: getpgrp has no preconditions.
+        t.pgid = unsafe { libc::getpgrp() } as u32;
         assert!(t.signal_verified(libc::SIGKILL).is_err());
         assert!(!reaped(&mut s, Duration::from_millis(300)));
     }
 
+    /// A child that did not get its own group gets no token, so nothing can ever signal the
+    /// group it shares with its spawner.
+    #[test]
+    fn a_child_in_the_spawners_group_gets_no_token() {
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn");
+        assert!(WorkerToken::for_spawned_child(child.id(), "f", "t", "codex").is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn sigterm_stops_a_cooperative_worker() {
-        let mut s = stub("sleep 30");
+        let s = stub("sleep 30");
         let t = WorkerToken::for_spawned_child(s.0.id(), "f", "t", "codex").expect("token");
         // Reap concurrently, the way a real owner (or launchd for an orphan) would.
         let pid = s.0.id();
@@ -458,5 +481,78 @@ mod tests {
         write_token(dir.path(), &t).expect("write");
         assert_eq!(read_token(dir.path()).expect("read"), Some(t));
         assert_eq!(read_token(&dir.path().join("none")).expect("read"), None);
+    }
+}
+
+/// Real-process fixtures for the fleet tests: orphans like the ones a crashed owner leaves.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    /// A true orphan: started through a shell that exits at once, so it is reparented to
+    /// launchd (which reaps it, as it would a real orphan) and leads its own process group.
+    /// `cwd` is where it runs. Returns its pid.
+    pub fn orphan(script: &str, cwd: &Path) -> u32 {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -m; sh -c '{script}' >/dev/null 2>&1 </dev/null & echo $!"))
+            .current_dir(cwd)
+            .stderr(Stdio::null())
+            .output()
+            .expect("spawn orphan");
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().expect("orphan pid");
+        // Let the trap (if any) install before anyone signals it.
+        std::thread::sleep(Duration::from_millis(200));
+        pid
+    }
+
+    /// The identity of a process that has exited: a stand-in for an owner that crashed.
+    pub fn dead_owner() -> ProcessIdentity {
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn owner");
+        let id = ProcessIdentity {
+            pid: child.id(),
+            start_time_us: proc_info(child.id()).expect("owner info").start_time_us,
+        };
+        child.kill().expect("kill owner");
+        child.wait().expect("reap owner");
+        assert!(!id.is_alive());
+        id
+    }
+
+    /// A token for `pid` owned by `owner`, written into `worktree`.
+    pub fn token_for(pid: u32, worktree: &Path, fleet_id: &str, task_id: &str, owner: ProcessIdentity) -> WorkerToken {
+        let mut t = WorkerToken::for_spawned_child(pid, fleet_id, task_id, "codex").expect("token");
+        t.owner = owner;
+        write_token(worktree, &t).expect("write token");
+        t
+    }
+
+    pub fn alive(pid: u32) -> bool {
+        proc_info(pid).is_some()
+    }
+
+    /// Wait until `pid` is gone (an orphan is reaped by launchd shortly after it dies).
+    pub fn gone_within(pid: u32, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Kill a leftover fixture process regardless of what the test did.
+    pub struct Reap(pub Vec<u32>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                // SAFETY: plain kill on a fixture pid this test started.
+                unsafe { libc::kill(-(*pid as i32), libc::SIGKILL) };
+                unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+            }
+        }
     }
 }

@@ -39,6 +39,9 @@ pub struct FleetOrchestrator<G: GitOps, L: AgentLauncher = DaemonAgentLauncher> 
     worktree: WorktreeManager<G>,
     git_ops: G,
     launcher: L,
+    /// The restart index (`fleets.json`). When set, a real spawn records the fleet there BEFORE
+    /// any worker launches, and fails if it cannot: restart recovery and cancel depend on it.
+    index_path: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -154,7 +157,13 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             worktree: WorktreeManager::new(git_ops.clone()),
             git_ops,
             launcher,
+            index_path: None,
         }
+    }
+
+    pub fn with_index_path(mut self, index_path: PathBuf) -> Self {
+        self.index_path = Some(index_path);
+        self
     }
 
     pub async fn fleet_spawn(&self, req: FleetSpawnRequest) -> anyhow::Result<FleetSpawnResult> {
@@ -176,6 +185,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
 
         let mut worktree_paths = Vec::new();
         if !req.dry_run {
+            // Both records exist before any worker does. The owner record names THIS process,
+            // which waits on the workers: startup recovery may only touch a fleet whose owner is
+            // gone. The index tells a restarted daemon which ledger the fleet lives in. Either
+            // failing would leave workers nobody can find, so the spawn fails instead.
+            let owner = crate::worker_token::ProcessIdentity::current()
+                .ok_or_else(|| anyhow::anyhow!("cannot identify this process for the fleet owner record"))?;
+            crate::worker_token::write_owner_record(&req.project_root, &fleet_id, &owner)
+                .map_err(|e| anyhow::anyhow!("fleet owner record could not be written: {e}"))?;
+            if let Some(index) = &self.index_path {
+                crate::index::record_fleet_root_in(index, &fleet_id, &req.project_root.display().to_string())
+                    .map_err(|e| anyhow::anyhow!("fleet restart index {} could not be written: {e}", index.display()))?;
+            }
             if req.wait.unwrap_or(false) {
                 worktree_paths = self
                     .spawn_fleet_members(
@@ -482,7 +503,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 // A fleet cancelled before this worker started must not start it (Codex,
                 // review of step 6: cancel between the in-memory insert and the background
                 // spawn returned `canceled: true` and the workers launched anyway).
-                if fleet_is_cancelled(&fleet_id) {
+                if fleet_cancel_requested(&project_root, &fleet_id) {
                     terminal_guard.disarm();
                     tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, "fleet cancelled before worker launch; skipping");
                     if let Ok(conn) = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")) {
@@ -515,8 +536,19 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         } else {
                             (fleet_task_timeout(), "fleet task exceeded TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS")
                         };
-                        let (wait_result, stdout_tail, stderr_tail) =
-                            wait_fleet_child(child, &fleet_id, limit, timeout_msg).await;
+                        let worker_ctx = WorkerContext {
+                            project_root: &project_root,
+                            worktree: &worktree_path,
+                            fleet_id: &fleet_id,
+                            task_id: &task_id,
+                            agent: &launch_agent,
+                        };
+                        let WorkerExit {
+                            result: wait_result,
+                            stdout_tail,
+                            stderr_tail,
+                            longest_silence,
+                        } = wait_fleet_child(child, &worker_ctx, limit, timeout_msg).await;
                         if !matches!(&wait_result, Ok(s) if s.success()) {
                             tracing::warn!(
                                 fleet_id = %fleet_id,
@@ -561,6 +593,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     "agent": launch_agent,
                                     "requested_agent": agent_name,
                                     "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
+                                    "longest_silence_ms": longest_silence.as_millis() as u64,
                                 }).to_string();
                                 ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
                                 if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.clone()) {
@@ -598,7 +631,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 // biases repeated ambiguous failures toward OPEN anyway).
                                 // An operator cancel is not an agy failure; it must not feed
                                 // the breaker (Codex, confirmation pass).
-                                if use_agy && !fleet_is_cancelled(&fleet_id) {
+                                if use_agy && !fleet_cancel_requested(&project_root, &fleet_id) {
                                     // record_other_failure emits "tripped_other" itself, and
                                     // only on the actual transition to OPEN. Emitting here
                                     // too would report a trip on every failed task.
@@ -615,7 +648,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 // check, cancelling an agy worker launched a codex replacement
                                 // (Codex, review of step 6).
                                 if use_agy
-                                    && !fleet_is_cancelled(&fleet_id)
+                                    && !fleet_cancel_requested(&project_root, &fleet_id)
                                     && mcp_bridge::agy_resilience::degraded_route_allows_codex()
                                 {
                                     tracing::warn!(
@@ -632,9 +665,16 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             // Same helper as the primary wait: the degrade child
                                             // was piped-and-not-drained and never registered for
                                             // cancel (Grok, review of step 6).
-                                            let (r, out_tail, err_tail) = wait_fleet_child(
+                                            let degrade_ctx = WorkerContext {
+                                                project_root: &project_root,
+                                                worktree: &worktree_path,
+                                                fleet_id: &fleet_id,
+                                                task_id: &task_id,
+                                                agent: "codex",
+                                            };
+                                            let WorkerExit { result: r, stdout_tail: out_tail, stderr_tail: err_tail, .. } = wait_fleet_child(
                                                 codex_child,
-                                                &fleet_id,
+                                                &degrade_ctx,
                                                 fleet_task_timeout(),
                                                 "degraded codex fleet task exceeded TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS",
                                             )
@@ -724,6 +764,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         "degraded_from": degraded_failure.as_ref().map(|_| agent_name.clone()),
                                         "first_attempt_error": format!("agent exited with status {:?}", status.code()),
                                         "error": failure_text,
+                                        "longest_silence_ms": longest_silence.as_millis() as u64,
                                     })
                                     .to_string();
                                     ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
@@ -764,7 +805,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     "task_id": task_id,
                                     "agent": launch_agent,
                                     "requested_agent": agent_name,
-                                    "error": err.to_string()
+                                    "error": err.to_string(),
+                                    "longest_silence_ms": longest_silence.as_millis() as u64,
                                 })
                                 .to_string();
                                 ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
@@ -921,9 +963,11 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         if failed_tasks > 0 {
             let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
             conn.execute(
+                // A cancelled fleet's killed workers leave failed tasks; the operator's
+                // `cancelled` must survive that, or cancel reads as a crash in the ledger.
                 "UPDATE fleets
                  SET state = 'failed', failure_reason = ?2
-                 WHERE fleet_id = ?1",
+                 WHERE fleet_id = ?1 AND state <> 'cancelled'",
                 rusqlite::params![
                     fleet_id,
                     format!("{failed_tasks} task(s) failed before merge"),
@@ -1293,9 +1337,34 @@ fn fleet_task_timeout() -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(900))
 }
 
-/// Read a pipe to the end on its own task, keeping the last 8 KiB for diagnostics. A `None`
-/// pipe (not captured) yields an empty tail.
-fn spawn_drain<R>(reader: Option<R>) -> tokio::task::JoinHandle<String>
+/// When a worker last produced output, shared by both of its pipe drains. Fleet progress is
+/// output growth: a fleet worker writes nothing to the outbox, so this is the only clock it has.
+struct ProgressClock {
+    origin: std::time::Instant,
+    last_growth_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ProgressClock {
+    fn new() -> Self {
+        Self { origin: std::time::Instant::now(), last_growth_ms: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    fn touch(&self) {
+        let now = self.origin.elapsed().as_millis() as u64;
+        self.last_growth_ms.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How long since the last byte arrived (or since spawn, before the first).
+    fn silence(&self) -> std::time::Duration {
+        let last = self.last_growth_ms.load(std::sync::atomic::Ordering::SeqCst);
+        let now = self.origin.elapsed().as_millis() as u64;
+        std::time::Duration::from_millis(now.saturating_sub(last))
+    }
+}
+
+/// Read a pipe to the end on its own task, keeping the last 8 KiB for diagnostics and stamping
+/// the progress clock as bytes arrive (one reader per pipe). A `None` pipe yields an empty tail.
+fn spawn_drain<R>(reader: Option<R>, clock: std::sync::Arc<ProgressClock>) -> tokio::task::JoinHandle<String>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -1311,6 +1380,7 @@ where
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    clock.touch();
                     tail.extend_from_slice(&buf[..n]);
                     if tail.len() > KEEP {
                         let cut = tail.len() - KEEP;
@@ -1336,41 +1406,123 @@ impl Drop for FleetChildRegistration {
     }
 }
 
-/// Wait for one fleet worker: drain both pipes on their own tasks, register the pid for
-/// `fleet_cancel`, bound the wait and kill on expiry. Returns the exit result and the last
-/// 8 KiB of each stream. The drain awaits are bounded too: a grandchild holding the pipe
-/// open must not hang the fleet after the worker has exited.
+/// Which worker a wait is for: where its token goes and what it is called in the record.
+pub(crate) struct WorkerContext<'a> {
+    pub project_root: &'a Path,
+    pub worktree: &'a Path,
+    pub fleet_id: &'a str,
+    pub task_id: &'a str,
+    pub agent: &'a str,
+}
+
+/// What one worker wait observed.
+pub(crate) struct WorkerExit {
+    pub result: std::io::Result<std::process::ExitStatus>,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    /// The longest stretch with no output, including the stretch before exit.
+    pub longest_silence: std::time::Duration,
+}
+
+/// How often the wait loop samples the progress clock. The recorded longest silence is accurate
+/// to about this much.
+const SILENCE_SAMPLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Wait for one fleet worker: write its launch token, drain both pipes on their own tasks,
+/// register the pid for an in-process `fleet_cancel`, bound the wait and kill on expiry. The
+/// drain awaits are bounded too: a grandchild holding the pipe open must not hang the fleet after
+/// the worker has exited.
+///
+/// Stall detection here is LOG-ONLY. The windows were measured on the ask path's event stream;
+/// output growth is a different clock. The wait records each worker's longest silence and says
+/// when the ask-path window would have fired, so the fleet windows can be measured before any
+/// kill is enabled. The 900 s limit stays the only kill.
 async fn wait_fleet_child(
     mut child: Child,
-    fleet_id: &str,
+    ctx: &WorkerContext<'_>,
     limit: std::time::Duration,
     timeout_msg: &str,
-) -> (std::io::Result<std::process::ExitStatus>, String, String) {
-    let stdout_tail = spawn_drain(child.stdout.take());
-    let stderr_tail = spawn_drain(child.stderr.take());
+) -> WorkerExit {
+    let fleet_id = ctx.fleet_id;
+    let clock = std::sync::Arc::new(ProgressClock::new());
+    let stdout_tail = spawn_drain(child.stdout.take(), clock.clone());
+    let stderr_tail = spawn_drain(child.stderr.take(), clock.clone());
+    // The launch token, before anything else may need to find this worker. A worker that exited
+    // already needs none; a token that cannot be WRITTEN means the worker would be unreachable
+    // after a restart, so it is stopped and the task fails loudly.
+    if let Some(pid) = child.id() {
+        match crate::worker_token::WorkerToken::for_spawned_child(pid, fleet_id, ctx.task_id, ctx.agent) {
+            Some(token) => {
+                if let Err(e) = crate::worker_token::write_token(ctx.worktree, &token) {
+                    tracing::error!(fleet_id, task_id = ctx.task_id, error = %e, "could not write the launch token; stopping the worker");
+                    let _ = crate::worker_token::signal_group(pid, libc::SIGKILL);
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return WorkerExit {
+                        result: Err(std::io::Error::other(format!("launch token write failed: {e}"))),
+                        stdout_tail: String::new(),
+                        stderr_tail: String::new(),
+                        longest_silence: std::time::Duration::ZERO,
+                    };
+                }
+            }
+            None if matches!(child.try_wait(), Ok(Some(_))) => {}
+            None => tracing::error!(
+                fleet_id,
+                task_id = ctx.task_id,
+                pid,
+                "no launch token: the worker does not lead its own process group or the OS would not report it; it cannot be stopped after a restart"
+            ),
+        }
+    }
     let _registration = child.id().map(|pid| {
         register_fleet_child(fleet_id, pid);
         // A cancel that landed between the pre-launch check and this registration would
         // otherwise leave an unregistered, unsignalled worker (Codex, confirmation pass).
-        if fleet_is_cancelled(fleet_id) {
-            signal_group(pid, "TERM");
+        if fleet_cancel_requested(ctx.project_root, fleet_id) {
+            let _ = crate::worker_token::signal_group(pid, libc::SIGTERM);
         }
         FleetChildRegistration { fleet_id: fleet_id.to_string(), pid }
     });
-    let wait_result = match tokio::time::timeout(limit, child.wait()).await {
-        Ok(r) => r,
-        Err(_) => {
-            if let Some(pid) = child.id() {
-                signal_group(pid, "KILL");
+    let window = mcp_bridge::stall::stall_window(ctx.agent);
+    let mut longest = std::time::Duration::ZERO;
+    let mut reported_stall = false;
+    let deadline = tokio::time::Instant::now() + limit;
+    let wait_result = loop {
+        tokio::select! {
+            r = child.wait() => break r,
+            _ = tokio::time::sleep(SILENCE_SAMPLE) => {
+                longest = longest.max(clock.silence());
+                if let Some(w) = window
+                    && !reported_stall
+                    && longest >= w
+                {
+                    reported_stall = true;
+                    tracing::warn!(
+                        fleet_id,
+                        task_id = ctx.task_id,
+                        agent = ctx.agent,
+                        window_secs = w.as_secs(),
+                        "fleet worker silent past its stall window (log-only; not killed)"
+                    );
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    if let Some(pid) = child.id() {
+                        let _ = crate::worker_token::signal_group(pid, libc::SIGKILL);
+                    }
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("{timeout_msg} ({}s)", limit.as_secs()),
+                    ));
+                }
             }
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("{timeout_msg} ({}s)", limit.as_secs()),
-            ))
         }
     };
+    // The silence that ended at exit counts too: a worker silent for its last 10 minutes and
+    // then exiting is exactly the case being measured.
+    longest = longest.max(clock.silence());
     async fn bounded(h: tokio::task::JoinHandle<String>) -> String {
         tokio::time::timeout(std::time::Duration::from_secs(5), h)
             .await
@@ -1378,12 +1530,30 @@ async fn wait_fleet_child(
             .and_then(|r| r.ok())
             .unwrap_or_default()
     }
-    (wait_result, bounded(stdout_tail).await, bounded(stderr_tail).await)
+    tracing::info!(
+        fleet_id,
+        task_id = ctx.task_id,
+        agent = ctx.agent,
+        longest_silence_ms = longest.as_millis() as u64,
+        "fleet worker exited"
+    );
+    mcp_bridge::posthog::record_fleet_worker_silence(
+        ctx.agent,
+        fleet_id,
+        ctx.task_id,
+        longest.as_millis() as u64,
+        window.map(|w| w.as_secs()),
+    );
+    WorkerExit {
+        result: wait_result,
+        stdout_tail: bounded(stdout_tail).await,
+        stderr_tail: bounded(stderr_tail).await,
+        longest_silence: longest,
+    }
 }
 
-/// Live worker pids per fleet, so `fleet_cancel` can reach the processes. Before this, cancel
-/// removed the in-memory record and the workers ran on (audit, 2026-09-13: a cancelled codex
-/// worker was killed by hand).
+/// Live worker pids per fleet, so an in-process `fleet_cancel` can reach the processes even
+/// before a token exists. After a restart this is empty and the launch tokens take over.
 static FLEET_CHILDREN: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u32>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -1406,8 +1576,8 @@ fn unregister_fleet_child(fleet_id: &str, pid: u32) {
     }
 }
 
-/// Fleets the operator cancelled, so a worker not yet launched stays unlaunched and a
-/// SIGTERMed agy worker is not replaced by a codex one. Process-global like the pid registry.
+/// Fleets the operator cancelled in THIS process, so a worker not yet launched stays unlaunched
+/// and a SIGTERMed agy worker is not replaced by a codex one.
 static CANCELLED_FLEETS: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
@@ -1415,30 +1585,107 @@ pub fn fleet_is_cancelled(fleet_id: &str) -> bool {
     CANCELLED_FLEETS.lock().map(|s| s.contains(fleet_id)).unwrap_or(false)
 }
 
-/// SIGTERM every live worker of `fleet_id` and remember the cancellation. Returns how many
-/// were signalled.
-pub fn kill_fleet_children(fleet_id: &str) -> usize {
+/// Whether a cancel was requested from ANY process: this one's memory, or the ledger. A fleet
+/// runs inside the `triumvirate mcp` that spawned it, and a cancel can arrive through a different
+/// one (or after a restart). Without the ledger read, the owner saw its worker die from a cancel
+/// it never heard about and launched a codex replacement for the "failed" agy task.
+pub fn fleet_cancel_requested(project_root: &Path, fleet_id: &str) -> bool {
+    if fleet_is_cancelled(fleet_id) {
+        return true;
+    }
+    let db = project_root.join(".triumvirate").join("ledger.db");
+    rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT state FROM fleets WHERE fleet_id = ?1",
+                rusqlite::params![fleet_id],
+                |r| r.get::<_, String>(0),
+            )
+        })
+        .is_ok_and(|state| state == "cancelled")
+}
+
+/// Remember a cancellation in this process and take the in-memory worker pids. Returns them
+/// UNSIGNALLED: `cancel_fleet_workers` signals through the launch tokens and falls back to these
+/// only for a worker that has no token.
+pub fn take_fleet_children_for_cancel(fleet_id: &str) -> Vec<u32> {
     if let Ok(mut s) = CANCELLED_FLEETS.lock() {
         s.insert(fleet_id.to_string());
     }
-    let pids: Vec<u32> = FLEET_CHILDREN
+    FLEET_CHILDREN
         .lock()
         .ok()
         .and_then(|mut m| m.remove(fleet_id))
-        .unwrap_or_default();
-    for pid in &pids {
-        signal_group(*pid, "TERM");
-    }
-    pids.len()
+        .unwrap_or_default()
 }
 
-/// Signal the worker's whole process group (the launcher puts each worker in its own).
-fn signal_group(pid: u32, sig: &str) {
-    let _ = std::process::Command::new("kill")
-        .arg(format!("-{sig}"))
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .status();
+/// What a cancel or a recovery did to a fleet's workers.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkerStopReport {
+    /// Workers that were running and were stopped (SIGTERM, or SIGKILL after the grace).
+    pub stopped: usize,
+    /// Workers that ignored SIGTERM and needed SIGKILL.
+    pub escalated: usize,
+    /// Anything that may still be running: a refused token, an unreadable token, a failed kill.
+    pub problems: Vec<String>,
+}
+
+/// The grace between SIGTERM and SIGKILL. `TRIUMVIRATE_FLEET_KILL_GRACE_SECS`, default 5.
+pub fn fleet_kill_grace() -> std::time::Duration {
+    std::env::var("TRIUMVIRATE_FLEET_KILL_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(5))
+}
+
+/// Stop every worker of `fleet_id` that its launch tokens can PROVE is still that worker:
+/// SIGTERM to the group, the grace, then SIGKILL, every result checked. A token that does not
+/// match its process is refused and nothing is signalled. Never finds workers any other way
+/// (never by working directory). `extra_pids` are in-memory children of this process with no
+/// token; they get one checked SIGTERM.
+pub async fn stop_fleet_workers(
+    project_root: &Path,
+    fleet_id: &str,
+    extra_pids: Vec<u32>,
+    grace: std::time::Duration,
+) -> WorkerStopReport {
+    let mut report = WorkerStopReport::default();
+    let mut covered = std::collections::BTreeSet::new();
+    let mut jobs = Vec::new();
+    for (path, token) in crate::worker_token::fleet_tokens(project_root, fleet_id) {
+        match token {
+            Ok(token) => {
+                covered.insert(token.pid);
+                jobs.push(tokio::task::spawn_blocking(move || {
+                    let r = token.terminate(grace);
+                    (token, r)
+                }));
+            }
+            Err(e) => report
+                .problems
+                .push(format!("unreadable launch token in {}: {e}", path.display())),
+        }
+    }
+    for job in jobs {
+        match job.await {
+            Ok((_, Ok(crate::worker_token::TerminateOutcome::AlreadyGone))) => {}
+            Ok((_, Ok(crate::worker_token::TerminateOutcome::Terminated))) => report.stopped += 1,
+            Ok((_, Ok(crate::worker_token::TerminateOutcome::Killed))) => {
+                report.stopped += 1;
+                report.escalated += 1;
+            }
+            Ok((token, Err(e))) => report.problems.push(format!("{}: {e}", token.task_id)),
+            Err(e) => report.problems.push(format!("stop task failed: {e}")),
+        }
+    }
+    for pid in extra_pids.into_iter().filter(|p| !covered.contains(p)) {
+        match crate::worker_token::signal_group(pid, libc::SIGTERM) {
+            Ok(()) => report.stopped += 1,
+            Err(e) => report.problems.push(e),
+        }
+    }
+    report
 }
 
 /// The fleet's state as the ledger records it, with the worktrees that exist on disk for its
@@ -1478,8 +1725,11 @@ pub fn mark_fleet_cancelled(project_root: &Path, fleet_id: &str, reason: &str) -
     let Ok(conn) = rusqlite::Connection::open(&db) else {
         return false;
     };
+    // A fleet that already finished keeps its outcome: cancelling a `done` fleet after a
+    // restart must not rewrite history.
     conn.execute(
-        "UPDATE fleets SET state = 'cancelled', failure_reason = ?2 WHERE fleet_id = ?1",
+        "UPDATE fleets SET state = 'cancelled', failure_reason = ?2
+         WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed', 'cancelled')",
         rusqlite::params![fleet_id, reason],
     )
     .is_ok()
@@ -2414,4 +2664,128 @@ mod tests {
         assert_eq!(inv.args[n - 1], "do the task");
     }
 
+
+    /// A worker launched in its own group with piped output, the way the production launcher
+    /// does it.
+    fn piped_worker(script: &str, cwd: &Path) -> Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0)
+            .spawn()
+            .expect("spawn worker")
+    }
+
+    /// Fleet stall is LOG-ONLY. A worker silent for 3 s against a 1 s window must still run to
+    /// completion, and its recorded longest silence must be right within a second.
+    /// RED IF: the fleet path starts killing on silence, or the silence is mis-measured.
+    #[tokio::test]
+    async fn fleet_stall_is_log_only_and_records_the_longest_silence() {
+        // A private agent name, so the override cannot reach any other test's agent.
+        unsafe { std::env::set_var("TRIUMVIRATE_STALL_SECS_STALLSTUB", "1") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = super::WorkerContext {
+            project_root: dir.path(),
+            worktree: dir.path(),
+            fleet_id: "fleet-silent",
+            task_id: "fleet-silent-T-001",
+            agent: "stallstub",
+        };
+        let child = piped_worker("sleep 3; exit 0", dir.path());
+        let exit = super::wait_fleet_child(child, &ctx, Duration::from_secs(30), "limit").await;
+
+        assert!(matches!(&exit.result, Ok(s) if s.success()), "log-only: the worker must not be killed: {:?}", exit.result);
+        let silence = exit.longest_silence.as_secs_f64();
+        assert!((2.0..=4.0).contains(&silence), "longest silence {silence}s, expected about 3s");
+        let token = crate::worker_token::read_token(dir.path()).expect("read").expect("a token is written for every worker");
+        assert_eq!(token.task_id, "fleet-silent-T-001");
+        assert_eq!(token.pgid, token.pid);
+    }
+
+    /// The twin: a chatty worker's longest silence stays well under a second.
+    #[tokio::test]
+    async fn a_chatty_worker_records_a_short_silence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = super::WorkerContext {
+            project_root: dir.path(),
+            worktree: dir.path(),
+            fleet_id: "fleet-chatty",
+            task_id: "fleet-chatty-T-001",
+            agent: "chattystub",
+        };
+        let child = piped_worker("for i in 1 2 3 4 5 6; do echo tick; sleep 0.3; done", dir.path());
+        let exit = super::wait_fleet_child(child, &ctx, Duration::from_secs(30), "limit").await;
+        assert!(matches!(&exit.result, Ok(s) if s.success()));
+        assert!(exit.longest_silence < Duration::from_millis(900), "got {:?}", exit.longest_silence);
+        assert!(exit.stdout_tail.contains("tick"));
+    }
+
+    /// The restart index is required. RED IF: a spawn whose fleets.json write fails launches
+    /// workers anyway (they would be unfindable after a restart).
+    #[tokio::test]
+    async fn a_failed_index_write_fails_the_spawn_before_any_worker_launches() {
+        let (temp, project_root, orchestrator) = d015_project();
+        let blocker = temp.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").expect("file");
+        let orchestrator = orchestrator.with_index_path(blocker.join("fleets.json"));
+        let seen = orchestrator.launcher.seen_project_roots.clone();
+
+        let err = orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.clone(),
+                agents: vec!["codex".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "index failure".to_string(),
+            })
+            .await
+            .expect_err("the spawn must fail");
+        assert!(err.to_string().contains("restart index"), "{err}");
+        assert!(seen.lock().await.is_empty(), "no worker may launch");
+    }
+
+    /// The twin: a writable index records the fleet, and the owner record names this process.
+    #[tokio::test]
+    async fn a_spawn_records_the_index_and_its_owner_before_launch() {
+        let (temp, project_root, orchestrator) = d015_project();
+        let index = temp.path().join("home").join("fleets.json");
+        let orchestrator = orchestrator.with_index_path(index.clone());
+        let spawned = orchestrator
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: project_root.clone(),
+                agents: vec!["codex".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "index ok".to_string(),
+            })
+            .await
+            .expect("spawn");
+        assert_eq!(
+            crate::index::lookup_fleet_root_in(&index, &spawned.fleet_id).as_deref(),
+            Some(project_root.display().to_string().as_str())
+        );
+        let owner = crate::worker_token::read_owner_record(&project_root, &spawned.fleet_id)
+            .expect("read")
+            .expect("owner record");
+        assert_eq!(owner, crate::worker_token::ProcessIdentity::current().expect("me"));
+    }
+
+    /// A cancel recorded in the LEDGER (by another process) is seen by the owner. RED IF: the
+    /// owner reads only its own memory and launches a codex replacement for a cancelled agy task.
+    #[test]
+    fn a_ledger_cancel_from_another_process_is_seen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".triumvirate")).expect("mkdir");
+        let _ = ledger::LedgerStore::open(root.clone()).expect("ledger");
+        FleetTaskStore::new(root.clone()).expect("tasks").insert_fleet("fleet-x", "t").expect("fleet");
+        assert!(!super::fleet_cancel_requested(&root, "fleet-x"));
+        assert!(super::mark_fleet_cancelled(&root, "fleet-x", "test"));
+        assert!(super::fleet_cancel_requested(&root, "fleet-x"));
+    }
 }

@@ -1,8 +1,17 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use ledger::LedgerStore;
 use rusqlite::Connection;
 use shared_types::RawEvent;
+
+use crate::worker_token::{self, TerminateOutcome, Verification};
+
+/// The reason every recovered fleet carries. A test asserts it; tooling may match on it.
+pub const RECOVERY_REASON: &str = "crash recovery: stale fleet detected";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryResult {
@@ -10,35 +19,117 @@ pub struct RecoveryResult {
     pub cleaned_worktrees: usize,
 }
 
-pub fn recover_crashed_fleets(project_root: PathBuf) -> anyhow::Result<RecoveryResult> {
+/// Which non-terminal fleets recovery may touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryOptions {
+    /// A fleet with no owner record was spawned by a binary older than owner records. Its owner
+    /// cannot be checked, so it may belong to a live process. Startup leaves it alone; only an
+    /// explicit operator call includes it.
+    pub include_ownerless: bool,
+    /// SIGTERM to SIGKILL grace for each orphan.
+    pub grace: Duration,
+}
+
+/// What recovery did in one project, fleet by fleet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaleFleetReport {
+    /// Marked failed, tasks reset to pending. Their worktrees are untouched.
+    pub recovered: Vec<String>,
+    /// Owner process still running: a live fleet, not a crashed one.
+    pub live_owner: Vec<String>,
+    /// No owner record and `include_ownerless` was off.
+    pub ownerless: Vec<String>,
+    /// An orphan could not be proven stopped, so the fleet was left as it was (resetting its
+    /// tasks would let a second claimant run a task the orphan is still running).
+    pub blocked: Vec<(String, String)>,
+    /// Orphaned workers stopped, across all fleets.
+    pub orphans_stopped: usize,
+}
+
+/// Recover crashed fleets WITHOUT deleting anything. For each fleet left `spawning`, `running`,
+/// `merging` or `recovery_required` whose owner process is gone:
+///
+/// 1. stop every orphaned worker its launch token can prove is still that worker (SIGTERM, grace,
+///    SIGKILL, every result checked; a mismatched token is refused and nothing is signalled);
+/// 2. only once every orphan is gone, mark the fleet failed and reset its claimed or in-progress
+///    tasks to pending.
+///
+/// Order matters: resetting first lets a second claimant run the same task while the orphan keeps
+/// spending (Codex, Grok, Gemini, review of 2026-10-03). Blocking (it sleeps through the grace):
+/// call it from a blocking context.
+pub fn recover_stale_fleets(project_root: &Path, opts: RecoveryOptions) -> anyhow::Result<StaleFleetReport> {
     if !project_root.is_absolute() {
         anyhow::bail!("project_root must be absolute");
     }
     let db_path = project_root.join(".triumvirate").join("ledger.db");
-    let conn = Connection::open(&db_path)?;
+    // Never CREATE a ledger: the index outlives the repos it names (deleted temp dirs, moved
+    // repos), and recovery must not leave empty databases behind in them.
+    let conn = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT fleet_id FROM fleets
-         WHERE state IN ('spawning', 'running', 'merging', 'recovery_required')",
-    )?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let candidates: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT fleet_id FROM fleets
+             WHERE state IN ('spawning', 'running', 'merging', 'recovery_required')",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
 
-    let mut failed_fleets = Vec::new();
-    for row in rows {
-        failed_fleets.push(row?);
-    }
+    let mut report = StaleFleetReport::default();
+    for fleet_id in candidates {
+        let tokens = worker_token::fleet_tokens(project_root, &fleet_id);
+        let owner = worker_token::read_owner_record(project_root, &fleet_id)?;
+        let token_owner_alive = tokens
+            .iter()
+            .any(|(_, t)| t.as_ref().is_ok_and(|t| t.owner.is_alive()));
+        if owner.is_some_and(|o| o.is_alive()) || token_owner_alive {
+            report.live_owner.push(fleet_id);
+            continue;
+        }
+        if owner.is_none() && !tokens.iter().any(|(_, t)| t.is_ok()) && !opts.include_ownerless {
+            tracing::warn!(fleet_id = %fleet_id, "stale-looking fleet has no owner record (spawned by an older binary); leaving it alone");
+            report.ownerless.push(fleet_id);
+            continue;
+        }
 
-    let mut cleaned_worktrees = 0usize;
-    let worktree_base = project_root.join(".triumvirate").join("worktrees");
-    for fleet_id in &failed_fleets {
+        let mut problems = Vec::new();
+        for (path, token) in &tokens {
+            let token = match token {
+                Ok(t) => t,
+                Err(e) => {
+                    problems.push(format!("unreadable launch token in {}: {e}", path.display()));
+                    continue;
+                }
+            };
+            if let Verification::Mismatch(why) = token.verify() {
+                // The pid now belongs to someone else, so OUR worker is gone. Logged, never signalled.
+                tracing::warn!(fleet_id = %fleet_id, task_id = %token.task_id, reason = %why, "launch token no longer matches; the worker is gone and the pid is not ours");
+                continue;
+            }
+            match token.terminate(opts.grace) {
+                Ok(TerminateOutcome::AlreadyGone) => {}
+                Ok(outcome) => {
+                    tracing::warn!(fleet_id = %fleet_id, task_id = %token.task_id, pid = token.pid, ?outcome, "stopped an orphaned fleet worker");
+                    report.orphans_stopped += 1;
+                }
+                Err(e) => problems.push(format!("{}: {e}", token.task_id)),
+            }
+        }
+        if !problems.is_empty() {
+            let why = problems.join("; ");
+            tracing::error!(fleet_id = %fleet_id, problems = %why, "orphan not proven stopped; fleet left as it was");
+            report.blocked.push((fleet_id, why));
+            continue;
+        }
+
         conn.execute(
             "UPDATE fleets
              SET state = 'failed',
                  completed_at = datetime('now'),
-                 failure_reason = 'crash recovery: stale fleet detected'
+                 failure_reason = ?2
              WHERE fleet_id = ?1",
-            [fleet_id],
+            rusqlite::params![fleet_id, RECOVERY_REASON],
         )?;
         conn.execute(
             "UPDATE tasks
@@ -46,9 +137,80 @@ pub fn recover_crashed_fleets(project_root: PathBuf) -> anyhow::Result<RecoveryR
                  assigned_agent = NULL
              WHERE fleet_id = ?1
                AND state IN ('claimed', 'in_progress')",
-            [fleet_id],
+            [&fleet_id],
         )?;
+        report.recovered.push(fleet_id);
+    }
 
+    if !report.recovered.is_empty() {
+        let store = LedgerStore::open(project_root.to_path_buf())?;
+        for (idx, fleet_id) in report.recovered.iter().enumerate() {
+            store.ingest_event(RawEvent {
+                session_id: fleet_id.clone(),
+                event_type: "fleet_recovery".to_string(),
+                sequence: (idx + 1) as i64,
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                payload_json: serde_json::json!({
+                    "fleet_id": fleet_id,
+                    "reason": RECOVERY_REASON
+                })
+                .to_string(),
+            })?;
+        }
+    }
+    Ok(report)
+}
+
+/// Summary of one startup pass over every project in the restart index.
+#[derive(Debug, Clone, Default)]
+pub struct StartupRecoverySummary {
+    pub projects_scanned: usize,
+    /// Index entries whose ledger no longer exists (deleted temp dirs, moved repos). Skipped.
+    pub projects_missing: usize,
+    pub recovered: Vec<String>,
+    pub orphans_stopped: usize,
+    pub live_owner: usize,
+    pub ownerless: usize,
+    pub blocked: Vec<(String, String)>,
+    pub errors: Vec<(PathBuf, String)>,
+}
+
+/// The startup entry point: the non-deleting recovery over every project the index names.
+/// Ownerless fleets are left alone. Blocking.
+pub fn recover_fleets_at_startup(index: &Path, grace: Duration) -> StartupRecoverySummary {
+    let mut summary = StartupRecoverySummary::default();
+    for root in crate::index::project_roots_in(index) {
+        if !root.join(".triumvirate").join("ledger.db").is_file() {
+            summary.projects_missing += 1;
+            continue;
+        }
+        summary.projects_scanned += 1;
+        let opts = RecoveryOptions { include_ownerless: false, grace };
+        match recover_stale_fleets(&root, opts) {
+            Ok(r) => {
+                summary.recovered.extend(r.recovered);
+                summary.orphans_stopped += r.orphans_stopped;
+                summary.live_owner += r.live_owner.len();
+                summary.ownerless += r.ownerless.len();
+                summary.blocked.extend(r.blocked);
+            }
+            Err(e) => summary.errors.push((root, e.to_string())),
+        }
+    }
+    summary
+}
+
+/// The explicit operator path, unchanged in what it promises: recover every stale fleet whose
+/// owner is gone (ownerless ones included) and DELETE their worktree directories. Startup never
+/// calls this; deleting a worktree can destroy uncommitted work. Blocking.
+pub fn recover_crashed_fleets(project_root: PathBuf) -> anyhow::Result<RecoveryResult> {
+    let report = recover_stale_fleets(
+        &project_root,
+        RecoveryOptions { include_ownerless: true, grace: crate::orchestrator::fleet_kill_grace() },
+    )?;
+    let mut cleaned_worktrees = 0usize;
+    let worktree_base = project_root.join(".triumvirate").join("worktrees");
+    for fleet_id in &report.recovered {
         if worktree_base.exists() {
             for entry in fs::read_dir(&worktree_base)? {
                 let entry = entry?;
@@ -65,26 +227,8 @@ pub fn recover_crashed_fleets(project_root: PathBuf) -> anyhow::Result<RecoveryR
             }
         }
     }
-
-    if !failed_fleets.is_empty() {
-        let store = LedgerStore::open(project_root)?;
-        for (idx, fleet_id) in failed_fleets.iter().enumerate() {
-            store.ingest_event(RawEvent {
-                session_id: fleet_id.clone(),
-                event_type: "fleet_recovery".to_string(),
-                sequence: (idx + 1) as i64,
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                payload_json: serde_json::json!({
-                    "fleet_id": fleet_id,
-                    "reason": "crash recovery: stale fleet detected"
-                })
-                .to_string(),
-            })?;
-        }
-    }
-
     Ok(RecoveryResult {
-        failed_fleets,
+        failed_fleets: report.recovered,
         cleaned_worktrees,
     })
 }
@@ -196,5 +340,162 @@ mod tests {
             )
             .expect("count recovery events");
         assert!(events >= 1);
+    }
+
+    use std::{path::Path, time::Duration};
+
+    use crate::tasks::FleetTaskStore;
+    use crate::worker_token::{self, test_support::*};
+
+    use super::{RECOVERY_REASON, RecoveryOptions, recover_fleets_at_startup, recover_stale_fleets};
+
+    const OPTS: RecoveryOptions = RecoveryOptions { include_ownerless: false, grace: Duration::from_millis(500) };
+
+    /// A ledger with `fleet_id` running and one in-progress task per worktree name given.
+    fn seed(root: &Path, fleet_id: &str, tasks: &[&str]) -> Vec<std::path::PathBuf> {
+        fs::create_dir_all(root.join(".triumvirate")).expect("mkdir");
+        let _ = LedgerStore::open(root.to_path_buf()).expect("ledger");
+        let store = FleetTaskStore::new(root.to_path_buf()).expect("tasks");
+        store.insert_fleet(fleet_id, "recovery test").expect("fleet");
+        let conn = rusqlite::Connection::open(root.join(".triumvirate").join("ledger.db")).expect("db");
+        conn.execute("UPDATE fleets SET state = 'running' WHERE fleet_id = ?1", [fleet_id]).expect("state");
+        let mut worktrees = Vec::new();
+        for t in tasks {
+            let task_id = format!("{fleet_id}-{t}");
+            store.insert_task(&task_id, fleet_id, t, &[]).expect("task");
+            conn.execute(
+                "UPDATE tasks SET state = 'in_progress', assigned_agent = 'codex' WHERE task_id = ?1",
+                [&task_id],
+            )
+            .expect("task state");
+            let wt = root.join(".triumvirate").join("worktrees").join(format!("{fleet_id}-{task_id}-codex"));
+            fs::create_dir_all(&wt).expect("worktree");
+            worktrees.push(wt);
+        }
+        worktrees
+    }
+
+    fn fleet_row(root: &Path, fleet_id: &str) -> (String, Option<String>) {
+        let conn = rusqlite::Connection::open(root.join(".triumvirate").join("ledger.db")).expect("db");
+        conn.query_row(
+            "SELECT state, failure_reason FROM fleets WHERE fleet_id = ?1",
+            [fleet_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row")
+    }
+
+    fn task_states(root: &Path, fleet_id: &str) -> Vec<String> {
+        let conn = rusqlite::Connection::open(root.join(".triumvirate").join("ledger.db")).expect("db");
+        let mut stmt = conn.prepare("SELECT state FROM tasks WHERE fleet_id = ?1 ORDER BY task_id").expect("q");
+        stmt.query_map([fleet_id], |r| r.get(0)).expect("rows").map(|r| r.expect("row")).collect()
+    }
+
+    /// The crash case. The owner is dead; one orphan stops on SIGTERM, one ignores it; an
+    /// operator's shell sits in a worktree with no token.
+    /// RED IF: an orphan survives, the fleet is not failed with the existing reason, a task is not
+    /// pending, a worktree is deleted, or the shell is signalled.
+    #[test]
+    fn a_dead_owners_orphans_are_stopped_then_the_fleet_fails_and_nothing_is_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let wts = seed(&root, "fleet-a", &["T-001", "T-002"]);
+        let owner = worker_token::test_support::dead_owner();
+        worker_token::write_owner_record(&root, "fleet-a", &owner).expect("owner");
+
+        let polite = orphan("sleep 60", &wts[0]);
+        let stubborn = orphan("trap \"\" TERM; while :; do sleep 1; done", &wts[1]);
+        let shell = orphan("sleep 60", &wts[0]);
+        let _reap = Reap(vec![polite, stubborn, shell]);
+        token_for(polite, &wts[0], "fleet-a", "fleet-a-T-001", owner);
+        token_for(stubborn, &wts[1], "fleet-a", "fleet-a-T-002", owner);
+
+        let report = recover_stale_fleets(&root, OPTS).expect("recover");
+
+        assert_eq!(report.recovered, vec!["fleet-a".to_string()]);
+        assert_eq!(report.orphans_stopped, 2);
+        assert!(gone_within(polite, Duration::from_secs(3)), "the polite orphan must be stopped");
+        assert!(gone_within(stubborn, Duration::from_secs(3)), "SIGKILL escalation must stop the stubborn one");
+        assert!(alive(shell), "a process in the worktree WITHOUT a token is never signalled");
+        let (state, reason) = fleet_row(&root, "fleet-a");
+        assert_eq!(state, "failed");
+        assert_eq!(reason.as_deref(), Some(RECOVERY_REASON));
+        assert_eq!(task_states(&root, "fleet-a"), vec!["pending", "pending"]);
+        assert!(wts.iter().all(|w| w.is_dir()), "startup recovery never deletes a worktree");
+    }
+
+    /// The twin that makes the owner record matter. RED IF: a fleet whose owner is ALIVE (another
+    /// session's `triumvirate mcp`) is touched: its worker killed or its tasks reset.
+    #[test]
+    fn a_live_owners_fleet_is_left_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let wts = seed(&root, "fleet-live", &["T-001"]);
+        let me = worker_token::ProcessIdentity::current().expect("me");
+        worker_token::write_owner_record(&root, "fleet-live", &me).expect("owner");
+        let worker = orphan("sleep 60", &wts[0]);
+        let _reap = Reap(vec![worker]);
+        token_for(worker, &wts[0], "fleet-live", "fleet-live-T-001", me);
+
+        let report = recover_stale_fleets(&root, OPTS).expect("recover");
+
+        assert_eq!(report.live_owner, vec!["fleet-live".to_string()]);
+        assert!(report.recovered.is_empty());
+        assert!(alive(worker), "a live owner's worker must not be signalled");
+        assert_eq!(fleet_row(&root, "fleet-live").0, "running");
+        assert_eq!(task_states(&root, "fleet-live"), vec!["in_progress"]);
+    }
+
+    /// A pid reused by an unrelated process. RED IF: it is signalled.
+    #[test]
+    fn a_token_whose_pid_was_reused_is_never_signalled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let wts = seed(&root, "fleet-reuse", &["T-001"]);
+        let owner = worker_token::test_support::dead_owner();
+        worker_token::write_owner_record(&root, "fleet-reuse", &owner).expect("owner");
+        let stranger = orphan("sleep 60", &wts[0]);
+        let _reap = Reap(vec![stranger]);
+        let mut t = token_for(stranger, &wts[0], "fleet-reuse", "fleet-reuse-T-001", owner);
+        t.start_time_us -= 1_000_000;
+        worker_token::write_token(&wts[0], &t).expect("rewrite");
+
+        let report = recover_stale_fleets(&root, OPTS).expect("recover");
+
+        assert!(alive(stranger), "a mismatched token must never be acted on");
+        assert_eq!(report.orphans_stopped, 0);
+        assert_eq!(report.recovered, vec!["fleet-reuse".to_string()], "our worker is gone, so the fleet is recoverable");
+    }
+
+    /// Fleets from before owner records cannot be checked. Startup leaves them alone.
+    #[test]
+    fn an_ownerless_fleet_is_skipped_at_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        seed(&root, "fleet-old", &["T-001"]);
+        let report = recover_stale_fleets(&root, OPTS).expect("recover");
+        assert_eq!(report.ownerless, vec!["fleet-old".to_string()]);
+        assert_eq!(fleet_row(&root, "fleet-old").0, "running");
+    }
+
+    /// The startup entry point reads the index, skips a root whose ledger is gone WITHOUT
+    /// creating one, and recovers the rest.
+    #[test]
+    fn startup_recovery_walks_the_index_and_never_creates_a_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        seed(&root, "fleet-s", &["T-001"]);
+        worker_token::write_owner_record(&root, "fleet-s", &worker_token::test_support::dead_owner()).expect("owner");
+        let gone = dir.path().join("gone");
+        fs::create_dir_all(gone.join(".triumvirate")).expect("mkdir");
+        let index = dir.path().join("fleets.json");
+        crate::index::record_fleet_root_in(&index, "fleet-s", &root.display().to_string()).expect("index");
+        crate::index::record_fleet_root_in(&index, "fleet-gone", &gone.display().to_string()).expect("index");
+
+        let summary = recover_fleets_at_startup(&index, Duration::from_millis(500));
+
+        assert_eq!(summary.recovered, vec!["fleet-s".to_string()]);
+        assert_eq!(summary.projects_missing, 1);
+        assert!(!gone.join(".triumvirate").join("ledger.db").exists(), "recovery must not create a ledger");
     }
 }
