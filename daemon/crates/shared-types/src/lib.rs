@@ -855,6 +855,12 @@ pub struct FleetCancelRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FleetCancelResponse {
     pub canceled: bool,
+    /// Workers that were running and were stopped (SIGTERM, or SIGKILL after the grace).
+    #[serde(default)]
+    pub signalled: usize,
+    /// Why `canceled` is false, or what may still be running. Omitted when there is nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
