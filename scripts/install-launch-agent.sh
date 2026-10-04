@@ -9,8 +9,8 @@
 # scripts/install.sh), which reads the env from ~/.claude.json exactly like a hand start and
 # refuses a dead backend. It never points into a repo checkout or target/.
 #
-# NOT `triumvirate install`: that writes a plist with only TRIUMVIRATE_HOME in its env, so the
-# daemon would start without the agy backend, the agent PATH or PostHog.
+# `triumvirate install` writes the same plist (it used to write one with only TRIUMVIRATE_HOME in
+# its env; fixed 2026-10-04). This script also loads it.
 #
 # Usage: bash scripts/install-launch-agent.sh            (install or update, then load)
 #        bash scripts/install-launch-agent.sh --remove   (unload and delete)

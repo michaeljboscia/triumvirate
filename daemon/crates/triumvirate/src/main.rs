@@ -5427,11 +5427,11 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
     #[test]
     fn launch_agent_plist_contains_expected_values() {
-        let plist = core_render_launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri-home");
+        let plist = core_render_launch_agent_plist("/usr/local/bin/triumvirate-start-daemon", "/tmp/tri-home");
         assert!(plist.contains("com.triumvirate.daemon-v2"));
-        assert!(plist.contains("<string>/usr/local/bin/triumvirate</string>"));
-        assert!(plist.contains("<string>daemon</string>"));
-        assert!(plist.contains("<string>/tmp/tri-home/daemon.log</string>"));
+        assert!(plist.contains("<string>/usr/local/bin/triumvirate-start-daemon</string>"));
+        assert!(plist.contains("<string>--foreground</string>"));
+        assert!(plist.contains("<string>/tmp/tri-home/launchd.err.log</string>"));
     }
 
     #[test]
