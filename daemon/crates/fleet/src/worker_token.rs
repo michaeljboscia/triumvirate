@@ -40,7 +40,8 @@ pub fn owner_record_path(project_root: &Path, fleet_id: &str) -> PathBuf {
 /// What the OS says about one pid right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcInfo {
-    /// Microseconds since the Unix epoch.
+    /// Microseconds: since the Unix epoch on macOS, since boot on Linux. Only ever compared for
+    /// equality, never read as a clock.
     pub start_time_us: u64,
     pub pgid: u32,
 }
@@ -468,8 +469,11 @@ pub fn proc_info(pid: u32) -> Option<ProcInfo> {
     })
 }
 
-/// Linux: field 22 of /proc/PID/stat is the start time in clock ticks since boot. That is not
-/// epoch time, but it is stable for the life of the process, which is all the token needs.
+/// Linux: field 22 of /proc/PID/stat is the start time in clock ticks since boot, converted to
+/// microseconds so the field means the same unit on both platforms. That is not epoch time, but it
+/// is stable for the life of the process, which is all the token needs. (Read raw, the ticks were
+/// stored as microseconds: 100 per second, so a CI runner booted minutes ago underflowed a test's
+/// `start_time_us - 1_000_000`.)
 #[cfg(target_os = "linux")]
 pub fn proc_info(pid: u32) -> Option<ProcInfo> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -480,9 +484,15 @@ pub fn proc_info(pid: u32) -> Option<ProcInfo> {
     if fields.first() == Some(&"Z") {
         return None;
     }
+    let ticks: u64 = fields.get(19)?.parse().ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
     Some(ProcInfo {
         pgid: fields.get(2)?.parse().ok()?,
-        start_time_us: fields.get(19)?.parse().ok()?,
+        start_time_us: ticks * 1_000_000 / hz as u64,
     })
 }
 
@@ -680,9 +690,10 @@ pub(crate) mod test_support {
 
     /// A true orphan: started through a shell that exits at once, so it is reparented to
     /// launchd (which reaps it, as it would a real orphan) and leads its own process group.
-    /// `cwd` is where it runs. Returns its pid.
+    /// `cwd` is where it runs. Returns its pid. bash, not sh: Ubuntu's sh is dash, which turns
+    /// `set -m` off without a tty, so the job stayed in our group and every token was refused.
     pub fn orphan(script: &str, cwd: &Path) -> u32 {
-        let out = Command::new("sh")
+        let out = Command::new("bash")
             .arg("-c")
             .arg(format!("set -m; sh -c '{script}' >/dev/null 2>&1 </dev/null & echo $!"))
             .current_dir(cwd)

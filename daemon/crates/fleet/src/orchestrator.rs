@@ -2947,7 +2947,7 @@ mod tests {
         let pid = child.id();
         let stale = crate::worker_token::ProcessIdentity {
             pid,
-            start_time_us: crate::worker_token::proc_info(pid).expect("info").start_time_us - 1_000_000,
+            start_time_us: crate::worker_token::proc_info(pid).expect("info").start_time_us + 1_000_000,
         };
         let report = super::stop_fleet_workers(dir.path(), "fleet-reuse", vec![stale], Duration::from_millis(100)).await;
         assert_eq!(report.stopped, 0, "{report:?}");
