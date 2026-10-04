@@ -115,7 +115,15 @@ impl AgentLauncher for DaemonAgentLauncher {
 /// worker runs the same CLI the same way whichever engine launched it.
 pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str) -> anyhow::Result<(String, Vec<String>)> {
     let (cmd, args): (String, Vec<String>) = match agent {
-        "codex" => ("codex".to_string(), fleet_codex_argv(task_prompt)),
+        // The SAME binary the consult path runs (TRIUMVIRATE_CODEX_BIN, else PATH). A bare
+        // "codex" here let the launchd daemon's PATH pick /opt/homebrew/bin/codex 0.133.0 while
+        // every consult ran the pinned ~/.local/bin/codex 0.154.0; the old CLI refused the
+        // configured model and every codex fleet member exited 1 (trial fleet 1, 2026-10-04).
+        "codex" => {
+            let (bin, mut args) = mcp_bridge::codex_command();
+            args.extend(fleet_codex_argv(task_prompt));
+            (bin, args)
+        }
         "gemini" => match mcp_bridge::gemini_backend() {
             // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
             // Under agy it spawns the shared sandbox-exec invocation (single-turn,
@@ -2074,6 +2082,27 @@ mod fleet_codex_argv_tests {
         assert!(argv.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{argv:?}");
         assert!(!argv.iter().any(|a| a.contains("dangerously") || a == "danger-full-access"), "{argv:?}");
         assert_eq!(argv.last().map(String::as_str), Some("task"), "the prompt stays last, after --");
+    }
+
+    /// RED IF a codex fleet member is spawned through a bare `codex` PATH lookup instead of the
+    /// operator's TRIUMVIRATE_CODEX_BIN pin, the binary every consult runs. Under launchd the
+    /// PATH lookup found a stale codex that refused the configured model.
+    #[test]
+    fn a_codex_fleet_worker_runs_the_pinned_codex_binary() {
+        let saved = std::env::var_os("TRIUMVIRATE_CODEX_BIN");
+        // SAFETY: no other fleet test reads or writes TRIUMVIRATE_CODEX_BIN; restored below.
+        unsafe { std::env::set_var("TRIUMVIRATE_CODEX_BIN", "/pinned/codex") };
+        let got = super::fleet_agent_command("codex", std::path::Path::new("/wt"), "task");
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("TRIUMVIRATE_CODEX_BIN", v),
+                None => std::env::remove_var("TRIUMVIRATE_CODEX_BIN"),
+            }
+        }
+        let (bin, argv) = got.expect("codex command");
+        assert_eq!(bin, "/pinned/codex");
+        assert!(argv.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{argv:?}");
+        assert_eq!(argv.last().map(String::as_str), Some("task"));
     }
 }
 
