@@ -320,6 +320,49 @@ pub fn write_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) -
     fs::write(path, b"")
 }
 
+/// Create the launch marker only if it does not exist: `Ok(true)` when this caller now owns the
+/// launch, `Ok(false)` when another attempt already does. Exclusive create (O_EXCL) closes the
+/// window between deciding to launch and launching, in which two attempts could both decide
+/// "fresh" and both spawn the agent (Codex, review of 3871850).
+///
+/// The marker records its claimant (pid plus start time). A claimant that died after claiming and
+/// before its worker's token existed cannot be mid-launch, so its marker is stale: it is removed
+/// and the claim retried once. Without that, every later attempt blocked on it for good (Codex,
+/// confirmation pass on d867c01). A live claimant's marker is never touched.
+pub fn try_claim_launch(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Result<bool> {
+    let path = launch_marker_path(project_root, fleet_id, task_id)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let me = ProcessIdentity::current()
+        .ok_or_else(|| io::Error::other("cannot read this process's identity for the launch marker"))?;
+    for _ in 0..2 {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(&serde_json::to_vec(&me).map_err(io::Error::other)?)?;
+                f.sync_all()?;
+                return Ok(true);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let claimant: Option<ProcessIdentity> =
+                    fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+                match claimant {
+                    Some(c) if !c.is_alive() && read_token(project_root, fleet_id, task_id)?.is_none() => {
+                        tracing::warn!(fleet_id, task_id, claimant_pid = c.pid, "stale launch marker from a dead claimant; reclaiming");
+                        fs::remove_file(&path)?;
+                    }
+                    // A live claimant, or a marker with no identity (written by the legacy
+                    // engine or an older binary): not ours to reclaim.
+                    _ => return Ok(false),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
+}
+
 pub fn clear_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) {
     if let Ok(path) = launch_marker_path(project_root, fleet_id, task_id) {
         match fs::remove_file(&path) {
@@ -328,6 +371,22 @@ pub fn clear_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) {
             Err(e) => tracing::error!(path = %path.display(), error = %e, "could not clear the launch marker; recovery will treat this task as untracked"),
         }
     }
+}
+
+/// Marks a fleet as run by the Temporal engine. Its tokens have no legacy owner record because
+/// Temporal owns them (the activity and its heartbeat), so the legacy startup recovery must leave
+/// the fleet alone: to it, a live Temporal fleet would look exactly like a crashed legacy one.
+pub fn mark_temporal_engine(project_root: &Path, fleet_id: &str) -> io::Result<()> {
+    let dir = fleet_token_dir(project_root, fleet_id)?;
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("ENGINE"), b"temporal\n")
+}
+
+pub fn is_temporal_engine(project_root: &Path, fleet_id: &str) -> bool {
+    fleet_token_dir(project_root, fleet_id)
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join("ENGINE")).ok())
+        .is_some_and(|s| s.trim() == "temporal")
 }
 
 pub fn has_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) -> bool {
@@ -479,6 +538,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    /// A marker whose claimant died before any token existed is reclaimed; a live claimant's is
+    /// not. RED IF a dead claimant blocks the launch for good, or a live one loses its claim.
+    #[test]
+    fn a_dead_claimants_launch_marker_is_reclaimed_and_a_live_ones_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let marker = launch_marker_path(root, "f", "f-T-001").unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+
+        let dead = test_support::dead_owner();
+        std::fs::write(&marker, serde_json::to_vec(&dead).unwrap()).unwrap();
+        assert!(try_claim_launch(root, "f", "f-T-001").unwrap(), "a dead claimant's marker is reclaimed");
+        let now: ProcessIdentity = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(now, ProcessIdentity::current().unwrap(), "the marker now names this claimant");
+
+        // This process is alive, so a second claim must lose.
+        assert!(!try_claim_launch(root, "f", "f-T-001").unwrap(), "a live claimant keeps its claim");
     }
 
     #[test]

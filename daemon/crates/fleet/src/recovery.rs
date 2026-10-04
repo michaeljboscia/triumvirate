@@ -44,6 +44,8 @@ pub struct StaleFleetReport {
     pub blocked: Vec<(String, String)>,
     /// Orphaned workers stopped, across all fleets.
     pub orphans_stopped: usize,
+    /// Run by the Temporal engine: Temporal owns them, so legacy recovery never touches them.
+    pub temporal_engine: Vec<String>,
 }
 
 /// Recover crashed fleets WITHOUT deleting anything. For each fleet left `spawning`, `running`,
@@ -78,6 +80,10 @@ pub fn recover_stale_fleets(project_root: &Path, opts: RecoveryOptions) -> anyho
 
     let mut report = StaleFleetReport::default();
     for fleet_id in candidates {
+        if worker_token::is_temporal_engine(project_root, &fleet_id) {
+            report.temporal_engine.push(fleet_id);
+            continue;
+        }
         let tokens = worker_token::fleet_tokens(project_root, &fleet_id);
         let owner = worker_token::read_owner_record(project_root, &fleet_id)?;
         let token_owner_alive = tokens
@@ -606,5 +612,26 @@ mod tests {
         let report = recover_stale_fleets(&root, OPTS).expect("recover");
         assert_eq!(report.live_owner, vec!["fleet-sp".to_string()]);
         assert_eq!(task_states(&root, "fleet-sp"), vec!["in_progress"]);
+    }
+
+    /// A Temporal-engine fleet with a dead "owner" and live-looking tokens is NOT a crashed
+    /// legacy fleet. RED IF legacy recovery fails it, resets its tasks, or signals its worker.
+    #[test]
+    fn a_temporal_engine_fleet_is_never_recovered_by_the_legacy_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let wts = seed(&root, "fleet-tmp", &["T-001"]);
+        worker_token::mark_temporal_engine(&root, "fleet-tmp").expect("mark");
+        let worker = orphan("sleep 60", &wts[0]);
+        let _reap = Reap(vec![worker]);
+        token_for(worker, &root, "fleet-tmp", "fleet-tmp-T-001", worker_token::test_support::dead_owner());
+
+        let report = recover_stale_fleets(&root, RecoveryOptions { include_ownerless: true, grace: Duration::from_millis(300) })
+            .expect("recover");
+
+        assert_eq!(report.temporal_engine, vec!["fleet-tmp".to_string()]);
+        assert!(report.recovered.is_empty());
+        assert!(alive(worker), "a Temporal fleet's worker is never signalled by legacy recovery");
+        assert_eq!(fleet_row(&root, "fleet-tmp").0, "running");
     }
 }

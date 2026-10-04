@@ -167,6 +167,27 @@ enum CliCommand {
     Proxy,
     /// Watch live agent streaming events.
     Watch(watch::WatchArgs),
+    /// Internal: run one fleet worker for the Temporal engine (launched by its run_worker
+    /// activity). Not for hand use.
+    #[command(hide = true)]
+    FleetShim(FleetShimArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct FleetShimArgs {
+    #[arg(long)]
+    project_root: PathBuf,
+    #[arg(long)]
+    fleet_id: String,
+    #[arg(long)]
+    task_id: String,
+    #[arg(long)]
+    agent: String,
+    #[arg(long)]
+    worktree: PathBuf,
+    /// The agent command line, after `--`.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
 }
 
 /// Append one line per `wiki_search` call to `~/.triumvirate/wiki-search.jsonl`.
@@ -1788,6 +1809,17 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Status => {
             run_status().await?;
         }
+        CliCommand::FleetShim(a) => {
+            let code = fleet::shim::run(&fleet::shim::ShimArgs {
+                project_root: a.project_root,
+                fleet_id: a.fleet_id,
+                task_id: a.task_id,
+                agent: a.agent,
+                worktree: a.worktree,
+                command: a.command,
+            })?;
+            std::process::exit(code);
+        }
         CliCommand::Doctor => {
             run_doctor().await?;
         }
@@ -2990,6 +3022,21 @@ async fn run_daemon() -> anyhow::Result<()> {
     };
     run_startup_gc_if_needed(&state).await;
     tokio::spawn(run_startup_fleet_recovery());
+    // The Temporal fleet engine (design triumvirate-fleet.md). Off unless
+    // TRIUMVIRATE_FLEET_ENGINE=temporal; then a worker polls `triumvirate-fleet` on its own
+    // thread (Worker::run is not Send). A failure to start is loud and does not stop the daemon:
+    // the legacy engine keeps serving.
+    if fleet_temporal::engine_enabled() {
+        match fleet_temporal::WorkerConfig::from_env()
+            .map_err(|e| e.to_string())
+            .and_then(|cfg| fleet_temporal::spawn_worker_thread(cfg.clone()).map(|_| cfg).map_err(|e| e.to_string()))
+        {
+            Ok(cfg) => tracing::info!(task_queue = %cfg.task_queue, namespace = %cfg.namespace, "temporal fleet engine ON: worker thread started"),
+            Err(e) => tracing::error!(error = %e, "temporal fleet engine requested but the worker did not start"),
+        }
+    } else {
+        tracing::info!("temporal fleet engine off (TRIUMVIRATE_FLEET_ENGINE is not 'temporal')");
+    }
     let app = Router::new()
         .route("/", get(daemon_http::dashboard_root_route))
         .route("/assets/{*path}", get(daemon_http::dashboard_assets_route))
