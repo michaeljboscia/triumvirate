@@ -212,7 +212,7 @@ impl<G: GitOps> MergeCoordinator<G> {
             session_id: fleet_id.to_string(),
             event_type: event_type.to_string(),
             sequence: max_seq.unwrap_or(0) + 1,
-            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            timestamp: crate::event_timestamp(),
             payload_json: payload.to_string(),
         })?;
         Ok(())

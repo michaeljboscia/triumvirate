@@ -169,6 +169,35 @@ pub async fn launch(input: &RunWorkerInput) -> Result<(Option<tokio::process::Ch
 }
 
 /// The run has a matching completion record.
+/// How long a fleet member's output may stay flat before the worker is stopped as stalled.
+///
+/// Enabled only for agents shown writing their output FILE while they work (design check 9):
+/// measured 2026-10-04 through fleet-shim in real worktrees, codex (stderr), agy (stream-json on
+/// stdout) and grok (streaming-json) all grew within 3 s, with no flat stretch over 18 s.
+/// Windows are the ask path's (codex 240, gemini 300, grok 780), far above anything observed.
+/// Anything else (deepseek, claude, the stub) has no rule unless
+/// `TRIUMVIRATE_FLEET_STALL_SECS_<AGENT>` sets one; that override also changes a default, and
+/// `0` turns the rule off for that agent.
+pub fn stall_window(agent: &str) -> Option<Duration> {
+    let key = format!("TRIUMVIRATE_FLEET_STALL_SECS_{}", agent.to_ascii_uppercase());
+    let secs = match std::env::var(&key).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(v) => v,
+        None => match agent {
+            "codex" => 240,
+            "gemini" => 300,
+            "grok" => 780,
+            _ => return None,
+        },
+    };
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Bytes the member has written so far, stdout and stderr together.
+pub fn output_bytes(root: &Path, input: &RunWorkerInput) -> u64 {
+    let size = |p: std::io::Result<std::path::PathBuf>| p.ok().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+    size(shim::out_path(root, &input.fleet_id, &input.task_id)) + size(shim::err_path(root, &input.fleet_id, &input.task_id))
+}
+
 pub fn finished(root: &Path, input: &RunWorkerInput, token: &WorkerToken) -> Option<DoneRecord> {
     shim::read_done(root, &input.fleet_id, &input.task_id)
         .ok()
@@ -273,5 +302,38 @@ mod tests {
         assert_eq!(token.pid, first.id());
         let _ = first.kill();
         let _ = first.wait();
+    }
+}
+
+#[cfg(test)]
+mod stall_window_tests {
+    use super::stall_window;
+    use std::time::Duration;
+
+    /// Design check 9. RED IF an agent that was never shown writing its output while it works
+    /// gets a stall rule by default (agy on the ASK path shipped one and killed every long call),
+    /// or a proven agent loses its window.
+    #[test]
+    fn only_proven_agents_get_a_default_window() {
+        assert_eq!(stall_window("codex"), Some(Duration::from_secs(240)));
+        assert_eq!(stall_window("gemini"), Some(Duration::from_secs(300)));
+        assert_eq!(stall_window("grok"), Some(Duration::from_secs(780)));
+        for unproven in ["deepseek", "claude", "stub"] {
+            assert_eq!(stall_window(unproven), None, "{unproven} has no proof and must get no rule");
+        }
+    }
+
+    /// An override sets a window for any agent, and 0 turns the rule off.
+    #[test]
+    fn an_override_sets_or_disables_the_window() {
+        // A name no other test uses, so this env key cannot race another test.
+        let key = "TRIUMVIRATE_FLEET_STALL_SECS_STALLWINDOWPROBE";
+        // SAFETY: the key is unique to this test.
+        unsafe { std::env::set_var(key, "12") };
+        assert_eq!(stall_window("stallwindowprobe"), Some(Duration::from_secs(12)));
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(stall_window("stallwindowprobe"), None);
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(stall_window("stallwindowprobe"), None);
     }
 }

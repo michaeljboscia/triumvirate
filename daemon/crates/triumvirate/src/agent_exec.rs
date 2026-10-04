@@ -492,9 +492,7 @@ pub(crate) fn record_ask_call_event(
             session_id,
             event_type: "wiki_call".to_string(),
             sequence: 1,
-            // The real time. The fleet crate writes a hardcoded "2030-01-01T00:00:00Z" here, which
-            // is a fabricated value; retention keys on `created_at`, so it does not break the
-            // sweep, but it is not copied.
+            // The real time, as the fleet crate's events now carry too.
             timestamp: chrono::Utc::now().to_rfc3339(),
             payload_json: payload.to_string(),
         })
@@ -2797,6 +2795,25 @@ fn enforce_reviewer_sight(
         });
         return Err(detail);
     }
+    // A review that DELEGATED is rejected whatever else it did (Codex and Grok, review of PR 57).
+    // A subagent's reads and reasoning never reach this stream, so any part of the answer may come
+    // from work this gate cannot see, even when the parent also read every source. The review
+    // prompt says delegation will be rejected; this is what makes that true. Known residual: codex
+    // omits `spawn_agent` from --json, so a spawn that is never followed by a collab call is
+    // invisible here; the prompt note is the only control on that path.
+    if tool_calls.iter().any(|c| c.tool == agent_adapter::codex::COLLAB_TOOL) {
+        let detail = format!(
+            "{agent_display} was dispatched as a review and delegated part of it to a subagent \
+             (collab_tool_call). A subagent's reads are not in this stream, so they cannot back a \
+             review, and any of the answer may rest on them. Rejecting the turn. Re-dispatch; the \
+             review prompt already forbids delegation, so a repeat is the agent ignoring it."
+        );
+        lifecycle.push(LifecycleEvent {
+            state: "REJECTED".to_string(),
+            detail: detail.clone(),
+        });
+        return Err(detail);
+    }
     // The named-sources check. This is the difference between a fig leaf and a gate.
     //
     // `tool_calls > 0` alone passes on one `todo_write`, one `list_dir .`, one `pwd`, or a
@@ -4351,6 +4368,18 @@ fn is_git_worktree(path: &str) -> bool {
     }
 }
 
+/// Appended to every read-only (review) codex prompt. Codex delegates reads to a subagent through
+/// `spawn_agent`, whose reads never reach this stream, so the sight gate rejects the review as
+/// "never opened" and the work is thrown away (2026-10-03, three times). No codex setting stops
+/// it on 0.154.0 (`--disable multi_agent`, `agents.max_depth=0` and `max_threads=1` were all
+/// tried live; a child thread still ran), so the instruction is the control, and the gate names
+/// delegation when it happens anyway.
+const CODEX_REVIEW_TOOL_NOTE: &str = "\n\nTool note for this read-only review: do ALL reading yourself. \
+Do not spawn, delegate to or wait on subagents or other agents (spawn_agent, wait_agent): their reads \
+are invisible to this review's verification and the review will be rejected. Read each file with \
+`cat FILE` or `sed -n 'A,Bp' FILE` windows that together cover every line. \
+Always finish with your written answer.";
+
 async fn run_codex_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -4469,7 +4498,11 @@ async fn run_codex_cli_process_with_session(
     ));
     final_args.push("--output-last-message".to_string());
     final_args.push(output_file.display().to_string());
-    final_args.push(message.to_string());
+    if read_only {
+        final_args.push(format!("{message}{CODEX_REVIEW_TOOL_NOTE}"));
+    } else {
+        final_args.push(message.to_string());
+    }
 
     let mut command = Command::new(bin);
     command
@@ -6731,6 +6764,78 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
             .expect("three overlapping windows covering 1..=556 are a whole read");
+    }
+
+    /// D-036, through the REAL classifier (codex_read hard-codes ReadFile, which is how the bug
+    /// hid: the gate was fine, `shell_read_kind` left a `;` chain as Bash). Codex read four sources
+    /// as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the review was discarded.
+    /// RED IF: windows of one file joined by `;` stop counting, or a `;` chain with anything else
+    /// in it (another file, a non-read, a masking `true`) starts counting.
+    #[test]
+    fn sight_36_semicolon_windows_of_one_file_are_a_whole_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "a.rs", 500);
+        let other = file_with_lines(dir.path(), "b.rs", 500);
+        let classified = |command: String| {
+            let args = serde_json::json!({ "command": command });
+            ToolCallRecord {
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+            }
+        };
+        let gate = |command: String| {
+            let mut lifecycle = Vec::new();
+            enforce_reviewer_sight(
+                "Codex", &[classified(command)], "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle,
+            )
+        };
+        gate(format!("/bin/zsh -lc \"sed -n '1,180p' {src}; sed -n '181,360p' {src}; sed -n '361,$p' {src}\""))
+            .expect("the D-036 shape covers the file");
+        gate(format!("/bin/zsh -lc \"sed -n '1,250p' {src}; nl -ba {src} | sed -n '251,500p'\""))
+            .expect("a nl window is a window");
+        for bad in [
+            format!("/bin/zsh -lc \"sed -n '1,250p' {src}; sed -n '251,500p' {other}\""),
+            format!("/bin/zsh -lc \"sed -n '1,500p' {other}; sed -n '1,1p' {src}\""),
+            format!("/bin/zsh -lc \"cat {src}; true\""),
+            format!("/bin/zsh -lc \"sed -n '1,500p' {src}; true\""),
+            format!("/bin/zsh -lc \"sed -n '1,250p' {src}; sed -n '251,499p' {src}\""),
+        ] {
+            assert!(gate(bad.clone()).is_err(), "must not satisfy the source: {bad}");
+        }
+    }
+
+    /// RED IF: a review that delegated to a codex subagent is rejected without naming delegation,
+    /// or a delegation alone counts as "looked at something" on the no-sources gate.
+    #[test]
+    fn sight_37_a_delegated_review_is_rejected_and_says_why() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "a.rs", 50);
+        let mut parser = agent_adapter::codex::CodexExecParser::new();
+        let line = r#"{"type":"item.started","item":{"id":"i7","type":"collab_tool_call","tool":"wait","receiver_thread_ids":[]}}"#;
+        let _ = parser.parse_line(line);
+        let tools = parser.finish().tool_calls;
+        assert_eq!(tools.len(), 1, "the collab call must be recorded");
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("a delegated review read nothing itself");
+        assert!(err.contains("delegated part of it to a subagent"), "{err}");
+        // Review of PR 57: the parent also read the whole source. Still rejected.
+        let mut both = vec![codex_read(&format!("cat {src}"))];
+        both.extend(tools.iter().cloned());
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &both, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("delegation is rejected even with full parent reads");
+        assert!(err.contains("delegated part of it to a subagent"), "{err}");
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &[], &cwd, &mut lifecycle)
+            .expect_err("delegating is not looking");
+        assert!(err.contains("delegated part of it to a subagent"), "{err}");
     }
 
     /// A window that stops short is still a peek, and so is a set of windows with a hole in

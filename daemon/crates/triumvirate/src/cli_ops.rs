@@ -34,13 +34,26 @@ pub(crate) fn run_install() -> anyhow::Result<()> {
     fs::create_dir_all(&launch_agents)?;
 
     let plist_path = core_launchd_plist_path()?;
+    // The launcher scripts/install.sh puts beside the binary; it loads the env from ~/.claude.json.
     let exe_path = std::env::current_exe()?;
-    let plist = core_render_launch_agent_plist(&exe_path.display().to_string(), &home.display().to_string());
+    let launcher = exe_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("binary {} has no parent directory", exe_path.display()))?
+        .join("triumvirate-start-daemon");
+    if !launcher.exists() {
+        anyhow::bail!(
+            "missing {}: install with scripts/install.sh, which puts the launcher beside the binary",
+            launcher.display()
+        );
+    }
+    let plist = core_render_launch_agent_plist(&launcher.display().to_string(), &home.display().to_string());
     fs::write(&plist_path, plist)?;
 
     write_line_stdout(&format!("Installed launchd plist at {}", plist_path.display()))?;
-    write_line_stdout(&format!("Load with: launchctl load {}", plist_path.display()))?;
-    write_line_stdout("Start now with: launchctl start com.triumvirate.daemon-v2")?;
+    write_line_stdout(&format!(
+        "Load with: launchctl bootstrap gui/$(id -u) {}  (or scripts/install-launch-agent.sh)",
+        plist_path.display()
+    ))?;
     Ok(())
 }
 

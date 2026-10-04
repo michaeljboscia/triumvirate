@@ -299,7 +299,18 @@ pub async fn fleet_task_list(
     fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
     req: FleetTaskListRequest,
 ) -> Result<FleetTaskListResponse, String> {
-    let status = resolve_fleet(fleet_states, &req.fleet_id, fleet_index_path().as_deref()).await?;
+    fleet_task_list_with(fleet_states, req, fleet_index_path().as_deref()).await
+}
+
+/// `fleet_task_list` with the restart index passed in, so a test drives the tool itself and not
+/// only the resolver it is supposed to call (the D-016 test used to call `resolve_fleet` directly,
+/// so it stayed green if the tool stopped using it).
+async fn fleet_task_list_with(
+    fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
+    req: FleetTaskListRequest,
+    index: Option<&Path>,
+) -> Result<FleetTaskListResponse, String> {
+    let status = resolve_fleet(fleet_states, &req.fleet_id, index).await?;
     let task_ids = status
         .worktree_paths
         .iter()
@@ -524,7 +535,15 @@ mod restart_index_tests {
         let index = idx_dir.path().join("fleets.json");
         record_fleet_root_in(&index, "fleet-list", &root.display().to_string()).expect("index");
         let restarted: Arc<Mutex<HashMap<String, FleetStatusResponse>>> = Arc::default();
-        assert!(resolve_fleet(&restarted, "fleet-list", Some(&index)).await.is_ok());
+        let req = FleetTaskListRequest { fleet_id: "fleet-list".to_string() };
+        fleet_task_list_with(&restarted, req, Some(&index))
+            .await
+            .expect("fleet_task_list must find a fleet the ledger holds after a restart");
+        // The negative twin: without the index the same call must fail, or the success above
+        // proves nothing about the index being consulted.
+        let req = FleetTaskListRequest { fleet_id: "fleet-list".to_string() };
+        let err = fleet_task_list_with(&Arc::default(), req, None).await.unwrap_err();
+        assert!(err.contains("fleet not found"), "{err}");
     }
 
     /// Two different "not found"s must read differently: never spawned, versus spawned into a

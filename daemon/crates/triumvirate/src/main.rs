@@ -4683,6 +4683,63 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    /// RED IF: a codex REVIEW prompt goes out without the no-delegation note, or a plain consult
+    /// gets it. Codex delegated reviews to subagents whose reads the gate cannot see (2026-10-03),
+    /// and no codex setting stops it, so the prompt is the control.
+    #[tokio::test]
+    async fn a_codex_review_prompt_forbids_delegation_and_a_consult_does_not() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let test_home = std::env::temp_dir().join(format!("triumvirate-codex-review-note-{now}"));
+        fs::create_dir_all(&test_home)?;
+        let args_file = test_home.join("codex-args.txt");
+        let script_path = write_codex_args_capture_script(&args_file, "done")?;
+        // Restore what was there, not remove it: a removed HOME breaks every later test that
+        // reads it (abe_red_team_* failed "environment variable not found" when this deleted it).
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_REQUIRE_PEER_REVIEW"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("HOME", &test_home);
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", script_path.as_os_str());
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
+        }
+        let mut captured = Vec::new();
+        for review in [true, false] {
+            let _ = fs::remove_file(&args_file);
+            let req = AskAgentRequest {
+                agent: "codex".to_string(),
+                message: "note probe".to_string(),
+                cwd: Some(test_home.display().to_string()),
+                require_sight: Some(review),
+                ..Default::default()
+            };
+            // A review with no tool calls is rejected by the gate; only the argv matters here.
+            let _ = execute_ask_agent(&req, None).await;
+            captured.push(fs::read_to_string(&args_file).unwrap_or_default());
+        }
+        // SAFETY: restore before asserting.
+        unsafe {
+            // Every variable this test touched, restored (Antigravity, review of PR 57).
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let _ = fs::remove_file(script_path);
+        let _ = fs::remove_dir_all(&test_home);
+        assert!(captured[0].contains("note probe"), "the stand-in never ran: {:?}", captured[0]);
+        assert!(captured[0].contains("Do not spawn, delegate to or wait on subagents"), "{:?}", captured[0]);
+        assert!(captured[1].contains("note probe"), "the stand-in never ran: {:?}", captured[1]);
+        assert!(!captured[1].contains("Do not spawn"), "a consult must not carry the review note");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ask_agent_codex_auto_approve_writes_ledger_record() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5427,11 +5484,11 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
     #[test]
     fn launch_agent_plist_contains_expected_values() {
-        let plist = core_render_launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri-home");
+        let plist = core_render_launch_agent_plist("/usr/local/bin/triumvirate-start-daemon", "/tmp/tri-home");
         assert!(plist.contains("com.triumvirate.daemon-v2"));
-        assert!(plist.contains("<string>/usr/local/bin/triumvirate</string>"));
-        assert!(plist.contains("<string>daemon</string>"));
-        assert!(plist.contains("<string>/tmp/tri-home/daemon.log</string>"));
+        assert!(plist.contains("<string>/usr/local/bin/triumvirate-start-daemon</string>"));
+        assert!(plist.contains("<string>--foreground</string>"));
+        assert!(plist.contains("<string>/tmp/tri-home/launchd.err.log</string>"));
     }
 
     #[test]

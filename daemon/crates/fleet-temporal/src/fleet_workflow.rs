@@ -94,7 +94,22 @@ struct Abort {
 
 fn abort(e: ActivityExecutionError) -> Abort {
     let cancelled = matches!(e, ActivityExecutionError::Cancelled(_));
-    Abort { cancelled, reason: e.to_string(), error: (!cancelled).then_some(e) }
+    Abort { cancelled, reason: failure_text(&e), error: (!cancelled).then_some(e) }
+}
+
+/// The whole failure chain of an activity error, outermost first. `to_string()` gives only the
+/// top line, "Activity failed: Activity task failed", which is what the ledger recorded for every
+/// member failure (a stalled worker's "stalled after 10 s ..." never reached it).
+fn failure_text(e: &ActivityExecutionError) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut f = e.failure();
+    while let Some(x) = f {
+        if !x.message.is_empty() && !parts.contains(&x.message) {
+            parts.push(x.message.clone());
+        }
+        f = x.cause.as_deref();
+    }
+    if parts.is_empty() { e.to_string() } else { parts.join(": ") }
 }
 
 /// Options for steps that must run even after the workflow is cancelled: recording outcomes that
@@ -175,7 +190,7 @@ impl FleetWorkflow {
                     cancelled.get_or_insert(e);
                     continue;
                 }
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(failure_text(&e))),
             };
             let outcome = TaskOutcome {
                 project_root: input.project_root.clone(),
@@ -267,7 +282,21 @@ impl FleetLedgerActivities {
     #[activity(name = "triumvirate-record-task-outcome")]
     pub async fn record_task_outcome(_ctx: ActivityContext, o: TaskOutcome) -> Result<String, ActivityError> {
         let root = PathBuf::from(&o.project_root);
-        let succeeded = o.output.as_ref().is_some_and(|out| out.exit_code == Some(0));
+        let base = fleet::orchestrator::fleet_base_sha(&root, &o.fleet_id);
+        let head = o.output.as_ref().and_then(|x| x.branch_head.clone());
+        let new_commit = match (&base, &head) {
+            (Some(b), Some(h)) => fleet::orchestrator::commit_is_new(&root, b, h),
+            _ => None,
+        };
+        let verdict = fleet::orchestrator::judge_member_run(
+            o.output.as_ref().and_then(|x| x.exit_code),
+            head.as_deref(),
+            base.as_deref(),
+            new_commit,
+        );
+        let succeeded = verdict.is_ok();
+        // A run that exited 0 without a commit is failed WITH the reason, not silently done.
+        let error = o.error.clone().or_else(|| verdict.err());
         let payload = serde_json::json!({
             "task_id": o.task_id,
             "agent": o.agent,
@@ -277,7 +306,8 @@ impl FleetLedgerActivities {
             "signal": o.output.as_ref().and_then(|x| x.signal),
             "branch_head": o.output.as_ref().and_then(|x| x.branch_head.clone()),
             "adopted": o.output.as_ref().is_some_and(|x| x.adopted),
-            "error": o.error,
+            "base_sha": base,
+            "error": error,
         });
         if succeeded {
             fleet::orchestrator::record_task_completed(&root, &o.fleet_id, &o.task_id, &o.agent, payload);

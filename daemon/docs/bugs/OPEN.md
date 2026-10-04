@@ -20,9 +20,10 @@ file is the thing you read to answer "what do we know is broken right now."
 ## Open
 
 ### D-036 - The sight gate does not count `sed` windows chained in one shell command
-**Found:** 2026-10-03 (legacy-fixes review round 2) · **Severity:** MEDIUM (a real review is discarded and re-paid) · **NOT FIXED**
+**Found:** 2026-10-03 (legacy-fixes review round 2) · **Severity:** MEDIUM (a real review is discarded and re-paid) · **FIXED 2026-10-04**
 **Evidence:** Codex read all four sources as `/bin/zsh -lc "sed -n '1,180p' F; sed -n '181,360p' F; ..."` and the gate rejected the turn: "named by [Bash ok no read the parser recognises ...], none counted as a successful whole read". The turn's review was thrown away. Workaround that worked: tell Codex one `sed -n` per tool call.
 **CHECK to close:** a single shell call of `sed -n` windows joined by `;` or `&&` that covers lines 1 to N satisfies the source; a chain that includes a non-read command is still judged per segment.
+**Fixed:** `read_segments` (`agent-adapter/src/codex.rs`) splits a `;` chain only when every link is a ranged read (`sed -n` window or `READER F | sed -n` window) of ONE operand; a missing file then fails the last link too, so the chain cannot mask a failed read. Any other `;` chain is judged whole, as before. CHECK passes: `sight_36_semicolon_windows_of_one_file_are_a_whole_read` drives the real classifier (`shell_read_kind`), not the hard-coded ReadFile helper that hid the bug; negatives (second file, `; true`, a gap) still fail; mutation-checked.
 
 ### D-032 - The sight gate credits the read a reviewer ASKED for, not the one it received
 **Found:** 2026-09-24 (D-028 panel, Codex) · **Severity:** LOW today, structural · **NOT FIXED**

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 async-trait = "0.1"
 shared-types = { path = "../shared-types" }
 mcp-bridge = { path = "../mcp-bridge" }

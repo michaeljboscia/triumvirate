@@ -198,7 +198,7 @@ pub fn recover_stale_fleets(project_root: &Path, opts: RecoveryOptions) -> anyho
                 session_id: fleet_id.clone(),
                 event_type: "fleet_recovery".to_string(),
                 sequence: (idx + 1) as i64,
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                timestamp: crate::event_timestamp(),
                 payload_json: serde_json::json!({
                     "fleet_id": fleet_id,
                     "reason": RECOVERY_REASON
@@ -249,6 +249,30 @@ pub fn recover_fleets_at_startup(index: &Path, grace: Duration) -> StartupRecove
     summary
 }
 
+/// Whether a worktree directory belongs to `fleet_id`. Names are exactly
+/// `{fleet}-{task_id}-{agent}`, with `task_id` either `{fleet}-T-NNN` (current) or `T-NNN`
+/// (ledgers written before task ids were made unique), NNN digits, and `agent` one token with no
+/// dash. A bare `{fleet}-` prefix also matched any fleet whose id merely starts with this one
+/// (review finding, 2026-10-03), and a loose `T-` check still matched `fleet-1-T-backup` or a
+/// fleet named `fleet-1-T-9` (Codex and Grok, review of PR 57), so the whole shape is checked.
+fn is_fleet_worktree(name: &str, fleet_id: &str) -> bool {
+    let Some(rest) = name.strip_prefix(fleet_id).and_then(|r| r.strip_prefix('-')) else {
+        return false;
+    };
+    // Current form first: `{fleet}-T-NNN-{agent}` after the leading `{fleet}-`.
+    let rest = rest.strip_prefix(fleet_id).and_then(|r| r.strip_prefix('-')).unwrap_or(rest);
+    let Some(rest) = rest.strip_prefix("T-") else {
+        return false;
+    };
+    let Some((num, agent)) = rest.split_once('-') else {
+        return false;
+    };
+    !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+        && !agent.is_empty()
+        && agent.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// The explicit operator path, unchanged in what it promises: recover every stale fleet whose
 /// owner is gone (ownerless ones included) and DELETE their worktree directories. Startup never
 /// calls this; deleting a worktree can destroy uncommitted work. Blocking.
@@ -269,7 +293,7 @@ pub fn recover_crashed_fleets(project_root: PathBuf) -> anyhow::Result<RecoveryR
                     .and_then(|s| s.to_str())
                     .unwrap_or_default()
                     .to_string();
-                if name.starts_with(&format!("{fleet_id}-")) && path.is_dir() {
+                if is_fleet_worktree(&name, fleet_id) && path.is_dir() {
                     fs::remove_dir_all(&path)?;
                     cleaned_worktrees += 1;
                 }
@@ -634,4 +658,23 @@ mod tests {
         assert!(alive(worker), "a Temporal fleet's worker is never signalled by legacy recovery");
         assert_eq!(fleet_row(&root, "fleet-tmp").0, "running");
     }
+
+    /// RED IF: recovery of one fleet deletes a worktree that belongs to another fleet whose id
+    /// starts with this one's, or misses either naming form of its own.
+    #[test]
+    fn only_this_fleets_worktrees_match() {
+        use super::is_fleet_worktree;
+        assert!(is_fleet_worktree("fleet-1-fleet-1-T-001-codex", "fleet-1"));
+        assert!(is_fleet_worktree("fleet-1-T-001-codex", "fleet-1"));
+        assert!(!is_fleet_worktree("fleet-1-b-fleet-1-b-T-001-codex", "fleet-1"));
+        assert!(!is_fleet_worktree("fleet-1-b-T-001-codex", "fleet-1"));
+        assert!(!is_fleet_worktree("fleet-10-fleet-10-T-001-codex", "fleet-1"));
+        assert!(!is_fleet_worktree("fleet-1", "fleet-1"));
+        // Review of PR 57: same-prefix names that are not a member worktree.
+        assert!(!is_fleet_worktree("fleet-1-T-backup", "fleet-1"));
+        assert!(!is_fleet_worktree("fleet-1-fleet-1-T-archive", "fleet-1"));
+        assert!(!is_fleet_worktree("fleet-1-T-9-fleet-1-T-9-T-001-codex", "fleet-1"));
+        assert!(!is_fleet_worktree("fleet-1-T-001-codex-old", "fleet-1"));
+    }
+
 }

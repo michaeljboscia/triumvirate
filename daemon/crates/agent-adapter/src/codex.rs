@@ -117,6 +117,9 @@ pub fn whole_file_read_operand(command: &str) -> Option<String> {
     whole_file_reader_with_one_operand(cmd).map(|(op, _)| op)
 }
 
+/// The `--json` item type codex emits for subagent (multi-agent) tool calls.
+pub const COLLAB_TOOL: &str = "collab_tool_call";
+
 /// The segments of an `&&` chain, quotes honored. A command with no `&&` is one segment.
 ///
 /// D-017: codex read a 97-line brief with `wc -l F && sed -n '1,240p' F`, which reads every
@@ -133,6 +136,12 @@ pub fn whole_file_read_operand(command: &str) -> Option<String> {
 /// unchanged parser, which still refuses a redirect, a comment, a subshell, a backtick, a
 /// single `&`, and a second operand, so no D-010 shape survives the split.
 pub fn and_chain_segments(command: &str) -> Vec<&str> {
+    split_unquoted(command, b"&&")
+}
+
+/// The segments of `command` separated by `sep` outside quotes. An unterminated quote returns
+/// the whole command as one segment: a command we do not understand is not split.
+fn split_unquoted<'a>(command: &'a str, sep: &[u8]) -> Vec<&'a str> {
     let bytes = command.as_bytes();
     let (mut out, mut start, mut i) = (Vec::new(), 0usize, 0usize);
     let mut quote: Option<u8> = None;
@@ -147,9 +156,9 @@ pub fn and_chain_segments(command: &str) -> Vec<&str> {
             None => {
                 if b == b'\'' || b == b'"' {
                     quote = Some(b);
-                } else if b == b'&' && bytes.get(i + 1) == Some(&b'&') {
+                } else if bytes[i..].starts_with(sep) {
                     out.push(command[start..i].trim());
-                    i += 2;
+                    i += sep.len();
                     start = i;
                     continue;
                 }
@@ -166,6 +175,32 @@ pub fn and_chain_segments(command: &str) -> Vec<&str> {
     out
 }
 
+/// The segments the read parsers judge: the `&&` chain, or (D-036) a `;` chain of WINDOWS ON ONE
+/// FILE.
+///
+/// Codex read four sources as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the gate threw
+/// the review away. `;` stays refused in general, because it masks a failed link (`cat missing ;
+/// true` exits zero having read nothing). This shape cannot mask one: every link is a `sed -n`
+/// range or `READER F | sed -n` range on the SAME operand, so a missing file fails the last link
+/// too and the call is not a success, and a range read of a file that exists cannot fail. The
+/// gate then checks the union of windows against the real file on disk, as for any ranged read.
+/// Anything else in a `;` chain (a second file, any other command, an `&&` inside a link) and the
+/// whole command is judged exactly as before.
+fn read_segments(command: &str) -> Vec<&str> {
+    let cmd = unwrap_shell_wrapper(command.trim());
+    let links = split_unquoted(cmd, b";");
+    if links.len() > 1 {
+        let reads: Option<Vec<RangedRead>> =
+            links.iter().map(|l| if l.contains("&&") { None } else { command_read_range(l) }).collect();
+        if let Some(reads) = reads
+            && reads.windows(2).all(|w| w[0].operand == w[1].operand)
+        {
+            return links;
+        }
+    }
+    and_chain_segments(cmd)
+}
+
 /// Every whole-file read in a command, one per `&&` segment.
 pub fn whole_file_read_operands(command: &str) -> Vec<String> {
     and_chain_segments(unwrap_shell_wrapper(command.trim()))
@@ -177,7 +212,7 @@ pub fn whole_file_read_operands(command: &str) -> Vec<String> {
 /// Every ranged read in a command, one per `&&` segment. A chain that walks a file in windows
 /// (`sed -n '1,200p' F && sed -n '201,400p' F`) yields both, so the gate can union them.
 pub fn command_read_ranges(command: &str) -> Vec<RangedRead> {
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .filter_map(command_read_range)
         .collect()
@@ -457,7 +492,7 @@ pub(crate) fn command_reads_file_contents(command: &str) -> bool {
     // chained read stayed `ToolKind::Bash`, and the gate's coverage check filters on
     // `ToolKind::ReadFile` before any of the other parsers are consulted. Fixing the two
     // downstream parsers changed nothing while this one classified the call out of the set.
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .any(segment_reads_file_contents)
 }
@@ -738,6 +773,22 @@ impl CodexExecParser {
                 Some(event)
             }
             _ => {
+                // A subagent's reads happen in another thread and never reach this stream, so a
+                // review that delegated is a review this process cannot verify. Record the call
+                // (never as a read) so the sight gate can say "delegated" instead of "never
+                // opened". Verified on codex-cli 0.154.0: `--disable multi_agent` and
+                // `agents.max_depth=0` do NOT stop `spawn_agent`, and the spawn itself is not in
+                // the --json stream; only the later `collab_tool_call` wait is.
+                if started && item_type == COLLAB_TOOL {
+                    self.tool_calls.push(ToolCallRecord {
+                        id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
+                        tool: COLLAB_TOOL.to_string(),
+                        kind: ToolKind::Unknown,
+                        success: None,
+                        duration_ms: None,
+                        args_json: Some(item.to_string()),
+                    });
+                }
                 let state = if started {
                     WorkingState::ToolCallStarted
                 } else {
@@ -1076,7 +1127,7 @@ mod command_classification_tests {
 
 #[cfg(test)]
 mod whole_file_read_operand_tests {
-    use super::{shell_read_kind, whole_file_read_operand};
+    use super::{command_read_ranges, command_reads_file_contents, shell_read_kind, whole_file_read_operand};
     use crate::ToolKind;
     use serde_json::json;
 
@@ -1121,4 +1172,25 @@ mod whole_file_read_operand_tests {
         assert_eq!(shell_read_kind(ToolKind::Grep, Some(&json!({"command": "cat a"}))), ToolKind::Grep);
         assert_eq!(shell_read_kind(ToolKind::Bash, None), ToolKind::Bash);
     }
+
+    /// D-036 at the parser: a `;` chain is split only when every link is a window on one file.
+    #[test]
+    fn semicolon_chains_split_only_for_windows_on_one_file() {
+        let ok = "/bin/zsh -lc \"sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/a.rs\"";
+        assert!(command_reads_file_contents(ok));
+        assert_eq!(command_read_ranges(ok).len(), 2);
+        for bad in [
+            "sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/b.rs",
+            "sed -n '1,180p' /r/a.rs; rm -rf /r",
+            "cat /r/a.rs; true",
+            "sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/a.rs && ls",
+            "sed -n '1,180p' /r/a.rs; sed -n '1,2p;w /tmp/x' /r/a.rs",
+        ] {
+            assert!(command_read_ranges(bad).is_empty(), "no windows from: {bad}");
+            assert!(!command_reads_file_contents(bad), "not a read: {bad}");
+        }
+        // A `;` inside a quoted sed script is not a separator.
+        assert!(command_read_ranges("sed -n '1,2p;3p' /r/a.rs").is_empty());
+    }
+
 }

@@ -171,6 +171,11 @@ impl FleetActivities {
             }
             Err(b) => return Err(non_retryable(b)),
         };
+        // Output growth is the progress signal (design section 4a). On adoption the clock starts
+        // now: the silence before this attempt is unknown, not evidence.
+        let stall = worker::stall_window(&input.agent);
+        let mut last_bytes = worker::output_bytes(&root, &input);
+        let mut last_growth = std::time::Instant::now();
         loop {
             if let Some(done) = worker::finished(&root, &input, &token) {
                 if let Some(c) = child.as_mut() {
@@ -196,15 +201,9 @@ impl FleetActivities {
             }
             tokio::select! {
                 _ = ctx.cancelled() => {
-                    let t = token.clone();
-                    let grace = fleet::orchestrator::fleet_kill_grace();
-                    let stopped = tokio::task::spawn_blocking(move || t.terminate(grace)).await;
+                    let stopped = stop_worker(&token, child.as_mut()).await;
                     match stopped {
                         Ok(Ok(outcome)) => {
-                            // Reap our own child, bounded: it is stopped, so this returns at once.
-                            if let Some(c) = child.as_mut() {
-                                let _ = tokio::time::timeout(Duration::from_secs(5), c.wait()).await;
-                            }
                             tracing::warn!(fleet_id = %input.fleet_id, task_id = %input.task_id, ?outcome, "run_worker: cancelled; worker group stopped");
                             return Err(ActivityError::cancelled());
                         }
@@ -220,6 +219,36 @@ impl FleetActivities {
                     }
                 }
                 _ = tokio::time::sleep(worker::POLL) => {
+                    let bytes = worker::output_bytes(&root, &input);
+                    if bytes != last_bytes {
+                        last_bytes = bytes;
+                        last_growth = std::time::Instant::now();
+                    }
+                    if let Some(window) = stall
+                        && last_growth.elapsed() > window
+                        // The record may have landed during the sleep: a finished run is not a stall.
+                        && worker::finished(&root, &input, &token).is_none()
+                    {
+                        let silent = last_growth.elapsed().as_secs();
+                        let stopped = stop_worker(&token, child.as_mut()).await;
+                        // The agent may have finished between the check above and the stop (Codex,
+                        // review of PR 57). A done record with no signal is the agent's own exit,
+                        // not our stop: that run completed and is judged like any other.
+                        if let Some(done) = worker::finished(&root, &input, &token)
+                            && done.signal.is_none()
+                        {
+                            tracing::info!(task_id = %input.task_id, "run_worker: finished as the stall stop began; recording its own exit");
+                            return Ok(worker::output(&input, done, adopted));
+                        }
+                        tracing::warn!(fleet_id = %input.fleet_id, task_id = %input.task_id, agent = %input.agent, silent, ?stopped, "run_worker: stalled; worker group stopped");
+                        // Non-retryable: a retry would rerun the same task from scratch, and the
+                        // caller decides what a stall means (design 4a).
+                        return Err(non_retryable(Blocked(match stopped {
+                            Ok(Ok(_)) => format!("stalled after {silent} s without output growth (window {} s); worker stopped", window.as_secs()),
+                            Ok(Err(e)) => format!("stalled after {silent} s without output growth, and the worker could not be stopped: {e}"),
+                            Err(e) => format!("stalled after {silent} s without output growth, and the stop task failed: {e}"),
+                        })));
+                    }
                     if let Err(e) = ctx.record_heartbeat(input.task_id.clone()).await {
                         tracing::warn!(task_id = %input.task_id, error = %e, "run_worker: heartbeat failed");
                     }
@@ -227,6 +256,28 @@ impl FleetActivities {
             }
         }
     }
+}
+
+/// Stop a worker's process group, reaping our own shim child WHILE it stops.
+///
+/// Reaping only afterwards left the shim a zombie for the whole wait: on macOS a group whose only
+/// member is an unreaped zombie answers kill(-pgid, 0) with EPERM, which `group_exists` reads as
+/// alive, so terminate waited out the grace, escalated, got EPERM again and reported a stopped
+/// worker as unstoppable (found by the stall exit check, 2026-10-04).
+async fn stop_worker(
+    token: &fleet::worker_token::WorkerToken,
+    child: Option<&mut tokio::process::Child>,
+) -> Result<Result<fleet::worker_token::TerminateOutcome, String>, tokio::task::JoinError> {
+    let t = token.clone();
+    let grace = fleet::orchestrator::fleet_kill_grace();
+    let term = tokio::task::spawn_blocking(move || t.terminate(grace));
+    let reap = async {
+        if let Some(c) = child {
+            let _ = tokio::time::timeout(grace + Duration::from_secs(10), c.wait()).await;
+        }
+    };
+    let (stopped, ()) = tokio::join!(term, reap);
+    stopped
 }
 
 fn worker_options(cfg: &WorkerConfig) -> anyhow::Result<WorkerOptions> {

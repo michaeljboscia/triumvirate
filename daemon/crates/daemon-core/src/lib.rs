@@ -326,8 +326,15 @@ pub fn launchd_plist_path() -> anyhow::Result<PathBuf> {
         .join("Library/LaunchAgents/com.triumvirate.daemon-v2.plist"))
 }
 
+/// The launchd plist for the daemon, identical to what `scripts/install-launch-agent.sh` writes.
+///
+/// It runs the start-daemon launcher (installed beside the binary by `scripts/install.sh`), which
+/// loads the daemon's env from ~/.claude.json, the same block the MCP servers get. The old plist
+/// ran `triumvirate daemon` with only TRIUMVIRATE_HOME set: no agy backend, no agent PATH, no
+/// PostHog. Worse, it wrote to the same path as the working plist, so `triumvirate install`
+/// silently replaced a good daemon setup with a broken one.
 #[instrument(skip_all)]
-pub fn render_launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
+pub fn render_launch_agent_plist(launcher_path: &str, home_dir: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -337,22 +344,20 @@ pub fn render_launch_agent_plist(exe_path: &str, home_dir: &str) -> String {
   <string>com.triumvirate.daemon-v2</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{exe_path}</string>
-    <string>daemon</string>
+    <string>/bin/bash</string>
+    <string>{launcher_path}</string>
+    <string>--foreground</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>TRIUMVIRATE_HOME</key>
-    <string>{home_dir}</string>
-  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>{home_dir}/daemon.log</string>
+  <string>{home_dir}/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>{home_dir}/daemon.err.log</string>
+  <string>{home_dir}/launchd.err.log</string>
 </dict>
 </plist>
 "#
@@ -915,9 +920,12 @@ mod tests {
 
     #[test]
     fn launch_plist_render_has_expected_label() {
-        let plist = super::render_launch_agent_plist("/usr/local/bin/triumvirate", "/tmp/tri");
+        let plist = super::render_launch_agent_plist("/u/.local/bin/triumvirate-start-daemon", "/tmp/tri");
         assert!(plist.contains("com.triumvirate.daemon-v2"));
-        assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains("<string>/u/.local/bin/triumvirate-start-daemon</string>"));
+        assert!(plist.contains("<string>--foreground</string>"));
+        // RED IF the plist runs the bare binary again (it starts with none of the MCP env).
+        assert!(!plist.contains("<string>daemon</string>"));
     }
 
     #[test]
