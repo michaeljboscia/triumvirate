@@ -1532,8 +1532,12 @@ name = "fleet-temporal"
 version = "3.9.0"
 dependencies = [
  "anyhow",
+ "fleet",
  "futures",
+ "libc",
  "serde",
+ "serde_json",
+ "tempfile",
  "temporalio-client",
  "temporalio-common",
  "temporalio-macros",

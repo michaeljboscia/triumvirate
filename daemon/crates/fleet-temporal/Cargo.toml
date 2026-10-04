@@ -17,7 +17,13 @@ temporalio-macros = "=1.0.0"
 temporalio-workflow = "=1.0.0"
 futures = "0.3"
 serde.workspace = true
-tokio = { version = "1", features = ["rt", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "time", "macros", "process"] }
 anyhow.workspace = true
 tracing.workspace = true
 url = "2"
+fleet = { path = "../fleet" }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true

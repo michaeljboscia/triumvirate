@@ -9,6 +9,8 @@
 //! not stated in the docs), so the worker cannot go on the daemon's multi-thread runtime via
 //! `tokio::spawn`. It gets its own OS thread with a current-thread runtime.
 
+pub mod worker;
+
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use temporalio_client::{
@@ -16,9 +18,14 @@ use temporalio_client::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
+    ActivityOptions, ApplicationFailure, Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
+use worker::{Blocked, RunWorkerInput, RunWorkerOutput, Start};
+
+fn non_retryable(b: Blocked) -> ActivityError {
+    ActivityError::Application(Box::new(ApplicationFailure::non_retryable(b.0)))
+}
 
 /// Whether the daemon runs the Temporal fleet engine. Default: legacy.
 pub fn engine_enabled() -> bool {
@@ -101,6 +108,39 @@ impl PingWorkflow {
     }
 }
 
+/// Runs one fleet member through `run_worker` and returns its result. The vehicle for the
+/// stage B checks (completion, cancel, adoption after a daemon kill) and a building block of
+/// FleetWorkflow.
+#[workflow]
+#[derive(Default)]
+pub struct RunWorkerProbeWorkflow;
+
+#[workflow_methods]
+impl RunWorkerProbeWorkflow {
+    #[run(name = "triumvirate-run-worker-probe")]
+    pub async fn run(ctx: &mut WorkflowContext<Self>, input: RunWorkerInput) -> WorkflowResult<RunWorkerOutput> {
+        let out = ctx
+            .execute_activity(FleetActivities::run_worker, input, run_worker_options())
+            .await?;
+        Ok(out)
+    }
+}
+
+/// `maximumAttempts: 2` with every agent error non-retryable (skill rule 4): the second attempt
+/// fires only when the first was lost (a dead daemon), and that attempt adopts rather than reruns.
+/// The heartbeat timeout is how a dead daemon is noticed, and how cancellation reaches the activity.
+pub fn run_worker_options() -> ActivityOptions {
+    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(4 * 3600))
+        .heartbeat_timeout(Duration::from_secs(20))
+        .retry_policy(
+            temporalio_common::RetryPolicy::builder()
+                .initial_interval(Duration::from_secs(1))
+                .maximum_attempts(2)
+                .build(),
+        )
+        .build()
+}
+
 pub struct FleetActivities;
 
 #[activities]
@@ -109,11 +149,72 @@ impl FleetActivities {
     pub async fn pong(_ctx: ActivityContext, nonce: String) -> Result<String, ActivityError> {
         Ok(format!("pong {nonce} from triumvirate daemon pid {}", std::process::id()))
     }
+
+    /// One fleet member's agent run. See `worker` for the fresh, adopt and finished paths.
+    #[activity(name = "triumvirate-run-worker")]
+    pub async fn run_worker(ctx: ActivityContext, input: RunWorkerInput) -> Result<RunWorkerOutput, ActivityError> {
+        let root = PathBuf::from(&input.project_root);
+        let (mut child, token, adopted) = match worker::decide(&root, &input.fleet_id, &input.task_id) {
+            Ok(Start::Finished(done)) => {
+                tracing::info!(fleet_id = %input.fleet_id, task_id = %input.task_id, "run_worker: already finished; returning its record");
+                return Ok(worker::output(&input, done, true));
+            }
+            Ok(Start::Adopt(t)) => {
+                tracing::warn!(fleet_id = %input.fleet_id, task_id = %input.task_id, pid = t.pid, "run_worker: adopting a running worker");
+                (None, t, true)
+            }
+            Ok(Start::Fresh) => {
+                let (c, t) = worker::launch(&input).await.map_err(non_retryable)?;
+                (Some(c), t, false)
+            }
+            Err(b) => return Err(non_retryable(b)),
+        };
+        loop {
+            if let Some(done) = worker::finished(&root, &input, &token) {
+                if let Some(c) = child.as_mut() {
+                    let _ = c.wait().await;
+                }
+                return Ok(worker::output(&input, done, adopted));
+            }
+            let ended = match child.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                None => token.verify() != fleet::worker_token::Verification::Live,
+            };
+            if ended {
+                if let Some(done) = worker::finished(&root, &input, &token) {
+                    return Ok(worker::output(&input, done, adopted));
+                }
+                // Killed from outside without a record. Retryable: the next attempt finds the
+                // token Gone and starts fresh, which is safe because nothing of ours runs.
+                return Err(ApplicationFailure::new(format!(
+                    "worker for {} ended without a completion record (killed?)",
+                    input.task_id
+                ))
+                .into());
+            }
+            tokio::select! {
+                _ = ctx.cancelled() => {
+                    let t = token.clone();
+                    let grace = fleet::orchestrator::fleet_kill_grace();
+                    let stopped = tokio::task::spawn_blocking(move || t.terminate(grace)).await;
+                    if let Some(c) = child.as_mut() {
+                        let _ = c.wait().await;
+                    }
+                    tracing::warn!(fleet_id = %input.fleet_id, task_id = %input.task_id, result = ?stopped, "run_worker: cancelled; worker group stopped");
+                    return Err(ActivityError::cancelled());
+                }
+                _ = tokio::time::sleep(worker::POLL) => {
+                    let _ = ctx.record_heartbeat(input.task_id.clone()).await;
+                }
+            }
+        }
+    }
 }
 
 fn worker_options(cfg: &WorkerConfig) -> anyhow::Result<WorkerOptions> {
     Ok(WorkerOptions::new(cfg.task_queue.clone())
         .register_workflow::<PingWorkflow>()?
+        .register_workflow::<RunWorkerProbeWorkflow>()?
         .register_activities(FleetActivities)
         .build())
 }
@@ -210,7 +311,8 @@ mod tests {
             cert_dir: PathBuf::from("/nonexistent/triumvirate-worker"),
             tls_domain: "temporal".to_string(),
         };
-        let err = connect(&cfg).await.err().expect("must fail").to_string();
+        let Err(err) = connect(&cfg).await else { panic!("connect must fail without certs") };
+        let err = err.to_string();
         assert!(err.contains("/nonexistent/triumvirate-worker/ca.cert"), "{err}");
     }
 }
