@@ -54,7 +54,7 @@ fn identity(pid: u32) -> ProcessIdentity {
 
 /// A true orphan in its own process group, running in `cwd`.
 fn orphan(script: &str, cwd: &Path) -> u32 {
-    let out = Command::new("sh")
+    let out = Command::new("bash")
         .arg("-c")
         .arg(format!("set -m; sh -c '{script}' >/dev/null 2>&1 </dev/null & echo $!"))
         .current_dir(cwd)

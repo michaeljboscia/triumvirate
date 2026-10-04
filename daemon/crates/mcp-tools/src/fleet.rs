@@ -438,7 +438,7 @@ mod restart_index_tests {
 
     /// A true orphan in its own process group (reparented to launchd), started in `cwd`.
     fn orphan(script: &str, cwd: &Path) -> u32 {
-        let out = std::process::Command::new("sh")
+        let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(format!("set -m; sh -c '{script}' >/dev/null 2>&1 </dev/null & echo $!"))
             .current_dir(cwd)

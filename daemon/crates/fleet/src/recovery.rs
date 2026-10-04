@@ -500,7 +500,7 @@ mod tests {
         let stranger = orphan("sleep 60", &wts[0]);
         let _reap = Reap(vec![stranger]);
         let mut t = token_for(stranger, &root, "fleet-reuse", "fleet-reuse-T-001", owner);
-        t.start_time_us -= 1_000_000;
+        t.start_time_us += 1_000_000;
         worker_token::write_token(&root, &t).expect("rewrite");
 
         let report = recover_stale_fleets(&root, OPTS).expect("recover");
