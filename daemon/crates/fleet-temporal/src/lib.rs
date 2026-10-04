@@ -45,12 +45,26 @@ pub struct WorkerConfig {
     pub tls_domain: String,
 }
 
+/// homebox's LAN address first, then its tailnet address (the `temporal-tailnet` relay). At home
+/// the LAN answers; away, or while macOS Local Network privacy has not approved this binary for
+/// the LAN (it blocks a launchd process with "No route to host"), the tailnet does.
+pub const DEFAULT_ADDRESSES: &str = "https://192.168.2.110:7233,https://100.73.45.3:7233";
+
+/// How long one address may take to connect before the next is tried. Away from home the LAN
+/// address does not answer at all, so without a bound the fallback would wait out a TCP timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl WorkerConfig {
+    /// `address` as an ordered list: comma-separated, tried first to last.
+    pub fn addresses(&self) -> Vec<&str> {
+        self.address.split(',').map(str::trim).filter(|a| !a.is_empty()).collect()
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let var = |k: &str, d: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| d.to_string());
         let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME is not set"))?;
         Ok(Self {
-            address: var("TRIUMVIRATE_TEMPORAL_ADDRESS", "https://192.168.2.110:7233"),
+            address: var("TRIUMVIRATE_TEMPORAL_ADDRESS", DEFAULT_ADDRESSES),
             namespace: var("TRIUMVIRATE_TEMPORAL_NAMESPACE", "triumvirate"),
             task_queue: var("TRIUMVIRATE_TEMPORAL_TASK_QUEUE", "triumvirate-fleet"),
             cert_dir: PathBuf::from(var(
@@ -80,12 +94,22 @@ pub async fn connect(cfg: &WorkerConfig) -> anyhow::Result<Client> {
         )
         .build();
     let host = std::env::var("HOST").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "mac".to_string());
-    let conn = ConnectionOptions::new(url::Url::from_str(&cfg.address)?)
-        .identity(format!("triumvirate-daemon-{}@{host}", std::process::id()))
-        .tls_options(tls)
-        .build();
-    let connection = Connection::connect(conn).await?;
-    Ok(Client::new(connection, ClientOptions::new(cfg.namespace.clone()).build())?)
+    let mut errors = Vec::new();
+    for address in cfg.addresses() {
+        let conn = ConnectionOptions::new(url::Url::from_str(address)?)
+            .identity(format!("triumvirate-daemon-{}@{host}", std::process::id()))
+            .tls_options(tls.clone())
+            .build();
+        match tokio::time::timeout(CONNECT_TIMEOUT, Connection::connect(conn)).await {
+            Ok(Ok(connection)) => {
+                tracing::info!(address, "temporal: connected");
+                return Ok(Client::new(connection, ClientOptions::new(cfg.namespace.clone()).build())?);
+            }
+            Ok(Err(e)) => errors.push(format!("{address}: {e}")),
+            Err(_) => errors.push(format!("{address}: no answer in {} s", CONNECT_TIMEOUT.as_secs())),
+        }
+    }
+    anyhow::bail!("no Temporal address answered: {}", errors.join("; "))
 }
 
 /// Liveness probe: a client starts it on `triumvirate-fleet` and gets back the worker's identity.
@@ -298,7 +322,7 @@ async fn run_worker_once(cfg: &WorkerConfig) -> anyhow::Result<()> {
     tracing::info!(
         namespace = %cfg.namespace,
         task_queue = %cfg.task_queue,
-        address = %cfg.address,
+        addresses = %cfg.address,
         "temporal fleet worker polling"
     );
     worker.run().await?;
@@ -394,7 +418,7 @@ mod tests {
         // RED IF: the engine turns on by default. Installing the binary must change nothing.
         assert!(!engine_enabled());
         let d = WorkerConfig::from_env().expect("defaults");
-        assert_eq!(d.address, "https://192.168.2.110:7233");
+        assert_eq!(d.address, DEFAULT_ADDRESSES);
         assert_eq!(d.namespace, "triumvirate");
         assert_eq!(d.task_queue, "triumvirate-fleet");
         assert!(d.cert_dir.ends_with(".temporal/triumvirate-worker"));
@@ -428,3 +452,24 @@ mod tests {
         assert!(err.contains("/nonexistent/triumvirate-worker/ca.cert"), "{err}");
     }
 }
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    /// RED IF the LAN stops being tried first, or the tailnet fallback drops out of the default.
+    #[test]
+    fn the_default_tries_the_lan_then_the_tailnet() {
+        let cfg = WorkerConfig {
+            address: DEFAULT_ADDRESSES.to_string(),
+            namespace: String::new(),
+            task_queue: String::new(),
+            cert_dir: PathBuf::new(),
+            tls_domain: String::new(),
+        };
+        assert_eq!(cfg.addresses(), vec!["https://192.168.2.110:7233", "https://100.73.45.3:7233"]);
+        let one = WorkerConfig { address: " https://h:1 , ,https://g:2".to_string(), ..cfg };
+        assert_eq!(one.addresses(), vec!["https://h:1", "https://g:2"]);
+    }
+}
+
