@@ -2972,6 +2972,7 @@ dependencies = [
  "daemon-http",
  "fallback-outbox",
  "fleet",
+ "fleet-temporal",
  "ledger",
  "mcp-bridge",
  "peer-review",

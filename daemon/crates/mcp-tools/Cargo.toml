@@ -12,6 +12,7 @@ daemon-core = { path = "../daemon-core" }
 daemon-http = { path = "../daemon-http" }
 fallback-outbox = { path = "../fallback-outbox" }
 fleet = { path = "../fleet" }
+fleet-temporal = { path = "../fleet-temporal" }
 ledger = { path = "../ledger" }
 mcp-bridge = { path = "../mcp-bridge" }
 peer-review = { path = "../peer-review" }

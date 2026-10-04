@@ -319,3 +319,38 @@ mod tests {
         assert!(err.contains("/nonexistent/triumvirate-worker/ca.cert"), "{err}");
     }
 }
+
+/// Start a fleet on the Temporal engine (the MCP `fleet_spawn` path when the flag is on). The
+/// caller has already generated the fleet ID, recorded the restart index and marked the fleet
+/// Temporal-owned. With `wait`, returns the final ledger state; otherwise "spawning".
+pub async fn start_fleet(
+    cfg: &WorkerConfig,
+    input: fleet_workflow::FleetInput,
+    wait: bool,
+) -> anyhow::Result<String> {
+    use temporalio_client::{WorkflowGetResultOptions, WorkflowStartOptions};
+    let client = connect(cfg).await?;
+    let handle = client
+        .start_workflow(
+            fleet_workflow::FleetWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(cfg.task_queue.clone(), input.fleet_id.clone()).build(),
+        )
+        .await?;
+    if !wait {
+        return Ok("spawning".to_string());
+    }
+    let result = handle.get_result(WorkflowGetResultOptions::default()).await?;
+    Ok(result.ledger_state)
+}
+
+/// Cancel a Temporal-engine fleet. Its workflow's cleanup stops the verified workers and marks the
+/// ledger cancelled; this call only requests it.
+pub async fn cancel_fleet(cfg: &WorkerConfig, fleet_id: &str) -> anyhow::Result<()> {
+    let client = connect(cfg).await?;
+    client
+        .get_workflow_handle::<fleet_workflow::FleetWorkflow>(fleet_id.to_string())
+        .cancel(Default::default())
+        .await?;
+    Ok(())
+}

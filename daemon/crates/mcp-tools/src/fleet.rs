@@ -61,6 +61,9 @@ where
         .task_description
         .unwrap_or_else(|| "Implement the assigned fleet task.".to_string());
 
+    if !dry_run && fleet_temporal::engine_enabled() {
+        return fleet_spawn_temporal(fleet_states, metrics, ws_events, project_root, agents, wait, task_description).await;
+    }
     let mut orchestrator = orchestrator_factory(project_root.clone())?;
     if !dry_run {
         // A real fleet must be findable after a restart, so the index write is part of the spawn
@@ -138,6 +141,80 @@ where
         fleet_id: result.fleet_id,
         plan: result.plan_text,
         head_sha: result.head_sha,
+        state,
+    })
+}
+
+/// `fleet_spawn` on the Temporal engine (TRIUMVIRATE_FLEET_ENGINE=temporal). The fleet ID is
+/// generated HERE, never inside workflow code (determinism). The restart index and the
+/// Temporal-ownership marker are written BEFORE the workflow starts, so the fleet is findable and
+/// legacy recovery leaves it alone from its first instant. A dirty repo is refused up front, as
+/// the legacy spawn does, instead of failing later inside the workflow.
+async fn fleet_spawn_temporal(
+    fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
+    metrics: &DaemonMetrics,
+    ws_events: Option<&broadcast::Sender<String>>,
+    project_root: PathBuf,
+    agents: Vec<String>,
+    wait: bool,
+    task_description: String,
+) -> Result<FleetSpawnResponse, String> {
+    let fail = |e: String| {
+        mcp_bridge::posthog::record_fleet_spawn("spawn_failed", false, agents.len(), Some(&project_root.display().to_string()));
+        format!("fleet_spawn failed: {e}")
+    };
+    if !project_root.is_absolute() {
+        return Err(fail("project_root must be absolute".to_string()));
+    }
+    let git = fleet::git_ops::RealGitOps::new(project_root.clone()).map_err(|e| fail(e.to_string()))?;
+    if !git.is_clean().await.map_err(|e| fail(e.to_string()))? {
+        return Err(fail("cannot create worktrees with uncommitted or dirty changes; commit or stash first".to_string()));
+    }
+    let head_sha = git.current_head().await.map_err(|e| fail(e.to_string()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| fail(e.to_string()))?
+        .as_nanos();
+    let fleet_id = format!("fleet-{nanos}");
+    let index = fleet_index_path().ok_or_else(|| fail("cannot resolve the triumvirate home for fleets.json".to_string()))?;
+    fleet::index::record_fleet_root_in(&index, &fleet_id, &project_root.display().to_string())
+        .map_err(|e| fail(format!("fleet restart index could not be written: {e}")))?;
+    fleet::worker_token::mark_temporal_engine(&project_root, &fleet_id)
+        .map_err(|e| fail(format!("engine marker could not be written: {e}")))?;
+    let cfg = fleet_temporal::WorkerConfig::from_env().map_err(|e| fail(e.to_string()))?;
+    let input = fleet_temporal::fleet_workflow::FleetInput {
+        fleet_id: fleet_id.clone(),
+        project_root: project_root.display().to_string(),
+        agents: agents.clone(),
+        task_description,
+    };
+    let state = fleet_temporal::start_fleet(&cfg, input, wait)
+        .await
+        .map_err(|e| fail(format!("Temporal start failed: {e}")))?;
+
+    let status = FleetStatusResponse {
+        fleet_id: fleet_id.clone(),
+        state: state.clone(),
+        worktree_paths: Vec::new(),
+        project_root: Some(project_root.display().to_string()),
+    };
+    let mut fleet_states = fleet_states.lock().await;
+    fleet_states.insert(fleet_id.clone(), status);
+    let active = fleet_states
+        .values()
+        .filter(|status| status.state == "running" || status.state == "spawning")
+        .count();
+    metrics.fleet_active_total.set(active as i64);
+    drop(fleet_states);
+    emit_fleet_progress(ws_events, &fleet_id, &state, active);
+    mcp_bridge::posthog::record_fleet_spawn(&state, false, agents.len(), Some(&project_root.display().to_string()));
+    Ok(FleetSpawnResponse {
+        plan: format!(
+            "fleet_id: {fleet_id}\nengine: temporal\nagent count: {}\nhead sha: {head_sha}\ndry_run: false",
+            agents.len()
+        ),
+        fleet_id,
+        head_sha,
         state,
     })
 }
@@ -301,6 +378,51 @@ async fn fleet_cancel_with(
         });
     };
     let already_finished = matches!(status.state.as_str(), "done" | "failed" | "cancelled");
+
+    // A Temporal-engine fleet is cancelled through its workflow: the workflow's own cleanup stops
+    // the verified workers and marks the ledger cancelled, whichever process owns the worker.
+    if fleet::worker_token::is_temporal_engine(&root, &req.fleet_id) {
+        if already_finished {
+            return Ok(FleetCancelResponse {
+                canceled: false,
+                signalled: 0,
+                detail: Some(format!("fleet already {}", status.state)),
+            });
+        }
+        let requested = match fleet_temporal::WorkerConfig::from_env() {
+            Ok(cfg) => fleet_temporal::cancel_fleet(&cfg, &req.fleet_id).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let mut fleet_states = fleet_states.lock().await;
+        if requested.is_ok() {
+            fleet_states.remove(&req.fleet_id);
+        }
+        let active = fleet_states
+            .values()
+            .filter(|status| status.state == "running" || status.state == "spawning")
+            .count();
+        metrics.fleet_active_total.set(active as i64);
+        drop(fleet_states);
+        return Ok(match requested {
+            Ok(()) => {
+                emit_fleet_progress(ws_events, &req.fleet_id, "cancelled", active);
+                mcp_bridge::posthog::record_fleet_spawn("cancelled", false, status.worktree_paths.len(), None);
+                FleetCancelResponse {
+                    canceled: true,
+                    signalled: 0,
+                    detail: Some(
+                        "cancel requested from Temporal; its workflow stops the workers and marks the ledger cancelled"
+                            .to_string(),
+                    ),
+                }
+            }
+            Err(e) => FleetCancelResponse {
+                canceled: false,
+                signalled: 0,
+                detail: Some(format!("Temporal cancel failed: {e}")),
+            },
+        });
+    }
 
     // Intent first, in memory AND in the ledger, so whichever process owns the workers sees the
     // cancel when they die and does not relaunch them as a degraded codex task.
