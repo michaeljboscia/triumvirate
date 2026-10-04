@@ -94,7 +94,22 @@ struct Abort {
 
 fn abort(e: ActivityExecutionError) -> Abort {
     let cancelled = matches!(e, ActivityExecutionError::Cancelled(_));
-    Abort { cancelled, reason: e.to_string(), error: (!cancelled).then_some(e) }
+    Abort { cancelled, reason: failure_text(&e), error: (!cancelled).then_some(e) }
+}
+
+/// The whole failure chain of an activity error, outermost first. `to_string()` gives only the
+/// top line, "Activity failed: Activity task failed", which is what the ledger recorded for every
+/// member failure (a stalled worker's "stalled after 10 s ..." never reached it).
+fn failure_text(e: &ActivityExecutionError) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut f = e.failure();
+    while let Some(x) = f {
+        if !x.message.is_empty() && !parts.contains(&x.message) {
+            parts.push(x.message.clone());
+        }
+        f = x.cause.as_deref();
+    }
+    if parts.is_empty() { e.to_string() } else { parts.join(": ") }
 }
 
 /// Options for steps that must run even after the workflow is cancelled: recording outcomes that
@@ -175,7 +190,7 @@ impl FleetWorkflow {
                     cancelled.get_or_insert(e);
                     continue;
                 }
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(failure_text(&e))),
             };
             let outcome = TaskOutcome {
                 project_root: input.project_root.clone(),
