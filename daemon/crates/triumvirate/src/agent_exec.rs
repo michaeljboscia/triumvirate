@@ -2795,6 +2795,25 @@ fn enforce_reviewer_sight(
         });
         return Err(detail);
     }
+    // A review that DELEGATED is rejected whatever else it did (Codex and Grok, review of PR 57).
+    // A subagent's reads and reasoning never reach this stream, so any part of the answer may come
+    // from work this gate cannot see, even when the parent also read every source. The review
+    // prompt says delegation will be rejected; this is what makes that true. Known residual: codex
+    // omits `spawn_agent` from --json, so a spawn that is never followed by a collab call is
+    // invisible here; the prompt note is the only control on that path.
+    if tool_calls.iter().any(|c| c.tool == agent_adapter::codex::COLLAB_TOOL) {
+        let detail = format!(
+            "{agent_display} was dispatched as a review and delegated part of it to a subagent \
+             (collab_tool_call). A subagent's reads are not in this stream, so they cannot back a \
+             review, and any of the answer may rest on them. Rejecting the turn. Re-dispatch; the \
+             review prompt already forbids delegation, so a repeat is the agent ignoring it."
+        );
+        lifecycle.push(LifecycleEvent {
+            state: "REJECTED".to_string(),
+            detail: detail.clone(),
+        });
+        return Err(detail);
+    }
     // The named-sources check. This is the difference between a fig leaf and a gate.
     //
     // `tool_calls > 0` alone passes on one `todo_write`, one `list_dir .`, one `pwd`, or a
@@ -2893,7 +2912,6 @@ fn enforce_reviewer_sight(
                 peeked.join(", "),
                 evidence.join(" | ")
             );
-            let detail = format!("{detail}{}", delegation_note(tool_calls));
             lifecycle.push(LifecycleEvent {
                 state: "REJECTED".to_string(),
                 detail: detail.clone(),
@@ -2925,7 +2943,6 @@ fn enforce_reviewer_sight(
                 missed.join(", "),
                 evidence.join(" | ")
             );
-            let detail = format!("{detail}{}", delegation_note(tool_calls));
             lifecycle.push(LifecycleEvent {
                 state: "REJECTED".to_string(),
                 detail: detail.clone(),
@@ -2936,8 +2953,7 @@ fn enforce_reviewer_sight(
     }
 
     // No named sources to check, so fall back to the weaker question: did it look at anything.
-    // Handing the work to a subagent is not looking.
-    if tool_calls.iter().any(|c| c.tool != agent_adapter::codex::COLLAB_TOOL) {
+    if !tool_calls.is_empty() {
         return Ok(());
     }
 
@@ -2949,24 +2965,11 @@ fn enforce_reviewer_sight(
          Re-dispatch naming the primary sources by absolute path, or drop require_sight if this \
          call was never meant to be a review."
     );
-    let detail = format!("{detail}{}", delegation_note(tool_calls));
     lifecycle.push(LifecycleEvent {
         state: "REJECTED".to_string(),
         detail: detail.clone(),
     });
     Err(detail)
-}
-
-/// Said in a rejection when the agent handed work to a subagent, so the reader fixes the cause
-/// (delegation) instead of chasing "never opened".
-fn delegation_note(tool_calls: &[ToolCallRecord]) -> &'static str {
-    if tool_calls.iter().any(|c| c.tool == agent_adapter::codex::COLLAB_TOOL) {
-        " CAUSE: the agent delegated to a subagent (collab_tool_call). A subagent's reads are not \
-         in this stream, so they cannot back a review. Re-dispatch; the review prompt already \
-         forbids delegation, so a repeat is the agent ignoring it."
-    } else {
-        ""
-    }
 }
 
 fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
@@ -6821,11 +6824,18 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
             .expect_err("a delegated review read nothing itself");
-        assert!(err.contains("delegated to a subagent"), "{err}");
+        assert!(err.contains("delegated part of it to a subagent"), "{err}");
+        // Review of PR 57: the parent also read the whole source. Still rejected.
+        let mut both = vec![codex_read(&format!("cat {src}"))];
+        both.extend(tools.iter().cloned());
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &both, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("delegation is rejected even with full parent reads");
+        assert!(err.contains("delegated part of it to a subagent"), "{err}");
         let mut lifecycle = Vec::new();
         let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &[], &cwd, &mut lifecycle)
             .expect_err("delegating is not looking");
-        assert!(err.contains("delegated to a subagent"), "{err}");
+        assert!(err.contains("delegated part of it to a subagent"), "{err}");
     }
 
     /// A window that stops short is still a peek, and so is a set of windows with a hole in

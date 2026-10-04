@@ -4696,8 +4696,10 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let script_path = write_codex_args_capture_script(&args_file, "done")?;
         // Restore what was there, not remove it: a removed HOME breaks every later test that
         // reads it (abe_red_team_* failed "environment variable not found" when this deleted it).
-        let saved_home = std::env::var_os("HOME");
-        let saved_bin = std::env::var_os("TRIUMVIRATE_CODEX_BIN");
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_REQUIRE_PEER_REVIEW"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("HOME", &test_home);
@@ -4721,13 +4723,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         }
         // SAFETY: restore before asserting.
         unsafe {
-            match saved_bin {
-                Some(v) => std::env::set_var("TRIUMVIRATE_CODEX_BIN", v),
-                None => std::env::remove_var("TRIUMVIRATE_CODEX_BIN"),
-            }
-            match saved_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+            // Every variable this test touched, restored (Antigravity, review of PR 57).
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
             }
         }
         let _ = fs::remove_file(script_path);

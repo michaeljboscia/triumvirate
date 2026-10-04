@@ -1920,22 +1920,49 @@ pub fn fleet_base_sha(project_root: &Path, fleet_id: &str) -> Option<String> {
     v.get("head_sha").and_then(|h| h.as_str()).map(str::to_string)
 }
 
-/// Whether a member's run counts as DONE: it exited 0 AND left a new commit on its branch.
+/// Whether `head` is a NEW commit on top of `base`: a strict descendant of it in `repo`. `None`
+/// when git cannot answer (no repo, an unknown sha).
+///
+/// String inequality was not enough (Codex and Grok, review of PR 57): an older commit, an
+/// unrelated one, or a reset to another existing commit all differ from the base and are not work.
+pub fn commit_is_new(repo: &Path, base: &str, head: &str) -> Option<bool> {
+    if base == head {
+        return Some(false);
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", base, head])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    // 0: base is an ancestor of head. 1: it is not. Anything else: git could not tell.
+    match status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a member's run counts as DONE: it exited 0 AND left a new commit on its branch
+/// (`new_commit` from [`commit_is_new`]).
 ///
 /// An exit code alone is not proof of work. On 2026-10-04 every codex fleet worker exited 0
 /// having written nothing (its sandbox was read-only), and the fleet recorded each one done.
-/// Fails closed: a head that cannot be read, or a base the ledger does not hold, is no proof.
-pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_sha: Option<&str>) -> Result<(), String> {
+/// Fails closed: a head, a base or an ancestry answer that cannot be had is no proof.
+pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_sha: Option<&str>, new_commit: Option<bool>) -> Result<(), String> {
     if exit_code != Some(0) {
         return Err(format!("agent exited {exit_code:?}"));
     }
-    match (branch_head, base_sha) {
-        (Some(head), Some(base)) if head != base => Ok(()),
-        (Some(head), Some(_)) => Err(format!(
-            "agent exited 0 without committing: its branch is still at the fleet's base {head}"
+    match (branch_head, base_sha, new_commit) {
+        (Some(_), Some(_), Some(true)) => Ok(()),
+        (Some(head), Some(base), Some(false)) => Err(format!(
+            "agent exited 0 without committing: its branch head {head} is not a new commit on the fleet's base {base}"
         )),
-        (None, _) => Err("agent exited 0 but its branch head could not be read, so no commit is proven".to_string()),
-        (Some(_), None) => Err("agent exited 0 but the fleet's base commit is not in the ledger, so no new commit is proven".to_string()),
+        (None, _, _) => Err("agent exited 0 but its branch head could not be read, so no commit is proven".to_string()),
+        (Some(_), None, _) => Err("agent exited 0 but the fleet's base commit is not in the ledger, so no new commit is proven".to_string()),
+        (Some(_), Some(_), None) => Err("agent exited 0 but git could not compare its head with the fleet's base, so no new commit is proven".to_string()),
     }
 }
 
@@ -1965,13 +1992,68 @@ mod judge_member_run_tests {
     /// a member that did commit is refused.
     #[test]
     fn done_needs_a_clean_exit_and_a_new_commit() {
-        assert!(judge_member_run(Some(0), Some("bbb"), Some("aaa")).is_ok());
-        let e = judge_member_run(Some(0), Some("aaa"), Some("aaa")).unwrap_err();
+        assert!(judge_member_run(Some(0), Some("bbb"), Some("aaa"), Some(true)).is_ok());
+        let e = judge_member_run(Some(0), Some("aaa"), Some("aaa"), Some(false)).unwrap_err();
         assert!(e.contains("without committing"), "{e}");
-        assert!(judge_member_run(Some(0), None, Some("aaa")).is_err());
-        assert!(judge_member_run(Some(0), Some("bbb"), None).is_err());
-        assert!(judge_member_run(Some(1), Some("bbb"), Some("aaa")).is_err());
-        assert!(judge_member_run(None, Some("bbb"), Some("aaa")).is_err());
+        assert!(judge_member_run(Some(0), None, Some("aaa"), None).is_err());
+        assert!(judge_member_run(Some(0), Some("bbb"), None, None).is_err());
+        assert!(judge_member_run(Some(0), Some("bbb"), Some("aaa"), None).is_err());
+        assert!(judge_member_run(Some(1), Some("bbb"), Some("aaa"), Some(true)).is_err());
+        assert!(judge_member_run(None, Some("bbb"), Some("aaa"), Some(true)).is_err());
+    }
+
+    /// RED IF an older, unrelated or equal commit counts as new work (review of PR 57), or a real
+    /// descendant does not. Real git, real commits.
+    #[test]
+    fn only_a_descendant_of_the_base_is_new() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(repo)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .expect("git");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "older"]);
+        let older = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "work"]);
+        let work = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "--orphan", "other"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "unrelated"]);
+        let unrelated = git(&["rev-parse", "HEAD"]);
+        assert_eq!(super::commit_is_new(repo, &base, &work), Some(true));
+        assert_eq!(super::commit_is_new(repo, &base, &base), Some(false));
+        assert_eq!(super::commit_is_new(repo, &base, &older), Some(false), "an older commit is not new work");
+        assert_eq!(super::commit_is_new(repo, &base, &unrelated), Some(false), "an unrelated commit is not new work");
+        assert_eq!(super::commit_is_new(repo, &base, "0000000000000000000000000000000000000001"), None);
+    }
+
+    /// RED IF the base commit stops being read from the fleet_spawned event (review of PR 57: it
+    /// had no test of its own).
+    #[test]
+    fn the_base_sha_comes_from_the_fleet_spawned_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".triumvirate").join("spool")).expect("spool");
+        let store = ledger::LedgerStore::open(root.clone()).expect("ledger");
+        assert_eq!(super::fleet_base_sha(&root, "fleet-b"), None);
+        store
+            .ingest_event(shared_types::RawEvent {
+                session_id: "fleet-b".to_string(),
+                event_type: "fleet_spawned".to_string(),
+                sequence: 1,
+                timestamp: crate::event_timestamp(),
+                payload_json: serde_json::json!({ "head_sha": "abc123", "agent_count": 2 }).to_string(),
+            })
+            .expect("event");
+        assert_eq!(super::fleet_base_sha(&root, "fleet-b").as_deref(), Some("abc123"));
+        assert_eq!(super::fleet_base_sha(&root, "fleet-other"), None);
     }
 }
 

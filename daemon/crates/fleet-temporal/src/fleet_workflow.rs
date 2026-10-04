@@ -283,10 +283,16 @@ impl FleetLedgerActivities {
     pub async fn record_task_outcome(_ctx: ActivityContext, o: TaskOutcome) -> Result<String, ActivityError> {
         let root = PathBuf::from(&o.project_root);
         let base = fleet::orchestrator::fleet_base_sha(&root, &o.fleet_id);
+        let head = o.output.as_ref().and_then(|x| x.branch_head.clone());
+        let new_commit = match (&base, &head) {
+            (Some(b), Some(h)) => fleet::orchestrator::commit_is_new(&root, b, h),
+            _ => None,
+        };
         let verdict = fleet::orchestrator::judge_member_run(
             o.output.as_ref().and_then(|x| x.exit_code),
-            o.output.as_ref().and_then(|x| x.branch_head.as_deref()),
+            head.as_deref(),
             base.as_deref(),
+            new_commit,
         );
         let succeeded = verdict.is_ok();
         // A run that exited 0 without a commit is failed WITH the reason, not silently done.

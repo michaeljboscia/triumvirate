@@ -231,6 +231,15 @@ impl FleetActivities {
                     {
                         let silent = last_growth.elapsed().as_secs();
                         let stopped = stop_worker(&token, child.as_mut()).await;
+                        // The agent may have finished between the check above and the stop (Codex,
+                        // review of PR 57). A done record with no signal is the agent's own exit,
+                        // not our stop: that run completed and is judged like any other.
+                        if let Some(done) = worker::finished(&root, &input, &token)
+                            && done.signal.is_none()
+                        {
+                            tracing::info!(task_id = %input.task_id, "run_worker: finished as the stall stop began; recording its own exit");
+                            return Ok(worker::output(&input, done, adopted));
+                        }
                         tracing::warn!(fleet_id = %input.fleet_id, task_id = %input.task_id, agent = %input.agent, silent, ?stopped, "run_worker: stalled; worker group stopped");
                         // Non-retryable: a retry would rerun the same task from scratch, and the
                         // caller decides what a stall means (design 4a).
