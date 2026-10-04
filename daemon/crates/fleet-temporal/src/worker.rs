@@ -268,7 +268,7 @@ mod tests {
         assert!(worker_token::try_claim_launch(root, "fleet-d", "fleet-d-T-001").unwrap(), "first attempt claims");
         let mut first = spawn_leader("sleep 30");
         worker_token::write_token(root, &token_for(first.id())).expect("first attempt's token");
-        let (child, token) = launch(&input).await.ok().expect("second attempt adopts");
+        let Ok((child, token)) = launch(&input).await else { panic!("second attempt must adopt") };
         assert!(child.is_none(), "the second attempt must not spawn anything");
         assert_eq!(token.pid, first.id());
         let _ = first.kill();

@@ -310,35 +310,57 @@ impl FleetLedgerActivities {
         let root = PathBuf::from(&a.fleet.project_root);
         let fleet_id = &a.fleet.fleet_id;
         let report = fleet::orchestrator::stop_fleet_workers(&root, fleet_id, Vec::new(), fleet::orchestrator::fleet_kill_grace()).await;
-        if !report.problems.is_empty() {
-            tracing::error!(fleet_id = %fleet_id, problems = ?report.problems, "abort: a worker may still be running; ledger left as it is");
-            return Err(ActivityError::Application(Box::new(temporalio_sdk::ApplicationFailure::non_retryable(format!(
-                "fleet {fleet_id} could not be stopped cleanly; workers may still run: {}",
-                report.problems.join("; ")
-            )))));
-        }
-        let state = if a.cancelled { "cancelled" } else { "failed" };
-        let reason = if a.cancelled {
-            "cancelled through the Temporal engine".to_string()
-        } else {
-            format!("Temporal engine: {}", a.reason.chars().take(500).collect::<String>())
-        };
-        let db = root.join(".triumvirate").join("ledger.db");
-        let conn = rusqlite::Connection::open(&db).map_err(app_err)?;
-        conn.execute(
-            "UPDATE fleets SET state = ?2, failure_reason = ?3
-             WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed', 'cancelled')",
-            rusqlite::params![fleet_id, state, reason],
-        )
-        .map_err(app_err)?;
-        conn.execute(
-            "UPDATE tasks SET state = 'failed'
-             WHERE fleet_id = ?1 AND state IN ('pending', 'claimed', 'in_progress')",
-            rusqlite::params![fleet_id],
-        )
-        .map_err(app_err)?;
-        Ok(state.to_string())
+        record_abort(&root, fleet_id, a.cancelled, &a.reason, &report.problems).map_err(|e| {
+            ActivityError::Application(Box::new(temporalio_sdk::ApplicationFailure::non_retryable(e)))
+        })
     }
+}
+
+/// The ledger side of an abort. Problems (a worker that could not be proven stopped) win:
+/// the fleet is marked `stop_failed` with what could not be stopped, and the abort is an error.
+/// Never `cancelled` while an agent may still run, and never a silent `running` that nothing
+/// revisits (Grok, review of 3871850 and its confirmation pass). Otherwise the fleet becomes
+/// `cancelled` or `failed` and every task left in flight is failed. A fleet that already finished
+/// keeps its outcome.
+pub fn record_abort(
+    root: &std::path::Path,
+    fleet_id: &str,
+    cancelled: bool,
+    reason: &str,
+    problems: &[String],
+) -> Result<String, String> {
+    let db = root.join(".triumvirate").join("ledger.db");
+    let conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+    if !problems.is_empty() {
+        let why = format!("STOP FAILED, workers may still run: {}", problems.join("; "));
+        tracing::error!(fleet_id, problems = ?problems, "abort: a worker may still be running; ledger marked stop_failed");
+        conn.execute(
+            "UPDATE fleets SET state = 'stop_failed', failure_reason = ?2
+             WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed', 'cancelled')",
+            rusqlite::params![fleet_id, why.chars().take(800).collect::<String>()],
+        )
+        .map_err(|e| e.to_string())?;
+        return Err(format!("fleet {fleet_id} could not be stopped cleanly; {why}"));
+    }
+    let state = if cancelled { "cancelled" } else { "failed" };
+    let why = if cancelled {
+        "cancelled through the Temporal engine".to_string()
+    } else {
+        format!("Temporal engine: {}", reason.chars().take(500).collect::<String>())
+    };
+    conn.execute(
+        "UPDATE fleets SET state = ?2, failure_reason = ?3
+         WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed', 'cancelled')",
+        rusqlite::params![fleet_id, state, why],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE tasks SET state = 'failed'
+         WHERE fleet_id = ?1 AND state IN ('pending', 'claimed', 'in_progress')",
+        rusqlite::params![fleet_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(state.to_string())
 }
 
 /// A member's command line. Real agents come from the one shared builder. `stub` exists only for
@@ -351,4 +373,67 @@ fn member_command(agent: &str, worktree: &std::path::Path, prompt: &str) -> anyh
     }
     let (cmd, args) = fleet::orchestrator::fleet_agent_command(agent, worktree, prompt)?;
     Ok(std::iter::once(cmd).chain(args).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed(root: &std::path::Path, fleet: &str) {
+        std::fs::create_dir_all(root.join(".triumvirate")).unwrap();
+        let _ = ledger::LedgerStore::open(root.to_path_buf()).unwrap();
+        let store = fleet::tasks::FleetTaskStore::new(root.to_path_buf()).unwrap();
+        store.insert_fleet(fleet, "t").unwrap();
+        store.insert_task(&format!("{fleet}-T-001"), fleet, "t", &[]).unwrap();
+        let c = rusqlite::Connection::open(root.join(".triumvirate/ledger.db")).unwrap();
+        c.execute("UPDATE fleets SET state='running' WHERE fleet_id=?1", [fleet]).unwrap();
+        c.execute("UPDATE tasks SET state='in_progress' WHERE fleet_id=?1", [fleet]).unwrap();
+    }
+    fn row(root: &std::path::Path, fleet: &str) -> (String, String, String) {
+        let c = rusqlite::Connection::open(root.join(".triumvirate/ledger.db")).unwrap();
+        let (s, r): (String, Option<String>) = c
+            .query_row("SELECT state, failure_reason FROM fleets WHERE fleet_id=?1", [fleet], |x| Ok((x.get(0)?, x.get(1)?)))
+            .unwrap();
+        let t: String = c.query_row("SELECT state FROM tasks WHERE fleet_id=?1", [fleet], |x| x.get(0)).unwrap();
+        (s, r.unwrap_or_default(), t)
+    }
+
+    /// RED IF an unprovable stop is recorded as cancelled, or left `running` with nothing saying so.
+    #[test]
+    fn an_unprovable_stop_is_stop_failed_never_cancelled() {
+        let d = tempfile::tempdir().unwrap();
+        seed(d.path(), "f1");
+        let err = record_abort(d.path(), "f1", true, "cancel", &["T-001: refused".to_string()]).unwrap_err();
+        assert!(err.contains("STOP FAILED"), "{err}");
+        let (s, r, t) = row(d.path(), "f1");
+        assert_eq!(s, "stop_failed");
+        assert!(r.contains("T-001: refused"), "{r}");
+        assert_eq!(t, "in_progress", "a task whose worker may still run is not marked failed");
+    }
+
+    #[test]
+    fn a_clean_cancel_and_a_failure_are_recorded_as_such() {
+        let d = tempfile::tempdir().unwrap();
+        seed(d.path(), "fc");
+        assert_eq!(record_abort(d.path(), "fc", true, "x", &[]).unwrap(), "cancelled");
+        assert_eq!(row(d.path(), "fc").0, "cancelled");
+        assert_eq!(row(d.path(), "fc").2, "failed");
+        seed(d.path(), "ff");
+        assert_eq!(record_abort(d.path(), "ff", false, "prepare blew up", &[]).unwrap(), "failed");
+        let (s, r, _) = row(d.path(), "ff");
+        assert_eq!(s, "failed");
+        assert!(r.contains("prepare blew up"));
+    }
+
+    #[test]
+    fn a_finished_fleet_keeps_its_outcome() {
+        let d = tempfile::tempdir().unwrap();
+        seed(d.path(), "fd");
+        rusqlite::Connection::open(d.path().join(".triumvirate/ledger.db"))
+            .unwrap()
+            .execute("UPDATE fleets SET state='done' WHERE fleet_id='fd'", [])
+            .unwrap();
+        let _ = record_abort(d.path(), "fd", true, "late", &[]);
+        assert_eq!(row(d.path(), "fd").0, "done");
+    }
 }
