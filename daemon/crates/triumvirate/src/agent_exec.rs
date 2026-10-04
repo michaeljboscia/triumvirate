@@ -157,6 +157,22 @@ pub(crate) fn note_attempt_child(child: &tokio::process::Child) {
     });
 }
 
+/// Whether this connector emits progress events DURING the run. The stall kill reads silence on
+/// this channel as a hang, so a connector that only reports at the end must never be stall-killed.
+///
+/// 2026-10-03, the day the kill shipped: the agy connector reads agy's whole stdout and parses it
+/// after exit, so every Antigravity review longer than 300 s was killed as "stalled" while working.
+/// The DeepSeek arm is never handed the events channel at all, and thinking mode legitimately runs
+/// past its 420 s window. codex, grok and gemini-cli emit per line. When agy streams its
+/// stream-json live, it can come back in here.
+fn streams_live_progress(agent: &str, gemini_backend: Option<GeminiBackend>) -> bool {
+    match agent {
+        "gemini" => !matches!(gemini_backend, Some(GeminiBackend::Agy)),
+        "deepseek" => false,
+        _ => true,
+    }
+}
+
 /// When the next stall check is due, given the last real progress. `None` when this agent has
 /// no stall window.
 fn stall_deadline(window: Option<Duration>, last_progress: Instant) -> Option<Instant> {
@@ -978,7 +994,12 @@ async fn execute_ask_agent_inner(
 
     // Stall kill (design 4a): end an attempt when no real progress event arrives for this
     // agent's measured window, instead of waiting out the 900 s limit. Read once per call.
-    let stall_window = mcp_bridge::stall::stall_window(&agent);
+    // Only for a connector that reports progress WHILE it runs; see `streams_live_progress`.
+    let stall_window = if streams_live_progress(&agent, gemini_backend_selected) {
+        mcp_bridge::stall::stall_window(&agent)
+    } else {
+        None
+    };
 
     for (idx, (backoff, model_override)) in attempt_schedule.iter().enumerate() {
         if agy_breaker_open {
@@ -9655,6 +9676,17 @@ mod stall_unit_tests {
     fn stuck_events_are_not_progress() {
         assert!(!is_progress_event(&event(WorkingState::Stuck)));
         assert!(is_progress_event(&event(WorkingState::MessageDelta)));
+    }
+
+    /// RED IF: a connector that reports nothing until it exits becomes stall-killable again.
+    /// That is how every agy review over 300 s was killed on 2026-10-03.
+    #[test]
+    fn only_connectors_that_stream_progress_are_stall_killed() {
+        assert!(!streams_live_progress("gemini", Some(GeminiBackend::Agy)));
+        assert!(!streams_live_progress("deepseek", None));
+        assert!(streams_live_progress("gemini", Some(GeminiBackend::GeminiCli)));
+        assert!(streams_live_progress("codex", None));
+        assert!(streams_live_progress("grok", None));
     }
 
     #[test]
