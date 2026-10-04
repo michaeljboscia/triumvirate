@@ -61,7 +61,14 @@ where
         .task_description
         .unwrap_or_else(|| "Implement the assigned fleet task.".to_string());
 
-    let orchestrator = orchestrator_factory(project_root.clone())?;
+    let mut orchestrator = orchestrator_factory(project_root.clone())?;
+    if !dry_run {
+        // A real fleet must be findable after a restart, so the index write is part of the spawn
+        // and happens before any worker launches (inside the orchestrator).
+        let index = fleet_index_path()
+            .ok_or_else(|| "fleet_spawn failed: cannot resolve the triumvirate home for fleets.json".to_string())?;
+        orchestrator = orchestrator.with_index_path(index);
+    }
     let run = orchestrator
         .fleet_spawn(FleetSpawnRunRequest {
             project_root: project_root.clone(),
@@ -103,8 +110,11 @@ where
         project_root: Some(project_root.display().to_string()),
     };
     // D-016: the in-memory map is gone after a restart, and it was the only thing that knew
-    // which repo's ledger this fleet lives in. Persist that one fact so the fleet can be found.
-    record_fleet_root(&result.fleet_id, &project_root.display().to_string());
+    // which repo's ledger this fleet lives in. A real spawn recorded it before launching; a dry
+    // run (no ledger rows, no workers) is recorded best effort, as before.
+    if dry_run {
+        record_fleet_root(&result.fleet_id, &project_root.display().to_string());
+    }
     let mut fleet_states = fleet_states.lock().await;
     fleet_states.insert(result.fleet_id.clone(), status);
     let active = fleet_states
@@ -188,15 +198,10 @@ async fn resolve_fleet(
 
 /// `{triumvirate_home}/fleets.json`: fleet id to the project root its ledger lives under.
 fn fleet_index_path() -> Option<PathBuf> {
-    daemon_core::triumvirate_home_dir().ok().map(|h| h.join("fleets.json"))
+    fleet::index::fleet_index_path()
 }
 
-fn index_lock() -> &'static std::sync::Mutex<()> {
-    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    L.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-/// Best effort: a failure to write the index costs restart recovery, never the spawn itself.
+/// Best effort, for dry runs only. A real spawn's write is required (see `fleet_spawn`).
 fn record_fleet_root(fleet_id: &str, project_root: &str) {
     let Some(index) = fleet_index_path() else { return };
     if let Err(e) = record_fleet_root_in(&index, fleet_id, project_root) {
@@ -205,25 +210,11 @@ fn record_fleet_root(fleet_id: &str, project_root: &str) {
 }
 
 fn record_fleet_root_in(index: &Path, fleet_id: &str, project_root: &str) -> std::io::Result<()> {
-    let _guard = index_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut map: std::collections::BTreeMap<String, String> = fs::read(index)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    map.insert(fleet_id.to_string(), project_root.to_string());
-    if let Some(dir) = index.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    // Write-then-rename, so a crash mid-write leaves the old index rather than a torn one.
-    let tmp = index.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&map).map_err(std::io::Error::other)?)?;
-    fs::rename(&tmp, index)
+    fleet::index::record_fleet_root_in(index, fleet_id, project_root)
 }
 
 fn lookup_fleet_root_in(index: &Path, fleet_id: &str) -> Option<String> {
-    let _guard = index_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map: std::collections::BTreeMap<String, String> = serde_json::from_slice(&fs::read(index).ok()?).ok()?;
-    map.get(fleet_id).cloned()
+    fleet::index::lookup_fleet_root_in(index, fleet_id)
 }
 
 #[instrument(skip_all, fields(fleet_id = %req.fleet_id))]
@@ -272,36 +263,93 @@ pub async fn fleet_cancel(
     ws_events: Option<&broadcast::Sender<String>>,
     req: FleetCancelRequest,
 ) -> Result<FleetCancelResponse, String> {
-    let mut fleet_states = fleet_states.lock().await;
-    // Keep the removed status so the cancel event can report the fleet's ACTUAL width
-    // (worktree_paths.len()) instead of a misleading zero.
-    let removed = fleet_states.remove(&req.fleet_id);
-    let canceled = removed.is_some();
-    // Reach the processes, not only the record. Before this the workers ran on after cancel.
-    let killed = fleet::orchestrator::kill_fleet_children(&req.fleet_id);
-    if let Some(root) = removed.as_ref().and_then(|s| s.project_root.clone()) {
-        fleet::orchestrator::mark_fleet_cancelled(
-            Path::new(&root),
-            &req.fleet_id,
-            &format!("cancelled by operator; {killed} worker(s) signalled"),
-        );
+    fleet_cancel_with(
+        fleet_states,
+        metrics,
+        ws_events,
+        req,
+        fleet_index_path().as_deref(),
+        fleet::orchestrator::fleet_kill_grace(),
+    )
+    .await
+}
+
+/// Cancel that works after a restart. Before this, cancel read only the in-memory map, so after
+/// a restart it returned `canceled: false`, signalled nothing, and left the ledger `running`.
+async fn fleet_cancel_with(
+    fleet_states: &Arc<Mutex<HashMap<String, FleetStatusResponse>>>,
+    metrics: &DaemonMetrics,
+    ws_events: Option<&broadcast::Sender<String>>,
+    req: FleetCancelRequest,
+    index: Option<&Path>,
+    grace: std::time::Duration,
+) -> Result<FleetCancelResponse, String> {
+    // Resolve BEFORE taking the fleet_states lock: resolve_fleet takes the same mutex, so calling
+    // it while holding the guard deadlocks every cancel.
+    let status = match resolve_fleet(fleet_states, &req.fleet_id, index).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(fleet_id = %req.fleet_id, error = %e, "fleet cancel: fleet not found");
+            return Ok(FleetCancelResponse { canceled: false, signalled: 0, detail: Some(e) });
+        }
+    };
+    let Some(root) = status.project_root.clone().map(PathBuf::from) else {
+        return Ok(FleetCancelResponse {
+            canceled: false,
+            signalled: 0,
+            detail: Some(format!("fleet {} has no project root on record", req.fleet_id)),
+        });
+    };
+    let already_finished = matches!(status.state.as_str(), "done" | "failed" | "cancelled");
+
+    // Intent first, in memory AND in the ledger, so whichever process owns the workers sees the
+    // cancel when they die and does not relaunch them as a degraded codex task.
+    let in_memory = fleet::orchestrator::take_fleet_children_for_cancel(&req.fleet_id);
+    let marked = already_finished
+        || fleet::orchestrator::mark_fleet_cancelled(&root, &req.fleet_id, "cancelled by operator");
+    // Then the processes, only through their launch tokens (SIGTERM, grace, SIGKILL, every result
+    // checked). Idempotent, so it also runs for an already-finished fleet in case anything lingers.
+    let report = fleet::orchestrator::stop_fleet_workers(&root, &req.fleet_id, in_memory, grace).await;
+
+    let mut detail = Vec::new();
+    if already_finished {
+        detail.push(format!("fleet already {}", status.state));
     }
-    tracing::info!(fleet_id = %req.fleet_id, killed, "fleet cancel");
-    let cancelled_width = removed.map(|s| s.worktree_paths.len()).unwrap_or(0);
+    if !marked {
+        detail.push("the ledger could not be marked cancelled".to_string());
+    }
+    if !report.problems.is_empty() {
+        detail.push(format!("may still be running: {}", report.problems.join("; ")));
+    }
+    let canceled = !already_finished && marked;
+    tracing::info!(
+        fleet_id = %req.fleet_id,
+        canceled,
+        stopped = report.stopped,
+        escalated = report.escalated,
+        problems = report.problems.len(),
+        "fleet cancel"
+    );
+
+    let mut fleet_states = fleet_states.lock().await;
+    fleet_states.remove(&req.fleet_id);
     let active = fleet_states
         .values()
         .filter(|status| status.state == "running" || status.state == "spawning")
         .count();
     metrics.fleet_active_total.set(active as i64);
+    drop(fleet_states);
     if canceled {
         emit_fleet_progress(ws_events, &req.fleet_id, "cancelled", active);
-        // Cancelling an in-flight fleet aborts real agent work / spend. Dark until now. This
-        // rides tv_fleet_spawn as another point in the fleet lifecycle (tv_state=cancelled),
-        // reporting the fleet's real width from the status we just removed. `canceled=false`
-        // (unknown fleet_id) is not reported: nothing was aborted, so there is no work event.
-        mcp_bridge::posthog::record_fleet_spawn("cancelled", false, cancelled_width, None);
+        // Cancelling an in-flight fleet aborts real agent work / spend. This rides tv_fleet_spawn
+        // as another point in the fleet lifecycle (tv_state=cancelled) with the fleet's real width.
+        mcp_bridge::posthog::record_fleet_spawn("cancelled", false, status.worktree_paths.len(), None);
     }
-    Ok(FleetCancelResponse { canceled })
+    Ok(FleetCancelResponse {
+        canceled,
+        signalled: report.stopped,
+        detail: (!detail.is_empty()).then(|| detail.join("; ")),
+    })
 }
 
 #[cfg(test)]
@@ -386,5 +434,147 @@ mod restart_index_tests {
         record_fleet_root_in(&index, "b", "/repo/b").expect("b");
         assert_eq!(lookup_fleet_root_in(&index, "a").as_deref(), Some("/repo/a"));
         assert_eq!(lookup_fleet_root_in(&index, "b").as_deref(), Some("/repo/b"));
+    }
+
+    /// A true orphan in its own process group (reparented to launchd), started in `cwd`.
+    fn orphan(script: &str, cwd: &Path) -> u32 {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("set -m; sh -c '{script}' >/dev/null 2>&1 </dev/null & echo $!"))
+            .current_dir(cwd)
+            .output()
+            .expect("spawn orphan");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        String::from_utf8_lossy(&out.stdout).trim().parse().expect("pid")
+    }
+
+    fn gone_within(pid: u32, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if fleet::worker_token::proc_info(pid).is_none() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    struct Reap(Vec<u32>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                let _ = fleet::worker_token::signal_group(*pid, 9);
+            }
+        }
+    }
+
+    /// Cancel after a restart: the in-memory map is empty, the workers are reachable only
+    /// through their launch tokens, one of them ignores SIGTERM. Bounded by a timeout, so the
+    /// old resolve-under-lock deadlock fails the test instead of hanging it.
+    /// RED IF: cancel deadlocks, returns canceled:false, leaves a worker running, or leaves the
+    /// ledger anything but `cancelled`.
+    #[tokio::test]
+    async fn cancel_after_a_restart_stops_every_worker_and_marks_the_ledger() {
+        let (_dir, root) = ledger_with_running_fleet("fleet-cancel");
+        let idx_dir = tempfile::tempdir().expect("tempdir");
+        let index = idx_dir.path().join("fleets.json");
+        record_fleet_root_in(&index, "fleet-cancel", &root.display().to_string()).expect("index");
+        let wt_a = root.join(".triumvirate/worktrees/fleet-cancel-fleet-cancel-T-001-codex");
+        let wt_b = root.join(".triumvirate/worktrees/fleet-cancel-fleet-cancel-T-002-codex");
+        std::fs::create_dir_all(&wt_a).expect("wt a");
+        std::fs::create_dir_all(&wt_b).expect("wt b");
+        let polite = orphan("sleep 60", &wt_a);
+        let stubborn = orphan("trap \"\" TERM; while :; do sleep 1; done", &wt_b);
+        let bystander = orphan("sleep 60", &wt_a);
+        let _reap = Reap(vec![polite, stubborn, bystander]);
+        for (pid, task) in [(polite, "fleet-cancel-T-001"), (stubborn, "fleet-cancel-T-002")] {
+            let t = fleet::worker_token::WorkerToken::for_spawned_child(pid, "fleet-cancel", task, "codex").expect("token");
+            fleet::worker_token::write_token(&root, &t).expect("write token");
+        }
+
+        let restarted: Arc<Mutex<HashMap<String, FleetStatusResponse>>> = Arc::default();
+        let metrics = DaemonMetrics::new().expect("metrics");
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            fleet_cancel_with(
+                &restarted,
+                &metrics,
+                None,
+                FleetCancelRequest { fleet_id: "fleet-cancel".to_string() },
+                Some(&index),
+                std::time::Duration::from_millis(500),
+            ),
+        )
+        .await
+        .expect("cancel must not deadlock")
+        .expect("cancel");
+
+        assert!(out.canceled, "{out:?}");
+        assert_eq!(out.signalled, 2, "{out:?}");
+        assert!(gone_within(polite, std::time::Duration::from_secs(3)));
+        assert!(gone_within(stubborn, std::time::Duration::from_secs(3)), "SIGKILL escalation");
+        assert!(fleet::worker_token::proc_info(bystander).is_some(), "a shell in the worktree without a token is never signalled");
+        let state: String = rusqlite::Connection::open(root.join(".triumvirate/ledger.db"))
+            .expect("db")
+            .query_row("SELECT state FROM fleets WHERE fleet_id = 'fleet-cancel'", [], |r| r.get(0))
+            .expect("row");
+        assert_eq!(state, "cancelled");
+    }
+
+    /// The twin: an unknown fleet is a clean not-found, not an error and not a hang.
+    #[tokio::test]
+    async fn cancel_of_an_unknown_fleet_is_a_clean_not_found() {
+        let idx_dir = tempfile::tempdir().expect("tempdir");
+        let index = idx_dir.path().join("fleets.json");
+        let empty: Arc<Mutex<HashMap<String, FleetStatusResponse>>> = Arc::default();
+        let metrics = DaemonMetrics::new().expect("metrics");
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fleet_cancel_with(
+                &empty,
+                &metrics,
+                None,
+                FleetCancelRequest { fleet_id: "fleet-nope".to_string() },
+                Some(&index),
+                std::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("no hang")
+        .expect("a clean response, not an error");
+        assert!(!out.canceled);
+        assert_eq!(out.signalled, 0);
+        assert!(out.detail.as_deref().unwrap_or_default().contains("fleet not found"), "{out:?}");
+    }
+
+    /// Cancelling a fleet that already finished must not rewrite its outcome.
+    #[tokio::test]
+    async fn cancel_of_a_finished_fleet_keeps_its_outcome() {
+        let (_dir, root) = ledger_with_running_fleet("fleet-done");
+        rusqlite::Connection::open(root.join(".triumvirate/ledger.db"))
+            .expect("db")
+            .execute("UPDATE fleets SET state = 'done' WHERE fleet_id = 'fleet-done'", [])
+            .expect("done");
+        let idx_dir = tempfile::tempdir().expect("tempdir");
+        let index = idx_dir.path().join("fleets.json");
+        record_fleet_root_in(&index, "fleet-done", &root.display().to_string()).expect("index");
+        let empty: Arc<Mutex<HashMap<String, FleetStatusResponse>>> = Arc::default();
+        let metrics = DaemonMetrics::new().expect("metrics");
+        let out = fleet_cancel_with(
+            &empty,
+            &metrics,
+            None,
+            FleetCancelRequest { fleet_id: "fleet-done".to_string() },
+            Some(&index),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect("cancel");
+        assert!(!out.canceled);
+        let state: String = rusqlite::Connection::open(root.join(".triumvirate/ledger.db"))
+            .expect("db")
+            .query_row("SELECT state FROM fleets WHERE fleet_id = 'fleet-done'", [], |r| r.get(0))
+            .expect("row");
+        assert_eq!(state, "done");
     }
 }

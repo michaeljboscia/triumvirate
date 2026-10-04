@@ -80,6 +80,9 @@ pub struct AgyStreamParser {
     events: Vec<WorkingStateEvent>,
     status: Option<String>,
     saw_result: bool,
+    /// The first failed tool call's own error message, so an empty result can say WHY (D-035:
+    /// a review whose every tool call failed came back as a bare "empty output").
+    first_tool_error: Option<String>,
 }
 
 /// Map an agy tool name to a kind.
@@ -250,6 +253,15 @@ impl AgyStreamParser {
         // fixture I collected and did not check.
         let done = state.eq_ignore_ascii_case("DONE");
         let errored = state.eq_ignore_ascii_case("ERROR");
+        if errored && self.first_tool_error.is_none() {
+            let msg = su
+                .get("tool_info")
+                .and_then(|ti| ti.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("no error message");
+            self.first_tool_error = Some(format!("{name}: {}", msg.chars().take(200).collect::<String>()));
+        }
 
         if let Some(pos) = self.open_steps.iter().position(|(i, _)| *i == idx) {
             let (_, call_pos) = self.open_steps[pos];
@@ -324,6 +336,11 @@ impl AgyStreamParser {
 
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    /// The first failed tool call's error, as `tool: message`. `None` when no call failed.
+    pub fn first_tool_error(&self) -> Option<&str> {
+        self.first_tool_error.as_deref()
     }
 
     pub fn finish(self) -> ParsedAgentResult {
@@ -629,5 +646,20 @@ mod tests {
             p.parse_line(l);
         }
         assert_eq!(p.finish().response_text, "pong");
+    }
+
+    /// D-035: a review whose every tool call failed came back as a bare "empty output". The
+    /// first tool error is kept so the failure can say why. Lines are from the real failing
+    /// stream of 2026-10-03 (reviews/2026-10-03/legacy-fixes/d035-failing-stream.jsonl).
+    #[test]
+    fn the_first_failed_tool_calls_error_is_kept() {
+        let mut p = AgyStreamParser::new();
+        p.parse_line(r#"{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"find ."}}}}"#);
+        p.parse_line(r#"{"event":"step_update","step_update":{"step_index":2,"state":"ERROR","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","error":{"type":"TOOL_ERROR","message":"failed to create PTY: operation not permitted"}}}}"#);
+        p.parse_line(r#"{"event":"result","result":{"status":"SUCCESS","response":""}}"#);
+        assert_eq!(p.first_tool_error(), Some("run_command: failed to create PTY: operation not permitted"));
+        let parsed = p.finish();
+        assert!(parsed.response_text.is_empty());
+        assert_eq!(parsed.tool_calls[0].success, Some(false));
     }
 }

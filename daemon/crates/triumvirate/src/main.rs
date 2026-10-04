@@ -2543,6 +2543,50 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
     }
 
+    /// Recover fleets whose owner process died, in every project the restart index names. The
+    /// non-deleting path only: orphans are stopped first (verified by launch token), then the
+    /// fleet is failed and its tasks reset. Worktrees are never deleted here. Fleets owned by a
+    /// live `triumvirate mcp` are left alone. Runs in the background so the kill grace periods
+    /// never delay the HTTP bind.
+    async fn run_startup_fleet_recovery() {
+        let Some(index) = fleet::index::fleet_index_path() else {
+            tracing::warn!("startup fleet recovery skipped: cannot resolve the triumvirate home");
+            return;
+        };
+        let grace = fleet::orchestrator::fleet_kill_grace();
+        let summary = match tokio::task::spawn_blocking(move || {
+            fleet::recovery::recover_fleets_at_startup(&index, grace)
+        })
+        .await
+        {
+            Ok(summary) => summary,
+            Err(err) => {
+                tracing::error!("startup fleet recovery join failure: {err}");
+                mcp_bridge::posthog::record_maintenance("fleet_recovery", "failed", 0);
+                return;
+            }
+        };
+        for (fleet_id, why) in &summary.blocked {
+            tracing::error!(fleet_id = %fleet_id, problems = %why, "startup fleet recovery left a fleet untouched: an orphan was not proven stopped");
+        }
+        for (root, err) in &summary.errors {
+            tracing::warn!(project_root = %root.display(), error = %err, "startup fleet recovery failed for a project");
+        }
+        tracing::info!(
+            projects_scanned = summary.projects_scanned,
+            projects_missing = summary.projects_missing,
+            recovered = summary.recovered.len(),
+            orphans_stopped = summary.orphans_stopped,
+            live_owner = summary.live_owner,
+            ownerless = summary.ownerless,
+            blocked = summary.blocked.len(),
+            errors = summary.errors.len(),
+            "startup fleet recovery finished"
+        );
+        let outcome = if summary.blocked.is_empty() && summary.errors.is_empty() { "ok" } else { "failed" };
+        mcp_bridge::posthog::record_maintenance("fleet_recovery", outcome, summary.recovered.len() as u64);
+    }
+
     async fn session_spawn_route(
         State(state): State<DaemonRuntimeState>,
         headers: HeaderMap,
@@ -2945,6 +2989,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         ask_agent_executor: Arc::new(|req| execute_ask_agent_boxed(req, None)),
     };
     run_startup_gc_if_needed(&state).await;
+    tokio::spawn(run_startup_fleet_recovery());
     let app = Router::new()
         .route("/", get(daemon_http::dashboard_root_route))
         .route("/assets/{*path}", get(daemon_http::dashboard_assets_route))

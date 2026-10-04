@@ -19,6 +19,11 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-036 - The sight gate does not count `sed` windows chained in one shell command
+**Found:** 2026-10-03 (legacy-fixes review round 2) · **Severity:** MEDIUM (a real review is discarded and re-paid) · **NOT FIXED**
+**Evidence:** Codex read all four sources as `/bin/zsh -lc "sed -n '1,180p' F; sed -n '181,360p' F; ..."` and the gate rejected the turn: "named by [Bash ok no read the parser recognises ...], none counted as a successful whole read". The turn's review was thrown away. Workaround that worked: tell Codex one `sed -n` per tool call.
+**CHECK to close:** a single shell call of `sed -n` windows joined by `;` or `&&` that covers lines 1 to N satisfies the source; a chain that includes a non-read command is still judged per segment.
+
 ### D-032 - The sight gate credits the read a reviewer ASKED for, not the one it received
 **Found:** 2026-09-24 (D-028 panel, Codex) · **Severity:** LOW today, structural · **NOT FIXED**
 **Evidence:** `structured_read_ranges` (`triumvirate/src/agent_exec.rs`) builds coverage from the `offset`/`limit` arguments of a successful read. `ToolCallRecord` carries arguments and a success flag, and nothing about the returned content, so a tool that caps or truncates its output is credited with the whole window it requested. The same record shape means an `offset` with no `limit` is credited to EOF.
@@ -284,6 +289,14 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 ---
 
 ## Closed
+
+### D-035 - Antigravity reviews return empty output after making tool calls
+**Found:** 2026-10-03 (legacy-fixes review, three of three attempts) · **Severity:** HIGH (the seat cannot review) · **CLOSED 2026-10-03**
+**Evidence:** `agy returned empty output (status=SUCCESS, permission_requests=0, tool_calls=N)` with N = 1, 6 and 3 on three `review_agent` dispatches the same day. 41 such lines in `~/.triumvirate/outbox.jsonl` overall.
+**Cause (reproduced with agy 1.2.16 and the daemon's exact prompt, streams in temporal-migration/reviews/2026-10-03/legacy-fixes/d035-*.jsonl):** three things together. (1) `review_agent` sent `sources` to the sight gate only, never into the prompt, so the reviewer guessed files (`package.json`, `go.mod`, a root `Cargo.toml`) that do not exist. (2) Under the read-only seatbelt agy's shell tool cannot start (`failed to create PTY: operation not permitted`, then print mode denies the command), so only its file viewer works. (3) With every tool call failed, agy exits `SUCCESS` with an empty `result.response`, and the error said only "empty output". NOT the agy version: 1.2.16 with paths in the prompt returned full reviews three times; the 1.2.7 pin is warn-only.
+**Fix:** required sources are named in every source-gated prompt (`with_required_sources`, all agents); read-only agy prompts carry a tool note (file viewer, no shell, always answer); an empty result now reports failed-call count and the first tool error, and keeps the prompt, raw stream and stderr under `{triumvirate_home}/agy-failures/`.
+**CHECK to close:** a `review_agent` dispatch to antigravity over one 500-line source returns a non-empty review on three consecutive attempts through the installed daemon.
+**Closed 2026-10-03.** Installed 70bd65d; three consecutive `review_agent` dispatches to antigravity through daemon 42453, one source each (recovery.rs 522 lines, mcp-tools fleet.rs, worker_token.rs), messages naming no paths: three non-empty reviews, one successful read each, real findings. Pins: `required_sources_are_named_in_the_prompt`, `the_first_failed_tool_calls_error_is_kept`. Not closed by it: the 1.2.7 version pin is still stale (warn-only) until the REQ-060 to 064 battery is re-run on 1.2.16.
 
 ### D-028 - The sight gate rejects a COMPLETE read served as limit/offset windows
 **Found:** 2026-09-22 (twice, on the D-027 panel's grok seat) · **Severity:** MEDIUM, and it discredits the guard · **CLOSED 2026-09-23**
