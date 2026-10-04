@@ -12,8 +12,30 @@
 #
 # So: read the env from ~/.claude.json, the same block the MCP servers get. One source of
 # truth. Do not hand-start the daemon any other way.
+#
+# Two modes:
+#   (default)     stop any running daemon and start one detached. If the launchd agent
+#                 com.triumvirate.daemon-v2 is loaded, restart THROUGH launchd instead
+#                 (`launchctl kickstart -k`), or this script and launchd would fight over :8080.
+#   --foreground  for launchd only: same env and checks, then `exec` the daemon so launchd
+#                 supervises the real process (KeepAlive restarts it after a crash or a kill).
+#                 Installed as ~/.local/bin/triumvirate-start-daemon by scripts/install.sh;
+#                 the plist must never point into a repo checkout or target/.
 
 set -euo pipefail
+
+FOREGROUND=0
+[[ "${1:-}" == "--foreground" ]] && FOREGROUND=1
+LAUNCHD_LABEL=com.triumvirate.daemon-v2
+if [[ $FOREGROUND -eq 0 ]] && launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1; then
+  echo "launchd agent $LAUNCHD_LABEL is loaded; restarting through launchd"
+  launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"
+  sleep 3
+  PID="$(ps -ax -o pid=,args= | awk '$2 ~ /(^|\/)triumvirate$/ && $3 == "daemon" { print $1 }' | head -1 || true)"
+  [[ -n "$PID" ]] || { echo "launchd did not bring the daemon back" >&2; exit 1; }
+  echo "daemon started under launchd: pid=$PID"
+  exit 0
+fi
 
 CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.claude.json}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -122,6 +144,15 @@ for pid in $(daemon_pids); do
 done
 
 mkdir -p "$(dirname "$LOG")"
+
+if [[ $FOREGROUND -eq 1 ]]; then
+  # launchd mode: become the daemon. Same `env -i` isolation and passthroughs as below.
+  exec env -i \
+    HOME="$HOME" USER="${USER:-$(id -un)}" \
+    "${ENV_ARGS[@]}" \
+    ${RUST_LOG:+RUST_LOG="$RUST_LOG"} \
+    "$BIN" daemon >>"$LOG" 2>&1 < /dev/null
+fi
 
 # Build the env assignments and exec. `env -i` is deliberate: inheriting the caller's shell
 # is how the drift happened. Only HOME/USER plus the MCP block get through.

@@ -26,11 +26,15 @@ mkdir -p "$(dirname "$DEST")"
 # install(1) writes atomically-ish and sets the mode in one step; a plain cp over a RUNNING
 # binary can fail with ETXTBSY, install replaces the directory entry instead.
 install -m 755 target/release/triumvirate "$DEST"
+# The launcher launchd runs (scripts/start-daemon.sh --foreground), at a stable path for the
+# same reason as the binary: a plist pointing into a worktree breaks when the worktree goes.
+install -m 755 "$REPO_ROOT/scripts/start-daemon.sh" "$(dirname "$DEST")/triumvirate-start-daemon"
 
 echo "installed: $("$DEST" --version 2>/dev/null || echo unknown) -> $DEST"
 cat <<'NOTE'
 
-NEXT — an install alone changes nothing that is already running:
+NEXT (launchd agent loaded): bash scripts/start-daemon.sh restarts the daemon through launchd.
+NEXT (no launchd agent): an install alone changes nothing that is already running:
   1. Kill the daemon so it reloads the new binary AND the current ~/.claude.json env:
        kill -TERM "$(lsof -tnP -iTCP:8080 -sTCP:LISTEN | head -1)"
        bash scripts/start-daemon.sh
