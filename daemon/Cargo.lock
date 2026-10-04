@@ -1534,6 +1534,7 @@ dependencies = [
  "anyhow",
  "fleet",
  "futures",
+ "ledger",
  "libc",
  "rusqlite",
  "serde",
