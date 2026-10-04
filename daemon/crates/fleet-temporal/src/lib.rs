@@ -10,6 +10,7 @@
 //! `tokio::spawn`. It gets its own OS thread with a current-thread runtime.
 
 pub mod worker;
+pub mod fleet_workflow;
 
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
@@ -215,7 +216,9 @@ fn worker_options(cfg: &WorkerConfig) -> anyhow::Result<WorkerOptions> {
     Ok(WorkerOptions::new(cfg.task_queue.clone())
         .register_workflow::<PingWorkflow>()?
         .register_workflow::<RunWorkerProbeWorkflow>()?
+        .register_workflow::<fleet_workflow::FleetWorkflow>()?
         .register_activities(FleetActivities)
+        .register_activities(fleet_workflow::FleetLedgerActivities)
         .build())
 }
 

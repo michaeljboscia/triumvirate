@@ -1537,6 +1537,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "shared-types",
  "tempfile",
  "temporalio-client",
  "temporalio-common",

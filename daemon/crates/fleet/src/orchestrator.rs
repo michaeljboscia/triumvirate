@@ -683,9 +683,6 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     &fleet_id,
                                     &task_id,
                                 );
-                                if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
-                                    let _ = task_store.complete_task(&task_id);
-                                }
                                 // The agent that DID the work, plus what was asked
                                 // for when they differ. Recording the requested agent
                                 // alone would credit gemini for a codex commit once
@@ -697,29 +694,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     "requested_agent": agent_name,
                                     "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
                                     "longest_silence_ms": longest_silence.as_millis() as u64,
-                                }).to_string();
-                                ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
-                                if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.clone()) {
-                                    // author_agent must be whoever actually wrote the code, or
-                                    // peer review can hand a codex diff back to codex to review
-                                    // its own work.
-                                    let _ = review_engine.request_review(peer_review::ReviewRequest {
-                                        fleet_id: Some(fleet_id.clone()),
-                                        author_agent: launch_agent.clone(),
-                                        artifact: format!("fleet/{fleet_id}/{task_id}"),
-                                        review_type: "code".to_string(),
-                                        // FIND-REVIEW-03: fleet queues a review for a human or
-                                        // an agent to pick up over MCP. It does not conduct it
-                                        // in-process, so it must stay client-writable.
-                                        dispatch_owned: false,
-                                    });
-                                    tracing::info!(
-                                        fleet_id = %fleet_id,
-                                        task_id = %task_id,
-                                        author_agent = %launch_agent,
-                                        "peer review requested for completed task"
-                                    );
-                                }
+                                });
+                                record_task_completed(&project_root, &fleet_id, &task_id, &launch_agent, payload);
                             }
                             Ok(status) => {
                                 // REQ-092: degraded route — when an agy gemini task fails,
@@ -1000,7 +976,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
     /// Start the merge phase once no task of this fleet is still pending. Every worker exit
     /// path calls this, including the ones that never launch a child: a fleet whose last
     /// worker returns early otherwise stays `running` with no merge and no failure event.
-    async fn finalize_if_all_tasks_terminal(&self, fleet_id: &str, project_root: &Path) {
+    pub async fn finalize_if_all_tasks_terminal(&self, fleet_id: &str, project_root: &Path) {
         let db_path = project_root.join(".triumvirate").join("ledger.db");
         let pending = rusqlite::Connection::open(db_path)
             .and_then(|conn| {
@@ -1436,6 +1412,49 @@ fn event_sequence_for(
         |row| row.get::<_, Option<i64>>(0),
     )?;
     Ok(max_seq.unwrap_or(0) + 1)
+}
+
+/// Record a fleet task as completed: the task row, the `task_completed` event, and the queued
+/// peer review. Shared by both engines so a completion is recorded one way.
+///
+/// `author_agent` must be whoever actually wrote the code, or peer review can hand a codex diff
+/// back to codex to review its own work.
+pub fn record_task_completed(
+    project_root: &Path,
+    fleet_id: &str,
+    task_id: &str,
+    author_agent: &str,
+    payload: serde_json::Value,
+) {
+    if let Ok(task_store) = FleetTaskStore::new(project_root.to_path_buf()) {
+        let _ = task_store.complete_task(task_id);
+    }
+    ingest_fleet_event(project_root, fleet_id, "task_completed", payload.to_string());
+    if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.to_path_buf()) {
+        let _ = review_engine.request_review(peer_review::ReviewRequest {
+            fleet_id: Some(fleet_id.to_string()),
+            author_agent: author_agent.to_string(),
+            artifact: format!("fleet/{fleet_id}/{task_id}"),
+            review_type: "code".to_string(),
+            // FIND-REVIEW-03: fleet queues a review for a human or an agent to pick up over
+            // MCP. It does not conduct it in-process, so it must stay client-writable.
+            dispatch_owned: false,
+        });
+        tracing::info!(fleet_id, task_id, author_agent, "peer review requested for completed task");
+    }
+}
+
+/// Record a fleet task as failed: the task row and the `task_failed` event. A row that cannot be
+/// updated is logged loudly: a task left `in_progress` keeps the fleet from ever finishing.
+pub fn record_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) {
+    match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).and_then(|conn| {
+        conn.execute("UPDATE tasks SET state = 'failed' WHERE task_id = ?1", rusqlite::params![task_id])
+    }) {
+        Ok(0) => tracing::error!(fleet_id, task_id, "failed task row not marked failed: no row matched"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(fleet_id, task_id, error = %e, "failed task row not marked failed"),
+    }
+    ingest_fleet_event(project_root, fleet_id, "task_failed", payload.to_string());
 }
 
 /// Wall-clock bound for one non-agy fleet worker. `TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS`,
