@@ -6731,6 +6731,49 @@ mod sight_gate_tests {
             .expect("three overlapping windows covering 1..=556 are a whole read");
     }
 
+    /// D-036, through the REAL classifier (codex_read hard-codes ReadFile, which is how the bug
+    /// hid: the gate was fine, `shell_read_kind` left a `;` chain as Bash). Codex read four sources
+    /// as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the review was discarded.
+    /// RED IF: windows of one file joined by `;` stop counting, or a `;` chain with anything else
+    /// in it (another file, a non-read, a masking `true`) starts counting.
+    #[test]
+    fn sight_36_semicolon_windows_of_one_file_are_a_whole_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "a.rs", 500);
+        let other = file_with_lines(dir.path(), "b.rs", 500);
+        let classified = |command: String| {
+            let args = serde_json::json!({ "command": command });
+            ToolCallRecord {
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+            }
+        };
+        let gate = |command: String| {
+            let mut lifecycle = Vec::new();
+            enforce_reviewer_sight(
+                "Codex", &[classified(command)], "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle,
+            )
+        };
+        gate(format!("/bin/zsh -lc \"sed -n '1,180p' {src}; sed -n '181,360p' {src}; sed -n '361,$p' {src}\""))
+            .expect("the D-036 shape covers the file");
+        gate(format!("/bin/zsh -lc \"sed -n '1,250p' {src}; nl -ba {src} | sed -n '251,500p'\""))
+            .expect("a nl window is a window");
+        for bad in [
+            format!("/bin/zsh -lc \"sed -n '1,250p' {src}; sed -n '251,500p' {other}\""),
+            format!("/bin/zsh -lc \"sed -n '1,500p' {other}; sed -n '1,1p' {src}\""),
+            format!("/bin/zsh -lc \"cat {src}; true\""),
+            format!("/bin/zsh -lc \"sed -n '1,500p' {src}; true\""),
+            format!("/bin/zsh -lc \"sed -n '1,250p' {src}; sed -n '251,499p' {src}\""),
+        ] {
+            assert!(gate(bad.clone()).is_err(), "must not satisfy the source: {bad}");
+        }
+    }
+
     /// A window that stops short is still a peek, and so is a set of windows with a hole in
     /// it. This is FIND-REVIEW-07 kept intact: `'500,$p'` returns the nonce on the last line
     /// and covers nothing before it.
