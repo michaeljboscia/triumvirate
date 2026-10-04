@@ -24,6 +24,8 @@ fn fleet_members_run_the_pinned_binaries_with_the_fleet_argv_only() {
     let (bin, argv) = fleet::orchestrator::fleet_agent_command("codex", Path::new("/wt"), "task").expect("codex");
     assert_eq!(bin, "/pinned/codex");
     assert_eq!(argv, fleet::orchestrator::fleet_codex_argv("task"));
+    // Not only "matches the helper": a helper that started appending the env args would match too (Grok).
+    assert!(!argv.iter().any(|a| a.contains("dangerously")), "{argv:?}");
 
     let (bin, argv) = fleet::orchestrator::fleet_agent_command("gemini", Path::new("/wt"), "task").expect("gemini");
     assert_eq!(bin, "/pinned/gemini");
