@@ -1905,8 +1905,88 @@ pub fn mark_fleet_cancelled(project_root: &Path, fleet_id: &str, reason: &str) -
 /// This was an inline tuple inside the spawn match, which is why it had no parse oracle: three
 /// of four codex argv surfaces emitted a flag the binary rejected in 2026-09 and every test
 /// stayed green, because the tests asserted what Triumvirate built, not what codex parses.
+/// The commit a fleet started from, as recorded in its `fleet_spawned` event. `None` when the
+/// ledger has no such event (or cannot be read).
+pub fn fleet_base_sha(project_root: &Path, fleet_id: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).ok()?;
+    let payload: String = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE session_id = ?1 AND event_type = 'fleet_spawned' ORDER BY sequence LIMIT 1",
+            [fleet_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&payload).ok()?;
+    v.get("head_sha").and_then(|h| h.as_str()).map(str::to_string)
+}
+
+/// Whether a member's run counts as DONE: it exited 0 AND left a new commit on its branch.
+///
+/// An exit code alone is not proof of work. On 2026-10-04 every codex fleet worker exited 0
+/// having written nothing (its sandbox was read-only), and the fleet recorded each one done.
+/// Fails closed: a head that cannot be read, or a base the ledger does not hold, is no proof.
+pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_sha: Option<&str>) -> Result<(), String> {
+    if exit_code != Some(0) {
+        return Err(format!("agent exited {exit_code:?}"));
+    }
+    match (branch_head, base_sha) {
+        (Some(head), Some(base)) if head != base => Ok(()),
+        (Some(head), Some(_)) => Err(format!(
+            "agent exited 0 without committing: its branch is still at the fleet's base {head}"
+        )),
+        (None, _) => Err("agent exited 0 but its branch head could not be read, so no commit is proven".to_string()),
+        (Some(_), None) => Err("agent exited 0 but the fleet's base commit is not in the ledger, so no new commit is proven".to_string()),
+    }
+}
+
+/// A fleet worker WRITES and COMMITS, so it runs codex's `workspace-write` sandbox.
+///
+/// Bare `codex exec` runs in codex's default READ-ONLY sandbox. Measured 2026-10-04 in a real
+/// `git worktree` through `fleet-shim`: codex replied "Blocked: the workspace is mounted
+/// read-only", wrote nothing, committed nothing, and EXITED 0, so the fleet recorded a done task
+/// with no work in it. Under `workspace-write` the same task wrote NOTES.md and committed it on
+/// the fleet branch, and a write into $HOME was still refused ("operation not permitted"): enough
+/// to do the work, no more.
 pub fn fleet_codex_argv(task_prompt: &str) -> Vec<String> {
-    vec!["exec".to_string(), "--".to_string(), task_prompt.to_string()]
+    vec![
+        "exec".to_string(),
+        "--sandbox".to_string(),
+        "workspace-write".to_string(),
+        "--".to_string(),
+        task_prompt.to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod judge_member_run_tests {
+    use super::judge_member_run;
+
+    /// RED IF a member that exited 0 with no new commit is recorded done (the quiet failure), or
+    /// a member that did commit is refused.
+    #[test]
+    fn done_needs_a_clean_exit_and_a_new_commit() {
+        assert!(judge_member_run(Some(0), Some("bbb"), Some("aaa")).is_ok());
+        let e = judge_member_run(Some(0), Some("aaa"), Some("aaa")).unwrap_err();
+        assert!(e.contains("without committing"), "{e}");
+        assert!(judge_member_run(Some(0), None, Some("aaa")).is_err());
+        assert!(judge_member_run(Some(0), Some("bbb"), None).is_err());
+        assert!(judge_member_run(Some(1), Some("bbb"), Some("aaa")).is_err());
+        assert!(judge_member_run(None, Some("bbb"), Some("aaa")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fleet_codex_argv_tests {
+    /// RED IF the codex fleet worker loses write access (it then exits 0 having done nothing and
+    /// the fleet reports success) or gains more than workspace-write.
+    #[test]
+    fn a_codex_fleet_worker_writes_inside_the_workspace_sandbox() {
+        let argv = super::fleet_codex_argv("task");
+        assert_eq!(argv.first().map(String::as_str), Some("exec"));
+        assert!(argv.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{argv:?}");
+        assert!(!argv.iter().any(|a| a.contains("dangerously") || a == "danger-full-access"), "{argv:?}");
+        assert_eq!(argv.last().map(String::as_str), Some("task"), "the prompt stays last, after --");
+    }
 }
 
 #[cfg(test)]
