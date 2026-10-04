@@ -1,0 +1,216 @@
+//! The fleet engine on Temporal (temporal-migration design `docs/designs/triumvirate-fleet.md`).
+//!
+//! Off unless `TRIUMVIRATE_FLEET_ENGINE=temporal`. With it on, `triumvirate daemon` runs a
+//! Temporal worker on queue `triumvirate-fleet` in namespace `triumvirate`, over mTLS with the
+//! `triumvirate-worker` client cert. Today it registers only [`PingWorkflow`], the liveness probe
+//! that proves the plumbing; `FleetWorkflow` lands on top of it.
+//!
+//! `Worker::run()` returns a future that is NOT `Send` (verified against temporalio-sdk 1.0.0,
+//! not stated in the docs), so the worker cannot go on the daemon's multi-thread runtime via
+//! `tokio::spawn`. It gets its own OS thread with a current-thread runtime.
+
+use std::{path::PathBuf, str::FromStr, time::Duration};
+
+use temporalio_client::{
+    Client, ClientOptions, ClientTlsOptions, Connection, ConnectionOptions, TlsOptions,
+};
+use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_sdk::{
+    ActivityOptions, Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
+    activities::{ActivityContext, ActivityError},
+};
+
+/// Whether the daemon runs the Temporal fleet engine. Default: legacy.
+pub fn engine_enabled() -> bool {
+    std::env::var("TRIUMVIRATE_FLEET_ENGINE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("temporal"))
+}
+
+/// Where and as whom the worker connects. Every field has an env override and a production
+/// default (the homebox stack in temporal-migration/deploy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerConfig {
+    pub address: String,
+    pub namespace: String,
+    pub task_queue: String,
+    pub cert_dir: PathBuf,
+    /// The name the server's TLS certificate is issued for.
+    pub tls_domain: String,
+}
+
+impl WorkerConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let var = |k: &str, d: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| d.to_string());
+        let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME is not set"))?;
+        Ok(Self {
+            address: var("TRIUMVIRATE_TEMPORAL_ADDRESS", "https://192.168.2.110:7233"),
+            namespace: var("TRIUMVIRATE_TEMPORAL_NAMESPACE", "triumvirate"),
+            task_queue: var("TRIUMVIRATE_TEMPORAL_TASK_QUEUE", "triumvirate-fleet"),
+            cert_dir: PathBuf::from(var(
+                "TRIUMVIRATE_TEMPORAL_CERT_DIR",
+                &format!("{home}/.temporal/triumvirate-worker"),
+            )),
+            tls_domain: var("TRIUMVIRATE_TEMPORAL_TLS_DOMAIN", "temporal"),
+        })
+    }
+}
+
+/// Connect a client over mTLS. Fails loudly on a missing cert file rather than falling back to
+/// plain TLS: the server refuses a client without a cert, and the error should name the file.
+pub async fn connect(cfg: &WorkerConfig) -> anyhow::Result<Client> {
+    let read = |name: &str| {
+        let p = cfg.cert_dir.join(name);
+        std::fs::read(&p).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", p.display()))
+    };
+    let tls = TlsOptions::builder()
+        .server_root_ca_cert(read("ca.cert")?)
+        .domain(cfg.tls_domain.clone())
+        .client_tls_options(
+            ClientTlsOptions::builder()
+                .client_cert(read("client.pem")?)
+                .client_private_key(read("client.key")?)
+                .build(),
+        )
+        .build();
+    let host = std::env::var("HOST").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "mac".to_string());
+    let conn = ConnectionOptions::new(url::Url::from_str(&cfg.address)?)
+        .identity(format!("triumvirate-daemon-{}@{host}", std::process::id()))
+        .tls_options(tls)
+        .build();
+    let connection = Connection::connect(conn).await?;
+    Ok(Client::new(connection, ClientOptions::new(cfg.namespace.clone()).build())?)
+}
+
+/// Liveness probe: a client starts it on `triumvirate-fleet` and gets back the worker's identity.
+/// If this completes, the daemon's worker is polling, connected and executing activities.
+#[workflow]
+#[derive(Default)]
+pub struct PingWorkflow;
+
+#[workflow_methods]
+impl PingWorkflow {
+    #[run(name = "triumvirate-ping")]
+    pub async fn run(ctx: &mut WorkflowContext<Self>, nonce: String) -> WorkflowResult<String> {
+        let pong = ctx
+            .execute_activity(
+                FleetActivities::pong,
+                nonce,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
+            )
+            .await?;
+        Ok(pong)
+    }
+}
+
+pub struct FleetActivities;
+
+#[activities]
+impl FleetActivities {
+    #[activity(name = "triumvirate-pong")]
+    pub async fn pong(_ctx: ActivityContext, nonce: String) -> Result<String, ActivityError> {
+        Ok(format!("pong {nonce} from triumvirate daemon pid {}", std::process::id()))
+    }
+}
+
+fn worker_options(cfg: &WorkerConfig) -> anyhow::Result<WorkerOptions> {
+    Ok(WorkerOptions::new(cfg.task_queue.clone())
+        .register_workflow::<PingWorkflow>()?
+        .register_activities(FleetActivities)
+        .build())
+}
+
+/// Run the worker until it fails. One attempt: the caller owns retry.
+async fn run_worker_once(cfg: &WorkerConfig) -> anyhow::Result<()> {
+    let runtime = Runtime::from_current_tokio(Default::default())?;
+    let client = connect(cfg).await?;
+    let mut worker = Worker::new(&runtime, client, worker_options(cfg)?)?;
+    tracing::info!(
+        namespace = %cfg.namespace,
+        task_queue = %cfg.task_queue,
+        address = %cfg.address,
+        "temporal fleet worker polling"
+    );
+    worker.run().await?;
+    Ok(())
+}
+
+/// Start the worker on its own thread and keep it running: a connect or poll failure is logged
+/// and retried with backoff (5 s doubling to 60 s), never silently abandoned. The no-pollers
+/// absence alert on this queue is what catches a worker that cannot get back up.
+pub fn spawn_worker_thread(cfg: WorkerConfig) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("temporal-fleet-worker".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(error = %e, "temporal fleet worker: cannot build its runtime; engine is DOWN");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let mut backoff = Duration::from_secs(5);
+                loop {
+                    match run_worker_once(&cfg).await {
+                        Ok(()) => tracing::warn!("temporal fleet worker stopped; restarting"),
+                        Err(e) => tracing::error!(error = %e, retry_in_s = backoff.as_secs(), "temporal fleet worker failed"),
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+            });
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One test owns every env var it touches, so nothing races.
+    #[test]
+    fn config_defaults_and_overrides() {
+        let keys = [
+            "TRIUMVIRATE_FLEET_ENGINE",
+            "TRIUMVIRATE_TEMPORAL_ADDRESS",
+            "TRIUMVIRATE_TEMPORAL_NAMESPACE",
+            "TRIUMVIRATE_TEMPORAL_TASK_QUEUE",
+            "TRIUMVIRATE_TEMPORAL_CERT_DIR",
+        ];
+        for k in keys {
+            unsafe { std::env::remove_var(k) };
+        }
+        // RED IF: the engine turns on by default. Installing the binary must change nothing.
+        assert!(!engine_enabled());
+        let d = WorkerConfig::from_env().expect("defaults");
+        assert_eq!(d.address, "https://192.168.2.110:7233");
+        assert_eq!(d.namespace, "triumvirate");
+        assert_eq!(d.task_queue, "triumvirate-fleet");
+        assert!(d.cert_dir.ends_with(".temporal/triumvirate-worker"));
+        assert_eq!(d.tls_domain, "temporal");
+
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_FLEET_ENGINE", " Temporal ");
+            std::env::set_var("TRIUMVIRATE_TEMPORAL_TASK_QUEUE", "triumvirate-fleet-exitcheck");
+        }
+        assert!(engine_enabled());
+        assert_eq!(WorkerConfig::from_env().expect("cfg").task_queue, "triumvirate-fleet-exitcheck");
+        unsafe { std::env::set_var("TRIUMVIRATE_FLEET_ENGINE", "legacy") };
+        assert!(!engine_enabled());
+        for k in keys {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    /// A missing cert fails loudly and names the file; it never falls back to plain TLS.
+    #[tokio::test]
+    async fn a_missing_cert_is_a_loud_error_naming_the_file() {
+        let cfg = WorkerConfig {
+            address: "https://127.0.0.1:1".to_string(),
+            namespace: "triumvirate".to_string(),
+            task_queue: "q".to_string(),
+            cert_dir: PathBuf::from("/nonexistent/triumvirate-worker"),
+            tls_domain: "temporal".to_string(),
+        };
+        let err = connect(&cfg).await.err().expect("must fail").to_string();
+        assert!(err.contains("/nonexistent/triumvirate-worker/ca.cert"), "{err}");
+    }
+}

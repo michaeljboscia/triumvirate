@@ -2990,6 +2990,21 @@ async fn run_daemon() -> anyhow::Result<()> {
     };
     run_startup_gc_if_needed(&state).await;
     tokio::spawn(run_startup_fleet_recovery());
+    // The Temporal fleet engine (design triumvirate-fleet.md). Off unless
+    // TRIUMVIRATE_FLEET_ENGINE=temporal; then a worker polls `triumvirate-fleet` on its own
+    // thread (Worker::run is not Send). A failure to start is loud and does not stop the daemon:
+    // the legacy engine keeps serving.
+    if fleet_temporal::engine_enabled() {
+        match fleet_temporal::WorkerConfig::from_env()
+            .map_err(|e| e.to_string())
+            .and_then(|cfg| fleet_temporal::spawn_worker_thread(cfg.clone()).map(|_| cfg).map_err(|e| e.to_string()))
+        {
+            Ok(cfg) => tracing::info!(task_queue = %cfg.task_queue, namespace = %cfg.namespace, "temporal fleet engine ON: worker thread started"),
+            Err(e) => tracing::error!(error = %e, "temporal fleet engine requested but the worker did not start"),
+        }
+    } else {
+        tracing::info!("temporal fleet engine off (TRIUMVIRATE_FLEET_ENGINE is not 'temporal')");
+    }
     let app = Router::new()
         .route("/", get(daemon_http::dashboard_root_route))
         .route("/assets/{*path}", get(daemon_http::dashboard_assets_route))

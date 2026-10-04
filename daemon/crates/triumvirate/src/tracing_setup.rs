@@ -16,7 +16,7 @@ static LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 pub(crate) fn init_tracing() -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
-            "triumvirate=info,daemon_core=info,daemon_http=info,agent_worker=info,agent_adapter=info,mcp_bridge=info,mcp_tools=info,fallback_outbox=info,shared_types=info,warn".into()
+            "triumvirate=info,fleet_temporal=info,daemon_core=info,daemon_http=info,agent_worker=info,agent_adapter=info,mcp_bridge=info,mcp_tools=info,fallback_outbox=info,shared_types=info,warn".into()
         });
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     let use_stderr = should_write_logs_to_stderr();

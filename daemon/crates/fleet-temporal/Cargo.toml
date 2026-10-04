@@ -1,0 +1,23 @@
+[package]
+name = "fleet-temporal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The fleet engine on Temporal (temporal-migration design triumvirate-fleet.md, slice 1).
+# Its own crate so the SDK's dependency tree stays out of every other crate.
+# Exact pins on purpose: a workflow definition change needs replay tests, and an SDK bump is
+# one. Building needs `protoc` (prost-wkt-types build script): brew install protobuf, or
+# apt-get install protobuf-compiler in CI.
+[dependencies]
+temporalio-sdk = "=1.0.0"
+temporalio-client = "=1.0.0"
+temporalio-common = "=1.0.0"
+temporalio-macros = "=1.0.0"
+temporalio-workflow = "=1.0.0"
+futures = "0.3"
+serde.workspace = true
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+anyhow.workspace = true
+tracing.workspace = true
+url = "2"
