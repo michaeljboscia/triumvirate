@@ -2893,6 +2893,7 @@ fn enforce_reviewer_sight(
                 peeked.join(", "),
                 evidence.join(" | ")
             );
+            let detail = format!("{detail}{}", delegation_note(tool_calls));
             lifecycle.push(LifecycleEvent {
                 state: "REJECTED".to_string(),
                 detail: detail.clone(),
@@ -2924,6 +2925,7 @@ fn enforce_reviewer_sight(
                 missed.join(", "),
                 evidence.join(" | ")
             );
+            let detail = format!("{detail}{}", delegation_note(tool_calls));
             lifecycle.push(LifecycleEvent {
                 state: "REJECTED".to_string(),
                 detail: detail.clone(),
@@ -2934,7 +2936,8 @@ fn enforce_reviewer_sight(
     }
 
     // No named sources to check, so fall back to the weaker question: did it look at anything.
-    if !tool_calls.is_empty() {
+    // Handing the work to a subagent is not looking.
+    if tool_calls.iter().any(|c| c.tool != agent_adapter::codex::COLLAB_TOOL) {
         return Ok(());
     }
 
@@ -2946,11 +2949,24 @@ fn enforce_reviewer_sight(
          Re-dispatch naming the primary sources by absolute path, or drop require_sight if this \
          call was never meant to be a review."
     );
+    let detail = format!("{detail}{}", delegation_note(tool_calls));
     lifecycle.push(LifecycleEvent {
         state: "REJECTED".to_string(),
         detail: detail.clone(),
     });
     Err(detail)
+}
+
+/// Said in a rejection when the agent handed work to a subagent, so the reader fixes the cause
+/// (delegation) instead of chasing "never opened".
+fn delegation_note(tool_calls: &[ToolCallRecord]) -> &'static str {
+    if tool_calls.iter().any(|c| c.tool == agent_adapter::codex::COLLAB_TOOL) {
+        " CAUSE: the agent delegated to a subagent (collab_tool_call). A subagent's reads are not \
+         in this stream, so they cannot back a review. Re-dispatch; the review prompt already \
+         forbids delegation, so a repeat is the agent ignoring it."
+    } else {
+        ""
+    }
 }
 
 fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
@@ -4349,6 +4365,18 @@ fn is_git_worktree(path: &str) -> bool {
     }
 }
 
+/// Appended to every read-only (review) codex prompt. Codex delegates reads to a subagent through
+/// `spawn_agent`, whose reads never reach this stream, so the sight gate rejects the review as
+/// "never opened" and the work is thrown away (2026-10-03, three times). No codex setting stops
+/// it on 0.154.0 (`--disable multi_agent`, `agents.max_depth=0` and `max_threads=1` were all
+/// tried live; a child thread still ran), so the instruction is the control, and the gate names
+/// delegation when it happens anyway.
+const CODEX_REVIEW_TOOL_NOTE: &str = "\n\nTool note for this read-only review: do ALL reading yourself. \
+Do not spawn, delegate to or wait on subagents or other agents (spawn_agent, wait_agent): their reads \
+are invisible to this review's verification and the review will be rejected. Read each file with \
+`cat FILE` or `sed -n 'A,Bp' FILE` windows that together cover every line. \
+Always finish with your written answer.";
+
 async fn run_codex_cli_process_with_session(
     bin: &str,
     args: &[String],
@@ -4467,7 +4495,11 @@ async fn run_codex_cli_process_with_session(
     ));
     final_args.push("--output-last-message".to_string());
     final_args.push(output_file.display().to_string());
-    final_args.push(message.to_string());
+    if read_only {
+        final_args.push(format!("{message}{CODEX_REVIEW_TOOL_NOTE}"));
+    } else {
+        final_args.push(message.to_string());
+    }
 
     let mut command = Command::new(bin);
     command
@@ -6772,6 +6804,28 @@ mod sight_gate_tests {
         ] {
             assert!(gate(bad.clone()).is_err(), "must not satisfy the source: {bad}");
         }
+    }
+
+    /// RED IF: a review that delegated to a codex subagent is rejected without naming delegation,
+    /// or a delegation alone counts as "looked at something" on the no-sources gate.
+    #[test]
+    fn sight_37_a_delegated_review_is_rejected_and_says_why() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "a.rs", 50);
+        let mut parser = agent_adapter::codex::CodexExecParser::new();
+        let line = r#"{"type":"item.started","item":{"id":"i7","type":"collab_tool_call","tool":"wait","receiver_thread_ids":[]}}"#;
+        let _ = parser.parse_line(line);
+        let tools = parser.finish().tool_calls;
+        assert_eq!(tools.len(), 1, "the collab call must be recorded");
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("a delegated review read nothing itself");
+        assert!(err.contains("delegated to a subagent"), "{err}");
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &[], &cwd, &mut lifecycle)
+            .expect_err("delegating is not looking");
+        assert!(err.contains("delegated to a subagent"), "{err}");
     }
 
     /// A window that stops short is still a peek, and so is a set of windows with a hole in

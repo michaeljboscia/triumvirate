@@ -117,6 +117,9 @@ pub fn whole_file_read_operand(command: &str) -> Option<String> {
     whole_file_reader_with_one_operand(cmd).map(|(op, _)| op)
 }
 
+/// The `--json` item type codex emits for subagent (multi-agent) tool calls.
+pub const COLLAB_TOOL: &str = "collab_tool_call";
+
 /// The segments of an `&&` chain, quotes honored. A command with no `&&` is one segment.
 ///
 /// D-017: codex read a 97-line brief with `wc -l F && sed -n '1,240p' F`, which reads every
@@ -770,6 +773,22 @@ impl CodexExecParser {
                 Some(event)
             }
             _ => {
+                // A subagent's reads happen in another thread and never reach this stream, so a
+                // review that delegated is a review this process cannot verify. Record the call
+                // (never as a read) so the sight gate can say "delegated" instead of "never
+                // opened". Verified on codex-cli 0.154.0: `--disable multi_agent` and
+                // `agents.max_depth=0` do NOT stop `spawn_agent`, and the spawn itself is not in
+                // the --json stream; only the later `collab_tool_call` wait is.
+                if started && item_type == COLLAB_TOOL {
+                    self.tool_calls.push(ToolCallRecord {
+                        id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
+                        tool: COLLAB_TOOL.to_string(),
+                        kind: ToolKind::Unknown,
+                        success: None,
+                        duration_ms: None,
+                        args_json: Some(item.to_string()),
+                    });
+                }
                 let state = if started {
                     WorkingState::ToolCallStarted
                 } else {
