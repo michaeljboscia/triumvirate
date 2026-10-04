@@ -105,10 +105,17 @@ pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
     let me = std::process::id();
     let token = WorkerToken::for_spawned_child(me, &args.fleet_id, &args.task_id, &args.agent)
         .ok_or_else(|| anyhow::anyhow!("fleet-shim: cannot read our own process identity, or we do not lead our group"))?;
-    // Stale outputs from an earlier attempt must not be read as this run's.
-    for p in [
-        done_path(&args.project_root, &args.fleet_id, &args.task_id)?,
-    ] {
+    // Survive a group SIGTERM ourselves so the agent's end gets recorded. Installed BEFORE the
+    // token exists: once the token is on disk a cancel may signal the group, and a shim killed in
+    // that window would leave no record (Codex, review of 3871850). The agent gets the default
+    // dispositions back before exec (SIG_IGN is inherited across exec otherwise).
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        set_signal(sig, libc::SIG_IGN);
+    }
+    // Stale outputs from an earlier attempt must not be read as this run's: the done record and
+    // a half-written one a SIGKILLed shim left behind.
+    let done = done_path(&args.project_root, &args.fleet_id, &args.task_id)?;
+    for p in [done.clone(), done.with_extension("done.tmp")] {
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -120,11 +127,6 @@ pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
     let out = File::create(out_path(&args.project_root, &args.fleet_id, &args.task_id)?)?;
     let err = File::create(err_path(&args.project_root, &args.fleet_id, &args.task_id)?)?;
 
-    // Survive the group SIGTERM ourselves so the agent's end gets recorded; the agent gets the
-    // default dispositions back before exec (SIG_IGN is inherited across exec otherwise).
-    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        set_signal(sig, libc::SIG_IGN);
-    }
     let mut cmd = Command::new(&args.command[0]);
     cmd.args(&args.command[1..])
         .current_dir(&args.worktree)
@@ -161,10 +163,20 @@ pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
         shim_pid: me,
         shim_start_time_us: token.start_time_us,
     };
+    // Durable, not only atomic: the record is how a retry knows the agent finished, so a power
+    // loss must not erase it and rerun finished work (Codex, review of 3871850).
     let path = done_path(&args.project_root, &args.fleet_id, &args.task_id)?;
     let tmp = path.with_extension("done.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&done)?)?;
+    {
+        use std::io::Write;
+        let mut f = File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec_pretty(&done)?)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, &path)?;
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
     Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
 }
 

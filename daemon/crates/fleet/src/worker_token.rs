@@ -319,6 +319,22 @@ pub fn write_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) -
     fs::write(path, b"")
 }
 
+/// Create the launch marker only if it does not exist: `Ok(true)` when this caller now owns the
+/// launch, `Ok(false)` when another attempt already does. Exclusive create (O_EXCL) closes the
+/// window between deciding to launch and launching, in which two attempts could both decide
+/// "fresh" and both spawn the agent (Codex, review of 3871850).
+pub fn try_claim_launch(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Result<bool> {
+    let path = launch_marker_path(project_root, fleet_id, task_id)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn clear_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) {
     if let Ok(path) = launch_marker_path(project_root, fleet_id, task_id) {
         match fs::remove_file(&path) {

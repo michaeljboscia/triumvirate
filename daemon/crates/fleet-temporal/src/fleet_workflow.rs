@@ -20,7 +20,7 @@ use shared_types::GitOps;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityExecutionError, ActivityOptions, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
-    WorkflowResult,
+    WorkflowResult, WorkflowTermination,
     activities::{ActivityContext, ActivityError},
 };
 
@@ -82,13 +82,67 @@ pub struct FleetWorkflow {
     members: Vec<MemberStatus>,
 }
 
+/// Why a fleet run stopped short. Every abort, from ANY step, goes through `abort_fleet`, so a
+/// crash, a failure or a cancel can no longer leave the fleet Temporal-owned and `running` with
+/// no one to finish it (Grok, review of 3871850).
+struct Abort {
+    cancelled: bool,
+    reason: String,
+    /// The failure to end the workflow with; None for a cancel.
+    error: Option<ActivityExecutionError>,
+}
+
+fn abort(e: ActivityExecutionError) -> Abort {
+    let cancelled = matches!(e, ActivityExecutionError::Cancelled(_));
+    Abort { cancelled, reason: e.to_string(), error: (!cancelled).then_some(e) }
+}
+
+/// Options for steps that must run even after the workflow is cancelled: recording outcomes that
+/// already happened, and the abort cleanup. A token the workflow's cancellation cannot reach.
+fn detached(opts_timeout: Duration) -> ActivityOptions {
+    ActivityOptions::with_start_to_close_timeout(opts_timeout)
+        .cancellation_token(WorkflowCancellationToken::new())
+        .retry_policy(
+            temporalio_common::RetryPolicy::builder()
+                .initial_interval(Duration::from_secs(2))
+                .maximum_attempts(3)
+                .build(),
+        )
+        .build()
+}
+
 #[workflow_methods]
 impl FleetWorkflow {
     #[run(name = "triumvirate-fleet")]
     pub async fn run(ctx: &mut WorkflowContext<Self>, input: FleetInput) -> WorkflowResult<FleetResult> {
+        match Self::drive(ctx, &input).await {
+            Ok(result) => Ok(result),
+            Err(a) => {
+                let cancelled = a.cancelled || ctx.cancellation_token().is_cancelled();
+                ctx.state_mut(|s| {
+                    for m in s.members.iter_mut().filter(|m| m.state == "running" || m.state == "pending") {
+                        m.state = if cancelled { "cancelled" } else { "failed" }.to_string();
+                    }
+                });
+                ctx.execute_activity(
+                    FleetLedgerActivities::abort_fleet,
+                    AbortInput { fleet: input, cancelled, reason: a.reason.clone() },
+                    detached(Duration::from_secs(180)),
+                )
+                .await?;
+                match a.error {
+                    Some(e) if !cancelled => Err(e.into()),
+                    _ => Err(WorkflowTermination::cancelled()),
+                }
+            }
+        }
+    }
+
+    async fn drive(ctx: &mut WorkflowContext<Self>, input: &FleetInput) -> Result<FleetResult, Abort> {
         let plans = ctx
             .execute_activity(FleetLedgerActivities::prepare_fleet, input.clone(), io_options())
-            .await?;
+            .await
+            .map_err(abort)?;
         ctx.state_mut(|s| {
             s.members = plans
                 .iter()
@@ -109,40 +163,18 @@ impl FleetWorkflow {
             .collect();
         let results = temporalio_sdk::workflows::join_all(runs).await;
 
+        // Record EVERY member that finished, success or failure, before acting on a cancel: an
+        // outcome that already happened must reach the ledger whatever happens next (a failed
+        // member was dropped when another was cancelled: Grok, review of 3871850). Detached, so
+        // a cancel cannot stop the recording of what already happened.
         let mut cancelled: Option<ActivityExecutionError> = None;
-        let mut outcomes = Vec::new();
         for (plan, result) in plans.iter().zip(results) {
-            match result {
-                Err(e @ ActivityExecutionError::Cancelled(_)) => {
-                    cancelled.get_or_insert(e);
-                }
-                other => outcomes.push((plan.clone(), other)),
-            }
-        }
-        if cancelled.is_some() || ctx.cancellation_token().is_cancelled() {
-            ctx.state_mut(|s| {
-                for m in s.members.iter_mut().filter(|m| m.state == "running") {
-                    m.state = "cancelled".to_string();
-                }
-            });
-            ctx.execute_activity(
-                FleetLedgerActivities::cancel_cleanup,
-                input.clone(),
-                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(120))
-                    // A token the workflow's own cancellation cannot reach, or cleanup is
-                    // cancelled too and the ledger stays `running`.
-                    .cancellation_token(WorkflowCancellationToken::new())
-                    .build(),
-            )
-            .await?;
-            if let Some(e) = cancelled {
-                return Err(e.into());
-            }
-        }
-
-        for (plan, result) in outcomes {
             let (output, error) = match result {
                 Ok(o) => (Some(o), None),
+                Err(e @ ActivityExecutionError::Cancelled(_)) => {
+                    cancelled.get_or_insert(e);
+                    continue;
+                }
                 Err(e) => (None, Some(e.to_string())),
             };
             let outcome = TaskOutcome {
@@ -154,8 +186,9 @@ impl FleetWorkflow {
                 error,
             };
             let state = ctx
-                .execute_activity(FleetLedgerActivities::record_task_outcome, outcome, io_options())
-                .await?;
+                .execute_activity(FleetLedgerActivities::record_task_outcome, outcome, detached(Duration::from_secs(120)))
+                .await
+                .map_err(abort)?;
             ctx.state_mut(|s| {
                 if let Some(m) = s.members.iter_mut().find(|m| m.task_id == plan.task_id) {
                     m.state = state.clone();
@@ -164,10 +197,19 @@ impl FleetWorkflow {
                 }
             });
         }
+        if let Some(e) = cancelled {
+            return Err(abort(e));
+        }
+        // A cancel that arrived after every member finished: their outcomes are recorded above;
+        // the merge must not run for a cancelled fleet.
+        if ctx.cancellation_token().is_cancelled() {
+            return Err(Abort { cancelled: true, reason: "cancelled after every member finished".to_string(), error: None });
+        }
 
         let ledger_state = ctx
-            .execute_activity(FleetLedgerActivities::finalize_fleet, input, io_options())
-            .await?;
+            .execute_activity(FleetLedgerActivities::finalize_fleet, input.clone(), io_options())
+            .await
+            .map_err(abort)?;
         Ok(FleetResult { ledger_state, members: ctx.state(|s| s.members.clone()) })
     }
 
@@ -176,6 +218,13 @@ impl FleetWorkflow {
     pub fn status(&self, _ctx: &WorkflowContextView) -> Vec<MemberStatus> {
         self.members.clone()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortInput {
+    pub fleet: FleetInput,
+    pub cancelled: bool,
+    pub reason: String,
 }
 
 fn app_err(e: impl std::fmt::Display) -> ActivityError {
@@ -251,24 +300,44 @@ impl FleetLedgerActivities {
         Ok(state)
     }
 
-    /// After a cancel: stop any verified worker still running, mark the ledger cancelled.
-    #[activity(name = "triumvirate-cancel-cleanup")]
-    pub async fn cancel_cleanup(_ctx: ActivityContext, input: FleetInput) -> Result<usize, ActivityError> {
-        let root = PathBuf::from(&input.project_root);
-        let report = fleet::orchestrator::stop_fleet_workers(
-            &root,
-            &input.fleet_id,
-            Vec::new(),
-            fleet::orchestrator::fleet_kill_grace(),
-        )
-        .await;
+    /// The one cleanup for every abort, cancel or failure, at any step. Stops any verified worker
+    /// still running; then marks the ledger cancelled or failed and fails any task left in
+    /// flight. If a worker cannot be PROVEN stopped it refuses to mark anything: claiming
+    /// `cancelled` while an agent may still run is the lie this engine exists to end (Grok,
+    /// review of 3871850). Then the workflow fails with that error instead.
+    #[activity(name = "triumvirate-abort-fleet")]
+    pub async fn abort_fleet(_ctx: ActivityContext, a: AbortInput) -> Result<String, ActivityError> {
+        let root = PathBuf::from(&a.fleet.project_root);
+        let fleet_id = &a.fleet.fleet_id;
+        let report = fleet::orchestrator::stop_fleet_workers(&root, fleet_id, Vec::new(), fleet::orchestrator::fleet_kill_grace()).await;
         if !report.problems.is_empty() {
-            tracing::error!(fleet_id = %input.fleet_id, problems = ?report.problems, "cancel cleanup: workers may still be running");
+            tracing::error!(fleet_id = %fleet_id, problems = ?report.problems, "abort: a worker may still be running; ledger left as it is");
+            return Err(ActivityError::Application(Box::new(temporalio_sdk::ApplicationFailure::non_retryable(format!(
+                "fleet {fleet_id} could not be stopped cleanly; workers may still run: {}",
+                report.problems.join("; ")
+            )))));
         }
-        if !fleet::orchestrator::mark_fleet_cancelled(&root, &input.fleet_id, "cancelled through the Temporal engine") {
-            return Err(app_err("the ledger could not be marked cancelled"));
-        }
-        Ok(report.stopped)
+        let state = if a.cancelled { "cancelled" } else { "failed" };
+        let reason = if a.cancelled {
+            "cancelled through the Temporal engine".to_string()
+        } else {
+            format!("Temporal engine: {}", a.reason.chars().take(500).collect::<String>())
+        };
+        let db = root.join(".triumvirate").join("ledger.db");
+        let conn = rusqlite::Connection::open(&db).map_err(app_err)?;
+        conn.execute(
+            "UPDATE fleets SET state = ?2, failure_reason = ?3
+             WHERE fleet_id = ?1 AND state NOT IN ('done', 'failed', 'cancelled')",
+            rusqlite::params![fleet_id, state, reason],
+        )
+        .map_err(app_err)?;
+        conn.execute(
+            "UPDATE tasks SET state = 'failed'
+             WHERE fleet_id = ?1 AND state IN ('pending', 'claimed', 'in_progress')",
+            rusqlite::params![fleet_id],
+        )
+        .map_err(app_err)?;
+        Ok(state.to_string())
     }
 }
 

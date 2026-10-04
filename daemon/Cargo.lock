@@ -1535,6 +1535,7 @@ dependencies = [
  "fleet",
  "futures",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "shared-types",

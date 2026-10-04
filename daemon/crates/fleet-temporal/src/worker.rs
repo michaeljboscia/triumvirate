@@ -8,7 +8,7 @@
 //!   is not its parent and cannot wait() on it.
 //! - FINISHED: a done record from the shim the token names. Return it; nothing runs again.
 //! - BLOCK (non-retryable): a Refused token (our process, but not in its group), or a launch
-//!   marker with no token (a spawn began and nothing names the process).
+//!   marker whose owner never produced a live token (checked in `launch`).
 //!
 //! Cancellation arrives through heartbeats; it stops the verified group (SIGTERM, grace,
 //! SIGKILL, every result checked) and returns cancelled.
@@ -79,9 +79,10 @@ pub fn decide(root: &Path, fleet_id: &str, task_id: &str) -> Result<Start, Block
             Verification::Gone | Verification::Reused(_) => Ok(Start::Fresh),
             Verification::Refused(why) => Err(Blocked(format!("worker cannot be verified: {why}"))),
         },
-        (None, _) if worker_token::has_launch_marker(root, fleet_id, task_id) => Err(Blocked(
-            "a launch began but no token was written; a worker may be running that nothing names".to_string(),
-        )),
+        // No token. A launch marker here means another attempt may be mid-launch, or one died
+        // between claiming and spawning: `launch` sorts that out (its exclusive claim fails, it
+        // waits for a live token to adopt, and blocks only if none appears). Blocking here would
+        // fail a member while a concurrent attempt is starting it.
         (None, _) => Ok(Start::Fresh),
     }
 }
@@ -94,11 +95,29 @@ fn shim_bin() -> std::io::Result<PathBuf> {
     }
 }
 
-/// Launch a fresh shim and return it once its token is on disk.
-pub async fn launch(input: &RunWorkerInput) -> Result<(tokio::process::Child, WorkerToken), Blocked> {
+/// Launch a fresh shim and return it once its token is on disk. If another attempt already owns
+/// the launch (its marker exists), wait for THAT shim's token and return it with no child: this
+/// attempt adopts it rather than starting the agent a second time.
+pub async fn launch(input: &RunWorkerInput) -> Result<(Option<tokio::process::Child>, WorkerToken), Blocked> {
     let root = Path::new(&input.project_root);
-    worker_token::write_launch_marker(root, &input.fleet_id, &input.task_id)
+    let claimed = worker_token::try_claim_launch(root, &input.fleet_id, &input.task_id)
         .map_err(|e| Blocked(format!("launch marker could not be written: {e}")))?;
+    if !claimed {
+        let started = Instant::now();
+        loop {
+            if let Ok(Some(t)) = worker_token::read_token(root, &input.fleet_id, &input.task_id)
+                && t.verify() == Verification::Live
+            {
+                return Ok((None, t));
+            }
+            if started.elapsed() > TOKEN_WAIT {
+                return Err(Blocked(
+                    "another attempt holds the launch marker but no live worker token appeared".to_string(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     let bin = shim_bin().map_err(|e| Blocked(format!("cannot locate the shim binary: {e}")))?;
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("fleet-shim")
@@ -123,13 +142,19 @@ pub async fn launch(input: &RunWorkerInput) -> Result<(tokio::process::Child, Wo
         }
     };
     let pid = child.id().unwrap_or(0);
+    // Our child's OS start time, read now while it certainly exists. The token must carry the same
+    // pid AND start time: the pid alone could match a stale token after pid reuse (Codex, review
+    // of 3871850). Not "is it Live now": a fast worker can finish before this loop looks, and its
+    // token is still ours.
+    let child_start = worker_token::proc_info(pid).map(|i| i.start_time_us);
     let started = Instant::now();
     loop {
         if let Ok(Some(t)) = worker_token::read_token(root, &input.fleet_id, &input.task_id)
             && t.pid == pid
+            && child_start.is_some_and(|cs| cs == t.start_time_us)
         {
             worker_token::clear_launch_marker(root, &input.fleet_id, &input.task_id);
-            return Ok((child, t));
+            return Ok((Some(child), t));
         }
         if let Ok(Some(status)) = child.try_wait() {
             worker_token::clear_launch_marker(root, &input.fleet_id, &input.task_id);
@@ -197,7 +222,7 @@ mod tests {
         assert!(matches!(decide(root, f, t), Ok(Start::Fresh)), "nothing on disk: fresh");
 
         worker_token::write_launch_marker(root, f, t).expect("marker");
-        assert!(matches!(decide(root, f, t), Err(Blocked(_))), "marker, no token: blocked");
+        assert!(matches!(decide(root, f, t), Ok(Start::Fresh)), "marker, no token: launch decides (claim fails, waits, adopts or blocks)");
         worker_token::clear_launch_marker(root, f, t);
 
         let mut live = spawn_leader("sleep 30");
@@ -223,5 +248,30 @@ mod tests {
         let _ = live.kill();
         let _ = live.wait();
         assert!(matches!(decide(root, f, t), Ok(Start::Fresh)), "dead shim, no matching done: fresh");
+    }
+
+    /// Two attempts racing to launch one member: the second finds the first's marker, waits for
+    /// its live token and adopts it, spawning nothing. RED IF it launches a second agent.
+    #[tokio::test]
+    async fn a_second_attempt_adopts_instead_of_launching_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let input = RunWorkerInput {
+            project_root: root.display().to_string(),
+            fleet_id: "fleet-d".to_string(),
+            task_id: "fleet-d-T-001".to_string(),
+            agent: "stub".to_string(),
+            worktree: root.display().to_string(),
+            // Would be visible if launched: the test asserts no child came back.
+            command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+        };
+        assert!(worker_token::try_claim_launch(root, "fleet-d", "fleet-d-T-001").unwrap(), "first attempt claims");
+        let mut first = spawn_leader("sleep 30");
+        worker_token::write_token(root, &token_for(first.id())).expect("first attempt's token");
+        let (child, token) = launch(&input).await.ok().expect("second attempt adopts");
+        assert!(child.is_none(), "the second attempt must not spawn anything");
+        assert_eq!(token.pid, first.id());
+        let _ = first.kill();
+        let _ = first.wait();
     }
 }

@@ -166,7 +166,8 @@ impl FleetActivities {
             }
             Ok(Start::Fresh) => {
                 let (c, t) = worker::launch(&input).await.map_err(non_retryable)?;
-                (Some(c), t, false)
+                let adopted = c.is_none();
+                (c, t, adopted)
             }
             Err(b) => return Err(non_retryable(b)),
         };
@@ -198,14 +199,30 @@ impl FleetActivities {
                     let t = token.clone();
                     let grace = fleet::orchestrator::fleet_kill_grace();
                     let stopped = tokio::task::spawn_blocking(move || t.terminate(grace)).await;
-                    if let Some(c) = child.as_mut() {
-                        let _ = c.wait().await;
+                    match stopped {
+                        Ok(Ok(outcome)) => {
+                            // Reap our own child, bounded: it is stopped, so this returns at once.
+                            if let Some(c) = child.as_mut() {
+                                let _ = tokio::time::timeout(Duration::from_secs(5), c.wait()).await;
+                            }
+                            tracing::warn!(fleet_id = %input.fleet_id, task_id = %input.task_id, ?outcome, "run_worker: cancelled; worker group stopped");
+                            return Err(ActivityError::cancelled());
+                        }
+                        // A worker that could not be proven stopped is NOT reported cancelled
+                        // (Codex, review of 3871850): the workflow's abort then refuses to mark
+                        // the fleet cancelled either.
+                        Ok(Err(e)) => {
+                            return Err(non_retryable(Blocked(format!("cancel could not stop the worker for {}: {e}", input.task_id))));
+                        }
+                        Err(e) => {
+                            return Err(non_retryable(Blocked(format!("cancel task failed for {}: {e}", input.task_id))));
+                        }
                     }
-                    tracing::warn!(fleet_id = %input.fleet_id, task_id = %input.task_id, result = ?stopped, "run_worker: cancelled; worker group stopped");
-                    return Err(ActivityError::cancelled());
                 }
                 _ = tokio::time::sleep(worker::POLL) => {
-                    let _ = ctx.record_heartbeat(input.task_id.clone()).await;
+                    if let Err(e) = ctx.record_heartbeat(input.task_id.clone()).await {
+                        tracing::warn!(task_id = %input.task_id, error = %e, "run_worker: heartbeat failed");
+                    }
                 }
             }
         }
@@ -254,9 +271,15 @@ pub fn spawn_worker_thread(cfg: WorkerConfig) -> std::io::Result<std::thread::Jo
             rt.block_on(async move {
                 let mut backoff = Duration::from_secs(5);
                 loop {
+                    let ran = std::time::Instant::now();
                     match run_worker_once(&cfg).await {
                         Ok(()) => tracing::warn!("temporal fleet worker stopped; restarting"),
                         Err(e) => tracing::error!(error = %e, retry_in_s = backoff.as_secs(), "temporal fleet worker failed"),
+                    }
+                    // A run that was healthy for a while earns a fast reconnect again; only a run
+                    // that keeps failing at once backs off toward the cap (Codex, review).
+                    if ran.elapsed() > Duration::from_secs(120) {
+                        backoff = Duration::from_secs(5);
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(60));

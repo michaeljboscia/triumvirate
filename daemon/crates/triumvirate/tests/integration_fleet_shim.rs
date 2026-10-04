@@ -81,9 +81,23 @@ fn a_stub_runs_and_everything_lands_outside_the_worktree() {
 #[test]
 fn a_group_sigterm_ends_the_agent_and_the_shim_records_it() {
     let fx = fixture();
-    let mut child = start(&fx, "sleep 30");
+    let agent_pid_file = fx.root.join("agent.pid");
+    let mut child = start(&fx, &format!("echo $$ > {}; exec sleep 30", agent_pid_file.display()));
     let token = wait_token(&fx.root);
-    std::thread::sleep(Duration::from_millis(300)); // let the agent start
+    let agent_pid = {
+        let started = Instant::now();
+        loop {
+            if let Some(p) = std::fs::read_to_string(&agent_pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+                break p;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "agent never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // While the agent runs, the worktree is still untouched (Antigravity: a shim that writes
+    // there mid-run and cleans up before exit would pass an after-the-fact check).
+    let mid_run: Vec<_> = std::fs::read_dir(&fx.worktree).unwrap().flatten().map(|e| e.path()).collect();
+    assert!(mid_run.is_empty(), "nothing in the worktree while the agent runs: {mid_run:?}");
     let started = Instant::now();
     worker_token::signal_group(token.pgid, libc::SIGTERM).expect("signal");
     let status = child.wait().expect("wait");
@@ -91,6 +105,8 @@ fn a_group_sigterm_ends_the_agent_and_the_shim_records_it() {
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "the shim reports the agent's signal");
     let done = shim::read_done(&fx.root, FLEET, TASK).unwrap().expect("the shim must record a cancelled run");
     assert_eq!(done.signal, Some(libc::SIGTERM));
+    // The AGENT is gone, not only the shim's record of it (Antigravity, review).
+    assert!(worker_token::proc_info(agent_pid).is_none(), "the agent {agent_pid} must be dead");
 }
 
 /// SIGKILL takes the shim too, so no done record: that is how a retry reads "partial".
@@ -108,6 +124,11 @@ fn a_sigkilled_shim_leaves_no_done_record() {
 #[test]
 fn a_stale_done_record_is_cleared_before_the_agent_runs() {
     let fx = fixture();
+    // Another task's record in the same fleet directory must survive (Antigravity: a shim that
+    // cleared every record would pass a one-task test and corrupt a real fleet).
+    let other = shim::done_path(&fx.root, FLEET, "fleet-shimtest-T-002").unwrap();
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"{}").unwrap();
     assert_eq!(start(&fx, "exit 0").wait().expect("wait").code(), Some(0));
     let mut child = start(&fx, "sleep 30");
     let _ = wait_token(&fx.root);
@@ -116,6 +137,7 @@ fn a_stale_done_record_is_cleared_before_the_agent_runs() {
         shim::read_done(&fx.root, FLEET, TASK).unwrap().is_none(),
         "the previous attempt's done record survived into a running attempt"
     );
+    assert!(other.exists(), "another task's done record must not be touched");
     let t = worker_token::read_token(&fx.root, FLEET, TASK).unwrap().unwrap();
     worker_token::signal_group(t.pgid, libc::SIGKILL).expect("cleanup");
     let _ = child.wait();

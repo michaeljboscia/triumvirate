@@ -73,7 +73,13 @@ async fn a_changed_workflow_fails_replay() {
     // It must fail for the RIGHT reason: incompatibility with the history, not a setup error.
     let text = format!("{err:?}").to_lowercase();
     eprintln!("replay error: {text}");
-    assert!(text.contains("nondetermin"), "expected a nondeterminism failure, got: {text}");
+    // The specific nondeterminism, not any error containing the word (Antigravity, review):
+    // the server's code, and the two activity types that disagree.
+    assert!(text.contains("tmprl1100"), "expected TMPRL1100, got: {text}");
+    assert!(
+        text.contains("triumvirate-prepare-fleet") && text.contains("triumvirate-finalize-fleet"),
+        "expected the prepare/finalize mismatch, got: {text}"
+    );
 }
 
 /// Capture a fixture (live server; run explicitly):

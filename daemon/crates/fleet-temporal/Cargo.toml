@@ -23,6 +23,7 @@ tracing.workspace = true
 url = "2"
 fleet = { path = "../fleet" }
 shared-types = { path = "../shared-types" }
+rusqlite = "0.32"
 serde_json.workspace = true
 libc.workspace = true
 
