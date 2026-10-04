@@ -26,6 +26,13 @@ mkdir -p "$(dirname "$DEST")"
 # install(1) writes atomically-ish and sets the mode in one step; a plain cp over a RUNNING
 # binary can fail with ETXTBSY, install replaces the directory entry instead.
 install -m 755 target/release/triumvirate "$DEST"
+# A STABLE code-signing identity. The linker's ad-hoc signature names the binary
+# `triumvirate-<hash>`, a new identity on every build, and macOS Local Network privacy decides per
+# identity: the launchd daemon's Temporal worker got "No route to host" to 192.168.2.110 after an
+# install (2026-10-04) until the new identity was approved. One fixed identifier, approved once.
+if [[ "$(uname)" == Darwin ]]; then
+  codesign --force --sign - --identifier com.triumvirate.daemon "$DEST"
+fi
 # The launcher launchd runs (scripts/start-daemon.sh --foreground), at a stable path for the
 # same reason as the binary: a plist pointing into a worktree breaks when the worktree goes.
 install -m 755 "$REPO_ROOT/scripts/start-daemon.sh" "$(dirname "$DEST")/triumvirate-start-daemon"
