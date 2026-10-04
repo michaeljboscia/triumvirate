@@ -593,4 +593,18 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    /// A live owner with NO tokens yet (a fleet still `spawning`). Isolates the owner-record
+    /// check: the token check cannot rescue it. RED IF the owner-record check is removed
+    /// (Antigravity, review of d434e38).
+    #[test]
+    fn a_live_owner_with_no_tokens_yet_is_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        seed(&root, "fleet-sp", &["T-001"]);
+        worker_token::write_owner_record(&root, "fleet-sp", &worker_token::ProcessIdentity::current().expect("me")).expect("owner");
+        let report = recover_stale_fleets(&root, OPTS).expect("recover");
+        assert_eq!(report.live_owner, vec!["fleet-sp".to_string()]);
+        assert_eq!(task_states(&root, "fleet-sp"), vec!["in_progress"]);
+    }
 }

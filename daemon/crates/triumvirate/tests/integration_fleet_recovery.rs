@@ -190,11 +190,18 @@ fn a_restarted_daemon_stops_orphans_first_then_fails_the_fleet_and_keeps_worktre
     cleanup.daemons.push(start_daemon(&home, &log));
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut failed_seen = false;
+    let mut reset_seen = false;
     loop {
         if !failed_seen && fleet_state(&crashed, "fleet-crashed").0 == "failed" {
             failed_seen = true;
             assert!(!alive(polite), "the fleet was failed while an orphan was still running");
             assert!(!alive(stubborn), "the fleet was failed while the SIGTERM-ignoring orphan was still running");
+        }
+        // The task reset is the step that lets a second claimant in, so it must come after the
+        // orphans too, not merely the fleet state (Antigravity, review of d434e38).
+        if !reset_seen && task_states(&crashed, "fleet-crashed").iter().any(|s| s == "pending") {
+            reset_seen = true;
+            assert!(!alive(polite) && !alive(stubborn), "a task was reset to pending while an orphan was still running");
         }
         if fs::read_to_string(&log).unwrap_or_default().contains("startup fleet recovery finished") {
             break;

@@ -834,7 +834,7 @@ async fn execute_ask_agent_inner(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
-    let execution_prompt = inject_tool_marker_prompt(&req.message);
+    let execution_prompt = inject_tool_marker_prompt(&with_required_sources(&req.message, &req.required_sources));
     // Named sessions get their own worker record; one-shot ask_agent keeps the shared one.
     let session_key = req.session_key.as_deref();
     let worker = acquire_worker(&agent, &exec_cwd, session_key).await;
@@ -1982,6 +1982,20 @@ async fn execute_ask_agent_inner(
             .map(|p| format!("; dead drop launched at {}", p.display()))
             .unwrap_or_default()
     ))
+}
+
+/// Name the required sources IN the prompt. They used to reach only the sight gate, so a
+/// reviewer told "read each source" had to guess which files those were. Antigravity guessed
+/// `package.json` and `go.mod`, every read failed, and the review came back empty (D-035,
+/// reproduced 2026-10-03). Every agent gets the list, not only agy.
+fn with_required_sources(message: &str, sources: &[String]) -> String {
+    if sources.is_empty() {
+        return message.to_string();
+    }
+    let list = sources.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n");
+    format!(
+        "{message}\n\nSources you must read in full (absolute paths; they exist, do not search for others):\n{list}"
+    )
 }
 
 fn inject_tool_marker_prompt(user_prompt: &str) -> String {
@@ -9668,6 +9682,15 @@ mod stall_unit_tests {
             token_usage: None,
             ts_ms: None,
         }
+    }
+
+    /// RED IF: a source-gated dispatch reaches the agent without the paths it must read (D-035).
+    #[test]
+    fn required_sources_are_named_in_the_prompt() {
+        let p = with_required_sources("review this", &["/abs/a.rs".to_string(), "/abs/b.rs".to_string()]);
+        assert!(p.starts_with("review this"));
+        assert!(p.contains("- /abs/a.rs") && p.contains("- /abs/b.rs"), "{p}");
+        assert_eq!(with_required_sources("plain", &[]), "plain");
     }
 
     /// RED IF: the detector's own STUCK events count as progress. They fire while a run is

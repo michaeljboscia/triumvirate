@@ -25,10 +25,11 @@ file is the thing you read to answer "what do we know is broken right now."
 **CHECK to close:** a single shell call of `sed -n` windows joined by `;` or `&&` that covers lines 1 to N satisfies the source; a chain that includes a non-read command is still judged per segment.
 
 ### D-035 - Antigravity reviews return empty output after making tool calls
-**Found:** 2026-10-03 (legacy-fixes review, three of three attempts) · **Severity:** HIGH (the seat cannot review) · **NOT FIXED**
-**Evidence:** `agy returned empty output (status=SUCCESS, permission_requests=0, tool_calls=N)` with N = 1, 6 and 3 on three `review_agent` dispatches the same day, including one with only about 1,400 lines of sources. 41 such lines in `~/.triumvirate/outbox.jsonl` overall. Dead drops under `~/.triumvirate/dead-drop/*-gemini.md`.
-**Unknown:** whether agy produced an answer the capture lost, or produced none. Not investigated in that session.
-**CHECK to close:** a `review_agent` dispatch to antigravity over one 500-line source returns a non-empty review on three consecutive attempts, and the empty-output rate in the outbox drops.
+**Found:** 2026-10-03 (legacy-fixes review, three of three attempts) · **Severity:** HIGH (the seat cannot review) · **FIX LANDED 2026-10-03; open until the CHECK passes through the daemon**
+**Evidence:** `agy returned empty output (status=SUCCESS, permission_requests=0, tool_calls=N)` with N = 1, 6 and 3 on three `review_agent` dispatches the same day. 41 such lines in `~/.triumvirate/outbox.jsonl` overall.
+**Cause (reproduced with agy 1.2.16 and the daemon's exact prompt, streams in temporal-migration/reviews/2026-10-03/legacy-fixes/d035-*.jsonl):** three things together. (1) `review_agent` sent `sources` to the sight gate only, never into the prompt, so the reviewer guessed files (`package.json`, `go.mod`, a root `Cargo.toml`) that do not exist. (2) Under the read-only seatbelt agy's shell tool cannot start (`failed to create PTY: operation not permitted`, then print mode denies the command), so only its file viewer works. (3) With every tool call failed, agy exits `SUCCESS` with an empty `result.response`, and the error said only "empty output". NOT the agy version: 1.2.16 with paths in the prompt returned full reviews three times; the 1.2.7 pin is warn-only.
+**Fix:** required sources are named in every source-gated prompt (`with_required_sources`, all agents); read-only agy prompts carry a tool note (file viewer, no shell, always answer); an empty result now reports failed-call count and the first tool error, and keeps the prompt, raw stream and stderr under `{triumvirate_home}/agy-failures/`.
+**CHECK to close:** a `review_agent` dispatch to antigravity over one 500-line source returns a non-empty review on three consecutive attempts through the installed daemon.
 
 ### D-032 - The sight gate credits the read a reviewer ASKED for, not the one it received
 **Found:** 2026-09-24 (D-028 panel, Codex) · **Severity:** LOW today, structural · **NOT FIXED**

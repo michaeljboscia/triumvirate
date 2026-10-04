@@ -491,7 +491,9 @@ mod tests {
         assert!(!reaped(&mut s, Duration::from_millis(300)), "the process must still be running");
     }
 
-    /// RED IF: a tampered token can aim the signal at another group (here the test runner's).
+    /// A tampered token aims the signal at the test runner's own group. RED IF the refusal is
+    /// removed: the SIGKILL then lands on this test binary and the whole run dies, which is a loud
+    /// failure rather than a failed assertion (Antigravity, review of d434e38).
     #[test]
     fn a_wrong_pgid_is_refused() {
         let mut s = stub("sleep 30");
@@ -523,7 +525,11 @@ mod tests {
             // SAFETY: waitpid on our own child.
             unsafe { libc::waitpid(pid as i32, &mut status, 0) };
         });
+        let started = Instant::now();
         assert_eq!(t.terminate(Duration::from_secs(3)), Ok(TerminateOutcome::Terminated));
+        // RED IF terminate sleeps out the whole grace instead of polling: a worker that stops
+        // on SIGTERM must not hold recovery for the full grace (Antigravity, review of d434e38).
+        assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
         reaper.join().expect("reaper");
         // Already reaped by the thread above; Stub's drop would wait on a pid we no longer own.
         std::mem::forget(s);
@@ -567,7 +573,7 @@ mod tests {
     #[test]
     fn ids_that_would_escape_the_token_directory_are_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for bad in ["../x", "a/b", "..", ""] {
+        for bad in ["../x", "a/b", "..", "", "a\\b", "..\\x"] {
             assert!(token_path(dir.path(), "fleet-1", bad).is_err(), "{bad:?}");
             assert!(token_path(dir.path(), bad, "t").is_err(), "{bad:?}");
         }

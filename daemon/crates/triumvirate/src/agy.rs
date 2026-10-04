@@ -324,6 +324,15 @@ pub(crate) async fn run_agy_cli_process_with_session(
     // REQ-059: version pin — warn on drift, or refuse under strict mode.
     enforce_version_pin()?;
 
+    // A read-only review runs under the seatbelt, where agy's shell tool cannot start (it fails
+    // creating a PTY, then print mode denies the command). Say so, or agy spends the turn on
+    // failing shell calls and gives up with an empty answer (D-035, reproduced 2026-10-03).
+    let message: std::borrow::Cow<'_, str> = if read_only {
+        std::borrow::Cow::Owned(format!("{message}{AGY_REVIEW_TOOL_NOTE}"))
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    };
+
     // REQ-040/042: single-turn. Ignore inbound session id; never pass resume flags.
     if session_id.is_some() {
         tracing::debug!("agy backend is single-turn; ignoring inbound session_id");
@@ -395,9 +404,9 @@ pub(crate) async fn run_agy_cli_process_with_session(
         }
         let attempt_kill_after = kill_after.min(remaining);
         let run = if use_pty {
-            run_agy_once_pty(bin, extra_args, message, cwd, attempt_kill_after, read_only).await
+            run_agy_once_pty(bin, extra_args, &message, cwd, attempt_kill_after, read_only).await
         } else {
-            run_agy_once(bin, extra_args, message, cwd, attempt_kill_after, read_only).await
+            run_agy_once(bin, extra_args, &message, cwd, attempt_kill_after, read_only).await
         };
         drop(slot);
         match run {
@@ -464,6 +473,7 @@ pub(crate) async fn run_agy_cli_process_with_session(
                         continue;
                     }
                     let status = sp.status().map(str::to_string);
+                    let first_tool_error = sp.first_tool_error().map(str::to_string);
                     let mut parsed = sp.finish();
                     if parsed.response_text.trim().is_empty() {
                         if let Some(signal) = quota_signal.as_deref() {
@@ -495,15 +505,22 @@ pub(crate) async fn run_agy_cli_process_with_session(
                             .filter(|c| matches!(c.kind, agent_adapter::ToolKind::RequestUserInput))
                             .count();
                         let status_label = status.as_deref().unwrap_or("none");
+                        let kept = keep_failed_stream(&message, &text, &stderr);
+                        let failed_calls = parsed.tool_calls.iter().filter(|c| c.success == Some(false)).count();
                         tracing::warn!(
                             status = status_label,
                             permission_requests,
                             tool_calls = parsed.tool_calls.len(),
+                            failed_tool_calls = failed_calls,
+                            first_tool_error = first_tool_error.as_deref().unwrap_or("none"),
+                            raw_stream = kept.as_deref().unwrap_or("not kept"),
                             "agy stream-json result carried no response text (attempt {attempt})"
                         );
                         last_err = Some(anyhow::anyhow!(
-                            "agy returned empty output (status={status_label}, permission_requests={permission_requests}, tool_calls={})",
-                            parsed.tool_calls.len()
+                            "agy returned empty output (status={status_label}, permission_requests={permission_requests}, tool_calls={}, failed={failed_calls}{}; raw stream: {})",
+                            parsed.tool_calls.len(),
+                            first_tool_error.as_deref().map(|e| format!(", first error: {e}")).unwrap_or_default(),
+                            kept.as_deref().unwrap_or("not kept")
                         ));
                         continue;
                     }
@@ -829,6 +846,29 @@ async fn run_agy_once(
 
     cleanup_invocation(&inv);
     outcome
+}
+
+/// Appended to every read-only agy prompt. See D-035.
+const AGY_REVIEW_TOOL_NOTE: &str = "\n\nTool note for this read-only review: shell commands are not available here and will fail. \
+Read files with your file-view tool, using the absolute paths given above. Do not guess at other files. \
+Always finish with your written answer, even if a tool call failed.";
+
+/// Keep the evidence of an empty agy result: the prompt agy was given, its raw stdout stream and
+/// its stderr, under `{triumvirate_home}/agy-failures/`. Returns the directory. D-035: every one
+/// of these used to be deleted with the run, so "empty output" could never be diagnosed after
+/// the fact. Best effort; a failure to keep it must not change the call's outcome.
+fn keep_failed_stream(prompt: &str, stdout: &str, stderr: &str) -> Option<String> {
+    let home = daemon_core::triumvirate_home_dir().ok()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dir = home.join("agy-failures").join(format!("{stamp}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join("prompt.txt"), prompt).ok()?;
+    std::fs::write(dir.join("stdout.jsonl"), stdout).ok()?;
+    std::fs::write(dir.join("stderr.txt"), stderr).ok()?;
+    Some(dir.display().to_string())
 }
 
 /// Remove the per-dispatch sandbox profile + log file.
