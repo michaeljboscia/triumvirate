@@ -62,6 +62,11 @@ jobs:
         run: npm install -g @openai/codex && codex --version
       - name: Run unit tests
         run: cargo test --workspace --exclude pantheon --lib
+      # The Temporal fleet engine's replay gate. An integration test, so `--lib` above never ran
+      # it: a nondeterministic change to FleetWorkflow would have shipped green. Offline (it
+      # replays a recorded history), no server needed.
+      - name: FleetWorkflow replay gate
+        run: cargo test -p fleet-temporal --test replay
 
   build:
     name: Build Release
