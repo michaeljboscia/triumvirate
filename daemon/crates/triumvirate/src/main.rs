@@ -167,6 +167,27 @@ enum CliCommand {
     Proxy,
     /// Watch live agent streaming events.
     Watch(watch::WatchArgs),
+    /// Internal: run one fleet worker for the Temporal engine (launched by its run_worker
+    /// activity). Not for hand use.
+    #[command(hide = true)]
+    FleetShim(FleetShimArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct FleetShimArgs {
+    #[arg(long)]
+    project_root: PathBuf,
+    #[arg(long)]
+    fleet_id: String,
+    #[arg(long)]
+    task_id: String,
+    #[arg(long)]
+    agent: String,
+    #[arg(long)]
+    worktree: PathBuf,
+    /// The agent command line, after `--`.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
 }
 
 /// Append one line per `wiki_search` call to `~/.triumvirate/wiki-search.jsonl`.
@@ -1787,6 +1808,17 @@ async fn main() -> anyhow::Result<()> {
         }
         CliCommand::Status => {
             run_status().await?;
+        }
+        CliCommand::FleetShim(a) => {
+            let code = fleet::shim::run(&fleet::shim::ShimArgs {
+                project_root: a.project_root,
+                fleet_id: a.fleet_id,
+                task_id: a.task_id,
+                agent: a.agent,
+                worktree: a.worktree,
+                command: a.command,
+            })?;
+            std::process::exit(code);
         }
         CliCommand::Doctor => {
             run_doctor().await?;
