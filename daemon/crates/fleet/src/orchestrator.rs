@@ -34,6 +34,15 @@ pub struct FleetSpawnResult {
     pub worktree_paths: Vec<PathBuf>,
 }
 
+/// One prepared fleet member: its task, agent, worktree and the prompt it runs with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedMember {
+    pub task_id: String,
+    pub agent: String,
+    pub worktree: PathBuf,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FleetOrchestrator<G: GitOps, L: AgentLauncher = DaemonAgentLauncher> {
     worktree: WorktreeManager<G>,
@@ -81,51 +90,7 @@ impl AgentLauncher for DaemonAgentLauncher {
             return Ok(child);
         }
 
-        let (cmd, args): (String, Vec<String>) = match agent {
-            "codex" => ("codex".to_string(), fleet_codex_argv(task_prompt)),
-            "gemini" => match mcp_bridge::gemini_backend() {
-                // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
-                // Under agy it spawns the shared sandbox-exec invocation (single-turn,
-                // no resume flags — REQ-091) instead of the soon-dead `gemini` binary;
-                // pipe capture is fine (agy doesn't drop over a pipe). The per-dispatch
-                // profile/log temp files are reaped by the OS from the temp dir.
-                mcp_bridge::GeminiBackend::Agy => {
-                    let (bin, extra) = mcp_bridge::agy_command();
-                    let cwd = worktree_path.to_string_lossy();
-                    let inv = mcp_bridge::agy::build_agy_invocation(
-                        &bin,
-                        &extra,
-                        task_prompt,
-                        &cwd,
-                        // Fleet workers WRITE code by design, so they keep the operator
-                        // default. read_only is for review dispatches, where a write is
-                        // never legitimate.
-                        false,
-                    )
-                        .map_err(|e| anyhow::anyhow!("failed to assemble agy invocation for fleet: {e}"))?;
-                    (inv.program, inv.args)
-                }
-                mcp_bridge::GeminiBackend::GeminiCli => {
-                    ("gemini".to_string(), vec!["-p".to_string(), task_prompt.to_string()])
-                }
-            },
-            // REQ-GROK-004: fleet reuses the SAME invocation builder as the consult path, so
-            // a fleet worker inherits the forbidden-flag guard, the sandbox default, and the
-            // session-flag rules rather than assembling a second, divergent argv.
-            //
-            // No session id: a fleet worker is single-turn in its own worktree, so passing one
-            // would either create a session nothing resumes or, worse, resume a stranger's.
-            "grok" => {
-                let (bin, extra) = mcp_bridge::grok_command();
-                let cwd = worktree_path.to_string_lossy();
-                let inv = mcp_bridge::grok::build_grok_invocation(
-                    &bin, &extra, task_prompt, &cwd, None, false,
-                )
-                .map_err(|e| anyhow::anyhow!("failed to assemble grok invocation for fleet: {e}"))?;
-                (inv.program, inv.args)
-            }
-            _ => anyhow::bail!("unsupported fleet agent: {agent}"),
-        };
+        let (cmd, args) = fleet_agent_command(agent, worktree_path, task_prompt)?;
         let mut child = Command::new(&cmd);
         let child = child
             .args(&args)
@@ -143,6 +108,58 @@ impl AgentLauncher for DaemonAgentLauncher {
         let child = child.spawn()?;
         Ok(child)
     }
+}
+
+/// The program and argv a fleet member's agent is spawned with. One builder for both engines:
+/// the legacy launcher below, and the Temporal engine's run_worker (through `fleet-shim`), so a
+/// worker runs the same CLI the same way whichever engine launched it.
+pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let (cmd, args): (String, Vec<String>) = match agent {
+        "codex" => ("codex".to_string(), fleet_codex_argv(task_prompt)),
+        "gemini" => match mcp_bridge::gemini_backend() {
+            // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
+            // Under agy it spawns the shared sandbox-exec invocation (single-turn,
+            // no resume flags — REQ-091) instead of the soon-dead `gemini` binary;
+            // pipe capture is fine (agy doesn't drop over a pipe). The per-dispatch
+            // profile/log temp files are reaped by the OS from the temp dir.
+            mcp_bridge::GeminiBackend::Agy => {
+                let (bin, extra) = mcp_bridge::agy_command();
+                let cwd = worktree_path.to_string_lossy();
+                let inv = mcp_bridge::agy::build_agy_invocation(
+                    &bin,
+                    &extra,
+                    task_prompt,
+                    &cwd,
+                    // Fleet workers WRITE code by design, so they keep the operator
+                    // default. read_only is for review dispatches, where a write is
+                    // never legitimate.
+                    false,
+                )
+                    .map_err(|e| anyhow::anyhow!("failed to assemble agy invocation for fleet: {e}"))?;
+                (inv.program, inv.args)
+            }
+            mcp_bridge::GeminiBackend::GeminiCli => {
+                ("gemini".to_string(), vec!["-p".to_string(), task_prompt.to_string()])
+            }
+        },
+        // REQ-GROK-004: fleet reuses the SAME invocation builder as the consult path, so
+        // a fleet worker inherits the forbidden-flag guard, the sandbox default, and the
+        // session-flag rules rather than assembling a second, divergent argv.
+        //
+        // No session id: a fleet worker is single-turn in its own worktree, so passing one
+        // would either create a session nothing resumes or, worse, resume a stranger's.
+        "grok" => {
+            let (bin, extra) = mcp_bridge::grok_command();
+            let cwd = worktree_path.to_string_lossy();
+            let inv = mcp_bridge::grok::build_grok_invocation(
+                &bin, &extra, task_prompt, &cwd, None, false,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to assemble grok invocation for fleet: {e}"))?;
+            (inv.program, inv.args)
+        }
+        _ => anyhow::bail!("unsupported fleet agent: {agent}"),
+    };
+    Ok((cmd, args))
 }
 
 impl<G: GitOps + Clone + 'static> FleetOrchestrator<G, DaemonAgentLauncher> {
@@ -266,21 +283,50 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
         })
     }
 
-    async fn spawn_fleet_members(
+    /// Prepare every member of a fleet: the ledger rows, the worktrees and their task files, and
+    /// the ledger events. Shared by both engines (the legacy spawn below, and the Temporal
+    /// engine's `prepare_fleet` activity), so a fleet is prepared one way whichever engine runs it.
+    ///
+    /// Idempotent, because a Temporal activity can run twice: rows are inserted only when missing,
+    /// an existing worktree is reused only after it is shown to be on this task's branch, and an
+    /// event is written only when the ledger does not already hold it. A fresh fleet is prepared
+    /// exactly as before.
+    pub async fn prepare_fleet_members(
         &self,
-        project_root: PathBuf,
-        fleet_id: String,
-        head_sha: String,
-        agents: Vec<String>,
-        task_description: String,
-    ) -> anyhow::Result<Vec<PathBuf>> {
+        project_root: &Path,
+        fleet_id: &str,
+        head_sha: &str,
+        agents: &[String],
+        task_description: &str,
+    ) -> anyhow::Result<Vec<PreparedMember>> {
+        let project_root = project_root.to_path_buf();
+        let fleet_id = fleet_id.to_string();
         let base = project_root.join(".triumvirate").join("worktrees");
         fs::create_dir_all(&base)?;
         let store = LedgerStore::open(project_root.clone())?;
         let task_store = FleetTaskStore::new(project_root.clone())?;
-        task_store.insert_fleet(&fleet_id, &task_description)?;
-        let mut worktree_paths = Vec::new();
-        let mut running_agents = Vec::new();
+        let db = project_root.join(".triumvirate").join("ledger.db");
+        let exists = |sql: &str, key: &str| -> anyhow::Result<bool> {
+            let conn = rusqlite::Connection::open(&db)?;
+            Ok(conn.query_row(sql, [key], |r| r.get::<_, i64>(0))? > 0)
+        };
+        let event_exists = |event_type: &str, task_id: Option<&str>| -> anyhow::Result<bool> {
+            let conn = rusqlite::Connection::open(&db)?;
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = ?2 AND payload_json LIKE ?3",
+                rusqlite::params![
+                    fleet_id.as_str(),
+                    event_type,
+                    task_id.map(|t| format!("%\"{t}\"%")).unwrap_or_else(|| "%".to_string())
+                ],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        };
+        if !exists("SELECT COUNT(*) FROM fleets WHERE fleet_id = ?1", &fleet_id)? {
+            task_store.insert_fleet(&fleet_id, task_description)?;
+        }
+        let mut prepared = Vec::new();
         for (idx, agent) in agents.iter().enumerate() {
             // D-015: task ids must be unique across fleets, not just within one. `tasks.task_id`
             // is the ledger's PRIMARY KEY, so the bare `T-001` made the SECOND fleet in any repo
@@ -301,17 +347,36 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let task_id = format!("{fleet_id}-T-{:03}", idx + 1);
             let branch = format!("fleet/{fleet_id}/{task_id}");
             let worktree_path = base.join(format!("{fleet_id}-{task_id}-{agent}"));
-            task_store.insert_task(&task_id, &fleet_id, &task_id, &[])?;
-            let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+            if !exists("SELECT COUNT(*) FROM tasks WHERE task_id = ?1", &task_id)? {
+                task_store.insert_task(&task_id, &fleet_id, &task_id, &[])?;
+            }
+            let conn = rusqlite::Connection::open(&db)?;
             conn.execute(
                 "UPDATE tasks
                  SET state = 'in_progress', assigned_agent = ?2
                  WHERE task_id = ?1",
                 rusqlite::params![task_id.as_str(), agent.as_str()],
             )?;
-            self.worktree
-                .create_worktree(&worktree_path, &branch)
-                .await?;
+            if worktree_path.exists() {
+                // A retry: reuse it only if it is this task's worktree, on this task's branch.
+                let out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&worktree_path)
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .await?;
+                let on = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !out.status.success() || on != branch {
+                    anyhow::bail!(
+                        "{} exists but is not on {branch} (on {on:?}); refusing to reuse it",
+                        worktree_path.display()
+                    );
+                }
+            } else {
+                self.worktree
+                    .create_worktree(&worktree_path, &branch)
+                    .await?;
+            }
             fs::create_dir_all(worktree_path.join(".triumvirate"))?;
             fs::write(
                 worktree_path.join(".triumvirate").join("fleet-task.md"),
@@ -322,52 +387,80 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             let task_prompt = format!(
                 "You are a fleet agent working in a git worktree. Read your task assignment at .triumvirate/fleet-task.md and complete the work. Commit your changes when done.\n\nTask: {task_description}"
             );
-            let sequence = event_sequence_for(&project_root, &fleet_id, "agent_started")?;
-            store.ingest_event(RawEvent {
-                session_id: fleet_id.clone(),
-                event_type: "agent_started".to_string(),
-                sequence,
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                payload_json: serde_json::json!({
-                    "fleet_id": fleet_id,
-                    "task_id": task_id,
-                    "agent": agent
-                })
-                .to_string(),
-            })?;
-            let sequence = event_sequence_for(&project_root, &fleet_id, "task_claimed")?;
-            store.ingest_event(RawEvent {
-                session_id: fleet_id.clone(),
-                event_type: "task_claimed".to_string(),
-                sequence,
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                payload_json: serde_json::json!({
-                    "task_id": task_id,
-                    "assigned_agent": agent
-                })
-                .to_string(),
-            })?;
-            // Launch subprocesses after all worktrees are prepared.
-            running_agents.push((task_prompt, task_id.clone(), agent.to_string()));
-            worktree_paths.push(worktree_path);
+            if !event_exists("agent_started", Some(&task_id))? {
+                let sequence = event_sequence_for(&project_root, &fleet_id, "agent_started")?;
+                store.ingest_event(RawEvent {
+                    session_id: fleet_id.clone(),
+                    event_type: "agent_started".to_string(),
+                    sequence,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: serde_json::json!({
+                        "fleet_id": fleet_id,
+                        "task_id": task_id,
+                        "agent": agent
+                    })
+                    .to_string(),
+                })?;
+            }
+            if !event_exists("task_claimed", Some(&task_id))? {
+                let sequence = event_sequence_for(&project_root, &fleet_id, "task_claimed")?;
+                store.ingest_event(RawEvent {
+                    session_id: fleet_id.clone(),
+                    event_type: "task_claimed".to_string(),
+                    sequence,
+                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    payload_json: serde_json::json!({
+                        "task_id": task_id,
+                        "assigned_agent": agent
+                    })
+                    .to_string(),
+                })?;
+            }
+            prepared.push(PreparedMember {
+                task_id,
+                agent: agent.to_string(),
+                worktree: worktree_path,
+                prompt: task_prompt,
+            });
         }
 
-        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+        let conn = rusqlite::Connection::open(&db)?;
         conn.execute(
             "UPDATE fleets SET state = 'running' WHERE fleet_id = ?1",
             [fleet_id.as_str()],
         )?;
-        store.ingest_event(RawEvent {
-            session_id: fleet_id.clone(),
-            event_type: "fleet_spawned".to_string(),
-            sequence: 1,
-            timestamp: "2030-01-01T00:00:00Z".to_string(),
-            payload_json: serde_json::json!({
-                "head_sha": head_sha,
-                "agent_count": agents.len()
-            })
-            .to_string(),
-        })?;
+        if !event_exists("fleet_spawned", None)? {
+            store.ingest_event(RawEvent {
+                session_id: fleet_id.clone(),
+                event_type: "fleet_spawned".to_string(),
+                sequence: 1,
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                payload_json: serde_json::json!({
+                    "head_sha": head_sha,
+                    "agent_count": agents.len()
+                })
+                .to_string(),
+            })?;
+        }
+        Ok(prepared)
+    }
+
+    async fn spawn_fleet_members(
+        &self,
+        project_root: PathBuf,
+        fleet_id: String,
+        head_sha: String,
+        agents: Vec<String>,
+        task_description: String,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let prepared = self
+            .prepare_fleet_members(&project_root, &fleet_id, &head_sha, &agents, &task_description)
+            .await?;
+        let worktree_paths: Vec<PathBuf> = prepared.iter().map(|m| m.worktree.clone()).collect();
+        let running_agents: Vec<(String, String, String)> = prepared
+            .into_iter()
+            .map(|m| (m.prompt, m.task_id, m.agent))
+            .collect();
 
         // Launch all agent processes in parallel and monitor completion.
         let mut join_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -2874,5 +2967,62 @@ mod tests {
         assert!(!super::fleet_cancel_requested(&root, "fleet-x"));
         assert!(super::mark_fleet_cancelled(&root, "fleet-x", "test"));
         assert!(super::fleet_cancel_requested(&root, "fleet-x"));
+    }
+
+    /// prepare_fleet_members is called by a Temporal activity, which can run twice. RED IF a second
+    /// call duplicates a ledger row or event, makes a second worktree, or fails on the first one.
+    #[tokio::test]
+    async fn preparing_a_fleet_twice_changes_nothing_the_second_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git").arg("-C").arg(&root).args(args).output().expect("git");
+            assert!(st.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&st.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+        // .triumvirate must not make the repo dirty for create_worktree's clean check.
+        std::fs::write(root.join(".gitignore"), ".triumvirate/\n").expect("ignore");
+        git(&["add", ".gitignore"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "ignore"]);
+        let _ = ledger::LedgerStore::open(root.clone()).expect("ledger");
+        let orch = FleetOrchestrator::new(crate::git_ops::RealGitOps::new(root.clone()).expect("gitops"));
+        let agents = vec!["codex".to_string(), "grok".to_string()];
+
+        let first = orch.prepare_fleet_members(&root, "fleet-idem", "sha", &agents, "do it").await.expect("first");
+        let second = orch.prepare_fleet_members(&root, "fleet-idem", "sha", &agents, "do it").await.expect("second");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|m| m.worktree.join(".triumvirate/fleet-task.md").is_file()));
+
+        let conn = rusqlite::Connection::open(root.join(".triumvirate/ledger.db")).expect("db");
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).expect("count");
+        assert_eq!(count("SELECT COUNT(*) FROM fleets WHERE fleet_id = 'fleet-idem'"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM tasks WHERE fleet_id = 'fleet-idem'"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM events WHERE session_id = 'fleet-idem' AND event_type = 'agent_started'"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM events WHERE session_id = 'fleet-idem' AND event_type = 'task_claimed'"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM events WHERE session_id = 'fleet-idem' AND event_type = 'fleet_spawned'"), 1);
+        let worktrees = std::process::Command::new("git").arg("-C").arg(&root).args(["worktree", "list"]).output().expect("list");
+        assert_eq!(String::from_utf8_lossy(&worktrees.stdout).lines().count(), 3, "main plus two");
+    }
+
+    /// The twin: a directory at a member's worktree path that is NOT that task's worktree is refused.
+    #[tokio::test]
+    async fn a_foreign_directory_at_a_worktree_path_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let st = std::process::Command::new("git").arg("-C").arg(&root).args(["init", "-q", "-b", "main"]).output().expect("git");
+        assert!(st.status.success());
+        let _ = ledger::LedgerStore::open(root.clone()).expect("ledger");
+        let squatter = root.join(".triumvirate/worktrees/fleet-x-fleet-x-T-001-codex");
+        std::fs::create_dir_all(&squatter).expect("squatter");
+        let orch = FleetOrchestrator::new(crate::git_ops::RealGitOps::new(root.clone()).expect("gitops"));
+        let err = orch
+            .prepare_fleet_members(&root, "fleet-x", "sha", &["codex".to_string()], "t")
+            .await
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("refusing to reuse"), "{err}");
     }
 }

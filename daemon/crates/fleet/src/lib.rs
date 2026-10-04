@@ -8,6 +8,7 @@ pub mod recovery;
 pub mod worker_token;
 pub mod shim;
 pub mod index;
+pub mod git_ops;
 
 use shared_types::GitOps;
 

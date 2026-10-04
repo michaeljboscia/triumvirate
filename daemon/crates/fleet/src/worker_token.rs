@@ -329,6 +329,22 @@ pub fn clear_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) {
     }
 }
 
+/// Marks a fleet as run by the Temporal engine. Its tokens have no legacy owner record because
+/// Temporal owns them (the activity and its heartbeat), so the legacy startup recovery must leave
+/// the fleet alone: to it, a live Temporal fleet would look exactly like a crashed legacy one.
+pub fn mark_temporal_engine(project_root: &Path, fleet_id: &str) -> io::Result<()> {
+    let dir = fleet_token_dir(project_root, fleet_id)?;
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("ENGINE"), b"temporal\n")
+}
+
+pub fn is_temporal_engine(project_root: &Path, fleet_id: &str) -> bool {
+    fleet_token_dir(project_root, fleet_id)
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join("ENGINE")).ok())
+        .is_some_and(|s| s.trim() == "temporal")
+}
+
 pub fn has_launch_marker(project_root: &Path, fleet_id: &str, task_id: &str) -> bool {
     launch_marker_path(project_root, fleet_id, task_id).is_ok_and(|p| p.exists())
 }
