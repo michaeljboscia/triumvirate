@@ -196,7 +196,7 @@ impl FleetTaskStore {
             session_id: session_id.to_string(),
             event_type: event_type.to_string(),
             sequence,
-            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            timestamp: crate::event_timestamp(),
             payload_json: payload.to_string(),
         })
     }

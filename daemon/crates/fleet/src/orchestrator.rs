@@ -263,7 +263,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 session_id: fleet_id_bg.clone(),
                                 event_type: "fleet_failed".to_string(),
                                 sequence,
-                                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                                timestamp: crate::event_timestamp(),
                                 payload_json: serde_json::json!({
                                     "error": err.to_string()
                                 })
@@ -343,7 +343,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             // Path-safe on purpose: a `/` here would nest directories under `Path::join`.
             // The worktree name becomes `{fleet_id}-{fleet_id}-T-001-{agent}`. That repetition is
             // ugly and CORRECT. Do not tidy it by dropping the leading `{fleet_id}-` unless the
-            // formula below, `fleet_ledger_snapshot`, and recovery's prefix match change together.
+            // formula below, `fleet_ledger_snapshot`, and recovery's is_fleet_worktree change together.
             let task_id = format!("{fleet_id}-T-{:03}", idx + 1);
             let branch = format!("fleet/{fleet_id}/{task_id}");
             let worktree_path = base.join(format!("{fleet_id}-{task_id}-{agent}"));
@@ -393,7 +393,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     session_id: fleet_id.clone(),
                     event_type: "agent_started".to_string(),
                     sequence,
-                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    timestamp: crate::event_timestamp(),
                     payload_json: serde_json::json!({
                         "fleet_id": fleet_id,
                         "task_id": task_id,
@@ -408,7 +408,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     session_id: fleet_id.clone(),
                     event_type: "task_claimed".to_string(),
                     sequence,
-                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    timestamp: crate::event_timestamp(),
                     payload_json: serde_json::json!({
                         "task_id": task_id,
                         "assigned_agent": agent
@@ -434,7 +434,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 session_id: fleet_id.clone(),
                 event_type: "fleet_spawned".to_string(),
                 sequence: 1,
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                timestamp: crate::event_timestamp(),
                 payload_json: serde_json::json!({
                     "head_sha": head_sha,
                     "agent_count": agents.len()
@@ -1021,7 +1021,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
             session_id: fleet_id.to_string(),
             event_type: "merge_started".to_string(),
             sequence: merge_started_seq,
-            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            timestamp: crate::event_timestamp(),
             payload_json: serde_json::json!({
                 "fleet_id": fleet_id
             })
@@ -1066,7 +1066,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 session_id: fleet_id.to_string(),
                 event_type: "fleet_failed".to_string(),
                 sequence: failed_seq,
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                timestamp: crate::event_timestamp(),
                 payload_json: serde_json::json!({
                     "fleet_id": fleet_id,
                     "failed_tasks": failed_tasks
@@ -1178,7 +1178,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     session_id: fleet_id.to_string(),
                     event_type: "fleet_done".to_string(),
                     sequence: done_seq,
-                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    timestamp: crate::event_timestamp(),
                     payload_json: serde_json::json!({
                         "fleet_id": fleet_id
                     })
@@ -1197,7 +1197,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                     session_id: fleet_id.to_string(),
                     event_type: "fleet_failed".to_string(),
                     sequence: failed_seq,
-                    timestamp: "2030-01-01T00:00:00Z".to_string(),
+                    timestamp: crate::event_timestamp(),
                     payload_json: serde_json::json!({
                         "fleet_id": fleet_id,
                         "error": err.to_string()
@@ -1385,7 +1385,7 @@ fn ingest_fleet_event(project_root: &Path, fleet_id: &str, event_type: &str, pay
             session_id: fleet_id.to_string(),
             event_type: event_type.to_string(),
             sequence,
-            timestamp: "2030-01-01T00:00:00Z".to_string(),
+            timestamp: crate::event_timestamp(),
             payload_json: payload_json.clone(),
         }) {
             Ok(_) => return,

@@ -492,9 +492,7 @@ pub(crate) fn record_ask_call_event(
             session_id,
             event_type: "wiki_call".to_string(),
             sequence: 1,
-            // The real time. The fleet crate writes a hardcoded "2030-01-01T00:00:00Z" here, which
-            // is a fabricated value; retention keys on `created_at`, so it does not break the
-            // sweep, but it is not copied.
+            // The real time, as the fleet crate's events now carry too.
             timestamp: chrono::Utc::now().to_rfc3339(),
             payload_json: payload.to_string(),
         })
