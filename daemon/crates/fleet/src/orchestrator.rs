@@ -1926,23 +1926,26 @@ pub fn fleet_base_sha(project_root: &Path, fleet_id: &str) -> Option<String> {
 /// String inequality was not enough (Codex and Grok, review of PR 57): an older commit, an
 /// unrelated one, or a reset to another existing commit all differ from the base and are not work.
 pub fn commit_is_new(repo: &Path, base: &str, head: &str) -> Option<bool> {
-    if base == head {
-        return Some(false);
-    }
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge-base", "--is-ancestor", base, head])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    // 0: base is an ancestor of head. 1: it is not. Anything else: git could not tell.
-    match status.code() {
-        Some(0) => Some(true),
-        Some(1) => Some(false),
-        _ => None,
-    }
+    // Identity is git's call, not a string compare: a short and a full sha of one commit differ
+    // as text and are the same commit (Grok, confirmation pass on PR 57). New work means base is
+    // an ancestor of head AND head is not an ancestor of base (which also covers equality).
+    let is_ancestor = |a: &str, b: &str| -> Option<bool> {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["merge-base", "--is-ancestor", a, b])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        // 0: a is an ancestor of b. 1: it is not. Anything else: git could not tell.
+        match status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        }
+    };
+    Some(is_ancestor(base, head)? && !is_ancestor(head, base)?)
 }
 
 /// Whether a member's run counts as DONE: it exited 0 AND left a new commit on its branch
@@ -2032,6 +2035,9 @@ mod judge_member_run_tests {
         assert_eq!(super::commit_is_new(repo, &base, &older), Some(false), "an older commit is not new work");
         assert_eq!(super::commit_is_new(repo, &base, &unrelated), Some(false), "an unrelated commit is not new work");
         assert_eq!(super::commit_is_new(repo, &base, "0000000000000000000000000000000000000001"), None);
+        // A short sha of the base is the base, not new work.
+        assert_eq!(super::commit_is_new(repo, &base[..10], &base), Some(false));
+        assert_eq!(super::commit_is_new(repo, &base, &base[..10]), Some(false));
     }
 
     /// RED IF the base commit stops being read from the fleet_spawned event (review of PR 57: it
