@@ -67,6 +67,11 @@ jobs:
       # replays a recorded history), no server needed.
       - name: FleetWorkflow replay gate
         run: cargo test -p fleet-temporal --test replay
+      # The fleet crate's integration tests (fleet_agent_bin_pin pins how members are launched:
+      # pinned binaries, commit grants, no operator args). Also integration tests, also skipped
+      # by `--lib`. Each test file is its own process, which that file relies on.
+      - name: Fleet integration tests
+        run: cargo test -p fleet --tests
 
   build:
     name: Build Release
