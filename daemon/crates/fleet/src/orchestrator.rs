@@ -2018,8 +2018,11 @@ pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_
 /// The directories a commit in a linked fleet worktree writes outside the worktree itself: its
 /// own git dir (index, HEAD, reflog), the shared object store, and the ref and reflog dirs of
 /// its own fleet only, so a member cannot move `main` or another fleet's branch. Never the whole
-/// .git (hooks, config). Known residual: a background `gc --auto` after the commit cannot write
-/// .git/packed-refs; the commit itself has already landed by then.
+/// .git (hooks, config). Accepted residuals (Codex, PR #61): the object store is shared and
+/// writable, so a hostile member could delete objects other branches need (any commit must write
+/// objects; the member is our own agent, not untrusted code); a member can move sibling task
+/// branches of its own fleet; a background `gc --auto` after the commit cannot write
+/// .git/packed-refs, by which time the commit has already landed.
 pub fn fleet_git_write_dirs(worktree: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let out = std::process::Command::new("git")
         .arg("-C")
