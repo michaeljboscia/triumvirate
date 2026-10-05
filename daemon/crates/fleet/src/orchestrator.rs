@@ -3325,6 +3325,56 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&worktrees.stdout).lines().count(), 3, "main plus two");
     }
 
+    /// The legacy worker's quiet failure: a member that exits 0 having committed nothing.
+    ///
+    /// RED IF the legacy success arm records `done` on the exit code alone. It did until the
+    /// trial fleet that added judge_worktree_run; the Temporal engine already refused it.
+    #[tokio::test]
+    async fn a_legacy_member_that_exits_0_without_committing_is_failed_not_done() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git").arg("-C").arg(&root).args(args).output().expect("git");
+            assert!(st.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&st.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), ".triumvirate/\n").expect("ignore");
+        git(&["add", ".gitignore"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init"]);
+        let _ = ledger::LedgerStore::open(root.clone()).expect("ledger");
+        // RecordingLauncher's stub exits 0 and touches nothing.
+        let orch = FleetOrchestrator::with_launcher(
+            crate::git_ops::RealGitOps::new(root.clone()).expect("gitops"),
+            RecordingLauncher::default(),
+        );
+        let spawned = orch
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: root.clone(),
+                agents: vec!["codex".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "do nothing".to_string(),
+            })
+            .await
+            .expect("spawn");
+
+        let conn = rusqlite::Connection::open(root.join(".triumvirate/ledger.db")).expect("db");
+        let state: String = conn
+            .query_row("SELECT state FROM tasks WHERE fleet_id = ?1", [spawned.fleet_id.as_str()], |r| r.get(0))
+            .expect("task state");
+        assert_eq!(state, "failed", "exit 0 with no commit is not done");
+        let reason: String = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE session_id = ?1 AND event_type = 'task_failed'",
+                [spawned.fleet_id.as_str()],
+                |r| r.get(0),
+            )
+            .expect("task_failed event");
+        assert!(reason.contains("without committing"), "{reason}");
+        assert_eq!(fleet_state(&root, &spawned.fleet_id), "failed");
+    }
+
     /// The twin: a directory at a member's worktree path that is NOT that task's worktree is refused.
     #[tokio::test]
     async fn a_foreign_directory_at_a_worktree_path_is_refused() {
