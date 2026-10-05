@@ -7957,6 +7957,8 @@ mod claude_runner_tests {
 /// `run_named_agent_with_session_and_model` would leave it GREEN. Rule 5 was satisfied
 /// (production does call the helper) but Rule 2 was not: two surfaces means two tests.
 #[cfg(test)]
+// The env lock is held across awaits on purpose: it serialises tests that repoint agent binaries via process env.
+#[allow(clippy::await_holding_lock)]
 mod grok_panel_route_tests {
     use super::*;
 
@@ -8188,6 +8190,8 @@ mod grok_tool_surface_tests {
 }
 
 #[cfg(test)]
+// The env lock is held across awaits on purpose: it serialises tests that repoint agent binaries via process env.
+#[allow(clippy::await_holding_lock)]
 mod mandatory_review_tests {
     use super::*;
 
