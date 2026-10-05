@@ -42,10 +42,12 @@ fn value_after<'a>(argv: &'a [String], flag: &str) -> Vec<&'a str> {
 
 /// RED IF a codex, gemini-cli or grok fleet member ignores its TRIUMVIRATE_*_BIN, operator
 /// connector args (consult-shaped; a sandbox bypass in them would widen the fleet argv) reach a
-/// codex fleet argv, the codex member cannot write the git dirs a commit needs (or can write all
-/// of .git), or the grok member keeps the consult's read-only sandbox and 12-turn Fast profile.
+/// codex fleet argv, the codex member is not granted the git dirs a commit needs (or is granted
+/// all of .git, or other fleets' refs), or the grok member keeps the consult's read-only sandbox
+/// and 12-turn Fast profile. Structural: it checks the argv, it does not run an agent. That a
+/// member really commits with these grants was probed live and is proven by a real fleet run.
 #[test]
-fn fleet_members_run_the_pinned_binaries_and_can_commit() {
+fn fleet_members_get_pinned_binaries_and_commit_grants() {
     let tmp = tempfile::tempdir().unwrap();
     let (main, wt) = linked_worktree(tmp.path());
     // SAFETY: the only test in this binary, so no other thread reads the environment.
@@ -65,13 +67,13 @@ fn fleet_members_run_the_pinned_binaries_and_can_commit() {
     assert_eq!(value_after(&argv, "--sandbox"), vec!["workspace-write"]);
     assert_eq!(argv.last().map(String::as_str), Some("task"));
     assert!(!argv.iter().any(|a| a.contains("dangerously")), "{argv:?}");
-    let git = main.join(".git");
+    let dotgit = main.join(".git");
     let grants: Vec<PathBuf> = value_after(&argv, "--add-dir").into_iter().map(PathBuf::from).collect();
     let want = vec![
-        git.join("worktrees").join("m"),
-        git.join("objects"),
-        git.join("refs").join("heads").join("fleet"),
-        git.join("logs").join("refs").join("heads").join("fleet"),
+        dotgit.join("worktrees").join("m"),
+        dotgit.join("objects"),
+        dotgit.join("refs").join("heads").join("fleet").join("f-1"),
+        dotgit.join("logs").join("refs").join("heads").join("fleet").join("f-1"),
     ];
     assert_eq!(grants, want, "exactly the dirs a commit writes, never .git itself");
     assert!(want.iter().all(|d| d.is_dir()), "a grant must name an existing directory");
@@ -85,6 +87,13 @@ fn fleet_members_run_the_pinned_binaries_and_can_commit() {
     assert!(value_after(&argv, "--sandbox").is_empty(), "no sandbox flag, as the agy fleet arm: {argv:?}");
     assert_eq!(value_after(&argv, "--max-turns"), vec!["30"], "Deep, not Fast's 12: {argv:?}");
 
-    // Not a worktree at all: refuse, never fall back to an argv that cannot commit.
+    // An operator's explicit grok sandbox outranks the fleet's "off".
+    unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "strict") };
+    let (_, argv) = fleet::orchestrator::fleet_agent_command("grok", &wt, "task").expect("grok");
+    assert_eq!(value_after(&argv, "--sandbox"), vec!["strict"], "{argv:?}");
+
+    // Not a worktree at all, or not on a fleet branch: refuse, never launch uncommittable.
     assert!(fleet::orchestrator::fleet_agent_command("codex", tmp.path(), "task").is_err());
+    git(&wt, &["checkout", "-q", "-b", "not-a-fleet-branch"]);
+    assert!(fleet::orchestrator::fleet_agent_command("codex", &wt, "task").is_err());
 }

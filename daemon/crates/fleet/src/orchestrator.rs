@@ -176,7 +176,10 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
             // worktree; workspace writes the worktree but not the main repo's .git, so commit
             // fails; grok has no --add-dir and a project profile would sit inside the worktree
             // where the member could commit it. So: no sandbox, the same posture as the agy
-            // fleet arm (yolo). An operator TRIUMVIRATE_GROK_SANDBOX still wins. And Deep: the
+            // fleet arm (yolo). An operator TRIUMVIRATE_GROK_SANDBOX still wins, and so would
+            // grok's own GROK_SANDBOX or a `[sandbox] profile` in ~/.grok/config.toml (neither is
+            // set on this host, 2026-10-04); either re-confines the member, which then fails loud
+            // for want of a commit rather than passing silently. And Deep: the
             // Fast profile's 12 turns ran out before a code task finished (trial fleet,
             // fleet-1791158358887817000).
             let inv = mcp_bridge::grok::build_grok_invocation_with_profile(
@@ -2014,7 +2017,9 @@ pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_
 /// to do the work, no more.
 /// The directories a commit in a linked fleet worktree writes outside the worktree itself: its
 /// own git dir (index, HEAD, reflog), the shared object store, and the ref and reflog dirs of
-/// fleet branches only, so a member cannot move `main`. Never the whole .git (hooks, config).
+/// its own fleet only, so a member cannot move `main` or another fleet's branch. Never the whole
+/// .git (hooks, config). Known residual: a background `gc --auto` after the commit cannot write
+/// .git/packed-refs; the commit itself has already landed by then.
 pub fn fleet_git_write_dirs(worktree: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -2038,8 +2043,25 @@ pub fn fleet_git_write_dirs(worktree: &Path) -> anyhow::Result<Vec<PathBuf>> {
         // Not a linked worktree: granting the git dir would grant all of .git.
         anyhow::bail!("fleet worktree {} is not a linked worktree", worktree.display());
     }
-    let refs = common.join("refs").join("heads").join("fleet");
-    let logs = common.join("logs").join("refs").join("heads").join("fleet");
+    // Only this fleet's ref dir: the member's branch is refs/heads/fleet/<fleet_id>/<task>, and
+    // a grant on refs/heads/fleet would let it move other fleets' branches (Codex, PR #61).
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()?;
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let fleet_ref_dir = match head.strip_prefix("refs/heads/fleet/").and_then(|rest| rest.split_once('/')) {
+        Some((fleet_id, task)) if !fleet_id.is_empty() && !task.is_empty() && !task.contains('/') => {
+            PathBuf::from("refs").join("heads").join("fleet").join(fleet_id)
+        }
+        _ => anyhow::bail!(
+            "fleet worktree {} is not on a fleet/<fleet>/<task> branch (HEAD {head:?})",
+            worktree.display()
+        ),
+    };
+    let refs = common.join(&fleet_ref_dir);
+    let logs = common.join("logs").join(&fleet_ref_dir);
     // A sandbox grant names an existing directory; packed refs can leave these absent.
     std::fs::create_dir_all(&refs)?;
     std::fs::create_dir_all(&logs)?;
