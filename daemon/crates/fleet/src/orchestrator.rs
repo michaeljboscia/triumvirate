@@ -905,6 +905,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             format!("agent exited with status {:?}", status.code()),
                                         ),
                                     };
+                                    let mut stderr_tail_val: Option<&str> = None;
+                                    if !stderr_tail.is_empty() {
+                                        let mut start = stderr_tail.len().saturating_sub(2000);
+                                        while start < stderr_tail.len() && !stderr_tail.is_char_boundary(start) {
+                                            start += 1;
+                                        }
+                                        stderr_tail_val = Some(&stderr_tail[start..]);
+                                    }
                                     let payload = serde_json::json!({
                                         "task_id": task_id,
                                         "agent": failing_agent,
@@ -913,6 +921,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         "first_attempt_error": format!("agent exited with status {:?}", status.code()),
                                         "error": failure_text,
                                         "longest_silence_ms": longest_silence.as_millis() as u64,
+                                        "stderr_tail": stderr_tail_val,
                                     })
                                     .to_string();
                                     ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
