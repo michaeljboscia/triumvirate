@@ -105,8 +105,16 @@ pub async fn connect(cfg: &WorkerConfig) -> anyhow::Result<Client> {
                 tracing::info!(address, "temporal: connected");
                 return Ok(Client::new(connection, ClientOptions::new(cfg.namespace.clone()).build())?);
             }
-            Ok(Err(e)) => errors.push(format!("{address}: {e}")),
-            Err(_) => errors.push(format!("{address}: no answer in {} s", CONNECT_TIMEOUT.as_secs())),
+            Ok(Err(e)) => {
+                let reason = format!("{address}: {e}");
+                tracing::warn!(address, error = %reason, "temporal: address failed; trying the next");
+                errors.push(reason);
+            }
+            Err(_) => {
+                let reason = format!("{address}: no answer in {} s", CONNECT_TIMEOUT.as_secs());
+                tracing::warn!(address, error = %reason, "temporal: address failed; trying the next");
+                errors.push(reason);
+            }
         }
     }
     anyhow::bail!("no Temporal address answered: {}", errors.join("; "))
