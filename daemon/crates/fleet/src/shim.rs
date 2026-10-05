@@ -74,6 +74,24 @@ pub fn read_done(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Resu
     }
 }
 
+pub fn output_tail(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    f.seek(SeekFrom::Start(len.saturating_sub(max_bytes as u64))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let s = String::from_utf8_lossy(&buf).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -196,5 +214,25 @@ mod tests {
         assert_eq!(err_path(root, "f", "f-T-001").unwrap(), Path::new("/p/.triumvirate/fleet-workers/f/f-T-001.err"));
         assert_eq!(done_path(root, "f", "f-T-001").unwrap(), Path::new("/p/.triumvirate/fleet-workers/f/f-T-001.done"));
         assert!(done_path(root, "f", "../x").is_err());
+    }
+
+    #[test]
+    fn test_output_tail() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("f");
+        assert_eq!(output_tail(&p, 10), None);
+
+        let mut f = File::create(&p).unwrap();
+        assert_eq!(output_tail(&p, 10), None);
+
+        f.write_all(b"  \n").unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(output_tail(&p, 10), None);
+
+        f.write_all(b"hello world!").unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(output_tail(&p, 5).as_deref(), Some("orld!"));
+        assert_eq!(output_tail(&p, 50).as_deref(), Some("hello world!"));
     }
 }

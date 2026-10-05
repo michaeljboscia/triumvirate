@@ -297,18 +297,27 @@ impl FleetLedgerActivities {
         let succeeded = verdict.is_ok();
         // A run that exited 0 without a commit is failed WITH the reason, not silently done.
         let error = o.error.clone().or_else(|| verdict.err());
-        let payload = serde_json::json!({
+        let exit_code = o.output.as_ref().and_then(|x| x.exit_code);
+        let mut payload = serde_json::json!({
             "task_id": o.task_id,
             "agent": o.agent,
             "requested_agent": o.agent,
             "engine": "temporal",
-            "exit_code": o.output.as_ref().and_then(|x| x.exit_code),
+            "exit_code": exit_code,
             "signal": o.output.as_ref().and_then(|x| x.signal),
             "branch_head": o.output.as_ref().and_then(|x| x.branch_head.clone()),
             "adopted": o.output.as_ref().is_some_and(|x| x.adopted),
             "base_sha": base,
             "error": error,
         });
+
+        if !succeeded && exit_code != Some(0) {
+            let stderr_tail = fleet::shim::err_path(&root, &o.fleet_id, &o.task_id)
+                .ok()
+                .and_then(|p| fleet::shim::output_tail(&p, 2000));
+            payload.as_object_mut().unwrap().insert("stderr_tail".to_string(), serde_json::json!(stderr_tail));
+        }
+
         if succeeded {
             fleet::orchestrator::record_task_completed(&root, &o.fleet_id, &o.task_id, &o.agent, payload);
             Ok("done".to_string())
