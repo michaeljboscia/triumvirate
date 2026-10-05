@@ -9260,6 +9260,19 @@ mod codex_error_tail_tests {
         );
     }
 
+    /// The exact budget (agy, PR #71 review): at most the LAST 2 structured errors, then the last
+    /// stderr line into the one slot left; 3 lines total, structured first.
+    #[test]
+    fn budget_is_two_structured_then_the_last_stderr_line() {
+        let raw = concat!(
+            "{\"type\":\"error\",\"message\":\"first\"}\n",
+            "{\"type\":\"error\",\"message\":\"second\"}\n",
+            "{\"type\":\"error\",\"message\":\"third\"}\n",
+        );
+        let out = codex_error_tail(raw, &tail(&["noise-a", "noise-b", "noise-c"]));
+        assert_eq!(out, "; codex said: second | third | noise-c", "{out}");
+    }
+
     #[test]
     fn plain_error_line_and_stderr_still_count() {
         let out = codex_error_tail("OK\nERROR: something broke\n", &tail(&["fatal: boom"]));
