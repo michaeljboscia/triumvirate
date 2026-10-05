@@ -3867,7 +3867,7 @@ fn is_mock_connector(bin: &str) -> bool {
 /// "Reading additional input from stdin..." is codex noticing a non-tty stdin and says nothing
 /// about the failure, so it is dropped.
 fn codex_error_tail(raw_output: &str, stderr_tail: &Arc<Mutex<VecDeque<String>>>) -> String {
-    let mut lines: Vec<String> = raw_output
+    let structured_lines: Vec<String> = raw_output
         .lines()
         .map(str::trim)
         .filter_map(|l| {
@@ -3886,19 +3886,46 @@ fn codex_error_tail(raw_output: &str, stderr_tail: &Arc<Mutex<VecDeque<String>>>
             }
         })
         .collect();
-    if let Ok(tail) = stderr_tail.lock() {
-        lines.extend(
-            tail.iter()
-                .filter(|l| !l.starts_with("Reading additional input from stdin"))
-                .cloned(),
-        );
+
+    let mut lines = Vec::new();
+    for line in structured_lines {
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
     }
-    lines.dedup();
+    if lines.len() > 2 {
+        lines.drain(..lines.len() - 2);
+    }
+
+    if let Ok(tail) = stderr_tail.lock() {
+        let mut stderr_lines: Vec<String> = tail
+            .iter()
+            .filter(|l| !l.starts_with("Reading additional input from stdin"))
+            .cloned()
+            .collect();
+        stderr_lines.dedup();
+
+        if lines.is_empty() {
+            let keep = stderr_lines.len().saturating_sub(3);
+            lines.extend(stderr_lines.drain(keep..));
+        } else {
+            let mut unique_stderr = Vec::new();
+            for line in stderr_lines.into_iter().rev() {
+                if !lines.contains(&line) && !unique_stderr.contains(&line) {
+                    unique_stderr.push(line);
+                }
+            }
+            unique_stderr.reverse();
+            let remaining = 3 - lines.len();
+            let keep = unique_stderr.len().saturating_sub(remaining);
+            lines.extend(unique_stderr.drain(keep..));
+        }
+    }
+
     if lines.is_empty() {
         String::new()
     } else {
-        let keep = lines.len().saturating_sub(3);
-        format!("; codex said: {}", lines[keep..].join(" | "))
+        format!("; codex said: {}", lines.join(" | "))
     }
 }
 
@@ -9207,6 +9234,30 @@ mod codex_error_tail_tests {
         assert!(!out.contains("Skill descriptions"), "item-level notices are not the failure: {out}");
         assert!(!out.contains("Reading additional input"), "stdin notice is noise: {out}");
         assert_eq!(out.matches("usage limit").count(), 1, "error and turn.failed carry the same text once: {out}");
+    }
+
+    #[test]
+    fn structured_quota_error_precedes_stderr_transport_noise() {
+        let raw = concat!(
+            "{\"type\":\"error\",\"message\":\"You've hit your usage limit. try again at 10:11 PM.\"}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. try again at 10:11 PM.\"}}\n",
+        );
+        let stderr = tail(&[
+            "ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed alpha (http://192.168.2.110:8000/mcp)",
+            "ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed beta (http://192.168.2.110:8000/mcp)",
+            "ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed gamma (http://192.168.2.110:8000/mcp)",
+        ]);
+
+        let out = codex_error_tail(raw, &stderr);
+        assert_eq!(
+            out.matches("usage limit").count(),
+            1,
+            "duplicate structured errors must collapse: {out}"
+        );
+        assert!(
+            out.find("usage limit") < out.find("rmcp"),
+            "structured error must precede stderr noise: {out}"
+        );
     }
 
     #[test]
