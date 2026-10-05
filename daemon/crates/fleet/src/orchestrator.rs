@@ -758,6 +758,10 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                 // failed, with gemini's code, when the thing that last failed
                                 // was codex (Antigravity, D-027 panel).
                                 let mut degraded_failure: Option<(String, String)> = None;
+                                // The failing degraded attempt's own stderr: the record names
+                                // codex as the agent that failed, so it must carry codex's
+                                // stderr, not agy's (Codex, PR #65).
+                                let mut degraded_stderr: Option<String> = None;
                                 // A SIGTERM from fleet_cancel is a non-zero exit too. Without this
                                 // check, cancelling an agy worker launched a codex replacement
                                 // (Codex, review of step 6).
@@ -817,12 +821,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                                         Err(reason) => {
                                                             tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, stdout_tail = %out_tail, stderr_tail = %err_tail, reason = %reason, "degraded codex fleet worker exited 0 but its work was rejected");
                                                             degraded_failure = Some(("codex".to_string(), reason));
+                                                            degraded_stderr = Some(err_tail.clone());
                                                             false
                                                         }
                                                     }
                                                 }
                                                 _ => {
                                                     tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, stdout_tail = %out_tail, stderr_tail = %err_tail, "degraded codex fleet worker did not succeed");
+                                                    degraded_stderr = Some(err_tail.clone());
                                                     degraded_failure = Some((
                                                         "codex".to_string(),
                                                         match &r {
@@ -905,14 +911,11 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             format!("agent exited with status {:?}", status.code()),
                                         ),
                                     };
-                                    let mut stderr_tail_val: Option<&str> = None;
-                                    if !stderr_tail.is_empty() {
-                                        let mut start = stderr_tail.len().saturating_sub(2000);
-                                        while start < stderr_tail.len() && !stderr_tail.is_char_boundary(start) {
-                                            start += 1;
-                                        }
-                                        stderr_tail_val = Some(&stderr_tail[start..]);
-                                    }
+                                    let failing_stderr = match &degraded_failure {
+                                        Some(_) => degraded_stderr.as_deref().unwrap_or(""),
+                                        None => stderr_tail.as_str(),
+                                    };
+                                    let stderr_tail_val = crate::shim::bounded_tail(failing_stderr, 2000);
                                     let payload = serde_json::json!({
                                         "task_id": task_id,
                                         "agent": failing_agent,
@@ -964,6 +967,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     "requested_agent": agent_name,
                                     "error": err.to_string(),
                                     "longest_silence_ms": longest_silence.as_millis() as u64,
+                                    // A timed-out or killed worker explains itself too (Grok, PR #65).
+                                    "stderr_tail": crate::shim::bounded_tail(&stderr_tail, 2000),
                                 })
                                 .to_string();
                                 ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
@@ -2404,8 +2409,15 @@ mod tests {
             _task_prompt: &str,
         ) -> anyhow::Result<Child> {
             self.launched.lock().await.push(agent.to_string());
-            let code = if agent == "gemini" { "exit 1" } else { "exit 0" };
-            Ok(Command::new("sh").arg("-c").arg(code).spawn()?)
+            // Each attempt says who it is on stderr, so a failure record can be checked for
+            // carrying the stderr of the attempt that failed LAST.
+            let code = if agent == "gemini" { "echo agy-stderr >&2; exit 1" } else { "echo codex-stderr >&2; exit 0" };
+            Ok(Command::new("sh")
+                .arg("-c")
+                .arg(code)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?)
         }
     }
 
@@ -3537,6 +3549,8 @@ mod tests {
             )
             .expect("task_failed event");
         assert!(reason.contains("without committing"), "{reason}");
+        let payload: serde_json::Value = serde_json::from_str(&reason).expect("payload json");
+        assert_eq!(payload["stderr_tail"], "codex-stderr", "the failing attempt's stderr, not agy's: {payload}");
     }
 
     /// The twin: a directory at a member's worktree path that is NOT that task's worktree is refused.
