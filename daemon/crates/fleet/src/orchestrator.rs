@@ -710,6 +710,16 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             reason = %reason,
                                             "fleet agent subprocess exited 0 but its work was rejected"
                                         );
+                                        // Telemetry says failed too (Codex, PR #62). Not the agy
+                                        // breaker: the backend answered; the work was wrong.
+                                        mcp_bridge::posthog::record_fleet_task(
+                                            &launch_agent,
+                                            launched_backend,
+                                            "failed",
+                                            task_started.elapsed().as_millis() as u64,
+                                            &fleet_id,
+                                            &task_id,
+                                        );
                                         let payload = serde_json::json!({
                                             "task_id": task_id,
                                             "agent": launch_agent,
@@ -3373,6 +3383,81 @@ mod tests {
             .expect("task_failed event");
         assert!(reason.contains("without committing"), "{reason}");
         assert_eq!(fleet_state(&root, &spawned.fleet_id), "failed");
+    }
+
+    /// The degraded arm's twin of the test above: agy fails, the codex replacement exits 0 having
+    /// committed nothing. RED IF the degraded arm records `task_completed` on codex's exit code
+    /// alone (Grok, PR #62: the primary-arm test does not reach this arm).
+    #[tokio::test]
+    async fn a_degraded_codex_that_exits_0_without_committing_is_failed_not_done() {
+        let _lock = ROUTE_ENV_LOCK.lock().await;
+        let keys = ["TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_DEGRADED_ROUTE"];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialised by ROUTE_ENV_LOCK; restored (never just removed) before it drops.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
+            std::env::set_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", "codex");
+        }
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git").arg("-C").arg(&root).args(args).output().expect("git");
+            assert!(st.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&st.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), ".triumvirate/\n").expect("ignore");
+        git(&["add", ".gitignore"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init"]);
+        let _ = ledger::LedgerStore::open(root.clone()).expect("ledger");
+        let launcher = GeminiDownLauncher::default();
+        let launched = launcher.launched.clone();
+        let orch = FleetOrchestrator::with_launcher(crate::git_ops::RealGitOps::new(root.clone()).expect("gitops"), launcher);
+        let spawned = orch
+            .fleet_spawn(FleetSpawnRequest {
+                project_root: root.clone(),
+                agents: vec!["gemini".to_string()],
+                dry_run: false,
+                wait: Some(true),
+                task_description: "do nothing".to_string(),
+            })
+            .await;
+
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        mcp_bridge::agy_resilience::agy_breaker_record_success();
+        let spawned = spawned.expect("spawn");
+
+        assert_eq!(launched.lock().await.clone(), vec!["gemini", "codex"], "the degraded arm ran");
+        let conn = rusqlite::Connection::open(root.join(".triumvirate/ledger.db")).expect("db");
+        let state: String = conn
+            .query_row("SELECT state FROM tasks WHERE fleet_id = ?1", [spawned.fleet_id.as_str()], |r| r.get(0))
+            .expect("task state");
+        assert_eq!(state, "failed", "a degraded codex that committed nothing is not done");
+        let completed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = 'task_completed'",
+                [spawned.fleet_id.as_str()],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(completed, 0);
+        let reason: String = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE session_id = ?1 AND event_type = 'task_failed'",
+                [spawned.fleet_id.as_str()],
+                |r| r.get(0),
+            )
+            .expect("task_failed event");
+        assert!(reason.contains("without committing"), "{reason}");
     }
 
     /// The twin: a directory at a member's worktree path that is NOT that task's worktree is refused.
