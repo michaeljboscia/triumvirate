@@ -115,7 +115,13 @@ impl AgentLauncher for DaemonAgentLauncher {
 /// worker runs the same CLI the same way whichever engine launched it.
 pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str) -> anyhow::Result<(String, Vec<String>)> {
     let (cmd, args): (String, Vec<String>) = match agent {
-        "codex" => ("codex".to_string(), fleet_codex_argv(task_prompt)),
+        // The SAME binary the consult path runs (TRIUMVIRATE_CODEX_BIN, else PATH). A bare
+        // "codex" here let the launchd daemon's PATH pick /opt/homebrew/bin/codex 0.133.0 while
+        // every consult ran the pinned ~/.local/bin/codex 0.154.0; the old CLI refused the
+        // configured model and every codex fleet member exited 1 (trial fleet 1, 2026-10-04).
+        // The binary only: TRIUMVIRATE_CODEX_ARGS is consult-shaped, and a `--full-auto` or a
+        // sandbox bypass in it would break or widen the fleet argv (Codex, PR #60 review).
+        "codex" => (mcp_bridge::codex_command().0, fleet_codex_argv(task_prompt)),
         "gemini" => match mcp_bridge::gemini_backend() {
             // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
             // Under agy it spawns the shared sandbox-exec invocation (single-turn,
@@ -139,7 +145,8 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
                 (inv.program, inv.args)
             }
             mcp_bridge::GeminiBackend::GeminiCli => {
-                ("gemini".to_string(), vec!["-p".to_string(), task_prompt.to_string()])
+                // Pinned binary, not a PATH lookup (same class as the codex arm above).
+                (mcp_bridge::gemini_command().0, vec!["-p".to_string(), task_prompt.to_string()])
             }
         },
         // REQ-GROK-004: fleet reuses the SAME invocation builder as the consult path, so
