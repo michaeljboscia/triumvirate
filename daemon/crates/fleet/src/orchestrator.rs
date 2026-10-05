@@ -2635,6 +2635,45 @@ mod tests {
 
     use super::{review_gate_decision, GateDecision, WorkerTerminalGuard};
 
+    /// D-045: the guard rescues through the one failure recorder. RED IF an armed guard writes a
+    /// second task_failed for a row that is already terminal, or rescues a stranded row without
+    /// exactly one event.
+    #[tokio::test]
+    async fn d045_the_guard_rescues_once_and_never_rewrites_a_terminal_row() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".triumvirate")).expect("mkdir");
+        let (fleet_id, task_id) = seeded_fleet(&project_root);
+        let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
+            .expect("open sqlite");
+        conn.execute("UPDATE tasks SET state = 'in_progress' WHERE task_id = ?1", [task_id.as_str()])
+            .expect("strand the row");
+        let orchestrator = FleetOrchestrator::new(MockGitOps { touched: Arc::new(Mutex::new(Vec::new())) });
+        let guard = || WorkerTerminalGuard {
+            orchestrator: orchestrator.clone(),
+            project_root: project_root.clone(),
+            fleet_id: fleet_id.clone(),
+            task_id: task_id.clone(),
+            armed: true,
+        };
+        let failed_events = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = 'task_failed'",
+                [fleet_id.as_str()],
+                |r| r.get(0),
+            )
+            .expect("count")
+        };
+        drop(guard());
+        let state: String = conn
+            .query_row("SELECT state FROM tasks WHERE task_id = ?1", [task_id.as_str()], |r| r.get(0))
+            .expect("state");
+        assert_eq!(state, "failed", "a stranded row is rescued");
+        assert_eq!(failed_events(), 1, "with exactly one event");
+        drop(guard());
+        assert_eq!(failed_events(), 1, "an armed guard on a terminal row writes nothing");
+    }
+
     /// D-031. An ARMED guard rescues a worker that recorded nothing; a DISARMED one is inert.
     ///
     /// RED IF: the arm/disarm flag is dropped. The first version ran on every exit, so the last

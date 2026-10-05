@@ -315,37 +315,37 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 **Found:** 2026-10-04 (codex review of PR #66) · **Severity:** MEDIUM · **CLOSED 2026-10-04** (#71)
 **Evidence:** `ask_agent` codex failed with `codex connector failed: exited with status 1; codex said: ... rmcp::transport::worker ... error sending request for url (http://192.168.2.110:8000/mcp)`. The real cause was only in the codex session rollout: `You've hit your usage limit ... try again at 10:11 PM`. The error led toward a network diagnosis.
 **CHECK to close:** a codex consult that fails on a usage limit (or any API error the rollout records) surfaces that message in the ask_agent error, ahead of stderr noise.
-**Fixed:** (#71) `codex_error_tail` puts structured stdout errors (dedup, at most 2) ahead of stderr, 3 lines total. Pins: `structured_quota_error_precedes_stderr_transport_noise` (tonight's exact case; the old code fails it) and `budget_is_two_structured_then_the_last_stderr_line`. Written by trial fleet 12, the first real codex fleet member that worked.
+**Fixed:** (#71) `codex_error_tail` puts structured stdout errors (dedup, at most 2) ahead of stderr, 3 lines total. Pins: `structured_quota_error_precedes_stderr_transport_noise` (tonight's exact case; the old code fails it) and `budget_is_two_structured_then_the_last_stderr_line`. Written by trial fleet 12, the first real codex fleet member that worked. CHECK passes on main 60aab14: these tests are green in the full run (cargo test: 658 lib, 70 fleet, 320 daemon binary, replay; 0 failed) and CI.
 
 ### D-046 - The agy and grok fleet arms pass operator connector args into their builders
 **Found:** 2026-10-04 (PR #60 review, Grok) · **Severity:** LOW · **CLOSED 2026-10-04** (#67)
 **Evidence:** the codex fleet arm now drops `TRIUMVIRATE_CODEX_ARGS` because a sandbox bypass in it would widen the fleet argv; the agy and grok arms still pass `TRIUMVIRATE_AGY_ARGS` / `TRIUMVIRATE_GROK_ARGS`. Grok's builder has a forbidden-flag guard; agy's does not claim one.
 **CHECK to close:** no fleet argv (codex, agy, gemini-cli, grok) contains an operator connector arg; `crates/fleet/tests/fleet_agent_bin_pin.rs` asserts it per agent and goes red if an arm forwards them (same rule as D-040).
-**Fixed:** (#67) agy and grok fleet arms take only the resolved binary and pass no operator args; `fleet_agent_bin_pin.rs` asserts it per agent, red with either arm reverted. CI now runs `cargo test -p fleet --tests` (PR #70).
+**Fixed:** (#67) agy and grok fleet arms take only the resolved binary and pass no operator args; `fleet_agent_bin_pin.rs` asserts it per agent, red with either arm reverted. CI now runs `cargo test -p fleet --tests` (PR #70). CHECK passes on main 60aab14: these tests are green in the full run (cargo test: 658 lib, 70 fleet, 320 daemon binary, replay; 0 failed) and CI.
 
 ### D-045 - `record_task_failed` swallows a ledger write error and the worker still disarms its guard
 **Found:** 2026-10-04 (PR #62 review, Codex) · **Severity:** LOW · **CLOSED 2026-10-04** (#66)
 **Evidence:** `record_task_failed` logs a failed UPDATE and returns `()`; the caller then disarms `WorkerTerminalGuard`, so if the write failed the task can stay `in_progress` with nothing left to rescue it. Shared by the legacy and Temporal paths.
 **CHECK to close:** a failed terminal write leaves the guard armed (or the worker retries the write), proven with a test that makes the UPDATE fail.
-**Fixed:** (#66) `record_task_completed` / `record_task_failed` are idempotent on the row (an already-terminal row is left alone), decide by their own UPDATE's affected rows (8-thread test: exactly one event), write the event only when the row lands, and open the ledger with a 5 s busy timeout. Every failure arm and the worker guard go through `write_task_failed`; the guard disarms only on a terminal row. Also found and fixed: every completion had written TWO task_completed events.
+**Fixed:** (#66) `record_task_completed` / `record_task_failed` are idempotent on the row (an already-terminal row is left alone), decide by their own UPDATE's affected rows (8-thread test: exactly one event), write the event only when the row lands, and open the ledger with a 5 s busy timeout. Every failure arm and the worker guard go through `write_task_failed`; the guard disarms only on a terminal row. Also found and fixed: every completion had written TWO task_completed events. CHECK passes: a write that matches no row returns false and writes no event; an armed guard rescues a stranded row with exactly one event and writes nothing on a terminal row (`d045_the_guard_rescues_once_and_never_rewrites_a_terminal_row`); 8 concurrent completions write one event. Not covered by a test: the worker-loop gate that disarms only on a terminal row (three-seat code review only).
 
 ### D-044 - A failed fleet member's ledger reason does not say why
 **Found:** 2026-10-04 (trial fleet fleet-1791157133256920000) · **Severity:** MEDIUM · **CLOSED 2026-10-04** (#65)
 **Evidence:** the `task_failed` payload said only `"error":"agent exited Some(1)"`; the cause (a 400 from the model API) was only in `.triumvirate/fleet-workers/<fleet>/<task>.err`.
 **CHECK to close:** a member that exits non-zero (or is killed or times out) records the last 2000 bytes of its stderr as `stderr_tail` in the task_failed payload, on both engines; a degraded failure carries the failing attempt's own stderr.
-**Fixed:** (#65) a non-zero (or killed/timed-out) member carries the last 2000 bytes of its stderr as `stderr_tail` on both engines; a degraded failure carries the failing attempt's own stderr. Pins: `a_nonzero_member_carries_its_stderr_tail`, the degraded test asserts `codex-stderr`.
+**Fixed:** (#65) a non-zero (or killed/timed-out) member carries the last 2000 bytes of its stderr as `stderr_tail` on both engines; a degraded failure carries the failing attempt's own stderr. Pins: `a_nonzero_member_carries_its_stderr_tail`, the degraded test asserts `codex-stderr`. CHECK passes on main 60aab14: these tests are green in the full run (cargo test: 658 lib, 70 fleet, 320 daemon binary, replay; 0 failed) and CI.
 
 ### D-043 - Tests deleted HOME for every later test
 **Found:** 2026-10-04 · **Severity:** MEDIUM · **CLOSED 2026-10-04** (#63)
 **Evidence:** four tests in `daemon/crates/triumvirate/src/main.rs` set HOME and then called `remove_var("HOME")`; `abe_red_team_*` then failed "environment variable not found". Review found about 46 more tests ending in `remove_var` (HOME, TRIUMVIRATE_HOME, agent bins and args); PR #63 converts every env-mutating test in main.rs to the `EnvRestore` guard.
 **CHECK to close:** no test ends by removing an env var it did not create; `test_env_restore_guard` passes.
-**Fixed:** (#63) every env-mutating test in `main.rs` takes an `EnvRestore` drop guard after `env_lock()`; no test ends by removing a var. Checker: 0 uncaptured mutations (was 46); `test_env_restore_guard`; Codex confirmed.
+**Fixed:** (#63) every env-mutating test in `main.rs` takes an `EnvRestore` drop guard after `env_lock()`; no test ends by removing a var. Checker: 0 uncaptured mutations (was 46); `test_env_restore_guard`; Codex confirmed. CHECK passes on main 60aab14: these tests are green in the full run (cargo test: 658 lib, 70 fleet, 320 daemon binary, replay; 0 failed) and CI.
 
 ### D-042 - The legacy fleet worker recorded a member done on exit 0 without a commit
 **Found:** 2026-10-04 · **Severity:** HIGH · **CLOSED 2026-10-04** (#62)
 **Evidence:** the legacy success arms called `record_task_completed` on the exit code alone; the Temporal engine already required a new descendant commit.
 **CHECK to close:** `a_legacy_member_that_exits_0_without_committing_is_failed_not_done` and `a_degraded_codex_that_exits_0_without_committing_is_failed_not_done` pass and go red when the judgement is bypassed.
-**Fixed:** (#62) both legacy success arms judge with `judge_worktree_run` (exit 0 AND a new commit descending from the fleet base). Pins: primary-arm and degraded-arm worker-loop tests, each red with the judgement bypassed.
+**Fixed:** (#62) both legacy success arms judge with `judge_worktree_run` (exit 0 AND a new commit descending from the fleet base). Pins: primary-arm and degraded-arm worker-loop tests, each red with the judgement bypassed. CHECK passes on main 60aab14: these tests are green in the full run (cargo test: 658 lib, 70 fleet, 320 daemon binary, replay; 0 failed) and CI.
 
 ### D-041 - No sandboxed fleet member could commit in its worktree
 **Found:** 2026-10-04 (live probes) · **Severity:** HIGH · **CLOSED 2026-10-04** (#61)
@@ -357,7 +357,7 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 **Found:** 2026-10-04 (Temporal trial fleet fleet-1791157133256920000) · **Severity:** HIGH · **CLOSED 2026-10-04** (#60)
 **Evidence:** the member's rollout shows `cli_version` 0.133.0 (`/opt/homebrew/bin/codex`, first on the launchd PATH) while consults run the pinned `TRIUMVIRATE_CODEX_BIN` 0.154.0; the old CLI refused the configured model with a 400 and every codex fleet member exited 1.
 **CHECK to close:** `fleet_agent_command` uses the resolver (`codex_command`, `gemini_command`) and never operator connector args; `crates/fleet/tests/fleet_agent_bin_pin.rs` passes and goes red with a bare name.
-**Fixed:** (#60) `fleet_agent_command` uses `codex_command()` / `gemini_command()`, binary only. LIVE: trial fleet 12's rollout shows `cli_version` 0.154.0, the pinned binary.
+**Fixed:** (#60) `fleet_agent_command` uses `codex_command()` / `gemini_command()`, binary only. LIVE: trial fleet 12's rollout shows `cli_version` 0.154.0, the pinned binary. CHECK passes on main 60aab14: these tests are green in the full run (cargo test: 658 lib, 70 fleet, 320 daemon binary, replay; 0 failed) and CI.
 
 ### D-038 - Codex fleet workers ran read-only and reported success
 **Found:** 2026-10-04 · **Severity:** HIGH · **CLOSED 2026-10-04**
