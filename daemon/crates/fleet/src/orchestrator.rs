@@ -700,7 +700,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             "branch_head": head,
                                             "base_sha": base,
                                         });
-                                        record_task_completed(&project_root, &fleet_id, &task_id, &launch_agent, payload);
+                                        let _ = record_task_completed(&project_root, &fleet_id, &task_id, &launch_agent, payload);
                                     }
                                     Err(reason) => {
                                         tracing::warn!(
@@ -728,7 +728,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             "longest_silence_ms": longest_silence.as_millis() as u64,
                                             "error": reason,
                                         });
-                                        record_task_failed(&project_root, &fleet_id, &task_id, payload);
+                                        let _ = record_task_failed(&project_root, &fleet_id, &task_id, payload);
                                     }
                                 }
                             }
@@ -1010,7 +1010,14 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                 orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
                 // Reached the end of the worker body: every path above recorded its own
                 // outcome, so the guard has nothing to rescue.
-                terminal_guard.disarm();
+                match crate::orchestrator::task_row_state(&project_root, &task_id).as_deref() {
+                    Some("done") | Some("failed") | Some("cancelled") => {
+                        terminal_guard.disarm();
+                    }
+                    _ => {
+                        tracing::error!("terminal state not persisted; leaving the guard armed");
+                    }
+                }
             });
             join_handles.push((joined_task_id, jh));
         }
@@ -1483,6 +1490,15 @@ fn event_sequence_for(
     Ok(max_seq.unwrap_or(0) + 1)
 }
 
+pub fn task_row_state(project_root: &Path, task_id: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).ok()?;
+    conn.query_row(
+        "SELECT state FROM tasks WHERE task_id = ?1",
+        rusqlite::params![task_id],
+        |row| row.get(0),
+    ).ok()
+}
+
 /// Record a fleet task as completed: the task row, the `task_completed` event, and the queued
 /// peer review. Shared by both engines so a completion is recorded one way.
 ///
@@ -1494,9 +1510,10 @@ pub fn record_task_completed(
     task_id: &str,
     author_agent: &str,
     payload: serde_json::Value,
-) {
+) -> bool {
+    let mut complete_ok = false;
     if let Ok(task_store) = FleetTaskStore::new(project_root.to_path_buf()) {
-        let _ = task_store.complete_task(task_id);
+        complete_ok = task_store.complete_task(task_id).is_ok();
     }
     ingest_fleet_event(project_root, fleet_id, "task_completed", payload.to_string());
     if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.to_path_buf()) {
@@ -1511,19 +1528,27 @@ pub fn record_task_completed(
         });
         tracing::info!(fleet_id, task_id, author_agent, "peer review requested for completed task");
     }
+    complete_ok && task_row_state(project_root, task_id).as_deref() == Some("done")
 }
 
 /// Record a fleet task as failed: the task row and the `task_failed` event. A row that cannot be
 /// updated is logged loudly: a task left `in_progress` keeps the fleet from ever finishing.
-pub fn record_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) {
-    match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).and_then(|conn| {
+pub fn record_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) -> bool {
+    let affected = match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).and_then(|conn| {
         conn.execute("UPDATE tasks SET state = 'failed' WHERE task_id = ?1", rusqlite::params![task_id])
     }) {
-        Ok(0) => tracing::error!(fleet_id, task_id, "failed task row not marked failed: no row matched"),
-        Ok(_) => {}
-        Err(e) => tracing::error!(fleet_id, task_id, error = %e, "failed task row not marked failed"),
-    }
+        Ok(0) => {
+            tracing::error!(fleet_id, task_id, "failed task row not marked failed: no row matched");
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!(fleet_id, task_id, error = %e, "failed task row not marked failed");
+            false
+        }
+    };
     ingest_fleet_event(project_root, fleet_id, "task_failed", payload.to_string());
+    affected
 }
 
 /// Wall-clock bound for one non-agy fleet worker. `TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS`,
@@ -2224,6 +2249,40 @@ mod fleet_codex_argv_tests {
         assert!(argv.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{argv:?}");
         assert!(!argv.iter().any(|a| a.contains("dangerously") || a == "danger-full-access"), "{argv:?}");
         assert_eq!(argv.last().map(String::as_str), Some("task"), "the prompt stays last, after --");
+    }
+}
+
+#[cfg(test)]
+mod task_row_state_tests {
+    use super::{record_task_failed, task_row_state};
+    use crate::tasks::FleetTaskStore;
+
+    #[test]
+    fn test_record_task_failed_and_task_row_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".triumvirate")).unwrap();
+        let _ = ledger::LedgerStore::open(root.to_path_buf()).unwrap();
+        let store = FleetTaskStore::new(root.to_path_buf()).unwrap();
+        
+        let fleet_id = "test-fleet-123";
+        let task_id = "test-fleet-123-T-001";
+        
+        store.insert_fleet(fleet_id, "desc").unwrap();
+        store.insert_task(task_id, fleet_id, "desc", &[]).unwrap();
+        
+        // Mark it as in_progress to test task_row_state
+        let conn = rusqlite::Connection::open(root.join(".triumvirate").join("ledger.db")).unwrap();
+        conn.execute("UPDATE tasks SET state = 'in_progress' WHERE task_id = ?1", rusqlite::params![task_id]).unwrap();
+        
+        assert_eq!(task_row_state(root, task_id).as_deref(), Some("in_progress"));
+        assert_eq!(task_row_state(root, "missing"), None);
+        
+        let payload = serde_json::json!({"error": "test"});
+        assert_eq!(record_task_failed(root, fleet_id, "missing", payload.clone()), false);
+        assert_eq!(record_task_failed(root, fleet_id, task_id, payload.clone()), true);
+        
+        assert_eq!(task_row_state(root, task_id).as_deref(), Some("failed"));
     }
 }
 
