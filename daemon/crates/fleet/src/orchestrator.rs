@@ -1309,35 +1309,26 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> Drop for WorkerTerminalGuard
         if !self.armed {
             return;
         }
-        let db = self.project_root.join(".triumvirate").join("ledger.db");
-        let updated = rusqlite::Connection::open(&db).and_then(|conn| {
-            // A busy timeout, because this runs when many workers may be finishing at once and
-            // a lost update here strands the fleet (Codex, panel review).
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-            conn.execute(
-                "UPDATE tasks SET state = 'failed'
-                 WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
-                rusqlite::params![self.task_id.as_str()],
-            )
-        });
-        let rescued = match updated {
-            Ok(0) => false,
-            Ok(_) => {
-                tracing::error!(
-                    fleet_id = %self.fleet_id,
-                    task_id = %self.task_id,
-                    "fleet worker ended without recording an outcome (panic or abort); marked failed"
-                );
-                true
-            }
-            Err(e) => {
-                tracing::error!(fleet_id = %self.fleet_id, task_id = %self.task_id, error = %e, "worker guard could not mark its task failed");
-                false
-            }
-        };
+        // The one failure recorder (row guarded on non-terminal, event only when it lands), so
+        // the guard cannot drift from the worker's own failure path (Codex, PR #66).
+        let rescued = write_task_failed(
+            &self.project_root,
+            &self.fleet_id,
+            &self.task_id,
+            serde_json::json!({
+                "task_id": self.task_id,
+                "agent": serde_json::Value::Null,
+                "error": "worker ended without recording an outcome (panic or abort)",
+            }),
+        ) == FailedWrite::Landed;
         if !rescued {
             return;
         }
+        tracing::error!(
+            fleet_id = %self.fleet_id,
+            task_id = %self.task_id,
+            "fleet worker ended without recording an outcome (panic or abort); marked failed"
+        );
         // The fleet still has to be driven to its terminal state, which the first version did
         // NOT do: it counted pending tasks, emitted an event, and left the fleet `running`,
         // so the exact scenario this guard exists for stayed broken (Codex, panel review).
@@ -1347,19 +1338,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> Drop for WorkerTerminalGuard
             let orchestrator = self.orchestrator.clone();
             let project_root = self.project_root.clone();
             let fleet_id = self.fleet_id.clone();
-            let task_id = self.task_id.clone();
             handle.spawn(async move {
-                ingest_fleet_event(
-                    &project_root,
-                    &fleet_id,
-                    "task_failed",
-                    serde_json::json!({
-                        "task_id": task_id,
-                        "agent": serde_json::Value::Null,
-                        "error": "worker ended without recording an outcome (panic or abort)",
-                    })
-                    .to_string(),
-                );
                 orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
             });
         }
@@ -1491,7 +1470,7 @@ pub fn record_task_completed(
     // task_completed event, so every completion was recorded twice (found by this PR's test).
     // Decided by THIS update's affected rows, so of two concurrent retries exactly one writes the
     // event and the review request (Codex, PR #66); the other reports the row's state.
-    match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).and_then(|conn| {
+    match ledger_conn(project_root).and_then(|conn| {
         conn.execute(
             "UPDATE tasks SET state = 'done', completed_at = datetime('now') WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
             rusqlite::params![task_id],
@@ -1535,30 +1514,55 @@ fn is_terminal_task_state(state: &str) -> bool {
 /// event is written. The event is written only when the row update landed, so a failed write
 /// leaves the worker's guard to record it once instead of twice (Codex, PR #66).
 pub fn record_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) -> bool {
+    write_task_failed(project_root, fleet_id, task_id, payload) != FailedWrite::NotWritten
+}
+
+/// What a failure write did. The worker guard must know whether THIS call rescued the row.
+#[derive(Debug, PartialEq, Eq)]
+enum FailedWrite {
+    Landed,
+    AlreadyTerminal,
+    NotWritten,
+}
+
+fn write_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) -> FailedWrite {
     if let Some(state) = task_row_state(project_root, task_id).filter(|s| is_terminal_task_state(s)) {
         tracing::warn!(fleet_id, task_id, state = %state, "task already terminal; failure not re-recorded");
-        return true;
+        return FailedWrite::AlreadyTerminal;
     }
-    let affected = match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).and_then(|conn| {
+    let updated = ledger_conn(project_root).and_then(|conn| {
         conn.execute(
             "UPDATE tasks SET state = 'failed' WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
             rusqlite::params![task_id],
         )
-    }) {
+    });
+    match updated {
         Ok(0) => {
-            tracing::error!(fleet_id, task_id, "failed task row not marked failed: no row matched");
-            false
+            // Lost a race to another terminal write, or no such row.
+            if task_row_state(project_root, task_id).is_some_and(|s| is_terminal_task_state(&s)) {
+                FailedWrite::AlreadyTerminal
+            } else {
+                tracing::error!(fleet_id, task_id, "failed task row not marked failed: no row matched");
+                FailedWrite::NotWritten
+            }
         }
-        Ok(_) => true,
+        Ok(_) => {
+            ingest_fleet_event(project_root, fleet_id, "task_failed", payload.to_string());
+            FailedWrite::Landed
+        }
         Err(e) => {
             tracing::error!(fleet_id, task_id, error = %e, "failed task row not marked failed");
-            false
+            FailedWrite::NotWritten
         }
-    };
-    if affected {
-        ingest_fleet_event(project_root, fleet_id, "task_failed", payload.to_string());
     }
-    affected
+}
+
+/// The ledger, with the busy timeout terminal writes need when many workers finish at once (a
+/// lost update strands the fleet; the guard had this, the recorders did not).
+fn ledger_conn(project_root: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
 }
 
 /// Wall-clock bound for one non-agy fleet worker. `TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS`,
