@@ -1036,6 +1036,21 @@ pub struct SessionState {
     pub pantheon_session_id: Option<String>,
 }
 
+/// Canonical agent key for an alias. ONE list, because two lists is how a reviewer named
+/// `antigravity` was assigned to review `gemini`'s own work: peer-review compared raw strings
+/// while dispatch canonicalized them, so the author and the reviewer were the same seat under
+/// different names (D-030). Lives here so peer-review and mcp-bridge share it rather than each
+/// keeping a copy.
+pub fn normalize_agent_name(agent: &str) -> String {
+    match agent.to_lowercase().as_str() {
+        "antigravity" | "agy" => "gemini".to_string(),
+        // REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an
+        // alias only. The canonical execution key is `grok` and the binary is `grok`.
+        "grok-build" | "xai" | "supergrok" => "grok".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1279,20 +1294,5 @@ mod tests {
                 serde_json::from_str(&raw).expect("parse");
             assert_eq!(&parsed, expected);
         }
-    }
-}
-
-/// Canonical agent key for an alias. ONE list, because two lists is how a reviewer named
-/// `antigravity` was assigned to review `gemini`'s own work: peer-review compared raw strings
-/// while dispatch canonicalized them, so the author and the reviewer were the same seat under
-/// different names (D-030). Lives here so peer-review and mcp-bridge share it rather than each
-/// keeping a copy.
-pub fn normalize_agent_name(agent: &str) -> String {
-    match agent.to_lowercase().as_str() {
-        "antigravity" | "agy" => "gemini".to_string(),
-        // REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an
-        // alias only. The canonical execution key is `grok` and the binary is `grok`.
-        "grok-build" | "xai" | "supergrok" => "grok".to_string(),
-        other => other.to_string(),
     }
 }
