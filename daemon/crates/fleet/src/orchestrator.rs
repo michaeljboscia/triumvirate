@@ -142,11 +142,12 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
             // pipe capture is fine (agy doesn't drop over a pipe). The per-dispatch
             // profile/log temp files are reaped by the OS from the temp dir.
             mcp_bridge::GeminiBackend::Agy => {
-                let (bin, extra) = mcp_bridge::agy_command();
+                let bin = mcp_bridge::agy_command().0;
                 let cwd = worktree_path.to_string_lossy();
+                // operator connector args are consult-shaped and never reach a fleet argv (D-046), as in the codex arm.
                 let inv = mcp_bridge::agy::build_agy_invocation(
                     &bin,
-                    &extra,
+                    &[],
                     task_prompt,
                     &cwd,
                     // Fleet workers WRITE code by design, so they keep the operator
@@ -169,8 +170,9 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
         // No session id: a fleet worker is single-turn in its own worktree, so passing one
         // would either create a session nothing resumes or, worse, resume a stranger's.
         "grok" => {
-            let (bin, extra) = mcp_bridge::grok_command();
+            let bin = mcp_bridge::grok_command().0;
             let cwd = worktree_path.to_string_lossy();
+            // operator connector args are consult-shaped and never reach a fleet argv (D-046), as in the codex arm.
             // A fleet worker WRITES and COMMITS, so it gets neither consult default. read-only
             // (grok's docs: writes only ~/.grok and temp) left the worker unable to edit its
             // worktree; workspace writes the worktree but not the main repo's .git, so commit
@@ -184,7 +186,7 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
             // fleet-1791158358887817000).
             let inv = mcp_bridge::grok::build_grok_invocation_with_profile(
                 &bin,
-                &extra,
+                &[],
                 task_prompt,
                 &cwd,
                 None,
