@@ -317,10 +317,16 @@ impl FleetLedgerActivities {
         }
 
         if succeeded {
-            fleet::orchestrator::record_task_completed(&root, &o.fleet_id, &o.task_id, &o.agent, payload);
+            if !fleet::orchestrator::record_task_completed(&root, &o.fleet_id, &o.task_id, &o.agent, payload) {
+                let task = &o.task_id;
+                return Err(ActivityError::from(anyhow::anyhow!("terminal ledger write for {task} did not land")));
+            }
             Ok("done".to_string())
         } else {
-            fleet::orchestrator::record_task_failed(&root, &o.fleet_id, &o.task_id, payload);
+            if !fleet::orchestrator::record_task_failed(&root, &o.fleet_id, &o.task_id, payload) {
+                let task = &o.task_id;
+                return Err(ActivityError::from(anyhow::anyhow!("terminal ledger write for {task} did not land")));
+            }
             Ok("failed".to_string())
         }
     }

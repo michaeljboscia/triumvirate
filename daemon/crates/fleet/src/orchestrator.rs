@@ -574,19 +574,6 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         &fleet_id,
                         &task_id,
                     );
-                    // A silently dropped UPDATE leaves the row `in_progress` forever, and the
-                    // fleet terminal check below counts it as still pending. Log it loud.
-                    match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))
-                        .and_then(|conn| {
-                            conn.execute(
-                                "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
-                                rusqlite::params![task_id.as_str()],
-                            )
-                        }) {
-                        Ok(0) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, "breaker-blocked task row not marked failed: no row matched"),
-                        Ok(_) => {}
-                        Err(e) => tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "breaker-blocked task row not marked failed"),
-                    }
                     // No agent ran, so there is no answering `agent` to name. Everywhere
                     // else in this file `agent` means who ANSWERED; writing the requested
                     // seat there would claim gemini ran and failed (Codex, panel review).
@@ -596,15 +583,18 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         "attempted_agent": agent_name,
                         "requested_agent": agent_name,
                         "error": "agy circuit breaker open; substitution disabled",
-                    })
-                    .to_string();
-                    ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
+                    });
+                    // Row and event through the one recorder: the event lands only with the row,
+                    // and a row that did not land keeps the guard armed to rescue it (D-045).
+                    let landed = record_task_failed(&project_root, &fleet_id, &task_id, payload);
                     // Every exit from this worker MUST pass through the fleet terminal check.
                     // Returning straight out left the fleet in `running` forever when this was
                     // the last worker to finish: no merge phase, no fleet_failed (Codex, panel
                     // review of this fix).
                     orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
-                    terminal_guard.disarm();
+                    if landed {
+                        terminal_guard.disarm();
+                    }
                     return;
                 }
                 // Route around agy for real. Emitting "skipped" and then launching agy
@@ -740,7 +730,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             "branch_head": head,
                                             "base_sha": base,
                                         });
-                                        record_task_completed(&project_root, &fleet_id, &task_id, &launch_agent, payload);
+                                        let _ = record_task_completed(&project_root, &fleet_id, &task_id, &launch_agent, payload);
                                     }
                                     Err(reason) => {
                                         tracing::warn!(
@@ -768,7 +758,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             "longest_silence_ms": longest_silence.as_millis() as u64,
                                             "error": reason,
                                         });
-                                        record_task_failed(&project_root, &fleet_id, &task_id, payload);
+                                        let _ = record_task_failed(&project_root, &fleet_id, &task_id, payload);
                                     }
                                 }
                             }
@@ -900,17 +890,16 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             &fleet_id,
                                             &task_id,
                                         );
-                                        if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
-                                            let _ = task_store.complete_task(&task_id);
-                                        }
+                                        // The one completion recorder, as the primary arm: row,
+                                        // a single task_completed event, and the review request.
                                         let payload = serde_json::json!({
                                             "task_id": task_id,
                                             "agent": "codex",
                                             "degraded_from": "agy",
                                             "branch_head": codex_head,
                                             "base_sha": codex_base
-                                        }).to_string();
-                                        ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
+                                        });
+                                        let _ = record_task_completed(&project_root, &fleet_id, &task_id, "codex", payload);
                                     }
                                 }
 
@@ -930,13 +919,6 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         &fleet_id,
                                         &task_id,
                                     );
-                                    let db_path = project_root.join(".triumvirate").join("ledger.db");
-                                    if let Ok(conn) = rusqlite::Connection::open(db_path) {
-                                        let _ = conn.execute(
-                                            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
-                                            [task_id.as_str()],
-                                        );
-                                    }
                                     // Without the agent, a task_failed row cannot tell
                                     // a degraded codex failure from the requested
                                     // gemini failing: the two demand opposite fixes. That
@@ -965,9 +947,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         "error": failure_text,
                                         "longest_silence_ms": longest_silence.as_millis() as u64,
                                         "stderr_tail": stderr_tail_val,
-                                    })
-                                    .to_string();
-                                    ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
+                                    });
+                                    let _ = record_task_failed(&project_root, &fleet_id, &task_id, payload);
                                 }
                             }
                             Err(err) => {
@@ -994,13 +975,6 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     &fleet_id,
                                     &task_id,
                                 );
-                                let db_path = project_root.join(".triumvirate").join("ledger.db");
-                                if let Ok(conn) = rusqlite::Connection::open(db_path) {
-                                    let _ = conn.execute(
-                                        "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
-                                        [task_id.as_str()],
-                                    );
-                                }
                                 let payload = serde_json::json!({
                                     "task_id": task_id,
                                     "agent": launch_agent,
@@ -1009,9 +983,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                     "longest_silence_ms": longest_silence.as_millis() as u64,
                                     // A timed-out or killed worker explains itself too (Grok, PR #65).
                                     "stderr_tail": crate::shim::bounded_tail(&stderr_tail, 2000),
-                                })
-                                .to_string();
-                                ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
+                                });
+                                let _ = record_task_failed(&project_root, &fleet_id, &task_id, payload);
                             }
                         }
                     }
@@ -1034,28 +1007,27 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                             &fleet_id,
                             &task_id,
                         );
-                        let db_path = project_root.join(".triumvirate").join("ledger.db");
-                        if let Ok(conn) = rusqlite::Connection::open(db_path) {
-                            let _ = conn.execute(
-                                "UPDATE tasks SET state = 'failed' WHERE task_id = ?1",
-                                [task_id.as_str()],
-                            );
-                        }
                         let payload = serde_json::json!({
                             "task_id": task_id,
                             "agent": launch_agent,
                             "requested_agent": agent_name,
                             "error": err.to_string()
-                        })
-                        .to_string();
-                        ingest_fleet_event(&project_root, &fleet_id, "task_failed", payload);
+                        });
+                        let _ = record_task_failed(&project_root, &fleet_id, &task_id, payload);
                     }
                 }
 
                 orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
                 // Reached the end of the worker body: every path above recorded its own
                 // outcome, so the guard has nothing to rescue.
-                terminal_guard.disarm();
+                match crate::orchestrator::task_row_state(&project_root, &task_id).as_deref() {
+                    Some("done") | Some("failed") | Some("cancelled") => {
+                        terminal_guard.disarm();
+                    }
+                    _ => {
+                        tracing::error!(fleet_id = %fleet_id, task_id = %task_id, "terminal state not persisted; leaving the guard armed");
+                    }
+                }
             });
             join_handles.push((joined_task_id, jh));
         }
@@ -1377,35 +1349,26 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> Drop for WorkerTerminalGuard
         if !self.armed {
             return;
         }
-        let db = self.project_root.join(".triumvirate").join("ledger.db");
-        let updated = rusqlite::Connection::open(&db).and_then(|conn| {
-            // A busy timeout, because this runs when many workers may be finishing at once and
-            // a lost update here strands the fleet (Codex, panel review).
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-            conn.execute(
-                "UPDATE tasks SET state = 'failed'
-                 WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
-                rusqlite::params![self.task_id.as_str()],
-            )
-        });
-        let rescued = match updated {
-            Ok(0) => false,
-            Ok(_) => {
-                tracing::error!(
-                    fleet_id = %self.fleet_id,
-                    task_id = %self.task_id,
-                    "fleet worker ended without recording an outcome (panic or abort); marked failed"
-                );
-                true
-            }
-            Err(e) => {
-                tracing::error!(fleet_id = %self.fleet_id, task_id = %self.task_id, error = %e, "worker guard could not mark its task failed");
-                false
-            }
-        };
+        // The one failure recorder (row guarded on non-terminal, event only when it lands), so
+        // the guard cannot drift from the worker's own failure path (Codex, PR #66).
+        let rescued = write_task_failed(
+            &self.project_root,
+            &self.fleet_id,
+            &self.task_id,
+            serde_json::json!({
+                "task_id": self.task_id,
+                "agent": serde_json::Value::Null,
+                "error": "worker ended without recording an outcome (panic or abort)",
+            }),
+        ) == FailedWrite::Landed;
         if !rescued {
             return;
         }
+        tracing::error!(
+            fleet_id = %self.fleet_id,
+            task_id = %self.task_id,
+            "fleet worker ended without recording an outcome (panic or abort); marked failed"
+        );
         // The fleet still has to be driven to its terminal state, which the first version did
         // NOT do: it counted pending tasks, emitted an event, and left the fleet `running`,
         // so the exact scenario this guard exists for stayed broken (Codex, panel review).
@@ -1415,19 +1378,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> Drop for WorkerTerminalGuard
             let orchestrator = self.orchestrator.clone();
             let project_root = self.project_root.clone();
             let fleet_id = self.fleet_id.clone();
-            let task_id = self.task_id.clone();
             handle.spawn(async move {
-                ingest_fleet_event(
-                    &project_root,
-                    &fleet_id,
-                    "task_failed",
-                    serde_json::json!({
-                        "task_id": task_id,
-                        "agent": serde_json::Value::Null,
-                        "error": "worker ended without recording an outcome (panic or abort)",
-                    })
-                    .to_string(),
-                );
                 orchestrator.finalize_if_all_tasks_terminal(&fleet_id, &project_root).await;
             });
         }
@@ -1528,6 +1479,15 @@ fn event_sequence_for(
     Ok(max_seq.unwrap_or(0) + 1)
 }
 
+pub fn task_row_state(project_root: &Path, task_id: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).ok()?;
+    conn.query_row(
+        "SELECT state FROM tasks WHERE task_id = ?1",
+        rusqlite::params![task_id],
+        |row| row.get(0),
+    ).ok()
+}
+
 /// Record a fleet task as completed: the task row, the `task_completed` event, and the queued
 /// peer review. Shared by both engines so a completion is recorded one way.
 ///
@@ -1539,9 +1499,35 @@ pub fn record_task_completed(
     task_id: &str,
     author_agent: &str,
     payload: serde_json::Value,
-) {
-    if let Ok(task_store) = FleetTaskStore::new(project_root.to_path_buf()) {
-        let _ = task_store.complete_task(task_id);
+) -> bool {
+    // Idempotent on the row (Codex, PR #66): a Temporal retry, or a second caller, must not turn
+    // a failed row into done, or add a second task_completed event and a second review request.
+    if let Some(state) = task_row_state(project_root, task_id).filter(|s| is_terminal_task_state(s)) {
+        tracing::warn!(fleet_id, task_id, state = %state, "task already terminal; completion not re-recorded");
+        return state == "done";
+    }
+    // The row directly, not FleetTaskStore::complete_task: that also writes a bare
+    // task_completed event, so every completion was recorded twice (found by this PR's test).
+    // Decided by THIS update's affected rows, so of two concurrent retries exactly one writes the
+    // event and the review request (Codex, PR #66); the other reports the row's state.
+    match ledger_conn(project_root).and_then(|conn| {
+        conn.execute(
+            "UPDATE tasks SET state = 'done', completed_at = datetime('now') WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
+            rusqlite::params![task_id],
+        )
+    }) {
+        Ok(0) => {
+            let state = task_row_state(project_root, task_id);
+            if state.is_none() {
+                tracing::error!(fleet_id, task_id, "completed task row not marked done: no row matched");
+            }
+            return state.as_deref() == Some("done");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(fleet_id, task_id, error = %e, "completed task row update failed");
+            return false;
+        }
     }
     ingest_fleet_event(project_root, fleet_id, "task_completed", payload.to_string());
     if let Ok(review_engine) = peer_review::PeerReviewEngine::new(project_root.to_path_buf()) {
@@ -1556,19 +1542,67 @@ pub fn record_task_completed(
         });
         tracing::info!(fleet_id, task_id, author_agent, "peer review requested for completed task");
     }
+    true
 }
 
-/// Record a fleet task as failed: the task row and the `task_failed` event. A row that cannot be
-/// updated is logged loudly: a task left `in_progress` keeps the fleet from ever finishing.
-pub fn record_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) {
-    match rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db")).and_then(|conn| {
-        conn.execute("UPDATE tasks SET state = 'failed' WHERE task_id = ?1", rusqlite::params![task_id])
-    }) {
-        Ok(0) => tracing::error!(fleet_id, task_id, "failed task row not marked failed: no row matched"),
-        Ok(_) => {}
-        Err(e) => tracing::error!(fleet_id, task_id, error = %e, "failed task row not marked failed"),
+fn is_terminal_task_state(state: &str) -> bool {
+    matches!(state, "done" | "failed")
+}
+
+/// Record a fleet task as failed: the task row and the `task_failed` event. Returns true when the
+/// row is terminal afterwards. Idempotent: an already-terminal row is left alone and no second
+/// event is written. The event is written only when the row update landed, so a failed write
+/// leaves the worker's guard to record it once instead of twice (Codex, PR #66).
+pub fn record_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) -> bool {
+    write_task_failed(project_root, fleet_id, task_id, payload) != FailedWrite::NotWritten
+}
+
+/// What a failure write did. The worker guard must know whether THIS call rescued the row.
+#[derive(Debug, PartialEq, Eq)]
+enum FailedWrite {
+    Landed,
+    AlreadyTerminal,
+    NotWritten,
+}
+
+fn write_task_failed(project_root: &Path, fleet_id: &str, task_id: &str, payload: serde_json::Value) -> FailedWrite {
+    if let Some(state) = task_row_state(project_root, task_id).filter(|s| is_terminal_task_state(s)) {
+        tracing::warn!(fleet_id, task_id, state = %state, "task already terminal; failure not re-recorded");
+        return FailedWrite::AlreadyTerminal;
     }
-    ingest_fleet_event(project_root, fleet_id, "task_failed", payload.to_string());
+    let updated = ledger_conn(project_root).and_then(|conn| {
+        conn.execute(
+            "UPDATE tasks SET state = 'failed' WHERE task_id = ?1 AND state NOT IN ('done', 'failed')",
+            rusqlite::params![task_id],
+        )
+    });
+    match updated {
+        Ok(0) => {
+            // Lost a race to another terminal write, or no such row.
+            if task_row_state(project_root, task_id).is_some_and(|s| is_terminal_task_state(&s)) {
+                FailedWrite::AlreadyTerminal
+            } else {
+                tracing::error!(fleet_id, task_id, "failed task row not marked failed: no row matched");
+                FailedWrite::NotWritten
+            }
+        }
+        Ok(_) => {
+            ingest_fleet_event(project_root, fleet_id, "task_failed", payload.to_string());
+            FailedWrite::Landed
+        }
+        Err(e) => {
+            tracing::error!(fleet_id, task_id, error = %e, "failed task row not marked failed");
+            FailedWrite::NotWritten
+        }
+    }
+}
+
+/// The ledger, with the busy timeout terminal writes need when many workers finish at once (a
+/// lost update strands the fleet; the guard had this, the recorders did not).
+fn ledger_conn(project_root: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
 }
 
 /// Wall-clock bound for one non-agy fleet worker. `TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS`,
@@ -2325,6 +2359,79 @@ mod fleet_codex_argv_tests {
         assert!(argv.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{argv:?}");
         assert!(!argv.iter().any(|a| a.contains("dangerously") || a == "danger-full-access"), "{argv:?}");
         assert_eq!(argv.last().map(String::as_str), Some("task"), "the prompt stays last, after --");
+    }
+}
+
+#[cfg(test)]
+mod task_row_state_tests {
+    use super::{record_task_failed, task_row_state};
+    use crate::tasks::FleetTaskStore;
+
+    #[test]
+    fn test_record_task_failed_and_task_row_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".triumvirate")).unwrap();
+        let _ = ledger::LedgerStore::open(root.to_path_buf()).unwrap();
+        let store = FleetTaskStore::new(root.to_path_buf()).unwrap();
+        
+        let fleet_id = "test-fleet-123";
+        let task_id = "test-fleet-123-T-001";
+        
+        store.insert_fleet(fleet_id, "desc").unwrap();
+        store.insert_task(task_id, fleet_id, "desc", &[]).unwrap();
+        
+        // Mark it as in_progress to test task_row_state
+        let conn = rusqlite::Connection::open(root.join(".triumvirate").join("ledger.db")).unwrap();
+        conn.execute("UPDATE tasks SET state = 'in_progress' WHERE task_id = ?1", rusqlite::params![task_id]).unwrap();
+        
+        assert_eq!(task_row_state(root, task_id).as_deref(), Some("in_progress"));
+        assert_eq!(task_row_state(root, "missing"), None);
+        
+        let payload = serde_json::json!({"error": "test"});
+        assert!(!record_task_failed(root, fleet_id, "missing", payload.clone()));
+        assert!(record_task_failed(root, fleet_id, task_id, payload.clone()));
+        
+        assert_eq!(task_row_state(root, task_id).as_deref(), Some("failed"));
+
+        let events = |kind: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = ?2",
+                rusqlite::params![fleet_id, kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Exactly one task_failed: the missing-row call wrote none, the real one wrote one.
+        assert_eq!(events("task_failed"), 1);
+        // Idempotent: a retry of the failure writes nothing more.
+        assert!(record_task_failed(root, fleet_id, task_id, payload.clone()));
+        assert_eq!(events("task_failed"), 1);
+        // A completion arriving after the failure (a retry, a race) cannot turn failed into done.
+        assert!(!super::record_task_completed(root, fleet_id, task_id, "codex", payload.clone()));
+        assert_eq!(task_row_state(root, task_id).as_deref(), Some("failed"));
+        assert_eq!(events("task_completed"), 0);
+
+        // A real completion lands once; its retry adds no second event.
+        let done_id = "test-fleet-123-T-002";
+        store.insert_task(done_id, fleet_id, "desc", &[]).unwrap();
+        assert!(super::record_task_completed(root, fleet_id, done_id, "codex", payload.clone()));
+        assert!(super::record_task_completed(root, fleet_id, done_id, "codex", payload.clone()));
+        assert_eq!(task_row_state(root, done_id).as_deref(), Some("done"));
+        assert_eq!(events("task_completed"), 1);
+
+        // Concurrent retries of one completion: every caller sees done, exactly one event lands.
+        let race_id = "test-fleet-123-T-003";
+        store.insert_task(race_id, fleet_id, "desc", &[]).unwrap();
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| sc.spawn(|| super::record_task_completed(root, fleet_id, race_id, "codex", payload.clone())))
+                .collect();
+            for h in handles {
+                assert!(h.join().unwrap(), "every concurrent caller reports the row done");
+            }
+        });
+        assert_eq!(events("task_completed"), 2, "one event for T-002, exactly one for T-003");
     }
 }
 
