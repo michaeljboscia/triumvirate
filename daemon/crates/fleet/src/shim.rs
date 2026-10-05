@@ -74,22 +74,16 @@ pub fn read_done(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Resu
     }
 }
 
-pub fn output_tail(path: &Path, max_bytes: usize) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len == 0 {
-        return None;
+/// The last `max_bytes` of an agent's output for a failure record (D-044): cut on a char
+/// boundary, trimmed, without a leading U+FFFD left by an earlier byte-level cut, None if empty.
+/// Takes text the worker already holds; it reads no file.
+pub fn bounded_tail(text: &str, max_bytes: usize) -> Option<String> {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
     }
-    f.seek(SeekFrom::Start(len.saturating_sub(max_bytes as u64))).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let s = String::from_utf8_lossy(&buf).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    let tail = text[start..].trim().trim_start_matches('\u{FFFD}').trim_start();
+    (!tail.is_empty()).then(|| tail.to_string())
 }
 
 fn now_ms() -> u64 {
@@ -217,22 +211,14 @@ mod tests {
     }
 
     #[test]
-    fn test_output_tail() {
-        use std::io::Write;
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("f");
-        assert_eq!(output_tail(&p, 10), None);
-
-        let mut f = File::create(&p).unwrap();
-        assert_eq!(output_tail(&p, 10), None);
-
-        f.write_all(b"  \n").unwrap();
-        f.sync_all().unwrap();
-        assert_eq!(output_tail(&p, 10), None);
-
-        f.write_all(b"hello world!").unwrap();
-        f.sync_all().unwrap();
-        assert_eq!(output_tail(&p, 5).as_deref(), Some("orld!"));
-        assert_eq!(output_tail(&p, 50).as_deref(), Some("hello world!"));
+    fn bounded_tail_cuts_on_a_char_boundary_and_drops_a_split_char() {
+        assert_eq!(bounded_tail("", 10), None);
+        assert_eq!(bounded_tail("  \n ", 10), None);
+        assert_eq!(bounded_tail("hello world!", 5).as_deref(), Some("orld!"));
+        assert_eq!(bounded_tail("hello world!", 50).as_deref(), Some("hello world!"));
+        // "é" is 2 bytes; a 3-byte budget lands inside it and must move forward, not panic.
+        assert_eq!(bounded_tail("aéz!", 3).as_deref(), Some("z!"));
+        // A tail that an upstream lossy cut started mid-char.
+        assert_eq!(bounded_tail("\u{FFFD}rest of the error", 100).as_deref(), Some("rest of the error"));
     }
 }

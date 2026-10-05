@@ -311,7 +311,8 @@ impl FleetLedgerActivities {
             "error": error,
         });
 
-        if let Some(tail) = failure_stderr_tail(&root, &o.fleet_id, &o.task_id, succeeded, exit_code) {
+        let worker_stderr = o.output.as_ref().map(|x| x.stderr_tail.as_str()).unwrap_or("");
+        if let Some(tail) = failure_stderr_tail(succeeded, exit_code, worker_stderr) {
             payload["stderr_tail"] = serde_json::json!(tail);
         }
 
@@ -474,13 +475,14 @@ mod tests {
     }
 }
 
-/// D-044: why a member that exited non-zero failed, from the tail of the shim's stderr file. The
-/// exit code alone ("agent exited Some(1)") hid a model-API 400 that was only in that file.
-fn failure_stderr_tail(root: &std::path::Path, fleet_id: &str, task_id: &str, succeeded: bool, exit_code: Option<i32>) -> Option<String> {
+/// D-044: why a member that exited non-zero failed: the tail of its stderr, which run_worker
+/// already read into its output. The exit code alone ("agent exited Some(1)") hid a model-API
+/// 400 that was only in that stream.
+fn failure_stderr_tail(succeeded: bool, exit_code: Option<i32>, worker_stderr: &str) -> Option<String> {
     if succeeded || exit_code == Some(0) {
         return None;
     }
-    fleet::shim::err_path(root, fleet_id, task_id).ok().and_then(|p| fleet::shim::output_tail(&p, 2000))
+    fleet::shim::bounded_tail(worker_stderr, 2000)
 }
 
 #[cfg(test)]
@@ -488,14 +490,12 @@ mod failure_stderr_tail_tests {
     /// RED IF a non-zero member's failure loses its stderr, or a clean or exit-0 run carries one.
     #[test]
     fn a_nonzero_member_carries_its_stderr_tail() {
-        let d = tempfile::tempdir().unwrap();
-        let err = fleet::shim::err_path(d.path(), "fleet-x", "fleet-x-T-001").unwrap();
-        std::fs::create_dir_all(err.parent().unwrap()).unwrap();
-        std::fs::write(&err, "noise\nERROR: The model requires a newer version of Codex\n").unwrap();
-        let tail = super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-001", false, Some(1));
+        let err = "noise\nERROR: The model requires a newer version of Codex\n";
+        let tail = super::failure_stderr_tail(false, Some(1), err);
         assert!(tail.as_deref().is_some_and(|t| t.contains("requires a newer version")), "{tail:?}");
-        assert_eq!(super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-001", false, Some(0)), None);
-        assert_eq!(super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-001", true, Some(0)), None);
-        assert_eq!(super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-002", false, Some(1)), None);
+        assert_eq!(super::failure_stderr_tail(false, Some(0), err), None);
+        assert_eq!(super::failure_stderr_tail(true, Some(0), err), None);
+        assert_eq!(super::failure_stderr_tail(false, Some(1), ""), None);
+        assert!(super::failure_stderr_tail(false, None, err).is_some(), "killed by a signal still explains itself");
     }
 }
