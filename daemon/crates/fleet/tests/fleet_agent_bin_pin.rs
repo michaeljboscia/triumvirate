@@ -57,6 +57,7 @@ fn fleet_members_get_pinned_binaries_and_commit_grants() {
         std::env::set_var("TRIUMVIRATE_GEMINI_BIN", "/pinned/gemini");
         std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
         std::env::set_var("TRIUMVIRATE_GROK_BIN", "/pinned/grok");
+        std::env::set_var("TRIUMVIRATE_GROK_ARGS", "--verbose");
         std::env::remove_var("TRIUMVIRATE_GROK_SANDBOX");
         std::env::remove_var("TRIUMVIRATE_GROK_DEPTH");
     }
@@ -84,6 +85,7 @@ fn fleet_members_get_pinned_binaries_and_commit_grants() {
 
     let (bin, argv) = fleet::orchestrator::fleet_agent_command("grok", &wt, "task").expect("grok");
     assert_eq!(bin, "/pinned/grok");
+    assert!(!argv.iter().any(|a| a == "--verbose"), "operator connector arg must not reach grok fleet argv: {argv:?}");
     assert!(value_after(&argv, "--sandbox").is_empty(), "no sandbox flag, as the agy fleet arm: {argv:?}");
     assert_eq!(value_after(&argv, "--max-turns"), vec!["30"], "Deep, not Fast's 12: {argv:?}");
 
@@ -91,6 +93,16 @@ fn fleet_members_get_pinned_binaries_and_commit_grants() {
     unsafe { std::env::set_var("TRIUMVIRATE_GROK_SANDBOX", "strict") };
     let (_, argv) = fleet::orchestrator::fleet_agent_command("grok", &wt, "task").expect("grok");
     assert_eq!(value_after(&argv, "--sandbox"), vec!["strict"], "{argv:?}");
+
+    // An agy fleet member ignores connector args.
+    unsafe {
+        std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "agy");
+        std::env::set_var("TRIUMVIRATE_AGY_BIN", "/pinned/agy");
+        std::env::set_var("TRIUMVIRATE_AGY_ARGS", "--verbose");
+    }
+    let (bin, argv) = fleet::orchestrator::fleet_agent_command("gemini", &wt, "task").expect("agy");
+    assert!(!argv.iter().any(|a| a == "--verbose"), "operator connector arg must not reach agy fleet argv: {argv:?}");
+    assert!(bin == "/pinned/agy" || argv.iter().any(|a| a == "/pinned/agy"), "pinned binary must appear: {bin} {argv:?}");
 
     // Not a worktree at all, or not on a fleet branch: refuse, never launch uncommittable.
     assert!(fleet::orchestrator::fleet_agent_command("codex", tmp.path(), "task").is_err());
