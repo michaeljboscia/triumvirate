@@ -663,39 +663,64 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         }
                         match wait_result {
                             Ok(status) if status.success() => {
-                                tracing::info!(
-                                    fleet_id = %fleet_id,
-                                    task_id = %task_id,
-                                    agent = %agent_name,
-                                    "fleet agent subprocess completed successfully"
-                                );
-                                // A working agy closes the breaker for EVERY caller. Fleet
-                                // never reported its successes, so its healthy traffic could
-                                // not help the shared breaker recover.
-                                if use_agy {
-                                    mcp_bridge::agy_resilience::agy_breaker_record_success();
+                                let (verdict, head, base) = judge_worktree_run(&project_root, &fleet_id, &worktree_path, status.code());
+                                match verdict {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            fleet_id = %fleet_id,
+                                            task_id = %task_id,
+                                            agent = %agent_name,
+                                            "fleet agent subprocess completed successfully"
+                                        );
+                                        // A working agy closes the breaker for EVERY caller. Fleet
+                                        // never reported its successes, so its healthy traffic could
+                                        // not help the shared breaker recover.
+                                        if use_agy {
+                                            mcp_bridge::agy_resilience::agy_breaker_record_success();
+                                        }
+                                        mcp_bridge::posthog::record_fleet_task(
+                                            &launch_agent,
+                                            launched_backend,
+                                            if breaker_open { "degraded_success" } else { "success" },
+                                            task_started.elapsed().as_millis() as u64,
+                                            &fleet_id,
+                                            &task_id,
+                                        );
+                                        // The agent that DID the work, plus what was asked
+                                        // for when they differ. Recording the requested agent
+                                        // alone would credit gemini for a codex commit once
+                                        // the breaker degrades a task, and the ledger is the
+                                        // record we reason about later.
+                                        let payload = serde_json::json!({
+                                            "task_id": task_id,
+                                            "agent": launch_agent,
+                                            "requested_agent": agent_name,
+                                            "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
+                                            "longest_silence_ms": longest_silence.as_millis() as u64,
+                                            "branch_head": head,
+                                            "base_sha": base,
+                                        });
+                                        record_task_completed(&project_root, &fleet_id, &task_id, &launch_agent, payload);
+                                    }
+                                    Err(reason) => {
+                                        tracing::warn!(
+                                            fleet_id = %fleet_id,
+                                            task_id = %task_id,
+                                            agent = %agent_name,
+                                            reason = %reason,
+                                            "fleet agent subprocess exited 0 but its work was rejected"
+                                        );
+                                        let payload = serde_json::json!({
+                                            "task_id": task_id,
+                                            "agent": launch_agent,
+                                            "requested_agent": agent_name,
+                                            "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
+                                            "longest_silence_ms": longest_silence.as_millis() as u64,
+                                            "error": reason,
+                                        });
+                                        record_task_failed(&project_root, &fleet_id, &task_id, payload);
+                                    }
                                 }
-                                mcp_bridge::posthog::record_fleet_task(
-                                    &launch_agent,
-                                    launched_backend,
-                                    if breaker_open { "degraded_success" } else { "success" },
-                                    task_started.elapsed().as_millis() as u64,
-                                    &fleet_id,
-                                    &task_id,
-                                );
-                                // The agent that DID the work, plus what was asked
-                                // for when they differ. Recording the requested agent
-                                // alone would credit gemini for a codex commit once
-                                // the breaker degrades a task, and the ledger is the
-                                // record we reason about later.
-                                let payload = serde_json::json!({
-                                    "task_id": task_id,
-                                    "agent": launch_agent,
-                                    "requested_agent": agent_name,
-                                    "degraded_from": if breaker_open { Some(agent_name.clone()) } else { None },
-                                    "longest_silence_ms": longest_silence.as_millis() as u64,
-                                });
-                                record_task_completed(&project_root, &fleet_id, &task_id, &launch_agent, payload);
                             }
                             Ok(status) => {
                                 // REQ-092: degraded route — when an agy gemini task fails,
@@ -748,6 +773,8 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         }
                                         Err(e) => Err(anyhow::anyhow!("launch marker could not be written: {e}")),
                                     };
+                                    let mut codex_head = None;
+                                    let mut codex_base = None;
                                     let codex_ok = match degrade_launch
                                     {
                                         Ok(codex_child) => {
@@ -767,18 +794,35 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                                 "degraded codex fleet task exceeded TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS",
                                             )
                                             .await;
-                                            let ok = matches!(&r, Ok(s) if s.success());
-                                            if !ok {
-                                                tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, stdout_tail = %out_tail, stderr_tail = %err_tail, "degraded codex fleet worker did not succeed");
-                                                degraded_failure = Some((
-                                                    "codex".to_string(),
-                                                    match &r {
-                                                        Ok(s) => format!("degraded codex exited with status {:?}", s.code()),
-                                                        Err(e) => format!("degraded codex did not run: {e}"),
-                                                    },
-                                                ));
+                                            
+                                            match &r {
+                                                Ok(s) if s.success() => {
+                                                    let (verdict, h, b) = judge_worktree_run(&project_root, &fleet_id, &worktree_path, s.code());
+                                                    match verdict {
+                                                        Ok(()) => {
+                                                            codex_head = h;
+                                                            codex_base = b;
+                                                            true
+                                                        }
+                                                        Err(reason) => {
+                                                            tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, stdout_tail = %out_tail, stderr_tail = %err_tail, reason = %reason, "degraded codex fleet worker exited 0 but its work was rejected");
+                                                            degraded_failure = Some(("codex".to_string(), reason));
+                                                            false
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    tracing::warn!(fleet_id = %fleet_id, task_id = %task_id, stdout_tail = %out_tail, stderr_tail = %err_tail, "degraded codex fleet worker did not succeed");
+                                                    degraded_failure = Some((
+                                                        "codex".to_string(),
+                                                        match &r {
+                                                            Ok(s) => format!("degraded codex exited with status {:?}", s.code()),
+                                                            Err(e) => format!("degraded codex did not run: {e}"),
+                                                        },
+                                                    ));
+                                                    false
+                                                }
                                             }
-                                            ok
                                         }
                                         Err(e) => {
                                             tracing::error!(fleet_id = %fleet_id, task_id = %task_id, error = %e, "fleet codex degraded launch failed");
@@ -803,7 +847,13 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                         if let Ok(task_store) = FleetTaskStore::new(project_root.clone()) {
                                             let _ = task_store.complete_task(&task_id);
                                         }
-                                        let payload = serde_json::json!({"task_id": task_id, "agent": "codex", "degraded_from": "agy"}).to_string();
+                                        let payload = serde_json::json!({
+                                            "task_id": task_id,
+                                            "agent": "codex",
+                                            "degraded_from": "agy",
+                                            "branch_head": codex_head,
+                                            "base_sha": codex_base
+                                        }).to_string();
                                         ingest_fleet_event(&project_root, &fleet_id, "task_completed", payload);
                                     }
                                 }
@@ -1969,6 +2019,35 @@ pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_
     }
 }
 
+pub fn judge_worktree_run(
+    project_root: &Path,
+    fleet_id: &str,
+    worktree_path: &Path,
+    exit_code: Option<i32>,
+) -> (Result<(), String>, Option<String>, Option<String>) {
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        });
+    let base = fleet_base_sha(project_root, fleet_id);
+    let new_commit = match (&head, &base) {
+        (Some(h), Some(b)) => commit_is_new(project_root, b, h),
+        _ => None,
+    };
+    let verdict = judge_member_run(exit_code, head.as_deref(), base.as_deref(), new_commit);
+    (verdict, head, base)
+}
+
 /// A fleet worker WRITES and COMMITS, so it runs codex's `workspace-write` sandbox.
 ///
 /// Bare `codex exec` runs in codex's default READ-ONLY sandbox. Measured 2026-10-04 in a real
@@ -2060,6 +2139,58 @@ mod judge_member_run_tests {
             .expect("event");
         assert_eq!(super::fleet_base_sha(&root, "fleet-b").as_deref(), Some("abc123"));
         assert_eq!(super::fleet_base_sha(&root, "fleet-other"), None);
+    }
+
+    #[test]
+    fn judge_worktree_run_reads_head_and_base_and_judges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".triumvirate").join("spool")).expect("spool");
+        let store = ledger::LedgerStore::open(root.clone()).expect("ledger");
+        let repo = &root;
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C").arg(repo)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .expect("git");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        store
+            .ingest_event(shared_types::RawEvent {
+                session_id: "fleet-w".to_string(),
+                event_type: "fleet_spawned".to_string(),
+                sequence: 1,
+                timestamp: crate::event_timestamp(),
+                payload_json: serde_json::json!({ "head_sha": base, "agent_count": 2 }).to_string(),
+            })
+            .expect("event");
+
+        let (verdict, head, b) = super::judge_worktree_run(&root, "fleet-w", repo, Some(0));
+        assert_eq!(b.as_deref(), Some(base.as_str()));
+        assert_eq!(head.as_deref(), Some(base.as_str()));
+        assert!(verdict.is_err());
+        assert!(verdict.unwrap_err().contains("without committing"));
+
+        git(&["commit", "-q", "--allow-empty", "-m", "work"]);
+        let work = git(&["rev-parse", "HEAD"]);
+        let (verdict2, head2, b2) = super::judge_worktree_run(&root, "fleet-w", repo, Some(0));
+        assert_eq!(b2.as_deref(), Some(base.as_str()));
+        assert_eq!(head2.as_deref(), Some(work.as_str()));
+        assert!(verdict2.is_ok());
+
+        git(&["reset", "-q", "--hard", &base]);
+        git(&["commit", "-q", "--allow-empty", "--amend", "-m", "other base"]);
+        let other = git(&["rev-parse", "HEAD"]);
+        let (verdict3, head3, b3) = super::judge_worktree_run(&root, "fleet-w", repo, Some(0));
+        assert_eq!(b3.as_deref(), Some(base.as_str()));
+        assert_eq!(head3.as_deref(), Some(other.as_str()));
+        assert!(verdict3.is_err());
+        assert!(verdict3.unwrap_err().contains("without committing"));
     }
 }
 
