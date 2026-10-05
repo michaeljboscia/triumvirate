@@ -19,24 +19,39 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-049 - An agy fleet member has a hard 15-minute ceiling
+**Found:** 2026-10-04 (trial fleet fleet-1791161535060714000) · **Severity:** MEDIUM · **NOT FIXED**
+**Evidence:** the member printed `[agy] print timeout after 15m0s with turn in progress; returning partial output`, exited 0 without committing, and its edits were left uncommitted in the worktree. The fleet arm launches agy with the connector's print timeout, sized for a consult, not a code task that builds and tests a large crate.
+**CHECK to close:** an agy fleet member's print timeout is set for fleet work (or configurable per dispatch), and a member that times out mid-turn is recorded failed with that reason.
+
+### D-048 - Every fleet member builds its own target/ and nothing removes it
+**Found:** 2026-10-04 (the trial filled the disk) · **Severity:** HIGH · **NOT FIXED**
+**Evidence:** each member worktree under `.triumvirate/worktrees/` held its own `daemon/target` (1 to 5 GB each); after about ten fleets the volume had 165 MB free and cargo failed with `No space left on device`. Worktrees and their build output stay after the fleet finishes.
+**CHECK to close:** fleet members share one cargo target dir (for example `CARGO_TARGET_DIR` set for the member), or a finished fleet's worktree build output is removed; ten consecutive fleets leave disk use flat.
+
+### D-047 - A failed consult reports transport noise and hides the real cause
+**Found:** 2026-10-04 (codex review of PR #66) · **Severity:** MEDIUM · **NOT FIXED**
+**Evidence:** `ask_agent` codex failed with `codex connector failed: exited with status 1; codex said: ... rmcp::transport::worker ... error sending request for url (http://192.168.2.110:8000/mcp)`. The real cause was only in the codex session rollout: `You've hit your usage limit ... try again at 10:11 PM`. The error led toward a network diagnosis.
+**CHECK to close:** a codex consult that fails on a usage limit (or any API error the rollout records) surfaces that message in the ask_agent error, ahead of stderr noise.
+
 ### D-046 - The agy and grok fleet arms pass operator connector args into their builders
-**Found:** 2026-10-04 (PR #60 review, Grok) · **Severity:** LOW · **NOT FIXED**
+**Found:** 2026-10-04 (PR #60 review, Grok) · **Severity:** LOW · **FIX IN PR #67 (not merged)**
 **Evidence:** the codex fleet arm now drops `TRIUMVIRATE_CODEX_ARGS` because a sandbox bypass in it would widen the fleet argv; the agy and grok arms still pass `TRIUMVIRATE_AGY_ARGS` / `TRIUMVIRATE_GROK_ARGS`. Grok's builder has a forbidden-flag guard; agy's does not claim one.
-**CHECK to close:** a fleet argv contains no operator connector arg, or each builder rejects flags that widen containment, with a test per agent.
+**CHECK to close:** no fleet argv (codex, agy, gemini-cli, grok) contains an operator connector arg; `crates/fleet/tests/fleet_agent_bin_pin.rs` asserts it per agent and goes red if an arm forwards them (same rule as D-040).
 
 ### D-045 - `record_task_failed` swallows a ledger write error and the worker still disarms its guard
-**Found:** 2026-10-04 (PR #62 review, Codex) · **Severity:** LOW · **NOT FIXED**
+**Found:** 2026-10-04 (PR #62 review, Codex) · **Severity:** LOW · **FIX IN PR #66 (not merged)**
 **Evidence:** `record_task_failed` logs a failed UPDATE and returns `()`; the caller then disarms `WorkerTerminalGuard`, so if the write failed the task can stay `in_progress` with nothing left to rescue it. Shared by the legacy and Temporal paths.
 **CHECK to close:** a failed terminal write leaves the guard armed (or the worker retries the write), proven with a test that makes the UPDATE fail.
 
 ### D-044 - A failed fleet member's ledger reason does not say why
-**Found:** 2026-10-04 (trial fleet fleet-1791157133256920000) · **Severity:** MEDIUM · **NOT FIXED**
+**Found:** 2026-10-04 (trial fleet fleet-1791157133256920000) · **Severity:** MEDIUM · **FIX IN PR #65 (not merged)**
 **Evidence:** the `task_failed` payload said only `"error":"agent exited Some(1)"`; the cause (a 400 from the model API) was only in `.triumvirate/fleet-workers/<fleet>/<task>.err`.
-**CHECK to close:** a member that exits non-zero records the tail of its stderr (bounded) in the task_failed payload.
+**CHECK to close:** a member that exits non-zero (or is killed or times out) records the last 2000 bytes of its stderr as `stderr_tail` in the task_failed payload, on both engines; a degraded failure carries the failing attempt's own stderr.
 
 ### D-043 - Tests deleted HOME for every later test
 **Found:** 2026-10-04 · **Severity:** MEDIUM · **FIX IN PR #63 (not merged)**
-**Evidence:** four tests in `daemon/crates/triumvirate/src/main.rs` set HOME and then called `remove_var("HOME")`; `abe_red_team_*` then failed "environment variable not found".
+**Evidence:** four tests in `daemon/crates/triumvirate/src/main.rs` set HOME and then called `remove_var("HOME")`; `abe_red_team_*` then failed "environment variable not found". Review found about 46 more tests ending in `remove_var` (HOME, TRIUMVIRATE_HOME, agent bins and args); PR #63 converts every env-mutating test in main.rs to the `EnvRestore` guard.
 **CHECK to close:** no test ends by removing an env var it did not create; `test_env_restore_guard` passes.
 
 ### D-042 - The legacy fleet worker recorded a member done on exit 0 without a commit
@@ -57,7 +72,7 @@ file is the thing you read to answer "what do we know is broken right now."
 ### D-039 - The launchd daemon cannot reach the LAN until macOS Local Network access is approved
 **Found:** 2026-10-04 · **Severity:** MEDIUM · **NEEDS MIKE**
 **Evidence:** after an install the daemon's Temporal worker got EHOSTUNREACH ("No route to host") to 192.168.2.110:7233 while the same port answered from a shell. macOS Local Network privacy decides per code-signing identity, and the linker's ad hoc identity (`triumvirate-<hash>`) changed every build. PR #58 signs the installed binary with the stable identifier `com.triumvirate.daemon`; PR #59 makes the worker try the LAN, then the tailnet relay (https://100.73.45.3:7233), which it uses today.
-**CHECK to close:** after Mike approves `com.triumvirate.daemon` in System Settings > Privacy & Security > Local Network and the daemon restarts, `daemon.log` says `temporal: connected address=https://192.168.2.110:7233`.
+**CHECK to close:** (needs Mike's hands; cannot be run remotely) after Mike approves `com.triumvirate.daemon` in System Settings > Privacy & Security > Local Network and the daemon restarts, `daemon.log` says `temporal: connected address=https://192.168.2.110:7233`.
 
 ### D-032 - The sight gate credits the read a reviewer ASKED for, not the one it received
 **Found:** 2026-09-24 (D-028 panel, Codex) · **Severity:** LOW today, structural · **NOT FIXED**
@@ -328,7 +343,7 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 ### D-038 - Codex fleet workers ran read-only and reported success
 **Found:** 2026-10-04 · **Severity:** HIGH · **CLOSED 2026-10-04**
 **Evidence:** bare `codex exec` runs codex's default read-only sandbox; a fleet member exited 0 having written nothing and the fleet counted it done.
-**CHECK to close:** the codex fleet argv carries `--sandbox workspace-write`, and a member counts done only with exit 0 and a new commit descending from the fleet base.
+**CHECK to close:** the codex fleet argv carries `--sandbox workspace-write`, and on the Temporal engine a member counts done only with exit 0 and a new commit descending from the fleet base (the legacy worker is D-042).
 **Fixed:** (PR #57) `fleet_codex_argv` uses `--sandbox workspace-write`; the Temporal engine judges a member with `judge_member_run`.
 
 ### D-037 - Codex reviews delegate to sub-agents and no codex setting stops it
@@ -341,7 +356,7 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 **Found:** 2026-10-03 (legacy-fixes review round 2) · **Severity:** MEDIUM (a real review is discarded and re-paid) · **CLOSED 2026-10-04** (PR #57)
 **Evidence:** Codex read all four sources as `/bin/zsh -lc "sed -n '1,180p' F; sed -n '181,360p' F; ..."` and the gate rejected the turn: "named by [Bash ok no read the parser recognises ...], none counted as a successful whole read". The turn's review was thrown away. Workaround that worked: tell Codex one `sed -n` per tool call.
 **CHECK to close:** a single shell call of `sed -n` windows joined by `;` or `&&` that covers lines 1 to N satisfies the source; a chain that includes a non-read command is still judged per segment.
-**Fixed:** `read_segments` (`agent-adapter/src/codex.rs`) splits a `;` chain only when every link is a ranged read (`sed -n` window or `READER F | sed -n` window) of ONE operand; a missing file then fails the last link too, so the chain cannot mask a failed read. Any other `;` chain is judged whole, as before. CHECK passes: `sight_36_semicolon_windows_of_one_file_are_a_whole_read` drives the real classifier (`shell_read_kind`), not the hard-coded ReadFile helper that hid the bug; negatives (second file, `; true`, a gap) still fail; mutation-checked.
+**Fixed:** `read_segments` (`agent-adapter/src/codex.rs`) splits a `;` chain only when every link is a ranged read (`sed -n` window or `READER F | sed -n` window) of ONE operand; a missing file then fails the last link too, so the chain cannot mask a failed read. Any other `;` chain is judged whole, as before. This narrows, not reverses, the 2026-09-19 rule that refuses `;` and `||` chains: only ranged reads of ONE file qualify, and a failed read fails the last link, so the chain cannot exit zero on a failed read. CHECK passes: `sight_36_semicolon_windows_of_one_file_are_a_whole_read` drives the real classifier (`shell_read_kind`), not the hard-coded ReadFile helper that hid the bug; negatives (second file, `; true`, a gap) still fail; mutation-checked.
 
 ### D-035 - Antigravity reviews return empty output after making tool calls
 **Found:** 2026-10-03 (legacy-fixes review, three of three attempts) · **Severity:** HIGH (the seat cannot review) · **CLOSED 2026-10-03**
@@ -399,4 +414,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-10-04 (D-036 closed; D-037, D-038 added closed; D-039 to D-046 added from the Temporal fleet trial and its PR reviews).
+**Last reviewed:** 2026-10-04 (D-036 closed; D-037, D-038 added closed; D-039 to D-049 added from the Temporal fleet trial and its PR reviews).
