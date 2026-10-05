@@ -74,6 +74,18 @@ pub fn read_done(project_root: &Path, fleet_id: &str, task_id: &str) -> io::Resu
     }
 }
 
+/// The last `max_bytes` of an agent's output for a failure record (D-044): cut on a char
+/// boundary, trimmed, without a leading U+FFFD left by an earlier byte-level cut, None if empty.
+/// Takes text the worker already holds; it reads no file.
+pub fn bounded_tail(text: &str, max_bytes: usize) -> Option<String> {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = text[start..].trim().trim_start_matches('\u{FFFD}').trim_start();
+    (!tail.is_empty()).then(|| tail.to_string())
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -196,5 +208,17 @@ mod tests {
         assert_eq!(err_path(root, "f", "f-T-001").unwrap(), Path::new("/p/.triumvirate/fleet-workers/f/f-T-001.err"));
         assert_eq!(done_path(root, "f", "f-T-001").unwrap(), Path::new("/p/.triumvirate/fleet-workers/f/f-T-001.done"));
         assert!(done_path(root, "f", "../x").is_err());
+    }
+
+    #[test]
+    fn bounded_tail_cuts_on_a_char_boundary_and_drops_a_split_char() {
+        assert_eq!(bounded_tail("", 10), None);
+        assert_eq!(bounded_tail("  \n ", 10), None);
+        assert_eq!(bounded_tail("hello world!", 5).as_deref(), Some("orld!"));
+        assert_eq!(bounded_tail("hello world!", 50).as_deref(), Some("hello world!"));
+        // "é" is 2 bytes; a 3-byte budget lands inside it and must move forward, not panic.
+        assert_eq!(bounded_tail("aéz!", 3).as_deref(), Some("z!"));
+        // A tail that an upstream lossy cut started mid-char.
+        assert_eq!(bounded_tail("\u{FFFD}rest of the error", 100).as_deref(), Some("rest of the error"));
     }
 }

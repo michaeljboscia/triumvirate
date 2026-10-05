@@ -297,18 +297,25 @@ impl FleetLedgerActivities {
         let succeeded = verdict.is_ok();
         // A run that exited 0 without a commit is failed WITH the reason, not silently done.
         let error = o.error.clone().or_else(|| verdict.err());
-        let payload = serde_json::json!({
+        let exit_code = o.output.as_ref().and_then(|x| x.exit_code);
+        let mut payload = serde_json::json!({
             "task_id": o.task_id,
             "agent": o.agent,
             "requested_agent": o.agent,
             "engine": "temporal",
-            "exit_code": o.output.as_ref().and_then(|x| x.exit_code),
+            "exit_code": exit_code,
             "signal": o.output.as_ref().and_then(|x| x.signal),
             "branch_head": o.output.as_ref().and_then(|x| x.branch_head.clone()),
             "adopted": o.output.as_ref().is_some_and(|x| x.adopted),
             "base_sha": base,
             "error": error,
         });
+
+        let worker_stderr = o.output.as_ref().map(|x| x.stderr_tail.as_str()).unwrap_or("");
+        if let Some(tail) = failure_stderr_tail(succeeded, exit_code, worker_stderr) {
+            payload["stderr_tail"] = serde_json::json!(tail);
+        }
+
         if succeeded {
             fleet::orchestrator::record_task_completed(&root, &o.fleet_id, &o.task_id, &o.agent, payload);
             Ok("done".to_string())
@@ -465,5 +472,30 @@ mod tests {
             .unwrap();
         let _ = record_abort(d.path(), "fd", true, "late", &[]);
         assert_eq!(row(d.path(), "fd").0, "done");
+    }
+}
+
+/// D-044: why a member that exited non-zero failed: the tail of its stderr, which run_worker
+/// already read into its output. The exit code alone ("agent exited Some(1)") hid a model-API
+/// 400 that was only in that stream.
+fn failure_stderr_tail(succeeded: bool, exit_code: Option<i32>, worker_stderr: &str) -> Option<String> {
+    if succeeded || exit_code == Some(0) {
+        return None;
+    }
+    fleet::shim::bounded_tail(worker_stderr, 2000)
+}
+
+#[cfg(test)]
+mod failure_stderr_tail_tests {
+    /// RED IF a non-zero member's failure loses its stderr, or a clean or exit-0 run carries one.
+    #[test]
+    fn a_nonzero_member_carries_its_stderr_tail() {
+        let err = "noise\nERROR: The model requires a newer version of Codex\n";
+        let tail = super::failure_stderr_tail(false, Some(1), err);
+        assert!(tail.as_deref().is_some_and(|t| t.contains("requires a newer version")), "{tail:?}");
+        assert_eq!(super::failure_stderr_tail(false, Some(0), err), None);
+        assert_eq!(super::failure_stderr_tail(true, Some(0), err), None);
+        assert_eq!(super::failure_stderr_tail(false, Some(1), ""), None);
+        assert!(super::failure_stderr_tail(false, None, err).is_some(), "killed by a signal still explains itself");
     }
 }
