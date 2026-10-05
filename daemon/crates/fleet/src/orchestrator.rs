@@ -3391,9 +3391,30 @@ mod tests {
     #[tokio::test]
     async fn a_degraded_codex_that_exits_0_without_committing_is_failed_not_done() {
         let _lock = ROUTE_ENV_LOCK.lock().await;
-        let keys = ["TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_DEGRADED_ROUTE"];
-        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
-        // SAFETY: serialised by ROUTE_ENV_LOCK; restored (never just removed) before it drops.
+        /// Restores the route env on drop, panic included (Codex, PR #62), and closes the breaker
+        /// the way the sibling route tests do (there is no read API to save its prior state).
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: dropped while ROUTE_ENV_LOCK is still held (declared after it).
+                unsafe {
+                    for (k, v) in &self.0 {
+                        match v {
+                            Some(v) => std::env::set_var(k, v),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+                mcp_bridge::agy_resilience::agy_breaker_record_success();
+            }
+        }
+        let _restore = Restore(
+            ["TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_DEGRADED_ROUTE"]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect(),
+        );
+        // SAFETY: serialised by ROUTE_ENV_LOCK; `_restore` puts both back.
         unsafe {
             std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
             std::env::set_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE", "codex");
@@ -3423,18 +3444,8 @@ mod tests {
                 wait: Some(true),
                 task_description: "do nothing".to_string(),
             })
-            .await;
-
-        unsafe {
-            for (k, v) in &saved {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        mcp_bridge::agy_resilience::agy_breaker_record_success();
-        let spawned = spawned.expect("spawn");
+            .await
+            .expect("spawn");
 
         assert_eq!(launched.lock().await.clone(), vec!["gemini", "codex"], "the degraded arm ran");
         let conn = rusqlite::Connection::open(root.join(".triumvirate/ledger.db")).expect("db");
