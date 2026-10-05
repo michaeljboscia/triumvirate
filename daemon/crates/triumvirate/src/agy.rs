@@ -1512,7 +1512,8 @@ pub(crate) mod tests {
     // backend targets macOS — C2). The real-binary happy path is covered separately by
     // the verification battery and the #[ignore]d test below.
 
-    #[cfg(target_os = "macos")]
+    // Not macOS-gated: ungated tests here and in agent_exec.rs take this lock too, so gating it
+    // broke the Linux test build (seen when CI's clippy began covering test targets).
     /// Serializes tests that touch the quota-backoff and degraded-route env vars, and restores
     /// the prior value on drop. Process-global env is the isolation trap this crate has hit
     /// before; the lock is the cure, the restore is the other half.

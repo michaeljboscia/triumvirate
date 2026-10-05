@@ -29,7 +29,7 @@ jobs:
       - name: Check
         run: cargo check --workspace --exclude pantheon
       - name: Clippy
-        run: cargo clippy --workspace --exclude pantheon -- -D warnings
+        run: cargo clippy --workspace --exclude pantheon --all-targets -- -D warnings
       # Format check temporarily disabled — pre-existing unformatted code across
       # the workspace would fail this gate. Follow-up PR will run `cargo fmt --all`
       # and restore this step. Tracked separately from PR #29 to keep that PR
@@ -67,6 +67,11 @@ jobs:
       # replays a recorded history), no server needed.
       - name: FleetWorkflow replay gate
         run: cargo test -p fleet-temporal --test replay
+      # The fleet crate's integration tests (fleet_agent_bin_pin pins how members are launched:
+      # pinned binaries, commit grants, no operator args). Also integration tests, also skipped
+      # by `--lib`. Each test file is its own process, which that file relies on.
+      - name: Fleet integration tests
+        run: cargo test -p fleet --tests
 
   build:
     name: Build Release
