@@ -121,7 +121,20 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
         // configured model and every codex fleet member exited 1 (trial fleet 1, 2026-10-04).
         // The binary only: TRIUMVIRATE_CODEX_ARGS is consult-shaped, and a `--full-auto` or a
         // sandbox bypass in it would break or widen the fleet argv (Codex, PR #60 review).
-        "codex" => (mcp_bridge::codex_command().0, fleet_codex_argv(task_prompt)),
+        "codex" => {
+            // workspace-write covers the worktree, but a linked worktree's git dir lives in the
+            // main repo, so `git add` died on .git/worktrees/<n>/index.lock and no codex member
+            // could ever commit (probed 2026-10-04; stub agents run unsandboxed and never saw it).
+            let mut args = Vec::new();
+            for dir in fleet_git_write_dirs(worktree_path)? {
+                args.push("--add-dir".to_string());
+                args.push(dir.to_string_lossy().into_owned());
+            }
+            let mut argv = fleet_codex_argv(task_prompt);
+            // After `exec`: --add-dir is an exec option.
+            argv.splice(1..1, args);
+            (mcp_bridge::codex_command().0, argv)
+        }
         "gemini" => match mcp_bridge::gemini_backend() {
             // REQ-090: fleet's second Gemini site honors TRIUMVIRATE_GEMINI_BACKEND.
             // Under agy it spawns the shared sandbox-exec invocation (single-turn,
@@ -158,8 +171,23 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
         "grok" => {
             let (bin, extra) = mcp_bridge::grok_command();
             let cwd = worktree_path.to_string_lossy();
-            let inv = mcp_bridge::grok::build_grok_invocation(
-                &bin, &extra, task_prompt, &cwd, None, false,
+            // A fleet worker WRITES and COMMITS, so it gets neither consult default. read-only
+            // (grok's docs: writes only ~/.grok and temp) left the worker unable to edit its
+            // worktree; workspace writes the worktree but not the main repo's .git, so commit
+            // fails; grok has no --add-dir and a project profile would sit inside the worktree
+            // where the member could commit it. So: no sandbox, the same posture as the agy
+            // fleet arm (yolo). An operator TRIUMVIRATE_GROK_SANDBOX still wins. And Deep: the
+            // Fast profile's 12 turns ran out before a code task finished (trial fleet,
+            // fleet-1791158358887817000).
+            let inv = mcp_bridge::grok::build_grok_invocation_with_profile(
+                &bin,
+                &extra,
+                task_prompt,
+                &cwd,
+                None,
+                false,
+                Some("off"),
+                Some(mcp_bridge::grok::GrokDepth::Deep),
             )
             .map_err(|e| anyhow::anyhow!("failed to assemble grok invocation for fleet: {e}"))?;
             (inv.program, inv.args)
@@ -1984,6 +2012,40 @@ pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_
 /// with no work in it. Under `workspace-write` the same task wrote NOTES.md and committed it on
 /// the fleet branch, and a write into $HOME was still refused ("operation not permitted"): enough
 /// to do the work, no more.
+/// The directories a commit in a linked fleet worktree writes outside the worktree itself: its
+/// own git dir (index, HEAD, reflog), the shared object store, and the ref and reflog dirs of
+/// fleet branches only, so a member cannot move `main`. Never the whole .git (hooks, config).
+pub fn fleet_git_write_dirs(worktree: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "fleet worktree {} is not a git checkout: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        anyhow::bail!("git rev-parse gave no git dir for {}", worktree.display());
+    };
+    let (git_dir, common) = (PathBuf::from(git_dir), PathBuf::from(common));
+    if git_dir == common {
+        // Not a linked worktree: granting the git dir would grant all of .git.
+        anyhow::bail!("fleet worktree {} is not a linked worktree", worktree.display());
+    }
+    let refs = common.join("refs").join("heads").join("fleet");
+    let logs = common.join("logs").join("refs").join("heads").join("fleet");
+    // A sandbox grant names an existing directory; packed refs can leave these absent.
+    std::fs::create_dir_all(&refs)?;
+    std::fs::create_dir_all(&logs)?;
+    Ok(vec![git_dir, common.join("objects"), refs, logs])
+}
+
 pub fn fleet_codex_argv(task_prompt: &str) -> Vec<String> {
     vec![
         "exec".to_string(),
