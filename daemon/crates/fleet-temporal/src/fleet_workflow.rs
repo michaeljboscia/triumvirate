@@ -311,11 +311,8 @@ impl FleetLedgerActivities {
             "error": error,
         });
 
-        if !succeeded && exit_code != Some(0) {
-            let stderr_tail = fleet::shim::err_path(&root, &o.fleet_id, &o.task_id)
-                .ok()
-                .and_then(|p| fleet::shim::output_tail(&p, 2000));
-            payload.as_object_mut().unwrap().insert("stderr_tail".to_string(), serde_json::json!(stderr_tail));
+        if let Some(tail) = failure_stderr_tail(&root, &o.fleet_id, &o.task_id, succeeded, exit_code) {
+            payload["stderr_tail"] = serde_json::json!(tail);
         }
 
         if succeeded {
@@ -474,5 +471,31 @@ mod tests {
             .unwrap();
         let _ = record_abort(d.path(), "fd", true, "late", &[]);
         assert_eq!(row(d.path(), "fd").0, "done");
+    }
+}
+
+/// D-044: why a member that exited non-zero failed, from the tail of the shim's stderr file. The
+/// exit code alone ("agent exited Some(1)") hid a model-API 400 that was only in that file.
+fn failure_stderr_tail(root: &std::path::Path, fleet_id: &str, task_id: &str, succeeded: bool, exit_code: Option<i32>) -> Option<String> {
+    if succeeded || exit_code == Some(0) {
+        return None;
+    }
+    fleet::shim::err_path(root, fleet_id, task_id).ok().and_then(|p| fleet::shim::output_tail(&p, 2000))
+}
+
+#[cfg(test)]
+mod failure_stderr_tail_tests {
+    /// RED IF a non-zero member's failure loses its stderr, or a clean or exit-0 run carries one.
+    #[test]
+    fn a_nonzero_member_carries_its_stderr_tail() {
+        let d = tempfile::tempdir().unwrap();
+        let err = fleet::shim::err_path(d.path(), "fleet-x", "fleet-x-T-001").unwrap();
+        std::fs::create_dir_all(err.parent().unwrap()).unwrap();
+        std::fs::write(&err, "noise\nERROR: The model requires a newer version of Codex\n").unwrap();
+        let tail = super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-001", false, Some(1));
+        assert!(tail.as_deref().is_some_and(|t| t.contains("requires a newer version")), "{tail:?}");
+        assert_eq!(super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-001", false, Some(0)), None);
+        assert_eq!(super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-001", true, Some(0)), None);
+        assert_eq!(super::failure_stderr_tail(d.path(), "fleet-x", "fleet-x-T-002", false, Some(1)), None);
     }
 }
