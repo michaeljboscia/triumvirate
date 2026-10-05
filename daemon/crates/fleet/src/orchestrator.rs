@@ -1015,7 +1015,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         terminal_guard.disarm();
                     }
                     _ => {
-                        tracing::error!("terminal state not persisted; leaving the guard armed");
+                        tracing::error!(fleet_id = %fleet_id, task_id = %task_id, "terminal state not persisted; leaving the guard armed");
                     }
                 }
             });
