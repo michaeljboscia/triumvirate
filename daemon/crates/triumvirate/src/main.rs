@@ -3563,6 +3563,59 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            let mut saved = Vec::with_capacity(keys.len());
+            for &k in keys {
+                saved.push((k, std::env::var_os(k)));
+            }
+            Self(saved)
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: test controls env var lifecycle under lock.
+            unsafe {
+                for (k, v) in &self.0 {
+                    if let Some(val) = v {
+                        std::env::set_var(k, val);
+                    } else {
+                        std::env::remove_var(k);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_env_restore_guard() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_TEST_ENVRESTORE_PROBE", "before");
+            std::env::remove_var("TRIUMVIRATE_TEST_ENVRESTORE_ABSENT");
+        }
+        {
+            let _env_restore = EnvRestore::capture(&[
+                "TRIUMVIRATE_TEST_ENVRESTORE_PROBE",
+                "TRIUMVIRATE_TEST_ENVRESTORE_ABSENT",
+            ]);
+            unsafe {
+                std::env::set_var("TRIUMVIRATE_TEST_ENVRESTORE_PROBE", "during");
+                std::env::set_var("TRIUMVIRATE_TEST_ENVRESTORE_ABSENT", "during");
+            }
+        }
+        assert_eq!(
+            std::env::var("TRIUMVIRATE_TEST_ENVRESTORE_PROBE").as_deref(),
+            Ok("before")
+        );
+        assert!(std::env::var("TRIUMVIRATE_TEST_ENVRESTORE_ABSENT").is_err());
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_TEST_ENVRESTORE_PROBE");
+        }
+    }
+
+
     fn write_mock_gemini_script() -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
@@ -4051,7 +4104,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .map(|t| t.text.clone())
             .unwrap_or_default();
 
-        assert!(raw_text.contains("codex done"));
+        assert!(raw_text.contains("codex done"), "raw_text: {raw_text}");
         assert!(raw_text.contains("SPAWNED"));
         assert!(raw_text.contains("WORKING"));
         assert!(raw_text.contains("DONE"));
@@ -4223,6 +4276,14 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_codex_adds_full_auto_only_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_CODEX_AUTO_APPROVE",
+            "TRIUMVIRATE_CODEX_SANDBOX",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+        ]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home = std::env::temp_dir().join(format!("triumvirate-codex-full-auto-{now}"));
         fs::create_dir_all(&test_home)?;
@@ -4282,14 +4343,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         );
         assert!(!captured_yolo.lines().any(|line| line == "--sandbox"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
-            std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
-            std::env::remove_var("TRIUMVIRATE_CODEX_SANDBOX");
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
         Ok(())
@@ -4630,6 +4683,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // Resolve the REAL binary first: the stand-in below replaces TRIUMVIRATE_CODEX_BIN.
         let real_codex = codex_oracle_installed();
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+        ]);
         let test_home = tempfile::tempdir()?;
         let args_file = test_home.path().join("codex-args.txt");
         // NUL-separated, not line-separated. The shared `write_codex_args_capture_script`
@@ -4664,10 +4723,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         };
         let outcome = execute_ask_agent(&req, None).await;
         // Restore BEFORE asserting, so a failure cannot leave the stand-in installed.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("HOME");
-        }
+        drop(_env_restore);
         outcome.map_err(anyhow::Error::msg)?;
 
         let captured: Vec<String> = fs::read(&args_file)?
@@ -4689,17 +4745,17 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn a_codex_review_prompt_forbids_delegation_and_a_consult_does_not() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+        ]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home = std::env::temp_dir().join(format!("triumvirate-codex-review-note-{now}"));
         fs::create_dir_all(&test_home)?;
         let args_file = test_home.join("codex-args.txt");
         let script_path = write_codex_args_capture_script(&args_file, "done")?;
-        // Restore what was there, not remove it: a removed HOME breaks every later test that
-        // reads it (abe_red_team_* failed "environment variable not found" when this deleted it).
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_REQUIRE_PEER_REVIEW"]
-            .into_iter()
-            .map(|k| (k, std::env::var_os(k)))
-            .collect();
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("HOME", &test_home);
@@ -4721,16 +4777,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             let _ = execute_ask_agent(&req, None).await;
             captured.push(fs::read_to_string(&args_file).unwrap_or_default());
         }
-        // SAFETY: restore before asserting.
-        unsafe {
-            // Every variable this test touched, restored (Antigravity, review of PR 57).
-            for (k, v) in &saved {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(&test_home);
         assert!(captured[0].contains("note probe"), "the stand-in never ran: {:?}", captured[0]);
@@ -4743,6 +4789,13 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_codex_auto_approve_writes_ledger_record() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_CODEX_AUTO_APPROVE",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+        ]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home =
             std::env::temp_dir().join(format!("triumvirate-codex-auto-approve-ledger-{now}"));
@@ -4773,13 +4826,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let summaries = store.query("Codex", 10)?;
         assert!(summaries.iter().any(|summary| summary.summary_type == "auto_approved"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
-            std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
         Ok(())
