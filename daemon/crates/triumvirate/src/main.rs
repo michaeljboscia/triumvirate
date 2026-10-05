@@ -3489,6 +3489,7 @@ mod tests {
     #[tokio::test]
     async fn ask_agent_emits_progress_notifications() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let script_path = write_mock_agent_script("gemini", 1.0)?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -3545,13 +3546,6 @@ mod tests {
             assert!(all_logs.iter().any(|m| m.contains("Antigravity: responded")));
         }
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-        }
         let _ = fs::remove_file(script_path);
         client.cancel().await?;
         server_handle.await??;
@@ -3562,6 +3556,57 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            let mut saved = Vec::with_capacity(keys.len());
+            for &k in keys {
+                saved.push((k, std::env::var_os(k)));
+            }
+            Self(saved)
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: test controls env var lifecycle under lock.
+            unsafe {
+                for (k, v) in &self.0 {
+                    if let Some(val) = v {
+                        std::env::set_var(k, val);
+                    } else {
+                        std::env::remove_var(k);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_env_restore_guard() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _outer = EnvRestore::capture(&["TRIUMVIRATE_TEST_ENVRESTORE_PROBE", "TRIUMVIRATE_TEST_ENVRESTORE_ABSENT"]);
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_TEST_ENVRESTORE_PROBE", "before");
+            std::env::remove_var("TRIUMVIRATE_TEST_ENVRESTORE_ABSENT");
+        }
+        {
+            let _env_restore = EnvRestore::capture(&[
+                "TRIUMVIRATE_TEST_ENVRESTORE_PROBE",
+                "TRIUMVIRATE_TEST_ENVRESTORE_ABSENT",
+            ]);
+            unsafe {
+                std::env::set_var("TRIUMVIRATE_TEST_ENVRESTORE_PROBE", "during");
+                std::env::set_var("TRIUMVIRATE_TEST_ENVRESTORE_ABSENT", "during");
+            }
+        }
+        assert_eq!(
+            std::env::var("TRIUMVIRATE_TEST_ENVRESTORE_PROBE").as_deref(),
+            Ok("before")
+        );
+        assert!(std::env::var("TRIUMVIRATE_TEST_ENVRESTORE_ABSENT").is_err());
+    }
+
 
     fn write_mock_gemini_script() -> anyhow::Result<PathBuf> {
         let now = SystemTime::now()
@@ -3824,6 +3869,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
     #[tokio::test]
     async fn ask_agent_gemini_happy_path_returns_lifecycle() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let script_path = write_mock_gemini_script()?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -3876,12 +3922,6 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         server_handle.await??;
 
         let _ = fs::remove_file(script_path);
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         Ok(())
     }
 
@@ -3892,6 +3932,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered wi
         // i.e. the selector did NOT route to agy. A non-"mock-" script name forces the
         // real `run_gemini_cli_process_with_session` (not the test mock connector).
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let argv_file = std::env::temp_dir().join(format!("gemini-rollback-argv-{now}.txt"));
         let script_path = std::env::temp_dir().join(format!("gemini-rollback-{now}.sh"));
@@ -3944,11 +3985,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             "gemini-cli must receive -o stream-json; argv was: {argv}"
         );
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-        }
         let _ = fs::remove_file(&script_path);
         let _ = fs::remove_file(&argv_file);
         Ok(())
@@ -3957,6 +3993,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_gemini_injects_tool_marker_instructions() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let script_path = write_mock_gemini_marker_probe_script()?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -3999,18 +4036,13 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         client.cancel().await?;
         server_handle.await??;
         let _ = fs::remove_file(script_path);
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         Ok(())
     }
 
     #[tokio::test]
     async fn ask_agent_codex_happy_path_returns_lifecycle() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN"]);
         let script_path = write_mock_agent_script("codex", 0.0)?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -4051,7 +4083,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .map(|t| t.text.clone())
             .unwrap_or_default();
 
-        assert!(raw_text.contains("codex done"));
+        assert!(raw_text.contains("codex done"), "raw_text: {raw_text}");
         assert!(raw_text.contains("SPAWNED"));
         assert!(raw_text.contains("WORKING"));
         assert!(raw_text.contains("DONE"));
@@ -4060,11 +4092,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server_handle.await??;
 
         let _ = fs::remove_file(script_path);
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
-        }
         Ok(())
     }
 
@@ -4077,6 +4104,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_jury_runs_two_mock_seats_end_to_end() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let root = tempfile::tempdir()?;
         let codex_bin = write_mock_agent_script("codex", 0.0)?;
         let gemini_bin = write_mock_agent_script("gemini", 0.0)?;
@@ -4115,13 +4143,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .await;
 
         // Cleanup BEFORE the assertions, so a failure cannot leave the mocks installed.
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-        }
         let _ = fs::remove_file(codex_bin);
         let _ = fs::remove_file(gemini_bin);
 
@@ -4167,6 +4188,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_retries_and_recovers() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let script_path = write_retry_agent_script("gemini")?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -4211,18 +4233,21 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         client.cancel().await?;
         server_handle.await??;
         let _ = fs::remove_file(script_path);
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         Ok(())
     }
 
     #[tokio::test]
     async fn ask_agent_codex_adds_full_auto_only_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_CODEX_AUTO_APPROVE",
+            "TRIUMVIRATE_CODEX_SANDBOX",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+            "TRIUMVIRATE_TEST_RECORD_WIKI_CALL",
+        ]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home = std::env::temp_dir().join(format!("triumvirate-codex-full-auto-{now}"));
         fs::create_dir_all(&test_home)?;
@@ -4282,14 +4307,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         );
         assert!(!captured_yolo.lines().any(|line| line == "--sandbox"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
-            std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
-            std::env::remove_var("TRIUMVIRATE_CODEX_SANDBOX");
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
         Ok(())
@@ -4298,17 +4315,25 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     /// Every `wiki_call` event in the ledger under `root`, as (session_id, payload).
     /// Opts one `wiki_call_*` test into ledger writes (D-019), and opts back out on drop.
     /// Hold `env_lock` for as long as this lives.
-    struct RecordWikiCalls;
+    struct RecordWikiCalls(Option<std::ffi::OsString>);
     impl RecordWikiCalls {
         fn on() -> Self {
+            let prev = std::env::var_os("TRIUMVIRATE_TEST_RECORD_WIKI_CALL");
             // SAFETY: callers hold the binary-wide env lock.
             unsafe { std::env::set_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL", "1") };
-            Self
+            Self(prev)
         }
     }
     impl Drop for RecordWikiCalls {
         fn drop(&mut self) {
-            unsafe { std::env::remove_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL") };
+            // Restore what was there, never just remove it (D-043).
+            // SAFETY: callers hold the binary-wide env lock.
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL", v),
+                    None => std::env::remove_var("TRIUMVIRATE_TEST_RECORD_WIKI_CALL"),
+                }
+            }
         }
     }
 
@@ -4334,6 +4359,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn wiki_call_01_one_answered_call_leaves_one_textless_event_in_its_own_ledger() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+            "TRIUMVIRATE_TEST_RECORD_WIKI_CALL"]);
         let _record = RecordWikiCalls::on();
         let project = tempfile::tempdir()?;
         let codex = write_mock_agent_script("codex", 0.0)?;
@@ -4354,7 +4381,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             None,
         )
         .await;
-        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_BIN") };
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&codex);
         let resp = outcome.map_err(anyhow::Error::msg)?;
 
@@ -4384,6 +4411,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn wiki_call_03_evidence_names_pages_opened_named_and_prompted() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+            "TRIUMVIRATE_TEST_RECORD_WIKI_CALL", "TRIUMVIRATE_WIKI_DIR"]);
         let _record = RecordWikiCalls::on();
         let project = tempfile::tempdir()?;
         let wiki = tempfile::tempdir()?;
@@ -4416,10 +4445,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             None,
         )
         .await;
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
-        }
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&codex);
         outcome.map_err(anyhow::Error::msg)?;
 
@@ -4461,6 +4487,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn wiki_call_04_a_missing_wiki_is_an_error_not_zero_use() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+            "TRIUMVIRATE_TEST_RECORD_WIKI_CALL", "TRIUMVIRATE_WIKI_DIR"]);
         let _record = RecordWikiCalls::on();
         let project = tempfile::tempdir()?;
         let codex = write_mock_agent_script("codex", 0.0)?;
@@ -4480,10 +4508,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             None,
         )
         .await;
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
-        }
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&codex);
         outcome.map_err(anyhow::Error::msg)?;
         let events = wiki_call_events(&fs::canonicalize(project.path())?);
@@ -4499,6 +4524,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn wiki_call_02_a_failed_call_still_leaves_one_event_without_its_error_text() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_HOME", "TRIUMVIRATE_TEST_RECORD_WIKI_CALL"]);
         let _record = RecordWikiCalls::on();
         let project = tempfile::tempdir()?;
         let failing = write_failing_agent_script("codex")?;
@@ -4518,10 +4544,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         )
         .await
         .expect_err("the failing stand-in must fail the call");
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_HOME");
-        }
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&failing);
 
         let events = wiki_call_events(&fs::canonicalize(project.path())?);
@@ -4630,6 +4653,13 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // Resolve the REAL binary first: the stand-in below replaces TRIUMVIRATE_CODEX_BIN.
         let real_codex = codex_oracle_installed();
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+            "TRIUMVIRATE_TEST_RECORD_WIKI_CALL",
+        ]);
         let test_home = tempfile::tempdir()?;
         let args_file = test_home.path().join("codex-args.txt");
         // NUL-separated, not line-separated. The shared `write_codex_args_capture_script`
@@ -4664,10 +4694,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         };
         let outcome = execute_ask_agent(&req, None).await;
         // Restore BEFORE asserting, so a failure cannot leave the stand-in installed.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("HOME");
-        }
+        drop(_env_restore);
         outcome.map_err(anyhow::Error::msg)?;
 
         let captured: Vec<String> = fs::read(&args_file)?
@@ -4689,17 +4716,18 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn a_codex_review_prompt_forbids_delegation_and_a_consult_does_not() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+            "TRIUMVIRATE_TEST_RECORD_WIKI_CALL",
+        ]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home = std::env::temp_dir().join(format!("triumvirate-codex-review-note-{now}"));
         fs::create_dir_all(&test_home)?;
         let args_file = test_home.join("codex-args.txt");
         let script_path = write_codex_args_capture_script(&args_file, "done")?;
-        // Restore what was there, not remove it: a removed HOME breaks every later test that
-        // reads it (abe_red_team_* failed "environment variable not found" when this deleted it).
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_REQUIRE_PEER_REVIEW"]
-            .into_iter()
-            .map(|k| (k, std::env::var_os(k)))
-            .collect();
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
             std::env::set_var("HOME", &test_home);
@@ -4721,16 +4749,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             let _ = execute_ask_agent(&req, None).await;
             captured.push(fs::read_to_string(&args_file).unwrap_or_default());
         }
-        // SAFETY: restore before asserting.
-        unsafe {
-            // Every variable this test touched, restored (Antigravity, review of PR 57).
-            for (k, v) in &saved {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(&test_home);
         assert!(captured[0].contains("note probe"), "the stand-in never ran: {:?}", captured[0]);
@@ -4743,6 +4761,14 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_codex_auto_approve_writes_ledger_record() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&[
+            "HOME",
+            "TRIUMVIRATE_CODEX_BIN",
+            "TRIUMVIRATE_CODEX_ARGS",
+            "TRIUMVIRATE_CODEX_AUTO_APPROVE",
+            "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+            "TRIUMVIRATE_TEST_RECORD_WIKI_CALL",
+        ]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let test_home =
             std::env::temp_dir().join(format!("triumvirate-codex-auto-approve-ledger-{now}"));
@@ -4773,13 +4799,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let summaries = store.query("Codex", 10)?;
         assert!(summaries.iter().any(|summary| summary.summary_type == "auto_approved"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
-            std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
         Ok(())
@@ -4788,6 +4807,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_invalid_stale_session_recovers_with_fresh_spawn() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         reset_worker_registry_for_tests().await;
         let script_path = write_invalid_session_recovery_script("gemini")?;
         // SAFETY: test controls env var lifecycle under lock.
@@ -4830,12 +4850,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert!(response.lifecycle.iter().any(|e| e.state == "RETRY"));
         assert!(response.lifecycle.iter().any(|e| e.state == "DONE"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         let _ = fs::remove_file(script_path);
         Ok(())
     }
@@ -4852,6 +4866,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn one_shot_ask_agent_does_not_inherit_a_cached_session() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         reset_worker_registry_for_tests().await;
         let script_path = write_invalid_session_recovery_script("gemini")?;
         // SAFETY: test controls env var lifecycle under lock.
@@ -4899,12 +4914,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             "one-shot must not clobber the cached session id"
         );
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         let _ = fs::remove_file(script_path);
         Ok(())
     }
@@ -4912,6 +4921,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_requires_peer_review_when_env_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_PEER_REVIEWERS", "TRIUMVIRATE_REQUIRE_PEER_REVIEW"]);
         let script_path = write_mock_gemini_script()?;
         let temp = tempfile::tempdir()?;
         let project_root = temp.path().join("peer-review-required");
@@ -5031,13 +5041,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .iter()
             .any(|event| event.state == "REVIEW_PENDING"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-            std::env::remove_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW");
-        }
         let _ = fs::remove_file(script_path);
         Ok(())
     }
@@ -5045,6 +5048,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn persistent_worker_reuse_second_call_is_faster_and_marked_reused() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         reset_worker_registry_for_tests().await;
         let script_path = write_mock_worker_warm_script("gemini")?;
         // SAFETY: test controls env var lifecycle under lock.
@@ -5094,12 +5098,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             "expected second call ({second_elapsed:?}) to be faster than first ({first_elapsed:?})"
         );
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         let _ = fs::remove_file(script_path);
         Ok(())
     }
@@ -5107,6 +5105,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn session_lifecycle_spawn_ask_list_dismiss() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let gemini_script = write_mock_agent_script("gemini", 0.0)?;
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -5181,18 +5180,13 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server_handle.await??;
 
         let _ = fs::remove_file(gemini_script);
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         Ok(())
     }
 
     #[tokio::test]
     async fn get_status_reports_active_sessions() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_BIND_ADDR"]);
         // SAFETY: test controls env var lifecycle under lock.
         unsafe { std::env::set_var("TRIUMVIRATE_DAEMON_BIND_ADDR", "127.0.0.1:7777") };
 
@@ -5248,14 +5242,13 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
         client.cancel().await?;
         server_handle.await??;
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_DAEMON_BIND_ADDR") };
         Ok(())
     }
 
     #[tokio::test]
     async fn get_status_includes_pending_fallback_tickets() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5291,8 +5284,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
         client.cancel().await?;
         server_handle.await??;
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5300,6 +5291,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn get_status_reports_total_pending_even_when_ticket_list_is_truncated() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5317,8 +5309,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let status_json = serde_json::to_string(&status.0)?;
         assert!(status_json.contains("\"pending_fallbacks\":12"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5326,6 +5316,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn get_status_uses_daemon_snapshot_when_proxy_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5382,12 +5373,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
         server.abort();
         let _ = server.await;
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5395,6 +5380,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn get_status_falls_back_local_when_daemon_snapshot_unreachable() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_AUTOSTART", "TRIUMVIRATE_DAEMON_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5425,13 +5411,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .any(|p| p.contains("ticket-local.md")));
         assert_eq!(status.0.daemon_bind_addr, "127.0.0.1:8080");
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5439,6 +5418,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[test]
     fn daemon_token_is_created_and_reused() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5456,8 +5436,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let token_path = test_home.join("daemon.token");
         assert!(token_path.exists());
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5494,6 +5472,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[test]
     fn daemon_autostart_attempt_is_one_shot() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_AUTOSTART", "TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN"]);
         reset_daemon_autostart_flag_for_tests();
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -5506,11 +5485,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert!(first, "first call should attempt autostart");
         assert!(!second, "second call should be suppressed");
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART_DRYRUN");
-        }
         Ok(())
     }
 
@@ -5551,6 +5525,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn daemon_health_uses_bearer_token() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_HEALTH_URL", "TRIUMVIRATE_DAEMON_URL", "TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5601,12 +5576,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_HEALTH_URL");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5698,6 +5667,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn fetch_daemon_ask_agent_uses_bearer_token() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_ASK_AGENT_URL", "TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5764,11 +5734,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5776,6 +5741,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn mcp_ask_agent_uses_daemon_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_ASK_AGENT_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5863,12 +5829,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5876,6 +5836,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn mcp_ask_agent_returns_daemon_recovery_error_when_unreachable() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_ASK_AGENT_URL", "TRIUMVIRATE_DAEMON_AUTOSTART", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -5926,13 +5887,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         client.cancel().await?;
         server_handle.await??;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_AUTOSTART");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_ASK_AGENT_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -5942,6 +5896,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn mcp_memory_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_MEMORY_READ_URL", "TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6078,13 +6033,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_WRITE_URL");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_MEMORY_READ_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6092,6 +6040,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn mcp_scratchpad_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL", "TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6217,13 +6166,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_SCRATCHPAD_WRITE_URL");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_SCRATCHPAD_LIST_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6231,6 +6173,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn mcp_fallback_tools_use_daemon_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL", "TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6366,13 +6309,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_FALLBACK_LIST_URL");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_FALLBACK_ACK_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6380,6 +6316,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn mcp_fallback_gc_uses_daemon_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_FALLBACK_GC_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6458,12 +6395,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_FALLBACK_GC_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6471,6 +6402,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn mcp_outbox_recent_uses_daemon_when_enabled() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL", "TRIUMVIRATE_HOME", "TRIUMVIRATE_MCP_USE_DAEMON"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6564,12 +6496,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         server.abort();
         let _ = server.await;
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-            std::env::remove_var("TRIUMVIRATE_DAEMON_OUTBOX_RECENT_URL");
-        }
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6579,6 +6505,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_writes_outbox_events() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6651,13 +6578,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .unwrap_or(0);
         assert!(count >= 1);
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
         Ok(())
@@ -6666,6 +6586,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn ask_agent_failure_creates_dead_drop_ticket() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6702,13 +6623,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .count();
         assert!(tickets >= 1);
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         let _ = fs::remove_file(script_path);
         let _ = fs::remove_dir_all(test_home);
         Ok(())
@@ -6717,6 +6631,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[test]
     fn count_pending_fallbacks_reads_dead_drop_directory() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6731,8 +6646,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let count = count_pending_fallbacks()?;
         assert_eq!(count, 2);
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6740,6 +6653,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn memory_write_and_read_roundtrip() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6769,8 +6683,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(read.0.entries.len(), 1);
         assert_eq!(read.0.entries[0].value, "use oauth");
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6778,6 +6690,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn scratchpad_write_and_list_roundtrip() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6806,8 +6719,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(list.0.files.len(), 1);
         assert!(list.0.files[0].contains("notes"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6815,6 +6726,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn outbox_recent_returns_latest_events() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6860,8 +6772,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(out.0.events.len(), 1);
         assert_eq!(out.0.events[0].request_id, "b");
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6869,6 +6779,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn fallback_list_and_ack_roundtrip() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6901,8 +6812,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(list_after.0.tickets.len(), 0);
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6912,6 +6821,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[test]
     fn fallback_ack_rejects_paths_outside_dead_drop() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6929,8 +6839,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .unwrap_or_default();
         assert!(err.contains("outside dead-drop"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6938,6 +6846,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn fallback_gc_removes_stale_tickets() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -6965,8 +6874,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(list_after.0.tickets.len(), 0);
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -6974,6 +6881,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn sessions_persist_across_bridge_instances() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_HOME"]);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos();
@@ -7006,8 +6914,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert!(persisted.is_some());
         assert_eq!(persisted.map(|s| s.agent.as_str()), Some("gemini"));
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_HOME") };
         let _ = fs::remove_dir_all(test_home);
         Ok(())
     }
@@ -7295,6 +7201,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn u_review_submit_cannot_approve_a_pending_row() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_REVIEW_MAX_INFLIGHT"]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let project_root = std::env::temp_dir().join(format!("triumvirate-review-forge-{now}"));
         fs::create_dir_all(project_root.join(".triumvirate").join("spool"))?;
@@ -7381,8 +7288,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(status.0.state, "done");
         assert_eq!(status.0.verdict.as_deref(), Some("approve"));
 
-        // SAFETY: held under env_lock.
-        unsafe { std::env::remove_var("TRIUMVIRATE_REVIEW_MAX_INFLIGHT") };
         let _ = fs::remove_dir_all(project_root);
         Ok(())
     }
@@ -7390,6 +7295,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn abe_phase1_dispatch_poll_output_review_and_cancel() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let project_root = std::env::temp_dir().join(format!("triumvirate-abe-phase1-{now}"));
@@ -7583,14 +7489,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert_eq!(cancelled.0.status, "cancelled");
 
         std::env::set_current_dir(&original_cwd)?;
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-        }
         let _ = fs::remove_file(codex_commit_script);
         let _ = fs::remove_file(codex_sleep_script);
         let _ = fs::remove_file(gemini_script);
@@ -7601,6 +7499,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn abe_red_team_enforcement_blocks_non_compliant_worker() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_ARGS", "TRIUMVIRATE_CODEX_BIN"]);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let project_root = std::env::temp_dir().join(format!("triumvirate-abe-red-team-{now}"));
@@ -7767,11 +7666,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         assert!(stdout.contains("BLOCKED"));
 
         std::env::set_current_dir(&original_cwd)?;
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
-        }
         let _ = fs::remove_file(forbidden_file_script);
         let _ = fs::remove_file(bad_commit_script);
         let _ = fs::remove_file(stub_script);
