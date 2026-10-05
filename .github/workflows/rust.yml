@@ -29,7 +29,7 @@ jobs:
       - name: Check
         run: cargo check --workspace --exclude pantheon
       - name: Clippy
-        run: cargo clippy --workspace --exclude pantheon -- -D warnings
+        run: cargo clippy --workspace --exclude pantheon --all-targets -- -D warnings
       # Format check temporarily disabled — pre-existing unformatted code across
       # the workspace would fail this gate. Follow-up PR will run `cargo fmt --all`
       # and restore this step. Tracked separately from PR #29 to keep that PR
