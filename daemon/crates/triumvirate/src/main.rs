@@ -3546,13 +3546,6 @@ mod tests {
             assert!(all_logs.iter().any(|m| m.contains("Antigravity: responded")));
         }
 
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
-            std::env::remove_var("TRIUMVIRATE_MCP_USE_DAEMON");
-        }
         let _ = fs::remove_file(script_path);
         client.cancel().await?;
         server_handle.await??;
@@ -4150,13 +4143,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .await;
 
         // Cleanup BEFORE the assertions, so a failure cannot leave the mocks installed.
-        // SAFETY: test controls env var lifecycle under lock.
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_HOME");
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BIN");
-            std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND");
-        }
         let _ = fs::remove_file(codex_bin);
         let _ = fs::remove_file(gemini_bin);
 
@@ -4395,7 +4381,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             None,
         )
         .await;
-        unsafe { std::env::remove_var("TRIUMVIRATE_CODEX_BIN") };
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&codex);
         let resp = outcome.map_err(anyhow::Error::msg)?;
 
@@ -4459,10 +4445,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             None,
         )
         .await;
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
-        }
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&codex);
         outcome.map_err(anyhow::Error::msg)?;
 
@@ -4525,10 +4508,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             None,
         )
         .await;
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_WIKI_DIR");
-        }
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&codex);
         outcome.map_err(anyhow::Error::msg)?;
         let events = wiki_call_events(&fs::canonicalize(project.path())?);
@@ -4564,10 +4544,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         )
         .await
         .expect_err("the failing stand-in must fail the call");
-        unsafe {
-            std::env::remove_var("TRIUMVIRATE_CODEX_BIN");
-            std::env::remove_var("TRIUMVIRATE_HOME");
-        }
+        drop(_env_restore); // restore the prior env before asserting
         let _ = fs::remove_file(&failing);
 
         let events = wiki_call_events(&fs::canonicalize(project.path())?);
