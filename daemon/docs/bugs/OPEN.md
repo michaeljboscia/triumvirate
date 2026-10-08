@@ -35,9 +35,11 @@ file is the thing you read to answer "what do we know is broken right now."
 **CHECK to close:** an agy fleet member's print timeout is set for fleet work (or configurable per dispatch), and a member that times out mid-turn is recorded failed with that reason.
 
 ### D-048 - Every fleet member builds its own target/ and nothing removes it
-**Found:** 2026-10-04 (the trial filled the disk) · **Severity:** HIGH · **NOT FIXED**
+**Found:** 2026-10-04 (the trial filled the disk) · **Severity:** HIGH · **FIX ON BRANCH fix/d048-fleet-target-cleanup; live check not run**
 **Evidence:** each member worktree under `.triumvirate/worktrees/` held its own `daemon/target` (1 to 5 GB each); after about ten fleets the volume had 165 MB free and cargo failed with `No space left on device`. Worktrees and their build output stay after the fleet finishes.
 **CHECK to close:** fleet members share one cargo target dir (for example `CARGO_TARGET_DIR` set for the member), or a finished fleet's worktree build output is removed; ten consecutive fleets leave disk use flat.
+**Fix (2026-10-07, 42b98e5 + 6eb908f):** both engines give the agent `CARGO_TARGET_DIR=<worktree>/.triumvirate/target` (`fleet::worktree::member_target_dir`) and delete it when the agent exits: fleet-shim after the done record on every post-spawn path; legacy `wait_fleet_child` on every exit including the token-failure return. The delete refuses a symlinked `.triumvirate` or `target`. Panel: codex and antigravity approve, grok concerns (below). Triage: /Users/michaelboscia/projects/temporal-migration/reviews/2026-10-07/d048-TRIAGE.md.
+**Residue:** a check-then-delete race against a process that escaped the member's group; escaped grandchildren may recreate output; a SIGKILL mid-delete leaves the dir and nothing retries; worktrees, branches and shim sidecars still accumulate.
 
 ### D-039 - The launchd daemon cannot reach the LAN until macOS Local Network access is approved
 **Found:** 2026-10-04 · **Severity:** MEDIUM · **NEEDS MIKE**
