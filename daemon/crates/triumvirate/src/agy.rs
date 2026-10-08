@@ -474,6 +474,7 @@ pub(crate) async fn run_agy_cli_process_with_session(
                     }
                     let status = sp.status().map(str::to_string);
                     let first_tool_error = sp.first_tool_error().map(str::to_string);
+                    let denied_actions = sp.denied_actions().to_vec();
                     let mut parsed = sp.finish();
                     if parsed.response_text.trim().is_empty() {
                         if let Some(signal) = quota_signal.as_deref() {
@@ -507,6 +508,27 @@ pub(crate) async fn run_agy_cli_process_with_session(
                         let status_label = status.as_deref().unwrap_or("none");
                         let kept = keep_failed_stream(&message, &text, &stderr);
                         let failed_calls = parsed.tool_calls.iter().filter(|c| c.success == Some(false)).count();
+                        // D-051: agy refused an action (a read-only review runs seatbelted, and agy
+                        // denies an unsandboxed run_command in print mode). That is not a dropped
+                        // capture: a retry is refused the same way, and "empty output" sent the
+                        // reader looking at the pipe. The signal is agy's OWN record of what it
+                        // refused (`result.denied_actions`), not a match on error wording: any
+                        // refused action counts, and a recoverable error that merely mentions
+                        // permission keeps its retry (Grok, panel review).
+                        if !denied_actions.is_empty() {
+                            let denied = denied_actions.join(", ");
+                            let detail = first_tool_error.as_deref().unwrap_or("no tool error recorded");
+                            tracing::warn!(
+                                denied_actions = %denied,
+                                first_tool_error = detail,
+                                raw_stream = kept.as_deref().unwrap_or("not kept"),
+                                "agy refused an action and stopped without an answer (attempt {attempt}); not retrying"
+                            );
+                            return Err(anyhow::anyhow!(
+                                "agy refused an action and stopped without an answer (not retried; a rerun is refused the same way): denied {denied}; {detail}; raw stream: {}",
+                                kept.as_deref().unwrap_or("not kept")
+                            ));
+                        }
                         tracing::warn!(
                             status = status_label,
                             permission_requests,
@@ -1613,6 +1635,70 @@ pub(crate) mod tests {
             .await
             .expect_err("empty output must fail, not succeed silently");
         assert!(err.to_string().contains("empty output"), "got: {err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    /// The 2026-10-05 capture, shortened: a run_command step that ends ERROR, then an empty
+    /// SUCCESS result, with agy's own `denied_actions` when `denied`. Each run appends a line to
+    /// `counter`, so retries are countable.
+    fn denied_stream_body(counter: &std::path::Path, error: &str, denied: bool) -> String {
+        let denied_actions = if denied {
+            r#",\"denied_actions\":[{\"action\":\"command\",\"display_name\":\"RunCommand\"}]"#
+        } else {
+            ""
+        };
+        format!(
+            "echo run >> {c}; printf '{{\"event\":\"init\",\"conversation_id\":\"c1\",\"init\":{{}}}}\n{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":2,\"state\":\"ERROR\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"tool_info\":{{\"name\":\"run_command\",\"parameters\":{{\"CommandLine\":\"git diff\"}},\"error\":{{\"type\":\"TOOL_ERROR\",\"message\":\"{error}\"}}}}}}}}\n{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"\"{denied_actions}}}}}\n'",
+            c = counter.display()
+        )
+    }
+
+    fn runs(counter: &std::path::Path) -> usize {
+        std::fs::read_to_string(counter).unwrap().lines().count()
+    }
+
+    /// D-051. RED IF a turn agy recorded as denied is reported as "empty output", or retried
+    /// (a rerun is refused the same way and doubles the spend).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_denied_command_is_named_and_not_retried() {
+        let _lock = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let body = denied_stream_body(&counter, "permission check failed for unsandboxed git diff: user denied permission to run command: git", true);
+        let msg = run_mock(&body, "review", None).await.expect_err("a denied turn has no answer").to_string();
+        assert!(msg.contains("refused an action") && msg.contains("RunCommand") && msg.contains("user denied permission"), "got: {msg}");
+        assert!(!msg.contains("empty output"), "a denial is not a dropped capture: {msg}");
+        assert_eq!(runs(&counter), 1, "a denial must not be retried");
+    }
+
+    /// Class, not wording: agy recorded a refusal whose tool error says something else entirely.
+    /// RED IF the check keys on error text again.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_any_recorded_denial_counts_whatever_the_wording() {
+        let _lock = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let body = denied_stream_body(&counter, "blocked by policy", true);
+        let msg = run_mock(&body, "review", None).await.expect_err("no answer").to_string();
+        assert!(msg.contains("refused an action"), "got: {msg}");
+        assert_eq!(runs(&counter), 1);
+    }
+
+    /// The twin: a failed tool whose text even MENTIONS a permission check, but which agy did
+    /// not record as denied, keeps the empty-output path and its retry. RED IF wording alone
+    /// skips a retry that could have helped (Grok, panel review).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_permission_wording_without_a_recorded_denial_stays_empty_output() {
+        let _lock = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let body = denied_stream_body(&counter, "permission check failed while parsing policy.toml", false);
+        let err = run_mock(&body, "review", None).await.expect_err("still no answer");
+        assert!(err.to_string().contains("empty output"), "got: {err}");
+        assert!(runs(&counter) > 1, "the capture-drop retry still runs");
     }
 
     #[cfg(target_os = "macos")]
