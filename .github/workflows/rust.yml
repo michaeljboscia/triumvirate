@@ -72,6 +72,11 @@ jobs:
       # by `--lib`. Each test file is its own process, which that file relies on.
       - name: Fleet integration tests
         run: cargo test -p fleet --tests
+      # D-050: the daemon binary's own tests (about 320 in main.rs) and its integration files.
+      # `--lib` never ran them: `triumvirate` is a bin target. Live-seat tests are #[ignore]d,
+      # so this is offline; the codex oracle tests among them use the CLI installed above.
+      - name: Daemon binary and integration tests
+        run: cargo test -p triumvirate --tests
 
   build:
     name: Build Release
