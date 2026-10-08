@@ -5059,12 +5059,17 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             std::env::remove_var("TRIUMVIRATE_GEMINI_ARGS");
         }
 
+        // reuse_session: since one-shot ask_agent stopped resuming cached sessions (see
+        // one_shot_ask_agent_does_not_inherit_a_cached_session), only an opted-in call is warm.
+        // Without it both calls sleep the cold 0.8 s and "faster" was a coin flip that passed on
+        // macOS and failed the first time Linux CI ran this test (D-050).
         let req = AskAgentRequest {
             agent: "gemini".to_string(),
             message: "first".to_string(),
             cwd: Some("/tmp/worker-reuse".to_string()),
             repo: None,
             branch: None,
+            reuse_session: Some(true),
             ..Default::default()
         };
         let first_start = Instant::now();
