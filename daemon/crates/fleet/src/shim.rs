@@ -103,7 +103,7 @@ fn set_signal(sig: i32, handler: libc::sighandler_t) {
 /// Run the shim. Returns the exit code the shim process should exit with (the agent's code, or
 /// 128 + signal). Errors are setup failures, before any agent ran.
 pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::os::unix::process::CommandExt;
 
     if args.command.is_empty() {
         anyhow::bail!("fleet-shim: no agent command given");
@@ -143,6 +143,7 @@ pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
     cmd.args(&args.command[1..])
         .current_dir(&args.worktree)
         .env("TRIUMVIRATE_PROJECT_ROOT", &args.project_root)
+        .env("CARGO_TARGET_DIR", crate::worktree::member_target_dir(&args.worktree))
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
@@ -155,7 +156,21 @@ pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
             Ok(())
         });
     }
-    let status = cmd.spawn()?.wait()?;
+    // Spawn failed: no agent ran, nothing was built. Past this point the agent has run, so the
+    // build output goes on EVERY path, error ones included (D-048 panel, Codex), and only after
+    // the done record: a shim killed during a multi-GB delete must still leave the record, or a
+    // retry would run finished work again.
+    let child = cmd.spawn()?;
+    let finished = record_done(args, child, me, &token);
+    crate::worktree::remove_member_target(&args.worktree);
+    finished
+}
+
+/// Wait for the agent and write its durable done record. Returns the shim's exit code.
+fn record_done(args: &ShimArgs, mut child: std::process::Child, me: u32, token: &WorkerToken) -> anyhow::Result<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let status = child.wait()?;
 
     let branch_head = Command::new("git")
         .args(["rev-parse", "HEAD"])
