@@ -2377,7 +2377,11 @@ fn printed_bytes(
 /// `None` for anything else: its output cannot be bounded, so the call fails closed.
 fn small_output_bound(seg: &str) -> Option<usize> {
     let seg = seg.trim();
-    if seg.contains(['|', '<', '>', '`', '$', ';', '(', ')', '*', '?']) {
+    // Literal tokens only. Anything the shell expands (braces, globs, `~`, quotes, escapes,
+    // variables, substitutions) prints more than its text: `echo {1..40000}` is a few bytes of
+    // command and hundreds of KB of output (Codex, D-032 fourth pass).
+    let literal = |t: &str| t.chars().all(|ch| ch.is_ascii_alphanumeric() || "._/-:=,+@%".contains(ch));
+    if !seg.split_whitespace().all(literal) {
         return None;
     }
     let mut toks = seg.split_whitespace();
@@ -9752,6 +9756,10 @@ mod grok_shell_read_gate_tests {
         let unbounded = vec![grok_shell(&format!("find {root} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
         enforce_reviewer_sight("Codex", &unbounded, "grok-streaming-json", &sources, &root, &mut Vec::new())
             .expect_err("find's output cannot be sized and shares the output");
+        // Brace expansion: a short command, a huge output (Codex, fourth pass).
+        let braces = vec![grok_shell(&format!("echo {{1..40000}} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &braces, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("echo {1..40000} prints far more than its text");
         let with_wc = vec![grok_shell(&format!("wc -l {src} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
         enforce_reviewer_sight("Codex", &with_wc, "grok-streaming-json", &sources, &root, &mut Vec::new())
             .expect("wc prints a bounded line");
