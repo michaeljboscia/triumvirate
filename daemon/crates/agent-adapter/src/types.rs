@@ -53,6 +53,41 @@ pub struct ToolCallRecord {
     pub success: Option<bool>,
     pub duration_ms: Option<u64>,
     pub args_json: Option<String>,
+    /// The line numbers the tool's RESULT showed, as contiguous runs `(first, last)`, when the
+    /// result numbers its lines (grok `N→text`, claude `N\ttext`). D-032: the sight gate used to
+    /// credit the window a read ASKED for; these are the lines it RECEIVED, truncation, gaps and
+    /// offset convention included. Empty when the result does not number its lines (agy
+    /// `view_file` reports only a count).
+    #[serde(default)]
+    pub returned_lines: Vec<(u64, u64)>,
+}
+
+/// The line numbers in a read tool's line-numbered output, as sorted contiguous runs. A line
+/// counts when, after leading spaces, it starts with digits followed by `→` (grok) or a tab
+/// (claude). Lines 1 and 100 alone are two runs, never 1..100 (Codex, panel review). Empty
+/// when no line is numbered, so an unnumbered result never invents a range.
+pub fn numbered_line_runs(text: &str) -> Vec<(u64, u64)> {
+    let mut seen: Vec<u64> = text
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim_start_matches(' ');
+            let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let rest = &t[digits..];
+            (digits > 0 && (rest.starts_with('→') || rest.starts_with('\t')))
+                .then(|| t[..digits].parse::<u64>().ok())
+                .flatten()
+        })
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for n in seen {
+        match runs.last_mut() {
+            Some((_, last)) if *last + 1 == n => *last = n,
+            _ => runs.push((n, n)),
+        }
+    }
+    runs
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,5 +164,23 @@ pub fn should_display(state: &WorkingState, verbosity: AgentVerbosity) -> bool {
         ),
         AgentVerbosity::Detailed => !matches!(state, WorkingState::Unknown),
         AgentVerbosity::Raw => true,
+    }
+}
+
+#[cfg(test)]
+mod numbered_line_runs_tests {
+    use super::numbered_line_runs;
+
+    /// RED IF a numbered result loses its lines, a gap is bridged, or an unnumbered result
+    /// invents a range.
+    #[test]
+    fn runs_follow_the_numbers_actually_shown() {
+        assert_eq!(numbered_line_runs("1→a\n2→b\n3→c\n"), vec![(1, 3)], "grok");
+        assert_eq!(numbered_line_runs("    41\tfn x() {\n    42\t}\n"), vec![(41, 42)], "claude cat -n");
+        assert_eq!(numbered_line_runs("1→a\n100→z\n"), vec![(1, 1), (100, 100)], "an elided middle stays a gap");
+        assert_eq!(numbered_line_runs("3→c\n1→a\n2→b\n2→b\n"), vec![(1, 3)], "out of order and duplicates");
+        assert_eq!(numbered_line_runs("1→a\n... 98 lines elided ...\n100→z\n"), vec![(1, 1), (100, 100)]);
+        assert_eq!(numbered_line_runs("403 lines, 42837 bytes"), Vec::<(u64, u64)>::new(), "agy's summary is not a span");
+        assert_eq!(numbered_line_runs("plain text\n12 apples\n"), Vec::<(u64, u64)>::new(), "a number without the marker is content");
     }
 }

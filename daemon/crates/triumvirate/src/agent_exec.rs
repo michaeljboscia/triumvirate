@@ -2267,9 +2267,12 @@ fn tool_call_read_source_in_full(
     cwd: &str,
 ) -> bool {
     let candidates = source_path_candidates(source, cwd);
+    // The CLI shows the model only SHELL_OUTPUT_BUDGET bytes of a call (D-032 shell half), so
+    // a whole-file shell read counts only when everything that call printed fits.
     let whole = tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
+            && (!is_shell_read_tool(&c.tool) || shell_call_fits_budget(c, cwd))
             && candidates.iter().any(|cand| record_read_source_whole(c, cand))
     });
     whole || codex_ranged_reads_cover_source(tool_calls, &candidates, source, cwd)
@@ -2318,7 +2321,7 @@ fn codex_ranged_reads_cover_source(
                 .and_then(agent_adapter::codex::shell_command_from_args_json)
                 .map(|command| agent_adapter::codex::command_read_ranges(&command))
                 .unwrap_or_default();
-            ranges.into_iter().filter(|read| {
+            let windows: Vec<agent_adapter::codex::LineRange> = ranges.into_iter().filter(|read| {
                 // Bound to the operand the reader opened, not to a path string anywhere in the
                 // command. Codex, round 3: a decoy operand embedding the source path used to
                 // collect the source's coverage.
@@ -2326,6 +2329,10 @@ fn codex_ranged_reads_cover_source(
                     && !(read.via_nl && nl_drops_lines)
             })
             .map(|read| read.range)
+            .collect();
+            // Everything one call prints shares one output, and the CLI truncates that output
+            // past SHELL_OUTPUT_BUDGET (D-032 shell half). A call over budget earns nothing.
+            if shell_call_fits_budget(c, cwd) { windows } else { Vec::new() }
         })
         .collect();
     let mut ranges = ranges;
@@ -2334,6 +2341,92 @@ fn codex_ranged_reads_cover_source(
         return false;
     }
     ranges_cover_lines(&ranges, count_lines(&bytes))
+}
+
+/// The most bytes of ONE shell call's output a reviewer is credited with having seen.
+/// Measured 2026-10-07, `cat` of a 58.6 KB, 3000-line file with a token per line: codex showed
+/// the model "Warning: truncated output (original token count: 15000)" and lost the middle
+/// (line 1500 not shown, 2999 shown; probe 45a30323); grok showed "first/last 19.6 KB of
+/// 58.6 KB" (probe 0800122b). Both kept roughly 39 KB. Claude Code middle-truncates Bash output
+/// past 30,000 characters by default. 30,000 bytes sits under all three.
+const SHELL_OUTPUT_BUDGET: usize = 30_000;
+
+/// Bytes a vetted reader prints for lines `start..=end` (1-based; `None` is EOF) of `bytes`,
+/// its decoration included (`nl -ba`, `cat -n`, `cat -e`, `cat -v`).
+fn printed_bytes(
+    bytes: &[u8],
+    range: &agent_adapter::codex::LineRange,
+    decoration: &agent_adapter::codex::Decoration,
+) -> usize {
+    let start = range.start.max(1);
+    let end = range.end.unwrap_or(u64::MAX);
+    if end < start {
+        return 0;
+    }
+    bytes
+        .split_inclusive(|b| *b == b'\n')
+        .enumerate()
+        .map(|(i, l)| (i as u64 + 1, l))
+        .filter(|(n, _)| *n >= start && *n <= end)
+        .map(|(n, l)| decoration.printed_len(l, n))
+        .sum()
+}
+
+/// An upper bound on what a non-read segment prints, for the few that codex chains around its
+/// reads (D-017): `wc` (a line per operand plus a total), `pwd` (one path), `echo` (its words).
+/// `None` for anything else: its output cannot be bounded, so the call fails closed.
+fn small_output_bound(seg: &str) -> Option<usize> {
+    let seg = seg.trim();
+    // Literal tokens only. Anything the shell expands (braces, globs, `~`, quotes, escapes,
+    // variables, substitutions) prints more than its text: `echo {1..40000}` is a few bytes of
+    // command and hundreds of KB of output (Codex, D-032 fourth pass).
+    let literal = |t: &str| t.chars().all(|ch| ch.is_ascii_alphanumeric() || "._/-:=,+@%".contains(ch));
+    if !seg.split_whitespace().all(literal) {
+        return None;
+    }
+    let mut toks = seg.split_whitespace();
+    let program = toks.next()?;
+    let rest: Vec<&str> = toks.collect();
+    match program.rsplit('/').next().unwrap_or(program) {
+        "pwd" if rest.is_empty() => Some(4096 + 1),
+        "echo" => Some(seg.len() + 1),
+        "wc" if rest.iter().all(|t| !t.starts_with('-') || matches!(*t, "-l" | "-c" | "-w" | "-m" | "-lc" | "-lw")) => {
+            Some(rest.iter().map(|t| t.len() + 64).sum::<usize>() + 64)
+        }
+        _ => None,
+    }
+}
+
+/// Did everything this shell call printed fit the budget? Summed over EVERY segment of the
+/// command, any file: a chain shares one output, and truncation can fall anywhere in it. A
+/// segment that is not a vetted read (`ls`, `find`, `wc`), or a file this process cannot read,
+/// cannot be sized, so the call fails closed (Codex, D-032 third pass).
+fn shell_call_fits_budget(c: &ToolCallRecord, cwd: &str) -> bool {
+    let Some(command) = c.args_json.as_deref().and_then(agent_adapter::codex::shell_command_from_args_json) else {
+        return false;
+    };
+    let mut total = 0usize;
+    for seg in agent_adapter::codex::read_segments_pub(&command) {
+        let (operand, range, decoration) = if let Some(r) = agent_adapter::codex::command_read_range(seg) {
+            (r.operand, r.range, r.decoration)
+        } else if let Some((op, d)) = agent_adapter::codex::whole_file_read(seg) {
+            (op, agent_adapter::codex::LineRange { start: 1, end: None }, d)
+        } else if let Some(n) = small_output_bound(seg) {
+            // `wc -l F && sed -n ...` is codex's live habit (D-017): a bounded few bytes.
+            total += n;
+            continue;
+        } else {
+            return false;
+        };
+        let Some(bytes) = source_bytes(&operand, cwd) else {
+            return false;
+        };
+        total += printed_bytes(&bytes, &range, &decoration);
+        if total > SHELL_OUTPUT_BUDGET {
+            return false;
+        }
+    }
+    true
 }
 
 /// The FIELDS a structured read tool uses to name the file it is opening.
@@ -2354,6 +2447,15 @@ const READ_OPERAND_KEYS: &[&str] = &[
     "filename",
 ];
 
+/// Read tools whose result does NOT number its lines, with the most lines one call delivers.
+/// Measured, not assumed. agy `view_file` (2026-10-07, a 3000-line file with one token per
+/// line): no range returned lines 1..800 and said "The above content does NOT show the entire
+/// file contents"; line 800's token came back verbatim, line 801's did not; StartLine 1500 /
+/// EndLine 1502 returned exactly those lines (1-based, inclusive). Probe requests
+/// 7f0fff2b, 3be89bbc, 731d2582. A tool missing from this list is credited nothing when its
+/// result is unnumbered.
+const UNNUMBERED_READ_CAPS: &[(&str, u64)] = &[("view_file", 800)];
+
 /// The windows a STRUCTURED read tool asked for, as ranges the same union can consume.
 ///
 /// D-028: only shell windows were ever unioned. A reviewer whose read tool takes `offset` and
@@ -2364,11 +2466,9 @@ const READ_OPERAND_KEYS: &[&str] = &[
 /// correctly teaches the operator to drop `require_sight`, which is the only thing standing
 /// between a real review and one written from memory.
 ///
-/// `offset` is the first line (1-based), `limit` the number of lines. KNOWN LIMITATION: this
-/// is what the reviewer ASKED for, not what it received. A tool that silently caps or
-/// truncates its output is credited with the whole window. The record carries arguments and a
-/// success flag, nothing about the returned content, so that gap cannot be closed here (Codex,
-/// panel review); it is filed rather than papered over.
+/// D-032 closed the ASKED-versus-RECEIVED gap this used to document: a numbered result is
+/// credited with the lines it showed, an unnumbered one only for a measured tool and within its
+/// cap (`UNNUMBERED_READ_CAPS`), anything else with nothing.
 fn structured_read_ranges(
     tool_calls: &[ToolCallRecord],
     candidates: &[String],
@@ -2393,21 +2493,40 @@ fn structured_read_ranges(
             if !operand_is_source {
                 return None;
             }
+            // D-032: when the result numbered its lines, credit what CAME BACK, not what was
+            // asked for. A capped or truncated read, or a zero-based offset, is credited at its
+            // true lines.
+            if !c.returned_lines.is_empty() {
+                return Some(
+                    c.returned_lines
+                        .iter()
+                        .map(|&(first, last)| agent_adapter::codex::LineRange { start: first, end: Some(last) })
+                        .collect(),
+                );
+            }
+            // No numbered lines in the result. Credit the requested window only for a tool whose
+            // delivery has been MEASURED, bounded by its cap; any other unnumbered read earns
+            // nothing, so an unknown tool cannot be credited with lines nobody saw it receive
+            // (Codex, D-032 confirmation pass).
+            let cap = UNNUMBERED_READ_CAPS.iter().find(|(tool, _)| *tool == c.tool).map(|(_, cap)| *cap)?;
             let num = |keys: &[&str]| -> Option<u64> {
                 keys.iter().find_map(|k| value.get(*k).and_then(serde_json::Value::as_u64))
             };
-            let start = num(&["offset", "line_offset", "start_line"]).unwrap_or(1).max(1);
+            let start = num(&["offset", "line_offset", "start_line", "StartLine"]).unwrap_or(1).max(1);
             let end = match num(&["limit", "max_lines"]) {
                 // A limit of 0 asks for NOTHING. `start + 0 - 1` saturated back to `start` and
                 // credited a line the reviewer never received; repeated across offsets that
                 // fabricated whole-file coverage (Codex, panel review).
                 Some(0) => return None,
                 // An explicit end_line wins over a count when both are somehow present.
-                Some(limit) => Some(num(&["end_line"]).unwrap_or(start + limit - 1)),
-                None => num(&["end_line"]),
+                Some(limit) => Some(num(&["end_line", "EndLine"]).unwrap_or(start + limit - 1)),
+                None => num(&["end_line", "EndLine"]),
             };
-            Some(agent_adapter::codex::LineRange { start, end })
+            let capped = start + cap - 1;
+            let end = Some(end.map_or(capped, |e| e.min(capped)));
+            Some(vec![agent_adapter::codex::LineRange { start, end }])
         })
+        .flatten()
         .collect()
 }
 
@@ -2654,26 +2773,11 @@ fn record_read_source_whole(c: &ToolCallRecord, cand: &str) -> bool {
             .map(|cmd| agent_adapter::codex::whole_file_read_operands(&cmd))
             .is_some_and(|ops| ops.iter().any(|op| op == cand));
     }
-    args_name_path(args, cand) && !read_args_are_partial(&c.tool, args)
-}
-
-fn read_args_are_partial(tool: &str, args_json: &str) -> bool {
-    // codex and grok: the slice lives in the command line, not in a field.
-    if is_shell_read_tool(tool) {
-        let command = agent_adapter::codex::shell_command_from_args_json(args_json);
-        return match command {
-            Some(cmd) => !agent_adapter::codex::command_reads_whole_file(&cmd),
-            None => true,
-        };
-    }
-
-    // Everyone else: an explicit, non-null limit or offset means a slice was requested.
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(args_json) else {
-        return true;
-    };
-    ["limit", "offset", "start_line", "end_line", "line_offset", "max_lines"]
-        .iter()
-        .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
+    // A structured read is never whole on its arguments alone (D-032): "no offset, no limit"
+    // credited to EOF a read that delivered 800 (agy view_file) or 2000 (claude Read) lines.
+    // Its coverage comes only from structured_read_ranges: the lines the result showed, or a
+    // measured tool's capped window.
+    false
 }
 
 /// Does `args` mention `path` as a WHOLE path, at token boundaries?
@@ -2902,9 +3006,10 @@ fn enforce_reviewer_sight(
                  read PART of {}: {}. A slice is not the source. `head`, `tail`, `cut`, a pager, \
                  or a read carrying `limit`/`offset` returns a few lines and leaves the work \
                  itself out of context, so a verdict formed from one cannot be about the work. \
-                 Re-read the whole file ON THIS TURN (`cat`, or a read with no limit and no \
-                 offset; codex and grok may read it in `sed -n` windows, and they must together cover \
-                 every line from 1 to the last with no gap). Only this turn's tool calls count: \
+                 Re-read the whole file ON THIS TURN (`cat`, or reads whose RESULTS together \
+                 show every line from 1 to the last with no gap: `sed -n` windows, read_file or \
+                 Read windows, and for view_file, which returns at most 800 lines a call, \
+                 StartLine/EndLine windows). Only this turn's tool calls count: \
                  a reused worker that read part of it on an earlier turn must read it all \
                  again. Reads counted this turn: {}",
                 required_sources.len(),
@@ -6263,7 +6368,20 @@ mod deepseek_dispatch_tests {
 mod sight_gate_tests {
     use super::*;
 
-    /// Build a successful structured read record for `path` with the given window.
+    /// A real repo root holding `rel` with `lines` lines, for tests about PATH matching: since
+    /// D-032 coverage is checked against the file's bytes, a fake `/repo` can no longer pass.
+    fn real_repo(rel: &str, lines: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, (1..=lines).map(|i| format!("l{i}\n")).collect::<String>()).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        (dir, root)
+    }
+
+    /// Build a successful grok `read_file` record for `path` with the given window. Real
+    /// read_file results number their lines (the committed capture), so the record carries the
+    /// lines a window of that shape returns; tests of a short or gapped delivery override it.
     fn structured_read(path: &str, offset: Option<u64>, limit: Option<u64>) -> ToolCallRecord {
         let mut args = serde_json::json!({ "target_file": path });
         if let Some(o) = offset {
@@ -6272,7 +6390,11 @@ mod sight_gate_tests {
         if let Some(l) = limit {
             args["limit"] = serde_json::json!(l);
         }
-        ToolCallRecord {
+        let total = std::fs::read_to_string(path).map(|t| t.lines().count() as u64).unwrap_or(0);
+        let first = offset.unwrap_or(1).max(1);
+        let last = limit.map_or(total, |l| (first + l).saturating_sub(1).min(total));
+        let returned_lines = if limit == Some(0) || first > last { Vec::new() } else { vec![(first, last)] };
+        ToolCallRecord { returned_lines,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -6319,6 +6441,79 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight("Grok", &wrong_file, "grok-streaming-json", &[src], &cwd, &mut lifecycle)
             .expect_err("reading another file is not reading this one");
+    }
+
+    /// D-032, unnumbered results. agy `view_file` delivers at most 800 lines a call (measured):
+    /// a no-range view of a 1000-line file is credited 1..800, so it is a PARTIAL read, and two
+    /// ranged views that tile the file are whole. An unmeasured unnumbered tool earns nothing.
+    /// RED IF view_file is credited to EOF again, or an unknown tool is credited at all.
+    #[test]
+    fn sight_d032_unnumbered_reads_are_capped_or_earn_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("long.rs");
+        std::fs::write(&src, (1..=1000).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let view = |args: serde_json::Value, tool: &str| ToolCallRecord {
+            returned_lines: Vec::new(),
+            id: None,
+            tool: tool.to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(args.to_string()),
+        };
+        let whole_ask = view(serde_json::json!({ "AbsolutePath": src }), "view_file");
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Antigravity", &[whole_ask], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("view_file returns 800 lines, not 1000");
+        assert!(err.contains("read PART"), "{err}");
+
+        let tiled = vec![
+            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 1, "EndLine": 800 }), "view_file"),
+            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 801, "EndLine": 1000 }), "view_file"),
+        ];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Antigravity", &tiled, "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect("1..800 and 801..1000 are the whole file");
+
+        let unknown = view(serde_json::json!({ "path": src, "offset": 1, "limit": 1000 }), "mystery_reader");
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Antigravity", &[unknown], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("an unmeasured unnumbered read proves nothing");
+    }
+
+    /// D-032. A read that ASKED for the whole file but RECEIVED only part of it (a capped tool)
+    /// is credited with what came back. RED IF the gate credits the requested window again.
+    #[test]
+    fn sight_d032_a_truncated_read_is_credited_with_what_came_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.rs");
+        std::fs::write(&src, (1..=100).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        let mut capped = structured_read(&src, Some(1), Some(100));
+        capped.returned_lines = vec![(1, 60)];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Grok", &[capped], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("asked for 1..100, received 1..60");
+        assert!(err.contains("read PART"), "{err}");
+
+        // An elided middle: lines 1..50 and 90..100 came back. Two runs, not 1..100.
+        let mut elided = structured_read(&src, Some(1), Some(100));
+        elided.returned_lines = vec![(1, 50), (90, 100)];
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Grok", &[elided], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("51..89 never came back");
+        assert!(err.contains("read PART"), "{err}");
+
+        // Twin: the tool numbered every line, so the whole file was received.
+        let mut whole = structured_read(&src, Some(1), Some(100));
+        whole.returned_lines = vec![(1, 100)];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Grok", &[whole], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect("received 1..100 of a 100-line file");
     }
 
     /// A relative source is rejected UP FRONT, naming the absolute path to pass instead.
@@ -6371,7 +6566,7 @@ mod sight_gate_tests {
         let parsed = ParsedAgentResult {
             response_text: "port 3300".to_string(),
             parser_mode: "grok-streaming-json".to_string(),
-            tool_calls: vec![ToolCallRecord {
+            tool_calls: vec![ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: "triumvirate__wiki_search".to_string(),
                 kind: ToolKind::Unknown,
@@ -6404,7 +6599,7 @@ mod sight_gate_tests {
         let parsed = ParsedAgentResult {
             response_text: "port 3300".to_string(),
             parser_mode: "grok-streaming-json".to_string(),
-            tool_calls: vec![ToolCallRecord {
+            tool_calls: vec![ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: "use_tool".to_string(),
                 kind: ToolKind::Unknown,
@@ -6426,7 +6621,7 @@ mod sight_gate_tests {
     fn calls(kinds: &[ToolKind]) -> Vec<ToolCallRecord> {
         kinds
             .iter()
-            .map(|k| ToolCallRecord {
+            .map(|k| ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: match k {
                     ToolKind::WriteFile => "write_file",
@@ -6694,7 +6889,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_12_a_named_source_that_was_never_opened_is_rejected() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "todo_write".to_string(),
             kind: ToolKind::Unknown,
@@ -6726,7 +6921,7 @@ mod sight_gate_tests {
     fn sight_36_a_failed_or_uncounted_attempt_is_reported_as_such() {
         let mut lifecycle = Vec::new();
         let tools = vec![
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: ToolKind::ReadFile,
@@ -6734,7 +6929,7 @@ mod sight_gate_tests {
                 duration_ms: None,
                 args_json: Some(r#"{"command":"cat /repo/agent_exec.rs"}"#.to_string()),
             },
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: ToolKind::Bash,
@@ -6754,7 +6949,7 @@ mod sight_gate_tests {
     }
 
     fn codex_read(command: &str) -> ToolCallRecord {
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
@@ -6806,7 +7001,7 @@ mod sight_gate_tests {
         let other = file_with_lines(dir.path(), "b.rs", 500);
         let classified = |command: String| {
             let args = serde_json::json!({ "command": command });
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -7004,7 +7199,8 @@ mod sight_gate_tests {
     #[test]
     fn sight_13_opening_the_source_by_relative_path_counts() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let (_dir, root) = real_repo("crates/triumvirate/src/agent_exec.rs", 40);
+        let tools = vec![ToolCallRecord { returned_lines: vec![(1, 40)],
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7012,10 +7208,10 @@ mod sight_gate_tests {
             duration_ms: None,
             args_json: Some(r#"{"path":"crates/triumvirate/src/agent_exec.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/crates/triumvirate/src/agent_exec.rs".to_string()];
+        let sources = vec![format!("{root}/crates/triumvirate/src/agent_exec.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle,
+                "Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "the cwd-relative form of the named source must satisfy it"
@@ -7027,7 +7223,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_14_a_failed_read_does_not_count_as_having_looked() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7052,7 +7248,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_15_a_same_named_file_elsewhere_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7425,7 +7621,7 @@ mod sight_gate_tests {
     fn sight_21_a_search_naming_the_file_does_not_count_as_reading_it() {
         let mut lifecycle = Vec::new();
         let tools = vec![
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: "grep_search".to_string(),
                 kind: ToolKind::Grep,
@@ -7434,7 +7630,7 @@ mod sight_gate_tests {
                 // Exact quoted path: the string match SUCCEEDS here.
                 args_json: Some(r#"{"Query":"crates/shared-types/src/lib.rs"}"#.to_string()),
             },
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: "run_command".to_string(),
                 kind: ToolKind::Bash,
@@ -7458,7 +7654,8 @@ mod sight_gate_tests {
     #[test]
     fn sight_21b_the_identical_args_pass_when_the_kind_is_a_read() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let (_dir, root) = real_repo("crates/shared-types/src/lib.rs", 300);
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7466,10 +7663,10 @@ mod sight_gate_tests {
             duration_ms: None,
             args_json: Some(r#"{"AbsolutePath":"crates/shared-types/src/lib.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
+        let sources = vec![format!("{root}/crates/shared-types/src/lib.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Antigravity", &tools, "agy-stream-json", &sources, "/repo", &mut lifecycle,
+                "Antigravity", &tools, "agy-stream-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "identical args under ReadFile must pass; if this fails the string match is what \
@@ -7482,7 +7679,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21c_an_in_flight_read_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7507,7 +7704,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21d_a_prefix_sibling_directory_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7531,7 +7728,8 @@ mod sight_gate_tests {
     #[test]
     fn sight_21e_a_dot_slash_relative_read_satisfies_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let (_dir, root) = real_repo("src/lib.rs", 12);
+        let tools = vec![ToolCallRecord { returned_lines: vec![(1, 12)],
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7539,10 +7737,10 @@ mod sight_gate_tests {
             duration_ms: None,
             args_json: Some(r#"{"path":"./src/lib.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/src/lib.rs".to_string()];
+        let sources = vec![format!("{root}/src/lib.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle,
+                "Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "./src/lib.rs is a genuine read of the named source"
@@ -7554,7 +7752,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_22_a_failed_read_on_the_agy_path_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: Some("7".to_string()),
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7584,18 +7782,20 @@ mod sight_gate_tests {
     #[test]
     fn sight_23_codex_can_be_source_gated_now_that_it_classifies_reads() {
         let mut lifecycle = Vec::new();
-        let read = vec![ToolCallRecord {
+        let (_dir, root) = real_repo("a.rs", 10);
+        let src = format!("{root}/a.rs");
+        let read = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"command":"cat /repo/a.rs"}"#.to_string()),
+            args_json: Some(serde_json::json!({ "command": format!("cat {src}") }).to_string()),
         }];
-        let sources = vec!["/repo/a.rs".to_string()];
+        let sources = vec![src.clone()];
         assert!(
             enforce_reviewer_sight(
-                "Codex", &read, "codex-exec-json", &sources, "/repo", &mut lifecycle,
+                "Codex", &read, "codex-exec-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "`cat` of the named source must satisfy it on codex"
@@ -7603,17 +7803,17 @@ mod sight_gate_tests {
 
         // And a path-naming command still must not.
         let mut l2 = Vec::new();
-        let listing = vec![ToolCallRecord {
+        let listing = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::Bash,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"command":"/repo/a.rs"}"#.to_string()),
+            args_json: Some(serde_json::json!({ "command": src }).to_string()),
         }];
         assert!(
             enforce_reviewer_sight(
-                "Codex", &listing, "codex-exec-json", &sources, "/repo", &mut l2,
+                "Codex", &listing, "codex-exec-json", &sources, &root, &mut l2,
             )
             .is_err(),
             "a Bash-classified command naming the path must still not satisfy the source"
@@ -7651,7 +7851,9 @@ mod sight_gate_tests {
     #[test]
     fn sight_20_antigravity_can_actually_pass_the_gate() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        // Within view_file's measured 800-line delivery, so one call is the whole file.
+        let (_dir, root) = real_repo("crates/shared-types/src/lib.rs", 300);
+        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: Some("2".to_string()),
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7659,10 +7861,10 @@ mod sight_gate_tests {
             duration_ms: Some(12),
             args_json: Some(r#"{"AbsolutePath":"crates/shared-types/src/lib.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
+        let sources = vec![format!("{root}/crates/shared-types/src/lib.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Antigravity", &tools, "agy-stream-json", &sources, "/repo", &mut lifecycle,
+                "Antigravity", &tools, "agy-stream-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "an antigravity review that opened the named source must PASS. A gate that always \
@@ -8881,7 +9083,7 @@ mod mandatory_review_tests {
             r#"{"file_path":"/repo/a.md","offset":9000}"#,
             r#"{"file_path":"/repo/a.md","limit":1,"offset":9000}"#,
         ] {
-            let calls = vec![ToolCallRecord {
+            let calls = vec![ToolCallRecord { returned_lines: Vec::new(),
                 id: Some("t".into()),
                 tool: "Read".into(),
                 kind: ToolKind::ReadFile,
@@ -8908,41 +9110,48 @@ mod mandatory_review_tests {
     /// RED IF: an honest whole-file read starts being called a slice.
     #[test]
     fn review_23_a_read_without_limit_or_offset_is_a_full_read() {
-        let calls = vec![ToolCallRecord {
+        // Since D-032 a read is whole when its RESULT showed every line, so the file must exist
+        // and the records carry what the real tools return (numbered lines).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.md");
+        std::fs::write(&src, "one\ntwo\nthree\n").unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let root = dir.path().to_string_lossy().into_owned();
+        let calls = vec![ToolCallRecord { returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "Read".into(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"file_path":"/repo/a.md"}"#.to_string()),
+            args_json: Some(serde_json::json!({ "file_path": src }).to_string()),
         }];
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight(
             "Claude",
             &calls,
             "claude-stream-json",
-            &["/repo/a.md".to_string()],
-            "/repo",
+            std::slice::from_ref(&src),
+            &root,
             &mut lifecycle,
         )
         .expect("an unbounded read of the named source must pass");
 
         // An explicit null is not a slice either: grok's own capture records "offset":null.
-        let with_nulls = vec![ToolCallRecord {
+        let with_nulls = vec![ToolCallRecord { returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "read_file".into(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"target_file":"/repo/a.md","offset":null,"limit":null}"#.to_string()),
+            args_json: Some(serde_json::json!({ "target_file": src, "offset": null, "limit": null }).to_string()),
         }];
         let mut lifecycle2 = Vec::new();
         enforce_reviewer_sight(
             "Grok",
             &with_nulls,
             "grok-streaming-json",
-            &["/repo/a.md".to_string()],
-            "/repo",
+            std::slice::from_ref(&src),
+            &root,
             &mut lifecycle2,
         )
         .expect("a null offset is not a slice; grok's live capture records exactly this");
@@ -8953,7 +9162,7 @@ mod mandatory_review_tests {
     /// RED IF: the partial branch is removed and both fall through to the same message.
     #[test]
     fn review_24_a_peek_and_a_miss_report_differently() {
-        let peek = vec![ToolCallRecord {
+        let peek = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: Some("t".into()),
             tool: "command_execution".into(),
             kind: ToolKind::ReadFile,
@@ -9290,8 +9499,17 @@ mod grok_shell_read_gate_tests {
     use super::enforce_reviewer_sight;
     use agent_adapter::{ToolCallRecord, ToolKind};
 
+    /// A small real source (under the shell output budget): (guard, root, absolute path).
+    fn small_source() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.rs");
+        std::fs::write(&src, "fn a() {}\nfn b() {}\n").unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        (dir, root, src.to_string_lossy().into_owned())
+    }
+
     fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "run_terminal_command".to_string(),
             kind,
@@ -9309,7 +9527,7 @@ mod grok_shell_read_gate_tests {
     /// this file tests are ever reached. A helper that skips the step under test is not a test.
     fn codex_shell(command: &str) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9384,7 +9602,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
         });
-        let call = ToolCallRecord {
+        let call = ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9415,7 +9633,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
         });
-        let call = ToolCallRecord {
+        let call = ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9472,11 +9690,79 @@ mod grok_shell_read_gate_tests {
     /// named source.
     #[test]
     fn a_grok_cat_of_the_named_source_passes() {
-        let tools = vec![grok_shell("cat /repo/a.rs", ToolKind::ReadFile)];
-        let sources = vec!["/repo/a.rs".to_string()];
+        // A real file under the shell output budget: since D-032 the gate sizes what `cat` printed.
+        let (_dir, root, src) = small_source();
+        let tools = vec![grok_shell(&format!("cat {src}"), ToolKind::ReadFile)];
+        let sources = vec![src];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+        enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle)
             .expect("a whole-file cat is the source");
+    }
+
+    /// D-032 shell half. The CLIs truncate one call's output (codex near 10k tokens, grok to the
+    /// first and last 19.6 KB, measured): a `cat` of a larger file never showed its middle.
+    /// RED IF an over-budget cat, or one call chaining over-budget windows, is credited; or if
+    /// windows that each fit stop tiling a large file.
+    #[test]
+    fn shell_reads_are_credited_only_within_the_output_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.rs");
+        let line = format!("{}\n", "x".repeat(99)); // 100 bytes a line
+        std::fs::write(&big, line.repeat(600)).unwrap(); // 60,000 bytes
+        let big = big.to_string_lossy().into_owned();
+        let root = dir.path().to_string_lossy().into_owned();
+        let sources = vec![big.clone()];
+
+        let cat = vec![grok_shell(&format!("cat {big}"), ToolKind::ReadFile)];
+        let err = enforce_reviewer_sight("Grok", &cat, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("60 KB through one call: the middle was truncated away");
+        assert!(err.contains("PART"), "{err}");
+
+        let chained = vec![grok_shell(&format!("sed -n '1,300p' {big} && sed -n '301,600p' {big}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Grok", &chained, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("two windows in ONE call still print 60 KB into one output");
+
+        let tiled = vec![
+            grok_shell(&format!("sed -n '1,250p' {big}"), ToolKind::ReadFile),
+            grok_shell(&format!("sed -n '251,500p' {big}"), ToolKind::ReadFile),
+            grok_shell(&format!("sed -n '501,600p' {big}"), ToolKind::ReadFile),
+        ];
+        enforce_reviewer_sight("Grok", &tiled, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect("25 KB, 25 KB and 10 KB calls each fit and together cover the file");
+    }
+
+    /// Codex, D-032 third pass: the budget is on PRINTED bytes. 5000 two-byte lines are 10 KB of
+    /// source, but `nl -ba` adds a 7-byte number column to each: 45 KB printed. RED IF the gate
+    /// sizes the source instead of the output, or a plain sed of the same window stops passing.
+    #[test]
+    fn the_budget_counts_what_the_reader_printed_not_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("short_lines.txt");
+        std::fs::write(&src, "x\n".repeat(5000)).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let root = dir.path().to_string_lossy().into_owned();
+        let sources = vec![src.clone()];
+
+        let numbered = vec![grok_shell(&format!("nl -ba {src} | sed -n '1,5000p'"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &numbered, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("10 KB of source, 45 KB printed: truncated");
+
+        let plain = vec![grok_shell(&format!("sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &plain, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect("the same window, undecorated, prints 10 KB");
+
+        // A segment whose output cannot be bounded poisons the call; `wc` (D-017's live habit)
+        // is bounded and does not.
+        let unbounded = vec![grok_shell(&format!("find {root} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &unbounded, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("find's output cannot be sized and shares the output");
+        // Brace expansion: a short command, a huge output (Codex, fourth pass).
+        let braces = vec![grok_shell(&format!("echo {{1..40000}} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &braces, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("echo {1..40000} prints far more than its text");
+        let with_wc = vec![grok_shell(&format!("wc -l {src} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &with_wc, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect("wc prints a bounded line");
     }
 
     /// RED IF: a peek passes as the source. `head -5` is the FIND-REVIEW-07 shape.
@@ -9513,13 +9799,15 @@ mod grok_shell_read_gate_tests {
     /// `CommandLine`, claude `Bash`, gemini `bash`.
     #[test]
     fn every_adapters_shell_tool_is_a_shell_read_for_the_gate() {
+        let (_dir, root, src) = small_source();
+        let cmd = format!("cat {src}");
         for (tool, args) in [
-            ("run_command", serde_json::json!({ "CommandLine": "cat /repo/a.rs" })),
-            ("Bash", serde_json::json!({ "command": "cat /repo/a.rs" })),
-            ("bash", serde_json::json!({ "command": "cat /repo/a.rs" })),
-            ("command_execution", serde_json::json!({ "command": "cat /repo/a.rs" })),
+            ("run_command", serde_json::json!({ "CommandLine": cmd })),
+            ("Bash", serde_json::json!({ "command": cmd })),
+            ("bash", serde_json::json!({ "command": cmd })),
+            ("command_execution", serde_json::json!({ "command": cmd })),
         ] {
-            let rec = ToolCallRecord {
+            let rec = ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
                 tool: tool.to_string(),
                 kind: ToolKind::ReadFile,
@@ -9527,9 +9815,9 @@ mod grok_shell_read_gate_tests {
                 duration_ms: None,
                 args_json: Some(args.to_string()),
             };
-            let sources = vec!["/repo/a.rs".to_string()];
+            let sources = vec![src.clone()];
             let mut lifecycle = Vec::new();
-            enforce_reviewer_sight("X", &[rec], "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+            enforce_reviewer_sight("X", &[rec], "grok-streaming-json", &sources, &root, &mut lifecycle)
                 .unwrap_or_else(|e| panic!("{tool}: {e}"));
         }
     }

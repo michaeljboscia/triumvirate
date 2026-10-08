@@ -256,7 +256,7 @@ impl GrokStreamParser {
                 );
                 let args_json = json.get("rawInput").map(|v| v.to_string());
 
-                self.tool_calls.push(ToolCallRecord {
+                self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
                     id: json.get("toolCallId").and_then(Value::as_str).map(str::to_string),
                     tool: tool.clone(),
                     kind: kind.clone(),
@@ -326,6 +326,24 @@ impl GrokStreamParser {
                 });
                 if let Some(idx) = target {
                     self.tool_calls[idx].success = Some(completed);
+                    // D-032: what the read RETURNED. read_file numbers its lines (`N→text`), so
+                    // the span is exact whatever offset convention or cap the tool applied.
+                    // Shell reads are windowed from the command and keep that path.
+                    let rec = &self.tool_calls[idx];
+                    if completed && rec.kind == ToolKind::ReadFile && !is_shell_tool(&rec.tool) {
+                        let text: String = json
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .map(|blocks| {
+                                blocks
+                                    .iter()
+                                    .filter_map(|b| b.get("content").and_then(|c| c.get("text")).and_then(Value::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        self.tool_calls[idx].returned_lines = crate::types::numbered_line_runs(&text);
+                    }
                 }
                 let kind = target
                     .map(|i| self.tool_calls[i].kind.clone())
@@ -813,6 +831,8 @@ mod tests {
         assert_eq!(c.success, Some(true), "the call completed; a null-status ping must not fail it");
         // rawInput uses `target_file`, not the `path` the vendor guide's example showed.
         assert!(c.args_json.as_deref().unwrap_or("").contains("target_file"));
+        // D-032: the real result is `1→ZEPHYR_MARKER_9931`, one numbered line.
+        assert_eq!(c.returned_lines, vec![(1, 1)], "the span the read actually returned");
         assert!(r.response_text.contains("ZEPHYR_MARKER_9931"), "the tool result reached the answer");
         assert_eq!(full.termination, Termination::EndTurn);
     }
