@@ -2354,6 +2354,15 @@ const READ_OPERAND_KEYS: &[&str] = &[
     "filename",
 ];
 
+/// Read tools whose result does NOT number its lines, with the most lines one call delivers.
+/// Measured, not assumed. agy `view_file` (2026-10-07, a 3000-line file with one token per
+/// line): no range returned lines 1..800 and said "The above content does NOT show the entire
+/// file contents"; line 800's token came back verbatim, line 801's did not; StartLine 1500 /
+/// EndLine 1502 returned exactly those lines (1-based, inclusive). Probe requests
+/// 7f0fff2b, 3be89bbc, 731d2582. A tool missing from this list is credited nothing when its
+/// result is unnumbered.
+const UNNUMBERED_READ_CAPS: &[(&str, u64)] = &[("view_file", 800)];
+
 /// The windows a STRUCTURED read tool asked for, as ranges the same union can consume.
 ///
 /// D-028: only shell windows were ever unioned. A reviewer whose read tool takes `offset` and
@@ -2364,11 +2373,9 @@ const READ_OPERAND_KEYS: &[&str] = &[
 /// correctly teaches the operator to drop `require_sight`, which is the only thing standing
 /// between a real review and one written from memory.
 ///
-/// `offset` is the first line (1-based), `limit` the number of lines. KNOWN LIMITATION: this
-/// is what the reviewer ASKED for, not what it received. A tool that silently caps or
-/// truncates its output is credited with the whole window. The record carries arguments and a
-/// success flag, nothing about the returned content, so that gap cannot be closed here (Codex,
-/// panel review); it is filed rather than papered over.
+/// D-032 closed the ASKED-versus-RECEIVED gap this used to document: a numbered result is
+/// credited with the lines it showed, an unnumbered one only for a measured tool and within its
+/// cap (`UNNUMBERED_READ_CAPS`), anything else with nothing.
 fn structured_read_ranges(
     tool_calls: &[ToolCallRecord],
     candidates: &[String],
@@ -2395,8 +2402,7 @@ fn structured_read_ranges(
             }
             // D-032: when the result numbered its lines, credit what CAME BACK, not what was
             // asked for. A capped or truncated read, or a zero-based offset, is credited at its
-            // true lines. Tools whose result carries no line numbers (agy view_file) still fall
-            // through to the requested window below: that half of D-032 stays open.
+            // true lines.
             if !c.returned_lines.is_empty() {
                 return Some(
                     c.returned_lines
@@ -2405,19 +2411,26 @@ fn structured_read_ranges(
                         .collect(),
                 );
             }
+            // No numbered lines in the result. Credit the requested window only for a tool whose
+            // delivery has been MEASURED, bounded by its cap; any other unnumbered read earns
+            // nothing, so an unknown tool cannot be credited with lines nobody saw it receive
+            // (Codex, D-032 confirmation pass).
+            let cap = UNNUMBERED_READ_CAPS.iter().find(|(tool, _)| *tool == c.tool).map(|(_, cap)| *cap)?;
             let num = |keys: &[&str]| -> Option<u64> {
                 keys.iter().find_map(|k| value.get(*k).and_then(serde_json::Value::as_u64))
             };
-            let start = num(&["offset", "line_offset", "start_line"]).unwrap_or(1).max(1);
+            let start = num(&["offset", "line_offset", "start_line", "StartLine"]).unwrap_or(1).max(1);
             let end = match num(&["limit", "max_lines"]) {
                 // A limit of 0 asks for NOTHING. `start + 0 - 1` saturated back to `start` and
                 // credited a line the reviewer never received; repeated across offsets that
                 // fabricated whole-file coverage (Codex, panel review).
                 Some(0) => return None,
                 // An explicit end_line wins over a count when both are somehow present.
-                Some(limit) => Some(num(&["end_line"]).unwrap_or(start + limit - 1)),
-                None => num(&["end_line"]),
+                Some(limit) => Some(num(&["end_line", "EndLine"]).unwrap_or(start + limit - 1)),
+                None => num(&["end_line", "EndLine"]),
             };
+            let capped = start + cap - 1;
+            let end = Some(end.map_or(capped, |e| e.min(capped)));
             Some(vec![agent_adapter::codex::LineRange { start, end }])
         })
         .flatten()
@@ -2667,26 +2680,11 @@ fn record_read_source_whole(c: &ToolCallRecord, cand: &str) -> bool {
             .map(|cmd| agent_adapter::codex::whole_file_read_operands(&cmd))
             .is_some_and(|ops| ops.iter().any(|op| op == cand));
     }
-    args_name_path(args, cand) && !read_args_are_partial(&c.tool, args)
-}
-
-fn read_args_are_partial(tool: &str, args_json: &str) -> bool {
-    // codex and grok: the slice lives in the command line, not in a field.
-    if is_shell_read_tool(tool) {
-        let command = agent_adapter::codex::shell_command_from_args_json(args_json);
-        return match command {
-            Some(cmd) => !agent_adapter::codex::command_reads_whole_file(&cmd),
-            None => true,
-        };
-    }
-
-    // Everyone else: an explicit, non-null limit or offset means a slice was requested.
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(args_json) else {
-        return true;
-    };
-    ["limit", "offset", "start_line", "end_line", "line_offset", "max_lines"]
-        .iter()
-        .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
+    // A structured read is never whole on its arguments alone (D-032): "no offset, no limit"
+    // credited to EOF a read that delivered 800 (agy view_file) or 2000 (claude Read) lines.
+    // Its coverage comes only from structured_read_ranges: the lines the result showed, or a
+    // measured tool's capped window.
+    false
 }
 
 /// Does `args` mention `path` as a WHOLE path, at token boundaries?
@@ -2915,9 +2913,10 @@ fn enforce_reviewer_sight(
                  read PART of {}: {}. A slice is not the source. `head`, `tail`, `cut`, a pager, \
                  or a read carrying `limit`/`offset` returns a few lines and leaves the work \
                  itself out of context, so a verdict formed from one cannot be about the work. \
-                 Re-read the whole file ON THIS TURN (`cat`, or a read with no limit and no \
-                 offset; codex and grok may read it in `sed -n` windows, and they must together cover \
-                 every line from 1 to the last with no gap). Only this turn's tool calls count: \
+                 Re-read the whole file ON THIS TURN (`cat`, or reads whose RESULTS together \
+                 show every line from 1 to the last with no gap: `sed -n` windows, read_file or \
+                 Read windows, and for view_file, which returns at most 800 lines a call, \
+                 StartLine/EndLine windows). Only this turn's tool calls count: \
                  a reused worker that read part of it on an earlier turn must read it all \
                  again. Reads counted this turn: {}",
                 required_sources.len(),
@@ -6276,7 +6275,20 @@ mod deepseek_dispatch_tests {
 mod sight_gate_tests {
     use super::*;
 
-    /// Build a successful structured read record for `path` with the given window.
+    /// A real repo root holding `rel` with `lines` lines, for tests about PATH matching: since
+    /// D-032 coverage is checked against the file's bytes, a fake `/repo` can no longer pass.
+    fn real_repo(rel: &str, lines: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, (1..=lines).map(|i| format!("l{i}\n")).collect::<String>()).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        (dir, root)
+    }
+
+    /// Build a successful grok `read_file` record for `path` with the given window. Real
+    /// read_file results number their lines (the committed capture), so the record carries the
+    /// lines a window of that shape returns; tests of a short or gapped delivery override it.
     fn structured_read(path: &str, offset: Option<u64>, limit: Option<u64>) -> ToolCallRecord {
         let mut args = serde_json::json!({ "target_file": path });
         if let Some(o) = offset {
@@ -6285,7 +6297,11 @@ mod sight_gate_tests {
         if let Some(l) = limit {
             args["limit"] = serde_json::json!(l);
         }
-        ToolCallRecord { returned_lines: Vec::new(),
+        let total = std::fs::read_to_string(path).map(|t| t.lines().count() as u64).unwrap_or(0);
+        let first = offset.unwrap_or(1).max(1);
+        let last = limit.map_or(total, |l| (first + l).saturating_sub(1).min(total));
+        let returned_lines = if limit == Some(0) || first > last { Vec::new() } else { vec![(first, last)] };
+        ToolCallRecord { returned_lines,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -6332,6 +6348,46 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight("Grok", &wrong_file, "grok-streaming-json", &[src], &cwd, &mut lifecycle)
             .expect_err("reading another file is not reading this one");
+    }
+
+    /// D-032, unnumbered results. agy `view_file` delivers at most 800 lines a call (measured):
+    /// a no-range view of a 1000-line file is credited 1..800, so it is a PARTIAL read, and two
+    /// ranged views that tile the file are whole. An unmeasured unnumbered tool earns nothing.
+    /// RED IF view_file is credited to EOF again, or an unknown tool is credited at all.
+    #[test]
+    fn sight_d032_unnumbered_reads_are_capped_or_earn_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("long.rs");
+        std::fs::write(&src, (1..=1000).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let view = |args: serde_json::Value, tool: &str| ToolCallRecord {
+            returned_lines: Vec::new(),
+            id: None,
+            tool: tool.to_string(),
+            kind: ToolKind::ReadFile,
+            success: Some(true),
+            duration_ms: None,
+            args_json: Some(args.to_string()),
+        };
+        let whole_ask = view(serde_json::json!({ "AbsolutePath": src }), "view_file");
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Antigravity", &[whole_ask], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("view_file returns 800 lines, not 1000");
+        assert!(err.contains("read PART"), "{err}");
+
+        let tiled = vec![
+            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 1, "EndLine": 800 }), "view_file"),
+            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 801, "EndLine": 1000 }), "view_file"),
+        ];
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Antigravity", &tiled, "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect("1..800 and 801..1000 are the whole file");
+
+        let unknown = view(serde_json::json!({ "path": src, "offset": 1, "limit": 1000 }), "mystery_reader");
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Antigravity", &[unknown], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("an unmeasured unnumbered read proves nothing");
     }
 
     /// D-032. A read that ASKED for the whole file but RECEIVED only part of it (a capped tool)
@@ -7050,7 +7106,8 @@ mod sight_gate_tests {
     #[test]
     fn sight_13_opening_the_source_by_relative_path_counts() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let (_dir, root) = real_repo("crates/triumvirate/src/agent_exec.rs", 40);
+        let tools = vec![ToolCallRecord { returned_lines: vec![(1, 40)],
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7058,10 +7115,10 @@ mod sight_gate_tests {
             duration_ms: None,
             args_json: Some(r#"{"path":"crates/triumvirate/src/agent_exec.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/crates/triumvirate/src/agent_exec.rs".to_string()];
+        let sources = vec![format!("{root}/crates/triumvirate/src/agent_exec.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle,
+                "Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "the cwd-relative form of the named source must satisfy it"
@@ -7504,6 +7561,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21b_the_identical_args_pass_when_the_kind_is_a_read() {
         let mut lifecycle = Vec::new();
+        let (_dir, root) = real_repo("crates/shared-types/src/lib.rs", 300);
         let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "view_file".to_string(),
@@ -7512,10 +7570,10 @@ mod sight_gate_tests {
             duration_ms: None,
             args_json: Some(r#"{"AbsolutePath":"crates/shared-types/src/lib.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
+        let sources = vec![format!("{root}/crates/shared-types/src/lib.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Antigravity", &tools, "agy-stream-json", &sources, "/repo", &mut lifecycle,
+                "Antigravity", &tools, "agy-stream-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "identical args under ReadFile must pass; if this fails the string match is what \
@@ -7577,7 +7635,8 @@ mod sight_gate_tests {
     #[test]
     fn sight_21e_a_dot_slash_relative_read_satisfies_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let (_dir, root) = real_repo("src/lib.rs", 12);
+        let tools = vec![ToolCallRecord { returned_lines: vec![(1, 12)],
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7585,10 +7644,10 @@ mod sight_gate_tests {
             duration_ms: None,
             args_json: Some(r#"{"path":"./src/lib.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/src/lib.rs".to_string()];
+        let sources = vec![format!("{root}/src/lib.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle,
+                "Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "./src/lib.rs is a genuine read of the named source"
@@ -7697,6 +7756,8 @@ mod sight_gate_tests {
     #[test]
     fn sight_20_antigravity_can_actually_pass_the_gate() {
         let mut lifecycle = Vec::new();
+        // Within view_file's measured 800-line delivery, so one call is the whole file.
+        let (_dir, root) = real_repo("crates/shared-types/src/lib.rs", 300);
         let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: Some("2".to_string()),
             tool: "view_file".to_string(),
@@ -7705,10 +7766,10 @@ mod sight_gate_tests {
             duration_ms: Some(12),
             args_json: Some(r#"{"AbsolutePath":"crates/shared-types/src/lib.rs"}"#.to_string()),
         }];
-        let sources = vec!["/repo/crates/shared-types/src/lib.rs".to_string()];
+        let sources = vec![format!("{root}/crates/shared-types/src/lib.rs")];
         assert!(
             enforce_reviewer_sight(
-                "Antigravity", &tools, "agy-stream-json", &sources, "/repo", &mut lifecycle,
+                "Antigravity", &tools, "agy-stream-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "an antigravity review that opened the named source must PASS. A gate that always \
@@ -8954,41 +9015,48 @@ mod mandatory_review_tests {
     /// RED IF: an honest whole-file read starts being called a slice.
     #[test]
     fn review_23_a_read_without_limit_or_offset_is_a_full_read() {
-        let calls = vec![ToolCallRecord { returned_lines: Vec::new(),
+        // Since D-032 a read is whole when its RESULT showed every line, so the file must exist
+        // and the records carry what the real tools return (numbered lines).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.md");
+        std::fs::write(&src, "one\ntwo\nthree\n").unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let root = dir.path().to_string_lossy().into_owned();
+        let calls = vec![ToolCallRecord { returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "Read".into(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"file_path":"/repo/a.md"}"#.to_string()),
+            args_json: Some(serde_json::json!({ "file_path": src }).to_string()),
         }];
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight(
             "Claude",
             &calls,
             "claude-stream-json",
-            &["/repo/a.md".to_string()],
-            "/repo",
+            std::slice::from_ref(&src),
+            &root,
             &mut lifecycle,
         )
         .expect("an unbounded read of the named source must pass");
 
         // An explicit null is not a slice either: grok's own capture records "offset":null.
-        let with_nulls = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let with_nulls = vec![ToolCallRecord { returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "read_file".into(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"target_file":"/repo/a.md","offset":null,"limit":null}"#.to_string()),
+            args_json: Some(serde_json::json!({ "target_file": src, "offset": null, "limit": null }).to_string()),
         }];
         let mut lifecycle2 = Vec::new();
         enforce_reviewer_sight(
             "Grok",
             &with_nulls,
             "grok-streaming-json",
-            &["/repo/a.md".to_string()],
-            "/repo",
+            std::slice::from_ref(&src),
+            &root,
             &mut lifecycle2,
         )
         .expect("a null offset is not a slice; grok's live capture records exactly this");
