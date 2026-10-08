@@ -507,6 +507,21 @@ pub(crate) async fn run_agy_cli_process_with_session(
                         let status_label = status.as_deref().unwrap_or("none");
                         let kept = keep_failed_stream(&message, &text, &stderr);
                         let failed_calls = parsed.tool_calls.iter().filter(|c| c.success == Some(false)).count();
+                        // D-051: agy refused a command (a read-only review runs seatbelted, and agy
+                        // denies an unsandboxed run_command in print mode). That is not a dropped
+                        // capture: a retry is denied the same way, and "empty output" sent the
+                        // reader looking at the pipe. Fail now, naming the refused command.
+                        if let Some(denied) = first_tool_error.as_deref().filter(|e| is_agy_permission_denial(e)) {
+                            tracing::warn!(
+                                first_tool_error = denied,
+                                raw_stream = kept.as_deref().unwrap_or("not kept"),
+                                "agy was denied a command and stopped without an answer (attempt {attempt}); not retrying"
+                            );
+                            return Err(anyhow::anyhow!(
+                                "agy was denied a command and stopped without an answer (not retried; a rerun is denied the same way): {denied}; raw stream: {}",
+                                kept.as_deref().unwrap_or("not kept")
+                            ));
+                        }
                         tracing::warn!(
                             status = status_label,
                             permission_requests,
@@ -852,6 +867,13 @@ async fn run_agy_once(
 const AGY_REVIEW_TOOL_NOTE: &str = "\n\nTool note for this read-only review: shell commands are not available here and will fail. \
 Read files with your file-view tool, using the absolute paths given above. Do not guess at other files. \
 Always finish with your written answer, even if a tool call failed.";
+
+/// agy's own wording when it refuses a tool action (captured 2026-10-05, agy 1.2.x): the
+/// `run_command` step ends `ERROR` with "permission check failed for unsandboxed ...: user
+/// denied permission to run command". D-051.
+fn is_agy_permission_denial(tool_error: &str) -> bool {
+    tool_error.contains("user denied permission") || tool_error.contains("permission check failed")
+}
 
 /// Keep the evidence of an empty agy result: the prompt agy was given, its raw stdout stream and
 /// its stderr, under `{triumvirate_home}/agy-failures/`. Returns the directory. D-035: every one
@@ -1613,6 +1635,46 @@ pub(crate) mod tests {
             .await
             .expect_err("empty output must fail, not succeed silently");
         assert!(err.to_string().contains("empty output"), "got: {err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    /// The 2026-10-05 capture, shortened: a run_command step that ends ERROR, then an empty
+    /// SUCCESS result. Each run appends a line to `counter`, so retries are countable.
+    fn denied_stream_body(counter: &std::path::Path, error: &str) -> String {
+        format!(
+            "echo run >> {c}; printf '{{\"event\":\"init\",\"conversation_id\":\"c1\",\"init\":{{}}}}\n{{\"event\":\"step_update\",\"step_update\":{{\"step_index\":2,\"state\":\"ERROR\",\"step_type\":\"tool\",\"tool_name\":\"run_command\",\"tool_info\":{{\"name\":\"run_command\",\"parameters\":{{\"CommandLine\":\"git diff\"}},\"error\":{{\"type\":\"TOOL_ERROR\",\"message\":\"{error}\"}}}}}}}}\n{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"\"}}}}\n'",
+            c = counter.display()
+        )
+    }
+
+    /// D-051. RED IF a denied command is reported as "empty output", or the denied run is
+    /// retried (a rerun is denied the same way and doubles the spend).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_denied_command_is_named_and_not_retried() {
+        let _lock = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let body = denied_stream_body(&counter, "permission check failed for unsandboxed git diff: user denied permission to run command: git");
+        let err = run_mock(&body, "review", None).await.expect_err("a denied turn has no answer");
+        let msg = err.to_string();
+        assert!(msg.contains("denied a command") && msg.contains("user denied permission"), "got: {msg}");
+        assert!(!msg.contains("empty output"), "a denial is not a dropped capture: {msg}");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 1, "a denial must not be retried");
+    }
+
+    /// The twin: a tool that failed for any other reason keeps the empty-output path (and its
+    /// retry). RED IF the denial check swallows every failed tool call.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_other_tool_failure_stays_empty_output() {
+        let _lock = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let body = denied_stream_body(&counter, "file not found: nope.rs");
+        let err = run_mock(&body, "review", None).await.expect_err("still no answer");
+        assert!(err.to_string().contains("empty output"), "got: {err}");
+        assert!(std::fs::read_to_string(&counter).unwrap().lines().count() > 1, "the capture-drop retry still runs");
     }
 
     #[cfg(target_os = "macos")]
