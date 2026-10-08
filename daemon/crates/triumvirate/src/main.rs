@@ -7635,19 +7635,38 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let s3 = dispatch_and_expect_failed(stub_script.clone(), "T-016C".to_string()).await?;
         assert!(!matches!(s3, shared_types::TaskStatus::Completed));
 
+        std::env::set_current_dir(&original_cwd)?;
+        let _ = fs::remove_file(forbidden_file_script);
+        let _ = fs::remove_file(bad_commit_script);
+        let _ = fs::remove_file(stub_script);
+        let _ = fs::remove_dir_all(project_root);
+        Ok(())
+    }
+
+    /// The host's command-scope hook blocks a forbidden command. Split out of the red-team test
+    /// above (D-050): the hook is installed at ~/.claude/hooks, not shipped in this repo, so on a
+    /// CI runner it does not exist and the whole red-team test failed with ENOENT. Run it on the
+    /// host with `cargo test -p triumvirate --bin triumvirate -- --ignored abe_command_scope`.
+    #[test]
+    #[ignore = "needs the host's ~/.claude/hooks/enforce-command-scope.sh (not in the repo)"]
+    fn abe_command_scope_hook_blocks_forbidden_command() -> anyhow::Result<()> {
         let command_hook = std::env::var("HOME")
             .map(PathBuf::from)?
             .join(".claude")
             .join("hooks")
             .join("enforce-command-scope.sh");
-        let contract_path = project_root.join(".triumvirate").join("contract-red-team.json");
-        fs::create_dir_all(contract_path.parent().unwrap_or(&project_root))?;
+        let dir = tempfile::tempdir()?;
+        let contract_path = dir.path().join(".triumvirate").join("contract-red-team.json");
+        fs::create_dir_all(contract_path.parent().unwrap_or(dir.path()))?;
         fs::write(
             &contract_path,
-            serde_json::to_string_pretty(&mk_contract("T-016D"))?,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "allowed_commands": [["true"]],
+                "forbidden_commands": [["rm", "-rf"]],
+            }))?,
         )?;
         let out = std::process::Command::new(command_hook)
-            .current_dir(&project_root)
+            .current_dir(dir.path())
             .env("TRIUMVIRATE_CONTRACT_PATH", &contract_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -7662,14 +7681,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 child.wait_with_output()
             })?;
         assert_eq!(out.status.code(), Some(2));
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.contains("BLOCKED"));
-
-        std::env::set_current_dir(&original_cwd)?;
-        let _ = fs::remove_file(forbidden_file_script);
-        let _ = fs::remove_file(bad_commit_script);
-        let _ = fs::remove_file(stub_script);
-        let _ = fs::remove_dir_all(project_root);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("BLOCKED"));
         Ok(())
     }
 }
