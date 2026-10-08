@@ -2393,6 +2393,13 @@ fn structured_read_ranges(
             if !operand_is_source {
                 return None;
             }
+            // D-032: when the result numbered its lines, credit what CAME BACK, not what was
+            // asked for. A capped or truncated read, or a zero-based offset, is credited at its
+            // true lines. Tools whose result carries no line numbers (agy view_file) still fall
+            // through to the requested window below: that half of D-032 stays open.
+            if let Some((first, last)) = c.returned_lines {
+                return Some(agent_adapter::codex::LineRange { start: first, end: Some(last) });
+            }
             let num = |keys: &[&str]| -> Option<u64> {
                 keys.iter().find_map(|k| value.get(*k).and_then(serde_json::Value::as_u64))
             };
@@ -6272,7 +6279,7 @@ mod sight_gate_tests {
         if let Some(l) = limit {
             args["limit"] = serde_json::json!(l);
         }
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: None,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -6319,6 +6326,31 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight("Grok", &wrong_file, "grok-streaming-json", &[src], &cwd, &mut lifecycle)
             .expect_err("reading another file is not reading this one");
+    }
+
+    /// D-032. A read that ASKED for the whole file but RECEIVED only part of it (a capped tool)
+    /// is credited with what came back. RED IF the gate credits the requested window again.
+    #[test]
+    fn sight_d032_a_truncated_read_is_credited_with_what_came_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.rs");
+        std::fs::write(&src, (1..=100).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        let mut capped = structured_read(&src, Some(1), Some(100));
+        capped.returned_lines = Some((1, 60));
+        let mut lifecycle = Vec::new();
+        let err = enforce_reviewer_sight("Grok", &[capped], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect_err("asked for 1..100, received 1..60");
+        assert!(err.contains("read PART"), "{err}");
+
+        // Twin: the tool numbered every line, so the whole file was received.
+        let mut whole = structured_read(&src, Some(1), Some(100));
+        whole.returned_lines = Some((1, 100));
+        let mut lifecycle = Vec::new();
+        enforce_reviewer_sight("Grok", &[whole], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
+            .expect("received 1..100 of a 100-line file");
     }
 
     /// A relative source is rejected UP FRONT, naming the absolute path to pass instead.
@@ -6371,7 +6403,7 @@ mod sight_gate_tests {
         let parsed = ParsedAgentResult {
             response_text: "port 3300".to_string(),
             parser_mode: "grok-streaming-json".to_string(),
-            tool_calls: vec![ToolCallRecord {
+            tool_calls: vec![ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: "triumvirate__wiki_search".to_string(),
                 kind: ToolKind::Unknown,
@@ -6404,7 +6436,7 @@ mod sight_gate_tests {
         let parsed = ParsedAgentResult {
             response_text: "port 3300".to_string(),
             parser_mode: "grok-streaming-json".to_string(),
-            tool_calls: vec![ToolCallRecord {
+            tool_calls: vec![ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: "use_tool".to_string(),
                 kind: ToolKind::Unknown,
@@ -6426,7 +6458,7 @@ mod sight_gate_tests {
     fn calls(kinds: &[ToolKind]) -> Vec<ToolCallRecord> {
         kinds
             .iter()
-            .map(|k| ToolCallRecord {
+            .map(|k| ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: match k {
                     ToolKind::WriteFile => "write_file",
@@ -6694,7 +6726,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_12_a_named_source_that_was_never_opened_is_rejected() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "todo_write".to_string(),
             kind: ToolKind::Unknown,
@@ -6726,7 +6758,7 @@ mod sight_gate_tests {
     fn sight_36_a_failed_or_uncounted_attempt_is_reported_as_such() {
         let mut lifecycle = Vec::new();
         let tools = vec![
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: ToolKind::ReadFile,
@@ -6734,7 +6766,7 @@ mod sight_gate_tests {
                 duration_ms: None,
                 args_json: Some(r#"{"command":"cat /repo/agent_exec.rs"}"#.to_string()),
             },
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: ToolKind::Bash,
@@ -6754,7 +6786,7 @@ mod sight_gate_tests {
     }
 
     fn codex_read(command: &str) -> ToolCallRecord {
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: None,
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
@@ -6806,7 +6838,7 @@ mod sight_gate_tests {
         let other = file_with_lines(dir.path(), "b.rs", 500);
         let classified = |command: String| {
             let args = serde_json::json!({ "command": command });
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -7004,7 +7036,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_13_opening_the_source_by_relative_path_counts() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7027,7 +7059,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_14_a_failed_read_does_not_count_as_having_looked() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7052,7 +7084,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_15_a_same_named_file_elsewhere_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7425,7 +7457,7 @@ mod sight_gate_tests {
     fn sight_21_a_search_naming_the_file_does_not_count_as_reading_it() {
         let mut lifecycle = Vec::new();
         let tools = vec![
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: "grep_search".to_string(),
                 kind: ToolKind::Grep,
@@ -7434,7 +7466,7 @@ mod sight_gate_tests {
                 // Exact quoted path: the string match SUCCEEDS here.
                 args_json: Some(r#"{"Query":"crates/shared-types/src/lib.rs"}"#.to_string()),
             },
-            ToolCallRecord {
+            ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: "run_command".to_string(),
                 kind: ToolKind::Bash,
@@ -7458,7 +7490,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21b_the_identical_args_pass_when_the_kind_is_a_read() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7482,7 +7514,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21c_an_in_flight_read_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7507,7 +7539,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21d_a_prefix_sibling_directory_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7531,7 +7563,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21e_a_dot_slash_relative_read_satisfies_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7554,7 +7586,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_22_a_failed_read_on_the_agy_path_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: Some("7".to_string()),
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7584,7 +7616,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_23_codex_can_be_source_gated_now_that_it_classifies_reads() {
         let mut lifecycle = Vec::new();
-        let read = vec![ToolCallRecord {
+        let read = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
@@ -7603,7 +7635,7 @@ mod sight_gate_tests {
 
         // And a path-naming command still must not.
         let mut l2 = Vec::new();
-        let listing = vec![ToolCallRecord {
+        let listing = vec![ToolCallRecord { returned_lines: None,
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::Bash,
@@ -7651,7 +7683,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_20_antigravity_can_actually_pass_the_gate() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord {
+        let tools = vec![ToolCallRecord { returned_lines: None,
             id: Some("2".to_string()),
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -8881,7 +8913,7 @@ mod mandatory_review_tests {
             r#"{"file_path":"/repo/a.md","offset":9000}"#,
             r#"{"file_path":"/repo/a.md","limit":1,"offset":9000}"#,
         ] {
-            let calls = vec![ToolCallRecord {
+            let calls = vec![ToolCallRecord { returned_lines: None,
                 id: Some("t".into()),
                 tool: "Read".into(),
                 kind: ToolKind::ReadFile,
@@ -8908,7 +8940,7 @@ mod mandatory_review_tests {
     /// RED IF: an honest whole-file read starts being called a slice.
     #[test]
     fn review_23_a_read_without_limit_or_offset_is_a_full_read() {
-        let calls = vec![ToolCallRecord {
+        let calls = vec![ToolCallRecord { returned_lines: None,
             id: Some("t".into()),
             tool: "Read".into(),
             kind: ToolKind::ReadFile,
@@ -8928,7 +8960,7 @@ mod mandatory_review_tests {
         .expect("an unbounded read of the named source must pass");
 
         // An explicit null is not a slice either: grok's own capture records "offset":null.
-        let with_nulls = vec![ToolCallRecord {
+        let with_nulls = vec![ToolCallRecord { returned_lines: None,
             id: Some("t".into()),
             tool: "read_file".into(),
             kind: ToolKind::ReadFile,
@@ -8953,7 +8985,7 @@ mod mandatory_review_tests {
     /// RED IF: the partial branch is removed and both fall through to the same message.
     #[test]
     fn review_24_a_peek_and_a_miss_report_differently() {
-        let peek = vec![ToolCallRecord {
+        let peek = vec![ToolCallRecord { returned_lines: None,
             id: Some("t".into()),
             tool: "command_execution".into(),
             kind: ToolKind::ReadFile,
@@ -9291,7 +9323,7 @@ mod grok_shell_read_gate_tests {
     use agent_adapter::{ToolCallRecord, ToolKind};
 
     fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: None,
             id: None,
             tool: "run_terminal_command".to_string(),
             kind,
@@ -9309,7 +9341,7 @@ mod grok_shell_read_gate_tests {
     /// this file tests are ever reached. A helper that skips the step under test is not a test.
     fn codex_shell(command: &str) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: None,
             id: None,
             tool: "command_execution".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9384,7 +9416,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
         });
-        let call = ToolCallRecord {
+        let call = ToolCallRecord { returned_lines: None,
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9415,7 +9447,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
         });
-        let call = ToolCallRecord {
+        let call = ToolCallRecord { returned_lines: None,
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9519,7 +9551,7 @@ mod grok_shell_read_gate_tests {
             ("bash", serde_json::json!({ "command": "cat /repo/a.rs" })),
             ("command_execution", serde_json::json!({ "command": "cat /repo/a.rs" })),
         ] {
-            let rec = ToolCallRecord {
+            let rec = ToolCallRecord { returned_lines: None,
                 id: None,
                 tool: tool.to_string(),
                 kind: ToolKind::ReadFile,

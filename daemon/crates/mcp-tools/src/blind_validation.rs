@@ -762,7 +762,7 @@ mod tests {
     use agent_adapter::{ToolCallRecord, ToolKind};
 
     fn read_call(args: &str) -> ToolCallRecord {
-        ToolCallRecord {
+        ToolCallRecord { returned_lines: None,
             id: Some("t".into()),
             tool: "Read".into(),
             kind: ToolKind::ReadFile,
@@ -1452,7 +1452,7 @@ mod orchestration_tests {
         let peeked = req.impl_worktree.join("src/thing.rs").to_string_lossy().to_string();
         let h = Harness {
             writes: "#[test] fn blind_a() {}".to_string(),
-            tool_calls: vec![ToolCallRecord {
+            tool_calls: vec![ToolCallRecord { returned_lines: None,
                 id: Some("t".into()),
                 tool: "Read".into(),
                 kind: ToolKind::ReadFile,
@@ -1602,7 +1602,7 @@ mod orchestration_tests {
 
         let h = Harness {
             writes: "#[test] fn blind_a() {}".to_string(),
-            tool_calls: vec![ToolCallRecord {
+            tool_calls: vec![ToolCallRecord { returned_lines: None,
                 id: Some("t".into()),
                 tool: "Read".into(),
                 kind: ToolKind::ReadFile,

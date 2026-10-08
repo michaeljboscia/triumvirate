@@ -237,7 +237,7 @@ impl ClaudeStreamParser {
                     if let Some(ref id) = id {
                         self.pending.insert(id.clone(), self.tool_calls.len());
                     }
-                    self.tool_calls.push(ToolCallRecord {
+                    self.tool_calls.push(ToolCallRecord { returned_lines: None,
                         id: id.clone(),
                         // D-010: a `Bash` call that reads a file is a read for the sight gate.
                         kind: crate::codex::shell_read_kind(tool_kind(&name), block.get("input")),
@@ -298,6 +298,21 @@ impl ClaudeStreamParser {
                 && let Some(rec) = self.tool_calls.get_mut(idx)
             {
                 rec.success = Some(ok);
+                // D-032: Read returns `cat -n` lines (`     1\ttext`), so the span it RECEIVED is
+                // exact, including Read's own cap when no limit was given. A Bash read is
+                // windowed from its command instead.
+                if ok && rec.kind == ToolKind::ReadFile && rec.tool != "Bash" {
+                    let text = match block.get("content") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Array(parts)) => parts
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        _ => String::new(),
+                    };
+                    rec.returned_lines = crate::types::numbered_line_span(&text);
+                }
                 let detail = format!(
                     "claude {} {}",
                     rec.tool,
@@ -457,6 +472,8 @@ mod tests {
             "a tool_result with NO is_error field is a SUCCESS; reading it the other way would \
              mark every successful read as failed and reject every review"
         );
+        // D-032: the captured result is `1\t##`, one numbered line.
+        assert_eq!(call.returned_lines, Some((1, 1)), "the span the Read actually returned");
         assert!(
             call.args_json.as_deref().unwrap_or("").contains("/etc/hosts"),
             "the path must survive into args_json or required_sources can never match it"

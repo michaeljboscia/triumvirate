@@ -720,7 +720,7 @@ impl CodexExecParser {
             "command_execution" => {
                 let command = item.get("command").and_then(|v| v.as_str()).unwrap_or_default();
                 if started {
-                    self.tool_calls.push(ToolCallRecord {
+                    self.tool_calls.push(ToolCallRecord { returned_lines: None,
                         id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
                         tool: "command_execution".to_string(),
                         // A pure content reader is classified as a READ so codex can satisfy
@@ -780,7 +780,7 @@ impl CodexExecParser {
                 // `agents.max_depth=0` do NOT stop `spawn_agent`, and the spawn itself is not in
                 // the --json stream; only the later `collab_tool_call` wait is.
                 if started && item_type == COLLAB_TOOL {
-                    self.tool_calls.push(ToolCallRecord {
+                    self.tool_calls.push(ToolCallRecord { returned_lines: None,
                         id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
                         tool: COLLAB_TOOL.to_string(),
                         kind: ToolKind::Unknown,
