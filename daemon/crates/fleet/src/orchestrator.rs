@@ -140,7 +140,7 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
                 let bin = mcp_bridge::agy_command().0;
                 let cwd = worktree_path.to_string_lossy();
                 // operator connector args are consult-shaped and never reach a fleet argv (D-046), as in the codex arm.
-                let inv = mcp_bridge::agy::build_agy_invocation(
+                let inv = mcp_bridge::agy::build_agy_invocation_with_timeout(
                     &bin,
                     &[],
                     task_prompt,
@@ -149,6 +149,7 @@ pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str)
                     // default. read_only is for review dispatches, where a write is
                     // never legitimate.
                     false,
+                    fleet_agy_timeout(),
                 )
                     .map_err(|e| anyhow::anyhow!("failed to assemble agy invocation for fleet: {e}"))?;
                 (inv.program, inv.args)
@@ -659,7 +660,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         // the wait, kill on expiry, keep an output tail for the failure reason.
                         let (limit, timeout_msg) = if use_agy {
                             (
-                                mcp_bridge::agy::agy_connector_timeout() + std::time::Duration::from_secs(30),
+                                fleet_agy_timeout() + std::time::Duration::from_secs(30),
                                 "agy fleet task exceeded connector timeout",
                             )
                         } else {
@@ -1600,6 +1601,23 @@ fn ledger_conn(project_root: &Path) -> rusqlite::Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(project_root.join(".triumvirate").join("ledger.db"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
+}
+
+/// The wall-clock bound on one fleet member under the Temporal engine: the `run_worker`
+/// activity's start-to-close timeout. Shared so agy's own limit can sit inside it.
+pub const MEMBER_WALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+/// agy's `--print-timeout` for a fleet member. `TRIUMVIRATE_FLEET_AGY_TIMEOUT_SECS`, default
+/// five minutes inside [`MEMBER_WALL_LIMIT`], so agy ends its own turn and reports before the
+/// activity is timed out from outside. D-049: members used the consult timeout (900 s) and every
+/// agy fleet task longer than 15 minutes was cut off, while codex and grok members had 4 h.
+pub fn fleet_agy_timeout() -> std::time::Duration {
+    std::env::var("TRIUMVIRATE_FLEET_AGY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(MEMBER_WALL_LIMIT - std::time::Duration::from_secs(300))
 }
 
 /// Wall-clock bound for one non-agy fleet worker. `TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS`,
