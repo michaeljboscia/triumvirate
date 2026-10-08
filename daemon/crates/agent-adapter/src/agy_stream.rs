@@ -83,6 +83,9 @@ pub struct AgyStreamParser {
     /// The first failed tool call's own error message, so an empty result can say WHY (D-035:
     /// a review whose every tool call failed came back as a bare "empty output").
     first_tool_error: Option<String>,
+    /// What agy itself recorded as refused in the turn's `result` event (`denied_actions`, each
+    /// by `display_name`, else `action`). D-051: agy's own record, not a guess from error text.
+    denied_actions: Vec<String>,
 }
 
 /// Map an agy tool name to a kind.
@@ -181,6 +184,18 @@ impl AgyStreamParser {
                     }
                     if let Some(u) = r.get("usage") {
                         self.usage = Some(parse_usage(u));
+                    }
+                    if let Some(denied) = r.get("denied_actions").and_then(Value::as_array) {
+                        self.denied_actions = denied
+                            .iter()
+                            .map(|d| {
+                                d.get("display_name")
+                                    .or_else(|| d.get("action"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unnamed action")
+                                    .to_string()
+                            })
+                            .collect();
                     }
                     self.events.push(event(
                         WorkingState::TurnCompleted,
@@ -343,6 +358,11 @@ impl AgyStreamParser {
         self.first_tool_error.as_deref()
     }
 
+    /// The actions agy recorded as denied in its `result` event. Empty when none were.
+    pub fn denied_actions(&self) -> &[String] {
+        &self.denied_actions
+    }
+
     pub fn finish(self) -> ParsedAgentResult {
         // `result.response` is the whole answer and wins. The accumulated deltas are the
         // fallback for a stream that ended without a result event, so a truncated turn still
@@ -379,6 +399,18 @@ impl AgyStreamParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-051: the `result` line of the 2026-10-05 denied review, verbatim except the ids.
+    /// RED IF agy's own record of a refused action is dropped.
+    #[test]
+    fn denied_actions_are_read_from_the_result_event() {
+        let mut p = AgyStreamParser::new();
+        p.parse_line(r#"{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"","duration_seconds":6.99,"num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}"#);
+        assert_eq!(p.denied_actions(), ["RunCommand".to_string()]);
+        let mut clean = AgyStreamParser::new();
+        clean.parse_line(r#"{"event":"result","result":{"status":"SUCCESS","response":"4"}}"#);
+        assert!(clean.denied_actions().is_empty(), "no record, no denial");
+    }
 
     // Fixtures are LIVE captures from agy v1.1.23 on 2026-09-01, not hand-written. A
     // hand-written fixture only proves the parser matches my belief about the format, which is
