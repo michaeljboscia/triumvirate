@@ -2267,14 +2267,12 @@ fn tool_call_read_source_in_full(
     cwd: &str,
 ) -> bool {
     let candidates = source_path_candidates(source, cwd);
-    // A whole-file shell read prints the whole file, and the CLI shows the model only
-    // SHELL_OUTPUT_BUDGET bytes of a call (D-032 shell half). Over budget, the middle was never
-    // seen, so the read earns nothing. An unreadable source cannot be sized and fails closed.
-    let fits_budget = source_bytes(source, cwd).is_some_and(|b| b.len() <= SHELL_OUTPUT_BUDGET);
+    // The CLI shows the model only SHELL_OUTPUT_BUDGET bytes of a call (D-032 shell half), so
+    // a whole-file shell read counts only when everything that call printed fits.
     let whole = tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
-            && (!is_shell_read_tool(&c.tool) || fits_budget)
+            && (!is_shell_read_tool(&c.tool) || shell_call_fits_budget(c, cwd))
             && candidates.iter().any(|cand| record_read_source_whole(c, cand))
     });
     whole || codex_ranged_reads_cover_source(tool_calls, &candidates, source, cwd)
@@ -2332,10 +2330,9 @@ fn codex_ranged_reads_cover_source(
             })
             .map(|read| read.range)
             .collect();
-            // One call's windows all print into one output, and the CLI truncates that output
+            // Everything one call prints shares one output, and the CLI truncates that output
             // past SHELL_OUTPUT_BUDGET (D-032 shell half). A call over budget earns nothing.
-            let printed: usize = windows.iter().map(|r| window_bytes(&bytes, r)).sum();
-            if printed > SHELL_OUTPUT_BUDGET { Vec::new() } else { windows }
+            if shell_call_fits_budget(c, cwd) { windows } else { Vec::new() }
         })
         .collect();
     let mut ranges = ranges;
@@ -2354,8 +2351,13 @@ fn codex_ranged_reads_cover_source(
 /// past 30,000 characters by default. 30,000 bytes sits under all three.
 const SHELL_OUTPUT_BUDGET: usize = 30_000;
 
-/// Bytes a shell window prints from `bytes`: lines `start..=end` (1-based; `None` is EOF).
-fn window_bytes(bytes: &[u8], range: &agent_adapter::codex::LineRange) -> usize {
+/// Bytes a vetted reader prints for lines `start..=end` (1-based; `None` is EOF) of `bytes`,
+/// its decoration included (`nl -ba`, `cat -n`, `cat -e`, `cat -v`).
+fn printed_bytes(
+    bytes: &[u8],
+    range: &agent_adapter::codex::LineRange,
+    decoration: &agent_adapter::codex::Decoration,
+) -> usize {
     let start = range.start.max(1);
     let end = range.end.unwrap_or(u64::MAX);
     if end < start {
@@ -2364,12 +2366,63 @@ fn window_bytes(bytes: &[u8], range: &agent_adapter::codex::LineRange) -> usize 
     bytes
         .split_inclusive(|b| *b == b'\n')
         .enumerate()
-        .filter(|(i, _)| {
-            let line = *i as u64 + 1;
-            line >= start && line <= end
-        })
-        .map(|(_, l)| l.len())
+        .map(|(i, l)| (i as u64 + 1, l))
+        .filter(|(n, _)| *n >= start && *n <= end)
+        .map(|(n, l)| decoration.printed_len(l, n))
         .sum()
+}
+
+/// An upper bound on what a non-read segment prints, for the few that codex chains around its
+/// reads (D-017): `wc` (a line per operand plus a total), `pwd` (one path), `echo` (its words).
+/// `None` for anything else: its output cannot be bounded, so the call fails closed.
+fn small_output_bound(seg: &str) -> Option<usize> {
+    let seg = seg.trim();
+    if seg.contains(['|', '<', '>', '`', '$', ';', '(', ')', '*', '?']) {
+        return None;
+    }
+    let mut toks = seg.split_whitespace();
+    let program = toks.next()?;
+    let rest: Vec<&str> = toks.collect();
+    match program.rsplit('/').next().unwrap_or(program) {
+        "pwd" if rest.is_empty() => Some(4096 + 1),
+        "echo" => Some(seg.len() + 1),
+        "wc" if rest.iter().all(|t| !t.starts_with('-') || matches!(*t, "-l" | "-c" | "-w" | "-m" | "-lc" | "-lw")) => {
+            Some(rest.iter().map(|t| t.len() + 64).sum::<usize>() + 64)
+        }
+        _ => None,
+    }
+}
+
+/// Did everything this shell call printed fit the budget? Summed over EVERY segment of the
+/// command, any file: a chain shares one output, and truncation can fall anywhere in it. A
+/// segment that is not a vetted read (`ls`, `find`, `wc`), or a file this process cannot read,
+/// cannot be sized, so the call fails closed (Codex, D-032 third pass).
+fn shell_call_fits_budget(c: &ToolCallRecord, cwd: &str) -> bool {
+    let Some(command) = c.args_json.as_deref().and_then(agent_adapter::codex::shell_command_from_args_json) else {
+        return false;
+    };
+    let mut total = 0usize;
+    for seg in agent_adapter::codex::read_segments_pub(&command) {
+        let (operand, range, decoration) = if let Some(r) = agent_adapter::codex::command_read_range(seg) {
+            (r.operand, r.range, r.decoration)
+        } else if let Some((op, d)) = agent_adapter::codex::whole_file_read(seg) {
+            (op, agent_adapter::codex::LineRange { start: 1, end: None }, d)
+        } else if let Some(n) = small_output_bound(seg) {
+            // `wc -l F && sed -n ...` is codex's live habit (D-017): a bounded few bytes.
+            total += n;
+            continue;
+        } else {
+            return false;
+        };
+        let Some(bytes) = source_bytes(&operand, cwd) else {
+            return false;
+        };
+        total += printed_bytes(&bytes, &range, &decoration);
+        if total > SHELL_OUTPUT_BUDGET {
+            return false;
+        }
+    }
+    true
 }
 
 /// The FIELDS a structured read tool uses to name the file it is opening.
@@ -9672,6 +9725,36 @@ mod grok_shell_read_gate_tests {
         ];
         enforce_reviewer_sight("Grok", &tiled, "grok-streaming-json", &sources, &root, &mut Vec::new())
             .expect("25 KB, 25 KB and 10 KB calls each fit and together cover the file");
+    }
+
+    /// Codex, D-032 third pass: the budget is on PRINTED bytes. 5000 two-byte lines are 10 KB of
+    /// source, but `nl -ba` adds a 7-byte number column to each: 45 KB printed. RED IF the gate
+    /// sizes the source instead of the output, or a plain sed of the same window stops passing.
+    #[test]
+    fn the_budget_counts_what_the_reader_printed_not_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("short_lines.txt");
+        std::fs::write(&src, "x\n".repeat(5000)).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        let root = dir.path().to_string_lossy().into_owned();
+        let sources = vec![src.clone()];
+
+        let numbered = vec![grok_shell(&format!("nl -ba {src} | sed -n '1,5000p'"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &numbered, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("10 KB of source, 45 KB printed: truncated");
+
+        let plain = vec![grok_shell(&format!("sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &plain, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect("the same window, undecorated, prints 10 KB");
+
+        // A segment whose output cannot be bounded poisons the call; `wc` (D-017's live habit)
+        // is bounded and does not.
+        let unbounded = vec![grok_shell(&format!("find {root} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &unbounded, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("find's output cannot be sized and shares the output");
+        let with_wc = vec![grok_shell(&format!("wc -l {src} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Codex", &with_wc, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect("wc prints a bounded line");
     }
 
     /// RED IF: a peek passes as the source. `head -5` is the FIND-REVIEW-07 shape.

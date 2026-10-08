@@ -114,7 +114,59 @@ pub fn whole_file_read_operand(command: &str) -> Option<String> {
     // The wider reader list (`od`, `xxd`, `strings`, ...) is fine for "did it read something"
     // but not for "did it show the whole file": `xxd -l0 SRC` and `od -N0 SRC` are readers that
     // print nothing (Antigravity, second pass on D-010). Any flag outside the vetted list fails.
-    whole_file_reader_with_one_operand(cmd).map(|(op, _)| op)
+    whole_file_read(cmd).map(|(op, _)| op)
+}
+
+/// [`whole_file_read_operand`] with the reader's [`Decoration`], so the gate can size what the
+/// command PRINTED rather than what the file holds (D-032 shell half).
+pub fn whole_file_read(command: &str) -> Option<(String, Decoration)> {
+    if command_read_range(command).is_some() {
+        return None;
+    }
+    let cmd = unwrap_shell_wrapper(command.trim());
+    if cmd.contains(['|', '<', '>', '#', ';', '&', '`', '$', '(', ')']) {
+        return None;
+    }
+    whole_file_reader_with_one_operand(cmd).map(|(op, _, d)| (op, d))
+}
+
+/// Every whole-file read in a command with its decoration, one per `&&` segment.
+pub fn whole_file_reads(command: &str) -> Vec<(String, Decoration)> {
+    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+        .into_iter()
+        .filter_map(whole_file_read)
+        .collect()
+}
+
+/// What a vetted reader adds to each line it prints. The gate budgets a shell call by PRINTED
+/// bytes, and `nl -ba` / `cat -n` add a number column, `cat -e` a `$`, `cat -v`/`-t` expand
+/// non-printing bytes (Codex, D-032: a raw window under budget printed over it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Decoration {
+    /// Number column width (`nl -w`, default 6; `cat -n`/`-b`, 6), plus one separator byte.
+    pub number_width: Option<u64>,
+    /// `cat -e`: a `$` before each newline.
+    pub dollar: bool,
+    /// `cat -v`/`-e`/`-t`: a non-printing byte prints as up to four (`M-^X`).
+    pub visible: bool,
+}
+
+impl Decoration {
+    /// An upper bound on the bytes `line` (with its newline, if any) prints as line `line_no`.
+    pub fn printed_len(&self, line: &[u8], line_no: u64) -> usize {
+        let mut n = line.len();
+        if let Some(w) = self.number_width {
+            let digits = line_no.max(1).ilog10() as u64 + 1;
+            n += (w.max(digits) + 1) as usize;
+        }
+        if self.dollar {
+            n += 1;
+        }
+        if self.visible {
+            n += 3 * line.iter().filter(|&&b| b != b'\n' && !(0x20..0x7f).contains(&b)).count();
+        }
+        n
+    }
 }
 
 /// The `--json` item type codex emits for subagent (multi-agent) tool calls.
@@ -186,6 +238,11 @@ fn split_unquoted<'a>(command: &'a str, sep: &[u8]) -> Vec<&'a str> {
 /// gate then checks the union of windows against the real file on disk, as for any ranged read.
 /// Anything else in a `;` chain (a second file, any other command, an `&&` inside a link) and the
 /// whole command is judged exactly as before.
+/// The segments [`command_read_ranges`] walks, for the gate to size a call's whole output.
+pub fn read_segments_pub(command: &str) -> Vec<&str> {
+    read_segments(command)
+}
+
 fn read_segments(command: &str) -> Vec<&str> {
     let cmd = unwrap_shell_wrapper(command.trim());
     let links = split_unquoted(cmd, b";");
@@ -325,12 +382,12 @@ pub fn command_read_range(command: &str) -> Option<RangedRead> {
     match stages.as_slice() {
         [single] => {
             let (range, operand) = sed_range_stage(single, true)?;
-            Some(RangedRead { range, operand: operand?, via_nl: false })
+            Some(RangedRead { range, operand: operand?, via_nl: false, decoration: Decoration::default() })
         }
         [reader, filter] => {
-            let (operand, via_nl) = whole_file_reader_with_one_operand(reader)?;
+            let (operand, via_nl, decoration) = whole_file_reader_with_one_operand(reader)?;
             let (range, _) = sed_range_stage(filter, false)?;
-            Some(RangedRead { range, operand, via_nl })
+            Some(RangedRead { range, operand, via_nl, decoration })
         }
         _ => None,
     }
@@ -349,6 +406,8 @@ pub struct RangedRead {
     /// lines (`\:`, `\:\:`, `\:\:\:` alone on a line), so on a file containing one the window
     /// is over fewer lines than the source has. The gate checks the file for that.
     pub via_nl: bool,
+    /// What the stage-1 reader adds to each printed line; plain for a bare `sed -n`.
+    pub decoration: Decoration,
 }
 
 fn strip_quotes(tok: &str) -> &str {
@@ -435,7 +494,7 @@ fn parse_sed_print_range(script: &str) -> Option<LineRange> {
 /// pipeline's exit code is sed's 0 on empty stdin. The record says success, the model saw
 /// nothing, and a `1,$p` window would have covered the file. So `-w` must be a positive number
 /// and only the flags BSD cat and GNU cat share are accepted.
-fn whole_file_reader_with_one_operand(stage: &str) -> Option<(String, bool)> {
+fn whole_file_reader_with_one_operand(stage: &str) -> Option<(String, bool, Decoration)> {
     const CAT_PORTABLE_LINE_PRESERVING_FLAGS: &[&str] = &["-n", "-b", "-v", "-e", "-t"];
     // `-ba` / `-bt` / `-bn` (which lines get numbers) and `-w<digits>`, width, at least 1.
     fn nl_flag_is_line_preserving(tok: &str) -> bool {
@@ -451,6 +510,10 @@ fn whole_file_reader_with_one_operand(stage: &str) -> Option<(String, bool)> {
         return None;
     }
     let mut operand: Option<String> = None;
+    let mut decoration = Decoration::default();
+    if base == "nl" {
+        decoration.number_width = Some(6);
+    }
     for tok in toks {
         // A bare `-` is stdin, which is a second input the window would then be over. Codex
         // found this on the live review of this very function: `cat - FILE | sed -n` counted
@@ -467,6 +530,18 @@ fn whole_file_reader_with_one_operand(stage: &str) -> Option<(String, bool)> {
             if !ok {
                 return None;
             }
+            match (base, tok) {
+                ("cat", "-n" | "-b") => decoration.number_width = Some(6),
+                ("cat", "-e") => {
+                    decoration.dollar = true;
+                    decoration.visible = true;
+                }
+                ("cat", "-v" | "-t") => decoration.visible = true,
+                ("nl", w) if w.starts_with("-w") => {
+                    decoration.number_width = w[2..].parse::<u64>().ok();
+                }
+                _ => {}
+            }
         } else {
             if operand.is_some() {
                 return None;
@@ -478,7 +553,7 @@ fn whole_file_reader_with_one_operand(stage: &str) -> Option<(String, bool)> {
             operand = Some(op.to_string());
         }
     }
-    operand.map(|op| (op, base == "nl"))
+    operand.map(|op| (op, base == "nl", decoration))
 }
 
 /// Public face of `command_reads_file_contents` for the gate's peek binding.
@@ -826,6 +901,24 @@ impl CodexExecParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-032: what each vetted reader adds per printed line. RED IF a decoration is dropped
+    /// (the gate would size output below what the model was shown).
+    #[test]
+    fn decorations_are_parsed_and_sized() {
+        let nl = command_read_range("nl -ba /r/a.rs | sed -n '1,10p'").unwrap().decoration;
+        assert_eq!(nl.number_width, Some(6));
+        assert_eq!(nl.printed_len(b"x\n", 7), 2 + 7, "6-wide number plus a tab");
+        let wide = command_read_range("nl -ba -w12 /r/a.rs | sed -n '1,10p'").unwrap().decoration;
+        assert_eq!(wide.printed_len(b"x\n", 1), 2 + 13);
+        let (_, cat_e) = whole_file_read("cat -e /r/a.rs").unwrap();
+        assert!(cat_e.dollar && cat_e.visible);
+        assert_eq!(cat_e.printed_len(b"a\tb\n", 1), 4 + 1 + 3, "$ plus ^I's bound");
+        let (_, plain) = whole_file_read("cat /r/a.rs").unwrap();
+        assert_eq!(plain, Decoration::default());
+        assert_eq!(command_read_range("sed -n '1,5p' /r/a.rs").unwrap().decoration, Decoration::default());
+        assert_eq!(nl.printed_len(b"x\n", 12_345_678), 2 + 9, "a number wider than the column widens it");
+    }
 
     #[test]
     fn parses_golden_trace() {
