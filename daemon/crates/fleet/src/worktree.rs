@@ -16,6 +16,23 @@ pub fn member_target_dir(worktree: &Path) -> PathBuf {
 /// Never fails the member: a leftover is logged, and the next exit tries again.
 pub fn remove_member_target(worktree: &Path) {
     let dir = member_target_dir(worktree);
+    // The agent owns the worktree's contents. A `.triumvirate` or `target` it replaced with a
+    // symlink would make the delete follow the link out of the worktree (D-048 panel, Grok),
+    // so the two components this fleet added must be real directories, or nothing is removed.
+    for component in [worktree.join(".triumvirate"), dir.clone()] {
+        match std::fs::symlink_metadata(&component) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                tracing::warn!(path = %component.display(), "fleet member build dir is not a plain directory; not removed (D-048)");
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(path = %component.display(), error = %e, "fleet member build dir could not be checked; not removed (D-048)");
+                return;
+            }
+        }
+    }
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -157,5 +174,53 @@ mod tests {
         let removed_paths = removed.lock().expect("removed lock");
         assert_eq!(removed_paths.len(), 1);
         assert_eq!(removed_paths[0], path);
+    }
+}
+
+#[cfg(test)]
+mod member_target_tests {
+    use super::{member_target_dir, remove_member_target};
+
+    fn build_output_in(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("debug")).expect("mkdir");
+        std::fs::write(dir.join("debug/big"), b"x").expect("write");
+    }
+
+    /// RED IF the member's own build output survives the cleanup.
+    #[test]
+    fn a_plain_build_dir_is_removed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ours = member_target_dir(tmp.path());
+        build_output_in(&ours);
+        remove_member_target(tmp.path());
+        assert!(!ours.exists());
+        assert!(tmp.path().join(".triumvirate").exists(), "only target/ goes, not .triumvirate/");
+    }
+
+    /// The agent swapped `.triumvirate` for a link to somewhere else that holds a `target/`.
+    /// RED IF the delete follows the link and empties a directory outside the worktree.
+    #[test]
+    fn a_symlinked_triumvirate_dir_is_not_followed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (wt, outside) = (tmp.path().join("wt"), tmp.path().join("outside"));
+        std::fs::create_dir_all(&wt).expect("wt");
+        build_output_in(&outside.join("target"));
+        std::os::unix::fs::symlink(&outside, wt.join(".triumvirate")).expect("symlink");
+        remove_member_target(&wt);
+        assert!(outside.join("target/debug/big").exists(), "a file outside the worktree was deleted");
+    }
+
+    /// Same, one level down: `target` itself is the link. std's `remove_dir_all` already unlinks
+    /// a final-component link without following it (negative control: this stays green with the
+    /// guard removed), so this pins that behavior rather than proving the guard.
+    #[test]
+    fn a_symlinked_target_dir_is_not_followed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (wt, outside) = (tmp.path().join("wt"), tmp.path().join("outside"));
+        std::fs::create_dir_all(wt.join(".triumvirate")).expect("wt");
+        build_output_in(&outside);
+        std::os::unix::fs::symlink(&outside, member_target_dir(&wt)).expect("symlink");
+        remove_member_target(&wt);
+        assert!(outside.join("debug/big").exists(), "a file outside the worktree was deleted");
     }
 }
