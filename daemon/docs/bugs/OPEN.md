@@ -19,40 +19,10 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-### D-051 - An agy review that is denied a shell command is reported as "empty output"
-**Found:** 2026-10-04 (PR #71/#72 review) · **Severity:** LOW · **NOT FIXED**
-**Evidence:** two agy reviews failed with `agy returned empty output (status=SUCCESS, ... tool_calls=1)`. The raw stream (`~/.triumvirate/agy-failures/1791168994994-13211/`) shows `"denied_actions":[{"action":"command","display_name":"RunCommand"}]` and agy's stderr names the cause: review mode cannot run shell commands. The reviewer had been asked to run `git diff`; with the diff given as a file it answered.
-**CHECK to close:** an agy result with non-empty `denied_actions` and an empty response surfaces the denied action in the ask_agent error.
-
-### D-050 - CI never runs the daemon binary's own test suite
-**Found:** 2026-10-04 (closing the trial) · **Severity:** MEDIUM · **NOT FIXED**
-**Evidence:** CI runs `cargo test --workspace --lib`, the replay gate and (since PR #70) `cargo test -p fleet --tests`, but not `cargo test -p triumvirate --bin triumvirate` (320 pass on macOS). In a bare Linux container (rust:latest) 302 pass and 6 fail: the three codex argv oracles (no codex installed; they fail loud by design), `abe_phase1_dispatch_poll_output_review_and_cancel`, `abe_red_team_enforcement_blocks_non_compliant_worker`, `persistent_worker_reuse_second_call_is_faster_and_marked_reused`.
-**CHECK to close:** CI runs the binary's tests on Linux with codex installed, green.
-
-### D-049 - An agy fleet member has a hard 15-minute ceiling
-**Found:** 2026-10-04 (trial fleet fleet-1791161535060714000) · **Severity:** MEDIUM · **NOT FIXED**
-**Evidence:** the member printed `[agy] print timeout after 15m0s with turn in progress; returning partial output`, exited 0 without committing, and its edits were left uncommitted in the worktree. The fleet arm launches agy with the connector's print timeout, sized for a consult, not a code task that builds and tests a large crate.
-**CHECK to close:** an agy fleet member's print timeout is set for fleet work (or configurable per dispatch), and a member that times out mid-turn is recorded failed with that reason.
-
-### D-048 - Every fleet member builds its own target/ and nothing removes it
-**Found:** 2026-10-04 (the trial filled the disk) · **Severity:** HIGH · **FIX ON BRANCH fix/d048-fleet-target-cleanup; live check not run**
-**Evidence:** each member worktree under `.triumvirate/worktrees/` held its own `daemon/target` (1 to 5 GB each); after about ten fleets the volume had 165 MB free and cargo failed with `No space left on device`. Worktrees and their build output stay after the fleet finishes.
-**CHECK to close:** fleet members share one cargo target dir (for example `CARGO_TARGET_DIR` set for the member), or a finished fleet's worktree build output is removed; ten consecutive fleets leave disk use flat.
-**Fix (2026-10-07, 42b98e5 + 6eb908f):** both engines give the agent `CARGO_TARGET_DIR=<worktree>/.triumvirate/target` (`fleet::worktree::member_target_dir`) and delete it when the agent exits: fleet-shim after the done record on every post-spawn path; legacy `wait_fleet_child` on every exit including the token-failure return. The delete refuses a symlinked `.triumvirate` or `target`. Panel: codex and antigravity approve, grok concerns (below). Triage: /Users/michaelboscia/projects/temporal-migration/reviews/2026-10-07/d048-TRIAGE.md.
-**Residue:** a check-then-delete race against a process that escaped the member's group; escaped grandchildren may recreate output; a SIGKILL mid-delete leaves the dir and nothing retries; worktrees, branches and shim sidecars still accumulate.
-
-### D-039 - The launchd daemon cannot reach the LAN until macOS Local Network access is approved
-**Found:** 2026-10-04 · **Severity:** MEDIUM · **NEEDS MIKE**
-**Evidence:** after an install the daemon's Temporal worker got EHOSTUNREACH ("No route to host") to 192.168.2.110:7233 while the same port answered from a shell. macOS Local Network privacy decides per code-signing identity, and the linker's ad hoc identity (`triumvirate-<hash>`) changed every build. PR #58 signs the installed binary with the stable identifier `com.triumvirate.daemon`; PR #59 makes the worker try the LAN, then the tailnet relay (https://100.73.45.3:7233), which it uses today.
-**Update 2026-10-04 23:15 ET:** on main 60aab14 (PR #72 logs each failed address) the LAN attempt fails with `tcp connect error ... Os { code: 65, kind: HostUnreachable, message: "No route to host" }` although four "triumvirate" entries are ON in Local Network. Working theory, unverified: macOS keys an ad-hoc signed binary by its code hash, so each rebuild is a new entry regardless of the stable identifier from PR #58. The tailnet fallback carries all traffic meanwhile.
-**CHECK to close:** (needs Mike's hands; cannot be run remotely) after Mike approves `com.triumvirate.daemon` in System Settings > Privacy & Security > Local Network and the daemon restarts, `daemon.log` says `temporal: connected address=https://192.168.2.110:7233`.
-
-### D-032 - The sight gate credits the read a reviewer ASKED for, not the one it received
-**Found:** 2026-09-24 (D-028 panel, Codex) · **Severity:** LOW today, structural · **NOT FIXED**
-**Evidence:** `structured_read_ranges` (`triumvirate/src/agent_exec.rs`) builds coverage from the `offset`/`limit` arguments of a successful read. `ToolCallRecord` carries arguments and a success flag, and nothing about the returned content, so a tool that caps or truncates its output is credited with the whole window it requested. The same record shape means an `offset` with no `limit` is credited to EOF.
-**Second half:** offset conventions are assumed 1-based across every read tool. A zero-based tool asking `offset: 1` actually returns lines 2..N while the gate credits 1..N-1, so line 1 can be credited unread.
-**Why it is filed rather than fixed:** closing it needs the adapters to record how many lines came BACK, which is a parser change per agent, or a per-tool semantics table. Both are larger than the defect. The shell path is unaffected: `sed -n` windows are exact.
-**CHECK to close:** a read whose output was truncated does not satisfy a source; a zero-based reader's windows are credited at their true lines.
+### D-052 - A fleet member that hits its timeout is recorded as "exited 0 without committing"
+**Found:** 2026-10-08 (closing D-049) · **Severity:** LOW · **NOT FIXED**
+**Evidence:** agy prints `[agy] print timeout after ...; returning partial output` and exits 0. The fleet then records the member failed with `agent exited 0 without committing: its branch head ... is not a new commit` (`fleet/src/orchestrator.rs:2135`). True, but it hides why: the reader cannot tell a timeout from an agent that chose not to commit.
+**CHECK to close:** a fleet member whose output contains agy's print-timeout line is recorded failed with a reason naming the timeout, on both engines.
 
 ### D-004 - Failed generations carry no error text
 **Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
@@ -313,6 +283,49 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ## Closed
 
+### D-051 - An agy review that is denied a shell command is reported as "empty output"
+**Found:** 2026-10-04 (PR #71/#72 review) · **Severity:** LOW · **CLOSED 2026-10-08** (#77)
+**Evidence:** two agy reviews failed with `agy returned empty output (status=SUCCESS, ... tool_calls=1)`. The raw stream (`~/.triumvirate/agy-failures/1791168994994-13211/`) shows `"denied_actions":[{"action":"command","display_name":"RunCommand"}]` and agy's stderr names the cause: review mode cannot run shell commands. The reviewer had been asked to run `git diff`; with the diff given as a file it answered.
+**CHECK to close:** an agy result with non-empty `denied_actions` and an empty response surfaces the denied action in the ask_agent error.
+**Fixed:** (#77) the agy stream parser reads `result.denied_actions` (`agy_stream.rs`, `denied_actions_are_read_from_the_result_event`); a non-empty list fails the call with "agy refused an action..." naming it, and the call is not retried. Pin: `mock_agy_denied_command_is_named_and_not_retried` (`triumvirate/src/agy.rs`). Grok approved. CHECK passes on main 9bb3556: CI green.
+
+### D-050 - CI never runs the daemon binary's own test suite
+**Found:** 2026-10-04 (closing the trial) · **Severity:** MEDIUM · **CLOSED 2026-10-08** (#75)
+**Evidence:** CI runs `cargo test --workspace --lib`, the replay gate and (since PR #70) `cargo test -p fleet --tests`, but not `cargo test -p triumvirate --bin triumvirate` (320 pass on macOS). In a bare Linux container (rust:latest) 302 pass and 6 fail: the three codex argv oracles (no codex installed; they fail loud by design), `abe_phase1_dispatch_poll_output_review_and_cancel`, `abe_red_team_enforcement_blocks_non_compliant_worker`, `persistent_worker_reuse_second_call_is_faster_and_marked_reused`.
+**CHECK to close:** CI runs the binary's tests on Linux with codex installed, green.
+**Fixed:** (#75) `rust.yml` runs `cargo test -p triumvirate --tests` after installing the codex CLI. The two Linux failures that were not about codex were real test defects: the ABE hook test needed a host-only hook (split into the ignored `abe_command_scope_hook_blocks_forbidden_command`) and the reuse test passed on macOS by timing luck (now sets `reuse_session: Some(true)`). Codex approved. CHECK passes: Rust CI on main green for every merge of 2026-10-08, this step included.
+
+### D-049 - An agy fleet member has a hard 15-minute ceiling
+**Found:** 2026-10-04 (trial fleet fleet-1791161535060714000) · **Severity:** MEDIUM · **CLOSED 2026-10-08** (#76), reason half split to D-052
+**Evidence:** the member printed `[agy] print timeout after 15m0s with turn in progress; returning partial output`, exited 0 without committing, and its edits were left uncommitted in the worktree. The fleet arm launches agy with the connector's print timeout, sized for a consult, not a code task that builds and tests a large crate.
+**CHECK to close:** an agy fleet member's print timeout is set for fleet work (or configurable per dispatch), and a member that times out mid-turn is recorded failed with that reason.
+**Fixed:** (#76) fleet agy members get `--print-timeout` from `fleet_agy_timeout()` (`TRIUMVIRATE_FLEET_AGY_TIMEOUT_SECS`, default 5 min inside `MEMBER_WALL_LIMIT` = 4 h, the one bound the Temporal activity also uses); the consult path keeps 900 s. `fleet_agent_bin_pin.rs` pins the argv; reverted, it shows `900s`. Antigravity approved. CHECK, first half passes on main 9bb3556. Second half does not: a member that times out is recorded failed, but with the generic "agent exited 0 without committing" (`fleet/src/orchestrator.rs:2135`), not the timeout. Filed as D-052.
+
+### D-048 - Every fleet member builds its own target/ and nothing removes it
+**Found:** 2026-10-04 (the trial filled the disk) · **Severity:** HIGH · **CLOSED 2026-10-08** (#74)
+**Evidence:** each member worktree under `.triumvirate/worktrees/` held its own `daemon/target` (1 to 5 GB each); after about ten fleets the volume had 165 MB free and cargo failed with `No space left on device`. Worktrees and their build output stay after the fleet finishes.
+**CHECK to close:** fleet members share one cargo target dir (for example `CARGO_TARGET_DIR` set for the member), or a finished fleet's worktree build output is removed; ten consecutive fleets leave disk use flat.
+**Fix (2026-10-07, 42b98e5 + 6eb908f):** both engines give the agent `CARGO_TARGET_DIR=<worktree>/.triumvirate/target` (`fleet::worktree::member_target_dir`) and delete it when the agent exits: fleet-shim after the done record on every post-spawn path; legacy `wait_fleet_child` on every exit including the token-failure return. The delete refuses a symlinked `.triumvirate` or `target`. Panel: codex and antigravity approve, grok concerns (below). Triage: /Users/michaelboscia/projects/temporal-migration/reviews/2026-10-07/d048-TRIAGE.md.
+**Residue:** a check-then-delete race against a process that escaped the member's group; escaped grandchildren may recreate output; a SIGKILL mid-delete leaves the dir and nothing retries; worktrees, branches and shim sidecars still accumulate.
+**Live check (2026-10-08, main 9bb3556 installed):** 10 consecutive fleets, 16 members (6 agy, 5 codex, 5 grok), all done, each running `cargo check -p fleet` and committing. Sampled every 5 s: member target dirs grew to 100 to 300 MB (peak 4 at once, 692 MB) and every one was gone on exit; free disk stayed 101 to 102 GB. Log: /Users/michaelboscia/projects/temporal-migration/reviews/trial/d048-disk-2026-10-08.log. CHECK passes. The residue above stays true and is not tracked as a defect.
+
+### D-039 - The launchd daemon cannot reach the LAN until macOS Local Network access is approved
+**Found:** 2026-10-04 · **Severity:** MEDIUM · **CLOSED 2026-10-08** (Mac setting, no code change)
+**Evidence:** after an install the daemon's Temporal worker got EHOSTUNREACH ("No route to host") to 192.168.2.110:7233 while the same port answered from a shell. macOS Local Network privacy decides per code-signing identity, and the linker's ad hoc identity (`triumvirate-<hash>`) changed every build. PR #58 signs the installed binary with the stable identifier `com.triumvirate.daemon`; PR #59 makes the worker try the LAN, then the tailnet relay (https://100.73.45.3:7233), which it uses today.
+**Update 2026-10-04 23:15 ET:** on main 60aab14 (PR #72 logs each failed address) the LAN attempt fails with `tcp connect error ... Os { code: 65, kind: HostUnreachable, message: "No route to host" }` although four "triumvirate" entries are ON in Local Network. Working theory, unverified: macOS keys an ad-hoc signed binary by its code hash, so each rebuild is a new entry regardless of the stable identifier from PR #58. The tailnet fallback carries all traffic meanwhile.
+**CHECK to close:** (needs Mike's hands; cannot be run remotely) after Mike approves `com.triumvirate.daemon` in System Settings > Privacy & Security > Local Network and the daemon restarts, `daemon.log` says `temporal: connected address=https://192.168.2.110:7233`.
+**Root cause, verified 2026-10-08:** `codesign -d -r- ~/.local/bin/triumvirate` gives `designated => cdhash H"..."`. An ad-hoc signature's identity is its code hash, new every build, so PR #58's fixed identifier never made the approval persist. TN3179 also exempts launchd daemons but not agents, and ours is a gui/ agent.
+**Fixed:** Mike set `AllowedEthernetLocalNetworkAddresses` and `AllowedWiFiLocalNetworkAddresses` in `com.apple.network.local-network` to `192.168.2.110/32` (TN3179; verified with `sudo defaults read`). This allows the address for every program, so rebuilds no longer matter. No Mac restart was needed: a `launchctl kickstart -k` logged `temporal: connected address=https://192.168.2.110:7233` at 2026-10-08T15:47:02Z with no errno 65 first. CHECK passes.
+
+### D-032 - The sight gate credits the read a reviewer ASKED for, not the one it received
+**Found:** 2026-09-24 (D-028 panel, Codex) · **Severity:** LOW today, structural · **CLOSED 2026-10-08** (#78)
+**Evidence:** `structured_read_ranges` (`triumvirate/src/agent_exec.rs`) builds coverage from the `offset`/`limit` arguments of a successful read. `ToolCallRecord` carries arguments and a success flag, and nothing about the returned content, so a tool that caps or truncates its output is credited with the whole window it requested. The same record shape means an `offset` with no `limit` is credited to EOF.
+**Second half:** offset conventions are assumed 1-based across every read tool. A zero-based tool asking `offset: 1` actually returns lines 2..N while the gate credits 1..N-1, so line 1 can be credited unread.
+**Why it is filed rather than fixed:** closing it needs the adapters to record how many lines came BACK, which is a parser change per agent, or a per-tool semantics table. Both are larger than the defect. The shell path is unaffected: `sed -n` windows are exact.
+**CHECK to close:** a read whose output was truncated does not satisfy a source; a zero-based reader's windows are credited at their true lines.
+**Fixed:** (#78) credit follows what the read RETURNED. `ToolCallRecord.returned_lines` is filled from the result's own line numbers (grok `N→`, claude `N\t`), so a truncated read (asked 1..100, got 1..60) is rejected. Unnumbered results are credited only for tools in `UNNUMBERED_READ_CAPS`, with a measured per-call cap (agy `view_file`: 800 lines, 1-based inclusive, measured 2026-10-07); any other unnumbered tool is credited nothing. Shell reads are credited only within `SHELL_OUTPUT_BUDGET` (30,000 bytes of what the reader printed, under the measured codex, grok and Claude truncation points); `sed`, `cat -n` and `nl` decorations count. Pins: `shell_reads_are_credited_only_within_the_output_budget`, `the_budget_counts_what_the_reader_printed_not_the_file`, and the real grok and claude capture tests. Codex approved after five rounds, each fixed with a negative control. CHECK passes on main 9bb3556.
+**Residue:** an agy `view_file` read is still trusted to return the window it asked for, up to 800 lines; agy's result carries no line numbers to prove it.
+
 ### D-047 - A failed consult reports transport noise and hides the real cause
 **Found:** 2026-10-04 (codex review of PR #66) · **Severity:** MEDIUM · **CLOSED 2026-10-04** (#71)
 **Evidence:** `ask_agent` codex failed with `codex connector failed: exited with status 1; codex said: ... rmcp::transport::worker ... error sending request for url (http://192.168.2.110:8000/mcp)`. The real cause was only in the codex session rollout: `You've hit your usage limit ... try again at 10:11 PM`. The error led toward a network diagnosis.
@@ -435,4 +448,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-10-04 23:30 ET (D-040 to D-047 closed: PRs #60 to #67, #71, all merged and installed on main 60aab14; D-050, D-051 added; D-039, D-048, D-049 open).
+**Last reviewed:** 2026-10-08 11:55 ET (D-032, D-039, D-048, D-049, D-050, D-051 closed: PRs #74 to #78 merged and installed on main 9bb3556, D-048 by a 10-fleet live check, D-039 by a Mac setting; D-052 added).
