@@ -2267,9 +2267,14 @@ fn tool_call_read_source_in_full(
     cwd: &str,
 ) -> bool {
     let candidates = source_path_candidates(source, cwd);
+    // A whole-file shell read prints the whole file, and the CLI shows the model only
+    // SHELL_OUTPUT_BUDGET bytes of a call (D-032 shell half). Over budget, the middle was never
+    // seen, so the read earns nothing. An unreadable source cannot be sized and fails closed.
+    let fits_budget = source_bytes(source, cwd).is_some_and(|b| b.len() <= SHELL_OUTPUT_BUDGET);
     let whole = tool_calls.iter().any(|c| {
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
+            && (!is_shell_read_tool(&c.tool) || fits_budget)
             && candidates.iter().any(|cand| record_read_source_whole(c, cand))
     });
     whole || codex_ranged_reads_cover_source(tool_calls, &candidates, source, cwd)
@@ -2318,7 +2323,7 @@ fn codex_ranged_reads_cover_source(
                 .and_then(agent_adapter::codex::shell_command_from_args_json)
                 .map(|command| agent_adapter::codex::command_read_ranges(&command))
                 .unwrap_or_default();
-            ranges.into_iter().filter(|read| {
+            let windows: Vec<agent_adapter::codex::LineRange> = ranges.into_iter().filter(|read| {
                 // Bound to the operand the reader opened, not to a path string anywhere in the
                 // command. Codex, round 3: a decoy operand embedding the source path used to
                 // collect the source's coverage.
@@ -2326,6 +2331,11 @@ fn codex_ranged_reads_cover_source(
                     && !(read.via_nl && nl_drops_lines)
             })
             .map(|read| read.range)
+            .collect();
+            // One call's windows all print into one output, and the CLI truncates that output
+            // past SHELL_OUTPUT_BUDGET (D-032 shell half). A call over budget earns nothing.
+            let printed: usize = windows.iter().map(|r| window_bytes(&bytes, r)).sum();
+            if printed > SHELL_OUTPUT_BUDGET { Vec::new() } else { windows }
         })
         .collect();
     let mut ranges = ranges;
@@ -2334,6 +2344,32 @@ fn codex_ranged_reads_cover_source(
         return false;
     }
     ranges_cover_lines(&ranges, count_lines(&bytes))
+}
+
+/// The most bytes of ONE shell call's output a reviewer is credited with having seen.
+/// Measured 2026-10-07, `cat` of a 58.6 KB, 3000-line file with a token per line: codex showed
+/// the model "Warning: truncated output (original token count: 15000)" and lost the middle
+/// (line 1500 not shown, 2999 shown; probe 45a30323); grok showed "first/last 19.6 KB of
+/// 58.6 KB" (probe 0800122b). Both kept roughly 39 KB. Claude Code middle-truncates Bash output
+/// past 30,000 characters by default. 30,000 bytes sits under all three.
+const SHELL_OUTPUT_BUDGET: usize = 30_000;
+
+/// Bytes a shell window prints from `bytes`: lines `start..=end` (1-based; `None` is EOF).
+fn window_bytes(bytes: &[u8], range: &agent_adapter::codex::LineRange) -> usize {
+    let start = range.start.max(1);
+    let end = range.end.unwrap_or(u64::MAX);
+    if end < start {
+        return 0;
+    }
+    bytes
+        .split_inclusive(|b| *b == b'\n')
+        .enumerate()
+        .filter(|(i, _)| {
+            let line = *i as u64 + 1;
+            line >= start && line <= end
+        })
+        .map(|(_, l)| l.len())
+        .sum()
 }
 
 /// The FIELDS a structured read tool uses to name the file it is opening.
@@ -7689,18 +7725,20 @@ mod sight_gate_tests {
     #[test]
     fn sight_23_codex_can_be_source_gated_now_that_it_classifies_reads() {
         let mut lifecycle = Vec::new();
+        let (_dir, root) = real_repo("a.rs", 10);
+        let src = format!("{root}/a.rs");
         let read = vec![ToolCallRecord { returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"command":"cat /repo/a.rs"}"#.to_string()),
+            args_json: Some(serde_json::json!({ "command": format!("cat {src}") }).to_string()),
         }];
-        let sources = vec!["/repo/a.rs".to_string()];
+        let sources = vec![src.clone()];
         assert!(
             enforce_reviewer_sight(
-                "Codex", &read, "codex-exec-json", &sources, "/repo", &mut lifecycle,
+                "Codex", &read, "codex-exec-json", &sources, &root, &mut lifecycle,
             )
             .is_ok(),
             "`cat` of the named source must satisfy it on codex"
@@ -7714,11 +7752,11 @@ mod sight_gate_tests {
             kind: ToolKind::Bash,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(r#"{"command":"/repo/a.rs"}"#.to_string()),
+            args_json: Some(serde_json::json!({ "command": src }).to_string()),
         }];
         assert!(
             enforce_reviewer_sight(
-                "Codex", &listing, "codex-exec-json", &sources, "/repo", &mut l2,
+                "Codex", &listing, "codex-exec-json", &sources, &root, &mut l2,
             )
             .is_err(),
             "a Bash-classified command naming the path must still not satisfy the source"
@@ -9404,6 +9442,15 @@ mod grok_shell_read_gate_tests {
     use super::enforce_reviewer_sight;
     use agent_adapter::{ToolCallRecord, ToolKind};
 
+    /// A small real source (under the shell output budget): (guard, root, absolute path).
+    fn small_source() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.rs");
+        std::fs::write(&src, "fn a() {}\nfn b() {}\n").unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        (dir, root, src.to_string_lossy().into_owned())
+    }
+
     fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
         ToolCallRecord { returned_lines: Vec::new(),
             id: None,
@@ -9586,11 +9633,45 @@ mod grok_shell_read_gate_tests {
     /// named source.
     #[test]
     fn a_grok_cat_of_the_named_source_passes() {
-        let tools = vec![grok_shell("cat /repo/a.rs", ToolKind::ReadFile)];
-        let sources = vec!["/repo/a.rs".to_string()];
+        // A real file under the shell output budget: since D-032 the gate sizes what `cat` printed.
+        let (_dir, root, src) = small_source();
+        let tools = vec![grok_shell(&format!("cat {src}"), ToolKind::ReadFile)];
+        let sources = vec![src];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+        enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle)
             .expect("a whole-file cat is the source");
+    }
+
+    /// D-032 shell half. The CLIs truncate one call's output (codex near 10k tokens, grok to the
+    /// first and last 19.6 KB, measured): a `cat` of a larger file never showed its middle.
+    /// RED IF an over-budget cat, or one call chaining over-budget windows, is credited; or if
+    /// windows that each fit stop tiling a large file.
+    #[test]
+    fn shell_reads_are_credited_only_within_the_output_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.rs");
+        let line = format!("{}\n", "x".repeat(99)); // 100 bytes a line
+        std::fs::write(&big, line.repeat(600)).unwrap(); // 60,000 bytes
+        let big = big.to_string_lossy().into_owned();
+        let root = dir.path().to_string_lossy().into_owned();
+        let sources = vec![big.clone()];
+
+        let cat = vec![grok_shell(&format!("cat {big}"), ToolKind::ReadFile)];
+        let err = enforce_reviewer_sight("Grok", &cat, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("60 KB through one call: the middle was truncated away");
+        assert!(err.contains("PART"), "{err}");
+
+        let chained = vec![grok_shell(&format!("sed -n '1,300p' {big} && sed -n '301,600p' {big}"), ToolKind::ReadFile)];
+        enforce_reviewer_sight("Grok", &chained, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect_err("two windows in ONE call still print 60 KB into one output");
+
+        let tiled = vec![
+            grok_shell(&format!("sed -n '1,250p' {big}"), ToolKind::ReadFile),
+            grok_shell(&format!("sed -n '251,500p' {big}"), ToolKind::ReadFile),
+            grok_shell(&format!("sed -n '501,600p' {big}"), ToolKind::ReadFile),
+        ];
+        enforce_reviewer_sight("Grok", &tiled, "grok-streaming-json", &sources, &root, &mut Vec::new())
+            .expect("25 KB, 25 KB and 10 KB calls each fit and together cover the file");
     }
 
     /// RED IF: a peek passes as the source. `head -5` is the FIND-REVIEW-07 shape.
@@ -9627,11 +9708,13 @@ mod grok_shell_read_gate_tests {
     /// `CommandLine`, claude `Bash`, gemini `bash`.
     #[test]
     fn every_adapters_shell_tool_is_a_shell_read_for_the_gate() {
+        let (_dir, root, src) = small_source();
+        let cmd = format!("cat {src}");
         for (tool, args) in [
-            ("run_command", serde_json::json!({ "CommandLine": "cat /repo/a.rs" })),
-            ("Bash", serde_json::json!({ "command": "cat /repo/a.rs" })),
-            ("bash", serde_json::json!({ "command": "cat /repo/a.rs" })),
-            ("command_execution", serde_json::json!({ "command": "cat /repo/a.rs" })),
+            ("run_command", serde_json::json!({ "CommandLine": cmd })),
+            ("Bash", serde_json::json!({ "command": cmd })),
+            ("bash", serde_json::json!({ "command": cmd })),
+            ("command_execution", serde_json::json!({ "command": cmd })),
         ] {
             let rec = ToolCallRecord { returned_lines: Vec::new(),
                 id: None,
@@ -9641,9 +9724,9 @@ mod grok_shell_read_gate_tests {
                 duration_ms: None,
                 args_json: Some(args.to_string()),
             };
-            let sources = vec!["/repo/a.rs".to_string()];
+            let sources = vec![src.clone()];
             let mut lifecycle = Vec::new();
-            enforce_reviewer_sight("X", &[rec], "grok-streaming-json", &sources, "/repo", &mut lifecycle)
+            enforce_reviewer_sight("X", &[rec], "grok-streaming-json", &sources, &root, &mut lifecycle)
                 .unwrap_or_else(|e| panic!("{tool}: {e}"));
         }
     }
