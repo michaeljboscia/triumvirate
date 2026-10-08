@@ -198,9 +198,22 @@ pub fn build_agy_invocation(
     cwd: &str,
     read_only: bool,
 ) -> std::io::Result<AgyInvocation> {
+    build_agy_invocation_with_timeout(bin, extra_args, prompt, cwd, read_only, agy_connector_timeout())
+}
+
+/// [`build_agy_invocation`] with an explicit `--print-timeout`. The consult default (900 s) is
+/// sized for a question; a fleet member writing code needs the fleet's own bound (D-049: every
+/// agy member was cut off at 15 minutes while codex and grok members had the 4 h activity).
+pub fn build_agy_invocation_with_timeout(
+    bin: &str,
+    extra_args: &[String],
+    prompt: &str,
+    cwd: &str,
+    read_only: bool,
+    print_timeout: Duration,
+) -> std::io::Result<AgyInvocation> {
     validate_extra_args(extra_args)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let print_timeout = agy_connector_timeout();
     let log_path = unique_temp("agy-log", "txt");
 
     // `read_only` FORCES the seatbelt on regardless of the operator default.

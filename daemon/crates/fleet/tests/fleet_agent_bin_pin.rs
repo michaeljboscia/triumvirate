@@ -103,6 +103,11 @@ fn fleet_members_get_pinned_binaries_and_commit_grants() {
     let (bin, argv) = fleet::orchestrator::fleet_agent_command("gemini", &wt, "task").expect("agy");
     assert!(!argv.iter().any(|a| a == "--verbose"), "operator connector arg must not reach agy fleet argv: {argv:?}");
     assert!(bin == "/pinned/agy" || argv.iter().any(|a| a == "/pinned/agy"), "pinned binary must appear: {bin} {argv:?}");
+    // D-049: the member's own limit, not the 900 s consult default, and inside the activity's.
+    // RED IF the fleet arm falls back to agy_connector_timeout().
+    let limit = fleet::orchestrator::fleet_agy_timeout();
+    assert!(limit < fleet::orchestrator::MEMBER_WALL_LIMIT && limit > std::time::Duration::from_secs(900));
+    assert_eq!(value_after(&argv, "--print-timeout"), vec![format!("{}s", limit.as_secs())], "{argv:?}");
 
     // Not a worktree at all, or not on a fleet branch: refuse, never launch uncommittable.
     assert!(fleet::orchestrator::fleet_agent_command("codex", tmp.path(), "task").is_err());

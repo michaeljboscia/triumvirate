@@ -163,7 +163,7 @@ impl RunWorkerProbeWorkflow {
 /// fires only when the first was lost (a dead daemon), and that attempt adopts rather than reruns.
 /// The heartbeat timeout is how a dead daemon is noticed, and how cancellation reaches the activity.
 pub fn run_worker_options() -> ActivityOptions {
-    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(4 * 3600))
+    ActivityOptions::with_start_to_close_timeout(fleet::orchestrator::MEMBER_WALL_LIMIT)
         .heartbeat_timeout(Duration::from_secs(20))
         .retry_policy(
             temporalio_common::RetryPolicy::builder()
