@@ -1,6 +1,27 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use shared_types::GitOps;
+
+/// Where a fleet member's cargo builds go: `CARGO_TARGET_DIR` for its agent, on both engines.
+/// A path WE chose, inside the worktree (so a sandboxed agent may write it) and under the
+/// ignored `.triumvirate/`, so the member's exit can delete it without guessing which `target/`
+/// directories in someone else's repo are build output. D-048: each member used to build into
+/// its own `daemon/target` (1 to 5 GB) and nothing removed it; ten fleets filled the disk.
+pub fn member_target_dir(worktree: &Path) -> PathBuf {
+    worktree.join(".triumvirate").join("target")
+}
+
+/// Delete a finished member's build output. The worktree and its branch stay (they are the
+/// deliverable). Nothing after the agent exits builds in the worktree, so nothing needs it.
+/// Never fails the member: a leftover is logged, and the next exit tries again.
+pub fn remove_member_target(worktree: &Path) {
+    let dir = member_target_dir(worktree);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "fleet member build output was not removed (D-048)"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WorktreeManager<G: GitOps> {

@@ -143,6 +143,7 @@ pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
     cmd.args(&args.command[1..])
         .current_dir(&args.worktree)
         .env("TRIUMVIRATE_PROJECT_ROOT", &args.project_root)
+        .env("CARGO_TARGET_DIR", crate::worktree::member_target_dir(&args.worktree))
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
@@ -189,6 +190,9 @@ pub fn run(args: &ShimArgs) -> anyhow::Result<i32> {
     if let Some(dir) = path.parent() {
         File::open(dir)?.sync_all()?;
     }
+    // After the done record, never before: a shim killed during a multi-GB delete must still
+    // leave the record, or a retry would run finished work again (D-048).
+    crate::worktree::remove_member_target(&args.worktree);
     Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
 }
 

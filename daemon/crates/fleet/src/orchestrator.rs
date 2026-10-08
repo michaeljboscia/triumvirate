@@ -96,6 +96,7 @@ impl AgentLauncher for DaemonAgentLauncher {
             .args(&args)
             .current_dir(worktree_path)
             .env("TRIUMVIRATE_PROJECT_ROOT", project_root.as_os_str())
+            .env("CARGO_TARGET_DIR", crate::worktree::member_target_dir(worktree_path))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -672,6 +673,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         };
                         let worker_ctx = WorkerContext {
                             project_root: &project_root,
+                            worktree: &worktree_path,
                             fleet_id: &fleet_id,
                             task_id: &task_id,
                             agent: &launch_agent,
@@ -827,6 +829,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             // cancel (Grok, review of step 6).
                                             let degrade_ctx = WorkerContext {
                                                 project_root: &project_root,
+                                                worktree: &worktree_path,
                                                 fleet_id: &fleet_id,
                                                 task_id: &task_id,
                                                 agent: "codex",
@@ -1688,6 +1691,8 @@ impl Drop for FleetChildRegistration {
 /// Which worker a wait is for: where its token goes and what it is called in the record.
 pub(crate) struct WorkerContext<'a> {
     pub project_root: &'a Path,
+    /// The member worktree; its build output is removed when the worker exits (D-048).
+    pub worktree: &'a Path,
     pub fleet_id: &'a str,
     pub task_id: &'a str,
     pub agent: &'a str,
@@ -1835,6 +1840,9 @@ async fn wait_fleet_child(
         longest.as_millis() as u64,
         window.map(|w| w.as_secs()),
     );
+    // Gigabytes: off the async runtime.
+    let worktree = ctx.worktree.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || crate::worktree::remove_member_target(&worktree)).await;
     WorkerExit {
         result: wait_result,
         stdout_tail: bounded(stdout_tail).await,
@@ -3424,6 +3432,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = super::WorkerContext {
             project_root: dir.path(),
+            worktree: dir.path(),
             fleet_id: "fleet-silent",
             task_id: "fleet-silent-T-001",
             agent: "stallstub",
@@ -3445,6 +3454,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = super::WorkerContext {
             project_root: dir.path(),
+            worktree: dir.path(),
             fleet_id: "fleet-chatty",
             task_id: "fleet-chatty-T-001",
             agent: "chattystub",
@@ -3454,6 +3464,30 @@ mod tests {
         assert!(matches!(&exit.result, Ok(s) if s.success()));
         assert!(exit.longest_silence < Duration::from_millis(900), "got {:?}", exit.longest_silence);
         assert!(exit.stdout_tail.contains("tick"));
+    }
+
+    /// D-048, legacy engine: once a worker exits, its build dir is gone and a `target/` the
+    /// fleet did not name is left alone. RED IF: the wait leaves the member's build output on
+    /// disk, or the cleanup deletes anything outside `member_target_dir`.
+    #[tokio::test]
+    async fn a_finished_worker_leaves_no_build_output_and_nothing_else_is_touched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worktree = dir.path().join("wt");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let ctx = super::WorkerContext {
+            project_root: dir.path(),
+            worktree: &worktree,
+            fleet_id: "fleet-d048",
+            task_id: "fleet-d048-T-001",
+            agent: "d048stub",
+        };
+        let ours = crate::worktree::member_target_dir(&worktree);
+        let script = format!("mkdir -p {}/debug target && touch {}/debug/big target/keep", ours.display(), ours.display());
+        let child = piped_worker(&script, &worktree);
+        let exit = super::wait_fleet_child(child, &ctx, Duration::from_secs(30), "limit").await;
+        assert!(matches!(&exit.result, Ok(s) if s.success()), "{:?}", exit.result);
+        assert!(!ours.exists(), "the member's build output must be removed: {}", ours.display());
+        assert!(worktree.join("target/keep").exists(), "a target/ the fleet did not name must stay");
     }
 
     /// The restart index is required. RED IF: a spawn whose fleets.json write fails launches

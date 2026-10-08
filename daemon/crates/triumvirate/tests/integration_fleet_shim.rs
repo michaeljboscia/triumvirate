@@ -142,3 +142,27 @@ fn a_stale_done_record_is_cleared_before_the_agent_runs() {
     worker_token::signal_group(t.pgid, libc::SIGKILL).expect("cleanup");
     let _ = child.wait();
 }
+
+/// D-048: the agent builds into the target dir the shim names, and that dir is gone once the
+/// shim is done, while the done record is still written. The twin: a `target/` the agent made
+/// on its own in the worktree is the repo's business and stays.
+/// RED IF: CARGO_TARGET_DIR is unset or points elsewhere, the build output survives the
+/// member, or the cleanup reaches outside the dir the shim chose.
+#[test]
+fn the_member_build_dir_is_named_by_the_shim_and_removed_after_the_done_record() {
+    let fx = fixture();
+    let seen = fx.root.join("seen-target");
+    let script = format!(
+        "printf %s \"$CARGO_TARGET_DIR\" > {seen}; mkdir -p \"$CARGO_TARGET_DIR/debug\" target; \
+         head -c 65536 /dev/zero > \"$CARGO_TARGET_DIR/debug/big\"; touch target/keep",
+        seen = seen.display()
+    );
+    let status = start(&fx, &script).wait().expect("wait");
+    assert_eq!(status.code(), Some(0));
+
+    let expected = fleet::worktree::member_target_dir(&fx.worktree);
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), expected.display().to_string());
+    assert!(!expected.exists(), "the member's build output must be removed: {}", expected.display());
+    assert!(fx.worktree.join("target/keep").exists(), "a target/ the shim did not name must stay");
+    assert!(shim::read_done(&fx.root, FLEET, TASK).unwrap().is_some(), "the done record is still written");
+}
