@@ -105,7 +105,7 @@ impl GeminiStreamParser {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 let args_json = json.get("parameters").map(|v| v.to_string());
-                self.tool_calls.push(ToolCallRecord { returned_lines: None,
+                self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
                     id: json.get("tool_id").and_then(|v| v.as_str()).map(ToString::to_string),
                     tool: tool_name.to_string(),
                     // D-010: a `bash` call that reads a file is a read for the sight gate.

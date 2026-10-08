@@ -25,7 +25,7 @@ pub use markers::{ToolCallRequest, parse_tool_call_marker};
 pub use stuck::{StuckDetector, StuckReason};
 pub use types::{
     AgentVerbosity, ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState,
-    numbered_line_span,
+    numbered_line_runs,
     WorkingStateEvent, should_display,
 };
 

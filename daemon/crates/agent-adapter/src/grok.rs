@@ -256,7 +256,7 @@ impl GrokStreamParser {
                 );
                 let args_json = json.get("rawInput").map(|v| v.to_string());
 
-                self.tool_calls.push(ToolCallRecord { returned_lines: None,
+                self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
                     id: json.get("toolCallId").and_then(Value::as_str).map(str::to_string),
                     tool: tool.clone(),
                     kind: kind.clone(),
@@ -342,7 +342,7 @@ impl GrokStreamParser {
                                     .join("\n")
                             })
                             .unwrap_or_default();
-                        self.tool_calls[idx].returned_lines = crate::types::numbered_line_span(&text);
+                        self.tool_calls[idx].returned_lines = crate::types::numbered_line_runs(&text);
                     }
                 }
                 let kind = target
@@ -832,7 +832,7 @@ mod tests {
         // rawInput uses `target_file`, not the `path` the vendor guide's example showed.
         assert!(c.args_json.as_deref().unwrap_or("").contains("target_file"));
         // D-032: the real result is `1→ZEPHYR_MARKER_9931`, one numbered line.
-        assert_eq!(c.returned_lines, Some((1, 1)), "the span the read actually returned");
+        assert_eq!(c.returned_lines, vec![(1, 1)], "the span the read actually returned");
         assert!(r.response_text.contains("ZEPHYR_MARKER_9931"), "the tool result reached the answer");
         assert_eq!(full.termination, Termination::EndTurn);
     }

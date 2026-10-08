@@ -237,7 +237,7 @@ impl ClaudeStreamParser {
                     if let Some(ref id) = id {
                         self.pending.insert(id.clone(), self.tool_calls.len());
                     }
-                    self.tool_calls.push(ToolCallRecord { returned_lines: None,
+                    self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
                         id: id.clone(),
                         // D-010: a `Bash` call that reads a file is a read for the sight gate.
                         kind: crate::codex::shell_read_kind(tool_kind(&name), block.get("input")),
@@ -311,7 +311,7 @@ impl ClaudeStreamParser {
                             .join("\n"),
                         _ => String::new(),
                     };
-                    rec.returned_lines = crate::types::numbered_line_span(&text);
+                    rec.returned_lines = crate::types::numbered_line_runs(&text);
                 }
                 let detail = format!(
                     "claude {} {}",
@@ -473,7 +473,7 @@ mod tests {
              mark every successful read as failed and reject every review"
         );
         // D-032: the captured result is `1\t##`, one numbered line.
-        assert_eq!(call.returned_lines, Some((1, 1)), "the span the Read actually returned");
+        assert_eq!(call.returned_lines, vec![(1, 1)], "the span the Read actually returned");
         assert!(
             call.args_json.as_deref().unwrap_or("").contains("/etc/hosts"),
             "the path must survive into args_json or required_sources can never match it"
