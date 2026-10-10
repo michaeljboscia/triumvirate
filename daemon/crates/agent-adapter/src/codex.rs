@@ -28,23 +28,9 @@ pub struct CodexExecParser {
 /// a single quoted string is left alone, so anything unusual falls through to the caller's
 /// fail-closed checks.
 fn unwrap_shell_wrapper(cmd: &str) -> &str {
-    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
-    let mut it = cmd.split_whitespace();
-    let Some(program) = it.next() else {
+    let Some(rest) = shell_c_script(cmd) else {
         return cmd;
     };
-    let base = program.rsplit('/').next().unwrap_or(program);
-    if !SHELLS.contains(&base) {
-        return cmd;
-    }
-    // The flag bundle must be a -c form: -c, -lc, -lic, -ic.
-    let Some(flag) = it.next() else {
-        return cmd;
-    };
-    if !(flag.starts_with('-') && flag.ends_with('c')) {
-        return cmd;
-    }
-    let rest = cmd[cmd.find(flag).map(|i| i + flag.len()).unwrap_or(cmd.len())..].trim();
     // Only a single fully-quoted script is unwrapped; anything else stays as-is and is then
     // rejected by the caller's compound/redirection checks.
     for q in ['\'', '"'] {
@@ -56,6 +42,73 @@ fn unwrap_shell_wrapper(cmd: &str) -> &str {
         }
     }
     cmd
+}
+
+/// The raw script word of `SHELL -c SCRIPT` (also `-lc`, `-lic`, `-ic`), quotes still on, or None
+/// when `cmd` is not that shape.
+fn shell_c_script(cmd: &str) -> Option<&str> {
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+    let mut it = cmd.split_whitespace();
+    let program = it.next()?;
+    let base = program.rsplit('/').next().unwrap_or(program);
+    if !SHELLS.contains(&base) {
+        return None;
+    }
+    let flag = it.next()?;
+    if !(flag.starts_with('-') && flag.ends_with('c')) {
+        return None;
+    }
+    Some(cmd[cmd.find(flag).map(|i| i + flag.len()).unwrap_or(cmd.len())..].trim())
+}
+
+/// A recorded shell command with codex's adjacent-quote rendering of its `-c` script undone.
+///
+/// Codex records the argv `["/bin/zsh", "-lc", "sed -n '1,$p' F"]` as
+/// `/bin/zsh -lc "sed -n '1,"'$p'"' F"`: three adjacent quoted pieces, which the single-string
+/// unwrap cannot see through, so five live reads of that shape were rejected "never opened"
+/// (2026-09-16 x3, 09-27, 10-09). When the script is such a word, the joined script is returned
+/// in place of the whole command; `unwrap_shell_wrapper` on the result is then the identity.
+/// Anything else is returned unchanged.
+pub fn normalize_wrapped_script(cmd: String) -> String {
+    let Some(rest) = shell_c_script(&cmd) else {
+        return cmd;
+    };
+    if unwrap_shell_wrapper(&cmd).len() != cmd.len() {
+        return cmd; // the plain single-string unwrap already handles it
+    }
+    join_adjacent_quotes(rest).unwrap_or(cmd)
+}
+
+/// One shell word made only of `'...'` pieces (literal) and `"..."` pieces, joined the way the
+/// shell joins them. A double-quoted piece may use only the `\"`, `\\`, `\$` and `` \` ``
+/// escapes and may contain no unescaped `$` or backtick: an expansion's result is not knowable
+/// here. A bare character, whitespace between pieces, or an unterminated piece gives None.
+fn join_adjacent_quotes(word: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    ch => out.push(ch),
+                }
+            },
+            '"' => loop {
+                match chars.next()? {
+                    '"' => break,
+                    '$' | '`' => return None,
+                    '\\' => match chars.next()? {
+                        e @ ('"' | '\\' | '$' | '`') => out.push(e),
+                        _ => return None,
+                    },
+                    ch => out.push(ch),
+                }
+            },
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Does this shell command READ file contents, as opposed to merely naming a path?
@@ -297,7 +350,7 @@ pub fn shell_command_from_value(args: Option<&serde_json::Value>) -> Option<Stri
     v.get("command")
         .or_else(|| v.get("CommandLine"))
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+        .map(|c| normalize_wrapped_script(c.to_string()))
 }
 
 /// Same, from the JSON string a `ToolCallRecord` carries.
@@ -800,7 +853,7 @@ impl CodexExecParser {
                         tool: "command_execution".to_string(),
                         // A pure content reader is classified as a READ so codex can satisfy
                         // `required_sources`. Everything else stays Bash and cannot.
-                        kind: if command_reads_file_contents(command) {
+                        kind: if command_reads_file_contents(&normalize_wrapped_script(command.to_string())) {
                             ToolKind::ReadFile
                         } else {
                             ToolKind::Bash
@@ -1193,6 +1246,35 @@ mod command_classification_tests {
             .all(|r| r.operand == "/repo/b.rs"));
         // And a chain whose every link is a non-reader stays closed.
         assert!(!command_reads_file_contents("ls /repo && wc -l /repo/a.rs"));
+    }
+
+    /// Codex's own rendering of `sed -n '1,$p' F`, from five live rejections, reaches the parsers
+    /// joined; expansions never do. RED IF: the live shape stops being a read, or an expansion
+    /// inside a double-quoted piece is joined.
+    #[test]
+    fn codex_03e_adjacent_quoted_pieces_join_like_the_shell_and_expansions_do_not() {
+        let live = r#"/bin/zsh -lc "sed -n '1,"'$p'"' /r/dist/index.html""#;
+        let cmd = shell_command_from_value(Some(&serde_json::json!({ "command": live }))).unwrap();
+        assert_eq!(cmd, "sed -n '1,$p' /r/dist/index.html");
+        assert_eq!(command_read_ranges(&cmd)[0].range, LineRange { start: 1, end: None });
+        assert!(command_reads_file_contents(&normalize_wrapped_script(live.to_string())));
+        let mut p = CodexExecParser::new();
+        let line = serde_json::json!({"type":"item.started","item":{"type":"command_execution","id":"c1","command": live}});
+        p.parse_line(&line.to_string());
+        assert_eq!(p.finish().tool_calls[0].kind, ToolKind::ReadFile, "the parser classifies it too");
+        assert_eq!(join_adjacent_quotes(r#""a "'b'"\"c\"""#).as_deref(), Some(r#"a b"c""#));
+        for refused in [
+            r#""cat "$SRC"#,
+            r#""cat $(echo /r/a)""#,
+            r#""cat `echo /r/a`""#,
+            r#""sed -n '1,"'$p'"' /r/a" extra"#,
+            r#""unterminated"#,
+            r#""bad \q escape""#,
+        ] {
+            assert!(join_adjacent_quotes(refused).is_none(), "joined: {refused}");
+        }
+        let expanding = r#"/bin/zsh -lc "cat "$SRC"""#;
+        assert_eq!(normalize_wrapped_script(expanding.to_string()), expanding, "left wrapped, fails closed");
     }
 
     /// The parser must actually apply the classification, not just define it.
