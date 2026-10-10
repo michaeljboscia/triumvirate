@@ -240,8 +240,66 @@ pub const COLLAB_TOOL: &str = "collab_tool_call";
 /// Splitting changes only which text each parser sees. Every segment goes through the same
 /// unchanged parser, which still refuses a redirect, a comment, a subshell, a backtick, a
 /// single `&`, and a second operand, so no D-010 shape survives the split.
+///
+/// A chain whose links might not RUN, or might not run the program they name, is not split, so
+/// it comes back whole and every read parser refuses it. `exit 0 && cat SRC` exits zero without
+/// reading; `cd /elsewhere && cat a.rs` reads a different `a.rs`; `cat() { :; } && cat SRC`
+/// runs a function. All three passed the gate before this guard.
 pub fn and_chain_segments(command: &str) -> Vec<&str> {
+    if chain_links_are_unprovable(command) {
+        return vec![command.trim()];
+    }
     split_unquoted(command, b"&&")
+}
+
+/// Does `command` contain anything that makes "this link ran this program on this operand"
+/// unprovable from the text: a heredoc, a line continuation, an unquoted subshell or brace
+/// group, or a link (at `&&`, `;` or a newline) starting with a reserved word, a builtin that
+/// changes what later links do or mean, a negation, or an assignment?
+fn chain_links_are_unprovable(command: &str) -> bool {
+    const UNSAFE_FIRST_WORDS: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until",
+        "do", "done", "function", "time", "coproc", "exit", "return", "exec", "break",
+        "continue", "eval", "source", ".", "alias", "unalias", "cd", "pushd", "popd", "set",
+        "shopt", "setopt", "trap", "kill", "builtin", "command", "enable", "hash", "export",
+        "unset", "declare", "typeset", "local", "readonly", "!", "[[", "{", "}",
+    ];
+    if command.contains("<<") || command.contains("\\\n") {
+        return true;
+    }
+    let bytes = command.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut link_start = 0usize;
+    let mut links: Vec<&str> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' | b')' | b'{' | b'}' => return true,
+                b';' | b'\n' => {
+                    links.push(&command[link_start..i]);
+                    link_start = i + 1;
+                }
+                b'&' if bytes.get(i + 1) == Some(&b'&') => {
+                    links.push(&command[link_start..i]);
+                    i += 2;
+                    link_start = i;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    links.push(&command[link_start..]);
+    links.iter().any(|l| {
+        let first = l.split_whitespace().next().unwrap_or("");
+        UNSAFE_FIRST_WORDS.contains(&first) || first.contains('=')
+    })
 }
 
 /// The segments of `command` separated by `sep` outside quotes. An unterminated quote returns
@@ -1335,6 +1393,35 @@ mod command_classification_tests {
         ] {
             assert!(command_read_range(refused).is_none(), "accepted: {refused}");
         }
+    }
+
+    /// Links that might not run, or might not run what they name, are never split out of an
+    /// `&&` chain. RED IF: any of these yields a whole-file read or a window.
+    #[test]
+    fn codex_03g_an_and_chain_whose_links_are_unprovable_is_not_split() {
+        for c in [
+            "exit 0 && cat /r/src",
+            "return 0 && cat /r/src",
+            "exec true && cat /r/src",
+            "cd /elsewhere && cat src",
+            "pushd /elsewhere && cat src",
+            "cat() { :; } && cat /r/src",
+            "alias cat=true && cat /r/src",
+            "export PATH=/tmp/evil && cat /r/src",
+            "PATH=/tmp/evil && cat /r/src",
+            "if true; then exit 0; fi && cat /r/src",
+            "(exit 0) && cat /r/src",
+            "python3 - <<'PY' && cat /r/src",
+            "true \\\n && cat /r/src",
+            "exit 0 && sed -n '1,9p' /r/src",
+        ] {
+            assert!(whole_file_read_operands(c).is_empty(), "whole read in: {c}");
+            assert!(command_read_ranges(c).is_empty(), "window in: {c}");
+        }
+        // Codex's real chains are unaffected.
+        assert_eq!(whole_file_read_operands("wc -l /r/a && cat /r/a"), vec!["/r/a"]);
+        assert_eq!(command_read_ranges("wc -l /r/a && sed -n '1,9p' /r/a").len(), 1);
+        assert_eq!(command_read_ranges("/bin/zsh -lc \"sed -n '1,9p' /r/a; sed -n '10,19p' /r/a\"").len(), 2, "D-036 intact");
     }
 
     /// The parser must actually apply the classification, not just define it.
