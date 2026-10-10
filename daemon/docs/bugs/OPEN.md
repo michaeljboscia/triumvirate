@@ -19,6 +19,31 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+### D-053 - Every grok review that reads with `read_file` is rejected as PART
+**Found:** 2026-10-10 (peer review of feat/sight-salvage-main) · **Severity:** HIGH · **FIX ON BRANCH, NOT MERGED** (2d1106d)
+**Evidence:** grok read a 445-line file with `read_file` and no offset or limit; the gate said "only read PART" with receipt `read this turn as [{"target_file":...}]`. A direct capture (`daemon/crates/agent-adapter/tests/fixtures/grok-1.0.46-read445-20261010.jsonl`) shows grok 1.0.46 numbers only line 1 and every tenth line, so D-032's `numbered_line_runs` credited 45 single lines. D-032's fixtures are grok 1.0.13 reads of a one-line file.
+**CHECK to close:** on main, a source-gated grok review that reads its source once with `read_file` passes the gate.
+
+### D-054 - Test runs write REJECTED rows into the production outbox
+**Found:** 2026-10-10 · **Severity:** LOW · **NOT FIXED**
+**Evidence:** 52 of 271 REJECTED rows in `~/.triumvirate/outbox.jsonl` (2026-09-01 to 2026-10-09) name sources under `/private/var/folders/.../T/.tmp*/`, which are test temp dirs. They inflate every rejection count read from the outbox.
+**CHECK to close:** `cargo test --workspace` leaves `~/.triumvirate/outbox.jsonl` byte-identical.
+
+### D-055 - A sight rejection keeps 600 characters and no tool calls
+**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (9ad3299)
+**Evidence:** both success arms returned `err` plus `response_text.chars().take(600)`; tool calls were never kept, so no rejection could be replayed against a corrected gate. This branch's own codex review lost everything after its first finding that way.
+**CHECK to close:** on main, a rejected review leaves `~/.triumvirate/rejected/<id>-<uuid>.json` holding the full reply and every tool call, and the error names it.
+
+### D-056 - Three shell read shapes codex really uses are not counted
+**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6bbce82, 68f3fe2)
+**Evidence:** (a) codex records `sed -n '1,$p' F` as `/bin/zsh -lc "sed -n '1,"'$p'"' F"`, which the unwrapper could not see through: 5 rejections (09-16 x3, 09-27, 10-09). (b) `sed -n 'a,bp' F | nl -ba -va` was not a recognised shape: this branch's codex review, reading every line of 654, was rejected. (c, NOT fixed) `cat A; echo ...; cat B` and newline-separated reads of different files are still refused; a design that marks links before `;` as masked was drafted and Antigravity found `false && cat F ; true` against it, so it was not ported.
+**CHECK to close:** (a) and (b) on main: the live shapes satisfy the gate. (c) stays open.
+
+### D-057 - The `&&` split credits links that never ran or ran something else
+**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6d979fd)
+**Evidence:** `exit 0 && cat SRC`, `cd /elsewhere && cat a.rs` and `cat() { :; } && cat SRC` each satisfied a source under D-017's split. None appears in the outbox, so nothing live was exploited.
+**CHECK to close:** on main, `codex_03g_an_and_chain_whose_links_are_unprovable_is_not_split` passes and fails with the guard disabled.
+
 ### D-052 - A fleet member that hits its timeout is recorded as "exited 0 without committing"
 **Found:** 2026-10-08 (closing D-049) · **Severity:** LOW · **NOT FIXED**
 **Evidence:** agy prints `[agy] print timeout after ...; returning partial output` and exits 0. The fleet then records the member failed with `agent exited 0 without committing: its branch head ... is not a new commit` (`fleet/src/orchestrator.rs:2135`). True, but it hides why: the reader cannot tell a timeout from an agent that chose not to commit.
@@ -448,4 +473,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-10-08 11:55 ET (D-032, D-039, D-048, D-049, D-050, D-051 closed: PRs #74 to #78 merged and installed on main 9bb3556, D-048 by a 10-fleet live check, D-039 by a Mac setting; D-052 added).
+**Last reviewed:** 2026-10-10 ET (D-053 to D-057 added from the sight-gate rejection analysis; fixes on feat/sight-salvage-main, not merged). Previous: 2026-10-08 11:55 ET (D-032, D-039, D-048, D-049, D-050, D-051 closed: PRs #74 to #78 merged and installed on main 9bb3556, D-048 by a 10-fleet live check, D-039 by a Mac setting; D-052 added).
