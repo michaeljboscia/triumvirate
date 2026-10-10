@@ -1,8 +1,22 @@
 # Sight gate: keep the first answer, reject less
 
 **Working Directory:** /Users/michaelboscia/projects/triumvirate
-**Git Branch:** feat/wiki-adoption
-**Status:** proposal, nothing built
+**Git Branch:** feat/sight-salvage-main (worktree /Users/michaelboscia/projects/triumvirate-sight-salvage), based on origin/main 8d147d8
+**Status:** Part 1 and most of 2a built; see "Correction" and "What was built" below
+
+## Correction, 2026-10-10
+
+The first draft of this brief and its first four commits were made on feat/wiki-adoption, 138 commits behind main. main had already fixed two of the buckets below: D-028 unions read_file windows, D-032 credits only the lines a read RETURNED (and sizes shell reads against a 30,000-byte output budget), and D-036 counts `;`-joined sed windows on one file. The rejection rows below predate those fixes. The work was redone on a branch from origin/main; what follows "What was built" is current.
+
+## What was built (feat/sight-salvage-main)
+
+- 9ad3299 D-055: a rejection saves the whole turn (reply and tool calls) to `~/.triumvirate/rejected/<id>-<uuid>.json`.
+- 6bbce82 D-056a: codex's adjacent-quote rendering of a `-c` script is joined.
+- 68f3fe2 D-056b: `sed -n 'a,bp' F | nl -ba -va` is a window on F.
+- 6d979fd D-057: an `&&` chain whose links might not run is not split.
+- 2d1106d D-053: grok 1.0.46 numbers every tenth line; a read is credited by its returned span when the shown text agrees.
+
+Not built: D-056c (`cat A; echo; cat B` and newline sequences of different files; Antigravity's `false && cat F ; true` defeats the masked-link draft), 2b (repair turn), 2c (sight contract in the brief), D-054 (test rows in the production outbox).
 
 ## The data (from /Users/michaelboscia/.triumvirate/outbox.jsonl, REJECTED rows, 2026-09-01 to 2026-10-09)
 
