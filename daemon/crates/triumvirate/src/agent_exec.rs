@@ -6726,6 +6726,37 @@ mod sight_gate_tests {
         assert!(msg.contains("--- rejected output, for inspection, NOT a review ---\nbody"), "{msg}");
     }
 
+    /// The codex review of this very change, rejected live on 2026-10-10: four windows read as
+    /// `sed -n 'a,bp' F | nl -ba -va`, covering 1-654. RED IF: that read stops satisfying the
+    /// source, or dropping a window still passes.
+    #[test]
+    fn codex_sed_then_nl_windows_from_the_live_rejection_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("agent-exec.patch");
+        let body: String = (1..=654).map(|i| format!("+    line {i} of the frozen review diff\n")).collect();
+        std::fs::write(&src, body).unwrap();
+        let src = src.display().to_string();
+        let cwd = dir.path().display().to_string();
+        let call = |a: u64, b: u64| {
+            let args = serde_json::json!({ "command": format!("/bin/zsh -lc \"sed -n '{a},{b}p' {src} | nl -ba -v{a}\"") });
+            ToolCallRecord {
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+                returned_lines: Vec::new(),
+            }
+        };
+        let all = [call(181, 360), call(1, 180), call(361, 540), call(541, 654)];
+        let mut lc = Vec::new();
+        enforce_reviewer_sight("Codex", &all, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect("four windows cover 1-654");
+        let mut lc = Vec::new();
+        assert!(enforce_reviewer_sight("Codex", &all[..3], "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc).is_err());
+    }
+
     /// Both success arms build their rejection through the one helper. RED IF: an arm goes back
     /// to formatting its own preview, which is how one surface gets the fix and the other not.
     #[test]

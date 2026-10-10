@@ -438,12 +438,49 @@ pub fn command_read_range(command: &str) -> Option<RangedRead> {
             Some(RangedRead { range, operand: operand?, via_nl: false, decoration: Decoration::default() })
         }
         [reader, filter] => {
-            let (operand, via_nl, decoration) = whole_file_reader_with_one_operand(reader)?;
-            let (range, _) = sed_range_stage(filter, false)?;
-            Some(RangedRead { range, operand, via_nl, decoration })
+            if let Some((operand, via_nl, decoration)) = whole_file_reader_with_one_operand(reader) {
+                let (range, _) = sed_range_stage(filter, false)?;
+                return Some(RangedRead { range, operand, via_nl, decoration });
+            }
+            // The other order, codex's habit since at least 2026-10-10:
+            // `sed -n '181,360p' F | nl -ba -v181`. Rejected live as "no read the parser
+            // recognises" on a review that read every line.
+            let (range, operand) = sed_range_stage(reader, true)?;
+            let decoration = nl_numbering_filter(filter, range.start)?;
+            Some(RangedRead { range, operand: operand?, via_nl: true, decoration })
         }
         _ => None,
     }
+}
+
+/// `nl` as the SECOND stage of `sed -n 'N,Mp' FILE | nl ...`: it numbers what sed printed and
+/// opens nothing itself, so it may have NO operand (one would be read in place of stdin).
+/// Flags: `-ba`/`-bt`/`-bn`, `-w<n>` with n at least 1, and `-v<k>` only with k at most N. The
+/// budget bounds a numbered line by its SOURCE line number; a start number above N would print
+/// wider numbers than that bound assumes. `nl` drops logical-page delimiter lines, so the read
+/// is marked `via_nl` and the gate refuses it on a file that has one.
+fn nl_numbering_filter(stage: &str, window_start: u64) -> Option<Decoration> {
+    let mut toks = stage.split_whitespace();
+    let program = toks.next()?;
+    if program.rsplit('/').next().unwrap_or(program) != "nl" {
+        return None;
+    }
+    let mut decoration = Decoration { number_width: Some(6), ..Decoration::default() };
+    for tok in toks {
+        if matches!(tok, "-ba" | "-bt" | "-bn") {
+            continue;
+        }
+        if let Some(w) = tok.strip_prefix("-w") {
+            decoration.number_width = Some(w.parse::<u64>().ok().filter(|n| *n > 0)?);
+            continue;
+        }
+        if let Some(k) = tok.strip_prefix("-v") {
+            k.parse::<u64>().ok().filter(|k| *k <= window_start)?;
+            continue;
+        }
+        return None;
+    }
+    Some(decoration)
 }
 
 /// A ranged read, with the ONE operand it read, so the gate can bind the window to the file
@@ -1275,6 +1312,29 @@ mod command_classification_tests {
         }
         let expanding = r#"/bin/zsh -lc "cat "$SRC"""#;
         assert_eq!(normalize_wrapped_script(expanding.to_string()), expanding, "left wrapped, fails closed");
+    }
+
+    /// Codex's live read shape on 2026-10-10, `sed -n 'a,bp' F | nl -ba -va`, is a window on F.
+    /// RED IF: it stops parsing, nl gains an operand or an unvetted flag, or `-v` above the
+    /// window start is accepted.
+    #[test]
+    fn codex_03f_sed_then_nl_is_a_window_and_nl_opens_nothing() {
+        let live = r#"/bin/zsh -lc "sed -n '181,360p' /r/a.patch | nl -ba -v181""#;
+        let r = command_read_range(live).expect("live shape");
+        assert_eq!((r.range, r.operand.as_str(), r.via_nl), (LineRange { start: 181, end: Some(360) }, "/r/a.patch", true));
+        assert!(command_reads_file_contents(live));
+        assert!(command_read_range("sed -n '1,9p' /r/a | nl").is_some());
+        for refused in [
+            "sed -n '1,9p' /r/a | nl /r/other",
+            "sed -n '1,9p' /r/a | nl -s, ",
+            "sed -n '10,19p' /r/a | nl -v11",
+            "sed -n '1,9p' /r/a | nl -w0",
+            "sed -n '1,9p' /r/a | nl -i2",
+            "sed -n '1,9p' /r/a | tail -1",
+            "sed -n '1,9p' | nl",
+        ] {
+            assert!(command_read_range(refused).is_none(), "accepted: {refused}");
+        }
     }
 
     /// The parser must actually apply the classification, not just define it.
