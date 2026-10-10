@@ -66,18 +66,18 @@ pub struct ToolCallRecord {
 /// counts when, after leading spaces, it starts with digits followed by `→` (grok) or a tab
 /// (claude). Lines 1 and 100 alone are two runs, never 1..100 (Codex, panel review). Empty
 /// when no line is numbered, so an unnumbered result never invents a range.
+/// The line number a read tool printed at the start of `line` (`N→text`, `N\ttext`), if any.
+pub fn line_number_marker(line: &str) -> Option<u64> {
+    let t = line.trim_start_matches(' ');
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = &t[digits..];
+    (digits > 0 && (rest.starts_with('→') || rest.starts_with('\t')))
+        .then(|| t[..digits].parse::<u64>().ok())
+        .flatten()
+}
+
 pub fn numbered_line_runs(text: &str) -> Vec<(u64, u64)> {
-    let mut seen: Vec<u64> = text
-        .lines()
-        .filter_map(|line| {
-            let t = line.trim_start_matches(' ');
-            let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-            let rest = &t[digits..];
-            (digits > 0 && (rest.starts_with('→') || rest.starts_with('\t')))
-                .then(|| t[..digits].parse::<u64>().ok())
-                .flatten()
-        })
-        .collect();
+    let mut seen: Vec<u64> = text.lines().filter_map(line_number_marker).collect();
     seen.sort_unstable();
     seen.dedup();
     let mut runs: Vec<(u64, u64)> = Vec::new();

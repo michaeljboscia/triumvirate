@@ -109,6 +109,51 @@ fn map_tool_kind(kind: Option<&str>, tool_name: &str) -> ToolKind {
     }
 }
 
+/// The lines a completed grok `read_file` returned.
+///
+/// grok 1.0.46 numbers only line 1 and every tenth line of a read (`1→`, `10→`, `20→`, ...),
+/// captured 2026-10-10 in `tests/fixtures/grok-1.0.46-read445-20261010.jsonl`. D-032 was built on
+/// 1.0.13, which numbered every line, so a whole read of a 445-line file was credited 45 single
+/// lines and every source-gated grok review that used `read_file` was rejected as PART.
+///
+/// The same update carries `rawOutput.FileContent`: the tool's own `offset` (1-based, "offset
+/// must be >= 1") and `raw_output`, the exact text returned, unnumbered. The span is
+/// `offset .. offset + lines(raw_output) - 1`, and it is used only when the numbered text the
+/// MODEL saw agrees with it: it has at least that many lines, its first line is marked `offset`,
+/// and every marker in it sits exactly where that span puts it. Anything else falls back to the
+/// numbered lines alone, which is what D-032 credited before.
+fn grok_returned_lines(update: &Value, shown: &str) -> Vec<(u64, u64)> {
+    let numbered = crate::types::numbered_line_runs(shown);
+    let Some(fc) = update.get("rawOutput").and_then(|r| r.get("FileContent")) else {
+        return numbered;
+    };
+    let Some(raw) = fc.get("raw_output").and_then(Value::as_str) else {
+        return numbered;
+    };
+    let start = match fc.get("offset") {
+        None | Some(Value::Null) => 1,
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= 1 => n,
+            _ => return numbered,
+        },
+    };
+    let n = raw.lines().count() as u64;
+    let shown_lines: Vec<&str> = shown.lines().collect();
+    if n == 0 || (shown_lines.len() as u64) < n {
+        return numbered;
+    }
+    if crate::types::line_number_marker(shown_lines[0]) != Some(start) {
+        return numbered;
+    }
+    let consistent = shown_lines.iter().take(n as usize).enumerate().all(|(i, l)| {
+        crate::types::line_number_marker(l).is_none_or(|k| k == start + i as u64)
+    });
+    if !consistent {
+        return numbered;
+    }
+    vec![(start, start + n - 1)]
+}
+
 /// Grok's shell tools. The gate's whole-vs-partial read logic keys on the tool name.
 pub fn is_shell_tool(tool_name: &str) -> bool {
     matches!(
@@ -342,7 +387,7 @@ impl GrokStreamParser {
                                     .join("\n")
                             })
                             .unwrap_or_default();
-                        self.tool_calls[idx].returned_lines = crate::types::numbered_line_runs(&text);
+                        self.tool_calls[idx].returned_lines = grok_returned_lines(&json, &text);
                     }
                 }
                 let kind = target
@@ -1068,6 +1113,63 @@ mod cost_passthrough_tests {
         let v: serde_json::Value =
             serde_json::from_str(r#"{"text":"hi","usage":{"input_tokens":1}}"#).unwrap();
         assert_eq!(GrokStreamParser::parse_batch_json(&v).self_reported_cost_usd, None);
+    }
+}
+
+#[cfg(test)]
+mod sparse_numbering_tests {
+    use super::GrokStreamParser;
+    use serde_json::json;
+
+    const READ445: &str = include_str!("../tests/fixtures/grok-1.0.46-read445-20261010.jsonl");
+
+    /// The real 1.0.46 whole read of a 445-line file is credited 1-445. RED IF: it goes back to
+    /// the 45 marker lines D-032 credited, which rejected every grok `read_file` review.
+    #[test]
+    fn a_real_sparse_numbered_whole_read_is_credited_every_line() {
+        let mut p = GrokStreamParser::new();
+        for line in READ445.lines() {
+            p.parse_line(line);
+        }
+        let r = p.finish();
+        assert_eq!(r.tool_calls[0].returned_lines, vec![(1, 445)]);
+    }
+
+    fn update(shown: &str, raw: &str, offset: serde_json::Value) -> String {
+        json!({"type":"tool_call_update","toolCallId":"t1","status":"completed",
+            "content":[{"type":"content","content":{"type":"text","text":shown}}],
+            "rawOutput":{"type":"ReadFile","FileContent":{"offset":offset,"raw_output":raw}}}).to_string()
+    }
+
+    fn returned(shown: &str, raw: &str, offset: serde_json::Value) -> Vec<(u64, u64)> {
+        let mut p = GrokStreamParser::new();
+        p.parse_line(&json!({"type":"tool_call","toolCallId":"t1","title":"read_file","kind":"read","status":"pending","toolName":"read_file","rawInput":{"target_file":"/r/a"}}).to_string());
+        p.parse_line(&update(shown, raw, offset));
+        p.finish().tool_calls[0].returned_lines.clone()
+    }
+
+    /// The span is trusted only when what the model saw agrees with it. RED IF: any
+    /// disagreement is credited past the numbered lines.
+    #[test]
+    fn the_raw_span_is_used_only_when_the_shown_text_agrees() {
+        let raw: String = (1..=25).map(|i| format!("l{i}\n")).collect();
+        let shown = |first: u64| -> String {
+            (0..25u64).map(|i| { let n = first + i; if i == 0 || n % 10 == 0 { format!("{n}→l{n}\n") } else { format!("l{n}\n") } }).collect()
+        };
+        assert_eq!(returned(&shown(1), &raw, serde_json::Value::Null), vec![(1, 25)]);
+        assert_eq!(returned(&shown(101), &raw, json!(101)), vec![(101, 125)], "offset is 1-based");
+        // Markers that disagree with the span: fall back to the markers alone.
+        assert_eq!(returned(&shown(1), &raw, json!(5)), vec![(1, 1), (10, 10), (20, 20)]);
+        // The model saw fewer lines than raw_output claims.
+        let short: String = shown(1).lines().take(12).map(|l| format!("{l}\n")).collect();
+        assert_eq!(returned(&short, &raw, serde_json::Value::Null), vec![(1, 1), (10, 10)]);
+        // offset 0 is not grok's schema.
+        assert_eq!(returned(&shown(1), &raw, json!(0)), vec![(1, 1), (10, 10), (20, 20)]);
+        // No rawOutput at all: D-032 behaviour.
+        let mut p = GrokStreamParser::new();
+        p.parse_line(&json!({"type":"tool_call","toolCallId":"t1","title":"read_file","kind":"read","status":"pending","toolName":"read_file","rawInput":{"target_file":"/r/a"}}).to_string());
+        p.parse_line(&json!({"type":"tool_call_update","toolCallId":"t1","status":"completed","content":[{"type":"content","content":{"type":"text","text":shown(1)}}]}).to_string());
+        assert_eq!(p.finish().tool_calls[0].returned_lines, vec![(1, 1), (10, 10), (20, 20)]);
     }
 }
 
