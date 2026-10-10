@@ -1290,9 +1290,13 @@ async fn execute_ask_agent_inner(
                     // 2026-09-01 the ONLY thing that caught the unsighted review was a human
                     // reading the output and noticing it had no links in it. Throwing the text
                     // away destroys the artifact the sole demonstrated catcher actually used.
-                    let preview: String = parsed.response_text.chars().take(600).collect();
-                    return Err(format!(
-                        "{err}\n\n--- rejected output, for inspection, NOT a review ---\n{preview}"
+                    return Err(rejected_turn_error(
+                        &err,
+                        &request_id,
+                        &agent,
+                        &parsed,
+                        &req.required_sources,
+                        &exec_cwd,
                     ));
                 }
                 if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
@@ -1755,9 +1759,13 @@ async fn execute_ask_agent_inner(
                         }) {
                             tracing::warn!("failed to append REJECTED outbox event: {e}");
                         }
-                        let preview: String = parsed.response_text.chars().take(600).collect();
-                        return Err(format!(
-                            "{err}\n\n--- rejected output, for inspection, NOT a review ---\n{preview}"
+                        return Err(rejected_turn_error(
+                            &err,
+                            &request_id,
+                            hop.agent,
+                            &parsed,
+                            &req.required_sources,
+                            &exec_cwd,
                         ));
                     }
                     persist_daemon_token_record(
@@ -3075,6 +3083,94 @@ fn enforce_reviewer_sight(
         detail: detail.clone(),
     });
     Err(detail)
+}
+
+/// Build the error a sight rejection returns, after saving the WHOLE declined turn to disk.
+///
+/// The error used to carry only 600 characters of the reply, and nothing kept the tool calls.
+/// So a long review that slipped on one source was gone, and no rejection could ever be
+/// replayed against a corrected gate, which left "how many of these were the gate's fault"
+/// unanswerable. Both dispatch arms call this one function so they cannot drift apart.
+///
+/// The preview and its marker line stay: the jury strips on that marker. The saved file is
+/// local and outside the ledger, which stays text-free by the jury's decision.
+fn rejected_turn_error(
+    err: &str,
+    request_id: &str,
+    agent: &str,
+    parsed: &ParsedAgentResult,
+    required_sources: &[String],
+    exec_cwd: &str,
+) -> String {
+    let saved = daemon_core::triumvirate_home_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|home| {
+            save_rejected_turn(&home, request_id, agent, parsed, required_sources, exec_cwd, err)
+                .map_err(|e| e.to_string())
+        });
+    let where_line = match saved {
+        Ok(path) => format!("full rejected turn (reply and tool calls) saved to {}", path.display()),
+        Err(e) => {
+            tracing::warn!("failed to save rejected turn {request_id}: {e}");
+            format!("full rejected turn could NOT be saved: {e}")
+        }
+    };
+    let preview: String = parsed.response_text.chars().take(600).collect();
+    format!("{err}\n\n{where_line}\n\n--- rejected output, for inspection, NOT a review ---\n{preview}")
+}
+
+/// Write `<home>/rejected/<request_id>-<uuid>.json`: everything the gate decided on, plus the
+/// reply. Written to a temp file and renamed, mode 0600, so a crash never leaves half a record.
+///
+/// Every save gets its own file. Sanitising the id is many-to-one (`a/b` and `a?b` both become
+/// `a_b`), and a fixed name opened with `truncate` let two saves overwrite each other (Codex,
+/// panel review). The exact request id is inside the record, which is what a lookup keys on.
+fn save_rejected_turn(
+    home: &Path,
+    request_id: &str,
+    agent: &str,
+    parsed: &ParsedAgentResult,
+    required_sources: &[String],
+    exec_cwd: &str,
+    gate_error: &str,
+) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = home.join("rejected");
+    fs::create_dir_all(&dir)?;
+    // The id becomes a file name, so nothing in it may walk out of the directory.
+    let safe_id: String = request_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let record = serde_json::json!({
+        "ts_ms": core_unix_time_ms(),
+        "request_id": request_id,
+        "agent": agent,
+        "session_id": parsed.session_id,
+        "parser_mode": parsed.parser_mode,
+        "exec_cwd": exec_cwd,
+        "required_sources": required_sources,
+        "gate_error": gate_error,
+        "note": "DECLINED by the sight gate. This is NOT a review.",
+        "response_text": parsed.response_text,
+        "tool_calls": parsed.tool_calls,
+        "token_usage": parsed.token_usage,
+    });
+    let unique = Uuid::new_v4().simple();
+    let path = dir.join(format!("{safe_id}-{unique}.json"));
+    let tmp = dir.join(format!(".{safe_id}-{unique}.json.tmp"));
+    let written = (|| {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(serde_json::to_string_pretty(&record)?.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(path)
 }
 
 fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
@@ -6549,6 +6645,101 @@ mod sight_gate_tests {
         assert!(rel.iter().any(|c| c == "/repo/a.rs"), "{rel:?}");
         let dotted = source_path_candidates("./a.rs", "/repo");
         assert!(dotted.iter().any(|c| c == "/repo/a.rs"), "{dotted:?}");
+    }
+
+    fn rejected_fixture(reply: &str) -> ParsedAgentResult {
+        ParsedAgentResult {
+            response_text: reply.to_string(),
+            session_id: Some("sess-1".to_string()),
+            tool_calls: vec![ToolCallRecord {
+                id: Some("c1".to_string()),
+                tool: "read_file".to_string(),
+                kind: ToolKind::ReadFile,
+                success: Some(true),
+                duration_ms: Some(3),
+                args_json: Some(r#"{"target_file":"/repo/a.rs","limit":200}"#.to_string()),
+                returned_lines: Vec::new(),
+            }],
+            parser_mode: "grok-streaming-json".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The whole declined turn survives: the full reply past 600 characters, every tool call
+    /// with its arguments, and what the gate decided on, so it can be replayed later.
+    /// RED IF: the reply is truncated, tool calls are dropped, the file is world-readable, or a
+    /// request id with path characters escapes the `rejected` directory.
+    #[test]
+    fn rejected_turn_is_saved_whole_and_private() {
+        let home = tempfile::tempdir().unwrap();
+        let reply = format!("{}TAIL-PAST-600", "x".repeat(2000));
+        let parsed = rejected_fixture(&reply);
+        let path = save_rejected_turn(
+            home.path(),
+            "../../escape/id",
+            "grok",
+            &parsed,
+            &["/repo/a.rs".to_string()],
+            "/repo",
+            "only read PART",
+        )
+        .unwrap();
+        assert_eq!(path.parent().unwrap(), home.path().join("rejected"));
+        // Ids that sanitise to the same name, and a repeat of one id, never overwrite.
+        let again = save_rejected_turn(home.path(), "../../escape/id", "grok", &parsed, &[], "/repo", "x").unwrap();
+        let other = save_rejected_turn(home.path(), "..?..?escape?id", "grok", &parsed, &[], "/repo", "y").unwrap();
+        assert!(path != again && again != other && path != other);
+        assert_eq!(std::fs::read_dir(home.path().join("rejected")).unwrap().count(), 3, "no temp file left, none lost");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v["response_text"].as_str().unwrap().ends_with("TAIL-PAST-600"));
+        assert_eq!(v["tool_calls"][0]["args_json"], r#"{"target_file":"/repo/a.rs","limit":200}"#);
+        assert_eq!(v["parser_mode"], "grok-streaming-json");
+        assert_eq!(v["required_sources"][0], "/repo/a.rs");
+        assert_eq!(v["gate_error"], "only read PART");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // A saved tool-call list must replay through the real gate to the same verdict.
+        let calls: Vec<ToolCallRecord> = serde_json::from_value(v["tool_calls"].clone()).unwrap();
+        assert_eq!(calls, parsed.tool_calls);
+    }
+
+    /// The returned error names the saved file and still carries the preview marker the jury
+    /// strips on. RED IF: the path line disappears or the marker text changes.
+    #[test]
+    fn rejected_turn_error_names_the_file_and_keeps_the_marker() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let prior = std::env::var_os("TRIUMVIRATE_HOME");
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", home.path()) };
+        let msg = rejected_turn_error("GATE SAID NO", "req-42", "codex", &rejected_fixture("body"), &[], "/repo");
+        match prior {
+            // SAFETY: as above.
+            Some(p) => unsafe { std::env::set_var("TRIUMVIRATE_HOME", p) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_HOME") },
+        }
+        let saved: Vec<_> = std::fs::read_dir(home.path().join("rejected")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert!(saved[0].file_name().unwrap().to_string_lossy().starts_with("req-42-"));
+        assert!(msg.starts_with("GATE SAID NO"));
+        assert!(msg.contains(&saved[0].display().to_string()), "{msg}");
+        assert!(msg.contains("--- rejected output, for inspection, NOT a review ---\nbody"), "{msg}");
+    }
+
+    /// Both success arms build their rejection through the one helper. RED IF: an arm goes back
+    /// to formatting its own preview, which is how one surface gets the fix and the other not.
+    #[test]
+    fn every_sight_rejection_arm_saves_the_turn() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("agent_exec.rs"),
+        )
+        .expect("read agent_exec.rs");
+        let production_src = &src[..src.find("mod sight_gate_tests").unwrap()];
+        let gates = production_src.matches("&& let Err(err) = enforce_reviewer_sight(").count();
+        let saves = production_src.matches("return Err(rejected_turn_error(").count();
+        assert_eq!(gates, 2, "gate call sites changed; revisit this test");
+        assert_eq!(saves, gates, "a sight-rejection arm does not save the turn");
+        assert!(!production_src.contains("--- rejected output, for inspection, NOT a review ---\\n{preview}\"\n                    ));"));
     }
 
     /// A `wiki_search` MCP call is a wiki touch, and its arguments are a QUERY, so nothing in
