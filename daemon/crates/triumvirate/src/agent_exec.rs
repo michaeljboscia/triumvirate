@@ -3170,7 +3170,34 @@ fn save_rejected_turn(
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
+    prune_rejected_turns(&dir, REJECTED_TURNS_KEPT);
     Ok(path)
+}
+
+/// How many saved rejected turns are kept. Each is one review's reply and tool calls, so a few
+/// hundred KB at most; 1,000 is months of rejections at the 2026-09/10 rate (about 170 real ones
+/// in 39 days) and a bounded directory (Antigravity, panel review).
+const REJECTED_TURNS_KEPT: usize = 1000;
+
+/// Delete the oldest saved turns beyond `keep`, by modification time. Best effort: a file that
+/// cannot be listed or removed is left, and nothing here can fail the save that called it.
+fn prune_rejected_turns(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut saved: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| Some((fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    if saved.len() <= keep {
+        return;
+    }
+    saved.sort();
+    for (_, old) in &saved[..saved.len() - keep] {
+        let _ = fs::remove_file(old);
+    }
 }
 
 fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
@@ -6701,6 +6728,25 @@ mod sight_gate_tests {
         // A saved tool-call list must replay through the real gate to the same verdict.
         let calls: Vec<ToolCallRecord> = serde_json::from_value(v["tool_calls"].clone()).unwrap();
         assert_eq!(calls, parsed.tool_calls);
+    }
+
+    /// The directory is bounded: the oldest saves go first, and temp files are never touched.
+    /// RED IF: pruning stops, deletes the newest, or removes a file that is not a saved turn.
+    #[test]
+    fn rejected_turns_are_pruned_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for i in 0..5 {
+            let p = d.join(format!("r{i}.json"));
+            std::fs::write(&p, "{}").unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+        }
+        std::fs::write(d.join(".r9.json.tmp"), "").unwrap();
+        prune_rejected_turns(d, 3);
+        let mut left: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec![".r9.json.tmp", "r2.json", "r3.json", "r4.json"]);
     }
 
     /// The returned error names the saved file and still carries the preview marker the jury

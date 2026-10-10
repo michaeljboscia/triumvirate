@@ -118,10 +118,12 @@ fn map_tool_kind(kind: Option<&str>, tool_name: &str) -> ToolKind {
 ///
 /// The same update carries `rawOutput.FileContent`: the tool's own `offset` (1-based, "offset
 /// must be >= 1") and `raw_output`, the exact text returned, unnumbered. The span is
-/// `offset .. offset + lines(raw_output) - 1`, and it is used only when the numbered text the
-/// MODEL saw agrees with it: it has at least that many lines, its first line is marked `offset`,
-/// and every marker in it sits exactly where that span puts it. Anything else falls back to the
-/// numbered lines alone, which is what D-032 credited before.
+/// `offset .. offset + lines(raw_output) - 1`, and it is used only when the text the MODEL saw
+/// agrees with it LINE BY LINE: its first line is marked `offset`, every marker sits exactly
+/// where the span puts it, and every shown line, number prefix removed, IS the raw line (or
+/// grok's `<prefix>... (line truncated to N chars)` of it). Checking only the markers credited
+/// unmarked lines whose text was never compared (Grok, panel review). Anything else falls back
+/// to the numbered lines alone, which is what D-032 credited before.
 fn grok_returned_lines(update: &Value, shown: &str) -> Vec<(u64, u64)> {
     let numbered = crate::types::numbered_line_runs(shown);
     let Some(fc) = update.get("rawOutput").and_then(|r| r.get("FileContent")) else {
@@ -145,13 +147,37 @@ fn grok_returned_lines(update: &Value, shown: &str) -> Vec<(u64, u64)> {
     if crate::types::line_number_marker(shown_lines[0]) != Some(start) {
         return numbered;
     }
-    let consistent = shown_lines.iter().take(n as usize).enumerate().all(|(i, l)| {
-        crate::types::line_number_marker(l).is_none_or(|k| k == start + i as u64)
+    let consistent = shown_lines.iter().zip(raw.lines()).enumerate().all(|(i, (shown_line, raw_line))| {
+        let body = match crate::types::line_number_marker(shown_line) {
+            Some(k) if k != start + i as u64 => return false,
+            Some(_) => strip_line_number(shown_line),
+            None => shown_line,
+        };
+        body == raw_line || is_grok_truncation_of(body, raw_line)
     });
     if !consistent {
         return numbered;
     }
     vec![(start, start + n - 1)]
+}
+
+/// `line` with its leading `N→` or `N\t` removed.
+fn strip_line_number(line: &str) -> &str {
+    let t = line.trim_start_matches(' ');
+    let t = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    t.strip_prefix('→').or_else(|| t.strip_prefix('\t')).unwrap_or(t)
+}
+
+/// Is `shown` grok's truncation of `raw`: a prefix of it followed by
+/// `... (line truncated to N chars)`? The format string is in the 1.0.46 binary.
+fn is_grok_truncation_of(shown: &str, raw: &str) -> bool {
+    const MARK: &str = "... (line truncated to ";
+    let Some(cut) = shown.rfind(MARK) else {
+        return false;
+    };
+    let tail = &shown[cut + MARK.len()..];
+    let digits_then_chars = tail.strip_suffix(" chars)").is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
+    digits_then_chars && raw.len() > cut && raw.starts_with(&shown[..cut])
 }
 
 /// Grok's shell tools. The gate's whole-vs-partial read logic keys on the tool name.
@@ -1157,12 +1183,24 @@ mod sparse_numbering_tests {
             (0..25u64).map(|i| { let n = first + i; if i == 0 || n % 10 == 0 { format!("{n}→l{n}\n") } else { format!("l{n}\n") } }).collect()
         };
         assert_eq!(returned(&shown(1), &raw, serde_json::Value::Null), vec![(1, 25)]);
-        assert_eq!(returned(&shown(101), &raw, json!(101)), vec![(101, 125)], "offset is 1-based");
+        let raw101: String = (101..=125).map(|i| format!("l{i}\n")).collect();
+        assert_eq!(returned(&shown(101), &raw101, json!(101)), vec![(101, 125)], "offset is 1-based");
         // Markers that disagree with the span: fall back to the markers alone.
         assert_eq!(returned(&shown(1), &raw, json!(5)), vec![(1, 1), (10, 10), (20, 20)]);
         // The model saw fewer lines than raw_output claims.
         let short: String = shown(1).lines().take(12).map(|l| format!("{l}\n")).collect();
         assert_eq!(returned(&short, &raw, serde_json::Value::Null), vec![(1, 1), (10, 10)]);
+        // The right line count with different TEXT on an unnumbered line: markers only.
+        let tampered = shown(1).replacen("l5\n", "not what the file says\n", 1);
+        assert_eq!(returned(&tampered, &raw, serde_json::Value::Null), vec![(1, 1), (10, 10), (20, 20)]);
+        // Grok's own truncation of a long line still agrees.
+        let long = format!("{}\n", "x".repeat(50));
+        let raw_long = raw.replacen("l5\n", &long, 1);
+        let shown_long = shown(1).replacen("l5\n", &format!("{}... (line truncated to 10 chars)\n", "x".repeat(10)), 1);
+        assert_eq!(returned(&shown_long, &raw_long, serde_json::Value::Null), vec![(1, 25)]);
+        // A "truncation" that is not a prefix of the raw line does not.
+        let fake = shown(1).replacen("l5\n", "yyyy... (line truncated to 4 chars)\n", 1);
+        assert_eq!(returned(&fake, &raw_long, serde_json::Value::Null), vec![(1, 1), (10, 10), (20, 20)]);
         // offset 0 is not grok's schema.
         assert_eq!(returned(&shown(1), &raw, json!(0)), vec![(1, 1), (10, 10), (20, 20)]);
         // No rawOutput at all: D-032 behaviour.
