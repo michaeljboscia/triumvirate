@@ -1263,7 +1263,7 @@ async fn execute_ask_agent_inner(
                         &mut lifecycle,
                     )
                 {
-                    let err = note_sources_changed_during_review(err, &req.required_sources, &source_snapshot, &exec_cwd);
+                    let err = note_sources_changed_during_review(err, &parsed.tool_calls, &req.required_sources, &source_snapshot, &exec_cwd);
                     // 2b: one repair turn in the reviewer's own session before rejecting.
                     let budget = review_timeout().saturating_sub(dispatch_started.elapsed());
                     match try_sight_repair(&agent, &agent_display, &parsed, &err, req, &exec_cwd, &source_snapshot, *model_override, budget, &mut lifecycle).await {
@@ -1758,7 +1758,7 @@ async fn execute_ask_agent_inner(
                             &mut lifecycle,
                         )
                     {
-                        let err = note_sources_changed_during_review(err, &req.required_sources, &source_snapshot, &exec_cwd);
+                        let err = note_sources_changed_during_review(err, &parsed.tool_calls, &req.required_sources, &source_snapshot, &exec_cwd);
                         // 2b, same helper as the primary arm. It resumes hop.agent's OWN session,
                         // never the primary seat's, inside what is left of both budgets.
                         let budget = deadline
@@ -2753,7 +2753,7 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             // #81: say which line the call's output did not show, so a refused read explains
             // itself instead of reading as a slice.
             Some(match shell_read_not_shown(c, &candidates, cwd) {
-                Some(why) => format!("{described} (not credited: its output does not show {why})"),
+                Some((window, why)) => format!("{described} ({window} not credited: its output does not show {why})"),
                 None => described,
             })
         })
@@ -2761,8 +2761,10 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
     format!("{source} has {total}; read this turn as [{}]", reads.join(", "))
 }
 
-/// The first of this shell call's reads of the source whose output check fails, as a reason.
-fn shell_read_not_shown(c: &ToolCallRecord, candidates: &[String], cwd: &str) -> Option<String> {
+/// The first of this shell call's reads of the source whose output check fails: that window, and
+/// why. Naming the window keeps a credited window in the same call from reading as refused
+/// (Antigravity, review of #81).
+fn shell_read_not_shown(c: &ToolCallRecord, candidates: &[String], cwd: &str) -> Option<(String, String)> {
     if !is_shell_read_tool(&c.tool) {
         return None;
     }
@@ -2774,7 +2776,15 @@ fn shell_read_not_shown(c: &ToolCallRecord, candidates: &[String], cwd: &str) ->
     whole
         .chain(ranged)
         .filter(|(op, _)| candidates.iter().any(|cand| cand == op))
-        .find_map(|(op, range)| first_line_not_shown(c, &op, &range, cwd))
+        .find_map(|(op, range)| {
+            let why = first_line_not_shown(c, &op, &range, cwd)?;
+            let window = match range.end {
+                None if range.start <= 1 => "the whole read".to_string(),
+                None => format!("lines {}-$", range.start),
+                Some(e) => format!("lines {}-{e}", range.start),
+            };
+            Some((window, why))
+        })
 }
 
 /// What the read parsers made of a call's arguments, for a rejection receipt.
@@ -3257,11 +3267,19 @@ fn enforce_reviewer_sight(
 /// taken before turn 1. #81: the caller rewrote a source while codex was reviewing it, codex's
 /// whole `cat` matched the version it read, and the gate (right to refuse it) said "only read
 /// PART", which sent everyone looking for a gate bug. Both dispatch arms call this.
-fn note_sources_changed_during_review(err: String, sources: &[String], snapshot: &[Option<Vec<u8>>], cwd: &str) -> String {
+fn note_sources_changed_during_review(
+    err: String,
+    tool_calls: &[ToolCallRecord],
+    sources: &[String],
+    snapshot: &[Option<Vec<u8>>],
+    cwd: &str,
+) -> String {
+    // Only sources the gate did NOT count: a changed source that was read in full did not cause
+    // this refusal, and naming it would point at the wrong file (Antigravity, review of #81).
     let changed: Vec<&str> = sources
         .iter()
         .zip(snapshot)
-        .filter(|(s, before)| source_bytes(s, cwd) != **before)
+        .filter(|(s, before)| source_bytes(s, cwd) != **before && !tool_call_read_source_in_full(tool_calls, s, cwd))
         .map(|(s, _)| s.as_str())
         .collect();
     if changed.is_empty() {
@@ -5049,28 +5067,50 @@ put your whole answer in your reply instead. Always finish with your written ans
 /// with `-c sandbox_mode="read-only"` the same write failed "operation not permitted". So the
 /// mode is restated through `-c`, which resume does accept.
 pub(crate) fn codex_resume_sandbox_args(args: Vec<String>) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut it = args.into_iter();
-    while let Some(arg) = it.next() {
-        let mode = if arg == "--sandbox" || arg == "-s" {
-            it.next()
-        } else if let Some(m) = arg.strip_prefix("--sandbox=") {
-            Some(m.to_string())
-        } else {
-            out.push(arg);
-            continue;
-        };
+    let (mut out, modes) = take_sandbox_flags(args);
+    let mut flags = Vec::new();
+    for mode in modes {
         match mode {
             Some(mode) => {
-                out.push("-c".to_string());
-                out.push(format!("sandbox_mode=\"{mode}\""));
+                flags.push("-c".to_string());
+                flags.push(format!("sandbox_mode=\"{mode}\""));
             }
             // A dangling `--sandbox` with no value: keep it, so codex fails loudly rather than
             // this silently running the turn unsandboxed.
-            None => out.push(arg),
+            None => flags.push("--sandbox".to_string()),
         }
     }
+    // Before any `--`, where they are still options.
+    let at = out.iter().position(|a| a == "--").unwrap_or(out.len());
+    out.splice(at..at, flags);
     out
+}
+
+/// Remove every sandbox flag before any `--`, in each spelling clap accepts (`--sandbox X`,
+/// `--sandbox=X`, `-s X`, `-s=X`, `-sX`), returning the rest and the modes in order (`None` for
+/// a flag with no value). Codex, review of #82: only three spellings were translated, and an
+/// operator `-s workspace-write` survived into a REVIEW, which then ran writable.
+fn take_sandbox_flags(args: Vec<String>) -> (Vec<String>, Vec<Option<String>>) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut modes = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            out.push(arg);
+            out.extend(it);
+            break;
+        }
+        if arg == "--sandbox" || arg == "-s" {
+            modes.push(it.next());
+        } else if let Some(m) = arg.strip_prefix("--sandbox=").or_else(|| arg.strip_prefix("-s=")) {
+            modes.push(Some(m.to_string()));
+        } else if let Some(m) = arg.strip_prefix("-s").filter(|m| !m.is_empty() && !m.starts_with('-')) {
+            modes.push(Some(m.to_string()));
+        } else {
+            out.push(arg);
+        }
+    }
+    (out, modes)
 }
 
 pub(crate) async fn run_codex_cli_process_with_session(
@@ -5151,10 +5191,16 @@ pub(crate) async fn run_codex_cli_process_with_session(
         // exactly the false-pass mode Grok named for sight_27, "the agent never tries, or fails
         // to start". sight_29 now asserts the turn actually produced output, so a crash cannot
         // masquerade as containment.
-        if !has_any_arg(&final_args, &["--sandbox", "-s"]) {
-            final_args.push("--sandbox".to_string());
-            final_args.push("read-only".to_string());
-        }
+        //
+        // Any operator sandbox flag is REMOVED, not deferred to: an operator `-s workspace-write`
+        // used to suppress this and the review ran writable (Codex, review of #82).
+        let (rest, _) = take_sandbox_flags(std::mem::take(&mut final_args));
+        final_args = rest
+            .into_iter()
+            .filter(|a| a != "--dangerously-bypass-approvals-and-sandbox" && a != "--full-auto")
+            .collect();
+        let at = final_args.iter().position(|a| a == "--").unwrap_or(final_args.len());
+        final_args.splice(at..at, ["--sandbox".to_string(), "read-only".to_string()]);
     } else if codex_yolo_enabled() && !caps.args_include_explicit_policy(&final_args) {
         final_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     }
@@ -7806,15 +7852,15 @@ mod sight_gate_tests {
         enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
             .expect("a whole cat whose output matches the file is a full read");
         let snapshot = vec![source_bytes(&src, &cwd)];
-        assert_eq!(note_sources_changed_during_review("E".to_string(), std::slice::from_ref(&src), &snapshot, &cwd), "E", "no edit, no note");
+        assert_eq!(note_sources_changed_during_review("E".to_string(), &tools, std::slice::from_ref(&src), &snapshot, &cwd), "E", "no edit, no note");
 
         // The caller edits line 7 after codex read it.
         let edited: String = (1..=42).map(|i| if i == 7 { "line 7 EDITED\n".to_string() } else { format!("line {i}\n") }).collect();
         std::fs::write(&src, edited).expect("edit");
         let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
             .expect_err("the bytes on disk are not the bytes codex read");
-        assert!(err.contains(&format!("not credited: its output does not show line 7 of {src}")), "names the line: {err}");
-        let err = note_sources_changed_during_review(err, std::slice::from_ref(&src), &snapshot, &cwd);
+        assert!(err.contains(&format!("the whole read not credited: its output does not show line 7 of {src}")), "names the line: {err}");
+        let err = note_sources_changed_during_review(err, &tools, std::slice::from_ref(&src), &snapshot, &cwd);
         assert!(err.contains(&format!("NOTE: {src} changed on disk while the review ran")), "names the edit: {err}");
     }
 

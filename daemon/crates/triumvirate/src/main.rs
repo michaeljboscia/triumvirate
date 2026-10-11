@@ -4758,8 +4758,15 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         fs::set_permissions(&stand_in, perms)?;
         let cwd = dir.path().display().to_string();
         let thread = "01a12cb6-55c8-75c2-b382-7281fb56c2e0";
-        // (read_only, operator opted into the sandbox) -> the mode the resumed turn must carry.
-        for (read_only, sandbox_env, want) in [(true, false, "read-only"), (false, true, "workspace-write")] {
+        // (read_only, operator opted into the sandbox, operator args) -> the mode the resumed turn
+        // must carry. The third case is Codex's review finding: an operator writable sandbox, in
+        // a spelling the first translator missed, must not survive into a REVIEW.
+        let operator: Vec<String> = ["-s=workspace-write", "--dangerously-bypass-approvals-and-sandbox"].map(String::from).to_vec();
+        for (read_only, sandbox_env, op_args, want) in [
+            (true, false, &[][..], "read-only"),
+            (false, true, &[][..], "workspace-write"),
+            (true, false, &operator[..], "read-only"),
+        ] {
             // SAFETY: serialised by the binary-wide env lock and restored by _env_restore.
             unsafe {
                 std::env::remove_var("TRIUMVIRATE_CODEX_PROTOCOL");
@@ -4774,7 +4781,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             let _ = fs::remove_file(&args_file);
             // The stand-in prints nothing, so the parse fails; only the argv matters here.
             let _ = agent_exec::run_codex_cli_process_with_session(
-                &stand_in.to_string_lossy(), &[], "a prompt", &cwd, Some(thread), None, read_only,
+                &stand_in.to_string_lossy(), op_args, "a prompt", &cwd, Some(thread), None, read_only,
             )
             .await;
             let captured: Vec<String> = fs::read(&args_file)?
@@ -4786,7 +4793,9 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             assert!(captured.iter().any(|a| a == thread), "resumes its own thread: {captured:?}");
             assert!(!captured.iter().any(|a| a == "--sandbox" || a == "-s"), "resume rejects --sandbox: {captured:?}");
             let mode = format!("sandbox_mode=\"{want}\"");
-            assert!(captured.windows(2).any(|w| w[0] == "-c" && w[1] == mode), "the resumed turn must restate {mode}: {captured:?}");
+            let modes: Vec<&String> = captured.windows(2).filter(|w| w[0] == "-c" && w[1].starts_with("sandbox_mode=")).map(|w| &w[1]).collect();
+            assert_eq!(modes, [&mode], "the resumed turn must restate exactly {mode}: {captured:?}");
+            assert!(!captured.iter().any(|a| a.starts_with("-s") || a.contains("bypass")), "an operator override survived: {captured:?}");
             codex_argv_parses(&real_codex, &captured).map_err(anyhow::Error::msg)?;
         }
         Ok(())

@@ -749,9 +749,12 @@ enum AgyRun {
 /// stream keeps only the target path. Say so, so the caller asks for the answer inline instead
 /// of paying for the same refused run again. Empty for any other refused action.
 fn denied_write_hint(denied_actions: &[String]) -> &'static str {
+    // A FILE action by name: agy records the refused write as `WriteToFile` (action `write_file`).
+    // Requiring "file" keeps a tool like `credit_check` from matching on "edit" (Antigravity).
     let wrote = denied_actions.iter().any(|a| {
         let a = a.to_ascii_lowercase();
-        a.contains("write") || a.contains("edit") || a.contains("replace")
+        a == "apply_patch"
+            || (a.contains("file") && ["write", "edit", "replace", "create", "save", "append"].iter().any(|v| a.contains(v)))
     });
     if wrote {
         "; the refused action was a file write, and the answer was most likely inside it: agy \
@@ -1709,6 +1712,8 @@ pub(crate) mod tests {
         assert!(msg.contains("WriteToFile") && msg.contains("the answer was most likely inside it"), "got: {msg}");
         assert_eq!(runs(&counter), 1, "a denial must not be retried");
         assert!(denied_write_hint(&["RunCommand".to_string()]).is_empty(), "a refused command is not a lost answer");
+        assert!(denied_write_hint(&["credit_check".to_string()]).is_empty(), "not a file action");
+        assert!(!denied_write_hint(&["ReplaceFileContent".to_string()]).is_empty(), "an edit to a file is a write");
     }
 
     /// Class, not wording: agy recorded a refusal whose tool error says something else entirely.
