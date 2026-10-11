@@ -836,6 +836,14 @@ async fn execute_ask_agent_inner(
         .clone()
         .unwrap_or_else(|| ".".to_string());
     let execution_prompt = inject_tool_marker_prompt(&with_required_sources(&req.message, &req.required_sources));
+    // 2b: every named source as it was BEFORE turn 1. A repair turn unions turn 1's reads only
+    // for sources still byte-identical to this (Codex, review: a snapshot taken at the repair let
+    // a window of an old version cover a new one).
+    let source_snapshot: Vec<Option<Vec<u8>>> = if sight_required(req) {
+        req.required_sources.iter().map(|s| source_bytes(s, &exec_cwd)).collect()
+    } else {
+        Vec::new()
+    };
     // Named sessions get their own worker record; one-shot ask_agent keeps the shared one.
     let session_key = req.session_key.as_deref();
     let worker = acquire_worker(&agent, &exec_cwd, session_key).await;
@@ -1257,7 +1265,7 @@ async fn execute_ask_agent_inner(
                 {
                     // 2b: one repair turn in the reviewer's own session before rejecting.
                     let budget = review_timeout().saturating_sub(dispatch_started.elapsed());
-                    match try_sight_repair(&agent, &agent_display, &parsed, req, &exec_cwd, *model_override, budget, &mut lifecycle).await {
+                    match try_sight_repair(&agent, &agent_display, &parsed, &err, req, &exec_cwd, &source_snapshot, *model_override, budget, &mut lifecycle).await {
                         SightRepair::Passed(merged) => parsed = merged,
                         SightRepair::Failed(e, merged) => {
                             parsed = merged;
@@ -1754,7 +1762,7 @@ async fn execute_ask_agent_inner(
                         let budget = deadline
                             .saturating_duration_since(Instant::now())
                             .min(review_timeout().saturating_sub(dispatch_started.elapsed()));
-                        match try_sight_repair(hop.agent, &hop_display, &parsed, req, &exec_cwd, None, budget, &mut lifecycle).await {
+                        match try_sight_repair(hop.agent, &hop_display, &parsed, &err, req, &exec_cwd, &source_snapshot, None, budget, &mut lifecycle).await {
                             SightRepair::Passed(merged) => parsed = merged,
                             SightRepair::Failed(e, merged) => {
                                 parsed = merged;
@@ -2044,7 +2052,9 @@ const SIGHT_CONTRACT_RULE: &str = "How this review is checked: it is rejected un
 every line, 1 to N, of every source above. Earlier turns do not count. Read each source whole \
 (`cat <path>`, or your file-read tool with no offset and no limit). If you read in windows, the \
 windows together must cover 1 to N with no gap. One shell command's output is cut at 30000 bytes \
-and a cut read earns nothing, so read a source marked over that limit in windows. Do not modify \
+and a cut read earns nothing, so read a source marked over that limit in windows. To read \
+several files in one command, join the reads with `&&`; reads of different files joined with `;` \
+or a newline are not counted, because a failed read is hidden by the next one. Do not modify \
 any file.";
 
 /// `- /abs/path (N lines, B bytes)`, with a note when one shell read cannot show it whole. A
@@ -3261,8 +3271,10 @@ async fn try_sight_repair(
     agent: &str,
     agent_display: &str,
     first: &ParsedAgentResult,
+    first_err: &str,
     req: &AskAgentRequest,
     exec_cwd: &str,
+    snapshot: &[Option<Vec<u8>>],
     model_override: Option<&str>,
     budget: Duration,
     lifecycle: &mut Vec<LifecycleEvent>,
@@ -3282,7 +3294,6 @@ async fn try_sight_repair(
         });
         return SightRepair::NotTried;
     }
-    let snapshot: Vec<Option<Vec<u8>>> = req.required_sources.iter().map(|s| source_bytes(s, exec_cwd)).collect();
     let prompt = sight_repair_prompt(&first.tool_calls, &req.required_sources, exec_cwd);
     lifecycle.push(LifecycleEvent {
         state: "SIGHT_REPAIR".to_string(),
@@ -3295,30 +3306,63 @@ async fn try_sight_repair(
     .await
     {
         Ok(Ok(parsed)) => parsed,
-        Ok(Err(e)) => {
-            lifecycle.push(LifecycleEvent { state: "SIGHT_REPAIR_FAILED".to_string(), detail: e.to_string() });
-            return SightRepair::NotTried;
-        }
+        // The repair ran and produced nothing usable. Said so, not reported as turn 1's error
+        // alone (Antigravity, review).
+        Ok(Err(e)) => return repair_did_not_finish(first, first_err, &e.to_string(), lifecycle),
         Err(_) => {
-            lifecycle.push(LifecycleEvent {
-                state: "SIGHT_REPAIR_FAILED".to_string(),
-                detail: format!("repair turn exceeded the {}s left of the review budget", budget.as_secs()),
-            });
-            return SightRepair::NotTried;
+            let why = format!("it exceeded the {}s left of the review budget", budget.as_secs());
+            return repair_did_not_finish(first, first_err, &why, lifecycle);
         }
     };
-    let drifted = req.required_sources.iter().zip(&snapshot).any(|(s, before)| source_bytes(s, exec_cwd) != *before)
-        || repair.parser_mode != first.parser_mode;
-    let repair_calls = repair.tool_calls.clone();
+    // Per source (Codex and Antigravity, review): a source whose bytes differ from the snapshot
+    // taken before turn 1 keeps none of turn 1's reads; an unchanged one keeps them all, which
+    // is what the repair prompt promised the reviewer. A different parser keeps nothing of turn 1.
+    let changed: Vec<&String> = req
+        .required_sources
+        .iter()
+        .zip(snapshot)
+        .filter(|(s, before)| source_bytes(s, exec_cwd) != **before)
+        .map(|(s, _)| s)
+        .collect();
+    let same_parser = repair.parser_mode == first.parser_mode;
+    let kept: Vec<ToolCallRecord> = first
+        .tool_calls
+        .iter()
+        .filter(|c| same_parser && !changed.iter().any(|s| tool_call_touched_source(std::slice::from_ref(*c), s, exec_cwd)))
+        .cloned()
+        .chain(repair.tool_calls.iter().cloned())
+        .collect();
     let merged = merge_repaired_turn(first, repair);
-    let gated: &[ToolCallRecord] = if drifted { &repair_calls } else { &merged.tool_calls };
-    match enforce_reviewer_sight(agent_display, gated, &merged.parser_mode, &req.required_sources, exec_cwd, lifecycle) {
-        Ok(()) => SightRepair::Passed(merged),
-        Err(e) => SightRepair::Failed(
-            format!("{e} (after one repair turn{})", if drifted { "; a source changed between turns, so only the repair turn's reads counted" } else { "" }),
-            merged,
-        ),
+    let note = if !same_parser {
+        "; the parser changed between turns, so only the repair turn's reads counted".to_string()
+    } else if changed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} changed after turn 1, so only the repair turn's reads of it counted",
+            changed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        )
+    };
+    match enforce_reviewer_sight(agent_display, &kept, &merged.parser_mode, &req.required_sources, exec_cwd, lifecycle) {
+        Ok(()) => {
+            lifecycle.push(LifecycleEvent {
+                state: "SIGHT_REPAIR_PASSED".to_string(),
+                detail: format!("{agent_display} read the missing lines on the repair turn{note}"),
+            });
+            SightRepair::Passed(merged)
+        }
+        Err(e) => {
+            lifecycle.push(LifecycleEvent { state: "SIGHT_REPAIR_FAILED".to_string(), detail: format!("the gate refused the repair turn too{note}") });
+            SightRepair::Failed(format!("{e} (after one repair turn{note})"), merged)
+        }
     }
+}
+
+/// A repair turn that errored or timed out. The rejection carries turn 1's error AND what
+/// happened to the repair, and turn 1 is what gets saved: the repair left no parsed turn.
+fn repair_did_not_finish(first: &ParsedAgentResult, first_err: &str, why: &str, lifecycle: &mut Vec<LifecycleEvent>) -> SightRepair {
+    lifecycle.push(LifecycleEvent { state: "SIGHT_REPAIR_FAILED".to_string(), detail: format!("the repair turn did not finish: {why}") });
+    SightRepair::Failed(format!("{first_err} (one repair turn was sent and did not finish: {why})"), first.clone())
 }
 
 /// Build the error a sight rejection returns, after saving the WHOLE declined turn to disk.
@@ -7039,9 +7083,9 @@ mod sight_gate_tests {
         assert!(enforce_reviewer_sight("Codex", &all[..3], "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc).is_err());
     }
 
-    /// D-056c at the gate, on real files. RED IF: `cat A; echo; cat B` or newline-joined windows
-    /// stop satisfying their sources, or a sequence whose read may not run (`false && cat F ;
-    /// true`) or whose output is over budget starts to.
+    /// D-056c at the gate, on real files. RED IF: newline-joined windows of one file stop
+    /// satisfying it, or a sequence whose read may not run (`false && cat F ; true`, two files
+    /// joined by `;`) or whose output is over budget starts to.
     #[test]
     fn codex_sequences_of_reads_satisfy_each_source() {
         let dir = tempfile::tempdir().unwrap();
@@ -7069,13 +7113,15 @@ mod sight_gate_tests {
             enforce_reviewer_sight("Codex", calls, "codex-exec-json", sources, &cwd, &mut lc)
         };
         let both = [a.clone(), b.clone()];
-        gate(&[call(format!("/bin/zsh -lc \"cat {a}; echo; echo ----; cat {b}\""))], &both)
-            .expect("one call, two whole reads");
+        // Two files: `&&` proves both reads ran; `;` would hide a failed first read (Codex).
+        gate(&[call(format!("/bin/zsh -lc \"cat {a} && echo ---- && cat {b}\""))], &both)
+            .expect("one && call, two whole reads");
+        assert!(gate(&[call(format!("/bin/zsh -lc \"cat {a}; echo; echo ----; cat {b}\""))], &both).is_err(), "; across two files");
         gate(&[call(format!("/bin/zsh -lc \"nl -ba {b} | sed -n '1,150p'\nnl -ba {b} | sed -n '151,300p'\""))], std::slice::from_ref(&b))
             .expect("newline-joined windows cover 1-300");
         assert!(gate(&[call(format!("/bin/zsh -lc \"nl -ba {b} | sed -n '1,150p'\nnl -ba {b} | sed -n '152,300p'\""))], std::slice::from_ref(&b)).is_err(), "a one-line gap");
         assert!(gate(&[call(format!("false && cat {a} ; true"))], std::slice::from_ref(&a)).is_err(), "the read may not have run");
-        assert!(gate(&[call(format!("cat {a}; cat {big}"))], &[a.clone(), big.clone()]).is_err(), "over the one-call budget");
+        assert!(gate(&[call(format!("cat {a} && cat {big}"))], &[a.clone(), big.clone()]).is_err(), "over the one-call budget");
         assert!(gate(&[call(format!("cat {a}; cat {}/missing.rs", cwd))], std::slice::from_ref(&a)).is_err(), "an operand the gate cannot read");
     }
 
@@ -10825,6 +10871,10 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         }
     }
 
+    fn snapshot(req: &AskAgentRequest, cwd: &str) -> Vec<Option<Vec<u8>>> {
+        req.required_sources.iter().map(|s| source_bytes(s, cwd)).collect()
+    }
+
     /// RED IF: only PARTIAL and NEVER-OPENED with a real read are repairable stops holding.
     #[test]
     fn only_a_missed_spot_is_repairable() {
@@ -10869,7 +10919,7 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
         assert!(enforce_reviewer_sight("Codex", &first.tool_calls, &first.parser_mode, &req.required_sources, &cwd, &mut lc).is_err(), "turn 1 alone is partial");
-        match try_sight_repair("codex", "Codex", &first, &req, &cwd, None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
             SightRepair::Passed(m) => {
                 assert!(m.response_text.ends_with("FULL REVIEW"), "{}", m.response_text);
                 assert_eq!(m.tool_calls.len(), 2);
@@ -10891,9 +10941,9 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let cwd = st.dir.path().display().to_string();
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        match try_sight_repair("codex", "Codex", &first, &req, &cwd, None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
             SightRepair::Failed(e, m) => {
-                assert!(e.contains("a source changed between turns"), "{e}");
+                assert!(e.contains("changed after turn 1"), "{e}");
                 assert_eq!(m.tool_calls.len(), 2, "both turns kept for the saved file");
             }
             SightRepair::Passed(_) => panic!("a window of the old file covered the new one"),
@@ -10911,12 +10961,12 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let cwd = st.dir.path().display().to_string();
         let partial = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        let gemini = try_sight_repair("gemini", "Antigravity", &partial, &req, &cwd, None, Duration::from_secs(600), &mut lc).await;
-        let empty = try_sight_repair("codex", "Codex", &first_turn(Vec::new()), &req, &cwd, None, Duration::from_secs(600), &mut lc).await;
-        let late = try_sight_repair("codex", "Codex", &partial, &req, &cwd, None, Duration::from_secs(30), &mut lc).await;
+        let gemini = try_sight_repair("gemini", "Antigravity", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
+        let empty = try_sight_repair("codex", "Codex", &first_turn(Vec::new()), "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
+        let late = try_sight_repair("codex", "Codex", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(30), &mut lc).await;
         let mut no_session = partial.clone();
         no_session.session_id = None;
-        let unresumable = try_sight_repair("codex", "Codex", &no_session, &req, &cwd, None, Duration::from_secs(600), &mut lc).await;
+        let unresumable = try_sight_repair("codex", "Codex", &no_session, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
         for (name, r) in [("gemini", gemini), ("zero tools", empty), ("budget", late), ("no session", unresumable)] {
             assert!(matches!(r, SightRepair::NotTried), "{name} must not be repaired");
         }
@@ -10932,5 +10982,68 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let home = std::env::var_os("TRIUMVIRATE_HOME").map(PathBuf::from).expect("TRIUMVIRATE_HOME unset in a test binary");
         let real = dirs::home_dir().map(|h| h.join(".triumvirate"));
         assert_ne!(Some(home), real, "tests are writing to the real home");
+    }
+
+    /// The file changes AFTER turn 1 and BEFORE the repair starts (Codex, review). RED IF: the
+    /// snapshot is taken at the repair, so turn 1's window of the old file is unioned.
+    #[tokio::test]
+    async fn a_change_before_the_repair_starts_is_caught() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(READ_REST);
+        let req = request(&st);
+        let cwd = st.dir.path().display().to_string();
+        let before = snapshot(&req, &cwd);
+        let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        std::fs::write(&st.src, (1..=480).map(|i| format!("CHANGED {i}\n")).collect::<String>()).unwrap();
+        let mut lc = Vec::new();
+        let r = try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await;
+        assert!(matches!(r, SightRepair::Failed(ref e, _) if e.contains("changed after turn 1")), "old window covered the new file");
+    }
+
+    /// Two sources: A read whole on turn 1 and unchanged, B changed and read whole on the repair.
+    /// RED IF: drift is global again, so A's good turn-1 read is dropped and the repair fails
+    /// (Codex and Antigravity, review).
+    #[tokio::test]
+    async fn drift_is_judged_per_source() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(r#"printf 'new\n' >> "$SRC"
+printf '{"type":"thread.started","thread_id":"thread-1"}\n'
+printf '{"type":"item.started","item":{"type":"command_execution","id":"c9","command":"cat %s"}}\n' "$SRC"
+printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"cat %s","exit_code":0}}\n' "$SRC"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'"#);
+        let a = st.dir.path().join("a.rs");
+        std::fs::write(&a, "a1\na2\n").unwrap();
+        let a = a.display().to_string();
+        let mut req = request(&st);
+        req.required_sources = vec![a.clone(), st.src.clone()];
+        let cwd = st.dir.path().display().to_string();
+        let before = snapshot(&req, &cwd);
+        let first = first_turn(vec![read_call(format!("cat {a}"), true), read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let mut lc = Vec::new();
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await {
+            SightRepair::Passed(_) => {}
+            SightRepair::Failed(e, _) => panic!("A's unchanged turn-1 read was dropped: {e}"),
+            SightRepair::NotTried => panic!("should try"),
+        }
+        assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_PASSED"));
+    }
+
+    /// RED IF: a repair turn that errors is reported as turn 1's error alone (Antigravity).
+    #[tokio::test]
+    async fn a_repair_that_does_not_finish_says_so() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub("exit 3");
+        let req = request(&st);
+        let cwd = st.dir.path().display().to_string();
+        let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let mut lc = Vec::new();
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+            SightRepair::Failed(e, kept) => {
+                assert!(e.starts_with("TURN 1 ERROR") && e.contains("did not finish"), "{e}");
+                assert_eq!(kept.response_text, "PARTIAL REVIEW");
+            }
+            _ => panic!("a repair that errored must be a named failure"),
+        }
+        assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_FAILED"));
     }
 }

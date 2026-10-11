@@ -343,19 +343,19 @@ fn split_unquoted<'a>(command: &'a str, sep: &[u8]) -> Vec<&'a str> {
 /// chain.
 ///
 /// D-036: codex read four sources as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the gate
-/// threw the review away. D-056c: it also joins reads with newlines (`nl -ba F | sed -n
-/// '1,240p'` NEWLINE `nl -ba F | sed -n '241,480p'`, live receipts) and walks several files in
-/// one call (`cat A; echo; cat B`). Both were rejected whole.
+/// threw the review away. D-056c: it also joins windows with newlines (`nl -ba F | sed -n
+/// '1,240p'` NEWLINE `nl -ba F | sed -n '241,480p'`, live receipts). Both were rejected whole.
 ///
-/// `;` and a newline mask a failed link, which is why a sequence was refused in general: `false
-/// && cat F ; true` exits zero having read nothing (Antigravity). So a sequence is split ONLY
-/// when every link is a vetted read (a whole-file read or a line window, any file) or an inert
-/// literal `echo`, no link contains `&&` or `||`, and [`chain_links_are_unprovable`] passes.
-/// `true`, `false`, `exit` and every other program make the whole command one segment again,
-/// which every read parser refuses. What is left is a read link that fails while a later one
-/// succeeds. A link fails on a missing or unreadable operand, and the gate reads every operand
-/// of the call from disk itself, as the same user, and credits nothing when one cannot be read
-/// (`shell_call_fits_budget`). The window union and the budget then apply as for any read.
+/// `;` and a newline mask a failed link: the call's status is the LAST link's. So a sequence is
+/// split only when that cannot hide a read that did not happen: every read link names the SAME
+/// file, the last link is one of those reads, and the rest are literal `echo`s. A file that is
+/// missing, unreadable, or denied by the reviewer's sandbox then fails the last link too, and a
+/// failed call is credited nothing. No link may contain `&&` or `||` (`false && cat F ; true`,
+/// Antigravity), and [`chain_links_are_unprovable`] must pass.
+///
+/// Reads of DIFFERENT files in one sequence stay refused (Codex, review of D-056c: `cat A; cat B`
+/// with A unreadable to the agent exits zero on B's read). `&&` is the way to chain those, and the
+/// sight contract in the prompt says so.
 pub fn read_segments_pub(command: &str) -> Vec<&str> {
     read_segments(command)
 }
@@ -365,8 +365,8 @@ fn read_segments(command: &str) -> Vec<&str> {
     sequence_of_reads(cmd).unwrap_or_else(|| and_chain_segments(cmd))
 }
 
-/// The links of a `;` or newline sequence in which every link is a vetted read or an inert
-/// `echo`, with at least one read. `None` for anything else. See [`read_segments`].
+/// The links of a `;` or newline sequence of reads of ONE file, ending in a read, with only
+/// literal `echo`s between. `None` for anything else. See [`read_segments`].
 fn sequence_of_reads(cmd: &str) -> Option<Vec<&str>> {
     if chain_links_are_unprovable(cmd) {
         return None;
@@ -378,25 +378,35 @@ fn sequence_of_reads(cmd: &str) -> Option<Vec<&str>> {
     if links.len() < 2 {
         return None;
     }
-    let mut reads = 0usize;
+    let mut operand: Option<String> = None;
+    let mut last_is_read = false;
     for link in &links {
         if link.contains("&&") || link.contains("||") {
             return None;
         }
-        if command_read_range(link).is_some() || whole_file_read(link).is_some() {
-            reads += 1;
-        } else if !is_inert_echo(link) {
-            return None;
+        let read = command_read_range(link)
+            .map(|r| r.operand)
+            .or_else(|| whole_file_read(link).map(|(op, _)| op));
+        match read {
+            Some(op) => {
+                if operand.as_ref().is_some_and(|o| *o != op) {
+                    return None;
+                }
+                operand = Some(op);
+                last_is_read = true;
+            }
+            None if is_inert_echo(link) => last_is_read = false,
+            None => return None,
         }
     }
-    (reads > 0).then_some(links)
+    (operand.is_some() && last_is_read).then_some(links)
 }
 
-/// `echo` with literal words only: the separator codex prints between files. The same literal
-/// rule the gate sizes it by (`small_output_bound`), so a link counted here is one the budget
-/// can bound. A quote, a variable, a glob or a brace is refused: each prints more than its text.
+/// `echo` with literal words only: a separator between windows. A quote, a variable, a glob or
+/// a brace is refused: each prints more than its text. So is `=`, because zsh expands a word
+/// starting with it to a command's path (`echo =cat`, Grok, review).
 fn is_inert_echo(link: &str) -> bool {
-    let literal = |t: &str| t.chars().all(|ch| ch.is_ascii_alphanumeric() || "._/-:=,+@%".contains(ch));
+    let literal = |t: &str| t.chars().all(|ch| ch.is_ascii_alphanumeric() || "._/-:,+@%".contains(ch));
     let mut toks = link.split_whitespace();
     toks.next() == Some("echo") && toks.all(literal)
 }
@@ -1533,10 +1543,9 @@ mod whole_file_read_operand_tests {
         let ok = "/bin/zsh -lc \"sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/a.rs\"";
         assert!(command_reads_file_contents(ok));
         assert_eq!(command_read_ranges(ok).len(), 2);
-        // D-056c: windows on two files are two reads, each bound to its own operand.
-        let two = command_read_ranges("sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/b.rs");
-        assert_eq!(two.iter().map(|r| r.operand.as_str()).collect::<Vec<_>>(), ["/r/a.rs", "/r/b.rs"]);
         for bad in [
+            // Two files: a failed read of a.rs is masked by b.rs's (Codex, review of D-056c).
+            "sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/b.rs",
             "sed -n '1,180p' /r/a.rs; rm -rf /r",
             "cat /r/a.rs; true",
             "sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/a.rs && ls",
@@ -1553,18 +1562,30 @@ mod whole_file_read_operand_tests {
     /// sequence with a link that may not run, or that is not a read, is split.
     #[test]
     fn newline_and_semicolon_sequences_of_reads_split() {
-        use super::{command_reads_whole_file, whole_file_read_operands};
+        use super::whole_file_read_operands;
         // Live 2026-10 shape: windows on one file, one per line.
         let nl_windows = "/bin/zsh -lc \"nl -ba /r/s.py | sed -n '1,240p'\nnl -ba /r/s.py | sed -n '241,480p'\"";
         let r = command_read_ranges(nl_windows);
         assert_eq!(r.iter().map(|w| (w.range.start, w.range.end)).collect::<Vec<_>>(), [(1, Some(240)), (241, Some(480))]);
         assert!(command_reads_file_contents(nl_windows));
-        // Whole files with literal echo separators.
-        let cats = "cat /r/a.rs; echo; echo ----- /r/b.rs; cat /r/b.rs";
-        assert_eq!(whole_file_read_operands(cats), ["/r/a.rs", "/r/b.rs"]);
-        assert!(command_reads_whole_file(cats));
-        assert_eq!(whole_file_read_operands("cat /r/a.rs\ncat /r/b.rs\n"), ["/r/a.rs", "/r/b.rs"]);
+        // One file, literal echo separators, ending in a read.
+        let one = "echo ----- /r/a.rs; sed -n '1,100p' /r/a.rs; echo; sed -n '101,$p' /r/a.rs";
+        assert_eq!(command_read_ranges(one).len(), 2);
+        assert_eq!(whole_file_read_operands("echo start\ncat /r/a.rs\n"), ["/r/a.rs"]);
         for bad in [
+            // A read of a different file masks a failed one (Codex): both shapes, and newlines.
+            "cat /r/a.rs; echo; echo ----- /r/b.rs; cat /r/b.rs",
+            "cat /r/a.rs\ncat /r/b.rs\n",
+            // Ends in an echo or another program, which succeeds whatever the read did (Grok).
+            "cat /r/a.rs; echo done",
+            "cat /r/no-such; echo ok",
+            "cat /r/a.rs\ntrue",
+            "wc -l /r/a.rs; cat /r/b.rs",
+            // Echo words the shell expands (Grok).
+            "echo =cat; cat /r/a.rs",
+            "echo $X; cat /r/a.rs",
+            "echo ~/x; cat /r/a.rs",
+            "sed -n '1,100p' /r/a.rs; sed -n '101,$p' /r/a.rs; echo",
             "false && cat /r/a.rs ; true",
             "false && cat /r/a.rs\ntrue",
             "cat /r/a.rs || true; cat /r/b.rs",

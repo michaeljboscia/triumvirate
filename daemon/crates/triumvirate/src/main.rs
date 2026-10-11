@@ -3557,12 +3557,13 @@ mod tests {
     /// and agy failure dumps landed in the operator's real ~/.triumvirate: 52 of 271 REJECTED
     /// rows there were tempdir fixtures. A test that needs its own home still sets one, and its
     /// EnvRestore puts this value back, never the real home.
+    ///
+    /// Unconditional: an operator who exports TRIUMVIRATE_HOME in their shell would otherwise
+    /// point the whole suite at the real home (Antigravity, review).
     #[ctor::ctor]
     fn isolate_triumvirate_home() {
-        if std::env::var_os("TRIUMVIRATE_HOME").is_none() {
-            // SAFETY: a constructor runs before main, so no other thread can read the environment.
-            unsafe { std::env::set_var("TRIUMVIRATE_HOME", isolated_test_home()) };
-        }
+        // SAFETY: a constructor runs before main, so no other thread can read the environment.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", isolated_test_home()) };
     }
 
     /// The home every test in this binary falls back to. A fixture that clears its env keys on
