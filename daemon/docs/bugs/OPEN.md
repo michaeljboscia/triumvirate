@@ -21,47 +21,6 @@ file is the thing you read to answer "what do we know is broken right now."
 
 > **Live check, 2026-10-11, build from feat/sight-salvage-main installed to ~/.local/bin (daemon pid 79491):** codex read a 300-line file as two `nl -ba F | sed -n` windows joined by a NEWLINE in one command and passed (D-056c, D-059 output check), request 96e9ae31; grok read a 445-line file with one whole `read_file` and passed (D-053), request e9e92416. Both answered the planted line token correctly. The entries below stay Open until the branch is merged to main, because the installed build is not yet main's.
 
-### D-053 - Every grok review that reads with `read_file` is rejected as PART
-**Found:** 2026-10-10 (peer review of feat/sight-salvage-main) · **Severity:** HIGH · **FIX ON BRANCH, NOT MERGED** (2d1106d)
-**Evidence:** grok read a 445-line file with `read_file` and no offset or limit; the gate said "only read PART" with receipt `read this turn as [{"target_file":...}]`. A direct capture (`daemon/crates/agent-adapter/tests/fixtures/grok-1.0.46-read445-20261010.jsonl`) shows grok 1.0.46 numbers only line 1 and every tenth line, so D-032's `numbered_line_runs` credited 45 single lines. D-032's fixtures are grok 1.0.13 reads of a one-line file.
-**CHECK to close:** on main, a source-gated grok review that reads its source once with `read_file` passes the gate.
-
-### D-054 - Test runs write REJECTED rows into the production outbox
-**Found:** 2026-10-10 · **Severity:** LOW · **Fix on branch feat/sight-salvage-main**
-**Evidence:** 52 of 271 REJECTED rows in `~/.triumvirate/outbox.jsonl` (2026-09-01 to 2026-10-09) name sources under `/private/var/folders/.../T/.tmp*/`, which are test temp dirs. They inflate every rejection count read from the outbox.
-**CHECK to close:** `cargo test --workspace` leaves `~/.triumvirate/outbox.jsonl` byte-identical.
-**Scope, measured 2026-10-11:** not only REJECTED rows. The live outbox holds about 9,000 tempdir rows of every state, and a run of the suite under a scratch HOME wrote outbox.jsonl (75 rows), workers.json, fleets.json, daemon.token, dead-drop/ and agy-failures/ into `$HOME/.triumvirate`.
-**Fix:** a `#[ctor]` in the triumvirate test binary sets a per-process TRIUMVIRATE_HOME under the temp dir before any test thread starts. The same scratch-HOME run then leaves `$HOME/.triumvirate` absent.
-
-### D-059 - A pipeline read is credited on a status its reader stage does not set
-**Found:** 2026-10-11 (Codex, round 2 review of D-056c) · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**
-**Evidence:** a shell pipeline's status is its last stage's. Measured with codex-cli 0.154.0: `nl -ba MISSING | sed -n '1,2p'; nl -ba F | sed -n '1,2p'` reported `exit_code: 0` with "nl: MISSING: No such file or directory" in `aggregated_output` (fixture `crates/agent-adapter/tests/fixtures/codex-0.154.0-pipeline-missing-20261011.jsonl`). Every `READER F | sed -n` and `sed -n F | nl` window shape the gate accepts since 2026-09-03 had this, sequence or not. Only a reader the agent cannot run, or a file its sandbox denies, triggers it: the gate itself reads every operand.
-Grok 1.0.46 (`rawOutput.exit_code` 0) and Claude Code 2.1.296 (`is_error: false`) do the same, measured with the same command; fixtures beside the codex one.
-**Fix:** every parser records a successful shell call's result text as `ToolCallRecord.shown_output` (codex `aggregated_output`, grok completed content text, claude Bash `tool_result`, agy `tool_info.output`, gemini `tool_result.output`; capped at 64 KiB, `""` when absent, never in the ledger). The gate credits a shell window or whole read only when every non-empty line of it appears, in order, in that output, and credits a shell read with no recorded output nothing.
-**Not live-verified:** the gemini-cli `tool_result.output` field (that seat has been unusable since 2026-09-13); a gemini shell read without it fails closed.
-**CHECK to close:** on main, `a_window_counts_only_when_its_lines_were_shown` and the four `*_records_what_a_*_showed` parser tests pass, and the first fails with `call_showed_lines` disabled.
-
-### D-058 - A unit test launched the real codex and agy CLIs on every `cargo test`
-**Found:** 2026-10-11 · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**
-**Evidence:** `fleet_spawn_and_status_tools_round_trip` (daemon/crates/triumvirate/src/main.rs) runs `fleet_spawn` with `wait: true` and no stand-in binaries, so `fleet_agent_command` resolved the installed codex and agy. Under a scratch HOME it left a real codex rollout (`codex_exec`, cli 0.154.0, cwd a fleet worktree) in `$HOME/.codex/sessions`. Under the real HOME that is a paid subscription turn with the task "test", and its failure is invisible because the test accepts `failed`.
-**Fix:** the test points TRIUMVIRATE_CODEX_BIN, TRIUMVIRATE_AGY_BIN and TRIUMVIRATE_GEMINI_BIN at `/usr/bin/false`.
-**CHECK to close:** `HOME=<scratch> cargo test --workspace` leaves no `<scratch>/.codex/sessions`.
-
-### D-055 - A sight rejection keeps 600 characters and no tool calls
-**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (9ad3299)
-**Evidence:** both success arms returned `err` plus `response_text.chars().take(600)`; tool calls were never kept, so no rejection could be replayed against a corrected gate. This branch's own codex review lost everything after its first finding that way.
-**CHECK to close:** on main, a rejected review leaves `~/.triumvirate/rejected/<id>-<uuid>.json` holding the full reply and every tool call, and the error names it.
-
-### D-056 - Three shell read shapes codex really uses are not counted
-**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6bbce82, 68f3fe2, and (c) on feat/sight-salvage-main)
-**Evidence:** (a) codex records `sed -n '1,$p' F` as `/bin/zsh -lc "sed -n '1,"'$p'"' F"`, which the unwrapper could not see through: 5 rejections (09-16 x3, 09-27, 10-09). (b) `sed -n 'a,bp' F | nl -ba -va` was not a recognised shape: this branch's codex review, reading every line of 654, was rejected. (c) `cat A; echo ...; cat B` and newline-joined reads were refused whole, including the live receipt `nl -ba F | sed -n '1,240p'` NEWLINE `nl -ba F | sed -n '241,480p'`. A first design that marked links before `;` as masked fell to `false && cat F ; true` (Antigravity) and was not ported. The fix splits a `;` or newline sequence only when every read link names the SAME file, the last link is a read, the rest are literal `echo`s, no link holds `&&` or `||`, and the unsafe-first-word guard passes, so a missing or sandbox-denied file fails the last link and the call. Reads of different files joined by `;` stay refused (Codex, review: `cat A; cat B` exits zero on B with A unread); the sight contract tells reviewers to join those with `&&`.
-**CHECK to close:** (a), (b) and (c) on main: the live shapes satisfy the gate, and `codex_sequences_of_reads_satisfy_each_source` passes and fails with `sequence_of_reads` disabled.
-
-### D-057 - The `&&` split credits links that never ran or ran something else
-**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6d979fd)
-**Evidence:** `exit 0 && cat SRC`, `cd /elsewhere && cat a.rs` and `cat() { :; } && cat SRC` each satisfied a source under D-017's split. None appears in the outbox, so nothing live was exploited.
-**CHECK to close:** on main, `codex_03g_an_and_chain_whose_links_are_unprovable_is_not_split` passes and fails with the guard disabled.
-
 ### D-052 - A fleet member that hits its timeout is recorded as "exited 0 without committing"
 **Found:** 2026-10-08 (closing D-049) · **Severity:** LOW · **NOT FIXED**
 **Evidence:** agy prints `[agy] print timeout after ...; returning partial output` and exits 0. The fleet then records the member failed with `agent exited 0 without committing: its branch head ... is not a new commit` (`fleet/src/orchestrator.rs:2135`). True, but it hides why: the reader cannot tell a timeout from an agent that chose not to commit.
@@ -326,6 +285,58 @@ See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
 ## Closed
 
+### #81, #82, #83 - Sight repair, codex resume, and agy write denial (GitHub issues)
+**CLOSED 2026-10-11 (PR #84):** #82, a resumed codex turn restates its sandbox via `-c sandbox_mode`; live, a forced partial read was repaired in the same session. #81 was not a gate bug: the source was edited mid-review, and the refusal now names the failing line and the edit. #83: write-confined agy is told it cannot write; live, it answered inline.
+
+### D-053 - Every grok review that reads with `read_file` is rejected as PART
+**CLOSED 2026-10-11 (PR #84, merge 2065a34):** live: a source-gated grok review reading once with read_file passed (2026-10-11 live checks), and its tests pass on main.
+**Found:** 2026-10-10 (peer review of feat/sight-salvage-main) · **Severity:** HIGH · **FIX ON BRANCH, NOT MERGED** (2d1106d)
+**Evidence:** grok read a 445-line file with `read_file` and no offset or limit; the gate said "only read PART" with receipt `read this turn as [{"target_file":...}]`. A direct capture (`daemon/crates/agent-adapter/tests/fixtures/grok-1.0.46-read445-20261010.jsonl`) shows grok 1.0.46 numbers only line 1 and every tenth line, so D-032's `numbered_line_runs` credited 45 single lines. D-032's fixtures are grok 1.0.13 reads of a one-line file.
+**CHECK to close:** on main, a source-gated grok review that reads its source once with `read_file` passes the gate.
+
+### D-054 - Test runs write REJECTED rows into the production outbox
+**CLOSED 2026-10-11 (PR #84, merge 2065a34):** on main, `cargo test --workspace` wrote 0 rows from test temp dirs to ~/.triumvirate/outbox.jsonl (the only new rows were live masterFFL traffic).
+**Found:** 2026-10-10 · **Severity:** LOW · **Fix on branch feat/sight-salvage-main**
+**Evidence:** 52 of 271 REJECTED rows in `~/.triumvirate/outbox.jsonl` (2026-09-01 to 2026-10-09) name sources under `/private/var/folders/.../T/.tmp*/`, which are test temp dirs. They inflate every rejection count read from the outbox.
+**CHECK to close:** `cargo test --workspace` leaves `~/.triumvirate/outbox.jsonl` byte-identical.
+**Scope, measured 2026-10-11:** not only REJECTED rows. The live outbox holds about 9,000 tempdir rows of every state, and a run of the suite under a scratch HOME wrote outbox.jsonl (75 rows), workers.json, fleets.json, daemon.token, dead-drop/ and agy-failures/ into `$HOME/.triumvirate`.
+**Fix:** a `#[ctor]` in the triumvirate test binary sets a per-process TRIUMVIRATE_HOME under the temp dir before any test thread starts. The same scratch-HOME run then leaves `$HOME/.triumvirate` absent.
+
+### D-059 - A pipeline read is credited on a status its reader stage does not set
+**CLOSED 2026-10-11 (PR #84, merge 2065a34):** `a_window_counts_only_when_its_lines_were_shown` and the parser output tests pass on main.
+**Found:** 2026-10-11 (Codex, round 2 review of D-056c) · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**
+**Evidence:** a shell pipeline's status is its last stage's. Measured with codex-cli 0.154.0: `nl -ba MISSING | sed -n '1,2p'; nl -ba F | sed -n '1,2p'` reported `exit_code: 0` with "nl: MISSING: No such file or directory" in `aggregated_output` (fixture `crates/agent-adapter/tests/fixtures/codex-0.154.0-pipeline-missing-20261011.jsonl`). Every `READER F | sed -n` and `sed -n F | nl` window shape the gate accepts since 2026-09-03 had this, sequence or not. Only a reader the agent cannot run, or a file its sandbox denies, triggers it: the gate itself reads every operand.
+Grok 1.0.46 (`rawOutput.exit_code` 0) and Claude Code 2.1.296 (`is_error: false`) do the same, measured with the same command; fixtures beside the codex one.
+**Fix:** every parser records a successful shell call's result text as `ToolCallRecord.shown_output` (codex `aggregated_output`, grok completed content text, claude Bash `tool_result`, agy `tool_info.output`, gemini `tool_result.output`; capped at 64 KiB, `""` when absent, never in the ledger). The gate credits a shell window or whole read only when every non-empty line of it appears, in order, in that output, and credits a shell read with no recorded output nothing.
+**Not live-verified:** the gemini-cli `tool_result.output` field (that seat has been unusable since 2026-09-13); a gemini shell read without it fails closed.
+**CHECK to close:** on main, `a_window_counts_only_when_its_lines_were_shown` and the four `*_records_what_a_*_showed` parser tests pass, and the first fails with `call_showed_lines` disabled.
+
+### D-058 - A unit test launched the real codex and agy CLIs on every `cargo test`
+**CLOSED 2026-10-11 (PR #84, merge 2065a34):** on main, `fleet_spawn_and_status_tools_round_trip` under a scratch HOME leaves no .codex/sessions.
+**Found:** 2026-10-11 · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**
+**Evidence:** `fleet_spawn_and_status_tools_round_trip` (daemon/crates/triumvirate/src/main.rs) runs `fleet_spawn` with `wait: true` and no stand-in binaries, so `fleet_agent_command` resolved the installed codex and agy. Under a scratch HOME it left a real codex rollout (`codex_exec`, cli 0.154.0, cwd a fleet worktree) in `$HOME/.codex/sessions`. Under the real HOME that is a paid subscription turn with the task "test", and its failure is invisible because the test accepts `failed`.
+**Fix:** the test points TRIUMVIRATE_CODEX_BIN, TRIUMVIRATE_AGY_BIN and TRIUMVIRATE_GEMINI_BIN at `/usr/bin/false`.
+**CHECK to close:** `HOME=<scratch> cargo test --workspace` leaves no `<scratch>/.codex/sessions`.
+
+### D-055 - A sight rejection keeps 600 characters and no tool calls
+**CLOSED 2026-10-11 (PR #84, merge 2065a34):** live: rejected turns are saved whole to ~/.triumvirate/rejected/ and the error names the file (7476de40 was replayed from one).
+**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (9ad3299)
+**Evidence:** both success arms returned `err` plus `response_text.chars().take(600)`; tool calls were never kept, so no rejection could be replayed against a corrected gate. This branch's own codex review lost everything after its first finding that way.
+**CHECK to close:** on main, a rejected review leaves `~/.triumvirate/rejected/<id>-<uuid>.json` holding the full reply and every tool call, and the error names it.
+
+### D-056 - Three shell read shapes codex really uses are not counted
+**CLOSED 2026-10-11 (PR #84, merge 2065a34):** the live shapes pass, and `codex_sequences_of_reads_satisfy_each_source` passes on main.
+**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6bbce82, 68f3fe2, and (c) on feat/sight-salvage-main)
+**Evidence:** (a) codex records `sed -n '1,$p' F` as `/bin/zsh -lc "sed -n '1,"'$p'"' F"`, which the unwrapper could not see through: 5 rejections (09-16 x3, 09-27, 10-09). (b) `sed -n 'a,bp' F | nl -ba -va` was not a recognised shape: this branch's codex review, reading every line of 654, was rejected. (c) `cat A; echo ...; cat B` and newline-joined reads were refused whole, including the live receipt `nl -ba F | sed -n '1,240p'` NEWLINE `nl -ba F | sed -n '241,480p'`. A first design that marked links before `;` as masked fell to `false && cat F ; true` (Antigravity) and was not ported. The fix splits a `;` or newline sequence only when every read link names the SAME file, the last link is a read, the rest are literal `echo`s, no link holds `&&` or `||`, and the unsafe-first-word guard passes, so a missing or sandbox-denied file fails the last link and the call. Reads of different files joined by `;` stay refused (Codex, review: `cat A; cat B` exits zero on B with A unread); the sight contract tells reviewers to join those with `&&`.
+**CHECK to close:** (a), (b) and (c) on main: the live shapes satisfy the gate, and `codex_sequences_of_reads_satisfy_each_source` passes and fails with `sequence_of_reads` disabled.
+
+### D-057 - The `&&` split credits links that never ran or ran something else
+**CLOSED 2026-10-11 (PR #84, merge 2065a34):** `codex_03g_an_and_chain_whose_links_are_unprovable_is_not_split` passes on main.
+**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6d979fd)
+**Evidence:** `exit 0 && cat SRC`, `cd /elsewhere && cat a.rs` and `cat() { :; } && cat SRC` each satisfied a source under D-017's split. None appears in the outbox, so nothing live was exploited.
+**CHECK to close:** on main, `codex_03g_an_and_chain_whose_links_are_unprovable_is_not_split` passes and fails with the guard disabled.
+
+
 ### D-051 - An agy review that is denied a shell command is reported as "empty output"
 **Found:** 2026-10-04 (PR #71/#72 review) · **Severity:** LOW · **CLOSED 2026-10-08** (#77)
 **Evidence:** two agy reviews failed with `agy returned empty output (status=SUCCESS, ... tool_calls=1)`. The raw stream (`~/.triumvirate/agy-failures/1791168994994-13211/`) shows `"denied_actions":[{"action":"command","display_name":"RunCommand"}]` and agy's stderr names the cause: review mode cannot run shell commands. The reviewer had been asked to run `git diff`; with the diff given as a file it answered.
@@ -491,4 +502,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-10-10 ET (D-053 to D-057 added from the sight-gate rejection analysis; fixes on feat/sight-salvage-main, not merged). Previous: 2026-10-08 11:55 ET (D-032, D-039, D-048, D-049, D-050, D-051 closed: PRs #74 to #78 merged and installed on main 9bb3556, D-048 by a 10-fleet live check, D-039 by a Mac setting; D-052 added).
+**Last reviewed:** 2026-10-11 18:10 ET
