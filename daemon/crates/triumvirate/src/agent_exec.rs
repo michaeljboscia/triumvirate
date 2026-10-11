@@ -7139,7 +7139,7 @@ mod sight_gate_tests {
         let call = |a: u64, b: u64| {
             let args = serde_json::json!({ "command": format!("/bin/zsh -lc \"sed -n '{a},{b}p' {src} | nl -ba -v{a}\"") });
             ToolCallRecord {
-                shown_output: Some(honest_shown_output(&args["command"].as_str().unwrap_or_default())),
+                shown_output: Some(honest_shown_output(args["command"].as_str().unwrap_or_default())),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
