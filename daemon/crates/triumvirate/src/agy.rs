@@ -1581,12 +1581,8 @@ pub(crate) mod tests {
     }
 
     fn write_mock_agy(body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!("mock-agy-{}.sh", uuid::Uuid::new_v4()));
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write mock agy");
-        let mut perms = std::fs::metadata(&path).expect("mock meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod mock");
+        crate::write_test_executable(&path, format!("#!/bin/sh\n{body}\n")).expect("write test executable");
         path
     }
 
@@ -2001,12 +1997,8 @@ mod breaker_probe_tests {
     /// `cooldown_secs` of "0" opens a breaker whose cooldown has ALREADY elapsed, which is the
     /// state every scheduled health probe finds it in (120s base cooldown, 300s interval).
     fn setup_with_cooldown(mock_body: &str, cooldown_secs: Option<&str>) -> ProbeFixture {
-        use std::os::unix::fs::PermissionsExt;
         let mock = std::env::temp_dir().join(format!("mock-agy-probe-{}.sh", uuid::Uuid::new_v4()));
-        std::fs::write(&mock, format!("#!/bin/sh\n{mock_body}\n")).expect("write mock agy");
-        let mut perms = std::fs::metadata(&mock).expect("mock meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&mock, perms).expect("chmod mock");
+        crate::write_test_executable(&mock, format!("#!/bin/sh\n{mock_body}\n")).expect("write test executable");
 
         let fx = ProbeFixture {
             _bin: tests::set_env_scoped("TRIUMVIRATE_AGY_BIN", Some(mock.to_str().expect("utf8"))),

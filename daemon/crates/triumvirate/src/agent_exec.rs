@@ -8874,14 +8874,7 @@ mod claude_runner_tests {
             log = argv_log.display(),
             body = body,
         );
-        std::fs::write(&bin, script).expect("write fake claude");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&bin, perms).expect("chmod");
-        }
+        crate::write_test_executable(&bin, script).expect("write test executable");
         bin
     }
 
@@ -9074,14 +9067,7 @@ mod grok_panel_route_tests {
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {log}\nprintf '{{\"type\":\"text\",\"data\":\"ok\"}}\\n'\nprintf '{{\"type\":\"end\",\"sessionId\":\"s\",\"stopReason\":\"end_turn\"}}\\n'\n",
             log = argv_log.display(),
         );
-        std::fs::write(&bin, script).expect("write fake grok");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&bin, perms).expect("chmod");
-        }
+        crate::write_test_executable(&bin, script).expect("write test executable");
         bin
     }
 
@@ -9577,14 +9563,7 @@ mod mandatory_review_tests {
     }
 
     fn write_executable(path: &std::path::Path, body: &str) {
-        std::fs::write(path, body).expect("write mock");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(path, perms).expect("chmod");
-        }
+        crate::write_test_executable(path, body).expect("write test executable");
     }
 
     /// Clears the review env on EVERY exit path, including a panicking assertion.
@@ -10720,7 +10699,6 @@ mod grok_shell_read_gate_tests {
 #[allow(clippy::await_holding_lock)]
 mod strict_agent_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     const ENV_KEYS: [&str; 7] = [
         "TRIUMVIRATE_GEMINI_DEGRADED_ROUTE",
@@ -10751,10 +10729,7 @@ mod strict_agent_tests {
     }
 
     fn write_script(path: &std::path::Path, body: &str) {
-        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write mock");
-        let mut perms = std::fs::metadata(path).expect("mock meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).expect("chmod mock");
+        crate::write_test_executable(path, format!("#!/bin/sh\n{body}\n")).expect("write test executable");
     }
 
     /// agy always fails on quota. codex always answers, and leaves a file saying it ran.
@@ -10876,7 +10851,6 @@ mod sight_gate_canary_tests {
 #[allow(clippy::await_holding_lock)]
 mod stall_kill_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     const ENV_KEYS: [&str; 3] = ["TRIUMVIRATE_HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_STALL_SECS_CODEX"];
 
@@ -10917,10 +10891,7 @@ mod stall_kill_tests {
              echo $! > '{d}/grandchild.pid'\n\
              {body}\n"
         );
-        fs::write(&stub, script).expect("write stub");
-        let mut perms = fs::metadata(&stub).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&stub, perms).expect("chmod");
+        crate::write_test_executable(&stub, script).expect("write test executable");
         // SAFETY: serialised by the binary-wide env lock, cleared in Drop.
         unsafe {
             std::env::set_var("TRIUMVIRATE_HOME", dir.path().join("home"));
@@ -11089,7 +11060,6 @@ mod stall_unit_tests {
 #[allow(clippy::await_holding_lock)]
 mod sight_repair_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn read_call(command: String, success: bool) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
@@ -11131,10 +11101,7 @@ mod sight_repair_tests {
         let src = src.display().to_string();
         let bin = dir.path().join("fake-codex-repair");
         let d = dir.path().display();
-        std::fs::write(&bin, format!("#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n", crate::tests::JSON_ESCAPE_SH)).unwrap();
-        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).unwrap();
+        crate::write_test_executable(&bin, format!("#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n", crate::tests::JSON_ESCAPE_SH)).expect("write test executable");
         let restore = crate::agy::tests::set_env_scoped("TRIUMVIRATE_CODEX_BIN", Some(bin.to_str().unwrap()));
         Stub { dir, src, _restore: restore }
     }
