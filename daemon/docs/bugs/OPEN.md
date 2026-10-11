@@ -19,6 +19,8 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
+> **Live check, 2026-10-11, build from feat/sight-salvage-main installed to ~/.local/bin (daemon pid 79491):** codex read a 300-line file as two `nl -ba F | sed -n` windows joined by a NEWLINE in one command and passed (D-056c, D-059 output check), request 96e9ae31; grok read a 445-line file with one whole `read_file` and passed (D-053), request e9e92416. Both answered the planted line token correctly. The entries below stay Open until the branch is merged to main, because the installed build is not yet main's.
+
 ### D-053 - Every grok review that reads with `read_file` is rejected as PART
 **Found:** 2026-10-10 (peer review of feat/sight-salvage-main) · **Severity:** HIGH · **FIX ON BRANCH, NOT MERGED** (2d1106d)
 **Evidence:** grok read a 445-line file with `read_file` and no offset or limit; the gate said "only read PART" with receipt `read this turn as [{"target_file":...}]`. A direct capture (`daemon/crates/agent-adapter/tests/fixtures/grok-1.0.46-read445-20261010.jsonl`) shows grok 1.0.46 numbers only line 1 and every tenth line, so D-032's `numbered_line_runs` credited 45 single lines. D-032's fixtures are grok 1.0.13 reads of a one-line file.
