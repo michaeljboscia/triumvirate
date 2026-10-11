@@ -1180,7 +1180,7 @@ mod sparse_numbering_tests {
     fn the_raw_span_is_used_only_when_the_shown_text_agrees() {
         let raw: String = (1..=25).map(|i| format!("l{i}\n")).collect();
         let shown = |first: u64| -> String {
-            (0..25u64).map(|i| { let n = first + i; if i == 0 || n % 10 == 0 { format!("{n}→l{n}\n") } else { format!("l{n}\n") } }).collect()
+            (0..25u64).map(|i| { let n = first + i; if i == 0 || n.is_multiple_of(10) { format!("{n}→l{n}\n") } else { format!("l{n}\n") } }).collect()
         };
         assert_eq!(returned(&shown(1), &raw, serde_json::Value::Null), vec![(1, 25)]);
         let raw101: String = (101..=125).map(|i| format!("l{i}\n")).collect();

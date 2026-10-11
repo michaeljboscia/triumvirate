@@ -3560,10 +3560,16 @@ mod tests {
     #[ctor::ctor]
     fn isolate_triumvirate_home() {
         if std::env::var_os("TRIUMVIRATE_HOME").is_none() {
-            let home = std::env::temp_dir().join(format!("triumvirate-test-home-{}", std::process::id()));
             // SAFETY: a constructor runs before main, so no other thread can read the environment.
-            unsafe { std::env::set_var("TRIUMVIRATE_HOME", home) };
+            unsafe { std::env::set_var("TRIUMVIRATE_HOME", isolated_test_home()) };
         }
+    }
+
+    /// The home every test in this binary falls back to. A fixture that clears its env keys on
+    /// drop must put TRIUMVIRATE_HOME back to THIS, never unset it: unset, every later test in
+    /// the binary writes to the operator's real ~/.triumvirate again.
+    pub(crate) fn isolated_test_home() -> PathBuf {
+        std::env::temp_dir().join(format!("triumvirate-test-home-{}", std::process::id()))
     }
 
     pub(crate) fn env_lock() -> &'static Mutex<()> {
