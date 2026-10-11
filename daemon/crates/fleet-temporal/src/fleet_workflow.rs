@@ -294,6 +294,13 @@ impl FleetLedgerActivities {
             base.as_deref(),
             new_commit,
         );
+        let verdict = fleet::orchestrator::name_print_timeout(
+            verdict,
+            &[
+                o.output.as_ref().map(|x| x.stdout_tail.as_str()).unwrap_or(""),
+                o.output.as_ref().map(|x| x.stderr_tail.as_str()).unwrap_or(""),
+            ],
+        );
         let succeeded = verdict.is_ok();
         // A run that exited 0 without a commit is failed WITH the reason, not silently done.
         let error = o.error.clone().or_else(|| verdict.err());
