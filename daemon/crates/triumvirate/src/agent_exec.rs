@@ -1263,6 +1263,7 @@ async fn execute_ask_agent_inner(
                         &mut lifecycle,
                     )
                 {
+                    let err = note_sources_changed_during_review(err, &req.required_sources, &source_snapshot, &exec_cwd);
                     // 2b: one repair turn in the reviewer's own session before rejecting.
                     let budget = review_timeout().saturating_sub(dispatch_started.elapsed());
                     match try_sight_repair(&agent, &agent_display, &parsed, &err, req, &exec_cwd, &source_snapshot, *model_override, budget, &mut lifecycle).await {
@@ -1757,6 +1758,7 @@ async fn execute_ask_agent_inner(
                             &mut lifecycle,
                         )
                     {
+                        let err = note_sources_changed_during_review(err, &req.required_sources, &source_snapshot, &exec_cwd);
                         // 2b, same helper as the primary arm. It resumes hop.agent's OWN session,
                         // never the primary seat's, inside what is left of both budgets.
                         let budget = deadline
@@ -2432,13 +2434,20 @@ fn codex_ranged_reads_cover_source(
 /// credited. `cat -v` of a line with control bytes prints them rewritten and is
 /// not credited: a false rejection, never a false pass.
 fn call_showed_lines(c: &ToolCallRecord, operand: &str, range: &agent_adapter::codex::LineRange, cwd: &str) -> bool {
+    first_line_not_shown(c, operand, range, cwd).is_none()
+}
+
+/// Why `call_showed_lines` refuses, for the rejection receipt; `None` when it credits the read.
+/// #81: a whole `cat` whose output matched the file was refused as "only read PART" because the
+/// file was edited on disk while the review ran, and nothing in the error said which line failed.
+fn first_line_not_shown(c: &ToolCallRecord, operand: &str, range: &agent_adapter::codex::LineRange, cwd: &str) -> Option<String> {
     // Every parser now records a shell call's output (D-059), so a shell read without one is a
     // shape no parser produces and is credited nothing (Codex, round 4).
     let Some(shown) = c.shown_output.as_deref() else {
-        return false;
+        return Some("no recorded output".to_string());
     };
     let Some(bytes) = source_bytes(operand, cwd) else {
-        return false;
+        return Some("a file the daemon cannot read".to_string());
     };
     let (start, end) = (range.start.max(1), range.end.unwrap_or(u64::MAX));
     let shown = shown.as_bytes();
@@ -2455,10 +2464,10 @@ fn call_showed_lines(c: &ToolCallRecord, operand: &str, range: &agent_adapter::c
         }
         match shown[cursor..].windows(line.len()).position(|w| w == line) {
             Some(at) => cursor += at + line.len(),
-            None => return false,
+            None => return Some(format!("line {n} of {operand} as it is on disk now")),
         }
     }
-    true
+    None
 }
 
 /// What an honest run of `command` would show: the raw lines of every read it parses to. Test
@@ -2736,14 +2745,36 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
                     None => format!("lines {}-$ of {}", r.range.start, r.operand),
                 })
                 .collect();
-            Some(if windows.is_empty() {
+            let described = if windows.is_empty() {
                 describe_what_the_read_bound(args)
             } else {
                 windows.join(", ")
+            };
+            // #81: say which line the call's output did not show, so a refused read explains
+            // itself instead of reading as a slice.
+            Some(match shell_read_not_shown(c, &candidates, cwd) {
+                Some(why) => format!("{described} (not credited: its output does not show {why})"),
+                None => described,
             })
         })
         .collect();
     format!("{source} has {total}; read this turn as [{}]", reads.join(", "))
+}
+
+/// The first of this shell call's reads of the source whose output check fails, as a reason.
+fn shell_read_not_shown(c: &ToolCallRecord, candidates: &[String], cwd: &str) -> Option<String> {
+    if !is_shell_read_tool(&c.tool) {
+        return None;
+    }
+    let cmd = c.args_json.as_deref().and_then(agent_adapter::codex::shell_command_from_args_json)?;
+    let whole = agent_adapter::codex::whole_file_read_operands(&cmd)
+        .into_iter()
+        .map(|op| (op, agent_adapter::codex::LineRange { start: 1, end: None }));
+    let ranged = agent_adapter::codex::command_read_ranges(&cmd).into_iter().map(|r| (r.operand, r.range));
+    whole
+        .chain(ranged)
+        .filter(|(op, _)| candidates.iter().any(|cand| cand == op))
+        .find_map(|(op, range)| first_line_not_shown(c, &op, &range, cwd))
 }
 
 /// What the read parsers made of a call's arguments, for a rejection receipt.
@@ -3220,6 +3251,29 @@ fn enforce_reviewer_sight(
         detail: detail.clone(),
     });
     Err(detail)
+}
+
+/// A sight rejection, plus a note naming every source whose bytes changed since the snapshot
+/// taken before turn 1. #81: the caller rewrote a source while codex was reviewing it, codex's
+/// whole `cat` matched the version it read, and the gate (right to refuse it) said "only read
+/// PART", which sent everyone looking for a gate bug. Both dispatch arms call this.
+fn note_sources_changed_during_review(err: String, sources: &[String], snapshot: &[Option<Vec<u8>>], cwd: &str) -> String {
+    let changed: Vec<&str> = sources
+        .iter()
+        .zip(snapshot)
+        .filter(|(s, before)| source_bytes(s, cwd) != **before)
+        .map(|(s, _)| s.as_str())
+        .collect();
+    if changed.is_empty() {
+        return err;
+    }
+    format!(
+        "{err} NOTE: {} changed on disk while the review ran (it differs from the copy taken at \
+         dispatch). A read of the earlier version cannot be matched against the file as it is now, \
+         so this refusal may be an edit racing the review, not a partial read. Do not edit a \
+         source while it is under review.",
+        changed.join(", ")
+    )
 }
 
 /// What one repair turn made of a sight rejection (2b). See [`try_sight_repair`].
@@ -4984,9 +5038,42 @@ const CODEX_REVIEW_TOOL_NOTE: &str = "\n\nTool note for this read-only review: d
 Do not spawn, delegate to or wait on subagents or other agents (spawn_agent, wait_agent): their reads \
 are invisible to this review's verification and the review will be rejected. Read each file with \
 `cat FILE` or `sed -n 'A,Bp' FILE` windows that together cover every line. \
-Always finish with your written answer.";
+This review cannot write files (#83): if anything above asks you to write your answer to a file, \
+put your whole answer in your reply instead. Always finish with your written answer.";
 
-async fn run_codex_cli_process_with_session(
+/// `codex exec resume` has no `--sandbox`/`-s` (codex-cli 0.154.0: "unexpected argument
+/// '--sandbox' found"), so every resumed turn that carried one exited 2 before running. That
+/// killed the sight repair turn for every codex review (#82). The flag cannot be dropped: a
+/// resumed session does NOT keep its first turn's sandbox. Measured 2026-10-11 on a thread
+/// started read-only: resumed with `-c sandbox_mode="workspace-write"` it wrote a file; resumed
+/// with `-c sandbox_mode="read-only"` the same write failed "operation not permitted". So the
+/// mode is restated through `-c`, which resume does accept.
+pub(crate) fn codex_resume_sandbox_args(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        let mode = if arg == "--sandbox" || arg == "-s" {
+            it.next()
+        } else if let Some(m) = arg.strip_prefix("--sandbox=") {
+            Some(m.to_string())
+        } else {
+            out.push(arg);
+            continue;
+        };
+        match mode {
+            Some(mode) => {
+                out.push("-c".to_string());
+                out.push(format!("sandbox_mode=\"{mode}\""));
+            }
+            // A dangling `--sandbox` with no value: keep it, so codex fails loudly rather than
+            // this silently running the turn unsandboxed.
+            None => out.push(arg),
+        }
+    }
+    out
+}
+
+pub(crate) async fn run_codex_cli_process_with_session(
     bin: &str,
     args: &[String],
     message: &str,
@@ -5092,6 +5179,9 @@ async fn run_codex_cli_process_with_session(
     {
         final_args.push("--sandbox".to_string());
         final_args.push("workspace-write".to_string());
+    }
+    if session_id.is_some() {
+        final_args = codex_resume_sandbox_args(final_args);
     }
 
     if !is_git_worktree(cwd) && !has_any_arg(&final_args, &["--skip-git-repo-check"]) {
@@ -7258,6 +7348,8 @@ mod sight_gate_tests {
         assert_eq!(saves, gates, "a sight-rejection arm does not save the turn");
         // 2b: both arms offer the one repair turn through the one helper.
         assert_eq!(production_src.matches("match try_sight_repair(").count(), gates, "a sight arm skips the repair turn");
+        // #81: both arms name a source edited during the review.
+        assert_eq!(production_src.matches("let err = note_sources_changed_during_review(err,").count(), gates, "a sight arm hides a mid-review edit");
         assert!(!production_src.contains("--- rejected output, for inspection, NOT a review ---\\n{preview}\"\n                    ));"));
     }
 
@@ -7696,6 +7788,34 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
             .expect("three overlapping windows covering 1..=556 are a whole read");
+    }
+
+    /// #81, from the live rejection 7476de40 (2026-10-11): codex read a 42-line source with one
+    /// `cat`, its output matched the file byte for byte, and the caller then rewrote the file
+    /// while the review was still running. The gate refused it as "only read PART", correctly
+    /// (the bytes on disk were not the bytes read) but with no way to tell that from a gate bug.
+    /// RED IF: a whole `cat` with matching output stops passing, an edited source starts passing,
+    /// or the refusal stops naming the unseen line and the mid-review edit.
+    #[test]
+    fn sight_81_a_whole_cat_passes_and_an_edit_during_the_review_is_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "menu.json", 42);
+        let tools = vec![codex_read(&format!("/bin/zsh -lc 'cat {src}'"))];
+        let mut lc = Vec::new();
+        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect("a whole cat whose output matches the file is a full read");
+        let snapshot = vec![source_bytes(&src, &cwd)];
+        assert_eq!(note_sources_changed_during_review("E".to_string(), std::slice::from_ref(&src), &snapshot, &cwd), "E", "no edit, no note");
+
+        // The caller edits line 7 after codex read it.
+        let edited: String = (1..=42).map(|i| if i == 7 { "line 7 EDITED\n".to_string() } else { format!("line {i}\n") }).collect();
+        std::fs::write(&src, edited).expect("edit");
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect_err("the bytes on disk are not the bytes codex read");
+        assert!(err.contains(&format!("not credited: its output does not show line 7 of {src}")), "names the line: {err}");
+        let err = note_sources_changed_during_review(err, std::slice::from_ref(&src), &snapshot, &cwd);
+        assert!(err.contains(&format!("NOTE: {src} changed on disk while the review ran")), "names the edit: {err}");
     }
 
     /// D-036, through the REAL classifier (codex_read hard-codes ReadFile, which is how the bug
