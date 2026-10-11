@@ -307,7 +307,7 @@ impl AgyStreamParser {
         }
 
         let params_value = params.as_deref().and_then(|p| serde_json::from_str::<Value>(p).ok());
-        self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+        self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: Some(idx.to_string()),
             tool: name.clone(),
             // D-010: a `run_command` that reads a file is a read for the sight gate.

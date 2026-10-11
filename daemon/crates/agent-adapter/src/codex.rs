@@ -985,7 +985,7 @@ impl CodexExecParser {
             "command_execution" => {
                 let command = item.get("command").and_then(|v| v.as_str()).unwrap_or_default();
                 if started {
-                    self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                    self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                         id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
                         tool: "command_execution".to_string(),
                         // A pure content reader is classified as a READ so codex can satisfy
@@ -1006,6 +1006,13 @@ impl CodexExecParser {
                         && let Some(existing) = self.tool_calls.iter_mut().find(|r| r.id.as_deref() == Some(id))
                     {
                         existing.success = Some(exit_code == 0);
+                        existing.shown_output = item.get("aggregated_output").and_then(|v| v.as_str()).map(|out| {
+                            let mut end = out.len().min(crate::types::SHOWN_OUTPUT_CAP);
+                            while !out.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            out[..end].to_string()
+                        });
                     }
                 }
                 let event = WorkingStateEvent {
@@ -1045,7 +1052,7 @@ impl CodexExecParser {
                 // `agents.max_depth=0` do NOT stop `spawn_agent`, and the spawn itself is not in
                 // the --json stream; only the later `collab_tool_call` wait is.
                 if started && item_type == COLLAB_TOOL {
-                    self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                    self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                         id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
                         tool: COLLAB_TOOL.to_string(),
                         kind: ToolKind::Unknown,
@@ -1606,4 +1613,26 @@ mod whole_file_read_operand_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod shown_output_tests {
+    use super::*;
+
+    /// Live capture, codex-cli 0.154.0, 2026-10-11 (scratch paths rewritten to /probe): a
+    /// `nl -ba MISSING | sed -n` window, then a real one, in one call. RED IF: the parser stops
+    /// recording `aggregated_output`, which is the only evidence the gate has that the reader
+    /// stage of a pipeline really read: the call's exit code is 0 although `nl` failed.
+    #[test]
+    fn codex_records_what_a_call_showed() {
+        let mut p = CodexExecParser::new();
+        for line in include_str!("../tests/fixtures/codex-0.154.0-pipeline-missing-20261011.jsonl").lines() {
+            p.parse_line(line);
+        }
+        let r = p.finish();
+        let call = r.tool_calls.iter().find(|c| c.tool == "command_execution").expect("the shell call");
+        assert_eq!(call.success, Some(true), "the pipeline's status hides the failed nl");
+        let shown = call.shown_output.as_deref().expect("aggregated_output recorded");
+        assert!(shown.contains("missing.txt: No such file or directory") && shown.contains("     1\tl1\n"), "{shown}");
+    }
 }

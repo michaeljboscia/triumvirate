@@ -237,7 +237,7 @@ impl ClaudeStreamParser {
                     if let Some(ref id) = id {
                         self.pending.insert(id.clone(), self.tool_calls.len());
                     }
-                    self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                    self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                         id: id.clone(),
                         // D-010: a `Bash` call that reads a file is a read for the sight gate.
                         kind: crate::codex::shell_read_kind(tool_kind(&name), block.get("input")),

@@ -31,6 +31,13 @@ file is the thing you read to answer "what do we know is broken right now."
 **Scope, measured 2026-10-11:** not only REJECTED rows. The live outbox holds about 9,000 tempdir rows of every state, and a run of the suite under a scratch HOME wrote outbox.jsonl (75 rows), workers.json, fleets.json, daemon.token, dead-drop/ and agy-failures/ into `$HOME/.triumvirate`.
 **Fix:** a `#[ctor]` in the triumvirate test binary sets a per-process TRIUMVIRATE_HOME under the temp dir before any test thread starts. The same scratch-HOME run then leaves `$HOME/.triumvirate` absent.
 
+### D-059 - A pipeline read is credited on a status its reader stage does not set
+**Found:** 2026-10-11 (Codex, round 2 review of D-056c) · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main, codex only**
+**Evidence:** a shell pipeline's status is its last stage's. Measured with codex-cli 0.154.0: `nl -ba MISSING | sed -n '1,2p'; nl -ba F | sed -n '1,2p'` reported `exit_code: 0` with "nl: MISSING: No such file or directory" in `aggregated_output` (fixture `crates/agent-adapter/tests/fixtures/codex-0.154.0-pipeline-missing-20261011.jsonl`). Every `READER F | sed -n` and `sed -n F | nl` window shape the gate accepts since 2026-09-03 had this, sequence or not. Only a reader the agent cannot run, or a file its sandbox denies, triggers it: the gate itself reads every operand.
+**Fix:** the codex parser records `aggregated_output` as `ToolCallRecord.shown_output` (capped at 64 KiB, never in the ledger), and the gate credits a codex window or whole read only when every non-empty line of it appears, in order, in that output.
+**Still open:** grok, claude and agy shell reads record no output and are still judged on status.
+**CHECK to close:** on main, `a_window_counts_only_when_its_lines_were_shown` and `codex_records_what_a_call_showed` pass, and the first fails with `call_showed_lines` disabled.
+
 ### D-058 - A unit test launched the real codex and agy CLIs on every `cargo test`
 **Found:** 2026-10-11 · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**
 **Evidence:** `fleet_spawn_and_status_tools_round_trip` (daemon/crates/triumvirate/src/main.rs) runs `fleet_spawn` with `wait: true` and no stand-in binaries, so `fleet_agent_command` resolved the installed codex and agy. Under a scratch HOME it left a real codex rollout (`codex_exec`, cli 0.154.0, cwd a fleet worktree) in `$HOME/.codex/sessions`. Under the real HOME that is a paid subscription turn with the task "test", and its failure is invisible because the test accepts `failed`.

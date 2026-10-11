@@ -327,7 +327,7 @@ impl GrokStreamParser {
                 );
                 let args_json = json.get("rawInput").map(|v| v.to_string());
 
-                self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                     id: json.get("toolCallId").and_then(Value::as_str).map(str::to_string),
                     tool: tool.clone(),
                     kind: kind.clone(),
