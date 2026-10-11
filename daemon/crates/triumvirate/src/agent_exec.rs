@@ -6827,6 +6827,46 @@ mod sight_gate_tests {
         assert!(enforce_reviewer_sight("Codex", &all[..3], "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc).is_err());
     }
 
+    /// D-056c at the gate, on real files. RED IF: `cat A; echo; cat B` or newline-joined windows
+    /// stop satisfying their sources, or a sequence whose read may not run (`false && cat F ;
+    /// true`) or whose output is over budget starts to.
+    #[test]
+    fn codex_sequences_of_reads_satisfy_each_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, n: usize| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, (1..=n).map(|i| format!("{name} line {i}\n")).collect::<String>()).unwrap();
+            p.display().to_string()
+        };
+        let (a, b, big) = (write("a.rs", 40), write("b.rs", 300), write("big.rs", 3000));
+        let cwd = dir.path().display().to_string();
+        let call = |command: String| {
+            let args = serde_json::json!({ "command": command });
+            ToolCallRecord {
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+                returned_lines: Vec::new(),
+            }
+        };
+        let gate = |calls: &[ToolCallRecord], sources: &[String]| {
+            let mut lc = Vec::new();
+            enforce_reviewer_sight("Codex", calls, "codex-exec-json", sources, &cwd, &mut lc)
+        };
+        let both = [a.clone(), b.clone()];
+        gate(&[call(format!("/bin/zsh -lc \"cat {a}; echo; echo ----; cat {b}\""))], &both)
+            .expect("one call, two whole reads");
+        gate(&[call(format!("/bin/zsh -lc \"nl -ba {b} | sed -n '1,150p'\nnl -ba {b} | sed -n '151,300p'\""))], std::slice::from_ref(&b))
+            .expect("newline-joined windows cover 1-300");
+        assert!(gate(&[call(format!("/bin/zsh -lc \"nl -ba {b} | sed -n '1,150p'\nnl -ba {b} | sed -n '152,300p'\""))], std::slice::from_ref(&b)).is_err(), "a one-line gap");
+        assert!(gate(&[call(format!("false && cat {a} ; true"))], std::slice::from_ref(&a)).is_err(), "the read may not have run");
+        assert!(gate(&[call(format!("cat {a}; cat {big}"))], &[a.clone(), big.clone()]).is_err(), "over the one-call budget");
+        assert!(gate(&[call(format!("cat {a}; cat {}/missing.rs", cwd))], std::slice::from_ref(&a)).is_err(), "an operand the gate cannot read");
+    }
+
     /// Both success arms build their rejection through the one helper. RED IF: an arm goes back
     /// to formatting its own preview, which is how one surface gets the fix and the other not.
     #[test]

@@ -43,9 +43,9 @@ file is the thing you read to answer "what do we know is broken right now."
 **CHECK to close:** on main, a rejected review leaves `~/.triumvirate/rejected/<id>-<uuid>.json` holding the full reply and every tool call, and the error names it.
 
 ### D-056 - Three shell read shapes codex really uses are not counted
-**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6bbce82, 68f3fe2)
-**Evidence:** (a) codex records `sed -n '1,$p' F` as `/bin/zsh -lc "sed -n '1,"'$p'"' F"`, which the unwrapper could not see through: 5 rejections (09-16 x3, 09-27, 10-09). (b) `sed -n 'a,bp' F | nl -ba -va` was not a recognised shape: this branch's codex review, reading every line of 654, was rejected. (c, NOT fixed) `cat A; echo ...; cat B` and newline-separated reads of different files are still refused; a design that marks links before `;` as masked was drafted and Antigravity found `false && cat F ; true` against it, so it was not ported.
-**CHECK to close:** (a) and (b) on main: the live shapes satisfy the gate. (c) stays open.
+**Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6bbce82, 68f3fe2, and (c) on feat/sight-salvage-main)
+**Evidence:** (a) codex records `sed -n '1,$p' F` as `/bin/zsh -lc "sed -n '1,"'$p'"' F"`, which the unwrapper could not see through: 5 rejections (09-16 x3, 09-27, 10-09). (b) `sed -n 'a,bp' F | nl -ba -va` was not a recognised shape: this branch's codex review, reading every line of 654, was rejected. (c) `cat A; echo ...; cat B` and newline-joined reads were refused whole, including the live receipt `nl -ba F | sed -n '1,240p'` NEWLINE `nl -ba F | sed -n '241,480p'`. A first design that marked links before `;` as masked fell to `false && cat F ; true` (Antigravity) and was not ported. The fix splits a `;` or newline sequence only when every link is a vetted read or a literal `echo`, no link holds `&&` or `||`, and the unsafe-first-word guard passes; the gate already reads every operand itself and credits nothing when one is unreadable.
+**CHECK to close:** (a), (b) and (c) on main: the live shapes satisfy the gate, and `codex_sequences_of_reads_satisfy_each_source` passes and fails with `sequence_of_reads` disabled.
 
 ### D-057 - The `&&` split credits links that never ran or ran something else
 **Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (6d979fd)

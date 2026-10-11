@@ -183,9 +183,9 @@ pub fn whole_file_read(command: &str) -> Option<(String, Decoration)> {
     whole_file_reader_with_one_operand(cmd).map(|(op, _, d)| (op, d))
 }
 
-/// Every whole-file read in a command with its decoration, one per `&&` segment.
+/// Every whole-file read in a command with its decoration, one per segment ([`read_segments`]).
 pub fn whole_file_reads(command: &str) -> Vec<(String, Decoration)> {
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .filter_map(whole_file_read)
         .collect()
@@ -235,7 +235,8 @@ pub const COLLAB_TOOL: &str = "collab_tool_call";
 /// ONLY `&&`, deliberately. The gate counts a call only when the tool reported success, and an
 /// `&&` chain exits zero only if every link ran and succeeded, so each link's read really
 /// happened. `;` and `||` both mask a failure (`cat missing ; true`, `cat missing || true`
-/// exit zero having read nothing), so a command containing either is still refused whole.
+/// exit zero having read nothing), so this split never cuts at either. A `;` or newline
+/// SEQUENCE is split only by [`read_segments`], and only when every link is a vetted read.
 ///
 /// Splitting changes only which text each parser sees. Every segment goes through the same
 /// unchanged parser, which still refuses a redirect, a comment, a subshell, a backtick, a
@@ -338,40 +339,71 @@ fn split_unquoted<'a>(command: &'a str, sep: &[u8]) -> Vec<&'a str> {
     out
 }
 
-/// The segments the read parsers judge: the `&&` chain, or (D-036) a `;` chain of WINDOWS ON ONE
-/// FILE.
+/// The segments the read parsers judge: a `;` or newline SEQUENCE OF READS, or else the `&&`
+/// chain.
 ///
-/// Codex read four sources as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the gate threw
-/// the review away. `;` stays refused in general, because it masks a failed link (`cat missing ;
-/// true` exits zero having read nothing). This shape cannot mask one: every link is a `sed -n`
-/// range or `READER F | sed -n` range on the SAME operand, so a missing file fails the last link
-/// too and the call is not a success, and a range read of a file that exists cannot fail. The
-/// gate then checks the union of windows against the real file on disk, as for any ranged read.
-/// Anything else in a `;` chain (a second file, any other command, an `&&` inside a link) and the
-/// whole command is judged exactly as before.
-/// The segments [`command_read_ranges`] walks, for the gate to size a call's whole output.
+/// D-036: codex read four sources as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the gate
+/// threw the review away. D-056c: it also joins reads with newlines (`nl -ba F | sed -n
+/// '1,240p'` NEWLINE `nl -ba F | sed -n '241,480p'`, live receipts) and walks several files in
+/// one call (`cat A; echo; cat B`). Both were rejected whole.
+///
+/// `;` and a newline mask a failed link, which is why a sequence was refused in general: `false
+/// && cat F ; true` exits zero having read nothing (Antigravity). So a sequence is split ONLY
+/// when every link is a vetted read (a whole-file read or a line window, any file) or an inert
+/// literal `echo`, no link contains `&&` or `||`, and [`chain_links_are_unprovable`] passes.
+/// `true`, `false`, `exit` and every other program make the whole command one segment again,
+/// which every read parser refuses. What is left is a read link that fails while a later one
+/// succeeds. A link fails on a missing or unreadable operand, and the gate reads every operand
+/// of the call from disk itself, as the same user, and credits nothing when one cannot be read
+/// (`shell_call_fits_budget`). The window union and the budget then apply as for any read.
 pub fn read_segments_pub(command: &str) -> Vec<&str> {
     read_segments(command)
 }
 
 fn read_segments(command: &str) -> Vec<&str> {
     let cmd = unwrap_shell_wrapper(command.trim());
-    let links = split_unquoted(cmd, b";");
-    if links.len() > 1 {
-        let reads: Option<Vec<RangedRead>> =
-            links.iter().map(|l| if l.contains("&&") { None } else { command_read_range(l) }).collect();
-        if let Some(reads) = reads
-            && reads.windows(2).all(|w| w[0].operand == w[1].operand)
-        {
-            return links;
-        }
-    }
-    and_chain_segments(cmd)
+    sequence_of_reads(cmd).unwrap_or_else(|| and_chain_segments(cmd))
 }
 
-/// Every whole-file read in a command, one per `&&` segment.
+/// The links of a `;` or newline sequence in which every link is a vetted read or an inert
+/// `echo`, with at least one read. `None` for anything else. See [`read_segments`].
+fn sequence_of_reads(cmd: &str) -> Option<Vec<&str>> {
+    if chain_links_are_unprovable(cmd) {
+        return None;
+    }
+    let links: Vec<&str> = split_unquoted(cmd, b";")
+        .into_iter()
+        .flat_map(|l| split_unquoted(l, b"\n"))
+        .collect();
+    if links.len() < 2 {
+        return None;
+    }
+    let mut reads = 0usize;
+    for link in &links {
+        if link.contains("&&") || link.contains("||") {
+            return None;
+        }
+        if command_read_range(link).is_some() || whole_file_read(link).is_some() {
+            reads += 1;
+        } else if !is_inert_echo(link) {
+            return None;
+        }
+    }
+    (reads > 0).then_some(links)
+}
+
+/// `echo` with literal words only: the separator codex prints between files. The same literal
+/// rule the gate sizes it by (`small_output_bound`), so a link counted here is one the budget
+/// can bound. A quote, a variable, a glob or a brace is refused: each prints more than its text.
+fn is_inert_echo(link: &str) -> bool {
+    let literal = |t: &str| t.chars().all(|ch| ch.is_ascii_alphanumeric() || "._/-:=,+@%".contains(ch));
+    let mut toks = link.split_whitespace();
+    toks.next() == Some("echo") && toks.all(literal)
+}
+
+/// Every whole-file read in a command, one per segment ([`read_segments`]).
 pub fn whole_file_read_operands(command: &str) -> Vec<String> {
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .filter_map(whole_file_read_operand)
         .collect()
@@ -420,7 +452,7 @@ pub fn shell_command_from_args_json(args_json: &str) -> Option<String> {
 pub fn command_reads_whole_file(command: &str) -> bool {
     // Per `&&` segment (D-017): `wc -l F && cat F` took `wc` as the program and reported a
     // partial read of a command that shows the whole file.
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .any(segment_reads_whole_file)
 }
@@ -1497,12 +1529,14 @@ mod whole_file_read_operand_tests {
 
     /// D-036 at the parser: a `;` chain is split only when every link is a window on one file.
     #[test]
-    fn semicolon_chains_split_only_for_windows_on_one_file() {
+    fn semicolon_chains_split_only_for_sequences_of_reads() {
         let ok = "/bin/zsh -lc \"sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/a.rs\"";
         assert!(command_reads_file_contents(ok));
         assert_eq!(command_read_ranges(ok).len(), 2);
+        // D-056c: windows on two files are two reads, each bound to its own operand.
+        let two = command_read_ranges("sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/b.rs");
+        assert_eq!(two.iter().map(|r| r.operand.as_str()).collect::<Vec<_>>(), ["/r/a.rs", "/r/b.rs"]);
         for bad in [
-            "sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/b.rs",
             "sed -n '1,180p' /r/a.rs; rm -rf /r",
             "cat /r/a.rs; true",
             "sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/a.rs && ls",
@@ -1513,6 +1547,42 @@ mod whole_file_read_operand_tests {
         }
         // A `;` inside a quoted sed script is not a separator.
         assert!(command_read_ranges("sed -n '1,2p;3p' /r/a.rs").is_empty());
+    }
+
+    /// RED IF: a `;` or newline sequence of reads (D-056c, live codex receipts) is refused, or a
+    /// sequence with a link that may not run, or that is not a read, is split.
+    #[test]
+    fn newline_and_semicolon_sequences_of_reads_split() {
+        use super::{command_reads_whole_file, whole_file_read_operands};
+        // Live 2026-10 shape: windows on one file, one per line.
+        let nl_windows = "/bin/zsh -lc \"nl -ba /r/s.py | sed -n '1,240p'\nnl -ba /r/s.py | sed -n '241,480p'\"";
+        let r = command_read_ranges(nl_windows);
+        assert_eq!(r.iter().map(|w| (w.range.start, w.range.end)).collect::<Vec<_>>(), [(1, Some(240)), (241, Some(480))]);
+        assert!(command_reads_file_contents(nl_windows));
+        // Whole files with literal echo separators.
+        let cats = "cat /r/a.rs; echo; echo ----- /r/b.rs; cat /r/b.rs";
+        assert_eq!(whole_file_read_operands(cats), ["/r/a.rs", "/r/b.rs"]);
+        assert!(command_reads_whole_file(cats));
+        assert_eq!(whole_file_read_operands("cat /r/a.rs\ncat /r/b.rs\n"), ["/r/a.rs", "/r/b.rs"]);
+        for bad in [
+            "false && cat /r/a.rs ; true",
+            "false && cat /r/a.rs\ntrue",
+            "cat /r/a.rs || true; cat /r/b.rs",
+            "cat /r/a.rs; true",
+            "cat /r/a.rs; exit 0",
+            "cd /elsewhere; cat /r/a.rs",
+            "X=1; cat /r/a.rs",
+            "cat /r/a.rs; echo \"$(rm -rf /r)\"",
+            "cat /r/a.rs; echo {1..40000}",
+            "cat /r/a.rs; echo *",
+            "cat /r/a.rs & cat /r/b.rs",
+            "echo a; echo b",
+            "cat /r/a.rs > /tmp/x; cat /r/b.rs",
+            "cat() { :; }; cat /r/a.rs",
+        ] {
+            assert!(whole_file_read_operands(bad).is_empty(), "no whole read from: {bad}");
+            assert!(command_read_ranges(bad).is_empty(), "no windows from: {bad}");
+        }
     }
 
 }
