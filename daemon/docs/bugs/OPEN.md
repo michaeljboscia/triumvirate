@@ -19,54 +19,11 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-> **Live check, 2026-10-11, build from feat/sight-salvage-main installed to ~/.local/bin (daemon pid 79491):** codex read a 300-line file as two `nl -ba F | sed -n` windows joined by a NEWLINE in one command and passed (D-056c, D-059 output check), request 96e9ae31; grok read a 445-line file with one whole `read_file` and passed (D-053), request e9e92416. Both answered the planted line token correctly. The entries below stay Open until the branch is merged to main, because the installed build is not yet main's.
+Nothing open. New defects go here.
 
-### D-052 - A fleet member that hits its timeout is recorded as "exited 0 without committing"
-**Found:** 2026-10-08 (closing D-049) · **Severity:** LOW · **NOT FIXED**
-**Evidence:** agy prints `[agy] print timeout after ...; returning partial output` and exits 0. The fleet then records the member failed with `agent exited 0 without committing: its branch head ... is not a new commit` (`fleet/src/orchestrator.rs:2135`). True, but it hides why: the reader cannot tell a timeout from an agent that chose not to commit.
-**CHECK to close:** a fleet member whose output contains agy's print-timeout line is recorded failed with a reason naming the timeout, on both engines.
+---
 
-### D-004 - Failed generations carry no error text
-**Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
-**Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried
-`tv_outcome` and nothing else; `$ai_error` did not exist in this project's taxonomy. The outcome
-half was resolved 2026-08-07 (`cancelled` instead of `unreported`).
-**What was actually wrong (found 2026-09-19):** the cause WAS captured. `CallTelemetry::failure`
-stored it in `self.detail`, and it was then sent only to a separate `$exception` event: the
-`AiGeneration` struct had no field for it, so the generation itself said "error" and never said
-what. An existing test claimed "the rejection is inspectable in the generation" and asserted
-`t.detail.is_some()`, which checked the holder and passed while the event never carried it.
-**Fixed:** `AiGeneration` carries `error`, emitted as PostHog's documented `$ai_error` ("the error
-message or object", confirmed against posthog.com/docs/ai-observability/generations) on every
-error outcome, and as `tv_detail` whenever present. BY CONSTRUCTION an event marked
-`$ai_is_error: true` now always carries a non-empty `$ai_error`: a caller-side cancel or an
-unclassified exit says so in words rather than shipping silence. Covered on BOTH surfaces that
-emit failed generations, the telemetry guard and `record_dispatch_generation`; fixing only the
-first would have left every failed dispatch causeless. The misleading test now asserts on the
-emitted payload. Removing the fallback cause turns `every_error_generation_carries_a_non_empty_cause` red.
-**Why it is not closed:** the check is "a failed generation IN POSTHOG carries a cause string",
-and nothing lands in PostHog while the account is over quota (D-018 measured it). The payload
-is proven; its arrival is not, and closing on the payload would be closing on reasoning.
-**Unblocks:** 2026-09-20 14:03 ET.
-**Check:** with `/health` reporting `telemetry_delivery: trusted`, force one failed dispatch and
-find its `$ai_error` in PostHog.
-
-### D-005 - Instrumentation streams gone silent, cause unknown
-**Found:** 2026-07-28 · **Severity:** LOW · **Blocked on an external reset, NOT fixed**
-**Remaining streams:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`,
-`tv_maintenance`. (`tv_codex_dispatch` was shown healthy on 2026-08-02.)
-**What changed 2026-09-19:** this row could never be resolved because nothing could tell "path
-idle" from "emitter broken". That question now has an instrument. The delivery round trip
-(`mcp_bridge::telemetry_delivery`, D-018) reports whether events are arriving AT ALL, so a
-quiet stream is interpretable: while `/health` says `telemetry_delivery: untrusted`, no stream's
-silence means anything; while it says `trusted`, a silent stream is an idle path.
-**Why it is still open:** its own check is "exercise each path once and confirm the event
-lands", and nothing lands while the PostHog account is over quota. Closing it on the new
-instrument alone would be closing it on reasoning rather than on its check, which is exactly
-what this file forbids.
-**Unblocks:** 2026-09-20 14:03 ET, when the quota resets.
-**Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
-stream once and find the event in PostHog.
+## Closed
 
 ### 2026-09-19: the test suite wrote wiki_call events into real shared ledgers (D-019)
 
@@ -281,9 +238,56 @@ atomic counter. Three consecutive full workspace runs clean.
 ### 2026-05-26 — ABE red-team stub detection not blocking
 See `2026-05-26-abe-red-team-stub-detection-not-blocking.md`.
 
----
+### D-052 - A fleet member that hits its timeout is recorded as "exited 0 without committing"
+**CLOSED 2026-10-11:** fixed in fleet::orchestrator::name_print_timeout, called at both legacy verdict sites and in the Temporal record_task_outcome activity. `a_print_timeout_is_named_in_the_no_commit_reason` proves the reason leads with the timeout line; `every_member_verdict_site_names_a_print_timeout` fails if either engine drops the call. Not forced live (that needs a member to run out its full print timeout).
+**Found:** 2026-10-08 (closing D-049) · **Severity:** LOW · **NOT FIXED**
+**Evidence:** agy prints `[agy] print timeout after ...; returning partial output` and exits 0. The fleet then records the member failed with `agent exited 0 without committing: its branch head ... is not a new commit` (`fleet/src/orchestrator.rs:2135`). True, but it hides why: the reader cannot tell a timeout from an agent that chose not to commit.
+**CHECK to close:** a fleet member whose output contains agy's print-timeout line is recorded failed with a reason naming the timeout, on both engines.
 
-## Closed
+### D-004 - Failed generations carry no error text
+**CLOSED 2026-10-11:** PostHog, 2026-10-11 with /health `telemetry_delivery: trusted`: since 2026-09-20, 89 of 89 failed `$ai_generation` events carry a non-empty `$ai_error` (83 from codex, grok and gemini dispatches). The 24 without one all date from 2026-09-12 to 2026-09-19 11:35, before the fix was installed.
+**Found:** 2026-07-28 · **Severity:** MEDIUM · **FIX LANDED 2026-09-19; live confirmation blocked on the quota reset**
+**Evidence (original):** failed `$ai_generation` events of 2026-07-28 and 2026-08-06 carried
+`tv_outcome` and nothing else; `$ai_error` did not exist in this project's taxonomy. The outcome
+half was resolved 2026-08-07 (`cancelled` instead of `unreported`).
+**What was actually wrong (found 2026-09-19):** the cause WAS captured. `CallTelemetry::failure`
+stored it in `self.detail`, and it was then sent only to a separate `$exception` event: the
+`AiGeneration` struct had no field for it, so the generation itself said "error" and never said
+what. An existing test claimed "the rejection is inspectable in the generation" and asserted
+`t.detail.is_some()`, which checked the holder and passed while the event never carried it.
+**Fixed:** `AiGeneration` carries `error`, emitted as PostHog's documented `$ai_error` ("the error
+message or object", confirmed against posthog.com/docs/ai-observability/generations) on every
+error outcome, and as `tv_detail` whenever present. BY CONSTRUCTION an event marked
+`$ai_is_error: true` now always carries a non-empty `$ai_error`: a caller-side cancel or an
+unclassified exit says so in words rather than shipping silence. Covered on BOTH surfaces that
+emit failed generations, the telemetry guard and `record_dispatch_generation`; fixing only the
+first would have left every failed dispatch causeless. The misleading test now asserts on the
+emitted payload. Removing the fallback cause turns `every_error_generation_carries_a_non_empty_cause` red.
+**Why it is not closed:** the check is "a failed generation IN POSTHOG carries a cause string",
+and nothing lands in PostHog while the account is over quota (D-018 measured it). The payload
+is proven; its arrival is not, and closing on the payload would be closing on reasoning.
+**Unblocks:** 2026-09-20 14:03 ET.
+**Check:** with `/health` reporting `telemetry_delivery: trusted`, force one failed dispatch and
+find its `$ai_error` in PostHog.
+
+### D-005 - Instrumentation streams gone silent, cause unknown
+**CLOSED 2026-10-11:** PostHog, 2026-10-11, telemetry trusted: `tv_maintenance` (113 in 60 days, latest 18:07) and `tv_fleet_spawn` (38, latest 2026-10-08) were live. `tv_review_requested` and `tv_review_verdict` had none because their only emitters are the review_request and review_submit MCP tools, which peer review no longer uses; exercised once each in a scratch project, both landed (18:24:40 and 18:24:45). Idle paths, not broken emitters.
+**Found:** 2026-07-28 · **Severity:** LOW · **Blocked on an external reset, NOT fixed**
+**Remaining streams:** `tv_review_verdict`, `tv_review_requested`, `tv_fleet_spawn`,
+`tv_maintenance`. (`tv_codex_dispatch` was shown healthy on 2026-08-02.)
+**What changed 2026-09-19:** this row could never be resolved because nothing could tell "path
+idle" from "emitter broken". That question now has an instrument. The delivery round trip
+(`mcp_bridge::telemetry_delivery`, D-018) reports whether events are arriving AT ALL, so a
+quiet stream is interpretable: while `/health` says `telemetry_delivery: untrusted`, no stream's
+silence means anything; while it says `trusted`, a silent stream is an idle path.
+**Why it is still open:** its own check is "exercise each path once and confirm the event
+lands", and nothing lands while the PostHog account is over quota. Closing it on the new
+instrument alone would be closing it on reasoning rather than on its check, which is exactly
+what this file forbids.
+**Unblocks:** 2026-09-20 14:03 ET, when the quota resets.
+**Check:** with `/health` reporting `telemetry_delivery: trusted`, exercise each remaining
+stream once and find the event in PostHog.
+
 
 ### #81, #82, #83 - Sight repair, codex resume, and agy write denial (GitHub issues)
 **CLOSED 2026-10-11 (PR #84):** #82, a resumed codex turn restates its sandbox via `-c sandbox_mode`; live, a forced partial read was repaired in the same session. #81 was not a gate bug: the source was edited mid-review, and the refusal now names the failing line and the edit. #83: write-confined agy is told it cannot write; live, it answered inline.
@@ -502,4 +506,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-10-11 18:10 ET
+**Last reviewed:** 2026-10-11 18:35 ET

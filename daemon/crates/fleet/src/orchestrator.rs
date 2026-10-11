@@ -691,6 +691,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                         match wait_result {
                             Ok(status) if status.success() => {
                                 let (verdict, head, base) = judge_worktree_run(&project_root, &fleet_id, &worktree_path, status.code());
+                                let verdict = name_print_timeout(verdict, &[&stdout_tail, &stderr_tail]);
                                 match verdict {
                                     Ok(()) => {
                                         tracing::info!(
@@ -840,6 +841,7 @@ impl<G: GitOps + Clone + 'static, L: AgentLauncher> FleetOrchestrator<G, L> {
                                             match &r {
                                                 Ok(s) if s.success() => {
                                                     let (verdict, h, b) = judge_worktree_run(&project_root, &fleet_id, &worktree_path, s.code());
+                                                    let verdict = name_print_timeout(verdict, &[&out_tail, &err_tail]);
                                                     match verdict {
                                                         Ok(()) => {
                                                             codex_head = h;
@@ -2140,6 +2142,25 @@ pub fn judge_member_run(exit_code: Option<i32>, branch_head: Option<&str>, base_
     }
 }
 
+/// D-052: a member that ran out of time is not a member that chose not to commit. agy prints
+/// `[agy] print timeout after <d> ...; returning partial output` and exits 0, and the verdict
+/// said only "exited 0 without committing", which hid the cause. When either output tail holds
+/// that line, the reason leads with it. Both engines call this on their verdict.
+pub fn name_print_timeout(verdict: Result<(), String>, outputs: &[&str]) -> Result<(), String> {
+    let Err(reason) = verdict else {
+        return verdict;
+    };
+    let line = outputs
+        .iter()
+        .flat_map(|o| o.lines())
+        .find(|l| l.contains("print timeout after"))
+        .map(str::trim);
+    match line {
+        Some(line) => Err(format!("agent hit its print timeout and stopped mid-turn ({line}); {reason}")),
+        None => Err(reason),
+    }
+}
+
 pub fn judge_worktree_run(
     project_root: &Path,
     fleet_id: &str,
@@ -2249,6 +2270,35 @@ mod judge_member_run_tests {
 
     /// RED IF a member that exited 0 with no new commit is recorded done (the quiet failure), or
     /// a member that did commit is refused.
+    /// D-052. RED IF a member that hit agy's print timeout is reported only as "without
+    /// committing", or a success or an unrelated failure gains a timeout it did not have.
+    #[test]
+    fn a_print_timeout_is_named_in_the_no_commit_reason() {
+        let no_commit = judge_member_run(Some(0), Some("aaa"), Some("aaa"), Some(false));
+        let out = "working...\n[agy] print timeout after 15m0s with turn in progress; returning partial output\n";
+        let e = super::name_print_timeout(no_commit.clone(), &["", out]).unwrap_err();
+        assert!(e.starts_with("agent hit its print timeout and stopped mid-turn ([agy] print timeout after 15m0s"), "{e}");
+        assert!(e.contains("without committing"), "the commit fact stays: {e}");
+        assert_eq!(super::name_print_timeout(no_commit.clone(), &["no timeout here", ""]), no_commit);
+        assert_eq!(super::name_print_timeout(Ok(()), &[out]), Ok(()));
+    }
+
+    /// D-052 on BOTH engines: every verdict site passes through the helper. Fixing one of two
+    /// surfaces is this codebase's recurring defect. RED IF a legacy arm or the Temporal
+    /// activity judges a member without naming a print timeout.
+    #[test]
+    fn every_member_verdict_site_names_a_print_timeout() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let legacy = std::fs::read_to_string(dir.join("src/orchestrator.rs")).unwrap();
+        let legacy = &legacy[..legacy.find("#[cfg(test)]").unwrap()];
+        let sites = legacy.matches("= judge_worktree_run(&project_root").count();
+        assert_eq!(sites, 2, "legacy verdict sites changed; revisit this test");
+        assert_eq!(legacy.matches("let verdict = name_print_timeout(verdict,").count(), sites);
+        let temporal = std::fs::read_to_string(dir.join("../fleet-temporal/src/fleet_workflow.rs")).unwrap();
+        assert_eq!(temporal.matches("fleet::orchestrator::judge_member_run(").count(), 1);
+        assert_eq!(temporal.matches("fleet::orchestrator::name_print_timeout(").count(), 1, "the Temporal engine hides the timeout");
+    }
+
     #[test]
     fn done_needs_a_clean_exit_and_a_new_commit() {
         assert!(judge_member_run(Some(0), Some("bbb"), Some("aaa"), Some(true)).is_ok());
