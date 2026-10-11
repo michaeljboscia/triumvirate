@@ -1998,10 +1998,34 @@ fn with_required_sources(message: &str, sources: &[String]) -> String {
     if sources.is_empty() {
         return message.to_string();
     }
-    let list = sources.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n");
+    let list = sources.iter().map(|s| sight_contract_line(s)).collect::<Vec<_>>().join("\n");
     format!(
-        "{message}\n\nSources you must read in full (absolute paths; they exist, do not search for others):\n{list}"
+        "{message}\n\nSources you must read in full (absolute paths; they exist, do not search for others):\n{list}\n\n{SIGHT_CONTRACT_RULE}"
     )
+}
+
+/// The rule the sight gate applies, told to the reviewer BEFORE it reads, not after it is
+/// rejected. About 25 of the real rejections had zero tool calls and about 35 never opened a
+/// named source: behaviour the agent could not correct, because it only saw the rule in the
+/// rejection. Every clause here is one the gate enforces; keep the two in step.
+const SIGHT_CONTRACT_RULE: &str = "How this review is checked: it is rejected unless THIS turn's tool calls show \
+every line, 1 to N, of every source above. Earlier turns do not count. Read each source whole \
+(`cat <path>`, or your file-read tool with no offset and no limit). If you read in windows, the \
+windows together must cover 1 to N with no gap. One shell command's output is cut at 30000 bytes \
+and a cut read earns nothing, so read a source marked over that limit in windows. Do not modify \
+any file.";
+
+/// `- /abs/path (N lines, B bytes)`, with a note when one shell read cannot show it whole. A
+/// source this process cannot read is listed bare: the gate will fail it anyway, and inventing
+/// a count would be telling the reviewer something untrue.
+fn sight_contract_line(source: &str) -> String {
+    match source_bytes(source, "") {
+        Some(bytes) => {
+            let over = if bytes.len() > SHELL_OUTPUT_BUDGET { ", over the one-command limit: read in windows" } else { "" };
+            format!("- {source} ({} lines, {} bytes{over})", count_lines(&bytes), bytes.len())
+        }
+        None => format!("- {source}"),
+    }
 }
 
 fn inject_tool_marker_prompt(user_prompt: &str) -> String {
@@ -10420,6 +10444,24 @@ mod stall_unit_tests {
         assert!(p.starts_with("review this"));
         assert!(p.contains("- /abs/a.rs") && p.contains("- /abs/b.rs"), "{p}");
         assert_eq!(with_required_sources("plain", &[]), "plain");
+    }
+
+    /// RED IF: a sighted dispatch does not tell the reviewer each source's size and the rule
+    /// the gate applies (2c). The counts must be the gate's own, or the contract misleads.
+    #[test]
+    fn sight_contract_states_line_counts_and_the_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, "a\nb\nc").expect("write");
+        let big = dir.path().join("big.rs");
+        std::fs::write(&big, "x".repeat(SHELL_OUTPUT_BUDGET + 1) + "\n").expect("write");
+        let (small_s, big_s) = (small.display().to_string(), big.display().to_string());
+        let p = with_required_sources("review", &[small_s.clone(), big_s.clone(), "/no/such/file.rs".to_string()]);
+        assert!(p.contains(&format!("- {small_s} (3 lines, 5 bytes)\n")), "{p}");
+        assert!(p.contains(&format!("- {big_s} (1 lines, {} bytes, over the one-command limit", SHELL_OUTPUT_BUDGET + 2)), "{p}");
+        assert!(p.contains("- /no/such/file.rs\n"), "an unreadable source is listed bare: {p}");
+        assert!(p.ends_with(SIGHT_CONTRACT_RULE), "{p}");
+        assert!(SIGHT_CONTRACT_RULE.contains("30000") && SHELL_OUTPUT_BUDGET == 30_000, "the rule's number is the gate's");
     }
 
     /// RED IF: the detector's own STUCK events count as progress. They fire while a run is
