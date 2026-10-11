@@ -687,6 +687,9 @@ async fn execute_ask_agent_inner(
     }
 
     let started = Instant::now();
+    // The dispatch's own start: `started` is shadowed per attempt below. The sight repair turn
+    // spends what is left of the review budget measured from here.
+    let dispatch_started = started;
     let span = Span::current();
 
     // request_id is minted here, ABOVE the early returns, so the telemetry guard below can
@@ -833,6 +836,14 @@ async fn execute_ask_agent_inner(
         .clone()
         .unwrap_or_else(|| ".".to_string());
     let execution_prompt = inject_tool_marker_prompt(&with_required_sources(&req.message, &req.required_sources));
+    // 2b: every named source as it was BEFORE turn 1. A repair turn unions turn 1's reads only
+    // for sources still byte-identical to this (Codex, review: a snapshot taken at the repair let
+    // a window of an old version cover a new one).
+    let source_snapshot: Vec<Option<Vec<u8>>> = if sight_required(req) {
+        req.required_sources.iter().map(|s| source_bytes(s, &exec_cwd)).collect()
+    } else {
+        Vec::new()
+    };
     // Named sessions get their own worker record; one-shot ask_agent keeps the shared one.
     let session_key = req.session_key.as_deref();
     let worker = acquire_worker(&agent, &exec_cwd, session_key).await;
@@ -1228,7 +1239,7 @@ async fn execute_ask_agent_inner(
         }
 
         match attempt_result {
-            Ok(parsed) => {
+            Ok(mut parsed) => {
                 // The sight gate runs FIRST, before any success side effect.
                 //
                 // It used to run after them, and Codex caught what that meant: the turn had
@@ -1241,6 +1252,7 @@ async fn execute_ask_agent_inner(
                 // Token accounting is deliberately still performed below on the reject path
                 // through the normal Err arm: the tokens were genuinely spent whether or not the
                 // answer is usable, and hiding that would misreport cost.
+                let mut sight_err = None;
                 if sight_required(req)
                     && let Err(err) = enforce_reviewer_sight(
                         &agent_display,
@@ -1251,6 +1263,19 @@ async fn execute_ask_agent_inner(
                         &mut lifecycle,
                     )
                 {
+                    let err = note_sources_changed_during_review(err, &parsed.tool_calls, &req.required_sources, &source_snapshot, &exec_cwd);
+                    // 2b: one repair turn in the reviewer's own session before rejecting.
+                    let budget = review_timeout().saturating_sub(dispatch_started.elapsed());
+                    match try_sight_repair(&agent, &agent_display, &parsed, &err, req, &exec_cwd, &source_snapshot, *model_override, budget, &mut lifecycle).await {
+                        SightRepair::Passed(merged) => parsed = merged,
+                        SightRepair::Failed(e, merged) => {
+                            parsed = merged;
+                            sight_err = Some(e);
+                        }
+                        SightRepair::NotTried => sight_err = Some(err),
+                    }
+                }
+                if let Some(err) = sight_err {
                     span.record("agent.outcome", "rejected_no_sight");
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                     persist_daemon_token_record(
@@ -1290,9 +1315,13 @@ async fn execute_ask_agent_inner(
                     // 2026-09-01 the ONLY thing that caught the unsighted review was a human
                     // reading the output and noticing it had no links in it. Throwing the text
                     // away destroys the artifact the sole demonstrated catcher actually used.
-                    let preview: String = parsed.response_text.chars().take(600).collect();
-                    return Err(format!(
-                        "{err}\n\n--- rejected output, for inspection, NOT a review ---\n{preview}"
+                    return Err(rejected_turn_error(
+                        &err,
+                        &request_id,
+                        &agent,
+                        &parsed,
+                        &req.required_sources,
+                        &exec_cwd,
                     ));
                 }
                 if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
@@ -1709,7 +1738,7 @@ async fn execute_ask_agent_inner(
             };
 
             match hop_result {
-                Ok(Ok(parsed)) => {
+                Ok(Ok(mut parsed)) => {
                     // Sight is enforced FIRST here too, for the same reason as the primary arm:
                     // a rejected turn must not first be written into the ledger as DONE.
                     //
@@ -1718,6 +1747,7 @@ async fn execute_ask_agent_inner(
                     // entry, emitted "responded", and recorded degraded_success before the gate
                     // ran. Fixing one of two surfaces is the recurring defect in this codebase,
                     // and this is the third time it has appeared in this change alone.
+                    let mut sight_err = None;
                     if sight_required(req)
                         && let Err(err) = enforce_reviewer_sight(
                             &hop_display,
@@ -1728,6 +1758,22 @@ async fn execute_ask_agent_inner(
                             &mut lifecycle,
                         )
                     {
+                        let err = note_sources_changed_during_review(err, &parsed.tool_calls, &req.required_sources, &source_snapshot, &exec_cwd);
+                        // 2b, same helper as the primary arm. It resumes hop.agent's OWN session,
+                        // never the primary seat's, inside what is left of both budgets.
+                        let budget = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(review_timeout().saturating_sub(dispatch_started.elapsed()));
+                        match try_sight_repair(hop.agent, &hop_display, &parsed, &err, req, &exec_cwd, &source_snapshot, None, budget, &mut lifecycle).await {
+                            SightRepair::Passed(merged) => parsed = merged,
+                            SightRepair::Failed(e, merged) => {
+                                parsed = merged;
+                                sight_err = Some(e);
+                            }
+                            SightRepair::NotTried => sight_err = Some(err),
+                        }
+                    }
+                    if let Some(err) = sight_err {
                         span.record("agent.outcome", "rejected_no_sight");
                         span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                         persist_daemon_token_record(
@@ -1755,9 +1801,13 @@ async fn execute_ask_agent_inner(
                         }) {
                             tracing::warn!("failed to append REJECTED outbox event: {e}");
                         }
-                        let preview: String = parsed.response_text.chars().take(600).collect();
-                        return Err(format!(
-                            "{err}\n\n--- rejected output, for inspection, NOT a review ---\n{preview}"
+                        return Err(rejected_turn_error(
+                            &err,
+                            &request_id,
+                            hop.agent,
+                            &parsed,
+                            &req.required_sources,
+                            &exec_cwd,
                         ));
                     }
                     persist_daemon_token_record(
@@ -1990,10 +2040,36 @@ fn with_required_sources(message: &str, sources: &[String]) -> String {
     if sources.is_empty() {
         return message.to_string();
     }
-    let list = sources.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n");
+    let list = sources.iter().map(|s| sight_contract_line(s)).collect::<Vec<_>>().join("\n");
     format!(
-        "{message}\n\nSources you must read in full (absolute paths; they exist, do not search for others):\n{list}"
+        "{message}\n\nSources you must read in full (absolute paths; they exist, do not search for others):\n{list}\n\n{SIGHT_CONTRACT_RULE}"
     )
+}
+
+/// The rule the sight gate applies, told to the reviewer BEFORE it reads, not after it is
+/// rejected. About 25 of the real rejections had zero tool calls and about 35 never opened a
+/// named source: behaviour the agent could not correct, because it only saw the rule in the
+/// rejection. Every clause here is one the gate enforces; keep the two in step.
+const SIGHT_CONTRACT_RULE: &str = "How this review is checked: it is rejected unless THIS turn's tool calls show \
+every line, 1 to N, of every source above. Earlier turns do not count. Read each source whole \
+(`cat <path>`, or your file-read tool with no offset and no limit). If you read in windows, the \
+windows together must cover 1 to N with no gap. One shell command's output is cut at 30000 bytes \
+and a cut read earns nothing, so read a source marked over that limit in windows. To read \
+several files in one command, join the reads with `&&`; reads of different files joined with `;` \
+or a newline are not counted, because a failed read is hidden by the next one. Do not modify \
+any file.";
+
+/// `- /abs/path (N lines, B bytes)`, with a note when one shell read cannot show it whole. A
+/// source this process cannot read is listed bare: the gate will fail it anyway, and inventing
+/// a count would be telling the reviewer something untrue.
+fn sight_contract_line(source: &str) -> String {
+    match source_bytes(source, "") {
+        Some(bytes) => {
+            let over = if bytes.len() > SHELL_OUTPUT_BUDGET { ", over the one-command limit: read in windows" } else { "" };
+            format!("- {source} ({} lines, {} bytes{over})", count_lines(&bytes), bytes.len())
+        }
+        None => format!("- {source}"),
+    }
 }
 
 fn inject_tool_marker_prompt(user_prompt: &str) -> String {
@@ -2273,7 +2349,10 @@ fn tool_call_read_source_in_full(
         matches!(c.kind, ToolKind::ReadFile)
             && c.success == Some(true)
             && (!is_shell_read_tool(&c.tool) || shell_call_fits_budget(c, cwd))
-            && candidates.iter().any(|cand| record_read_source_whole(c, cand))
+            && candidates.iter().any(|cand| {
+                record_read_source_whole(c, cand)
+                    && call_showed_lines(c, cand, &agent_adapter::codex::LineRange { start: 1, end: None }, cwd)
+            })
     });
     whole || codex_ranged_reads_cover_source(tool_calls, &candidates, source, cwd)
 }
@@ -2327,6 +2406,7 @@ fn codex_ranged_reads_cover_source(
                 // collect the source's coverage.
                 candidates.iter().any(|cand| cand == &read.operand)
                     && !(read.via_nl && nl_drops_lines)
+                    && call_showed_lines(c, &read.operand, &read.range, cwd)
             })
             .map(|read| read.range)
             .collect();
@@ -2341,6 +2421,80 @@ fn codex_ranged_reads_cover_source(
         return false;
     }
     ranges_cover_lines(&ranges, count_lines(&bytes))
+}
+
+/// Did this call's recorded output really show lines `range` of `operand`, each in order?
+///
+/// A shell pipeline's status is its LAST stage's. `nl -ba F | sed -n '1,240p'` exits 0 when `nl`
+/// cannot read F, and so does `sed -n '1,240p' F | nl -ba` (measured: codex-cli 0.154.0 reported
+/// exit_code 0 with "nl: F: No such file or directory" as the output). Codex, review of D-056c:
+/// the status cannot prove a read happened. The output can. Every non-empty line of the window
+/// must appear in what the call showed, in file order; a number column or a `$` added around a
+/// line does not hide it. A call with no recorded output (`shown_output: None`) is not
+/// credited. `cat -v` of a line with control bytes prints them rewritten and is
+/// not credited: a false rejection, never a false pass.
+fn call_showed_lines(c: &ToolCallRecord, operand: &str, range: &agent_adapter::codex::LineRange, cwd: &str) -> bool {
+    first_line_not_shown(c, operand, range, cwd).is_none()
+}
+
+/// Why `call_showed_lines` refuses, for the rejection receipt; `None` when it credits the read.
+/// #81: a whole `cat` whose output matched the file was refused as "only read PART" because the
+/// file was edited on disk while the review ran, and nothing in the error said which line failed.
+fn first_line_not_shown(c: &ToolCallRecord, operand: &str, range: &agent_adapter::codex::LineRange, cwd: &str) -> Option<String> {
+    // Every parser now records a shell call's output (D-059), so a shell read without one is a
+    // shape no parser produces and is credited nothing (Codex, round 4).
+    let Some(shown) = c.shown_output.as_deref() else {
+        return Some("no recorded output".to_string());
+    };
+    let Some(bytes) = source_bytes(operand, cwd) else {
+        return Some("a file the daemon cannot read".to_string());
+    };
+    let (start, end) = (range.start.max(1), range.end.unwrap_or(u64::MAX));
+    let shown = shown.as_bytes();
+    let mut cursor = 0usize;
+    for (n, line) in bytes.split(|b| *b == b'\n').enumerate() {
+        let n = n as u64 + 1;
+        // A CRLF file's `\r` is matched loosely: some renderers drop it (Antigravity, review).
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if n < start || line.is_empty() {
+            continue;
+        }
+        if n > end {
+            break;
+        }
+        match shown[cursor..].windows(line.len()).position(|w| w == line) {
+            Some(at) => cursor += at + line.len(),
+            None => return Some(format!("line {n} of {operand} as it is on disk now")),
+        }
+    }
+    None
+}
+
+/// What an honest run of `command` would show: the raw lines of every read it parses to. Test
+/// records are built with it, so a gate test exercises the D-059 output check rather than a
+/// record no parser produces. Decoration is left out; the check ignores it.
+#[cfg(test)]
+pub(crate) fn honest_shown_output(command: &str) -> String {
+    let cmd = agent_adapter::codex::normalize_wrapped_script(command.to_string());
+    let mut out = String::new();
+    for seg in agent_adapter::codex::read_segments_pub(&cmd) {
+        let (op, start, end) = if let Some(r) = agent_adapter::codex::command_read_range(seg) {
+            (r.operand, r.range.start, r.range.end)
+        } else if let Some((op, _)) = agent_adapter::codex::whole_file_read(seg) {
+            (op, 1, None)
+        } else {
+            continue;
+        };
+        if let Some(bytes) = source_bytes(&op, "") {
+            for (i, line) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+                let n = i as u64 + 1;
+                if n >= start && end.is_none_or(|e| n <= e) {
+                    out.push_str(&String::from_utf8_lossy(line));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The most bytes of ONE shell call's output a reviewer is credited with having seen.
@@ -2591,14 +2745,46 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
                     None => format!("lines {}-$ of {}", r.range.start, r.operand),
                 })
                 .collect();
-            Some(if windows.is_empty() {
+            let described = if windows.is_empty() {
                 describe_what_the_read_bound(args)
             } else {
                 windows.join(", ")
+            };
+            // #81: say which line the call's output did not show, so a refused read explains
+            // itself instead of reading as a slice.
+            Some(match shell_read_not_shown(c, &candidates, cwd) {
+                Some((window, why)) => format!("{described} ({window} not credited: its output does not show {why})"),
+                None => described,
             })
         })
         .collect();
     format!("{source} has {total}; read this turn as [{}]", reads.join(", "))
+}
+
+/// The first of this shell call's reads of the source whose output check fails: that window, and
+/// why. Naming the window keeps a credited window in the same call from reading as refused
+/// (Antigravity, review of #81).
+fn shell_read_not_shown(c: &ToolCallRecord, candidates: &[String], cwd: &str) -> Option<(String, String)> {
+    if !is_shell_read_tool(&c.tool) {
+        return None;
+    }
+    let cmd = c.args_json.as_deref().and_then(agent_adapter::codex::shell_command_from_args_json)?;
+    let whole = agent_adapter::codex::whole_file_read_operands(&cmd)
+        .into_iter()
+        .map(|op| (op, agent_adapter::codex::LineRange { start: 1, end: None }));
+    let ranged = agent_adapter::codex::command_read_ranges(&cmd).into_iter().map(|r| (r.operand, r.range));
+    whole
+        .chain(ranged)
+        .filter(|(op, _)| candidates.iter().any(|cand| cand == op))
+        .find_map(|(op, range)| {
+            let why = first_line_not_shown(c, &op, &range, cwd)?;
+            let window = match range.end {
+                None if range.start <= 1 => "the whole read".to_string(),
+                None => format!("lines {}-$", range.start),
+                Some(e) => format!("lines {}-{e}", range.start),
+            };
+            Some((window, why))
+        })
 }
 
 /// What the read parsers made of a call's arguments, for a rejection receipt.
@@ -3075,6 +3261,366 @@ fn enforce_reviewer_sight(
         detail: detail.clone(),
     });
     Err(detail)
+}
+
+/// A sight rejection, plus a note naming every source whose bytes changed since the snapshot
+/// taken before turn 1. #81: the caller rewrote a source while codex was reviewing it, codex's
+/// whole `cat` matched the version it read, and the gate (right to refuse it) said "only read
+/// PART", which sent everyone looking for a gate bug. Both dispatch arms call this.
+fn note_sources_changed_during_review(
+    err: String,
+    tool_calls: &[ToolCallRecord],
+    sources: &[String],
+    snapshot: &[Option<Vec<u8>>],
+    cwd: &str,
+) -> String {
+    // Only sources the gate did NOT count: a changed source that was read in full did not cause
+    // this refusal, and naming it would point at the wrong file (Antigravity, review of #81).
+    let changed: Vec<&str> = sources
+        .iter()
+        .zip(snapshot)
+        .filter(|(s, before)| source_bytes(s, cwd) != **before && !tool_call_read_source_in_full(tool_calls, s, cwd))
+        .map(|(s, _)| s.as_str())
+        .collect();
+    if changed.is_empty() {
+        return err;
+    }
+    format!(
+        "{err} NOTE: {} changed on disk while the review ran (it differs from the copy taken at \
+         dispatch). A read of the earlier version cannot be matched against the file as it is now, \
+         so this refusal may be an edit racing the review, not a partial read. Do not edit a \
+         source while it is under review.",
+        changed.join(", ")
+    )
+}
+
+/// What one repair turn made of a sight rejection (2b). See [`try_sight_repair`].
+enum SightRepair {
+    /// Not attempted: the failure is not "missed a spot", the seat cannot resume, or the
+    /// review budget is spent. The caller rejects with the gate's original error.
+    NotTried,
+    /// The repair turn's reads, with turn 1's, satisfy the gate. The merged turn is the answer.
+    Passed(ParsedAgentResult),
+    /// The repair ran and the gate still refused: this error, and both turns for the saved file.
+    Failed(String, ParsedAgentResult),
+}
+
+/// Seats whose CLI resumes a session, which is what makes a second turn of ONE dispatch possible.
+const SIGHT_REPAIR_AGENTS: &[&str] = &["codex", "grok"];
+
+/// A repair turn is not started with less than this left of the review budget. A repair that
+/// the client abandons mid-turn is paid for and lost, which is worse than the rejection.
+const SIGHT_REPAIR_MIN_BUDGET: Duration = Duration::from_secs(120);
+
+/// Is this sight failure one a second look can fix? Only PARTIAL and NEVER-OPENED, re-derived
+/// from the gate's own conditions rather than its prose: named sources, a parser that records
+/// AND classifies reads, no write, no delegation, and at least one successful read this turn
+/// (Codex, consult: a reviewer that read nothing is not one to coax).
+fn sight_failure_is_repairable(tool_calls: &[ToolCallRecord], parser_mode: &str, required_sources: &[String]) -> bool {
+    !required_sources.is_empty()
+        && PARSER_MODES_WITH_TOOL_RECORDS.contains(&parser_mode)
+        && PARSER_MODES_THAT_CLASSIFY_READS.contains(&parser_mode)
+        && !tool_calls.iter().any(|c| matches!(c.kind, ToolKind::WriteFile | ToolKind::EditFile))
+        && !tool_calls.iter().any(|c| c.tool == agent_adapter::codex::COLLAB_TOOL)
+        && tool_calls.iter().any(|c| matches!(c.kind, ToolKind::ReadFile) && c.success == Some(true))
+}
+
+/// The follow-up sent into the reviewer's own session. It names each source the gate did not
+/// count, with its size and the reads that were counted, and asks for the COMPLETE review again,
+/// because the restated text replaces the first answer (Antigravity, consult: a model asked to
+/// "update" tends to send only a delta).
+fn sight_repair_prompt(tool_calls: &[ToolCallRecord], required_sources: &[String], cwd: &str) -> String {
+    let gaps: Vec<String> = required_sources
+        .iter()
+        .filter(|src| !tool_call_read_source_in_full(tool_calls, src, cwd))
+        .map(|src| {
+            let receipt = if tool_call_touched_source(tool_calls, src, cwd) {
+                describe_reads_of_source(tool_calls, src, cwd)
+            } else {
+                "never opened".to_string()
+            };
+            format!("{}\n  counted so far: {receipt}", sight_contract_line(src))
+        })
+        .collect();
+    format!(
+        "Your review is not accepted yet: the sight gate could not count every line of these \
+         sources as read.\n{}\n\nRead what is missing now, on this turn. Your reads from the \
+         previous turn of this conversation still count, unless a file changed since, in which \
+         case read that file whole again. One shell command's output is cut at 30000 bytes, and a \
+         cut read earns nothing. Do not modify any file.\n\nThen write your COMPLETE review again \
+         from the beginning, not only what changed: this text replaces your first answer. Change \
+         anything the lines you had not read change.",
+        gaps.join("\n")
+    )
+}
+
+fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (None, None) => None,
+        _ => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    }
+}
+
+/// Both turns as one result: every tool call and event, summed tokens and cost, the repair
+/// turn's session, and its text marked as the product of a repair.
+fn merge_repaired_turn(first: &ParsedAgentResult, repair: ParsedAgentResult) -> ParsedAgentResult {
+    let token_usage = match (first.token_usage.as_ref(), repair.token_usage.as_ref()) {
+        (Some(a), Some(b)) => Some(agent_adapter::TokenUsage {
+            input: add_opt(a.input, b.input),
+            output: add_opt(a.output, b.output),
+            cached: add_opt(a.cached, b.cached),
+            thinking_tokens: add_opt(a.thinking_tokens, b.thinking_tokens),
+            latency_ms: add_opt(a.latency_ms, b.latency_ms),
+            tool_calls: add_opt(a.tool_calls, b.tool_calls),
+            total: add_opt(a.total, b.total),
+        }),
+        (a, b) => a.or(b).cloned(),
+    };
+    let mut tool_calls = first.tool_calls.clone();
+    tool_calls.extend(repair.tool_calls);
+    let mut events = first.events.clone();
+    events.extend(repair.events);
+    ParsedAgentResult {
+        response_text: format!(
+            "[sight repair: the first turn did not read every line of the named sources; this \
+             answer was written again after a second turn read them]\n\n{}",
+            repair.response_text
+        ),
+        session_id: repair.session_id.or_else(|| first.session_id.clone()),
+        events,
+        tool_calls,
+        token_usage,
+        self_reported_cost_usd: match (first.self_reported_cost_usd, repair.self_reported_cost_usd) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        },
+        cli_version: repair.cli_version.or_else(|| first.cli_version.clone()),
+        parser_mode: repair.parser_mode,
+    }
+}
+
+/// One repair turn for a PARTIAL or NEVER-OPENED sight rejection (2b), shared by BOTH dispatch
+/// arms so they cannot drift apart. `agent` is the seat that ran turn 1 (the degraded arm passes
+/// `hop.agent`), and only that seat's own session is resumed.
+///
+/// Turn 1's reads are unioned with the repair turn's: both belong to this one dispatch and both
+/// are verified records from the same parser. Unless a source CHANGED between the turns (all
+/// three peers, consult): every source's bytes are snapshotted before the repair, and if any
+/// differs afterwards, or the parser differs, only the repair turn's calls are gated, so no
+/// window of an old version covers the new one. A write or a delegation in the repair turn is
+/// still caught: the union goes through the same gate.
+#[allow(clippy::too_many_arguments)]
+async fn try_sight_repair(
+    agent: &str,
+    agent_display: &str,
+    first: &ParsedAgentResult,
+    first_err: &str,
+    req: &AskAgentRequest,
+    exec_cwd: &str,
+    snapshot: &[Option<Vec<u8>>],
+    model_override: Option<&str>,
+    budget: Duration,
+    lifecycle: &mut Vec<LifecycleEvent>,
+) -> SightRepair {
+    let Some(session) = first.session_id.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return SightRepair::NotTried;
+    };
+    if !SIGHT_REPAIR_AGENTS.contains(&agent)
+        || !sight_failure_is_repairable(&first.tool_calls, &first.parser_mode, &req.required_sources)
+    {
+        return SightRepair::NotTried;
+    }
+    if budget < SIGHT_REPAIR_MIN_BUDGET {
+        lifecycle.push(LifecycleEvent {
+            state: "SIGHT_REPAIR_SKIPPED".to_string(),
+            detail: format!("{}s of the review budget left, under the {}s a repair turn needs", budget.as_secs(), SIGHT_REPAIR_MIN_BUDGET.as_secs()),
+        });
+        return SightRepair::NotTried;
+    }
+    let prompt = sight_repair_prompt(&first.tool_calls, &req.required_sources, exec_cwd);
+    lifecycle.push(LifecycleEvent {
+        state: "SIGHT_REPAIR".to_string(),
+        detail: format!("{agent_display} missed part of the named sources; one repair turn in session {session}"),
+    });
+    let repair = match timeout(
+        budget,
+        run_named_agent_with_session_and_model(agent, &prompt, exec_cwd, Some(session), None, model_override, Some(req)),
+    )
+    .await
+    {
+        Ok(Ok(parsed)) => parsed,
+        // The repair ran and produced nothing usable. Said so, not reported as turn 1's error
+        // alone (Antigravity, review).
+        Ok(Err(e)) => return repair_did_not_finish(first, first_err, &e.to_string(), lifecycle),
+        Err(_) => {
+            let why = format!("it exceeded the {}s left of the review budget", budget.as_secs());
+            return repair_did_not_finish(first, first_err, &why, lifecycle);
+        }
+    };
+    // Per source (Codex and Antigravity, review): a source whose bytes differ from the snapshot
+    // taken before turn 1 keeps none of turn 1's reads; an unchanged one keeps them all, which
+    // is what the repair prompt promised the reviewer. A different parser keeps nothing of turn 1.
+    let changed: Vec<&String> = req
+        .required_sources
+        .iter()
+        .zip(snapshot)
+        .filter(|(s, before)| source_bytes(s, exec_cwd) != **before)
+        .map(|(s, _)| s)
+        .collect();
+    let same_parser = repair.parser_mode == first.parser_mode;
+    let kept: Vec<ToolCallRecord> = first
+        .tool_calls
+        .iter()
+        .filter(|c| same_parser && !changed.iter().any(|s| tool_call_touched_source(std::slice::from_ref(*c), s, exec_cwd)))
+        .cloned()
+        .chain(repair.tool_calls.iter().cloned())
+        .collect();
+    let merged = merge_repaired_turn(first, repair);
+    let note = if !same_parser {
+        "; the parser changed between turns, so only the repair turn's reads counted".to_string()
+    } else if changed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} changed after turn 1, so only the repair turn's reads of it counted",
+            changed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        )
+    };
+    match enforce_reviewer_sight(agent_display, &kept, &merged.parser_mode, &req.required_sources, exec_cwd, lifecycle) {
+        Ok(()) => {
+            lifecycle.push(LifecycleEvent {
+                state: "SIGHT_REPAIR_PASSED".to_string(),
+                detail: format!("{agent_display} read the missing lines on the repair turn{note}"),
+            });
+            SightRepair::Passed(merged)
+        }
+        Err(e) => {
+            lifecycle.push(LifecycleEvent { state: "SIGHT_REPAIR_FAILED".to_string(), detail: format!("the gate refused the repair turn too{note}") });
+            SightRepair::Failed(format!("{e} (after one repair turn{note})"), merged)
+        }
+    }
+}
+
+/// A repair turn that errored or timed out. The rejection carries turn 1's error AND what
+/// happened to the repair, and turn 1 is what gets saved: the repair left no parsed turn.
+fn repair_did_not_finish(first: &ParsedAgentResult, first_err: &str, why: &str, lifecycle: &mut Vec<LifecycleEvent>) -> SightRepair {
+    lifecycle.push(LifecycleEvent { state: "SIGHT_REPAIR_FAILED".to_string(), detail: format!("the repair turn did not finish: {why}") });
+    SightRepair::Failed(format!("{first_err} (one repair turn was sent and did not finish: {why})"), first.clone())
+}
+
+/// Build the error a sight rejection returns, after saving the WHOLE declined turn to disk.
+///
+/// The error used to carry only 600 characters of the reply, and nothing kept the tool calls.
+/// So a long review that slipped on one source was gone, and no rejection could ever be
+/// replayed against a corrected gate, which left "how many of these were the gate's fault"
+/// unanswerable. Both dispatch arms call this one function so they cannot drift apart.
+///
+/// The preview and its marker line stay: the jury strips on that marker. The saved file is
+/// local and outside the ledger, which stays text-free by the jury's decision.
+fn rejected_turn_error(
+    err: &str,
+    request_id: &str,
+    agent: &str,
+    parsed: &ParsedAgentResult,
+    required_sources: &[String],
+    exec_cwd: &str,
+) -> String {
+    let saved = daemon_core::triumvirate_home_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|home| {
+            save_rejected_turn(&home, request_id, agent, parsed, required_sources, exec_cwd, err)
+                .map_err(|e| e.to_string())
+        });
+    let where_line = match saved {
+        Ok(path) => format!("full rejected turn (reply and tool calls) saved to {}", path.display()),
+        Err(e) => {
+            tracing::warn!("failed to save rejected turn {request_id}: {e}");
+            format!("full rejected turn could NOT be saved: {e}")
+        }
+    };
+    let preview: String = parsed.response_text.chars().take(600).collect();
+    format!("{err}\n\n{where_line}\n\n--- rejected output, for inspection, NOT a review ---\n{preview}")
+}
+
+/// Write `<home>/rejected/<request_id>-<uuid>.json`: everything the gate decided on, plus the
+/// reply. Written to a temp file and renamed, mode 0600, so a crash never leaves half a record.
+///
+/// Every save gets its own file. Sanitising the id is many-to-one (`a/b` and `a?b` both become
+/// `a_b`), and a fixed name opened with `truncate` let two saves overwrite each other (Codex,
+/// panel review). The exact request id is inside the record, which is what a lookup keys on.
+fn save_rejected_turn(
+    home: &Path,
+    request_id: &str,
+    agent: &str,
+    parsed: &ParsedAgentResult,
+    required_sources: &[String],
+    exec_cwd: &str,
+    gate_error: &str,
+) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = home.join("rejected");
+    fs::create_dir_all(&dir)?;
+    // The id becomes a file name, so nothing in it may walk out of the directory.
+    let safe_id: String = request_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let record = serde_json::json!({
+        "ts_ms": core_unix_time_ms(),
+        "request_id": request_id,
+        "agent": agent,
+        "session_id": parsed.session_id,
+        "parser_mode": parsed.parser_mode,
+        "exec_cwd": exec_cwd,
+        "required_sources": required_sources,
+        "gate_error": gate_error,
+        "note": "DECLINED by the sight gate. This is NOT a review.",
+        "response_text": parsed.response_text,
+        "tool_calls": parsed.tool_calls,
+        "token_usage": parsed.token_usage,
+    });
+    let unique = Uuid::new_v4().simple();
+    let path = dir.join(format!("{safe_id}-{unique}.json"));
+    let tmp = dir.join(format!(".{safe_id}-{unique}.json.tmp"));
+    let written = (|| {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(serde_json::to_string_pretty(&record)?.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    prune_rejected_turns(&dir, REJECTED_TURNS_KEPT);
+    Ok(path)
+}
+
+/// How many saved rejected turns are kept. Each is one review's reply and tool calls, so a few
+/// hundred KB at most; 1,000 is months of rejections at the 2026-09/10 rate (about 170 real ones
+/// in 39 days) and a bounded directory (Antigravity, panel review).
+const REJECTED_TURNS_KEPT: usize = 1000;
+
+/// Delete the oldest saved turns beyond `keep`, by modification time. Best effort: a file that
+/// cannot be listed or removed is left, and nothing here can fail the save that called it.
+fn prune_rejected_turns(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut saved: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| Some((fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    if saved.len() <= keep {
+        return;
+    }
+    saved.sort();
+    for (_, old) in &saved[..saved.len() - keep] {
+        let _ = fs::remove_file(old);
+    }
 }
 
 fn resolve_absolute_project_root(exec_cwd: &str) -> Result<PathBuf, String> {
@@ -4510,9 +5056,64 @@ const CODEX_REVIEW_TOOL_NOTE: &str = "\n\nTool note for this read-only review: d
 Do not spawn, delegate to or wait on subagents or other agents (spawn_agent, wait_agent): their reads \
 are invisible to this review's verification and the review will be rejected. Read each file with \
 `cat FILE` or `sed -n 'A,Bp' FILE` windows that together cover every line. \
-Always finish with your written answer.";
+This review cannot write files (#83): if anything above asks you to write your answer to a file, \
+put your whole answer in your reply instead. Always finish with your written answer.";
 
-async fn run_codex_cli_process_with_session(
+/// `codex exec resume` has no `--sandbox`/`-s` (codex-cli 0.154.0: "unexpected argument
+/// '--sandbox' found"), so every resumed turn that carried one exited 2 before running. That
+/// killed the sight repair turn for every codex review (#82). The flag cannot be dropped: a
+/// resumed session does NOT keep its first turn's sandbox. Measured 2026-10-11 on a thread
+/// started read-only: resumed with `-c sandbox_mode="workspace-write"` it wrote a file; resumed
+/// with `-c sandbox_mode="read-only"` the same write failed "operation not permitted". So the
+/// mode is restated through `-c`, which resume does accept.
+pub(crate) fn codex_resume_sandbox_args(args: Vec<String>) -> Vec<String> {
+    let (mut out, modes) = take_sandbox_flags(args);
+    let mut flags = Vec::new();
+    for mode in modes {
+        match mode {
+            Some(mode) => {
+                flags.push("-c".to_string());
+                flags.push(format!("sandbox_mode=\"{mode}\""));
+            }
+            // A dangling `--sandbox` with no value: keep it, so codex fails loudly rather than
+            // this silently running the turn unsandboxed.
+            None => flags.push("--sandbox".to_string()),
+        }
+    }
+    // Before any `--`, where they are still options.
+    let at = out.iter().position(|a| a == "--").unwrap_or(out.len());
+    out.splice(at..at, flags);
+    out
+}
+
+/// Remove every sandbox flag before any `--`, in each spelling clap accepts (`--sandbox X`,
+/// `--sandbox=X`, `-s X`, `-s=X`, `-sX`), returning the rest and the modes in order (`None` for
+/// a flag with no value). Codex, review of #82: only three spellings were translated, and an
+/// operator `-s workspace-write` survived into a REVIEW, which then ran writable.
+fn take_sandbox_flags(args: Vec<String>) -> (Vec<String>, Vec<Option<String>>) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut modes = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            out.push(arg);
+            out.extend(it);
+            break;
+        }
+        if arg == "--sandbox" || arg == "-s" {
+            modes.push(it.next());
+        } else if let Some(m) = arg.strip_prefix("--sandbox=").or_else(|| arg.strip_prefix("-s=")) {
+            modes.push(Some(m.to_string()));
+        } else if let Some(m) = arg.strip_prefix("-s").filter(|m| !m.is_empty() && !m.starts_with('-')) {
+            modes.push(Some(m.to_string()));
+        } else {
+            out.push(arg);
+        }
+    }
+    (out, modes)
+}
+
+pub(crate) async fn run_codex_cli_process_with_session(
     bin: &str,
     args: &[String],
     message: &str,
@@ -4590,10 +5191,16 @@ async fn run_codex_cli_process_with_session(
         // exactly the false-pass mode Grok named for sight_27, "the agent never tries, or fails
         // to start". sight_29 now asserts the turn actually produced output, so a crash cannot
         // masquerade as containment.
-        if !has_any_arg(&final_args, &["--sandbox", "-s"]) {
-            final_args.push("--sandbox".to_string());
-            final_args.push("read-only".to_string());
-        }
+        //
+        // Any operator sandbox flag is REMOVED, not deferred to: an operator `-s workspace-write`
+        // used to suppress this and the review ran writable (Codex, review of #82).
+        let (rest, _) = take_sandbox_flags(std::mem::take(&mut final_args));
+        final_args = rest
+            .into_iter()
+            .filter(|a| a != "--dangerously-bypass-approvals-and-sandbox" && a != "--full-auto")
+            .collect();
+        let at = final_args.iter().position(|a| a == "--").unwrap_or(final_args.len());
+        final_args.splice(at..at, ["--sandbox".to_string(), "read-only".to_string()]);
     } else if codex_yolo_enabled() && !caps.args_include_explicit_policy(&final_args) {
         final_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     }
@@ -4618,6 +5225,9 @@ async fn run_codex_cli_process_with_session(
     {
         final_args.push("--sandbox".to_string());
         final_args.push("workspace-write".to_string());
+    }
+    if session_id.is_some() {
+        final_args = codex_resume_sandbox_args(final_args);
     }
 
     if !is_git_worktree(cwd) && !has_any_arg(&final_args, &["--skip-git-repo-check"]) {
@@ -6394,7 +7004,7 @@ mod sight_gate_tests {
         let first = offset.unwrap_or(1).max(1);
         let last = limit.map_or(total, |l| (first + l).saturating_sub(1).min(total));
         let returned_lines = if limit == Some(0) || first > last { Vec::new() } else { vec![(first, last)] };
-        ToolCallRecord { returned_lines,
+        ToolCallRecord { shown_output: None, returned_lines,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -6455,6 +7065,7 @@ mod sight_gate_tests {
         let src = src.to_string_lossy().into_owned();
         let cwd = dir.path().to_string_lossy().into_owned();
         let view = |args: serde_json::Value, tool: &str| ToolCallRecord {
+            shown_output: None,
             returned_lines: Vec::new(),
             id: None,
             tool: tool.to_string(),
@@ -6551,6 +7162,243 @@ mod sight_gate_tests {
         assert!(dotted.iter().any(|c| c == "/repo/a.rs"), "{dotted:?}");
     }
 
+    fn rejected_fixture(reply: &str) -> ParsedAgentResult {
+        ParsedAgentResult {
+            response_text: reply.to_string(),
+            session_id: Some("sess-1".to_string()),
+            tool_calls: vec![ToolCallRecord {
+                shown_output: None,
+                id: Some("c1".to_string()),
+                tool: "read_file".to_string(),
+                kind: ToolKind::ReadFile,
+                success: Some(true),
+                duration_ms: Some(3),
+                args_json: Some(r#"{"target_file":"/repo/a.rs","limit":200}"#.to_string()),
+                returned_lines: Vec::new(),
+            }],
+            parser_mode: "grok-streaming-json".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The whole declined turn survives: the full reply past 600 characters, every tool call
+    /// with its arguments, and what the gate decided on, so it can be replayed later.
+    /// RED IF: the reply is truncated, tool calls are dropped, the file is world-readable, or a
+    /// request id with path characters escapes the `rejected` directory.
+    #[test]
+    fn rejected_turn_is_saved_whole_and_private() {
+        let home = tempfile::tempdir().unwrap();
+        let reply = format!("{}TAIL-PAST-600", "x".repeat(2000));
+        let parsed = rejected_fixture(&reply);
+        let path = save_rejected_turn(
+            home.path(),
+            "../../escape/id",
+            "grok",
+            &parsed,
+            &["/repo/a.rs".to_string()],
+            "/repo",
+            "only read PART",
+        )
+        .unwrap();
+        assert_eq!(path.parent().unwrap(), home.path().join("rejected"));
+        // Ids that sanitise to the same name, and a repeat of one id, never overwrite.
+        let again = save_rejected_turn(home.path(), "../../escape/id", "grok", &parsed, &[], "/repo", "x").unwrap();
+        let other = save_rejected_turn(home.path(), "..?..?escape?id", "grok", &parsed, &[], "/repo", "y").unwrap();
+        assert!(path != again && again != other && path != other);
+        assert_eq!(std::fs::read_dir(home.path().join("rejected")).unwrap().count(), 3, "no temp file left, none lost");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v["response_text"].as_str().unwrap().ends_with("TAIL-PAST-600"));
+        assert_eq!(v["tool_calls"][0]["args_json"], r#"{"target_file":"/repo/a.rs","limit":200}"#);
+        assert_eq!(v["parser_mode"], "grok-streaming-json");
+        assert_eq!(v["required_sources"][0], "/repo/a.rs");
+        assert_eq!(v["gate_error"], "only read PART");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // A saved tool-call list must replay through the real gate to the same verdict.
+        let calls: Vec<ToolCallRecord> = serde_json::from_value(v["tool_calls"].clone()).unwrap();
+        assert_eq!(calls, parsed.tool_calls);
+    }
+
+    /// The directory is bounded: the oldest saves go first, and temp files are never touched.
+    /// RED IF: pruning stops, deletes the newest, or removes a file that is not a saved turn.
+    #[test]
+    fn rejected_turns_are_pruned_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for i in 0..5 {
+            let p = d.join(format!("r{i}.json"));
+            std::fs::write(&p, "{}").unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+        }
+        std::fs::write(d.join(".r9.json.tmp"), "").unwrap();
+        prune_rejected_turns(d, 3);
+        let mut left: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec![".r9.json.tmp", "r2.json", "r3.json", "r4.json"]);
+    }
+
+    /// The returned error names the saved file and still carries the preview marker the jury
+    /// strips on. RED IF: the path line disappears or the marker text changes.
+    #[test]
+    fn rejected_turn_error_names_the_file_and_keeps_the_marker() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let prior = std::env::var_os("TRIUMVIRATE_HOME");
+        // SAFETY: serialised by the binary-wide env lock and restored below.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", home.path()) };
+        let msg = rejected_turn_error("GATE SAID NO", "req-42", "codex", &rejected_fixture("body"), &[], "/repo");
+        match prior {
+            // SAFETY: as above.
+            Some(p) => unsafe { std::env::set_var("TRIUMVIRATE_HOME", p) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_HOME") },
+        }
+        let saved: Vec<_> = std::fs::read_dir(home.path().join("rejected")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert!(saved[0].file_name().unwrap().to_string_lossy().starts_with("req-42-"));
+        assert!(msg.starts_with("GATE SAID NO"));
+        assert!(msg.contains(&saved[0].display().to_string()), "{msg}");
+        assert!(msg.contains("--- rejected output, for inspection, NOT a review ---\nbody"), "{msg}");
+    }
+
+    /// The codex review of this very change, rejected live on 2026-10-10: four windows read as
+    /// `sed -n 'a,bp' F | nl -ba -va`, covering 1-654. RED IF: that read stops satisfying the
+    /// source, or dropping a window still passes.
+    #[test]
+    fn codex_sed_then_nl_windows_from_the_live_rejection_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("agent-exec.patch");
+        let body: String = (1..=654).map(|i| format!("+    line {i} of the frozen review diff\n")).collect();
+        std::fs::write(&src, body).unwrap();
+        let src = src.display().to_string();
+        let cwd = dir.path().display().to_string();
+        let call = |a: u64, b: u64| {
+            let args = serde_json::json!({ "command": format!("/bin/zsh -lc \"sed -n '{a},{b}p' {src} | nl -ba -v{a}\"") });
+            ToolCallRecord {
+                shown_output: Some(honest_shown_output(args["command"].as_str().unwrap_or_default())),
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+                returned_lines: Vec::new(),
+            }
+        };
+        let all = [call(181, 360), call(1, 180), call(361, 540), call(541, 654)];
+        let mut lc = Vec::new();
+        enforce_reviewer_sight("Codex", &all, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect("four windows cover 1-654");
+        let mut lc = Vec::new();
+        assert!(enforce_reviewer_sight("Codex", &all[..3], "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc).is_err());
+    }
+
+    /// D-056c at the gate, on real files. RED IF: newline-joined windows of one file stop
+    /// satisfying it, or a sequence whose read may not run (`false && cat F ; true`, two files
+    /// joined by `;`) or whose output is over budget starts to.
+    #[test]
+    fn codex_sequences_of_reads_satisfy_each_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, n: usize| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, (1..=n).map(|i| format!("{name} line {i}\n")).collect::<String>()).unwrap();
+            p.display().to_string()
+        };
+        let (a, b, big) = (write("a.rs", 40), write("b.rs", 300), write("big.rs", 3000));
+        let cwd = dir.path().display().to_string();
+        let call = |command: String| {
+            let args = serde_json::json!({ "command": command });
+            ToolCallRecord {
+                shown_output: Some(honest_shown_output(&command)),
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+                returned_lines: Vec::new(),
+            }
+        };
+        let gate = |calls: &[ToolCallRecord], sources: &[String]| {
+            let mut lc = Vec::new();
+            enforce_reviewer_sight("Codex", calls, "codex-exec-json", sources, &cwd, &mut lc)
+        };
+        let both = [a.clone(), b.clone()];
+        // Two files: `&&` proves both reads ran; `;` would hide a failed first read (Codex).
+        gate(&[call(format!("/bin/zsh -lc \"cat {a} && echo ---- && cat {b}\""))], &both)
+            .expect("one && call, two whole reads");
+        assert!(gate(&[call(format!("/bin/zsh -lc \"cat {a}; echo; echo ----; cat {b}\""))], &both).is_err(), "; across two files");
+        gate(&[call(format!("/bin/zsh -lc \"nl -ba {b} | sed -n '1,150p'\nnl -ba {b} | sed -n '151,300p'\""))], std::slice::from_ref(&b))
+            .expect("newline-joined windows cover 1-300");
+        assert!(gate(&[call(format!("/bin/zsh -lc \"nl -ba {b} | sed -n '1,150p'\nnl -ba {b} | sed -n '152,300p'\""))], std::slice::from_ref(&b)).is_err(), "a one-line gap");
+        assert!(gate(&[call(format!("false && cat {a} ; true"))], std::slice::from_ref(&a)).is_err(), "the read may not have run");
+        assert!(gate(&[call(format!("cat {a} && cat {big}"))], &[a.clone(), big.clone()]).is_err(), "over the one-call budget");
+        assert!(gate(&[call(format!("cat {a}; cat {}/missing.rs", cwd))], std::slice::from_ref(&a)).is_err(), "an operand the gate cannot read");
+    }
+
+    /// Codex's attack on D-056c, round 2: the reader stage of a window pipeline fails and the
+    /// pipeline still exits 0. RED IF: a call whose recorded output does not hold the window's
+    /// lines is credited, or one whose output does hold them is not.
+    #[test]
+    fn a_window_counts_only_when_its_lines_were_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("s.rs");
+        std::fs::write(&src, (1..=6).map(|i| format!("fn line_{i}() {{}}\n")).collect::<String>()).unwrap();
+        let src = src.display().to_string();
+        let cwd = dir.path().display().to_string();
+        let call = |shown: Option<String>| {
+            let args = serde_json::json!({ "command": format!("/bin/zsh -lc \"nl -ba {src} | sed -n '1,3p'\nnl -ba {src} | sed -n '4,6p'\"") });
+            ToolCallRecord {
+                shown_output: shown,
+                id: None,
+                tool: "command_execution".to_string(),
+                kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+                success: Some(true),
+                duration_ms: None,
+                args_json: Some(args.to_string()),
+                returned_lines: Vec::new(),
+            }
+        };
+        let gate = |c: ToolCallRecord| {
+            let mut lc = Vec::new();
+            enforce_reviewer_sight("Codex", &[c], "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+        };
+        let honest: String = (1..=6).map(|i| format!("     {i}\tfn line_{i}() {{}}\n")).collect();
+        gate(call(Some(honest))).expect("both windows were shown");
+        let denied = format!("nl: {src}: Operation not permitted\nnl: {src}: Operation not permitted\n");
+        assert!(gate(call(Some(denied))).is_err(), "nothing was shown, exit 0 regardless");
+        let half: String = (1..=3).map(|i| format!("     {i}\tfn line_{i}() {{}}\n")).collect();
+        assert!(gate(call(Some(half))).is_err(), "the second window was not shown");
+        assert!(gate(call(Some(String::new()))).is_err(), "codex reported no output");
+        let crlf_dir = tempfile::tempdir().unwrap();
+        let crlf = crlf_dir.path().join("w.rs");
+        std::fs::write(&crlf, "a\r\n\r\nb\r\n").unwrap();
+        let crlf = crlf.display().to_string();
+        let crlf_call = ToolCallRecord { shown_output: Some("     1\ta\n     2\t\n     3\tb\n".to_string()), ..call(None) };
+        assert!(call_showed_lines(&crlf_call, &crlf, &agent_adapter::codex::LineRange { start: 1, end: None }, &cwd), "a dropped \\r is not a missing line");
+        assert!(gate(call(None)).is_err(), "no recorded output: not credited (Codex, round 4)");
+    }
+
+    /// Both success arms build their rejection through the one helper. RED IF: an arm goes back
+    /// to formatting its own preview, which is how one surface gets the fix and the other not.
+    #[test]
+    fn every_sight_rejection_arm_saves_the_turn() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("agent_exec.rs"),
+        )
+        .expect("read agent_exec.rs");
+        let production_src = &src[..src.find("mod sight_gate_tests").unwrap()];
+        let gates = production_src.matches("&& let Err(err) = enforce_reviewer_sight(").count();
+        let saves = production_src.matches("return Err(rejected_turn_error(").count();
+        assert_eq!(gates, 2, "gate call sites changed; revisit this test");
+        assert_eq!(saves, gates, "a sight-rejection arm does not save the turn");
+        // 2b: both arms offer the one repair turn through the one helper.
+        assert_eq!(production_src.matches("match try_sight_repair(").count(), gates, "a sight arm skips the repair turn");
+        // #81: both arms name a source edited during the review.
+        assert_eq!(production_src.matches("let err = note_sources_changed_during_review(err,").count(), gates, "a sight arm hides a mid-review edit");
+        assert!(!production_src.contains("--- rejected output, for inspection, NOT a review ---\\n{preview}\"\n                    ));"));
+    }
+
     /// A `wiki_search` MCP call is a wiki touch, and its arguments are a QUERY, so nothing in
     /// them names the wiki. Before the tool existed the filter matched paths only, which would
     /// have scored the very behaviour the tool was built to produce as "did not consult".
@@ -6566,7 +7414,7 @@ mod sight_gate_tests {
         let parsed = ParsedAgentResult {
             response_text: "port 3300".to_string(),
             parser_mode: "grok-streaming-json".to_string(),
-            tool_calls: vec![ToolCallRecord { returned_lines: Vec::new(),
+            tool_calls: vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: None,
                 tool: "triumvirate__wiki_search".to_string(),
                 kind: ToolKind::Unknown,
@@ -6599,7 +7447,7 @@ mod sight_gate_tests {
         let parsed = ParsedAgentResult {
             response_text: "port 3300".to_string(),
             parser_mode: "grok-streaming-json".to_string(),
-            tool_calls: vec![ToolCallRecord { returned_lines: Vec::new(),
+            tool_calls: vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: None,
                 tool: "use_tool".to_string(),
                 kind: ToolKind::Unknown,
@@ -6621,7 +7469,7 @@ mod sight_gate_tests {
     fn calls(kinds: &[ToolKind]) -> Vec<ToolCallRecord> {
         kinds
             .iter()
-            .map(|k| ToolCallRecord { returned_lines: Vec::new(),
+            .map(|k| ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: None,
                 tool: match k {
                     ToolKind::WriteFile => "write_file",
@@ -6889,7 +7737,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_12_a_named_source_that_was_never_opened_is_rejected() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: None,
             tool: "todo_write".to_string(),
             kind: ToolKind::Unknown,
@@ -6921,7 +7769,7 @@ mod sight_gate_tests {
     fn sight_36_a_failed_or_uncounted_attempt_is_reported_as_such() {
         let mut lifecycle = Vec::new();
         let tools = vec![
-            ToolCallRecord { returned_lines: Vec::new(),
+            ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: ToolKind::ReadFile,
@@ -6929,7 +7777,7 @@ mod sight_gate_tests {
                 duration_ms: None,
                 args_json: Some(r#"{"command":"cat /repo/agent_exec.rs"}"#.to_string()),
             },
-            ToolCallRecord { returned_lines: Vec::new(),
+            ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: ToolKind::Bash,
@@ -6949,7 +7797,7 @@ mod sight_gate_tests {
     }
 
     fn codex_read(command: &str) -> ToolCallRecord {
-        ToolCallRecord { returned_lines: Vec::new(),
+        ToolCallRecord { shown_output: Some(honest_shown_output(command)), returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
@@ -6988,6 +7836,34 @@ mod sight_gate_tests {
             .expect("three overlapping windows covering 1..=556 are a whole read");
     }
 
+    /// #81, from the live rejection 7476de40 (2026-10-11): codex read a 42-line source with one
+    /// `cat`, its output matched the file byte for byte, and the caller then rewrote the file
+    /// while the review was still running. The gate refused it as "only read PART", correctly
+    /// (the bytes on disk were not the bytes read) but with no way to tell that from a gate bug.
+    /// RED IF: a whole `cat` with matching output stops passing, an edited source starts passing,
+    /// or the refusal stops naming the unseen line and the mid-review edit.
+    #[test]
+    fn sight_81_a_whole_cat_passes_and_an_edit_during_the_review_is_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let src = file_with_lines(dir.path(), "menu.json", 42);
+        let tools = vec![codex_read(&format!("/bin/zsh -lc 'cat {src}'"))];
+        let mut lc = Vec::new();
+        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect("a whole cat whose output matches the file is a full read");
+        let snapshot = vec![source_bytes(&src, &cwd)];
+        assert_eq!(note_sources_changed_during_review("E".to_string(), &tools, std::slice::from_ref(&src), &snapshot, &cwd), "E", "no edit, no note");
+
+        // The caller edits line 7 after codex read it.
+        let edited: String = (1..=42).map(|i| if i == 7 { "line 7 EDITED\n".to_string() } else { format!("line {i}\n") }).collect();
+        std::fs::write(&src, edited).expect("edit");
+        let err = enforce_reviewer_sight("Codex", &tools, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect_err("the bytes on disk are not the bytes codex read");
+        assert!(err.contains(&format!("the whole read not credited: its output does not show line 7 of {src}")), "names the line: {err}");
+        let err = note_sources_changed_during_review(err, &tools, std::slice::from_ref(&src), &snapshot, &cwd);
+        assert!(err.contains(&format!("NOTE: {src} changed on disk while the review ran")), "names the edit: {err}");
+    }
+
     /// D-036, through the REAL classifier (codex_read hard-codes ReadFile, which is how the bug
     /// hid: the gate was fine, `shell_read_kind` left a `;` chain as Bash). Codex read four sources
     /// as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the review was discarded.
@@ -7001,7 +7877,7 @@ mod sight_gate_tests {
         let other = file_with_lines(dir.path(), "b.rs", 500);
         let classified = |command: String| {
             let args = serde_json::json!({ "command": command });
-            ToolCallRecord { returned_lines: Vec::new(),
+            ToolCallRecord { shown_output: Some(honest_shown_output(&command)), returned_lines: Vec::new(),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -7200,7 +8076,7 @@ mod sight_gate_tests {
     fn sight_13_opening_the_source_by_relative_path_counts() {
         let mut lifecycle = Vec::new();
         let (_dir, root) = real_repo("crates/triumvirate/src/agent_exec.rs", 40);
-        let tools = vec![ToolCallRecord { returned_lines: vec![(1, 40)],
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 40)],
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7223,7 +8099,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_14_a_failed_read_does_not_count_as_having_looked() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7248,7 +8124,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_15_a_same_named_file_elsewhere_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7621,7 +8497,7 @@ mod sight_gate_tests {
     fn sight_21_a_search_naming_the_file_does_not_count_as_reading_it() {
         let mut lifecycle = Vec::new();
         let tools = vec![
-            ToolCallRecord { returned_lines: Vec::new(),
+            ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: None,
                 tool: "grep_search".to_string(),
                 kind: ToolKind::Grep,
@@ -7630,7 +8506,7 @@ mod sight_gate_tests {
                 // Exact quoted path: the string match SUCCEEDS here.
                 args_json: Some(r#"{"Query":"crates/shared-types/src/lib.rs"}"#.to_string()),
             },
-            ToolCallRecord { returned_lines: Vec::new(),
+            ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: None,
                 tool: "run_command".to_string(),
                 kind: ToolKind::Bash,
@@ -7655,7 +8531,7 @@ mod sight_gate_tests {
     fn sight_21b_the_identical_args_pass_when_the_kind_is_a_read() {
         let mut lifecycle = Vec::new();
         let (_dir, root) = real_repo("crates/shared-types/src/lib.rs", 300);
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7679,7 +8555,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21c_an_in_flight_read_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7704,7 +8580,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_21d_a_prefix_sibling_directory_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: None,
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7729,7 +8605,7 @@ mod sight_gate_tests {
     fn sight_21e_a_dot_slash_relative_read_satisfies_a_source() {
         let mut lifecycle = Vec::new();
         let (_dir, root) = real_repo("src/lib.rs", 12);
-        let tools = vec![ToolCallRecord { returned_lines: vec![(1, 12)],
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 12)],
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7752,7 +8628,7 @@ mod sight_gate_tests {
     #[test]
     fn sight_22_a_failed_read_on_the_agy_path_does_not_satisfy_a_source() {
         let mut lifecycle = Vec::new();
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: Some("7".to_string()),
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7784,7 +8660,7 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         let (_dir, root) = real_repo("a.rs", 10);
         let src = format!("{root}/a.rs");
-        let read = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let read = vec![ToolCallRecord { shown_output: Some(honest_shown_output(&format!("cat {src}"))), returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
@@ -7803,7 +8679,7 @@ mod sight_gate_tests {
 
         // And a path-naming command still must not.
         let mut l2 = Vec::new();
-        let listing = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let listing = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::Bash,
@@ -7853,7 +8729,7 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         // Within view_file's measured 800-line delivery, so one call is the whole file.
         let (_dir, root) = real_repo("crates/shared-types/src/lib.rs", 300);
-        let tools = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let tools = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: Some("2".to_string()),
             tool: "view_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -8654,7 +9530,7 @@ mod mandatory_review_tests {
         // script that emitted nothing, which surfaced as "no usable verdict" instead of the
         // rejection the test was asserting. A test helper that fails in a way that mimics a
         // different defect is worse than no helper.
-        let mut script = String::from("#!/usr/bin/env bash\n");
+        let mut script = format!("#!/usr/bin/env bash\n{}\n", crate::tests::JSON_ESCAPE_SH);
         script.push_str("PROMPT=\"$*\"\n");
         script.push_str(&format!("echo invoked >> {}\n", count_file.display()));
 
@@ -8673,7 +9549,7 @@ mod mandatory_review_tests {
             script.push_str(&format!("  READ_OUTPUT=\"$({reader} \"$ARTIFACT\" 2>/dev/null)\"\n"));
             script.push_str("  RC=$?\n");
             script.push_str(&format!(
-                "  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\",\"exit_code\":%d}}}}\\n' \"$ARTIFACT\" \"$RC\"\n"
+                "  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\",\"exit_code\":%d,\"aggregated_output\":\"%s\"}}}}\\n' \"$ARTIFACT\" \"$RC\" \"$(jesc \"$READ_OUTPUT\")\"\n"
             ));
             script.push_str("fi\n");
         }
@@ -9083,7 +9959,7 @@ mod mandatory_review_tests {
             r#"{"file_path":"/repo/a.md","offset":9000}"#,
             r#"{"file_path":"/repo/a.md","limit":1,"offset":9000}"#,
         ] {
-            let calls = vec![ToolCallRecord { returned_lines: Vec::new(),
+            let calls = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                 id: Some("t".into()),
                 tool: "Read".into(),
                 kind: ToolKind::ReadFile,
@@ -9117,7 +9993,7 @@ mod mandatory_review_tests {
         std::fs::write(&src, "one\ntwo\nthree\n").unwrap();
         let src = src.to_string_lossy().into_owned();
         let root = dir.path().to_string_lossy().into_owned();
-        let calls = vec![ToolCallRecord { returned_lines: vec![(1, 3)],
+        let calls = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "Read".into(),
             kind: ToolKind::ReadFile,
@@ -9137,7 +10013,7 @@ mod mandatory_review_tests {
         .expect("an unbounded read of the named source must pass");
 
         // An explicit null is not a slice either: grok's own capture records "offset":null.
-        let with_nulls = vec![ToolCallRecord { returned_lines: vec![(1, 3)],
+        let with_nulls = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "read_file".into(),
             kind: ToolKind::ReadFile,
@@ -9162,7 +10038,7 @@ mod mandatory_review_tests {
     /// RED IF: the partial branch is removed and both fall through to the same message.
     #[test]
     fn review_24_a_peek_and_a_miss_report_differently() {
-        let peek = vec![ToolCallRecord { returned_lines: Vec::new(),
+        let peek = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
             id: Some("t".into()),
             tool: "command_execution".into(),
             kind: ToolKind::ReadFile,
@@ -9509,7 +10385,7 @@ mod grok_shell_read_gate_tests {
     }
 
     fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
-        ToolCallRecord { returned_lines: Vec::new(),
+        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
             id: None,
             tool: "run_terminal_command".to_string(),
             kind,
@@ -9527,7 +10403,7 @@ mod grok_shell_read_gate_tests {
     /// this file tests are ever reached. A helper that skips the step under test is not a test.
     fn codex_shell(command: &str) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
-        ToolCallRecord { returned_lines: Vec::new(),
+        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9602,7 +10478,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
         });
-        let call = ToolCallRecord { returned_lines: Vec::new(),
+        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9633,7 +10509,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
         });
-        let call = ToolCallRecord { returned_lines: Vec::new(),
+        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -9807,7 +10683,7 @@ mod grok_shell_read_gate_tests {
             ("bash", serde_json::json!({ "command": cmd })),
             ("command_execution", serde_json::json!({ "command": cmd })),
         ] {
-            let rec = ToolCallRecord { returned_lines: Vec::new(),
+            let rec = ToolCallRecord { shown_output: Some(super::honest_shown_output(&cmd)), returned_lines: Vec::new(),
                 id: None,
                 tool: tool.to_string(),
                 kind: ToolKind::ReadFile,
@@ -9867,6 +10743,8 @@ mod strict_agent_tests {
             for key in ENV_KEYS {
                 unsafe { std::env::remove_var(key) };
             }
+            // D-054: back to the binary's isolated home, never unset.
+            unsafe { std::env::set_var("TRIUMVIRATE_HOME", crate::tests::isolated_test_home()) };
             // The quota exit below feeds the process-global breaker. Leave it closed.
             mcp_bridge::agy_resilience::agy_breaker_record_success();
         }
@@ -10011,6 +10889,8 @@ mod stall_kill_tests {
             for key in ENV_KEYS {
                 unsafe { std::env::remove_var(key) };
             }
+            // D-054: back to the binary's isolated home, never unset.
+            unsafe { std::env::set_var("TRIUMVIRATE_HOME", crate::tests::isolated_test_home()) };
             // Never leave a stub behind, even when an assertion failed.
             for name in ["leader.pid", "grandchild.pid"] {
                 if let Ok(pid) = fs::read_to_string(self.dir.path().join(name))
@@ -10154,6 +11034,24 @@ mod stall_unit_tests {
         assert_eq!(with_required_sources("plain", &[]), "plain");
     }
 
+    /// RED IF: a sighted dispatch does not tell the reviewer each source's size and the rule
+    /// the gate applies (2c). The counts must be the gate's own, or the contract misleads.
+    #[test]
+    fn sight_contract_states_line_counts_and_the_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, "a\nb\nc").expect("write");
+        let big = dir.path().join("big.rs");
+        std::fs::write(&big, "x".repeat(SHELL_OUTPUT_BUDGET + 1) + "\n").expect("write");
+        let (small_s, big_s) = (small.display().to_string(), big.display().to_string());
+        let p = with_required_sources("review", &[small_s.clone(), big_s.clone(), "/no/such/file.rs".to_string()]);
+        assert!(p.contains(&format!("- {small_s} (3 lines, 5 bytes)\n")), "{p}");
+        assert!(p.contains(&format!("- {big_s} (1 lines, {} bytes, over the one-command limit", SHELL_OUTPUT_BUDGET + 2)), "{p}");
+        assert!(p.contains("- /no/such/file.rs\n"), "an unreadable source is listed bare: {p}");
+        assert!(p.ends_with(SIGHT_CONTRACT_RULE), "{p}");
+        assert!(SIGHT_CONTRACT_RULE.contains("30000") && SHELL_OUTPUT_BUDGET == 30_000, "the rule's number is the gate's");
+    }
+
     /// RED IF: the detector's own STUCK events count as progress. They fire while a run is
     /// silent, so counting them would keep a hung run alive forever.
     #[test]
@@ -10184,5 +11082,253 @@ mod stall_unit_tests {
     #[test]
     fn an_attempt_with_no_child_kills_nothing() {
         assert_eq!(AttemptChild::default().kill_group(), Ok(false));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)]
+mod sight_repair_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn read_call(command: String, success: bool) -> ToolCallRecord {
+        let args = serde_json::json!({ "command": command });
+        ToolCallRecord {
+            shown_output: Some(honest_shown_output(&command)),
+            id: None,
+            tool: "command_execution".to_string(),
+            kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
+            success: Some(success),
+            duration_ms: None,
+            args_json: Some(args.to_string()),
+            returned_lines: Vec::new(),
+        }
+    }
+
+    fn first_turn(calls: Vec<ToolCallRecord>) -> ParsedAgentResult {
+        ParsedAgentResult {
+            response_text: "PARTIAL REVIEW".to_string(),
+            session_id: Some("thread-1".to_string()),
+            tool_calls: calls,
+            token_usage: Some(agent_adapter::TokenUsage { input: Some(100), output: Some(10), cached: None, thinking_tokens: None, latency_ms: None, tool_calls: None, total: Some(110) }),
+            parser_mode: "codex-exec-json".to_string(),
+            ..Default::default()
+        }
+    }
+
+    struct Stub {
+        dir: tempfile::TempDir,
+        src: String,
+        _restore: crate::agy::tests::EnvRestore,
+    }
+
+    /// A 480-line source and a stand-in codex. Every invocation logs its argv; `body` is the
+    /// shell that emits the repair turn's codex `--json` events.
+    fn stub(body: &str) -> Stub {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src.rs");
+        std::fs::write(&src, (1..=480).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let src = src.display().to_string();
+        let bin = dir.path().join("fake-codex-repair");
+        let d = dir.path().display();
+        std::fs::write(&bin, format!("#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n", crate::tests::JSON_ESCAPE_SH)).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        let restore = crate::agy::tests::set_env_scoped("TRIUMVIRATE_CODEX_BIN", Some(bin.to_str().unwrap()));
+        Stub { dir, src, _restore: restore }
+    }
+
+    const READ_REST: &str = r#"printf '{"type":"thread.started","thread_id":"thread-1"}\n'
+printf '{"type":"item.started","item":{"type":"command_execution","id":"c9","command":"sed -n '"'"'241,480p'"'"' %s"}}\n' "$SRC"
+printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"sed -n '"'"'241,480p'"'"' %s","exit_code":0,"aggregated_output":"%s"}}\n' "$SRC" "$(jesc "$(sed -n '241,480p' "$SRC")")"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'
+printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\n'"#;
+
+    fn request(st: &Stub) -> AskAgentRequest {
+        AskAgentRequest {
+            agent: "codex".to_string(),
+            message: "review".to_string(),
+            cwd: Some(st.dir.path().display().to_string()),
+            require_sight: Some(true),
+            required_sources: vec![st.src.clone()],
+            ..Default::default()
+        }
+    }
+
+    fn snapshot(req: &AskAgentRequest, cwd: &str) -> Vec<Option<Vec<u8>>> {
+        req.required_sources.iter().map(|s| source_bytes(s, cwd)).collect()
+    }
+
+    /// RED IF: only PARTIAL and NEVER-OPENED with a real read are repairable stops holding.
+    #[test]
+    fn only_a_missed_spot_is_repairable() {
+        let src = vec!["/r/a.rs".to_string()];
+        let read = read_call("sed -n '1,10p' /r/a.rs".to_string(), true);
+        assert!(sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &src));
+        assert!(!sight_failure_is_repairable(&[], "codex-exec-json", &src), "zero tool calls");
+        assert!(!sight_failure_is_repairable(&[read_call("ls /r".to_string(), true)], "codex-exec-json", &src), "no read at all");
+        assert!(!sight_failure_is_repairable(&[read_call("sed -n '1,10p' /r/a.rs".to_string(), false)], "codex-exec-json", &src), "a failed read");
+        assert!(!sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &[]), "no named sources");
+        assert!(!sight_failure_is_repairable(std::slice::from_ref(&read), "agy-pipe-plain-text", &src), "blind parser");
+        let mut write = read.clone();
+        write.kind = ToolKind::WriteFile;
+        assert!(!sight_failure_is_repairable(&[read.clone(), write], "codex-exec-json", &src), "a write");
+        let mut collab = read.clone();
+        collab.tool = agent_adapter::codex::COLLAB_TOOL.to_string();
+        assert!(!sight_failure_is_repairable(&[read, collab], "codex-exec-json", &src), "a delegation");
+    }
+
+    /// RED IF: the merged turn drops a turn's tool calls, does not sum tokens, or does not say
+    /// the answer came from a repair.
+    #[test]
+    fn merged_turn_keeps_both_turns() {
+        let a = first_turn(vec![read_call("cat /r/a.rs".to_string(), true)]);
+        let mut b = first_turn(vec![read_call("cat /r/b.rs".to_string(), true)]);
+        b.response_text = "FULL".to_string();
+        b.session_id = Some("thread-1".to_string());
+        let m = merge_repaired_turn(&a, b);
+        assert_eq!(m.tool_calls.len(), 2);
+        assert_eq!(m.token_usage.as_ref().and_then(|t| t.total), Some(220));
+        assert!(m.response_text.starts_with("[sight repair:") && m.response_text.ends_with("FULL"), "{}", m.response_text);
+    }
+
+    /// End to end through a stand-in codex. RED IF: the repair does not resume turn 1's own
+    /// thread, does not union the two turns, or passes when it should not.
+    #[tokio::test]
+    async fn a_partial_read_is_repaired_in_the_same_session() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(READ_REST);
+        let req = request(&st);
+        let cwd = st.dir.path().display().to_string();
+        let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let mut lc = Vec::new();
+        assert!(enforce_reviewer_sight("Codex", &first.tool_calls, &first.parser_mode, &req.required_sources, &cwd, &mut lc).is_err(), "turn 1 alone is partial");
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+            SightRepair::Passed(m) => {
+                assert!(m.response_text.ends_with("FULL REVIEW"), "{}", m.response_text);
+                assert_eq!(m.tool_calls.len(), 2);
+            }
+            SightRepair::Failed(e, _) => panic!("should pass: {e}"),
+            SightRepair::NotTried => panic!("should try: {lc:?}"),
+        }
+        let argv = std::fs::read_to_string(st.dir.path().join("argv")).unwrap();
+        assert!(argv.contains("resume") && argv.contains("thread-1"), "resumed its own thread: {argv}");
+        assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR"));
+    }
+
+    /// The file changes between the turns. RED IF: turn 1's window of the OLD file still counts.
+    #[tokio::test]
+    async fn a_source_that_changed_between_turns_counts_only_the_repair_reads() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(&format!("printf 'line 0\\n' | cat - \"$SRC\" > \"$SRC.new\" && mv \"$SRC.new\" \"$SRC\"\n{READ_REST}"));
+        let req = request(&st);
+        let cwd = st.dir.path().display().to_string();
+        let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let mut lc = Vec::new();
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+            SightRepair::Failed(e, m) => {
+                assert!(e.contains("changed after turn 1"), "{e}");
+                assert_eq!(m.tool_calls.len(), 2, "both turns kept for the saved file");
+            }
+            SightRepair::Passed(_) => panic!("a window of the old file covered the new one"),
+            SightRepair::NotTried => panic!("should try: {lc:?}"),
+        }
+    }
+
+    /// RED IF: a seat that cannot resume, a reviewer that read nothing, or a spent budget gets
+    /// a repair turn. None of these may even launch the stand-in.
+    #[tokio::test]
+    async fn no_repair_where_one_cannot_help() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(READ_REST);
+        let req = request(&st);
+        let cwd = st.dir.path().display().to_string();
+        let partial = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let mut lc = Vec::new();
+        let gemini = try_sight_repair("gemini", "Antigravity", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
+        let empty = try_sight_repair("codex", "Codex", &first_turn(Vec::new()), "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
+        let late = try_sight_repair("codex", "Codex", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(30), &mut lc).await;
+        let mut no_session = partial.clone();
+        no_session.session_id = None;
+        let unresumable = try_sight_repair("codex", "Codex", &no_session, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
+        for (name, r) in [("gemini", gemini), ("zero tools", empty), ("budget", late), ("no session", unresumable)] {
+            assert!(matches!(r, SightRepair::NotTried), "{name} must not be repaired");
+        }
+        assert!(!st.dir.path().join("argv").exists(), "the stand-in was launched");
+        assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_SKIPPED"));
+    }
+
+    /// D-054 backstop. RED IF: a test fixture unsets TRIUMVIRATE_HOME on drop, which sends every
+    /// later test in this binary back to the operator's real ~/.triumvirate.
+    #[test]
+    fn test_home_stays_isolated() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::var_os("TRIUMVIRATE_HOME").map(PathBuf::from).expect("TRIUMVIRATE_HOME unset in a test binary");
+        let real = dirs::home_dir().map(|h| h.join(".triumvirate"));
+        assert_ne!(Some(home), real, "tests are writing to the real home");
+    }
+
+    /// The file changes AFTER turn 1 and BEFORE the repair starts (Codex, review). RED IF: the
+    /// snapshot is taken at the repair, so turn 1's window of the old file is unioned.
+    #[tokio::test]
+    async fn a_change_before_the_repair_starts_is_caught() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(READ_REST);
+        let req = request(&st);
+        let cwd = st.dir.path().display().to_string();
+        let before = snapshot(&req, &cwd);
+        let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        std::fs::write(&st.src, (1..=480).map(|i| format!("CHANGED {i}\n")).collect::<String>()).unwrap();
+        let mut lc = Vec::new();
+        let r = try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await;
+        assert!(matches!(r, SightRepair::Failed(ref e, _) if e.contains("changed after turn 1")), "old window covered the new file");
+    }
+
+    /// Two sources: A read whole on turn 1 and unchanged, B changed and read whole on the repair.
+    /// RED IF: drift is global again, so A's good turn-1 read is dropped and the repair fails
+    /// (Codex and Antigravity, review).
+    #[tokio::test]
+    async fn drift_is_judged_per_source() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(r#"printf 'new\n' >> "$SRC"
+printf '{"type":"thread.started","thread_id":"thread-1"}\n'
+printf '{"type":"item.started","item":{"type":"command_execution","id":"c9","command":"cat %s"}}\n' "$SRC"
+printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"cat %s","exit_code":0,"aggregated_output":"%s"}}\n' "$SRC" "$(jesc "$(cat "$SRC")")"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'"#);
+        let a = st.dir.path().join("a.rs");
+        std::fs::write(&a, "a1\na2\n").unwrap();
+        let a = a.display().to_string();
+        let mut req = request(&st);
+        req.required_sources = vec![a.clone(), st.src.clone()];
+        let cwd = st.dir.path().display().to_string();
+        let before = snapshot(&req, &cwd);
+        let first = first_turn(vec![read_call(format!("cat {a}"), true), read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let mut lc = Vec::new();
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await {
+            SightRepair::Passed(_) => {}
+            SightRepair::Failed(e, _) => panic!("A's unchanged turn-1 read was dropped: {e}"),
+            SightRepair::NotTried => panic!("should try"),
+        }
+        assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_PASSED"));
+    }
+
+    /// RED IF: a repair turn that errors is reported as turn 1's error alone (Antigravity).
+    #[tokio::test]
+    async fn a_repair_that_does_not_finish_says_so() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub("exit 3");
+        let req = request(&st);
+        let cwd = st.dir.path().display().to_string();
+        let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let mut lc = Vec::new();
+        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+            SightRepair::Failed(e, kept) => {
+                assert!(e.starts_with("TURN 1 ERROR") && e.contains("did not finish"), "{e}");
+                assert_eq!(kept.response_text, "PARTIAL REVIEW");
+            }
+            _ => panic!("a repair that errored must be a named failure"),
+        }
+        assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_FAILED"));
     }
 }

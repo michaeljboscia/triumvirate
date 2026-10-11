@@ -3552,6 +3552,32 @@ mod tests {
         Ok(())
     }
 
+    /// D-054. Every test in this binary gets a private TRIUMVIRATE_HOME, set before any test
+    /// thread starts. Most tests never set one, so their outbox rows, dead drops, workers.json
+    /// and agy failure dumps landed in the operator's real ~/.triumvirate: 52 of 271 REJECTED
+    /// rows there were tempdir fixtures. A test that needs its own home still sets one, and its
+    /// EnvRestore puts this value back, never the real home.
+    ///
+    /// Unconditional: an operator who exports TRIUMVIRATE_HOME in their shell would otherwise
+    /// point the whole suite at the real home (Antigravity, review).
+    #[ctor::ctor]
+    fn isolate_triumvirate_home() {
+        // SAFETY: a constructor runs before main, so no other thread can read the environment.
+        unsafe { std::env::set_var("TRIUMVIRATE_HOME", isolated_test_home()) };
+    }
+
+    /// A POSIX `jesc TEXT` for stand-in agents: TEXT as the body of a JSON string. Real codex
+    /// reports what a call showed in `aggregated_output`, and the sight gate credits a codex read
+    /// only when its lines are in it (D-059), so a stand-in must report its read's output too.
+    pub(crate) const JSON_ESCAPE_SH: &str = r#"TAB="$(printf '\t')"; jesc() { printf '%s\n' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$TAB/\\\\t/g" | awk '{printf "%s\\n", $0}'; }"#;
+
+    /// The home every test in this binary falls back to. A fixture that clears its env keys on
+    /// drop must put TRIUMVIRATE_HOME back to THIS, never unset it: unset, every later test in
+    /// the binary writes to the operator's real ~/.triumvirate again.
+    pub(crate) fn isolated_test_home() -> PathBuf {
+        std::env::temp_dir().join(format!("triumvirate-test-home-{}", std::process::id()))
+    }
+
     pub(crate) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -4424,9 +4450,9 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let wiki_dir = wiki.path().display().to_string();
         let codex = write_codex_custom_script(&format!(
             "printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\"}}}}'\n\
-             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\",\"exit_code\":0}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\",\"exit_code\":0,\"aggregated_output\":\"the alpha page\\n\"}}}}'\n\
              printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\"}}}}'\n\
-             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\",\"exit_code\":0}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\",\"exit_code\":0,\"aggregated_output\":\"\"}}}}'\n\
              printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"Per alpha-page. research/beta-page-notes.md is not a citation.\"}}}}'"
         ))?;
         unsafe {
@@ -4710,6 +4736,83 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    /// The RESUME surface (#82): the sight repair turn and any resumed codex turn, captured from
+    /// the real argv builder. `codex exec resume` has no `--sandbox`, so the review's read-only
+    /// flag made every repair exit 2; the old test checked only that `resume` and the thread id
+    /// were present and never asked codex. RED IF: a resumed review or a resumed sandboxed
+    /// consult emits a flag the installed codex rejects, or a resumed review is not read-only.
+    #[tokio::test]
+    async fn codex_argv_oracle_03_resumed_turns_parse_and_stay_sandboxed() -> anyhow::Result<()> {
+        if codex_oracle_skip_requested() {
+            return Ok(());
+        }
+        let real_codex = codex_oracle_installed();
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_SANDBOX", "TRIUMVIRATE_CODEX_AUTO_APPROVE", "TRIUMVIRATE_CODEX_PROTOCOL"]);
+        let dir = tempfile::tempdir()?;
+        let args_file = dir.path().join("codex-args.txt");
+        let stand_in = dir.path().join("codex-nul-capture.sh");
+        fs::write(&stand_in, format!("#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{}\"\n", args_file.display()))?;
+        let mut perms = fs::metadata(&stand_in)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stand_in, perms)?;
+        let cwd = dir.path().display().to_string();
+        let thread = "01a12cb6-55c8-75c2-b382-7281fb56c2e0";
+        // (read_only, operator opted into the sandbox, operator args) -> the mode the resumed turn
+        // must carry. The third case is Codex's review finding: an operator writable sandbox, in
+        // a spelling the first translator missed, must not survive into a REVIEW.
+        let operator: Vec<String> = ["-s=workspace-write", "--dangerously-bypass-approvals-and-sandbox"].map(String::from).to_vec();
+        for (read_only, sandbox_env, op_args, want) in [
+            (true, false, &[][..], "read-only"),
+            (false, true, &[][..], "workspace-write"),
+            (true, false, &operator[..], "read-only"),
+        ] {
+            // SAFETY: serialised by the binary-wide env lock and restored by _env_restore.
+            unsafe {
+                std::env::remove_var("TRIUMVIRATE_CODEX_PROTOCOL");
+                if sandbox_env {
+                    std::env::set_var("TRIUMVIRATE_CODEX_SANDBOX", "1");
+                    std::env::set_var("TRIUMVIRATE_CODEX_AUTO_APPROVE", "1");
+                } else {
+                    std::env::remove_var("TRIUMVIRATE_CODEX_SANDBOX");
+                    std::env::remove_var("TRIUMVIRATE_CODEX_AUTO_APPROVE");
+                }
+            }
+            let _ = fs::remove_file(&args_file);
+            // The stand-in prints nothing, so the parse fails; only the argv matters here.
+            let _ = agent_exec::run_codex_cli_process_with_session(
+                &stand_in.to_string_lossy(), op_args, "a prompt", &cwd, Some(thread), None, read_only,
+            )
+            .await;
+            let captured: Vec<String> = fs::read(&args_file)?
+                .split(|b| *b == 0)
+                .filter(|chunk| !chunk.is_empty())
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect();
+            assert_eq!(captured.get(..2), Some(&["exec".to_string(), "resume".to_string()][..]), "{captured:?}");
+            assert!(captured.iter().any(|a| a == thread), "resumes its own thread: {captured:?}");
+            assert!(!captured.iter().any(|a| a == "--sandbox" || a == "-s"), "resume rejects --sandbox: {captured:?}");
+            let mode = format!("sandbox_mode=\"{want}\"");
+            let modes: Vec<&String> = captured.windows(2).filter(|w| w[0] == "-c" && w[1].starts_with("sandbox_mode=")).map(|w| &w[1]).collect();
+            assert_eq!(modes, [&mode], "the resumed turn must restate exactly {mode}: {captured:?}");
+            assert!(!captured.iter().any(|a| a.starts_with("-s") || a.contains("bypass")), "an operator override survived: {captured:?}");
+            codex_argv_parses(&real_codex, &captured).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    /// NEGATIVE CONTROL for 03. RED IF: the oracle stops rejecting `--sandbox` on resume, which
+    /// would mean 03 can pass on an argv codex refuses.
+    #[test]
+    fn codex_argv_oracle_04_resume_rejects_sandbox() {
+        if codex_oracle_skip_requested() {
+            return;
+        }
+        let bin = codex_oracle_installed();
+        let bad: Vec<String> = ["exec", "resume", "--sandbox", "read-only", "thread", "x"].map(String::from).to_vec();
+        assert!(codex_argv_parses(&bin, &bad).is_err(), "codex exec resume accepted --sandbox: #82's premise changed");
+    }
+
     /// RED IF: a codex REVIEW prompt goes out without the no-delegation note, or a plain consult
     /// gets it. Codex delegated reviews to subagents whose reads the gate cannot see (2026-10-03),
     /// and no codex setting stops it, so the prompt is the control.
@@ -4946,13 +5049,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let reviewer = temp.path().join("fake-codex-approver");
         fs::write(
             &reviewer,
-            "#!/usr/bin/env bash\n\
-             PROMPT=\"$*\"\n\
+            format!("#!/usr/bin/env bash\n{JSON_ESCAPE_SH}\n") + "PROMPT=\"$*\"\n\
              ARTIFACT=\"$(printf '%s' \"$PROMPT\" | grep -o '/[^[:space:]]*/[.]triumvirate/reviews/[^[:space:]]*[.]md' | head -1)\"\n\
              if [ -n \"$ARTIFACT\" ]; then\n\
              printf '{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\"}}\\n' \"$ARTIFACT\"\n\
              READ_OUTPUT=\"$(cat \"$ARTIFACT\" 2>/dev/null)\"\n\
-             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\",\"exit_code\":0}}\\n' \"$ARTIFACT\"\n\
+             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\",\"exit_code\":0,\"aggregated_output\":\"%s\"}}\\n' \"$ARTIFACT\" \"$(jesc \"$READ_OUTPUT\")\"\n\
              fi\n\
              NONCE=\"$(printf '%s' \"$READ_OUTPUT\" | grep -o 'REVIEW-NONCE: [^ ]*' | tail -1)\"\n\
              printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"APPROVE\\\\n%s\\\\nlooks fine\"}}\\n' \"$NONCE\"\n",
@@ -7057,6 +7159,16 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn fleet_spawn_and_status_tools_round_trip() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // D-058. Stand-ins for both members. Without them this test launched the REAL codex
+        // and agy CLIs, on the operator's subscription login, with the task "test", on every
+        // `cargo test`. `false` exits 1, which the state assertion below already allows.
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_AGY_BIN", "TRIUMVIRATE_GEMINI_BIN"]);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", "/usr/bin/false");
+            std::env::set_var("TRIUMVIRATE_AGY_BIN", "/usr/bin/false");
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", "/usr/bin/false");
+        }
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?

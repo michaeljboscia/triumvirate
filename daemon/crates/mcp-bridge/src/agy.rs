@@ -184,6 +184,15 @@ fn yolo_add_dirs(cwd: &str) -> Vec<String> {
     dirs
 }
 
+/// Appended to the prompt of every write-confined run. That branch omits
+/// `--dangerously-skip-permissions`, so headless agy auto-denies any write, and its stream keeps
+/// only the target path, never the content. #83: twice on 2026-10-11 a brief said "write your
+/// result to <file>", agy did about 290 s of work, put the whole answer in the refused
+/// `write_to_file`, and returned an empty response. Telling it first is the only way to keep it.
+pub const AGY_NO_WRITE_NOTE: &str = "\n\nRun note: this run cannot write, create or edit any \
+file. A write is refused and everything in it is lost. If anything above asks you to write \
+your answer to a file, ignore that part and put your whole answer in your reply text instead.";
+
 /// Build one agy invocation (REQ-016). `bin` + `extra_args` come from `agy_command()`.
 /// Rejects forbidden operator flags (H3). Yolo by default (no seatbelt); the legacy
 /// `sandbox-exec` wrapper is opt-in via `TRIUMVIRATE_AGY_SANDBOX` — see
@@ -235,7 +244,8 @@ pub fn build_agy_invocation_with_timeout(
             profile_path.to_string_lossy().into_owned(),
             bin.to_string(),
         ];
-        args.extend(agy_args(prompt, &log_path, print_timeout, extra_args));
+        let prompt = format!("{prompt}{AGY_NO_WRITE_NOTE}");
+        args.extend(agy_args(&prompt, &log_path, print_timeout, extra_args));
         return Ok(AgyInvocation {
             program: "sandbox-exec".to_string(),
             args,
@@ -358,6 +368,21 @@ mod tests {
             validate_extra_args(&["--output-format=json".to_string()]).is_err(),
             "operators must not be able to override the output format"
         );
+    }
+
+    /// #83. RED IF: a write-confined run stops telling agy it cannot write (the answer then dies
+    /// in a refused write_to_file), or a yolo consult, which CAN write, starts carrying the note.
+    #[test]
+    fn a_write_confined_run_is_told_it_cannot_write_and_a_yolo_one_is_not() {
+        let prompt_of = |inv: &AgyInvocation| {
+            let at = inv.args.iter().position(|a| a == "-p").expect("-p");
+            inv.args[at + 1].clone()
+        };
+        let review = build_agy_invocation("agy", &[], "write your result to /x/out.md", "/tmp/x", true).expect("invocation");
+        let p = prompt_of(&review);
+        assert!(p.starts_with("write your result to /x/out.md") && p.ends_with(AGY_NO_WRITE_NOTE), "{p}");
+        let yolo = build_agy_invocation("agy", &[], "hi", "/tmp/x", false).expect("invocation");
+        assert_eq!(prompt_of(&yolo), "hi");
     }
 
     /// A REVIEW dispatch must be write-contained even though the operator default is yolo.

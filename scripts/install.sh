@@ -25,7 +25,11 @@ cargo build --release -p triumvirate
 mkdir -p "$(dirname "$DEST")"
 # install(1) writes atomically-ish and sets the mode in one step; a plain cp over a RUNNING
 # binary can fail with ETXTBSY, install replaces the directory entry instead.
-install -m 755 target/release/triumvirate "$DEST"
+# Ask cargo where it built: a `[build] target-dir` in any parent .cargo/config.toml moves it
+# (this machine sets one in ~/projects for every project), and a hardcoded `target/` then fails
+# in every worktree.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+install -m 755 "${TARGET_DIR:?cargo metadata gave no target_directory}/release/triumvirate" "$DEST"
 # A STABLE code-signing identity. The linker's ad-hoc signature names the binary
 # `triumvirate-<hash>`, a new identity on every build, and macOS Local Network privacy decides per
 # identity: the launchd daemon's Temporal worker got "No route to host" to 192.168.2.110 after an

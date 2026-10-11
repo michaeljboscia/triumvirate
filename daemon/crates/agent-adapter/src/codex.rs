@@ -28,23 +28,9 @@ pub struct CodexExecParser {
 /// a single quoted string is left alone, so anything unusual falls through to the caller's
 /// fail-closed checks.
 fn unwrap_shell_wrapper(cmd: &str) -> &str {
-    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
-    let mut it = cmd.split_whitespace();
-    let Some(program) = it.next() else {
+    let Some(rest) = shell_c_script(cmd) else {
         return cmd;
     };
-    let base = program.rsplit('/').next().unwrap_or(program);
-    if !SHELLS.contains(&base) {
-        return cmd;
-    }
-    // The flag bundle must be a -c form: -c, -lc, -lic, -ic.
-    let Some(flag) = it.next() else {
-        return cmd;
-    };
-    if !(flag.starts_with('-') && flag.ends_with('c')) {
-        return cmd;
-    }
-    let rest = cmd[cmd.find(flag).map(|i| i + flag.len()).unwrap_or(cmd.len())..].trim();
     // Only a single fully-quoted script is unwrapped; anything else stays as-is and is then
     // rejected by the caller's compound/redirection checks.
     for q in ['\'', '"'] {
@@ -56,6 +42,73 @@ fn unwrap_shell_wrapper(cmd: &str) -> &str {
         }
     }
     cmd
+}
+
+/// The raw script word of `SHELL -c SCRIPT` (also `-lc`, `-lic`, `-ic`), quotes still on, or None
+/// when `cmd` is not that shape.
+fn shell_c_script(cmd: &str) -> Option<&str> {
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+    let mut it = cmd.split_whitespace();
+    let program = it.next()?;
+    let base = program.rsplit('/').next().unwrap_or(program);
+    if !SHELLS.contains(&base) {
+        return None;
+    }
+    let flag = it.next()?;
+    if !(flag.starts_with('-') && flag.ends_with('c')) {
+        return None;
+    }
+    Some(cmd[cmd.find(flag).map(|i| i + flag.len()).unwrap_or(cmd.len())..].trim())
+}
+
+/// A recorded shell command with codex's adjacent-quote rendering of its `-c` script undone.
+///
+/// Codex records the argv `["/bin/zsh", "-lc", "sed -n '1,$p' F"]` as
+/// `/bin/zsh -lc "sed -n '1,"'$p'"' F"`: three adjacent quoted pieces, which the single-string
+/// unwrap cannot see through, so five live reads of that shape were rejected "never opened"
+/// (2026-09-16 x3, 09-27, 10-09). When the script is such a word, the joined script is returned
+/// in place of the whole command; `unwrap_shell_wrapper` on the result is then the identity.
+/// Anything else is returned unchanged.
+pub fn normalize_wrapped_script(cmd: String) -> String {
+    let Some(rest) = shell_c_script(&cmd) else {
+        return cmd;
+    };
+    if unwrap_shell_wrapper(&cmd).len() != cmd.len() {
+        return cmd; // the plain single-string unwrap already handles it
+    }
+    join_adjacent_quotes(rest).unwrap_or(cmd)
+}
+
+/// One shell word made only of `'...'` pieces (literal) and `"..."` pieces, joined the way the
+/// shell joins them. A double-quoted piece may use only the `\"`, `\\`, `\$` and `` \` ``
+/// escapes and may contain no unescaped `$` or backtick: an expansion's result is not knowable
+/// here. A bare character, whitespace between pieces, or an unterminated piece gives None.
+fn join_adjacent_quotes(word: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    ch => out.push(ch),
+                }
+            },
+            '"' => loop {
+                match chars.next()? {
+                    '"' => break,
+                    '$' | '`' => return None,
+                    '\\' => match chars.next()? {
+                        e @ ('"' | '\\' | '$' | '`') => out.push(e),
+                        _ => return None,
+                    },
+                    ch => out.push(ch),
+                }
+            },
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Does this shell command READ file contents, as opposed to merely naming a path?
@@ -130,9 +183,9 @@ pub fn whole_file_read(command: &str) -> Option<(String, Decoration)> {
     whole_file_reader_with_one_operand(cmd).map(|(op, _, d)| (op, d))
 }
 
-/// Every whole-file read in a command with its decoration, one per `&&` segment.
+/// Every whole-file read in a command with its decoration, one per segment ([`read_segments`]).
 pub fn whole_file_reads(command: &str) -> Vec<(String, Decoration)> {
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .filter_map(whole_file_read)
         .collect()
@@ -182,13 +235,72 @@ pub const COLLAB_TOOL: &str = "collab_tool_call";
 /// ONLY `&&`, deliberately. The gate counts a call only when the tool reported success, and an
 /// `&&` chain exits zero only if every link ran and succeeded, so each link's read really
 /// happened. `;` and `||` both mask a failure (`cat missing ; true`, `cat missing || true`
-/// exit zero having read nothing), so a command containing either is still refused whole.
+/// exit zero having read nothing), so this split never cuts at either. A `;` or newline
+/// SEQUENCE is split only by [`read_segments`], and only when every link is a vetted read.
 ///
 /// Splitting changes only which text each parser sees. Every segment goes through the same
 /// unchanged parser, which still refuses a redirect, a comment, a subshell, a backtick, a
 /// single `&`, and a second operand, so no D-010 shape survives the split.
+///
+/// A chain whose links might not RUN, or might not run the program they name, is not split, so
+/// it comes back whole and every read parser refuses it. `exit 0 && cat SRC` exits zero without
+/// reading; `cd /elsewhere && cat a.rs` reads a different `a.rs`; `cat() { :; } && cat SRC`
+/// runs a function. All three passed the gate before this guard.
 pub fn and_chain_segments(command: &str) -> Vec<&str> {
+    if chain_links_are_unprovable(command) {
+        return vec![command.trim()];
+    }
     split_unquoted(command, b"&&")
+}
+
+/// Does `command` contain anything that makes "this link ran this program on this operand"
+/// unprovable from the text: a heredoc, a line continuation, an unquoted subshell or brace
+/// group, or a link (at `&&`, `;` or a newline) starting with a reserved word, a builtin that
+/// changes what later links do or mean, a negation, or an assignment?
+fn chain_links_are_unprovable(command: &str) -> bool {
+    const UNSAFE_FIRST_WORDS: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until",
+        "do", "done", "function", "time", "coproc", "exit", "return", "exec", "break",
+        "continue", "eval", "source", ".", "alias", "unalias", "cd", "pushd", "popd", "set",
+        "shopt", "setopt", "trap", "kill", "builtin", "command", "enable", "hash", "export",
+        "unset", "declare", "typeset", "local", "readonly", "!", "[[", "{", "}",
+    ];
+    if command.contains("<<") || command.contains("\\\n") {
+        return true;
+    }
+    let bytes = command.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut link_start = 0usize;
+    let mut links: Vec<&str> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' | b')' | b'{' | b'}' => return true,
+                b';' | b'\n' => {
+                    links.push(&command[link_start..i]);
+                    link_start = i + 1;
+                }
+                b'&' if bytes.get(i + 1) == Some(&b'&') => {
+                    links.push(&command[link_start..i]);
+                    i += 2;
+                    link_start = i;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    links.push(&command[link_start..]);
+    links.iter().any(|l| {
+        let first = l.split_whitespace().next().unwrap_or("");
+        UNSAFE_FIRST_WORDS.contains(&first) || first.contains('=')
+    })
 }
 
 /// The segments of `command` separated by `sep` outside quotes. An unterminated quote returns
@@ -227,40 +339,81 @@ fn split_unquoted<'a>(command: &'a str, sep: &[u8]) -> Vec<&'a str> {
     out
 }
 
-/// The segments the read parsers judge: the `&&` chain, or (D-036) a `;` chain of WINDOWS ON ONE
-/// FILE.
+/// The segments the read parsers judge: a `;` or newline SEQUENCE OF READS, or else the `&&`
+/// chain.
 ///
-/// Codex read four sources as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the gate threw
-/// the review away. `;` stays refused in general, because it masks a failed link (`cat missing ;
-/// true` exits zero having read nothing). This shape cannot mask one: every link is a `sed -n`
-/// range or `READER F | sed -n` range on the SAME operand, so a missing file fails the last link
-/// too and the call is not a success, and a range read of a file that exists cannot fail. The
-/// gate then checks the union of windows against the real file on disk, as for any ranged read.
-/// Anything else in a `;` chain (a second file, any other command, an `&&` inside a link) and the
-/// whole command is judged exactly as before.
-/// The segments [`command_read_ranges`] walks, for the gate to size a call's whole output.
+/// D-036: codex read four sources as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the gate
+/// threw the review away. D-056c: it also joins windows with newlines (`nl -ba F | sed -n
+/// '1,240p'` NEWLINE `nl -ba F | sed -n '241,480p'`, live receipts). Both were rejected whole.
+///
+/// `;` and a newline mask a failed link: the call's status is the LAST link's. So a sequence is
+/// split only when that cannot hide a read that did not happen: every read link names the SAME
+/// file, the last link is one of those reads, and the rest are literal `echo`s. A file that is
+/// missing, unreadable, or denied by the reviewer's sandbox then fails the last link too, and a
+/// failed call is credited nothing. No link may contain `&&` or `||` (`false && cat F ; true`,
+/// Antigravity), and [`chain_links_are_unprovable`] must pass.
+///
+/// Reads of DIFFERENT files in one sequence stay refused (Codex, review of D-056c: `cat A; cat B`
+/// with A unreadable to the agent exits zero on B's read). `&&` is the way to chain those, and the
+/// sight contract in the prompt says so.
 pub fn read_segments_pub(command: &str) -> Vec<&str> {
     read_segments(command)
 }
 
 fn read_segments(command: &str) -> Vec<&str> {
     let cmd = unwrap_shell_wrapper(command.trim());
-    let links = split_unquoted(cmd, b";");
-    if links.len() > 1 {
-        let reads: Option<Vec<RangedRead>> =
-            links.iter().map(|l| if l.contains("&&") { None } else { command_read_range(l) }).collect();
-        if let Some(reads) = reads
-            && reads.windows(2).all(|w| w[0].operand == w[1].operand)
-        {
-            return links;
-        }
-    }
-    and_chain_segments(cmd)
+    sequence_of_reads(cmd).unwrap_or_else(|| and_chain_segments(cmd))
 }
 
-/// Every whole-file read in a command, one per `&&` segment.
+/// The links of a `;` or newline sequence of reads of ONE file, ending in a read, with only
+/// literal `echo`s between. `None` for anything else. See [`read_segments`].
+fn sequence_of_reads(cmd: &str) -> Option<Vec<&str>> {
+    if chain_links_are_unprovable(cmd) {
+        return None;
+    }
+    let links: Vec<&str> = split_unquoted(cmd, b";")
+        .into_iter()
+        .flat_map(|l| split_unquoted(l, b"\n"))
+        .collect();
+    if links.len() < 2 {
+        return None;
+    }
+    let mut operand: Option<String> = None;
+    let mut last_is_read = false;
+    for link in &links {
+        if link.contains("&&") || link.contains("||") {
+            return None;
+        }
+        let read = command_read_range(link)
+            .map(|r| r.operand)
+            .or_else(|| whole_file_read(link).map(|(op, _)| op));
+        match read {
+            Some(op) => {
+                if operand.as_ref().is_some_and(|o| *o != op) {
+                    return None;
+                }
+                operand = Some(op);
+                last_is_read = true;
+            }
+            None if is_inert_echo(link) => last_is_read = false,
+            None => return None,
+        }
+    }
+    (operand.is_some() && last_is_read).then_some(links)
+}
+
+/// `echo` with literal words only: a separator between windows. A quote, a variable, a glob or
+/// a brace is refused: each prints more than its text. So is `=`, because zsh expands a word
+/// starting with it to a command's path (`echo =cat`, Grok, review).
+fn is_inert_echo(link: &str) -> bool {
+    let literal = |t: &str| t.chars().all(|ch| ch.is_ascii_alphanumeric() || "._/-:,+@%".contains(ch));
+    let mut toks = link.split_whitespace();
+    toks.next() == Some("echo") && toks.all(literal)
+}
+
+/// Every whole-file read in a command, one per segment ([`read_segments`]).
 pub fn whole_file_read_operands(command: &str) -> Vec<String> {
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .filter_map(whole_file_read_operand)
         .collect()
@@ -297,7 +450,7 @@ pub fn shell_command_from_value(args: Option<&serde_json::Value>) -> Option<Stri
     v.get("command")
         .or_else(|| v.get("CommandLine"))
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+        .map(|c| normalize_wrapped_script(c.to_string()))
 }
 
 /// Same, from the JSON string a `ToolCallRecord` carries.
@@ -309,7 +462,7 @@ pub fn shell_command_from_args_json(args_json: &str) -> Option<String> {
 pub fn command_reads_whole_file(command: &str) -> bool {
     // Per `&&` segment (D-017): `wc -l F && cat F` took `wc` as the program and reported a
     // partial read of a command that shows the whole file.
-    and_chain_segments(unwrap_shell_wrapper(command.trim()))
+    read_segments(command)
         .into_iter()
         .any(segment_reads_whole_file)
 }
@@ -385,12 +538,49 @@ pub fn command_read_range(command: &str) -> Option<RangedRead> {
             Some(RangedRead { range, operand: operand?, via_nl: false, decoration: Decoration::default() })
         }
         [reader, filter] => {
-            let (operand, via_nl, decoration) = whole_file_reader_with_one_operand(reader)?;
-            let (range, _) = sed_range_stage(filter, false)?;
-            Some(RangedRead { range, operand, via_nl, decoration })
+            if let Some((operand, via_nl, decoration)) = whole_file_reader_with_one_operand(reader) {
+                let (range, _) = sed_range_stage(filter, false)?;
+                return Some(RangedRead { range, operand, via_nl, decoration });
+            }
+            // The other order, codex's habit since at least 2026-10-10:
+            // `sed -n '181,360p' F | nl -ba -v181`. Rejected live as "no read the parser
+            // recognises" on a review that read every line.
+            let (range, operand) = sed_range_stage(reader, true)?;
+            let decoration = nl_numbering_filter(filter, range.start)?;
+            Some(RangedRead { range, operand: operand?, via_nl: true, decoration })
         }
         _ => None,
     }
+}
+
+/// `nl` as the SECOND stage of `sed -n 'N,Mp' FILE | nl ...`: it numbers what sed printed and
+/// opens nothing itself, so it may have NO operand (one would be read in place of stdin).
+/// Flags: `-ba`/`-bt`/`-bn`, `-w<n>` with n at least 1, and `-v<k>` only with k at most N. The
+/// budget bounds a numbered line by its SOURCE line number; a start number above N would print
+/// wider numbers than that bound assumes. `nl` drops logical-page delimiter lines, so the read
+/// is marked `via_nl` and the gate refuses it on a file that has one.
+fn nl_numbering_filter(stage: &str, window_start: u64) -> Option<Decoration> {
+    let mut toks = stage.split_whitespace();
+    let program = toks.next()?;
+    if program.rsplit('/').next().unwrap_or(program) != "nl" {
+        return None;
+    }
+    let mut decoration = Decoration { number_width: Some(6), ..Decoration::default() };
+    for tok in toks {
+        if matches!(tok, "-ba" | "-bt" | "-bn") {
+            continue;
+        }
+        if let Some(w) = tok.strip_prefix("-w") {
+            decoration.number_width = Some(w.parse::<u64>().ok().filter(|n| *n > 0)?);
+            continue;
+        }
+        if let Some(k) = tok.strip_prefix("-v") {
+            k.parse::<u64>().ok().filter(|k| *k <= window_start)?;
+            continue;
+        }
+        return None;
+    }
+    Some(decoration)
 }
 
 /// A ranged read, with the ONE operand it read, so the gate can bind the window to the file
@@ -795,12 +985,12 @@ impl CodexExecParser {
             "command_execution" => {
                 let command = item.get("command").and_then(|v| v.as_str()).unwrap_or_default();
                 if started {
-                    self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                    self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                         id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
                         tool: "command_execution".to_string(),
                         // A pure content reader is classified as a READ so codex can satisfy
                         // `required_sources`. Everything else stays Bash and cannot.
-                        kind: if command_reads_file_contents(command) {
+                        kind: if command_reads_file_contents(&normalize_wrapped_script(command.to_string())) {
                             ToolKind::ReadFile
                         } else {
                             ToolKind::Bash
@@ -816,6 +1006,12 @@ impl CodexExecParser {
                         && let Some(existing) = self.tool_calls.iter_mut().find(|r| r.id.as_deref() == Some(id))
                     {
                         existing.success = Some(exit_code == 0);
+                        // Always Some for codex, "" when the field is absent: real codex sends
+                        // it on every command item, even `item.started`, so a missing one is a
+                        // shape this parser does not know, and it fails closed (Codex and Grok,
+                        // review: `None` would credit the read on status alone).
+                        let out = item.get("aggregated_output").and_then(|v| v.as_str()).unwrap_or_default();
+                        existing.shown_output = Some(crate::types::capped_shown_output(out));
                     }
                 }
                 let event = WorkingStateEvent {
@@ -855,7 +1051,7 @@ impl CodexExecParser {
                 // `agents.max_depth=0` do NOT stop `spawn_agent`, and the spawn itself is not in
                 // the --json stream; only the later `collab_tool_call` wait is.
                 if started && item_type == COLLAB_TOOL {
-                    self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                    self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                         id: item.get("id").and_then(|v| v.as_str()).map(ToString::to_string),
                         tool: COLLAB_TOOL.to_string(),
                         kind: ToolKind::Unknown,
@@ -1195,6 +1391,87 @@ mod command_classification_tests {
         assert!(!command_reads_file_contents("ls /repo && wc -l /repo/a.rs"));
     }
 
+    /// Codex's own rendering of `sed -n '1,$p' F`, from five live rejections, reaches the parsers
+    /// joined; expansions never do. RED IF: the live shape stops being a read, or an expansion
+    /// inside a double-quoted piece is joined.
+    #[test]
+    fn codex_03e_adjacent_quoted_pieces_join_like_the_shell_and_expansions_do_not() {
+        let live = r#"/bin/zsh -lc "sed -n '1,"'$p'"' /r/dist/index.html""#;
+        let cmd = shell_command_from_value(Some(&serde_json::json!({ "command": live }))).unwrap();
+        assert_eq!(cmd, "sed -n '1,$p' /r/dist/index.html");
+        assert_eq!(command_read_ranges(&cmd)[0].range, LineRange { start: 1, end: None });
+        assert!(command_reads_file_contents(&normalize_wrapped_script(live.to_string())));
+        let mut p = CodexExecParser::new();
+        let line = serde_json::json!({"type":"item.started","item":{"type":"command_execution","id":"c1","command": live}});
+        p.parse_line(&line.to_string());
+        assert_eq!(p.finish().tool_calls[0].kind, ToolKind::ReadFile, "the parser classifies it too");
+        assert_eq!(join_adjacent_quotes(r#""a "'b'"\"c\"""#).as_deref(), Some(r#"a b"c""#));
+        for refused in [
+            r#""cat "$SRC"#,
+            r#""cat $(echo /r/a)""#,
+            r#""cat `echo /r/a`""#,
+            r#""sed -n '1,"'$p'"' /r/a" extra"#,
+            r#""unterminated"#,
+            r#""bad \q escape""#,
+        ] {
+            assert!(join_adjacent_quotes(refused).is_none(), "joined: {refused}");
+        }
+        let expanding = r#"/bin/zsh -lc "cat "$SRC"""#;
+        assert_eq!(normalize_wrapped_script(expanding.to_string()), expanding, "left wrapped, fails closed");
+    }
+
+    /// Codex's live read shape on 2026-10-10, `sed -n 'a,bp' F | nl -ba -va`, is a window on F.
+    /// RED IF: it stops parsing, nl gains an operand or an unvetted flag, or `-v` above the
+    /// window start is accepted.
+    #[test]
+    fn codex_03f_sed_then_nl_is_a_window_and_nl_opens_nothing() {
+        let live = r#"/bin/zsh -lc "sed -n '181,360p' /r/a.patch | nl -ba -v181""#;
+        let r = command_read_range(live).expect("live shape");
+        assert_eq!((r.range, r.operand.as_str(), r.via_nl), (LineRange { start: 181, end: Some(360) }, "/r/a.patch", true));
+        assert!(command_reads_file_contents(live));
+        assert!(command_read_range("sed -n '1,9p' /r/a | nl").is_some());
+        for refused in [
+            "sed -n '1,9p' /r/a | nl /r/other",
+            "sed -n '1,9p' /r/a | nl -s, ",
+            "sed -n '10,19p' /r/a | nl -v11",
+            "sed -n '1,9p' /r/a | nl -w0",
+            "sed -n '1,9p' /r/a | nl -i2",
+            "sed -n '1,9p' /r/a | tail -1",
+            "sed -n '1,9p' | nl",
+        ] {
+            assert!(command_read_range(refused).is_none(), "accepted: {refused}");
+        }
+    }
+
+    /// Links that might not run, or might not run what they name, are never split out of an
+    /// `&&` chain. RED IF: any of these yields a whole-file read or a window.
+    #[test]
+    fn codex_03g_an_and_chain_whose_links_are_unprovable_is_not_split() {
+        for c in [
+            "exit 0 && cat /r/src",
+            "return 0 && cat /r/src",
+            "exec true && cat /r/src",
+            "cd /elsewhere && cat src",
+            "pushd /elsewhere && cat src",
+            "cat() { :; } && cat /r/src",
+            "alias cat=true && cat /r/src",
+            "export PATH=/tmp/evil && cat /r/src",
+            "PATH=/tmp/evil && cat /r/src",
+            "if true; then exit 0; fi && cat /r/src",
+            "(exit 0) && cat /r/src",
+            "python3 - <<'PY' && cat /r/src",
+            "true \\\n && cat /r/src",
+            "exit 0 && sed -n '1,9p' /r/src",
+        ] {
+            assert!(whole_file_read_operands(c).is_empty(), "whole read in: {c}");
+            assert!(command_read_ranges(c).is_empty(), "window in: {c}");
+        }
+        // Codex's real chains are unaffected.
+        assert_eq!(whole_file_read_operands("wc -l /r/a && cat /r/a"), vec!["/r/a"]);
+        assert_eq!(command_read_ranges("wc -l /r/a && sed -n '1,9p' /r/a").len(), 1);
+        assert_eq!(command_read_ranges("/bin/zsh -lc \"sed -n '1,9p' /r/a; sed -n '10,19p' /r/a\"").len(), 2, "D-036 intact");
+    }
+
     /// The parser must actually apply the classification, not just define it.
     /// RED IF: command_execution goes back to hardcoding ToolKind::Bash.
     #[test]
@@ -1268,11 +1545,12 @@ mod whole_file_read_operand_tests {
 
     /// D-036 at the parser: a `;` chain is split only when every link is a window on one file.
     #[test]
-    fn semicolon_chains_split_only_for_windows_on_one_file() {
+    fn semicolon_chains_split_only_for_sequences_of_reads() {
         let ok = "/bin/zsh -lc \"sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/a.rs\"";
         assert!(command_reads_file_contents(ok));
         assert_eq!(command_read_ranges(ok).len(), 2);
         for bad in [
+            // Two files: a failed read of a.rs is masked by b.rs's (Codex, review of D-056c).
             "sed -n '1,180p' /r/a.rs; sed -n '181,360p' /r/b.rs",
             "sed -n '1,180p' /r/a.rs; rm -rf /r",
             "cat /r/a.rs; true",
@@ -1286,4 +1564,84 @@ mod whole_file_read_operand_tests {
         assert!(command_read_ranges("sed -n '1,2p;3p' /r/a.rs").is_empty());
     }
 
+    /// RED IF: a `;` or newline sequence of reads (D-056c, live codex receipts) is refused, or a
+    /// sequence with a link that may not run, or that is not a read, is split.
+    #[test]
+    fn newline_and_semicolon_sequences_of_reads_split() {
+        use super::whole_file_read_operands;
+        // Live 2026-10 shape: windows on one file, one per line.
+        let nl_windows = "/bin/zsh -lc \"nl -ba /r/s.py | sed -n '1,240p'\nnl -ba /r/s.py | sed -n '241,480p'\"";
+        let r = command_read_ranges(nl_windows);
+        assert_eq!(r.iter().map(|w| (w.range.start, w.range.end)).collect::<Vec<_>>(), [(1, Some(240)), (241, Some(480))]);
+        assert!(command_reads_file_contents(nl_windows));
+        // One file, literal echo separators, ending in a read.
+        let one = "echo ----- /r/a.rs; sed -n '1,100p' /r/a.rs; echo; sed -n '101,$p' /r/a.rs";
+        assert_eq!(command_read_ranges(one).len(), 2);
+        assert_eq!(whole_file_read_operands("echo start\ncat /r/a.rs\n"), ["/r/a.rs"]);
+        for bad in [
+            // A read of a different file masks a failed one (Codex): both shapes, and newlines.
+            "cat /r/a.rs; echo; echo ----- /r/b.rs; cat /r/b.rs",
+            "cat /r/a.rs\ncat /r/b.rs\n",
+            // Ends in an echo or another program, which succeeds whatever the read did (Grok).
+            "cat /r/a.rs; echo done",
+            "cat /r/no-such; echo ok",
+            "cat /r/a.rs\ntrue",
+            "wc -l /r/a.rs; cat /r/b.rs",
+            // Echo words the shell expands (Grok).
+            "echo =cat; cat /r/a.rs",
+            "echo $X; cat /r/a.rs",
+            "echo ~/x; cat /r/a.rs",
+            "sed -n '1,100p' /r/a.rs; sed -n '101,$p' /r/a.rs; echo",
+            "false && cat /r/a.rs ; true",
+            "false && cat /r/a.rs\ntrue",
+            "cat /r/a.rs || true; cat /r/b.rs",
+            "cat /r/a.rs; true",
+            "cat /r/a.rs; exit 0",
+            "cd /elsewhere; cat /r/a.rs",
+            "X=1; cat /r/a.rs",
+            "cat /r/a.rs; echo \"$(rm -rf /r)\"",
+            "cat /r/a.rs; echo {1..40000}",
+            "cat /r/a.rs; echo *",
+            "cat /r/a.rs & cat /r/b.rs",
+            "echo a; echo b",
+            "cat /r/a.rs > /tmp/x; cat /r/b.rs",
+            "cat() { :; }; cat /r/a.rs",
+        ] {
+            assert!(whole_file_read_operands(bad).is_empty(), "no whole read from: {bad}");
+            assert!(command_read_ranges(bad).is_empty(), "no windows from: {bad}");
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod shown_output_tests {
+    use super::*;
+
+    /// Live capture, codex-cli 0.154.0, 2026-10-11 (scratch paths rewritten to /probe): a
+    /// `nl -ba MISSING | sed -n` window, then a real one, in one call. RED IF: the parser stops
+    /// recording `aggregated_output`, which is the only evidence the gate has that the reader
+    /// stage of a pipeline really read: the call's exit code is 0 although `nl` failed.
+    #[test]
+    fn codex_records_what_a_call_showed() {
+        let mut p = CodexExecParser::new();
+        for line in include_str!("../tests/fixtures/codex-0.154.0-pipeline-missing-20261011.jsonl").lines() {
+            p.parse_line(line);
+        }
+        let r = p.finish();
+        let call = r.tool_calls.iter().find(|c| c.tool == "command_execution").expect("the shell call");
+        assert_eq!(call.success, Some(true), "the pipeline's status hides the failed nl");
+        let shown = call.shown_output.as_deref().expect("aggregated_output recorded");
+        assert!(shown.contains("missing.txt: No such file or directory") && shown.contains("     1\tl1\n"), "{shown}");
+    }
+
+    /// RED IF: a completed command with no `aggregated_output` leaves `shown_output` as `None`,
+    /// which the gate reads as "no evidence recorded" and credits on status alone.
+    #[test]
+    fn a_codex_call_without_output_fails_closed() {
+        let mut p = CodexExecParser::new();
+        p.parse_line(r#"{"type":"item.started","item":{"type":"command_execution","id":"c1","command":"cat /r/a.rs"}}"#);
+        p.parse_line(r#"{"type":"item.completed","item":{"type":"command_execution","id":"c1","command":"cat /r/a.rs","exit_code":0}}"#);
+        assert_eq!(p.finish().tool_calls[0].shown_output.as_deref(), Some(""));
+    }
 }

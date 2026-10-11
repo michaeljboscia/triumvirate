@@ -105,7 +105,7 @@ impl GeminiStreamParser {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 let args_json = json.get("parameters").map(|v| v.to_string());
-                self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                     id: json.get("tool_id").and_then(|v| v.as_str()).map(ToString::to_string),
                     tool: tool_name.to_string(),
                     // D-010: a `bash` call that reads a file is a read for the sight gate.
@@ -153,6 +153,13 @@ impl GeminiStreamParser {
                     && let Some(existing) = self.tool_calls.iter_mut().find(|r| r.id.as_deref() == Some(id))
                 {
                     existing.success = Some(status.eq_ignore_ascii_case("success"));
+                    // D-059: a shell result's text, "" when absent (not live-verified: the
+                    // gemini-cli seat has been unusable since 2026-09-13, so this fails closed).
+                    if crate::grok::is_shell_tool(&existing.tool) {
+                        existing.shown_output = Some(crate::types::capped_shown_output(
+                            json.get("output").and_then(|v| v.as_str()).unwrap_or_default(),
+                        ));
+                    }
                 }
                 let event = WorkingStateEvent {
                     agent: "gemini".to_string(),

@@ -237,7 +237,7 @@ impl ClaudeStreamParser {
                     if let Some(ref id) = id {
                         self.pending.insert(id.clone(), self.tool_calls.len());
                     }
-                    self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+                    self.tool_calls.push(ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
                         id: id.clone(),
                         // D-010: a `Bash` call that reads a file is a read for the sight gate.
                         kind: crate::codex::shell_read_kind(tool_kind(&name), block.get("input")),
@@ -301,17 +301,21 @@ impl ClaudeStreamParser {
                 // D-032: Read returns `cat -n` lines (`     1\ttext`), so the span it RECEIVED is
                 // exact, including Read's own cap when no limit was given. A Bash read is
                 // windowed from its command instead.
+                let text = || match block.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                };
                 if ok && rec.kind == ToolKind::ReadFile && rec.tool != "Bash" {
-                    let text = match block.get("content") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(Value::Array(parts)) => parts
-                            .iter()
-                            .filter_map(|p| p.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        _ => String::new(),
-                    };
-                    rec.returned_lines = crate::types::numbered_line_runs(&text);
+                    rec.returned_lines = crate::types::numbered_line_runs(&text());
+                } else if ok && rec.tool == "Bash" {
+                    // D-059: the Bash result is what the model was shown; a pipeline's status is
+                    // its last stage's (measured: is_error false with "nl: F: No such file").
+                    rec.shown_output = Some(crate::types::capped_shown_output(&text()));
                 }
                 let detail = format!(
                     "claude {} {}",
@@ -725,5 +729,26 @@ mod tests {
         p.parse_line("");
         p.parse_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer"}"#);
         assert_eq!(p.finish().response_text, "the answer");
+    }
+}
+
+#[cfg(test)]
+mod shown_output_tests {
+    use super::*;
+
+    /// Live capture, Claude Code 2.1.296, 2026-10-11, trimmed to the tool_use and tool_result
+    /// lines: the Bash result has is_error false although `nl` failed. RED IF: a completed Bash
+    /// call stops recording its result text (D-059).
+    #[test]
+    fn claude_records_what_a_bash_call_showed() {
+        let mut p = ClaudeStreamParser::new();
+        for line in include_str!("../tests/fixtures/claude-2.1.296-bash-pipeline-missing-20261011.jsonl").lines() {
+            p.parse_line(line);
+        }
+        let r = p.finish();
+        let call = r.tool_calls.iter().find(|c| c.tool == "Bash").expect("the Bash call");
+        assert_eq!(call.success, Some(true));
+        let shown = call.shown_output.as_deref().expect("output recorded");
+        assert!(shown.contains("missing.txt: No such file or directory") && shown.contains("     2\tl2"), "{shown}");
     }
 }

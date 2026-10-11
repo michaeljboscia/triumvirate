@@ -525,7 +525,8 @@ pub(crate) async fn run_agy_cli_process_with_session(
                                 "agy refused an action and stopped without an answer (attempt {attempt}); not retrying"
                             );
                             return Err(anyhow::anyhow!(
-                                "agy refused an action and stopped without an answer (not retried; a rerun is refused the same way): denied {denied}; {detail}; raw stream: {}",
+                                "agy refused an action and stopped without an answer (not retried; a rerun is refused the same way): denied {denied}; {detail}{}; raw stream: {}",
+                                denied_write_hint(&denied_actions),
                                 kept.as_deref().unwrap_or("not kept")
                             ));
                         }
@@ -742,6 +743,26 @@ enum AgyRun {
         log: AgyLogInfo,
     },
     SpawnError(anyhow::Error),
+}
+
+/// #83: a refused WRITE usually held the answer itself (the brief asked for a file), and agy's
+/// stream keeps only the target path. Say so, so the caller asks for the answer inline instead
+/// of paying for the same refused run again. Empty for any other refused action.
+fn denied_write_hint(denied_actions: &[String]) -> &'static str {
+    // A FILE action by name: agy records the refused write as `WriteToFile` (action `write_file`).
+    // Requiring "file" keeps a tool like `credit_check` from matching on "edit" (Antigravity).
+    let wrote = denied_actions.iter().any(|a| {
+        let a = a.to_ascii_lowercase();
+        a == "apply_patch"
+            || (a.contains("file") && ["write", "edit", "replace", "create", "save", "append"].iter().any(|v| a.contains(v)))
+    });
+    if wrote {
+        "; the refused action was a file write, and the answer was most likely inside it: agy \
+         keeps only the target path, so the content is gone. This run cannot write files. Ask for \
+         the answer in the reply, not in a file, before re-running"
+    } else {
+        ""
+    }
 }
 
 async fn run_agy_once(
@@ -1670,6 +1691,29 @@ pub(crate) mod tests {
         assert!(msg.contains("refused an action") && msg.contains("RunCommand") && msg.contains("user denied permission"), "got: {msg}");
         assert!(!msg.contains("empty output"), "a denial is not a dropped capture: {msg}");
         assert_eq!(runs(&counter), 1, "a denial must not be retried");
+    }
+
+    /// #83, the live shape (2026-10-11, agy-failures/1791736686150-79491): a brief asked for a
+    /// file, agy put its whole answer in a write_to_file that headless mode refused. RED IF the
+    /// error stops saying the answer was in the refused write, or a refused COMMAND starts
+    /// claiming it was.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mock_agy_denied_write_says_the_answer_was_in_it() {
+        let _lock = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let body = denied_stream_body(&counter, "x", true).replace(
+            r#"{\"action\":\"command\",\"display_name\":\"RunCommand\"}"#,
+            r#"{\"action\":\"write_file\",\"display_name\":\"WriteToFile\"}"#,
+        );
+        assert!(body.contains("WriteToFile"), "fixture rewrite failed: {body}");
+        let msg = run_mock(&body, "review", None).await.expect_err("no answer").to_string();
+        assert!(msg.contains("WriteToFile") && msg.contains("the answer was most likely inside it"), "got: {msg}");
+        assert_eq!(runs(&counter), 1, "a denial must not be retried");
+        assert!(denied_write_hint(&["RunCommand".to_string()]).is_empty(), "a refused command is not a lost answer");
+        assert!(denied_write_hint(&["credit_check".to_string()]).is_empty(), "not a file action");
+        assert!(!denied_write_hint(&["ReplaceFileContent".to_string()]).is_empty(), "an edit to a file is a write");
     }
 
     /// Class, not wording: agy recorded a refusal whose tool error says something else entirely.

@@ -268,6 +268,12 @@ impl AgyStreamParser {
         // fixture I collected and did not check.
         let done = state.eq_ignore_ascii_case("DONE");
         let errored = state.eq_ignore_ascii_case("ERROR");
+        // D-059: what a finished `run_command` returned (`tool_info.output`), "" when absent.
+        let shown = (done && name == "run_command").then(|| {
+            crate::types::capped_shown_output(
+                su.get("tool_info").and_then(|ti| ti.get("output")).and_then(Value::as_str).unwrap_or_default(),
+            )
+        });
         if errored && self.first_tool_error.is_none() {
             let msg = su
                 .get("tool_info")
@@ -283,6 +289,7 @@ impl AgyStreamParser {
             let rec = &mut self.tool_calls[call_pos];
             if done || errored {
                 rec.success = Some(!errored);
+                rec.shown_output = shown;
                 self.open_steps.remove(pos);
             }
             if params.is_some() {
@@ -307,7 +314,7 @@ impl AgyStreamParser {
         }
 
         let params_value = params.as_deref().and_then(|p| serde_json::from_str::<Value>(p).ok());
-        self.tool_calls.push(ToolCallRecord { returned_lines: Vec::new(),
+        self.tool_calls.push(ToolCallRecord { shown_output: shown, returned_lines: Vec::new(),
             id: Some(idx.to_string()),
             tool: name.clone(),
             // D-010: a `run_command` that reads a file is a read for the sight gate.
@@ -693,5 +700,24 @@ mod tests {
         let parsed = p.finish();
         assert!(parsed.response_text.is_empty());
         assert_eq!(parsed.tool_calls[0].success, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod shown_output_tests {
+    use super::*;
+
+    /// The 2026-09-01 live capture: `run_command pwd` finished with tool_info.output. RED IF: a
+    /// finished run_command stops recording it, or a non-shell tool starts to (D-059).
+    #[test]
+    fn agy_records_what_a_run_command_showed() {
+        let mut p = AgyStreamParser::new();
+        for line in include_str!("../tests/fixtures/agy-stream-tools-20260901.jsonl").lines() {
+            p.parse_line(line);
+        }
+        let r = p.finish();
+        let pwd = r.tool_calls.iter().find(|c| c.tool == "run_command").expect("run_command");
+        assert_eq!(pwd.shown_output.as_deref(), Some("/Users/michaelboscia\n"));
+        assert!(r.tool_calls.iter().filter(|c| c.tool != "run_command").all(|c| c.shown_output.is_none()));
     }
 }

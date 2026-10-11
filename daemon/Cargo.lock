@@ -6883,6 +6883,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "ctor",
  "daemon-core",
  "daemon-http",
  "dirs",

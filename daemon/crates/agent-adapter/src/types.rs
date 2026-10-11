@@ -60,24 +60,48 @@ pub struct ToolCallRecord {
     /// `view_file` reports only a count).
     #[serde(default)]
     pub returned_lines: Vec<(u64, u64)>,
+    /// The text a SUCCESSFUL shell call's result showed the model (a failed call earns no
+    /// credit, so its output is not kept; Codex, round 5): codex `aggregated_output`, grok's
+    /// completed content text, claude's Bash `tool_result`, agy's `tool_info.output`, gemini's
+    /// `tool_result.output`; capped at [`SHOWN_OUTPUT_CAP`] bytes, and `Some("")` when the event
+    /// carried none. A shell pipeline's status is
+    /// its last stage's, so `nl -ba F | sed -n '1,240p'` exits 0 when `nl` cannot read F
+    /// (measured, codex-cli 0.154.0). This is the evidence that the lines were really shown.
+    /// `None` for non-shell tools, whose reads are proven by `returned_lines`. Kept out of the ledger: only the local
+    /// rejected-turn file serializes tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_output: Option<String>,
+}
+
+/// The most bytes of one call's shown output a [`ToolCallRecord`] keeps. Above the gate's
+/// 30,000-byte shell budget, so a call the gate can credit is never cut here.
+pub const SHOWN_OUTPUT_CAP: usize = 64 * 1024;
+
+/// `out` cut to [`SHOWN_OUTPUT_CAP`] bytes on a char boundary, for `ToolCallRecord::shown_output`.
+pub fn capped_shown_output(out: &str) -> String {
+    let mut end = out.len().min(SHOWN_OUTPUT_CAP);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out[..end].to_string()
 }
 
 /// The line numbers in a read tool's line-numbered output, as sorted contiguous runs. A line
 /// counts when, after leading spaces, it starts with digits followed by `→` (grok) or a tab
 /// (claude). Lines 1 and 100 alone are two runs, never 1..100 (Codex, panel review). Empty
 /// when no line is numbered, so an unnumbered result never invents a range.
+/// The line number a read tool printed at the start of `line` (`N→text`, `N\ttext`), if any.
+pub fn line_number_marker(line: &str) -> Option<u64> {
+    let t = line.trim_start_matches(' ');
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = &t[digits..];
+    (digits > 0 && (rest.starts_with('→') || rest.starts_with('\t')))
+        .then(|| t[..digits].parse::<u64>().ok())
+        .flatten()
+}
+
 pub fn numbered_line_runs(text: &str) -> Vec<(u64, u64)> {
-    let mut seen: Vec<u64> = text
-        .lines()
-        .filter_map(|line| {
-            let t = line.trim_start_matches(' ');
-            let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-            let rest = &t[digits..];
-            (digits > 0 && (rest.starts_with('→') || rest.starts_with('\t')))
-                .then(|| t[..digits].parse::<u64>().ok())
-                .flatten()
-        })
-        .collect();
+    let mut seen: Vec<u64> = text.lines().filter_map(line_number_marker).collect();
     seen.sort_unstable();
     seen.dedup();
     let mut runs: Vec<(u64, u64)> = Vec::new();
