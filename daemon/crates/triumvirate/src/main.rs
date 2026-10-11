@@ -3552,6 +3552,20 @@ mod tests {
         Ok(())
     }
 
+    /// D-054. Every test in this binary gets a private TRIUMVIRATE_HOME, set before any test
+    /// thread starts. Most tests never set one, so their outbox rows, dead drops, workers.json
+    /// and agy failure dumps landed in the operator's real ~/.triumvirate: 52 of 271 REJECTED
+    /// rows there were tempdir fixtures. A test that needs its own home still sets one, and its
+    /// EnvRestore puts this value back, never the real home.
+    #[ctor::ctor]
+    fn isolate_triumvirate_home() {
+        if std::env::var_os("TRIUMVIRATE_HOME").is_none() {
+            let home = std::env::temp_dir().join(format!("triumvirate-test-home-{}", std::process::id()));
+            // SAFETY: a constructor runs before main, so no other thread can read the environment.
+            unsafe { std::env::set_var("TRIUMVIRATE_HOME", home) };
+        }
+    }
+
     pub(crate) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -7057,6 +7071,16 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[tokio::test]
     async fn fleet_spawn_and_status_tools_round_trip() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // D-058. Stand-ins for both members. Without them this test launched the REAL codex
+        // and agy CLIs, on the operator's subscription login, with the task "test", on every
+        // `cargo test`. `false` exits 1, which the state assertion below already allows.
+        let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_AGY_BIN", "TRIUMVIRATE_GEMINI_BIN"]);
+        // SAFETY: test controls env var lifecycle under lock.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_CODEX_BIN", "/usr/bin/false");
+            std::env::set_var("TRIUMVIRATE_AGY_BIN", "/usr/bin/false");
+            std::env::set_var("TRIUMVIRATE_GEMINI_BIN", "/usr/bin/false");
+        }
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?

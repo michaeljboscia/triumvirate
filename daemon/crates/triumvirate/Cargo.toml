@@ -50,6 +50,7 @@ peer-review = { path = "../peer-review" }
 token-economics = { path = "../token-economics" }
 
 [dev-dependencies]
+ctor = "0.2"
 rusqlite = "0.32"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = "3"

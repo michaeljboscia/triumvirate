@@ -25,9 +25,17 @@ file is the thing you read to answer "what do we know is broken right now."
 **CHECK to close:** on main, a source-gated grok review that reads its source once with `read_file` passes the gate.
 
 ### D-054 - Test runs write REJECTED rows into the production outbox
-**Found:** 2026-10-10 · **Severity:** LOW · **NOT FIXED**
+**Found:** 2026-10-10 · **Severity:** LOW · **Fix on branch feat/sight-salvage-main**
 **Evidence:** 52 of 271 REJECTED rows in `~/.triumvirate/outbox.jsonl` (2026-09-01 to 2026-10-09) name sources under `/private/var/folders/.../T/.tmp*/`, which are test temp dirs. They inflate every rejection count read from the outbox.
 **CHECK to close:** `cargo test --workspace` leaves `~/.triumvirate/outbox.jsonl` byte-identical.
+**Scope, measured 2026-10-11:** not only REJECTED rows. The live outbox holds about 9,000 tempdir rows of every state, and a run of the suite under a scratch HOME wrote outbox.jsonl (75 rows), workers.json, fleets.json, daemon.token, dead-drop/ and agy-failures/ into `$HOME/.triumvirate`.
+**Fix:** a `#[ctor]` in the triumvirate test binary sets a per-process TRIUMVIRATE_HOME under the temp dir before any test thread starts. The same scratch-HOME run then leaves `$HOME/.triumvirate` absent.
+
+### D-058 - A unit test launched the real codex and agy CLIs on every `cargo test`
+**Found:** 2026-10-11 · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**
+**Evidence:** `fleet_spawn_and_status_tools_round_trip` (daemon/crates/triumvirate/src/main.rs) runs `fleet_spawn` with `wait: true` and no stand-in binaries, so `fleet_agent_command` resolved the installed codex and agy. Under a scratch HOME it left a real codex rollout (`codex_exec`, cli 0.154.0, cwd a fleet worktree) in `$HOME/.codex/sessions`. Under the real HOME that is a paid subscription turn with the task "test", and its failure is invisible because the test accepts `failed`.
+**Fix:** the test points TRIUMVIRATE_CODEX_BIN, TRIUMVIRATE_AGY_BIN and TRIUMVIRATE_GEMINI_BIN at `/usr/bin/false`.
+**CHECK to close:** `HOME=<scratch> cargo test --workspace` leaves no `<scratch>/.codex/sessions`.
 
 ### D-055 - A sight rejection keeps 600 characters and no tool calls
 **Found:** 2026-10-10 · **Severity:** MEDIUM · **FIX ON BRANCH, NOT MERGED** (9ad3299)
