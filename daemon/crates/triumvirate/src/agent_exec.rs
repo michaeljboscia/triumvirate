@@ -2443,6 +2443,8 @@ fn call_showed_lines(c: &ToolCallRecord, operand: &str, range: &agent_adapter::c
     let mut cursor = 0usize;
     for (n, line) in bytes.split(|b| *b == b'\n').enumerate() {
         let n = n as u64 + 1;
+        // A CRLF file's `\r` is matched loosely: some renderers drop it (Antigravity, review).
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if n < start || line.is_empty() {
             continue;
         }
@@ -7202,7 +7204,14 @@ mod sight_gate_tests {
         assert!(gate(call(Some(denied))).is_err(), "nothing was shown, exit 0 regardless");
         let half: String = (1..=3).map(|i| format!("     {i}\tfn line_{i}() {{}}\n")).collect();
         assert!(gate(call(Some(half))).is_err(), "the second window was not shown");
-        gate(call(None)).expect("no recorded output: judged on status, as before");
+        assert!(gate(call(Some(String::new()))).is_err(), "codex reported no output");
+        let crlf_dir = tempfile::tempdir().unwrap();
+        let crlf = crlf_dir.path().join("w.rs");
+        std::fs::write(&crlf, "a\r\n\r\nb\r\n").unwrap();
+        let crlf = crlf.display().to_string();
+        let crlf_call = ToolCallRecord { shown_output: Some("     1\ta\n     2\t\n     3\tb\n".to_string()), ..call(None) };
+        assert!(call_showed_lines(&crlf_call, &crlf, &agent_adapter::codex::LineRange { start: 1, end: None }, &cwd), "a dropped \\r is not a missing line");
+        gate(call(None)).expect("no recorded output (a parser that records none): judged on status, as before");
     }
 
     /// Both success arms build their rejection through the one helper. RED IF: an arm goes back
@@ -9326,7 +9335,7 @@ mod mandatory_review_tests {
         // script that emitted nothing, which surfaced as "no usable verdict" instead of the
         // rejection the test was asserting. A test helper that fails in a way that mimics a
         // different defect is worse than no helper.
-        let mut script = String::from("#!/usr/bin/env bash\n");
+        let mut script = format!("#!/usr/bin/env bash\n{}\n", crate::tests::JSON_ESCAPE_SH);
         script.push_str("PROMPT=\"$*\"\n");
         script.push_str(&format!("echo invoked >> {}\n", count_file.display()));
 
@@ -9345,7 +9354,7 @@ mod mandatory_review_tests {
             script.push_str(&format!("  READ_OUTPUT=\"$({reader} \"$ARTIFACT\" 2>/dev/null)\"\n"));
             script.push_str("  RC=$?\n");
             script.push_str(&format!(
-                "  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\",\"exit_code\":%d}}}}\\n' \"$ARTIFACT\" \"$RC\"\n"
+                "  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\",\"exit_code\":%d,\"aggregated_output\":\"%s\"}}}}\\n' \"$ARTIFACT\" \"$RC\" \"$(jesc \"$READ_OUTPUT\")\"\n"
             ));
             script.push_str("fi\n");
         }
@@ -10927,7 +10936,7 @@ mod sight_repair_tests {
         let src = src.display().to_string();
         let bin = dir.path().join("fake-codex-repair");
         let d = dir.path().display();
-        std::fs::write(&bin, format!("#!/bin/sh\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n")).unwrap();
+        std::fs::write(&bin, format!("#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n", crate::tests::JSON_ESCAPE_SH)).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
@@ -10937,7 +10946,7 @@ mod sight_repair_tests {
 
     const READ_REST: &str = r#"printf '{"type":"thread.started","thread_id":"thread-1"}\n'
 printf '{"type":"item.started","item":{"type":"command_execution","id":"c9","command":"sed -n '"'"'241,480p'"'"' %s"}}\n' "$SRC"
-printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"sed -n '"'"'241,480p'"'"' %s","exit_code":0}}\n' "$SRC"
+printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"sed -n '"'"'241,480p'"'"' %s","exit_code":0,"aggregated_output":"%s"}}\n' "$SRC" "$(jesc "$(sed -n '241,480p' "$SRC")")"
 printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'
 printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\n'"#;
 
@@ -11090,7 +11099,7 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let st = stub(r#"printf 'new\n' >> "$SRC"
 printf '{"type":"thread.started","thread_id":"thread-1"}\n'
 printf '{"type":"item.started","item":{"type":"command_execution","id":"c9","command":"cat %s"}}\n' "$SRC"
-printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"cat %s","exit_code":0}}\n' "$SRC"
+printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"cat %s","exit_code":0,"aggregated_output":"%s"}}\n' "$SRC" "$(jesc "$(cat "$SRC")")"
 printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'"#);
         let a = st.dir.path().join("a.rs");
         std::fs::write(&a, "a1\na2\n").unwrap();

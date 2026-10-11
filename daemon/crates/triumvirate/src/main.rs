@@ -3566,6 +3566,11 @@ mod tests {
         unsafe { std::env::set_var("TRIUMVIRATE_HOME", isolated_test_home()) };
     }
 
+    /// A POSIX `jesc TEXT` for stand-in agents: TEXT as the body of a JSON string. Real codex
+    /// reports what a call showed in `aggregated_output`, and the sight gate credits a codex read
+    /// only when its lines are in it (D-059), so a stand-in must report its read's output too.
+    pub(crate) const JSON_ESCAPE_SH: &str = r#"TAB="$(printf '\t')"; jesc() { printf '%s\n' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$TAB/\\\\t/g" | awk '{printf "%s\\n", $0}'; }"#;
+
     /// The home every test in this binary falls back to. A fixture that clears its env keys on
     /// drop must put TRIUMVIRATE_HOME back to THIS, never unset it: unset, every later test in
     /// the binary writes to the operator's real ~/.triumvirate again.
@@ -4445,9 +4450,9 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let wiki_dir = wiki.path().display().to_string();
         let codex = write_codex_custom_script(&format!(
             "printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\"}}}}'\n\
-             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\",\"exit_code\":0}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat {alpha}\",\"exit_code\":0,\"aggregated_output\":\"the alpha page\\n\"}}}}'\n\
              printf '%s\\n' '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\"}}}}'\n\
-             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\",\"exit_code\":0}}}}'\n\
+             printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c2\",\"command\":\"rg 3300 {wiki_dir}\",\"exit_code\":0,\"aggregated_output\":\"\"}}}}'\n\
              printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"Per alpha-page. research/beta-page-notes.md is not a citation.\"}}}}'"
         ))?;
         unsafe {
@@ -4967,13 +4972,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let reviewer = temp.path().join("fake-codex-approver");
         fs::write(
             &reviewer,
-            "#!/usr/bin/env bash\n\
-             PROMPT=\"$*\"\n\
+            format!("#!/usr/bin/env bash\n{JSON_ESCAPE_SH}\n") + "PROMPT=\"$*\"\n\
              ARTIFACT=\"$(printf '%s' \"$PROMPT\" | grep -o '/[^[:space:]]*/[.]triumvirate/reviews/[^[:space:]]*[.]md' | head -1)\"\n\
              if [ -n \"$ARTIFACT\" ]; then\n\
              printf '{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\"}}\\n' \"$ARTIFACT\"\n\
              READ_OUTPUT=\"$(cat \"$ARTIFACT\" 2>/dev/null)\"\n\
-             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\",\"exit_code\":0}}\\n' \"$ARTIFACT\"\n\
+             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"cat %s\",\"exit_code\":0,\"aggregated_output\":\"%s\"}}\\n' \"$ARTIFACT\" \"$(jesc \"$READ_OUTPUT\")\"\n\
              fi\n\
              NONCE=\"$(printf '%s' \"$READ_OUTPUT\" | grep -o 'REVIEW-NONCE: [^ ]*' | tail -1)\"\n\
              printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"APPROVE\\\\n%s\\\\nlooks fine\"}}\\n' \"$NONCE\"\n",

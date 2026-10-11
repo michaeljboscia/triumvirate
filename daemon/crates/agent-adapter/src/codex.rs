@@ -1006,13 +1006,16 @@ impl CodexExecParser {
                         && let Some(existing) = self.tool_calls.iter_mut().find(|r| r.id.as_deref() == Some(id))
                     {
                         existing.success = Some(exit_code == 0);
-                        existing.shown_output = item.get("aggregated_output").and_then(|v| v.as_str()).map(|out| {
-                            let mut end = out.len().min(crate::types::SHOWN_OUTPUT_CAP);
-                            while !out.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            out[..end].to_string()
-                        });
+                        // Always Some for codex, "" when the field is absent: real codex sends
+                        // it on every command item, even `item.started`, so a missing one is a
+                        // shape this parser does not know, and it fails closed (Codex and Grok,
+                        // review: `None` would credit the read on status alone).
+                        let out = item.get("aggregated_output").and_then(|v| v.as_str()).unwrap_or_default();
+                        let mut end = out.len().min(crate::types::SHOWN_OUTPUT_CAP);
+                        while !out.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        existing.shown_output = Some(out[..end].to_string());
                     }
                 }
                 let event = WorkingStateEvent {
@@ -1634,5 +1637,15 @@ mod shown_output_tests {
         assert_eq!(call.success, Some(true), "the pipeline's status hides the failed nl");
         let shown = call.shown_output.as_deref().expect("aggregated_output recorded");
         assert!(shown.contains("missing.txt: No such file or directory") && shown.contains("     1\tl1\n"), "{shown}");
+    }
+
+    /// RED IF: a completed command with no `aggregated_output` leaves `shown_output` as `None`,
+    /// which the gate reads as "no evidence recorded" and credits on status alone.
+    #[test]
+    fn a_codex_call_without_output_fails_closed() {
+        let mut p = CodexExecParser::new();
+        p.parse_line(r#"{"type":"item.started","item":{"type":"command_execution","id":"c1","command":"cat /r/a.rs"}}"#);
+        p.parse_line(r#"{"type":"item.completed","item":{"type":"command_execution","id":"c1","command":"cat /r/a.rs","exit_code":0}}"#);
+        assert_eq!(p.finish().tool_calls[0].shown_output.as_deref(), Some(""));
     }
 }
