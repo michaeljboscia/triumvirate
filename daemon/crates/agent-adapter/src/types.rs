@@ -60,7 +60,8 @@ pub struct ToolCallRecord {
     /// `view_file` reports only a count).
     #[serde(default)]
     pub returned_lines: Vec<(u64, u64)>,
-    /// The text a SHELL call's result showed the model: codex `aggregated_output`, grok's
+    /// The text a SUCCESSFUL shell call's result showed the model (a failed call earns no
+    /// credit, so its output is not kept; Codex, round 5): codex `aggregated_output`, grok's
     /// completed content text, claude's Bash `tool_result`, agy's `tool_info.output`, gemini's
     /// `tool_result.output`; capped at [`SHOWN_OUTPUT_CAP`] bytes, and `Some("")` when the event
     /// carried none. A shell pipeline's status is
