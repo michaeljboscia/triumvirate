@@ -2428,12 +2428,14 @@ fn codex_ranged_reads_cover_source(
 /// exit_code 0 with "nl: F: No such file or directory" as the output). Codex, review of D-056c:
 /// the status cannot prove a read happened. The output can. Every non-empty line of the window
 /// must appear in what the call showed, in file order; a number column or a `$` added around a
-/// line does not hide it. A call whose parser records no output (`shown_output: None`) is judged
-/// as before, on its status. `cat -v` of a line with control bytes prints them rewritten and is
+/// line does not hide it. A call with no recorded output (`shown_output: None`) is not
+/// credited. `cat -v` of a line with control bytes prints them rewritten and is
 /// not credited: a false rejection, never a false pass.
 fn call_showed_lines(c: &ToolCallRecord, operand: &str, range: &agent_adapter::codex::LineRange, cwd: &str) -> bool {
+    // Every parser now records a shell call's output (D-059), so a shell read without one is a
+    // shape no parser produces and is credited nothing (Codex, round 4).
     let Some(shown) = c.shown_output.as_deref() else {
-        return true;
+        return false;
     };
     let Some(bytes) = source_bytes(operand, cwd) else {
         return false;
@@ -2457,6 +2459,33 @@ fn call_showed_lines(c: &ToolCallRecord, operand: &str, range: &agent_adapter::c
         }
     }
     true
+}
+
+/// What an honest run of `command` would show: the raw lines of every read it parses to. Test
+/// records are built with it, so a gate test exercises the D-059 output check rather than a
+/// record no parser produces. Decoration is left out; the check ignores it.
+#[cfg(test)]
+pub(crate) fn honest_shown_output(command: &str) -> String {
+    let cmd = agent_adapter::codex::normalize_wrapped_script(command.to_string());
+    let mut out = String::new();
+    for seg in agent_adapter::codex::read_segments_pub(&cmd) {
+        let (op, start, end) = if let Some(r) = agent_adapter::codex::command_read_range(seg) {
+            (r.operand, r.range.start, r.range.end)
+        } else if let Some((op, _)) = agent_adapter::codex::whole_file_read(seg) {
+            (op, 1, None)
+        } else {
+            continue;
+        };
+        if let Some(bytes) = source_bytes(&op, "") {
+            for (i, line) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+                let n = i as u64 + 1;
+                if n >= start && end.is_none_or(|e| n <= e) {
+                    out.push_str(&String::from_utf8_lossy(line));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The most bytes of ONE shell call's output a reviewer is credited with having seen.
@@ -7110,7 +7139,7 @@ mod sight_gate_tests {
         let call = |a: u64, b: u64| {
             let args = serde_json::json!({ "command": format!("/bin/zsh -lc \"sed -n '{a},{b}p' {src} | nl -ba -v{a}\"") });
             ToolCallRecord {
-                shown_output: None,
+                shown_output: Some(honest_shown_output(&args["command"].as_str().unwrap_or_default())),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -7144,7 +7173,7 @@ mod sight_gate_tests {
         let call = |command: String| {
             let args = serde_json::json!({ "command": command });
             ToolCallRecord {
-                shown_output: None,
+                shown_output: Some(honest_shown_output(&command)),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -7211,7 +7240,7 @@ mod sight_gate_tests {
         let crlf = crlf.display().to_string();
         let crlf_call = ToolCallRecord { shown_output: Some("     1\ta\n     2\t\n     3\tb\n".to_string()), ..call(None) };
         assert!(call_showed_lines(&crlf_call, &crlf, &agent_adapter::codex::LineRange { start: 1, end: None }, &cwd), "a dropped \\r is not a missing line");
-        gate(call(None)).expect("no recorded output (a parser that records none): judged on status, as before");
+        assert!(gate(call(None)).is_err(), "no recorded output: not credited (Codex, round 4)");
     }
 
     /// Both success arms build their rejection through the one helper. RED IF: an arm goes back
@@ -7630,7 +7659,7 @@ mod sight_gate_tests {
     }
 
     fn codex_read(command: &str) -> ToolCallRecord {
-        ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        ToolCallRecord { shown_output: Some(honest_shown_output(command)), returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
@@ -7682,7 +7711,7 @@ mod sight_gate_tests {
         let other = file_with_lines(dir.path(), "b.rs", 500);
         let classified = |command: String| {
             let args = serde_json::json!({ "command": command });
-            ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+            ToolCallRecord { shown_output: Some(honest_shown_output(&command)), returned_lines: Vec::new(),
                 id: None,
                 tool: "command_execution".to_string(),
                 kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -8465,7 +8494,7 @@ mod sight_gate_tests {
         let mut lifecycle = Vec::new();
         let (_dir, root) = real_repo("a.rs", 10);
         let src = format!("{root}/a.rs");
-        let read = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        let read = vec![ToolCallRecord { shown_output: Some(honest_shown_output(&format!("cat {src}"))), returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: ToolKind::ReadFile,
@@ -10190,7 +10219,7 @@ mod grok_shell_read_gate_tests {
     }
 
     fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
-        ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
             id: None,
             tool: "run_terminal_command".to_string(),
             kind,
@@ -10208,7 +10237,7 @@ mod grok_shell_read_gate_tests {
     /// this file tests are ever reached. A helper that skips the step under test is not a test.
     fn codex_shell(command: &str) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
-        ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -10283,7 +10312,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
         });
-        let call = ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -10314,7 +10343,7 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
         });
-        let call = ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -10488,7 +10517,7 @@ mod grok_shell_read_gate_tests {
             ("bash", serde_json::json!({ "command": cmd })),
             ("command_execution", serde_json::json!({ "command": cmd })),
         ] {
-            let rec = ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+            let rec = ToolCallRecord { shown_output: Some(super::honest_shown_output(&cmd)), returned_lines: Vec::new(),
                 id: None,
                 tool: tool.to_string(),
                 kind: ToolKind::ReadFile,
@@ -10899,7 +10928,7 @@ mod sight_repair_tests {
     fn read_call(command: String, success: bool) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
         ToolCallRecord {
-            shown_output: None,
+            shown_output: Some(honest_shown_output(&command)),
             id: None,
             tool: "command_execution".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),

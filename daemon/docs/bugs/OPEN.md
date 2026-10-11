@@ -32,11 +32,12 @@ file is the thing you read to answer "what do we know is broken right now."
 **Fix:** a `#[ctor]` in the triumvirate test binary sets a per-process TRIUMVIRATE_HOME under the temp dir before any test thread starts. The same scratch-HOME run then leaves `$HOME/.triumvirate` absent.
 
 ### D-059 - A pipeline read is credited on a status its reader stage does not set
-**Found:** 2026-10-11 (Codex, round 2 review of D-056c) · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main, codex only**
+**Found:** 2026-10-11 (Codex, round 2 review of D-056c) · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**
 **Evidence:** a shell pipeline's status is its last stage's. Measured with codex-cli 0.154.0: `nl -ba MISSING | sed -n '1,2p'; nl -ba F | sed -n '1,2p'` reported `exit_code: 0` with "nl: MISSING: No such file or directory" in `aggregated_output` (fixture `crates/agent-adapter/tests/fixtures/codex-0.154.0-pipeline-missing-20261011.jsonl`). Every `READER F | sed -n` and `sed -n F | nl` window shape the gate accepts since 2026-09-03 had this, sequence or not. Only a reader the agent cannot run, or a file its sandbox denies, triggers it: the gate itself reads every operand.
-**Fix:** the codex parser records `aggregated_output` as `ToolCallRecord.shown_output` (capped at 64 KiB, never in the ledger), and the gate credits a codex window or whole read only when every non-empty line of it appears, in order, in that output.
-**Still open:** grok, claude and agy shell reads record no output and are still judged on status.
-**CHECK to close:** on main, `a_window_counts_only_when_its_lines_were_shown` and `codex_records_what_a_call_showed` pass, and the first fails with `call_showed_lines` disabled.
+Grok 1.0.46 (`rawOutput.exit_code` 0) and Claude Code 2.1.296 (`is_error: false`) do the same, measured with the same command; fixtures beside the codex one.
+**Fix:** every parser records a shell call's result text as `ToolCallRecord.shown_output` (codex `aggregated_output`, grok completed content text, claude Bash `tool_result`, agy `tool_info.output`, gemini `tool_result.output`; capped at 64 KiB, `""` when absent, never in the ledger). The gate credits a shell window or whole read only when every non-empty line of it appears, in order, in that output, and credits a shell read with no recorded output nothing.
+**Not live-verified:** the gemini-cli `tool_result.output` field (that seat has been unusable since 2026-09-13); a gemini shell read without it fails closed.
+**CHECK to close:** on main, `a_window_counts_only_when_its_lines_were_shown` and the four `*_records_what_a_*_showed` parser tests pass, and the first fails with `call_showed_lines` disabled.
 
 ### D-058 - A unit test launched the real codex and agy CLIs on every `cargo test`
 **Found:** 2026-10-11 · **Severity:** MEDIUM · **Fix on branch feat/sight-salvage-main**

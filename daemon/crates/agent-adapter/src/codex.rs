@@ -1011,11 +1011,7 @@ impl CodexExecParser {
                         // shape this parser does not know, and it fails closed (Codex and Grok,
                         // review: `None` would credit the read on status alone).
                         let out = item.get("aggregated_output").and_then(|v| v.as_str()).unwrap_or_default();
-                        let mut end = out.len().min(crate::types::SHOWN_OUTPUT_CAP);
-                        while !out.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        existing.shown_output = Some(out[..end].to_string());
+                        existing.shown_output = Some(crate::types::capped_shown_output(out));
                     }
                 }
                 let event = WorkingStateEvent {

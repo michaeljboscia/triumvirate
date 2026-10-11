@@ -401,9 +401,8 @@ impl GrokStreamParser {
                     // the span is exact whatever offset convention or cap the tool applied.
                     // Shell reads are windowed from the command and keep that path.
                     let rec = &self.tool_calls[idx];
-                    if completed && rec.kind == ToolKind::ReadFile && !is_shell_tool(&rec.tool) {
-                        let text: String = json
-                            .get("content")
+                    let text = || -> String {
+                        json.get("content")
                             .and_then(Value::as_array)
                             .map(|blocks| {
                                 blocks
@@ -412,8 +411,15 @@ impl GrokStreamParser {
                                     .collect::<Vec<_>>()
                                     .join("\n")
                             })
-                            .unwrap_or_default();
-                        self.tool_calls[idx].returned_lines = grok_returned_lines(&json, &text);
+                            .unwrap_or_default()
+                    };
+                    if completed && rec.kind == ToolKind::ReadFile && !is_shell_tool(&rec.tool) {
+                        self.tool_calls[idx].returned_lines = grok_returned_lines(&json, &text());
+                    } else if completed && is_shell_tool(&rec.tool) {
+                        // D-059: a pipeline exits 0 when its reader stage fails (measured, grok
+                        // 1.0.46: `rawOutput.exit_code` 0 with "nl: F: No such file"). The text
+                        // the call returned is the evidence the lines were shown.
+                        self.tool_calls[idx].shown_output = Some(crate::types::capped_shown_output(&text()));
                     }
                 }
                 let kind = target
@@ -1250,5 +1256,26 @@ mod shell_read_classification_tests {
         assert_eq!(r.tool_calls[0].tool, "run_terminal_command");
         assert_eq!(r.tool_calls[0].kind, ToolKind::ReadFile);
         assert!(r.tool_calls[0].args_json.as_deref().unwrap_or("").contains("cat /repo/probe.txt"));
+    }
+}
+
+#[cfg(test)]
+mod shown_output_tests {
+    use super::*;
+
+    /// Live capture, grok 1.0.46, 2026-10-11 (paths rewritten, rawOutput's byte array emptied):
+    /// `nl -ba MISSING | sed -n '1,2p'; nl -ba F | sed -n '1,2p'` reports exit_code 0. RED IF:
+    /// the completed shell call stops recording the text it returned (D-059).
+    #[test]
+    fn grok_records_what_a_shell_call_showed() {
+        let mut p = GrokStreamParser::new();
+        for line in include_str!("../tests/fixtures/grok-1.0.46-pipeline-missing-20261011.jsonl").lines() {
+            p.parse_line(line);
+        }
+        let r = p.finish();
+        let call = r.tool_calls.iter().find(|c| is_shell_tool(&c.tool)).expect("the shell call");
+        assert_eq!(call.success, Some(true), "the pipeline's status hides the failed nl");
+        let shown = call.shown_output.as_deref().expect("output recorded");
+        assert!(shown.contains("missing.txt: No such file or directory") && shown.contains("     1\tl1\n"), "{shown}");
     }
 }

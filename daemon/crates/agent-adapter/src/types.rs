@@ -60,11 +60,13 @@ pub struct ToolCallRecord {
     /// `view_file` reports only a count).
     #[serde(default)]
     pub returned_lines: Vec<(u64, u64)>,
-    /// The text the call's result showed the model, when the parser records it: codex's
-    /// `aggregated_output`, capped at [`SHOWN_OUTPUT_CAP`] bytes. A shell pipeline's status is
+    /// The text a SHELL call's result showed the model: codex `aggregated_output`, grok's
+    /// completed content text, claude's Bash `tool_result`, agy's `tool_info.output`, gemini's
+    /// `tool_result.output`; capped at [`SHOWN_OUTPUT_CAP`] bytes, and `Some("")` when the event
+    /// carried none. A shell pipeline's status is
     /// its last stage's, so `nl -ba F | sed -n '1,240p'` exits 0 when `nl` cannot read F
     /// (measured, codex-cli 0.154.0). This is the evidence that the lines were really shown.
-    /// `None` for parsers that do not record it. Kept out of the ledger: only the local
+    /// `None` for non-shell tools, whose reads are proven by `returned_lines`. Kept out of the ledger: only the local
     /// rejected-turn file serializes tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shown_output: Option<String>,
@@ -73,6 +75,15 @@ pub struct ToolCallRecord {
 /// The most bytes of one call's shown output a [`ToolCallRecord`] keeps. Above the gate's
 /// 30,000-byte shell budget, so a call the gate can credit is never cut here.
 pub const SHOWN_OUTPUT_CAP: usize = 64 * 1024;
+
+/// `out` cut to [`SHOWN_OUTPUT_CAP`] bytes on a char boundary, for `ToolCallRecord::shown_output`.
+pub fn capped_shown_output(out: &str) -> String {
+    let mut end = out.len().min(SHOWN_OUTPUT_CAP);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out[..end].to_string()
+}
 
 /// The line numbers in a read tool's line-numbered output, as sorted contiguous runs. A line
 /// counts when, after leading spaces, it starts with digits followed by `→` (grok) or a tab

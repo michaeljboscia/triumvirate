@@ -153,6 +153,13 @@ impl GeminiStreamParser {
                     && let Some(existing) = self.tool_calls.iter_mut().find(|r| r.id.as_deref() == Some(id))
                 {
                     existing.success = Some(status.eq_ignore_ascii_case("success"));
+                    // D-059: a shell result's text, "" when absent (not live-verified: the
+                    // gemini-cli seat has been unusable since 2026-09-13, so this fails closed).
+                    if crate::grok::is_shell_tool(&existing.tool) {
+                        existing.shown_output = Some(crate::types::capped_shown_output(
+                            json.get("output").and_then(|v| v.as_str()).unwrap_or_default(),
+                        ));
+                    }
                 }
                 let event = WorkingStateEvent {
                     agent: "gemini".to_string(),
