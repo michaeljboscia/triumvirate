@@ -1850,6 +1850,88 @@ async fn run_status() -> anyhow::Result<()> {
     cli_ops::run_status().await
 }
 
+/// Writes a script a test is about to run, without this process ever holding it open for
+/// writing. Every test fixture in this crate that is made executable goes through here. The
+/// production writers in `abe/` (git hooks, validate-task.sh) do not; that race is D-060.
+///
+/// Linux refuses to exec a file any process has open for writing (ETXTBSY, "Text file busy").
+/// Tests run on parallel threads, and a sibling test's spawn forks a child that holds a copy of
+/// every fd open at that instant until it execs. An in-process `fs::write` here can land in
+/// that window, so the child keeps our write fd and our exec fails. CI hit it on PR #86
+/// (u_cr_04). Renaming does not help: the fd follows the inode. `cp` writes the destination in
+/// its own process, which no sibling test can fork.
+#[cfg(test)]
+pub(crate) fn write_test_executable(
+    path: &std::path::Path,
+    body: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let staged = path.with_file_name(format!(".{name}.staged-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&staged, body)?;
+    // A path being rewritten may still be running from an earlier step; `cp` would reopen that
+    // busy inode for writing. Unlinking first gives `cp` a fresh inode.
+    let _ = std::fs::remove_file(path);
+    let copied = std::process::Command::new("/bin/cp").arg(&staged).arg(path).status();
+    let _ = std::fs::remove_file(&staged);
+    let status = copied?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("cp to {} failed: {status}", path.display())));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod write_test_executable_tests {
+    /// RED IF: any source in this crate outside `abe/` sets an executable mode in process, in
+    /// either spelling, other than the helper itself. That would reopen the ETXTBSY race.
+    #[test]
+    fn every_test_stand_in_goes_through_the_helper() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "abe") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 5, "the walk must actually find the crate's sources");
+        let pattern = ["_mode(", "0o7"].concat();
+        for file in files {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let allowed = usize::from(file.ends_with("src/main.rs"));
+            assert_eq!(
+                src.matches(pattern.as_str()).count(),
+                allowed,
+                "{} makes a file executable in process; use crate::write_test_executable",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_helper_writes_a_script_that_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("stand-in");
+        crate::write_test_executable(&bin, "#!/bin/sh\necho ran\n").expect("write");
+        let out = std::process::Command::new(&bin).output().expect("exec");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+        let leftovers = std::fs::read_dir(dir.path()).expect("list").count();
+        assert_eq!(leftovers, 1, "the staged copy must be removed");
+    }
+}
+
 /// T-004 stdio-transport reality tests for `extract_pantheon_scope_from_meta`
 /// and the composed `call_tool` scope wrap.
 ///
@@ -3644,10 +3726,7 @@ echo '{"jsonrpc":"2.0","method":"session/ready","params":{"text":"mock ready"}}'
 IFS= read -r _line
 echo '{"jsonrpc":"2.0","id":1,"result":{"text":"mock-gemini received: test message"}}'
 "#;
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3666,10 +3745,7 @@ else
   echo '{"jsonrpc":"2.0","id":1,"result":{"text":"marker_probe=missing"}}'
 fi
 "#;
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3687,10 +3763,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} done\"}}}}'\
             name = name,
             delay = delay_s
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3710,10 +3783,7 @@ IFS= read -r _line\n\
 echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} warm worker done\"}}}}'\n",
             name = name
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3730,10 +3800,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{response_text}\"}}
             args_path = args_path.display(),
             response_text = response_text
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3750,10 +3817,7 @@ echo '{"type":"tool_result","tool_id":"tool-1","status":"success"}'
 echo '{"type":"message","role":"assistant","content":"stream usage done"}'
 echo '{"type":"result","stats":{"input_tokens":123,"output_tokens":45,"cached":10,"total_tokens":178}}'
 "#;
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3784,10 +3848,7 @@ PAYLOAD\n\
 git add \"{rel_path}\"\n\
 git commit -m \"{commit_message}\"\n",
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3802,10 +3863,7 @@ set -euo pipefail\n\
 sleep {seconds}\n\
 exit 0\n"
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3815,10 +3873,7 @@ exit 0\n"
             .as_nanos();
         let path = std::env::temp_dir().join(format!("codex-custom-{now}.sh"));
         let script = format!("#!/usr/bin/env bash\nset -euo pipefail\n{script_body}\n");
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3844,10 +3899,7 @@ echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered on
             state_file = state_path.display(),
             name = name
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3863,10 +3915,7 @@ IFS= read -r _line\n\
 exit 1\n",
             name = name
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3885,10 +3934,7 @@ IFS= read -r _line\n\
 echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} recovered with fresh session\"}}}}'\n",
             name = name
         );
-        fs::write(&path, script)?;
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms)?;
+        crate::write_test_executable(&path, script)?;
         Ok(path)
     }
 
@@ -3970,10 +4016,7 @@ echo '{{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"rollback NDJSO
 echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}}'\n",
             argv = argv_file.display()
         );
-        fs::write(&script_path, &script)?;
-        let mut perms = fs::metadata(&script_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms)?;
+        crate::write_test_executable(&script_path, &script)?;
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
@@ -4694,7 +4737,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // for what was really one prompt cut in half by the capture. The oracle must see the
         // argv exactly as spawned, so elements are delimited by the one byte they cannot contain.
         let stand_in = test_home.path().join("codex-nul-capture.sh");
-        fs::write(
+        crate::write_test_executable(
             &stand_in,
             format!(
                 "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{}\"\nIFS= read -r _line\n\
@@ -4702,9 +4745,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 args_file.display()
             ),
         )?;
-        let mut perms = fs::metadata(&stand_in)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&stand_in, perms)?;
         // SAFETY: serialised by the binary-wide env lock and restored below.
         unsafe {
             std::env::set_var("HOME", test_home.path());
@@ -4752,10 +4792,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         let dir = tempfile::tempdir()?;
         let args_file = dir.path().join("codex-args.txt");
         let stand_in = dir.path().join("codex-nul-capture.sh");
-        fs::write(&stand_in, format!("#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{}\"\n", args_file.display()))?;
-        let mut perms = fs::metadata(&stand_in)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&stand_in, perms)?;
+        crate::write_test_executable(&stand_in, format!("#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{}\"\n", args_file.display()))?;
         let cwd = dir.path().display().to_string();
         let thread = "01a12cb6-55c8-75c2-b382-7281fb56c2e0";
         // (read_only, operator opted into the sandbox, operator args) -> the mode the resumed turn
@@ -5047,7 +5084,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         // gate under test is not the gate that runs, so the stand-in emits the real
         // `codex exec --experimental-json` shape and performs a real `cat` of the artifact.
         let reviewer = temp.path().join("fake-codex-approver");
-        fs::write(
+        crate::write_test_executable(
             &reviewer,
             format!("#!/usr/bin/env bash\n{JSON_ESCAPE_SH}\n") + "PROMPT=\"$*\"\n\
              ARTIFACT=\"$(printf '%s' \"$PROMPT\" | grep -o '/[^[:space:]]*/[.]triumvirate/reviews/[^[:space:]]*[.]md' | head -1)\"\n\
@@ -5059,13 +5096,6 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
              NONCE=\"$(printf '%s' \"$READ_OUTPUT\" | grep -o 'REVIEW-NONCE: [^ ]*' | tail -1)\"\n\
              printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"APPROVE\\\\n%s\\\\nlooks fine\"}}\\n' \"$NONCE\"\n",
         )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&reviewer)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&reviewer, perms)?;
-        }
 
         // SAFETY: test controls env var lifecycle under lock.
         unsafe {
