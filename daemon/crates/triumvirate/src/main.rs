@@ -1851,7 +1851,8 @@ async fn run_status() -> anyhow::Result<()> {
 }
 
 /// Writes a script a test is about to run, without this process ever holding it open for
-/// writing. Every test that execs a stand-in it wrote goes through here.
+/// writing. Every test fixture in this crate that is made executable goes through here. The
+/// production writers in `abe/` (git hooks, validate-task.sh) do not; that race is D-060.
 ///
 /// Linux refuses to exec a file any process has open for writing (ETXTBSY, "Text file busy").
 /// Tests run on parallel threads, and a sibling test's spawn forks a child that holds a copy of
@@ -1867,6 +1868,9 @@ pub(crate) fn write_test_executable(
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let staged = path.with_file_name(format!(".{name}.staged-{}", uuid::Uuid::new_v4()));
     std::fs::write(&staged, body)?;
+    // A path being rewritten may still be running from an earlier step; `cp` would reopen that
+    // busy inode for writing. Unlinking first gives `cp` a fresh inode.
+    let _ = std::fs::remove_file(path);
     let copied = std::process::Command::new("/bin/cp").arg(&staged).arg(path).status();
     let _ = std::fs::remove_file(&staged);
     let status = copied?;
@@ -1883,18 +1887,35 @@ pub(crate) fn write_test_executable(
 
 #[cfg(test)]
 mod write_test_executable_tests {
-    /// RED IF: a test writes its own stand-in and chmods it in process again, reopening the
-    /// ETXTBSY race. The production writers in `abe/` are not test fixtures and are not scanned.
+    /// RED IF: any source in this crate outside `abe/` sets an executable mode in process, in
+    /// either spelling, other than the helper itself. That would reopen the ETXTBSY race.
     #[test]
     fn every_test_stand_in_goes_through_the_helper() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let pattern = ["set_mode(", "0o755)"].concat();
-        for file in ["main.rs", "agent_exec.rs", "agy.rs"] {
-            let src = std::fs::read_to_string(dir.join(file)).expect("read source");
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "abe") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 5, "the walk must actually find the crate's sources");
+        let pattern = ["_mode(", "0o7"].concat();
+        for file in files {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let allowed = usize::from(file.ends_with("src/main.rs"));
             assert_eq!(
                 src.matches(pattern.as_str()).count(),
-                0,
-                "{file} makes a file executable in process; use crate::write_test_executable"
+                allowed,
+                "{} makes a file executable in process; use crate::write_test_executable",
+                file.display()
             );
         }
     }

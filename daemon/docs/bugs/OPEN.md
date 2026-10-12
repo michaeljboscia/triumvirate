@@ -19,7 +19,10 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Open
 
-Nothing open. New defects go here.
+### D-060 - Production hook and script writers can hit ETXTBSY under a concurrent spawn
+**Found:** 2026-10-11 (peer review of the test-fixture ETXTBSY fix) · **Severity:** LOW · **NOT FIXED**
+**Evidence:** `abe/worktree_setup.rs` writes validate-task.sh, the pre-commit hook and the commit-msg hook in process, then chmods them (lines 281, 334, 382); `mcp-tools/src/abe.rs` does the same for `.triumvirate/commit.sh`. Linux refuses to exec a file any process has open for writing. If another thread spawns a child inside the write window, that child holds the write fd until it execs, and git's run of the hook fails with "Text file busy". Same mechanism CI hit on PR #86 in a test fixture; not yet seen in production.
+**CHECK to close:** these writers no longer hold the destination open for writing in the daemon process (or the exec retries on ETXTBSY), with a test or source guard that fails if one returns.
 
 ---
 
@@ -506,4 +509,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-10-11 18:35 ET
+**Last reviewed:** 2026-10-11 20:03 ET
