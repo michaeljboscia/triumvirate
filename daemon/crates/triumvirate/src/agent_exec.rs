@@ -59,6 +59,14 @@ const GEMINI_MODEL_FAILDOWN: &[&str] = &[
     "gemini-3.1-pro-preview",
 ];
 
+const TOOL_MARKER_INSTRUCTIONS: &str = "\
+When you need to call a Triumvirate tool, emit exactly one XML block with this shape:
+<triumvirate_tool name=\"ledger_record\">{\"title\":\"...\",\"narrative\":\"...\"}</triumvirate_tool>
+Rules:
+- Use name values only from supported tools: ledger_query, ledger_session, ledger_record, lesson_add, lesson_query, lesson_validate, lesson_list.
+- The body must be valid JSON object parameters for that tool.
+- Emit normal prose outside the XML block when needed.";
+
 #[cfg(unix)]
 pub(crate) fn configure_process_group(command: &mut Command) {
     // SAFETY: pre_exec runs in the spawned child process before exec.
@@ -827,7 +835,7 @@ async fn execute_ask_agent_inner(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
-    let execution_prompt = with_required_sources(&req.message, &req.required_sources);
+    let execution_prompt = inject_tool_marker_prompt(&with_required_sources(&req.message, &req.required_sources));
     // 2b: every named source as it was BEFORE turn 1. A repair turn unions turn 1's reads only
     // for sources still byte-identical to this (Codex, review: a snapshot taken at the repair let
     // a window of an old version cover a new one).
@@ -2052,7 +2060,7 @@ every line, 1 to N, of every source above. Earlier turns do not count. Read each
 windows together must cover 1 to N with no gap. One shell command's output is cut at 30000 bytes \
 and a cut read earns nothing. The limit counts everything the command prints, every file in it \
 together, so read a source marked over that limit in windows, and keep each command's reads under \
-it. To read several files in one command, join the reads with `&&`; reads of different files joined with `;` \
+it. To read several small files in one command, join the reads with `&&`; reads of different files joined with `;` \
 or a newline are not counted, because a failed read is hidden by the next one. Do not modify \
 any file.";
 
@@ -2069,18 +2077,33 @@ fn sight_contract_line(source: &str) -> String {
     }
 }
 
+fn inject_tool_marker_prompt(user_prompt: &str) -> String {
+    format!("{TOOL_MARKER_INSTRUCTIONS}\n\nUser request:\n{user_prompt}")
+}
+
 /// The refusal for a reply that is nothing but `<triumvirate_tool>` markers; `None` otherwise.
 ///
-/// T-206 taught every peer to emit these markers and never built anything that runs them: the
-/// daemon only parses them for a success-rate metric. On 2026-10-11 codex answered an ask_agent
-/// with one bare `ledger_query` marker and the call came back DONE (Mneme handoff, request
-/// 5c988187). The instructions are no longer injected; this catches a peer that emits one anyway.
+/// v2.2 REQ-014b injects the marker instructions into every peer prompt; REQ-014a, the executor
+/// that runs a marker and feeds its result back, was never built (D-064): the daemon only parses
+/// markers for a success-rate metric. On 2026-10-11 codex answered an ask_agent with one bare
+/// `ledger_query` marker and the call came back DONE (Mneme handoff, request 5c988187).
 /// A reply with prose around a marker passes: quoting the tag is how a review of this code reads.
+/// A code fence around the markers, or a marker left unclosed, is still only a marker (Grok).
 fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String> {
     let mut rest = response.trim();
+    if let Some(inner) = rest.strip_prefix("```") {
+        // A fenced reply: drop the opening fence line and a closing fence.
+        let inner = inner.split_once('\n').map_or("", |(_, body)| body);
+        rest = inner.trim_end().strip_suffix("```").unwrap_or(inner).trim();
+    }
     let mut names = Vec::new();
     while rest.starts_with("<triumvirate_tool") {
-        let end = rest.find("</triumvirate_tool>")? + "</triumvirate_tool>".len();
+        let Some(close) = rest.find("</triumvirate_tool>") else {
+            names.push("(unclosed)".to_string());
+            rest = "";
+            break;
+        };
+        let end = close + "</triumvirate_tool>".len();
         let name = agent_adapter::parse_tool_call_marker(&rest[..end])
             .ok()
             .flatten()
@@ -2093,7 +2116,7 @@ fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String>
     }
     Some(format!(
         "{agent_display} replied with only an unexecuted tool call ({}), not an answer. Triumvirate \
-         does not run <triumvirate_tool> markers; ask again for an answer in prose.",
+         does not run <triumvirate_tool> markers yet (D-064); ask again for an answer in prose.",
         names.join(", ")
     ))
 }
@@ -2581,7 +2604,8 @@ fn shell_call_fits_budget(c: &ToolCallRecord, cwd: &str) -> bool {
     shell_call_printed_bytes(c, cwd).is_some_and(|n| n <= SHELL_OUTPUT_BUDGET)
 }
 
-/// What one shell call prints, every segment together; `None` when it cannot be sized.
+/// What one shell call prints, every segment together, counted until it passes the budget (so
+/// over budget it is a lower bound); `None` when a segment before that point cannot be sized.
 fn shell_call_printed_bytes(c: &ToolCallRecord, cwd: &str) -> Option<usize> {
     let command = c.args_json.as_deref().and_then(agent_adapter::codex::shell_command_from_args_json)?;
     let mut total = 0usize;
@@ -2598,6 +2622,11 @@ fn shell_call_printed_bytes(c: &ToolCallRecord, cwd: &str) -> Option<usize> {
             return None;
         };
         total += printed_bytes(&source_bytes(&operand, cwd)?, &range, &decoration);
+        // Stop at the first segment past the budget, as the check always did: later segments
+        // cannot bring it back under, and need not be read (Codex, review).
+        if total > SHELL_OUTPUT_BUDGET {
+            return Some(total);
+        }
     }
     Some(total)
 }
@@ -2775,7 +2804,7 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             // again (Mneme handoff, 2026-10-11).
             if is_shell_read_tool(&c.tool) && !shell_call_fits_budget(c, cwd) {
                 let size = match shell_call_printed_bytes(c, cwd) {
-                    Some(n) => format!("printed {n} bytes, every file in it together, over"),
+                    Some(n) => format!("printed at least {n} bytes, every file in it together, over"),
                     None => "could not be sized against".to_string(),
                 };
                 return Some(format!(
@@ -11427,7 +11456,10 @@ mod unexecuted_tool_marker_tests {
 
         assert_eq!(unexecuted_tool_marker("Codex", &format!("The reply was {bare}, which nothing runs.")), None);
         assert_eq!(unexecuted_tool_marker("Codex", &format!("{bare}\nThen I answered: two providers.")), None);
-        assert_eq!(unexecuted_tool_marker("Codex", "<triumvirate_tool name=\"x\"> never closed"), None);
+        assert!(unexecuted_tool_marker("Codex", "<triumvirate_tool name=\"x\"> never closed").expect("unclosed").contains("(unclosed)"));
+        let fenced = format!("```xml\n{bare}\n```");
+        assert!(unexecuted_tool_marker("Codex", &fenced).expect("a fenced marker").contains("(ledger_query)"));
+        assert_eq!(unexecuted_tool_marker("Codex", &format!("```xml\n{bare}\n```\nThat is the call I would make.")), None);
         assert_eq!(unexecuted_tool_marker("Codex", "a plain answer"), None);
     }
 }

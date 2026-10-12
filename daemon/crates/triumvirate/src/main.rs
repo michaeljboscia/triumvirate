@@ -4061,11 +4061,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
-    /// T-206 taught every peer a `<triumvirate_tool>` marker that nothing ever ran; codex then
-    /// answered an ask_agent with a bare marker and the call came back DONE (Mneme handoff,
-    /// 2026-10-11). RED IF: the marker instructions are injected into a peer prompt again.
     #[tokio::test]
-    async fn ask_agent_does_not_teach_peers_unexecuted_tool_markers() -> anyhow::Result<()> {
+    async fn ask_agent_gemini_injects_tool_marker_instructions() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let script_path = write_mock_gemini_marker_probe_script()?;
@@ -4105,7 +4102,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .and_then(|c| c.raw.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
-        assert!(raw_text.contains("marker_probe=missing"), "{raw_text}");
+        assert!(raw_text.contains("marker_probe=present"));
 
         client.cancel().await?;
         server_handle.await??;

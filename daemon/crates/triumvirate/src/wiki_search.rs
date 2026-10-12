@@ -174,7 +174,7 @@ pub(crate) fn render(dir: &Path, hits: &[PageHit], terms_used: &[String]) -> Str
     }
     let mut out = format!(
         "{} wiki page(s) matched [{}]. Each claim on a page carries a verbatim quote and its \
-         source note id. Open <page-id>.md in {} for the whole page.\n",
+         source note id. Each heading names the page's file in {}: open it for the whole page.\n",
         hits.len(),
         terms_used.join(", "),
         dir.display()
