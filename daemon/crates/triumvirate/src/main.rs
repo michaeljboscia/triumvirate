@@ -206,7 +206,7 @@ pub(crate) fn wiki_search_journal(terms: &[String], hits: &[crate::wiki_search::
     let row = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "terms": terms.len(),
-        "pages": hits.iter().map(|h| h.page.clone()).collect::<Vec<_>>(),
+        "pages": hits.iter().map(|h| if h.reading { format!("reading/{}", h.page) } else { h.page.clone() }).collect::<Vec<_>>(),
         "lines": hits.iter().map(|h| h.lines.len()).sum::<usize>(),
     });
     // Loud on failure. The first live peer call left no journal row and no error anywhere,
@@ -612,9 +612,11 @@ impl McpBridge {
         let dir = crate::wiki_usage::wiki_dir()?;
         let wiki = crate::wiki_usage::load_wiki(&dir)?;
         let terms = crate::wiki_search::terms(&req.query);
+        let reading = crate::wiki_search::reading_pages(&wiki.dir);
         let hits = crate::wiki_search::search(
             &wiki.dir,
             &wiki.pages,
+            &reading,
             &req.query,
             req.max_pages.unwrap_or(3).clamp(1, 10) as usize,
             8,
