@@ -166,7 +166,7 @@ pub(crate) fn search(
 pub(crate) fn render(dir: &Path, hits: &[PageHit], terms_used: &[String]) -> String {
     if hits.is_empty() {
         return format!(
-            "No wiki page matched [{}]. The wiki is at {}; every page is `<page-id>.md`. Try \
+            "No wiki page matched [{}]. The wiki is at {} (rule pages `<page-id>.md`, reading pages `reading/<page-id>.md`). Try \
              different words, or say you do not know rather than guessing.",
             terms_used.join(", "),
             dir.display()
