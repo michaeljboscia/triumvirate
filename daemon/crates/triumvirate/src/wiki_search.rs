@@ -16,6 +16,8 @@ use std::path::Path;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PageHit {
     pub page: String,
+    /// A Mneme reading page (`reading/<id>.md`, a saved bookmark), not a rule page.
+    pub reading: bool,
     pub score: usize,
     /// (1-based line number, line text), best first.
     pub lines: Vec<(usize, String)>,
@@ -64,20 +66,57 @@ fn contains_word(hay: &str, term: &str) -> bool {
     false
 }
 
+/// Mneme's reading pages: saved bookmarks, explicitly NOT rules, listed in
+/// `reading/_pages.json` as `[{"id": ...}, ...]`. They are kept out of `_menu.json` on purpose
+/// (the Mneme judge files notes into menu pages), so they get their own list.
+///
+/// `reading/` is git-ignored and exists only on the Mac, so a missing list is the normal case
+/// elsewhere and returns nothing, silently. A list that exists and does not parse is logged and
+/// skipped: it must not take the rule pages' search down with it.
+pub(crate) fn reading_pages(dir: &Path) -> Vec<String> {
+    let path = dir.join("reading").join("_pages.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let ids: Option<Vec<String>> = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| {
+        v.as_array()?
+            .iter()
+            .map(|p| p.get("id")?.as_str().map(str::to_string))
+            .collect()
+    });
+    ids.unwrap_or_else(|| {
+        tracing::warn!(list = %path.display(), "reading page list does not parse as [{{\"id\": ...}}]; reading pages not searched");
+        Vec::new()
+    })
+}
+
 /// Rank pages by how many of the query's terms they cover, then by the best line.
 ///
 /// Coverage first, volume second, and deliberately so: the first live call ranked a 1050-line
 /// page that matched ONE term hundreds of times above the short page that matched all three.
 /// A page holding every word of the question is the one being looked for. The page id counts
 /// as text, which is what makes "aws" find `aws-operations` when the body never says it.
-pub(crate) fn search(dir: &Path, pages: &[String], query: &str, max_pages: usize, max_lines: usize) -> Vec<PageHit> {
+///
+/// `reading` pages (from `reading_pages`) are scored the same way and come back marked. On an
+/// equal score a rule page ranks first: a standing rule outranks a bookmark about the subject.
+pub(crate) fn search(
+    dir: &Path,
+    pages: &[String],
+    reading: &[String],
+    query: &str,
+    max_pages: usize,
+    max_lines: usize,
+) -> Vec<PageHit> {
     let terms = terms(query);
     if terms.is_empty() {
         return Vec::new();
     }
+    let rule_pages = pages.iter().map(|p| (p, false, dir.join(format!("{p}.md"))));
+    let reading_dir = dir.join("reading");
+    let reading_pages = reading.iter().map(|p| (p, true, reading_dir.join(format!("{p}.md"))));
     let mut hits: Vec<PageHit> = Vec::new();
-    for page in pages {
-        let Ok(text) = std::fs::read_to_string(dir.join(format!("{page}.md"))) else {
+    for (page, is_reading, path) in rule_pages.chain(reading_pages) {
+        let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         let id_lower = page.to_lowercase();
@@ -112,11 +151,12 @@ pub(crate) fn search(dir: &Path, pages: &[String], query: &str, max_pages: usize
         scored.sort_by_key(|(_, i, _)| *i);
         hits.push(PageHit {
             page: page.clone(),
+            reading: is_reading,
             score,
             lines: scored.into_iter().map(|(_, i, t)| (i, t)).collect(),
         });
     }
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.page.cmp(&b.page)));
+    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.reading.cmp(&b.reading)).then(a.page.cmp(&b.page)));
     hits.truncate(max_pages);
     hits
 }
@@ -139,8 +179,21 @@ pub(crate) fn render(dir: &Path, hits: &[PageHit], terms_used: &[String]) -> Str
         terms_used.join(", "),
         dir.display()
     );
+    if hits.iter().any(|h| h.reading) {
+        out.push_str(
+            "Pages marked READING are saved bookmarks Mike has not adopted: cite them as \
+             reading, never as a rule or a decision.\n",
+        );
+    }
     for hit in hits {
-        out.push_str(&format!("\n## {} ({}.md)\n", hit.page, hit.page));
+        if hit.reading {
+            out.push_str(&format!(
+                "\n## {} (reading/{}.md) READING: a saved bookmark, not a rule\n",
+                hit.page, hit.page
+            ));
+        } else {
+            out.push_str(&format!("\n## {} ({}.md)\n", hit.page, hit.page));
+        }
         for (line_no, text) in &hit.lines {
             out.push_str(&format!("  L{line_no}: {text}\n"));
         }
@@ -170,7 +223,7 @@ mod tests {
     #[test]
     fn finds_the_page_that_holds_the_answer() {
         let (dir, pages) = wiki();
-        let hits = search(dir.path(), &pages, "What port does Langfuse run on?", 3, 5);
+        let hits = search(dir.path(), &pages, &[], "What port does Langfuse run on?", 3, 5);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].page, "home-infra");
         assert!(hits[0].lines.iter().any(|(_, t)| t.contains("3300")), "{hits:?}");
@@ -190,7 +243,7 @@ mod tests {
         )
         .unwrap();
         let pages = vec!["evidence".to_string(), "home-infra".to_string()];
-        let hits = search(dir.path(), &pages, "langfuse port homebox", 3, 5);
+        let hits = search(dir.path(), &pages, &[], "langfuse port homebox", 3, 5);
         assert_eq!(hits[0].page, "home-infra", "{hits:?}");
         assert!(!contains_word("supports", "port"));
         assert!(contains_word("on port 3300", "port"));
@@ -201,7 +254,7 @@ mod tests {
     #[test]
     fn ranks_the_page_whose_id_matches_first() {
         let (dir, pages) = wiki();
-        let hits = search(dir.path(), &pages, "aws operations sqs", 3, 5);
+        let hits = search(dir.path(), &pages, &[], "aws operations sqs", 3, 5);
         assert_eq!(hits[0].page, "aws-operations", "{hits:?}");
     }
 
@@ -210,7 +263,7 @@ mod tests {
     #[test]
     fn a_word_that_appears_only_in_a_page_id_still_finds_that_page() {
         let (dir, pages) = wiki();
-        let hits = search(dir.path(), &pages, "aws", 3, 5);
+        let hits = search(dir.path(), &pages, &[], "aws", 3, 5);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].page, "aws-operations");
     }
@@ -219,13 +272,13 @@ mod tests {
     fn a_query_of_only_short_words_matches_nothing_rather_than_everything() {
         let (dir, pages) = wiki();
         assert!(terms("is it on us or in it").is_empty());
-        assert!(search(dir.path(), &pages, "is it on us", 3, 5).is_empty());
+        assert!(search(dir.path(), &pages, &[], "is it on us", 3, 5).is_empty());
     }
 
     #[test]
     fn no_match_says_so_and_names_the_wiki() {
         let (dir, pages) = wiki();
-        let hits = search(dir.path(), &pages, "kubernetes helm chart", 3, 5);
+        let hits = search(dir.path(), &pages, &[], "kubernetes helm chart", 3, 5);
         assert!(hits.is_empty());
         let text = render(dir.path(), &hits, &terms("kubernetes helm chart"));
         assert!(text.contains("No wiki page matched"), "{text}");
@@ -235,7 +288,7 @@ mod tests {
     #[test]
     fn lines_come_back_in_file_order_with_their_numbers() {
         let (dir, pages) = wiki();
-        let hits = search(dir.path(), &pages, "homebox langfuse 192.168.2.110", 3, 5);
+        let hits = search(dir.path(), &pages, &[], "homebox langfuse 192.168.2.110", 3, 5);
         let nums: Vec<usize> = hits[0].lines.iter().map(|(n, _)| *n).collect();
         let mut sorted = nums.clone();
         sorted.sort_unstable();
@@ -244,12 +297,70 @@ mod tests {
         assert!(text.contains("L4:") && text.contains("home-infra.md"), "{text}");
     }
 
+    fn with_reading(dir: &Path, list: &str, pages: &[(&str, &str)]) {
+        let r = dir.join("reading");
+        std::fs::create_dir_all(&r).unwrap();
+        std::fs::write(r.join("_pages.json"), list).unwrap();
+        for (id, body) in pages {
+            std::fs::write(r.join(format!("{id}.md")), body).unwrap();
+        }
+    }
+
+    /// Mneme handoff, 2026-10-11: reading pages are searched from `reading/_pages.json`, come
+    /// back labelled as reading, and lose a tie to a rule page.
+    /// RED IF: a reading hit is unlabelled, a tie puts the bookmark above the rule, or a page
+    /// that is in the reading folder but not in `_pages.json` is searched.
+    #[test]
+    fn reading_pages_are_searched_labelled_and_lose_ties_to_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("orchestration.md"), "Prefect runs the scheduled flows.\n").unwrap();
+        with_reading(
+            dir.path(),
+            r#"[{"id": "reading-loops", "title": "Reading: Loops", "count": 3, "unit": "claims"}]"#,
+            &[
+                ("reading-loops", "Prefect runs the scheduled flows.\n"),
+                ("reading-unlisted", "Prefect runs the scheduled flows.\n"),
+            ],
+        );
+        let reading = reading_pages(dir.path());
+        assert_eq!(reading, vec!["reading-loops".to_string()]);
+        let pages = vec!["orchestration".to_string()];
+        // Same text, same score: the rule page must come first.
+        let hits = search(dir.path(), &pages, &reading, "prefect scheduled flows", 5, 5);
+        let order: Vec<(&str, bool)> = hits.iter().map(|h| (h.page.as_str(), h.reading)).collect();
+        assert_eq!(order, vec![("orchestration", false), ("reading-loops", true)], "{hits:?}");
+        assert_eq!(hits[0].score, hits[1].score, "the fixture must be a real tie");
+
+        let text = render(dir.path(), &hits, &terms("prefect scheduled flows"));
+        assert!(text.contains("## reading-loops (reading/reading-loops.md) READING: a saved bookmark, not a rule"), "{text}");
+        assert!(text.contains("## orchestration (orchestration.md)\n"), "{text}");
+        assert!(text.contains("never as a rule"), "{text}");
+
+        // A better-matching bookmark still outranks a weaker rule page: only TIES go to rules.
+        let hits = search(dir.path(), &pages, &reading, "prefect loops", 5, 5);
+        assert_eq!(hits[0].page, "reading-loops", "{hits:?}");
+    }
+
+    /// RED IF: a missing or malformed `_pages.json` errors, or stops the rule pages being searched.
+    #[test]
+    fn a_missing_or_broken_reading_list_is_a_no_op() {
+        let (dir, pages) = wiki();
+        assert!(reading_pages(dir.path()).is_empty(), "no reading folder at all");
+        with_reading(dir.path(), "not json", &[]);
+        assert!(reading_pages(dir.path()).is_empty(), "a list that does not parse");
+        with_reading(dir.path(), r#"[{"title": "no id"}]"#, &[]);
+        assert!(reading_pages(dir.path()).is_empty(), "an entry without an id");
+        let hits = search(dir.path(), &pages, &reading_pages(dir.path()), "langfuse", 3, 5);
+        assert_eq!(hits.len(), 1, "the rule pages are still searched: {hits:?}");
+        assert!(!render(dir.path(), &hits, &terms("langfuse")).contains("READING"));
+    }
+
     #[test]
     fn a_long_line_is_truncated_rather_than_dumped() {
         let dir = tempfile::tempdir().unwrap();
         let long = "langfuse ".repeat(200);
         std::fs::write(dir.path().join("p.md"), format!("{long}\n")).unwrap();
-        let hits = search(dir.path(), &["p".to_string()], "langfuse", 3, 5);
+        let hits = search(dir.path(), &["p".to_string()], &[], "langfuse", 3, 5);
         assert!(hits[0].lines[0].1.chars().count() <= MAX_LINE_CHARS + 3, "{:?}", hits[0].lines[0]);
     }
 }

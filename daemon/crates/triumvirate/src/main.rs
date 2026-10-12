@@ -206,7 +206,7 @@ pub(crate) fn wiki_search_journal(terms: &[String], hits: &[crate::wiki_search::
     let row = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "terms": terms.len(),
-        "pages": hits.iter().map(|h| h.page.clone()).collect::<Vec<_>>(),
+        "pages": hits.iter().map(|h| if h.reading { format!("reading/{}", h.page) } else { h.page.clone() }).collect::<Vec<_>>(),
         "lines": hits.iter().map(|h| h.lines.len()).sum::<usize>(),
     });
     // Loud on failure. The first live peer call left no journal row and no error anywhere,
@@ -612,9 +612,11 @@ impl McpBridge {
         let dir = crate::wiki_usage::wiki_dir()?;
         let wiki = crate::wiki_usage::load_wiki(&dir)?;
         let terms = crate::wiki_search::terms(&req.query);
+        let reading = crate::wiki_search::reading_pages(&wiki.dir);
         let hits = crate::wiki_search::search(
             &wiki.dir,
             &wiki.pages,
+            &reading,
             &req.query,
             req.max_pages.unwrap_or(3).clamp(1, 10) as usize,
             8,
@@ -4059,8 +4061,11 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    /// T-206 taught every peer a `<triumvirate_tool>` marker that nothing ever ran; codex then
+    /// answered an ask_agent with a bare marker and the call came back DONE (Mneme handoff,
+    /// 2026-10-11). RED IF: the marker instructions are injected into a peer prompt again.
     #[tokio::test]
-    async fn ask_agent_gemini_injects_tool_marker_instructions() -> anyhow::Result<()> {
+    async fn ask_agent_does_not_teach_peers_unexecuted_tool_markers() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let script_path = write_mock_gemini_marker_probe_script()?;
@@ -4100,7 +4105,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .and_then(|c| c.raw.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
-        assert!(raw_text.contains("marker_probe=present"));
+        assert!(raw_text.contains("marker_probe=missing"), "{raw_text}");
 
         client.cancel().await?;
         server_handle.await??;

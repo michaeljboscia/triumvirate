@@ -28,6 +28,20 @@ file is the thing you read to answer "what do we know is broken right now."
 
 ## Closed
 
+### D-061 - A sight rejection listed over-budget windows as reads, with no reason
+**CLOSED 2026-10-11:** the receipt now marks each window from an over-budget command "not credited: this command printed N bytes, every file in it together, over the 30000-byte limit for one command". The reviewer rule and the repair prompt say the limit counts every file in a command together. `sight_handoff_an_over_budget_chain_is_named_in_the_receipt` reproduces the live shape and proves the same windows, one command each, pass.
+**Found:** 2026-10-11 (Mneme handoff; rejected record 6a0543cf) · **Severity:** MEDIUM
+**Evidence:** codex read a 323-line file as 1-120, 121-240, 241-323, the first window chained with a second required file (33,237 bytes printed), and was rejected as a partial read with those three windows listed bare. The gate was right: an over-budget command earns nothing. The receipt hid why, and the rule told codex to chain files with `&&`, so the repair turn did the same again.
+
+### D-062 - A reply that was only an unexecuted tool marker came back DONE
+**CLOSED 2026-10-11:** T-206 injected marker instructions into every ask_agent prompt and never built anything that runs a marker. The instructions are no longer injected, and a reply that is nothing but `<triumvirate_tool>` markers is refused on both dispatch arms, naming the marker, outcome `rejected_tool_marker`. `marker_01_a_reply_of_only_a_tool_marker_is_not_done` drives it through `execute_ask_agent` (negative control: it returns Ok with the check off); `both_dispatch_arms_check_for_a_bare_marker` guards the two arms.
+**Found:** 2026-10-11 (Mneme handoff; request 5c988187) · **Severity:** MEDIUM
+**Evidence:** codex answered one ask_agent with a bare `ledger_query` marker, tool_calls_made 0, lifecycle DONE.
+
+### D-063 - wiki_search did not search Mneme's reading pages
+**CLOSED 2026-10-11:** `wiki_search` also searches `reading/<id>.md` for ids in `reading/_pages.json`, labels each hit "READING: a saved bookmark, not a rule", and ranks a rule page first on a tie. A missing list is a silent no-op; a malformed one is logged and skipped. Tests: `reading_pages_are_searched_labelled_and_lose_ties_to_rules`, `a_missing_or_broken_reading_list_is_a_no_op`.
+**Found:** 2026-10-11 (Mneme handoff) · **Severity:** LOW
+
 ### 2026-09-19: the test suite wrote wiki_call events into real shared ledgers (D-019)
 
 Found by the first real run of `scripts/wiki-usage-report.py`: 11 rows said "wiki not loadable
@@ -509,4 +523,4 @@ From the gate's own rejection text: `agy_resilience.rs`, 750 lines, read as `[of
 **Closed 2026-09-22.** Every CHECK ran: binary rebuilt from this branch and installed 14:20:36; daemon 7612 (running since 2026-09-20, still substituting) replaced by pid 94278 at 14:20:56; `scripts/verify-live-agents.sh strict` passed.
 **Live evidence, not just tests.** A gemini `ask_agent` at 14:30:49 hit the real agy quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). The call FAILED with agy's own error, lifecycle `... RETRY, FAILED, FALLBACK`, and `ps` showed no codex child spawned by the daemon. `FALLBACK` is the dead-drop record at `~/.triumvirate/dead-drop/ccd65e4f-...-gemini.md`, which names `agent: gemini` and the quota reason. Before this fix that same 429 returned a codex answer marked success.
 
-**Last reviewed:** 2026-10-11 20:03 ET
+**Last reviewed:** 2026-10-11 22:35 ET

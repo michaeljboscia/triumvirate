@@ -59,14 +59,6 @@ const GEMINI_MODEL_FAILDOWN: &[&str] = &[
     "gemini-3.1-pro-preview",
 ];
 
-const TOOL_MARKER_INSTRUCTIONS: &str = "\
-When you need to call a Triumvirate tool, emit exactly one XML block with this shape:
-<triumvirate_tool name=\"ledger_record\">{\"title\":\"...\",\"narrative\":\"...\"}</triumvirate_tool>
-Rules:
-- Use name values only from supported tools: ledger_query, ledger_session, ledger_record, lesson_add, lesson_query, lesson_validate, lesson_list.
-- The body must be valid JSON object parameters for that tool.
-- Emit normal prose outside the XML block when needed.";
-
 #[cfg(unix)]
 pub(crate) fn configure_process_group(command: &mut Command) {
     // SAFETY: pre_exec runs in the spawned child process before exec.
@@ -835,7 +827,7 @@ async fn execute_ask_agent_inner(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
-    let execution_prompt = inject_tool_marker_prompt(&with_required_sources(&req.message, &req.required_sources));
+    let execution_prompt = with_required_sources(&req.message, &req.required_sources);
     // 2b: every named source as it was BEFORE turn 1. A repair turn unions turn 1's reads only
     // for sources still byte-identical to this (Codex, review: a snapshot taken at the repair let
     // a window of an old version cover a new one).
@@ -1252,8 +1244,10 @@ async fn execute_ask_agent_inner(
                 // Token accounting is deliberately still performed below on the reject path
                 // through the normal Err arm: the tokens were genuinely spent whether or not the
                 // answer is usable, and hiding that would misreport cost.
-                let mut sight_err = None;
-                if sight_required(req)
+                let mut sight_err = unexecuted_tool_marker(&agent_display, &parsed.response_text);
+                let marker_only = sight_err.is_some();
+                if !marker_only
+                    && sight_required(req)
                     && let Err(err) = enforce_reviewer_sight(
                         &agent_display,
                         &parsed.tool_calls,
@@ -1276,7 +1270,7 @@ async fn execute_ask_agent_inner(
                     }
                 }
                 if let Some(err) = sight_err {
-                    span.record("agent.outcome", "rejected_no_sight");
+                    span.record("agent.outcome", if marker_only { "rejected_tool_marker" } else { "rejected_no_sight" });
                     span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                     persist_daemon_token_record(
                         &agent,
@@ -1747,8 +1741,10 @@ async fn execute_ask_agent_inner(
                     // entry, emitted "responded", and recorded degraded_success before the gate
                     // ran. Fixing one of two surfaces is the recurring defect in this codebase,
                     // and this is the third time it has appeared in this change alone.
-                    let mut sight_err = None;
-                    if sight_required(req)
+                    let mut sight_err = unexecuted_tool_marker(&hop_display, &parsed.response_text);
+                    let marker_only = sight_err.is_some();
+                    if !marker_only
+                        && sight_required(req)
                         && let Err(err) = enforce_reviewer_sight(
                             &hop_display,
                             &parsed.tool_calls,
@@ -1774,7 +1770,7 @@ async fn execute_ask_agent_inner(
                         }
                     }
                     if let Some(err) = sight_err {
-                        span.record("agent.outcome", "rejected_no_sight");
+                        span.record("agent.outcome", if marker_only { "rejected_tool_marker" } else { "rejected_no_sight" });
                         span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
                         persist_daemon_token_record(
                             hop.agent, &request_id, &parsed, &resolved_cwd, &resolved_repo,
@@ -2054,8 +2050,9 @@ const SIGHT_CONTRACT_RULE: &str = "How this review is checked: it is rejected un
 every line, 1 to N, of every source above. Earlier turns do not count. Read each source whole \
 (`cat <path>`, or your file-read tool with no offset and no limit). If you read in windows, the \
 windows together must cover 1 to N with no gap. One shell command's output is cut at 30000 bytes \
-and a cut read earns nothing, so read a source marked over that limit in windows. To read \
-several files in one command, join the reads with `&&`; reads of different files joined with `;` \
+and a cut read earns nothing. The limit counts everything the command prints, every file in it \
+together, so read a source marked over that limit in windows, and keep each command's reads under \
+it. To read several files in one command, join the reads with `&&`; reads of different files joined with `;` \
 or a newline are not counted, because a failed read is hidden by the next one. Do not modify \
 any file.";
 
@@ -2072,8 +2069,33 @@ fn sight_contract_line(source: &str) -> String {
     }
 }
 
-fn inject_tool_marker_prompt(user_prompt: &str) -> String {
-    format!("{TOOL_MARKER_INSTRUCTIONS}\n\nUser request:\n{user_prompt}")
+/// The refusal for a reply that is nothing but `<triumvirate_tool>` markers; `None` otherwise.
+///
+/// T-206 taught every peer to emit these markers and never built anything that runs them: the
+/// daemon only parses them for a success-rate metric. On 2026-10-11 codex answered an ask_agent
+/// with one bare `ledger_query` marker and the call came back DONE (Mneme handoff, request
+/// 5c988187). The instructions are no longer injected; this catches a peer that emits one anyway.
+/// A reply with prose around a marker passes: quoting the tag is how a review of this code reads.
+fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String> {
+    let mut rest = response.trim();
+    let mut names = Vec::new();
+    while rest.starts_with("<triumvirate_tool") {
+        let end = rest.find("</triumvirate_tool>")? + "</triumvirate_tool>".len();
+        let name = agent_adapter::parse_tool_call_marker(&rest[..end])
+            .ok()
+            .flatten()
+            .map_or_else(|| "(unparsed)".to_string(), |call| call.name);
+        names.push(name);
+        rest = rest[end..].trim_start();
+    }
+    if names.is_empty() || !rest.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{agent_display} replied with only an unexecuted tool call ({}), not an answer. Triumvirate \
+         does not run <triumvirate_tool> markers; ask again for an answer in prose.",
+        names.join(", ")
+    ))
 }
 
 fn require_peer_review_enabled() -> bool {
@@ -2556,9 +2578,12 @@ fn small_output_bound(seg: &str) -> Option<usize> {
 /// segment that is not a vetted read (`ls`, `find`, `wc`), or a file this process cannot read,
 /// cannot be sized, so the call fails closed (Codex, D-032 third pass).
 fn shell_call_fits_budget(c: &ToolCallRecord, cwd: &str) -> bool {
-    let Some(command) = c.args_json.as_deref().and_then(agent_adapter::codex::shell_command_from_args_json) else {
-        return false;
-    };
+    shell_call_printed_bytes(c, cwd).is_some_and(|n| n <= SHELL_OUTPUT_BUDGET)
+}
+
+/// What one shell call prints, every segment together; `None` when it cannot be sized.
+fn shell_call_printed_bytes(c: &ToolCallRecord, cwd: &str) -> Option<usize> {
+    let command = c.args_json.as_deref().and_then(agent_adapter::codex::shell_command_from_args_json)?;
     let mut total = 0usize;
     for seg in agent_adapter::codex::read_segments_pub(&command) {
         let (operand, range, decoration) = if let Some(r) = agent_adapter::codex::command_read_range(seg) {
@@ -2570,17 +2595,11 @@ fn shell_call_fits_budget(c: &ToolCallRecord, cwd: &str) -> bool {
             total += n;
             continue;
         } else {
-            return false;
+            return None;
         };
-        let Some(bytes) = source_bytes(&operand, cwd) else {
-            return false;
-        };
-        total += printed_bytes(&bytes, &range, &decoration);
-        if total > SHELL_OUTPUT_BUDGET {
-            return false;
-        }
+        total += printed_bytes(&source_bytes(&operand, cwd)?, &range, &decoration);
     }
-    true
+    Some(total)
 }
 
 /// The FIELDS a structured read tool uses to name the file it is opening.
@@ -2750,6 +2769,19 @@ fn describe_reads_of_source(tool_calls: &[ToolCallRecord], source: &str, cwd: &s
             } else {
                 windows.join(", ")
             };
+            // A call over the one-command budget earns nothing, whatever it read. The receipt
+            // listed such windows bare, so 1-120, 121-240 and 241-323 of a 323-line file read
+            // as a full read refused for no reason, and the repair turn chained the same files
+            // again (Mneme handoff, 2026-10-11).
+            if is_shell_read_tool(&c.tool) && !shell_call_fits_budget(c, cwd) {
+                let size = match shell_call_printed_bytes(c, cwd) {
+                    Some(n) => format!("printed {n} bytes, every file in it together, over"),
+                    None => "could not be sized against".to_string(),
+                };
+                return Some(format!(
+                    "{described} (not credited: this command {size} the {SHELL_OUTPUT_BUDGET}-byte limit for one command)"
+                ));
+            }
             // #81: say which line the call's output did not show, so a refused read explains
             // itself instead of reading as a slice.
             Some(match shell_read_not_shown(c, &candidates, cwd) {
@@ -3346,8 +3378,9 @@ fn sight_repair_prompt(tool_calls: &[ToolCallRecord], required_sources: &[String
         "Your review is not accepted yet: the sight gate could not count every line of these \
          sources as read.\n{}\n\nRead what is missing now, on this turn. Your reads from the \
          previous turn of this conversation still count, unless a file changed since, in which \
-         case read that file whole again. One shell command's output is cut at 30000 bytes, and a \
-         cut read earns nothing. Do not modify any file.\n\nThen write your COMPLETE review again \
+         case read that file whole again. One shell command's output is cut at 30000 bytes, \
+         counting every file in it together, and a cut read earns nothing: read one file per \
+         command, in windows if it is large. Do not modify any file.\n\nThen write your COMPLETE review again \
          from the beginning, not only what changed: this text replaces your first answer. Change \
          anything the lines you had not read change.",
         gaps.join("\n")
@@ -7864,6 +7897,48 @@ mod sight_gate_tests {
         assert!(err.contains(&format!("NOTE: {src} changed on disk while the review ran")), "names the edit: {err}");
     }
 
+    /// Mneme handoff, 2026-10-11: codex read a 323-line file as 1-120, 121-240 and 241-323, the
+    /// first window chained with a second required file. That command printed 33 KB, over the
+    /// one-command budget, so it earned nothing and the gate was right. The receipt listed the
+    /// window bare, which read as a full read refused for no reason.
+    /// RED IF: the over-budget window stops being named as such, or the same windows read one
+    /// command each stop passing.
+    #[test]
+    fn sight_handoff_an_over_budget_chain_is_named_in_the_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let long = |name: &str, n: usize| {
+            let path = dir.path().join(name);
+            let body: String = (1..=n).map(|i| format!("line {i} {}\n", "x".repeat(200))).collect();
+            std::fs::write(&path, body).expect("write");
+            path.to_string_lossy().into_owned()
+        };
+        let src = long("to-try.md", 323);
+        let other = long("inventory.md", 46);
+        let chained = vec![
+            codex_read(&format!("/bin/zsh -lc \"sed -n '1,120p' {src} && sed -n '1,46p' {other}\"")),
+            codex_read(&format!("/bin/zsh -lc \"sed -n '121,240p' {src}\"")),
+            codex_read(&format!("/bin/zsh -lc \"sed -n '241,323p' {src}\"")),
+        ];
+        let mut lc = Vec::new();
+        let err = enforce_reviewer_sight("Codex", &chained, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect_err("the chained command is over budget and earns nothing");
+        assert!(
+            err.contains(&format!("lines 1-120 of {src} (not credited: this command printed "))
+                && err.contains("every file in it together, over the 30000-byte limit for one command)"),
+            "the receipt names why the window earned nothing: {err}"
+        );
+        assert!(!err.contains(&format!("lines 121-240 of {src} (not credited")), "a credited window is not marked: {err}");
+
+        let separate = vec![
+            codex_read(&format!("/bin/zsh -lc \"sed -n '1,120p' {src}\"")),
+            codex_read(&format!("/bin/zsh -lc \"sed -n '121,240p' {src}\"")),
+            codex_read(&format!("/bin/zsh -lc \"sed -n '241,323p' {src}\"")),
+        ];
+        enforce_reviewer_sight("Codex", &separate, "codex-exec-json", std::slice::from_ref(&src), &cwd, &mut lc)
+            .expect("the same windows, one command each, are a full read");
+    }
+
     /// D-036, through the REAL classifier (codex_read hard-codes ReadFile, which is how the bug
     /// hid: the gate was fine, `shell_read_kind` left a `;` chain as Bash). Codex read four sources
     /// as `sed -n '1,180p' F; sed -n '181,360p' F; ...` and the review was discarded.
@@ -10910,6 +10985,27 @@ mod stall_kill_tests {
         }
     }
 
+    /// Mneme handoff, request 5c988187: codex's whole reply was one `ledger_query` marker and
+    /// the call came back DONE. Through the real entry point and the real codex parser.
+    /// RED IF: a bare-marker reply returns Ok, or the refusal stops naming the marker.
+    #[tokio::test]
+    #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
+    async fn marker_01_a_reply_of_only_a_tool_marker_is_not_done() {
+        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fx = setup(
+            // The fixture's background sleep would hold stdout open; this test is not about stalls.
+            r#"kill $!
+printf '{"type":"thread.started","thread_id":"t-marker"}\n'
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"<triumvirate_tool name=\\"ledger_query\\">{\\"query\\":\\"x\\"}</triumvirate_tool>"}}\n'
+printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n'"#,
+            30,
+        );
+        let err = execute_ask_agent(&request(&fx), None)
+            .await
+            .expect_err("a reply that is only an unexecuted marker is not an answer");
+        assert!(err.contains("replied with only an unexecuted tool call (ledger_query)"), "{err}");
+    }
+
     fn pid_in(fx: &Fixture, name: &str) -> u32 {
         fs::read_to_string(fx.dir.path().join(name))
             .expect("pid file")
@@ -11297,5 +11393,41 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REV
             _ => panic!("a repair that errored must be a named failure"),
         }
         assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_FAILED"));
+    }
+}
+
+#[cfg(test)]
+mod unexecuted_tool_marker_tests {
+    use super::unexecuted_tool_marker;
+
+    /// RED IF: either dispatch arm (primary or degraded hop) stops checking for a bare marker
+    /// before it records DONE. Fixing one of two surfaces is this codebase's recurring defect.
+    #[test]
+    fn both_dispatch_arms_check_for_a_bare_marker() {
+        let src = include_str!("agent_exec.rs");
+        let call = ["let mut sight_err = ", "unexecuted_tool_marker("].concat();
+        let old = ["let mut sight_err = ", "None;"].concat();
+        assert_eq!(src.matches(call.as_str()).count(), 2, "primary and degraded arms");
+        assert_eq!(src.matches(old.as_str()).count(), 0, "no arm starts without the check");
+    }
+
+    /// The live shape (Mneme handoff, request 5c988187): the whole reply was one marker.
+    /// RED IF: a bare marker reply passes, or a reply that discusses the tag in prose is refused.
+    #[test]
+    fn a_reply_of_only_markers_is_refused_and_prose_around_one_is_not() {
+        let bare = r#"<triumvirate_tool name="ledger_query">{"query":"one token data providers"}</triumvirate_tool>"#;
+        let err = unexecuted_tool_marker("Codex", &format!("\n  {bare}\n")).expect("a bare marker is not an answer");
+        assert!(err.contains("Codex replied with only an unexecuted tool call (ledger_query)"), "{err}");
+
+        let two = format!("{bare}\n<triumvirate_tool name=\"lesson_list\"></triumvirate_tool>");
+        assert!(unexecuted_tool_marker("Codex", &two).expect("two markers").contains("(ledger_query, lesson_list)"));
+
+        let broken = r#"<triumvirate_tool name="ledger_query">not json</triumvirate_tool>"#;
+        assert!(unexecuted_tool_marker("Codex", broken).expect("a malformed marker").contains("(unparsed)"));
+
+        assert_eq!(unexecuted_tool_marker("Codex", &format!("The reply was {bare}, which nothing runs.")), None);
+        assert_eq!(unexecuted_tool_marker("Codex", &format!("{bare}\nThen I answered: two providers.")), None);
+        assert_eq!(unexecuted_tool_marker("Codex", "<triumvirate_tool name=\"x\"> never closed"), None);
+        assert_eq!(unexecuted_tool_marker("Codex", "a plain answer"), None);
     }
 }
