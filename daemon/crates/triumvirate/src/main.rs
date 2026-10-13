@@ -4060,6 +4060,47 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    // The prompt test below covers one path. This one covers every crate: tool marker text may
+    // appear only where it is pinned below (the D-062 refusal and its tests, DeepSeek's ban on
+    // emitting tags, this file's prompt probe). A new prompt, parser or executor anywhere in the
+    // workspace changes a count and fails here (Grok, review of D-064).
+    #[test]
+    fn tool_marker_text_appears_only_where_pinned() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "target") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        walk(&crates, &mut files);
+        assert!(files.len() > 50, "the walk must actually find the workspace's sources");
+        let tag = ["triumvirate", "_tool"].concat();
+        for file in files {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let pinned = if file.ends_with("triumvirate/src/agent_exec.rs") {
+                22
+            } else if file.ends_with("triumvirate/src/main.rs") {
+                2
+            } else {
+                0
+            };
+            assert_eq!(
+                src.matches(tag.as_str()).count(),
+                pinned,
+                "{}: tool markers are retired (D-064); nothing may teach, parse or run them",
+                file.display()
+            );
+        }
+    }
+
     #[tokio::test]
     // Tool markers are retired for good (D-064): v2.2 REQ-014b taught every peer a
     // `<triumvirate_tool>` call that nothing ever ran, and peers answered with bare markers. The

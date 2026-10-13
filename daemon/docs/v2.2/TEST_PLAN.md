@@ -34,7 +34,7 @@
 | REQ | Acceptance Criteria | Test Type | Pass Condition | Reality Test |
 |-----|-------------------|-----------|----------------|-------------|
 | REQ-014 | FTS5 search | Integration | Query returns relevant summaries | Insert 3 summaries ("auth bug", "database migration", "CSS layout"). Query "auth" returns only the auth summary. |
-| REQ-014a | RETIRED 2026-10-12 (D-064) | None | No marker parser exists | None. |
+| REQ-014a | RETIRED 2026-10-12 (D-064) | Unit | No marker executor or parser exists; marker text only where pinned | `tool_marker_text_appears_only_where_pinned` walks every crate and fails on unpinned `triumvirate_tool` text. |
 | REQ-014b | RETIRED 2026-10-12 (D-064): no prompt injection | Integration | Gemini prompt carries the request and no marker instructions | `ask_agent_gemini_sends_no_tool_marker_instructions`: a mock Gemini reports whether its payload holds `triumvirate_tool`. |
 | REQ-019 | Lessons table | Unit | CRUD works | Add lesson, query it, validate it, list it. All operations succeed. |
 | REQ-020-LL | Confidence decay | Unit | Decay formula correct | Add lesson 50 days ago (mock time). Query with min_confidence=0.3 → found. Query with min_confidence=0.4 → not found (0.36 < 0.4). |

@@ -2085,7 +2085,11 @@ fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String>
         rest = inner.trim_end().strip_suffix("```").unwrap_or(inner).trim();
     }
     let mut names = Vec::new();
-    while rest.starts_with("<triumvirate_tool") {
+    // The tag name must end at `>` or whitespace: `<triumvirate_toolbox>` is not a marker (Codex).
+    while rest
+        .strip_prefix("<triumvirate_tool")
+        .is_some_and(|after| after.starts_with(|c: char| c == '>' || c.is_whitespace()))
+    {
         let Some(close) = rest.find("</triumvirate_tool>") else {
             names.push("(unclosed)".to_string());
             rest = "";
@@ -2093,9 +2097,11 @@ fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String>
         };
         let end = close + "</triumvirate_tool>".len();
         let open_tag = rest[..end].split_once('>').map_or("", |(tag, _)| tag);
+        // A whole `name="..."` attribute, so `surname="x"` is not read as the name (Codex).
         let name = open_tag
-            .split_once("name=\"")
-            .and_then(|(_, tail)| tail.split_once('"'))
+            .split_whitespace()
+            .find_map(|attr| attr.strip_prefix("name=\""))
+            .and_then(|tail| tail.split_once('"'))
             .map(|(name, _)| name.trim())
             .filter(|name| !name.is_empty())
             .map_or_else(|| "(unparsed)".to_string(), str::to_string);
@@ -11452,5 +11458,9 @@ mod unexecuted_tool_marker_tests {
         assert!(unexecuted_tool_marker("Codex", &fenced).expect("a fenced marker").contains("(ledger_query)"));
         assert_eq!(unexecuted_tool_marker("Codex", &format!("```xml\n{bare}\n```\nThat is the call I would make.")), None);
         assert_eq!(unexecuted_tool_marker("Codex", "a plain answer"), None);
+        // A longer tag name is not a marker, and only a whole name attribute names one.
+        assert_eq!(unexecuted_tool_marker("Codex", "<triumvirate_toolbox>x</triumvirate_tool>"), None);
+        let surname = r#"<triumvirate_tool surname="x">{}</triumvirate_tool>"#;
+        assert!(unexecuted_tool_marker("Codex", surname).expect("still a marker").contains("(unparsed)"));
     }
 }
