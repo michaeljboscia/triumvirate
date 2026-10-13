@@ -68,7 +68,6 @@ The daemon declares tracing, OpenTelemetry, and Prometheus deps but has zero ins
   - `triumvirate_ledger_spool_size_bytes{project}` — gauge
   - `triumvirate_fleet_active_total` — gauge
   - `triumvirate_reviews_total{verdict}` — counter
-  - `triumvirate_marker_parse_success_rate` — gauge (REQ-014b)
 - **REQ-062:** Every new crate (`ledger`, `fleet`, `peer-review`) MUST use `tracing::instrument` on public API methods. No `println!` or `eprintln!` for operational logging — all logging via `tracing` macros (`info!`, `warn!`, `error!`, `debug!`).
 
 ---
@@ -113,8 +112,8 @@ Replaces the broken stenographer. SQLite-backed session persistence with health 
   - `ledger_session(session_id: string)` — Full session reconstruction: metadata + events + summaries.
   - `ledger_record(title: string, narrative: string, facts: string[], concepts: string[])` — Manual high-signal recording by any agent. Writes directly to `summaries`.
   Note: `ledger_health()` is in REQ-015a (Health section, Phase 1).
-- **REQ-014a:** Gemini and Codex (text-in/text-out subprocesses) MAY access ledger tools via structured XML markers in their stdout (e.g., `<triumvirate_tool name="ledger_record">...</triumvirate_tool>`). This is an OPPORTUNISTIC high-signal capture path, not the primary durability mechanism. The `agent-adapter` crate MUST parse these markers when present, execute the tool in the daemon, and inject the result back into the agent's context. If the agent outputs malformed XML, the adapter MUST return a synthetic error message to trigger self-correction.
-- **REQ-014b:** The daemon MUST inject XML tool usage instructions into the startup prompt for Gemini and Codex agents. Core session capture (REQ-010) remains the primary durability path — XML markers are additive, not required. The daemon MUST track `marker_parse_success_rate` as a Prometheus metric and emit a `degraded` health warning if the rate falls below 50% over a 1-hour window.
+- **REQ-014a: RETIRED 2026-10-12 (D-064).** Never built; removed for good with REQ-014b. Peers get no tool markers and the daemon parses none. Original text, kept for the record: Gemini and Codex (text-in/text-out subprocesses) MAY access ledger tools via structured XML markers in their stdout (e.g., `<triumvirate_tool name="ledger_record">...</triumvirate_tool>`). This is an OPPORTUNISTIC high-signal capture path, not the primary durability mechanism. The `agent-adapter` crate MUST parse these markers when present, execute the tool in the daemon, and inject the result back into the agent's context. If the agent outputs malformed XML, the adapter MUST return a synthetic error message to trigger self-correction.
+- **REQ-014b: RETIRED 2026-10-12 (D-064).** The daemon MUST NOT put tool marker instructions in any peer prompt; `ask_agent_gemini_sends_no_tool_marker_instructions` guards it. The injection taught peers a call nothing ran, and they answered with bare markers (D-062). The parser and the `marker_parse_success_rate` metric are removed. Original text, kept for the record: The daemon MUST inject XML tool usage instructions into the startup prompt for Gemini and Codex agents. Core session capture (REQ-010) remains the primary durability path — XML markers are additive, not required. The daemon MUST track `marker_parse_success_rate` as a Prometheus metric and emit a `degraded` health warning if the rate falls below 50% over a 1-hour window.
 
 ### Health
 
@@ -276,7 +275,7 @@ v2.2 ships incrementally. Each phase is independently shippable and testable. La
 |-------|----------|------|-------|-----------|
 | **0.5 — Observability** | `triumvirate` (wiring existing deps) | REQ-059–062 | tracing + OTel + Prometheus /metrics. All subsequent phases are instrumented. | Yes — disable via RUST_LOG/OTEL env vars |
 | **1 — Data** | `shared-types` (DTOs + GitOps trait), `ledger` (ingestion/spool/drain/health) | REQ-001–005, 006–013b, 015–018a (excl. 014 block) | Fixes stenographer. Ledger captures events. Health visible. | Yes — JSONL still works (REQ-018) |
-| **2 — Knowledge** | `ledger` (retrieval + lessons) | REQ-014–014b, 019–022 | FTS5 search, lesson CRUD, confidence decay | Yes — Phase 1 still captures without retrieval |
+| **2 — Knowledge** | `ledger` (retrieval + lessons) | REQ-014, REQ-019 to REQ-022 (014a/b retired) | FTS5 search, lesson CRUD, confidence decay | Yes — Phase 1 still captures without retrieval |
 | **3 — Fleet Core** | `fleet` (worktrees/tasks/claiming/progress) | REQ-028–037 | Parallel agents with task lists. No review gate yet. | Yes — behind `TRIUMVIRATE_FLEET_ENABLED` flag |
 | **4 — Review** | `peer-review`, fleet merge gating | REQ-023–027b, 024a, 040–040b | Cross-model review. Fleet merge gate. | Yes — `TRIUMVIRATE_FLEET_SKIP_REVIEW=1` disables |
 | **5 — Visibility** | `dashboard` (Svelte + rust-embed + WebSocket) | REQ-041–048, 044a, 045a–045e | Dashboard with all views. | Yes — daemon works without dashboard |

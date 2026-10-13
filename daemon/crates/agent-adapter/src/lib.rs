@@ -8,7 +8,6 @@ pub mod claude_stream;
 pub mod codex_app_server;
 pub mod gemini;
 pub mod grok;
-pub mod markers;
 pub mod stuck;
 pub mod types;
 
@@ -21,7 +20,6 @@ pub use codex_app_server::{
 };
 pub use gemini::GeminiStreamParser;
 pub use grok::{GrokStreamParser, Termination as GrokTermination};
-pub use markers::{ToolCallRequest, parse_tool_call_marker};
 pub use stuck::{StuckDetector, StuckReason};
 pub use types::{
     AgentVerbosity, ParsedAgentResult, TokenUsage, ToolCallRecord, ToolKind, WorkingState,

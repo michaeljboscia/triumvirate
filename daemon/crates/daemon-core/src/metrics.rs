@@ -22,7 +22,6 @@ pub struct DaemonMetrics {
     pub ledger_spool_size_bytes: IntGauge,
     pub fleet_active_total: IntGauge,
     pub reviews_total: IntCounter,
-    pub marker_parse_success_rate: Gauge,
     pub http_requests_total: IntCounterVec,
     pub http_request_duration_seconds: HistogramVec,
     pub http_in_flight_requests: IntGauge,
@@ -104,10 +103,6 @@ impl DaemonMetrics {
         )?;
         let fleet_active_total = IntGauge::new("triumvirate_fleet_active_total", "Active fleet count")?;
         let reviews_total = IntCounter::new("triumvirate_reviews_total", "Total reviews completed")?;
-        let marker_parse_success_rate = Gauge::new(
-            "triumvirate_marker_parse_success_rate",
-            "Marker parse success rate",
-        )?;
         let http_requests_total = IntCounterVec::new(
             Opts::new(
                 "triumvirate_http_requests_total",
@@ -140,11 +135,9 @@ impl DaemonMetrics {
         registry.register(Box::new(ledger_spool_size_bytes.clone()))?;
         registry.register(Box::new(fleet_active_total.clone()))?;
         registry.register(Box::new(reviews_total.clone()))?;
-        registry.register(Box::new(marker_parse_success_rate.clone()))?;
         registry.register(Box::new(http_requests_total.clone()))?;
         registry.register(Box::new(http_request_duration_seconds.clone()))?;
         registry.register(Box::new(http_in_flight_requests.clone()))?;
-        marker_parse_success_rate.set(1.0);
         Ok(Self {
             registry,
             agent_requests_total,
@@ -163,7 +156,6 @@ impl DaemonMetrics {
             ledger_spool_size_bytes,
             fleet_active_total,
             reviews_total,
-            marker_parse_success_rate,
             http_requests_total,
             http_request_duration_seconds,
             http_in_flight_requests,
@@ -177,6 +169,5 @@ impl DaemonMetrics {
         let _ = self.ledger_spool_size_bytes.get();
         let _ = self.fleet_active_total.get();
         let _ = self.reviews_total.get();
-        let _ = self.marker_parse_success_rate.get();
     }
 }

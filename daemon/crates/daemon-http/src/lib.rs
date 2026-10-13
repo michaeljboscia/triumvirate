@@ -60,7 +60,6 @@ use tokio::{
     time::{Duration, Instant, sleep},
 };
 use token_economics::{BuildCostBreakdown, SessionTokenBreakdown, SummaryQueryFilters};
-use tracing::warn;
 use uuid::Uuid;
 
 static DAEMON_AUTOSTART_ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -659,7 +658,6 @@ pub struct DaemonHttpState {
     pub token: String,
     pub queues: QueueRegistry,
     pub ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
-    pub marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
     pub metrics: Arc<DaemonMetrics>,
     pub ws_events: broadcast::Sender<String>,
     pub token_db: Arc<token_economics::TokenDb>,
@@ -779,41 +777,6 @@ pub async fn metrics_route(
             AxumJson(serde_json::json!({ "error": e.to_string() })),
         )
     })
-}
-
-async fn record_marker_parse_result(state: &DaemonHttpState, response: &str) {
-    let parse_ok = match agent_adapter::parse_tool_call_marker(response) {
-        Ok(_) => true,
-        Err(err) => {
-            warn!("tool marker parse failed: {err}");
-            false
-        }
-    };
-
-    let mut window = state.marker_parse_window.lock().await;
-    let now = Instant::now();
-    window.push_back((now, parse_ok));
-    while let Some((ts, _)) = window.front() {
-        if now.duration_since(*ts) > Duration::from_secs(3600) {
-            let _ = window.pop_front();
-        } else {
-            break;
-        }
-    }
-    let total = window.len();
-    if total == 0 {
-        return;
-    }
-    let successes = window.iter().filter(|(_, ok)| *ok).count();
-    let rate = successes as f64 / total as f64;
-    state.metrics.marker_parse_success_rate.set(rate);
-    if total >= 10 && rate < 0.5 {
-        warn!(
-            marker_parse_success_rate = rate,
-            sample_count = total,
-            "marker parse success rate degraded below 50% over rolling 1h window"
-        );
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1008,7 +971,6 @@ pub async fn ask_agent_route(
     state.metrics.agent_duration_seconds.observe(started.elapsed().as_secs_f64());
     match result {
         Ok(response) => {
-            record_marker_parse_result(&state, &response.response).await;
             publish_ws_event(
                 &state,
                 "agent_state",
