@@ -3072,7 +3072,6 @@ async fn run_daemon() -> anyhow::Result<()> {
             Some(ws_events.clone()),
         ),
         Arc::new(Mutex::new(VecDeque::new())),
-        Arc::new(Mutex::new(VecDeque::new())),
         metrics.clone(),
         ws_events,
     );
@@ -3098,7 +3097,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         token: state.token.clone(),
         queues: state.queues.clone(),
         ledger_project_lru: state.ledger_project_lru.clone(),
-        marker_parse_window: state.marker_parse_window.clone(),
         metrics: state.metrics.clone(),
         ws_events: state.ws_events.clone(),
         token_db,
@@ -3740,11 +3738,12 @@ echo '{"jsonrpc":"2.0","id":1,"result":{"text":"mock-gemini received: test messa
         let script = r#"#!/bin/sh
 echo '{"jsonrpc":"2.0","method":"session/ready","params":{"text":"mock ready"}}'
 payload="$(cat)"
-echo "$payload" | grep -q '<triumvirate_tool name="ledger_record">'
-if [ $? -eq 0 ]; then
+if echo "$payload" | grep -q 'triumvirate_tool'; then
   echo '{"jsonrpc":"2.0","id":1,"result":{"text":"marker_probe=present"}}'
+elif echo "$payload" | grep -q 'test message'; then
+  echo '{"jsonrpc":"2.0","id":1,"result":{"text":"marker_probe=clean"}}'
 else
-  echo '{"jsonrpc":"2.0","id":1,"result":{"text":"marker_probe=missing"}}'
+  echo '{"jsonrpc":"2.0","id":1,"result":{"text":"marker_probe=no_payload"}}'
 fi
 "#;
         crate::write_test_executable(&path, script)?;
@@ -4061,8 +4060,52 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
+    // The prompt test below covers one path. This one covers every Rust crate: it pins how many
+    // times tool marker text appears in each file (the D-062 refusal and its tests, DeepSeek's
+    // ban on emitting tags, this file's prompt probe; zero everywhere else). Adding marker text
+    // anywhere changes a count and fails here. It pins counts, not locations (Grok, Codex).
+    #[test]
+    fn tool_marker_text_count_is_pinned_in_every_crate() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "target") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        walk(&crates, &mut files);
+        assert!(files.len() > 50, "the walk must actually find the workspace's sources");
+        let tag = ["triumvirate", "_tool"].concat();
+        for file in files {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let pinned = if file.ends_with("triumvirate/src/agent_exec.rs") {
+                24
+            } else if file.ends_with("triumvirate/src/main.rs") {
+                2
+            } else {
+                0
+            };
+            assert_eq!(
+                src.matches(tag.as_str()).count(),
+                pinned,
+                "{}: tool markers are retired (D-064); nothing may teach, parse or run them",
+                file.display()
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn ask_agent_gemini_injects_tool_marker_instructions() -> anyhow::Result<()> {
+    // Tool markers are retired for good (D-064): v2.2 REQ-014b taught every peer a
+    // `<triumvirate_tool>` call that nothing ever ran, and peers answered with bare markers. The
+    // prompt a peer receives must carry the request and no marker instructions.
+    async fn ask_agent_gemini_sends_no_tool_marker_instructions() -> anyhow::Result<()> {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN"]);
         let script_path = write_mock_gemini_marker_probe_script()?;
@@ -4102,7 +4145,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
             .and_then(|c| c.raw.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
-        assert!(raw_text.contains("marker_probe=present"));
+        assert!(raw_text.contains("marker_probe=clean"), "{raw_text}");
 
         client.cancel().await?;
         server_handle.await??;
@@ -7912,7 +7955,6 @@ mod pantheon_rest_tests {
             None,
             abe_tasks,
             Arc::new(Mutex::new(VecDeque::new())),
-            Arc::new(Mutex::new(VecDeque::new())),
             metrics,
             ws_events,
         )
@@ -8231,7 +8273,6 @@ mod pantheon_ws_replay_tests {
             None,
             abe_tasks,
             Arc::new(Mutex::new(VecDeque::new())),
-            Arc::new(Mutex::new(VecDeque::new())),
             metrics.clone(),
             ws_events.clone(),
         );
@@ -8241,7 +8282,6 @@ mod pantheon_ws_replay_tests {
             token: state.token.clone(),
             queues: state.queues.clone(),
             ledger_project_lru: state.ledger_project_lru.clone(),
-            marker_parse_window: state.marker_parse_window.clone(),
             metrics: state.metrics.clone(),
             ws_events: state.ws_events.clone(),
             token_db,

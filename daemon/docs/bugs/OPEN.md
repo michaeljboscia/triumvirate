@@ -24,15 +24,14 @@ file is the thing you read to answer "what do we know is broken right now."
 **Evidence:** `abe/worktree_setup.rs` writes validate-task.sh, the pre-commit hook and the commit-msg hook in process, then chmods them (lines 281, 334, 382); `mcp-tools/src/abe.rs` does the same for `.triumvirate/commit.sh`. Linux refuses to exec a file any process has open for writing. If another thread spawns a child inside the write window, that child holds the write fd until it execs, and git's run of the hook fails with "Text file busy". Same mechanism CI hit on PR #86 in a test fixture; not yet seen in production.
 **CHECK to close:** these writers no longer hold the destination open for writing in the daemon process (or the exec retries on ETXTBSY), with a test or source guard that fails if one returns.
 
-### D-064 - Tool markers are taught to every peer and never executed (v2.2 REQ-014a unbuilt)
-**Found:** 2026-10-11 (Codex, review of D-062) · **Severity:** MEDIUM · **NOT FIXED: needs a decision**
-**Evidence:** v2.2 SPEC REQ-014b injects marker instructions into every peer prompt (`inject_tool_marker_prompt`, agent_exec.rs), and REQ-014a says the daemon MUST execute a marker and inject its result back. Only the parse half exists: `record_marker_parse_result` (daemon-http/src/lib.rs) feeds a success-rate metric and nothing runs the tool. A peer that follows the instructions gets its turn refused (D-062) instead of a tool result.
-**Decision:** build the REQ-014a executor, or retire REQ-014a/b (stop injecting, revise SPEC.md and TEST_PLAN.md, invert `ask_agent_gemini_injects_tool_marker_instructions`).
-**CHECK to close:** either a marker in a peer reply is executed and its result reaches the peer's next turn (REQ-014a test), or the instructions are no longer injected and the spec says so.
-
 ---
 
 ## Closed
+
+### D-064 - Tool markers were taught to every peer and never executed
+**CLOSED 2026-10-12: retired for good.** Mike chose to retire REQ-014a/b, not build the executor. No peer prompt teaches or requests marker use (`inject_tool_marker_prompt` and `TOOL_MARKER_INSTRUCTIONS` removed; DeepSeek's system prompt still names the tag only to forbid it); the `agent-adapter` marker parser, `record_marker_parse_result` and the `triumvirate_marker_parse_success_rate` metric are removed; SPEC.md and TEST_PLAN.md mark both REQs retired. `ask_agent_gemini_sends_no_tool_marker_instructions` fails if `triumvirate_tool` text reaches the prompt on the shared ask_agent path, and `tool_marker_text_count_is_pinned_in_every_crate` fails when marker text is added to any Rust file in the daemon crates (it pins a count per file, not locations) (negative controls: a marker reinjected into the prompt, and one added to the ledger crate, each fail). The D-062 refusal (now matching only a whole `<triumvirate_tool` tag and a whole `name` attribute) stays as a backstop for persistent sessions whose history still holds the old instructions.
+**Found:** 2026-10-11 (Codex, review of D-062) · **Severity:** MEDIUM
+**Evidence:** REQ-014b injected the instructions into every peer prompt while REQ-014a, the executor, was never built. The 2026-09-13 CLI path audit failed session memory checks because Gemini and Grok answered turn 1 with a `ledger_record` marker.
 
 ### D-061 - A sight rejection listed over-budget windows as reads, with no reason
 **CLOSED 2026-10-11:** the receipt now marks each window from an over-budget command "not credited: this command printed N bytes, every file in it together, over the 30000-byte limit for one command". The reviewer rule and the repair prompt say the limit counts every file in a command together. `sight_handoff_an_over_budget_chain_is_named_in_the_receipt` reproduces the live shape and proves the same windows, one command each, pass.
@@ -40,7 +39,7 @@ file is the thing you read to answer "what do we know is broken right now."
 **Evidence:** codex read a 323-line file as 1-120, 121-240, 241-323, the first window chained with a second required file (33,237 bytes printed), and was rejected as a partial read with those three windows listed bare. The gate was right: an over-budget command earns nothing. The receipt hid why, and the rule told codex to chain files with `&&`, so the repair turn did the same again.
 
 ### D-062 - A reply that was only an unexecuted tool marker came back DONE
-**CLOSED 2026-10-11:** a reply that is nothing but `<triumvirate_tool>` markers (bare, fenced, or unclosed) is refused on both dispatch arms, naming the marker, outcome `rejected_tool_marker`; prose around a marker still passes. `marker_01_a_reply_of_only_a_tool_marker_is_not_done` drives it through `execute_ask_agent` (negative control: it returns Ok with the check off); `both_dispatch_arms_check_for_a_bare_marker` guards the two arms. The marker instructions are still injected (v2.2 REQ-014b); the missing executor is D-064.
+**CLOSED 2026-10-11:** a reply that is nothing but `<triumvirate_tool>` markers (bare, fenced, or unclosed) is refused on both dispatch arms, naming the marker, outcome `rejected_tool_marker`; prose around a marker still passes. `marker_01_a_reply_of_only_a_tool_marker_is_not_done` drives it through `execute_ask_agent` (negative control: it returns Ok with the check off); `both_dispatch_arms_check_for_a_bare_marker` guards the two arms. Tool markers were then retired for good (D-064).
 **Found:** 2026-10-11 (Mneme handoff; request 5c988187) · **Severity:** MEDIUM
 **Evidence:** codex answered one ask_agent with a bare `ledger_query` marker, tool_calls_made 0, lifecycle DONE.
 

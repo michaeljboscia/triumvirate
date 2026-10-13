@@ -34,8 +34,8 @@
 | REQ | Acceptance Criteria | Test Type | Pass Condition | Reality Test |
 |-----|-------------------|-----------|----------------|-------------|
 | REQ-014 | FTS5 search | Integration | Query returns relevant summaries | Insert 3 summaries ("auth bug", "database migration", "CSS layout"). Query "auth" returns only the auth summary. |
-| REQ-014a | XML marker parsing | Integration | Gemini output with marker → ledger write | Feed agent-adapter a mock stdout containing `<triumvirate_tool name="ledger_record">...`. Verify summary in DB. |
-| REQ-014b | Prompt injection | Integration | Gemini startup prompt contains XML instructions | Spawn Gemini via ask_agent, capture the prompt, verify XML tool instructions present. |
+| REQ-014a | RETIRED 2026-10-12 (D-064) | Unit | No marker executor or parser exists; marker text count pinned per file | `tool_marker_text_count_is_pinned_in_every_crate` walks every crate and fails when a file's `triumvirate_tool` count changes. |
+| REQ-014b | RETIRED 2026-10-12 (D-064): no prompt injection | Integration | Gemini prompt carries the request and no marker instructions | `ask_agent_gemini_sends_no_tool_marker_instructions`: a mock Gemini reports whether its payload holds `triumvirate_tool`. |
 | REQ-019 | Lessons table | Unit | CRUD works | Add lesson, query it, validate it, list it. All operations succeed. |
 | REQ-020-LL | Confidence decay | Unit | Decay formula correct | Add lesson 50 days ago (mock time). Query with min_confidence=0.3 → found. Query with min_confidence=0.4 → not found (0.36 < 0.4). |
 | REQ-022 | Auto-lesson from summary | Integration | bug_fix summary → lesson created | Insert summary with type=bug_fix. Verify lesson auto-created with confidence=0.6. |

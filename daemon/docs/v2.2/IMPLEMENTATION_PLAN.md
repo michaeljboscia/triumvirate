@@ -28,10 +28,10 @@
 - [ ] **0.3** Wire Prometheus /metrics endpoint.
 
 <task id="T-003" req="REQ-061" wave="1" depends="">
-  <description>Implement GET /metrics returning Prometheus text format. Register all metrics: agent_requests_total, agent_duration_seconds, agent_tokens_total, ledger_events_ingested_total, ledger_queue_lag_seconds, ledger_spool_size_bytes, fleet_active_total, reviews_total, marker_parse_success_rate.</description>
+  <description>Implement GET /metrics returning Prometheus text format. Register all metrics: agent_requests_total, agent_duration_seconds, agent_tokens_total, ledger_events_ingested_total, ledger_queue_lag_seconds, ledger_spool_size_bytes, fleet_active_total, reviews_total. (marker_parse_success_rate removed 2026-10-12 with REQ-014b, D-064.)</description>
   <files>triumvirate/src/main.rs</files>
   <verify>cargo check -p triumvirate</verify>
-  <reality_test>curl localhost:8080/metrics returns text/plain with Prometheus format. Output contains all 9 metric names. After running ask_agent, triumvirate_agent_requests_total counter > 0. A stub returning empty 200 fails the metric name check.</reality_test>
+  <reality_test>curl localhost:8080/metrics returns text/plain with Prometheus format. Output contains all 8 metric names. After running ask_agent, triumvirate_agent_requests_total counter > 0. A stub returning empty 200 fails the metric name check.</reality_test>
 </task>
 
 - [ ] **0.4** Establish tracing::instrument convention.
@@ -290,7 +290,7 @@
   <reality_test>Call ledger_record via MCP with title="test". Then call ledger_query via MCP with query="test". Returns the record. A stub that registers tools but doesn't wire to store fails the round-trip.</reality_test>
 </task>
 
-- [ ] **2.5** Implement XML marker parsing in `agent-adapter`.
+- [ ] **2.5** RETIRED 2026-10-12 (D-064): do not build. Implement XML marker parsing in `agent-adapter`.
 
 <task id="T-205" req="REQ-014a" wave="1" depends="">
   <description>Parse &lt;triumvirate_tool name="ledger_record"&gt;...&lt;/triumvirate_tool&gt; from agent stdout. Extract params. Return structured ToolCallRequest. Handle malformed XML with error.</description>
@@ -299,7 +299,7 @@
   <reality_test>Feed parser valid XML marker → extracts name + params correctly. Feed malformed XML → returns parse error (not panic). Feed normal text without markers → returns None. A stub always returning None fails the valid-XML extraction.</reality_test>
 </task>
 
-- [ ] **2.6** Add prompt injection + parse success metric.
+- [ ] **2.6** RETIRED 2026-10-12 (D-064): do not build; the injection and metric were removed. Add prompt injection + parse success metric.
 
 <task id="T-206" req="REQ-014b" wave="2" depends="T-205">
   <description>Inject XML tool instructions into Gemini/Codex startup prompts. Track marker_parse_success_rate Prometheus metric. Degraded warning if &lt;50% over 1hr.</description>

@@ -59,14 +59,6 @@ const GEMINI_MODEL_FAILDOWN: &[&str] = &[
     "gemini-3.1-pro-preview",
 ];
 
-const TOOL_MARKER_INSTRUCTIONS: &str = "\
-When you need to call a Triumvirate tool, emit exactly one XML block with this shape:
-<triumvirate_tool name=\"ledger_record\">{\"title\":\"...\",\"narrative\":\"...\"}</triumvirate_tool>
-Rules:
-- Use name values only from supported tools: ledger_query, ledger_session, ledger_record, lesson_add, lesson_query, lesson_validate, lesson_list.
-- The body must be valid JSON object parameters for that tool.
-- Emit normal prose outside the XML block when needed.";
-
 #[cfg(unix)]
 pub(crate) fn configure_process_group(command: &mut Command) {
     // SAFETY: pre_exec runs in the spawned child process before exec.
@@ -835,7 +827,7 @@ async fn execute_ask_agent_inner(
     let exec_cwd = resolved_cwd
         .clone()
         .unwrap_or_else(|| ".".to_string());
-    let execution_prompt = inject_tool_marker_prompt(&with_required_sources(&req.message, &req.required_sources));
+    let execution_prompt = with_required_sources(&req.message, &req.required_sources);
     // 2b: every named source as it was BEFORE turn 1. A repair turn unions turn 1's reads only
     // for sources still byte-identical to this (Codex, review: a snapshot taken at the repair let
     // a window of an old version cover a new one).
@@ -2077,16 +2069,12 @@ fn sight_contract_line(source: &str) -> String {
     }
 }
 
-fn inject_tool_marker_prompt(user_prompt: &str) -> String {
-    format!("{TOOL_MARKER_INSTRUCTIONS}\n\nUser request:\n{user_prompt}")
-}
-
 /// The refusal for a reply that is nothing but `<triumvirate_tool>` markers; `None` otherwise.
 ///
-/// v2.2 REQ-014b injects the marker instructions into every peer prompt; REQ-014a, the executor
-/// that runs a marker and feeds its result back, was never built (D-064): the daemon only parses
-/// markers for a success-rate metric. On 2026-10-11 codex answered an ask_agent with one bare
-/// `ledger_query` marker and the call came back DONE (Mneme handoff, request 5c988187).
+/// Tool markers are retired (D-064): no prompt teaches them and nothing runs them. A peer can still
+/// emit one from an older persistent session whose history holds the old instructions. On
+/// 2026-10-11 codex answered an ask_agent with one bare `ledger_query` marker and the call came
+/// back DONE (Mneme handoff, request 5c988187).
 /// A reply with prose around a marker passes: quoting the tag is how a review of this code reads.
 /// A code fence around the markers, or a marker left unclosed, is still only a marker (Grok).
 fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String> {
@@ -2097,17 +2085,27 @@ fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String>
         rest = inner.trim_end().strip_suffix("```").unwrap_or(inner).trim();
     }
     let mut names = Vec::new();
-    while rest.starts_with("<triumvirate_tool") {
+    // The tag name must end at `>` or whitespace: `<triumvirate_toolbox>` is not a marker (Codex).
+    while rest
+        .strip_prefix("<triumvirate_tool")
+        .is_some_and(|after| after.starts_with(|c: char| c == '>' || c.is_whitespace()))
+    {
         let Some(close) = rest.find("</triumvirate_tool>") else {
             names.push("(unclosed)".to_string());
             rest = "";
             break;
         };
         let end = close + "</triumvirate_tool>".len();
-        let name = agent_adapter::parse_tool_call_marker(&rest[..end])
-            .ok()
-            .flatten()
-            .map_or_else(|| "(unparsed)".to_string(), |call| call.name);
+        let open_tag = rest[..end].split_once('>').map_or("", |(tag, _)| tag);
+        // A whole `name="..."` attribute, so `surname="x"` is not read as the name (Codex).
+        let name = open_tag
+            .split_whitespace()
+            .find_map(|attr| attr.strip_prefix("name=\""))
+            .and_then(|tail| tail.split_once('"'))
+            .filter(|(_, after)| after.is_empty())
+            .map(|(name, _)| name.trim())
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| "(unparsed)".to_string(), str::to_string);
         names.push(name);
         rest = rest[end..].trim_start();
     }
@@ -2116,7 +2114,7 @@ fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String>
     }
     Some(format!(
         "{agent_display} replied with only an unexecuted tool call ({}), not an answer. Triumvirate \
-         does not run <triumvirate_tool> markers yet (D-064); ask again for an answer in prose.",
+         has no tool markers and never runs them (D-064); ask again for an answer in prose.",
         names.join(", ")
     ))
 }
@@ -11451,7 +11449,7 @@ mod unexecuted_tool_marker_tests {
         let two = format!("{bare}\n<triumvirate_tool name=\"lesson_list\"></triumvirate_tool>");
         assert!(unexecuted_tool_marker("Codex", &two).expect("two markers").contains("(ledger_query, lesson_list)"));
 
-        let broken = r#"<triumvirate_tool name="ledger_query">not json</triumvirate_tool>"#;
+        let broken = r#"<triumvirate_tool>{"query":"x"}</triumvirate_tool>"#;
         assert!(unexecuted_tool_marker("Codex", broken).expect("a malformed marker").contains("(unparsed)"));
 
         assert_eq!(unexecuted_tool_marker("Codex", &format!("The reply was {bare}, which nothing runs.")), None);
@@ -11461,5 +11459,11 @@ mod unexecuted_tool_marker_tests {
         assert!(unexecuted_tool_marker("Codex", &fenced).expect("a fenced marker").contains("(ledger_query)"));
         assert_eq!(unexecuted_tool_marker("Codex", &format!("```xml\n{bare}\n```\nThat is the call I would make.")), None);
         assert_eq!(unexecuted_tool_marker("Codex", "a plain answer"), None);
+        // A longer tag name is not a marker, and only a whole name attribute names one.
+        assert_eq!(unexecuted_tool_marker("Codex", "<triumvirate_toolbox>x</triumvirate_tool>"), None);
+        let surname = r#"<triumvirate_tool surname="x">{}</triumvirate_tool>"#;
+        assert!(unexecuted_tool_marker("Codex", surname).expect("still a marker").contains("(unparsed)"));
+        let junk = r#"<triumvirate_tool name="ledger_query"junk>{}</triumvirate_tool>"#;
+        assert!(unexecuted_tool_marker("Codex", junk).expect("still a marker").contains("(unparsed)"));
     }
 }

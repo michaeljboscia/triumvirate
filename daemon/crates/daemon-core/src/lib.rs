@@ -12,7 +12,6 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use shared_types::{FleetBuild, MemoryEntry, SessionState};
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -469,7 +468,6 @@ pub struct DaemonState<TAbeTasks> {
     pub sessions_file: Option<PathBuf>,
     pub abe_tasks: TAbeTasks,
     pub ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
-    pub marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
     pub metrics: Arc<metrics::DaemonMetrics>,
     pub ws_events: tokio::sync::broadcast::Sender<String>,
     /// FEAT-013 (REQ-020) T-007.5: shared event replay ring buffer.
@@ -509,7 +507,6 @@ impl<TAbeTasks> DaemonState<TAbeTasks> {
         sessions_file: Option<PathBuf>,
         abe_tasks: TAbeTasks,
         ledger_project_lru: Arc<Mutex<VecDeque<PathBuf>>>,
-        marker_parse_window: Arc<Mutex<VecDeque<(Instant, bool)>>>,
         metrics: Arc<metrics::DaemonMetrics>,
         ws_events: tokio::sync::broadcast::Sender<String>,
     ) -> Self {
@@ -521,7 +518,6 @@ impl<TAbeTasks> DaemonState<TAbeTasks> {
             sessions_file,
             abe_tasks,
             ledger_project_lru,
-            marker_parse_window,
             metrics,
             ws_events,
             replay_buffer: Arc::new(replay::EventReplayBuffer::default_capacity()),
