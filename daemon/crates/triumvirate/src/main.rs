@@ -4060,12 +4060,12 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         Ok(())
     }
 
-    // The prompt test below covers one path. This one covers every crate: tool marker text may
-    // appear only where it is pinned below (the D-062 refusal and its tests, DeepSeek's ban on
-    // emitting tags, this file's prompt probe). A new prompt, parser or executor anywhere in the
-    // workspace changes a count and fails here (Grok, review of D-064).
+    // The prompt test below covers one path. This one covers every Rust crate: it pins how many
+    // times tool marker text appears in each file (the D-062 refusal and its tests, DeepSeek's
+    // ban on emitting tags, this file's prompt probe; zero everywhere else). Adding marker text
+    // anywhere changes a count and fails here. It pins counts, not locations (Grok, Codex).
     #[test]
-    fn tool_marker_text_appears_only_where_pinned() {
+    fn tool_marker_text_count_is_pinned_in_every_crate() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).expect("read dir") {
                 let path = entry.expect("dir entry").path();
@@ -4086,7 +4086,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
         for file in files {
             let src = std::fs::read_to_string(&file).expect("read source");
             let pinned = if file.ends_with("triumvirate/src/agent_exec.rs") {
-                22
+                24
             } else if file.ends_with("triumvirate/src/main.rs") {
                 2
             } else {

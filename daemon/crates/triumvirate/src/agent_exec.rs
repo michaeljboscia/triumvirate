@@ -2102,6 +2102,7 @@ fn unexecuted_tool_marker(agent_display: &str, response: &str) -> Option<String>
             .split_whitespace()
             .find_map(|attr| attr.strip_prefix("name=\""))
             .and_then(|tail| tail.split_once('"'))
+            .filter(|(_, after)| after.is_empty())
             .map(|(name, _)| name.trim())
             .filter(|name| !name.is_empty())
             .map_or_else(|| "(unparsed)".to_string(), str::to_string);
@@ -11462,5 +11463,7 @@ mod unexecuted_tool_marker_tests {
         assert_eq!(unexecuted_tool_marker("Codex", "<triumvirate_toolbox>x</triumvirate_tool>"), None);
         let surname = r#"<triumvirate_tool surname="x">{}</triumvirate_tool>"#;
         assert!(unexecuted_tool_marker("Codex", surname).expect("still a marker").contains("(unparsed)"));
+        let junk = r#"<triumvirate_tool name="ledger_query"junk>{}</triumvirate_tool>"#;
+        assert!(unexecuted_tool_marker("Codex", junk).expect("still a marker").contains("(unparsed)"));
     }
 }
