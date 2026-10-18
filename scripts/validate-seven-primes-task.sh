@@ -86,9 +86,15 @@ suite_for() {
     esac
 }
 
-# Commits on the branch whose message names the task id as a whole token (T-30 must not match T-302).
+# Commits that BELONG to the task: the subject starts with the task id, bare (`T-302: evidence`) or after the
+# conventional prefix (`feat(seven-primes): T-302 ...`). Matching the id anywhere in the message was wrong: T-106's
+# body said "for T-107's gate", and T-106's files were then scoped as T-107's. A whole-token match keeps T-30 from
+# matching T-302.
 task_commits() {
-    git -C "$REPO" log --format=%H -E --grep="(^|[^A-Za-z0-9-])$1([^0-9]|$)" "$BASE..HEAD"
+    local id="$1" sha subject
+    while IFS=$'\t' read -r sha subject; do
+        if [[ "$subject" =~ ^([a-z]+(\([^\)]*\))?!?:\ )?$id([^0-9]|$) ]]; then printf '%s\n' "$sha"; fi
+    done < <(git -C "$REPO" log --format=$'%H\t%s' "$BASE..HEAD")
 }
 
 # files_in <commit...>: every path touched by those commits, one per line, unique.
@@ -531,7 +537,8 @@ self_test() {
 
     # 14. Suite selection is by task id: T-104 runs FULL_TESTS, T-105 runs FULL_TESTS_BASE.
     r="$(fresh_repo suite)"
-    printf '\n// suite\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-104 T-105: suite probe"
+    printf '\n// suite\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-104: suite probe"
+    printf '\n// suite 105\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "test(fx): T-105 suite probe"
     run_case suite-104 0 "$r" 0 T-104 daemon/fx/src/lib.rs
     expect_text suite-104 "suite: FULL_TESTS,"
     verdict "14a T-104 -> FULL_TESTS"
@@ -568,6 +575,16 @@ self_test() {
             verdict "15b legacy drift on base + badly formatted addition -> exit 1"
         fi
     done
+
+    # 16. A commit that merely MENTIONS a task id (in its subject tail or body) does not belong to that task.
+    r="$(fresh_repo mention)"
+    printf '\n// t-106\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "feat(fx): T-106 state, used by T-107's gate"
+    printf 'x\n' >"$r/docs/gate.md" && git -C "$r" -c user.name=t -c user.email=t@t add -A \
+        && git -C "$r" -c user.name=t -c user.email=t@t commit -qm "fix(fx): T-107 gate docs" -m "follows T-106"
+    run_case mention 1 "$r" 0 T-107 docs/gate.md
+    expect_text mention "1 commits reference T-107"
+    expect_text mention "0 daemon .rs files touched by T-107"
+    verdict "16 a commit that only mentions T-107 is not scoped to T-107"
 
     echo
     echo "self-test: $pass passed, $fail failed"
