@@ -1406,7 +1406,11 @@ mod alias_census_tests {
         let mut names: Vec<&str> = super::AGENT_ALIASES.iter().map(|(a, _)| *a).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), super::AGENT_ALIASES.len(), "duplicate alias in AGENT_ALIASES");
+        assert_eq!(
+            names.len(),
+            super::AGENT_ALIASES.len(),
+            "duplicate alias in AGENT_ALIASES"
+        );
         assert_eq!(super::AGENT_ALIASES.len(), ALIASES.len());
     }
 }

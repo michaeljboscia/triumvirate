@@ -6554,7 +6554,10 @@ mod deepseek_dispatch_tests {
     /// roster, so a new seat is covered the moment it gets a row. Comments are skipped: they explain, and match arms
     /// and fixtures legitimately name agents one at a time. What must not exist is PROSE listing several.
     fn hand_written_agent_lists(src: &str) -> Vec<String> {
-        let mut names: Vec<String> = mcp_bridge::supported_agent_names().iter().map(|n| n.to_string()).collect();
+        let mut names: Vec<String> = mcp_bridge::supported_agent_names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
         names.push("antigravity".to_string());
         let unescaped_quotes = |t: &str| t.matches('"').count() - t.matches("\\\"").count();
         let mut found = Vec::new();
@@ -6622,18 +6625,19 @@ mod deepseek_dispatch_tests {
             "    description = \"Supported: 'codex', \\\n",
             "                   'kimi'.\"\n",
         );
-        assert_eq!(hand_written_agent_lists(wrapped).len(), 1, "wrapped list must fail: {wrapped}");
+        assert_eq!(
+            hand_written_agent_lists(wrapped).len(),
+            1,
+            "wrapped list must fail: {wrapped}"
+        );
         // Ordinary prose that happens to name several agents is not a list.
         let prose = "    let note = \"codex and grok disagreed about the lock, and qwen agreed with codex\";\n";
         assert_eq!(hand_written_agent_lists(prose), Vec::<String>::new());
-        // A comment may list agents freely. (Split so this test's own source line is not itself a list.)
-        let comment = concat!(
-            "    // Supported: ",
-            "\"codex\", \"grok\"\n",
-        );
+        // A comment may list agents freely. (Built from two statements so no single source line here is a list.)
+        let trigger = "    // Supported: ";
+        let comment = format!("{trigger}{}", "\"codex\", \"grok\"\n");
         assert_eq!(hand_written_agent_lists(comment), Vec::<String>::new());
     }
-
 
     /// The auth classifier must not fire on prose that merely mentions authentication.
     ///

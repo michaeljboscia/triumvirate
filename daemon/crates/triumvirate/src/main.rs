@@ -593,7 +593,11 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
 fn render_tool_descriptions<S>(mut router: ToolRouter<S>) -> ToolRouter<S> {
     let fills = [
         ("ask_agent", "{SUPPORTED_AGENTS}", supported_agents_text()),
-        ("ask_jury", "{DEFAULT_SEATS}", mcp_tools::jury::DEFAULT_SEATS.join(", ")),
+        (
+            "ask_jury",
+            "{DEFAULT_SEATS}",
+            mcp_tools::jury::DEFAULT_SEATS.join(", "),
+        ),
     ];
     for (tool, placeholder, text) in fills {
         if let Some(route) = router.map.get_mut(tool)
@@ -8865,7 +8869,12 @@ mod seven_primes_description_tests {
 
     fn rendered(tool: &str) -> String {
         let router = render_tool_descriptions(McpBridge::tool_router());
-        router.map[tool].attr.description.as_deref().unwrap_or_default().to_string()
+        router.map[tool]
+            .attr
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// RED IF: a new seat, its display name or an alias is missing from ask_agent, or a placeholder survives.
@@ -8883,7 +8892,10 @@ mod seven_primes_description_tests {
         }
         assert!(!d.contains('{'), "unfilled placeholder: {d}");
         let jury = rendered("ask_jury");
-        assert!(jury.contains("(default seats: codex, grok, gemini)"), "{jury}");
+        assert!(
+            jury.contains("(default seats: codex, grok, gemini)"),
+            "{jury}"
+        );
         assert!(!jury.contains("{DEFAULT_SEATS}"));
     }
 
@@ -8913,12 +8925,24 @@ mod seven_primes_description_tests {
     fn roster_aliases_and_display_names() {
         assert_eq!(
             mcp_bridge::supported_agent_names(),
-            ["gemini", "codex", "deepseek", "claude", "grok", "kimi", "mistral", "qwen"]
+            [
+                "gemini", "codex", "deepseek", "claude", "grok", "kimi", "mistral", "qwen"
+            ]
         );
-        for (alias, seat) in [("vibe", "mistral"), ("moonshot", "kimi"), ("bailian", "qwen"), ("Le-Chat", "mistral")] {
+        for (alias, seat) in [
+            ("vibe", "mistral"),
+            ("moonshot", "kimi"),
+            ("bailian", "qwen"),
+            ("Le-Chat", "mistral"),
+        ] {
             assert_eq!(mcp_bridge::normalize_agent_name(alias), seat);
         }
-        for (alias, display) in [("kimi-code", "Kimi"), ("devstral", "Mistral"), ("qwen-code", "Qwen"), ("agy", "Antigravity")] {
+        for (alias, display) in [
+            ("kimi-code", "Kimi"),
+            ("devstral", "Mistral"),
+            ("qwen-code", "Qwen"),
+            ("agy", "Antigravity"),
+        ] {
             assert_eq!(mcp_bridge::display_agent_name(alias), display, "{alias}");
         }
     }
