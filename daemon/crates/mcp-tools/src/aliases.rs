@@ -188,8 +188,19 @@ pub struct ReviewRequestLike {
 ///
 /// Both exclusions predate grok and are preserved, now with a reason attached. `grok` joins
 /// `gemini` and `codex` because it IS a spawnable CLI. REQ-GROK-003.
+///
+/// Seven Primes T-202 (REQ-004, REQ-061): derived from SeatProfile rows with `daemon_target = true`. The three new seats
+/// are session-capable, so they are targets; their session flow is T-208, and until their dispatch arms land (T-205) a
+/// call to one fails loudly with "unsupported agent", never silently as another seat.
 pub fn daemon_target_agents() -> &'static [&'static str] {
-    &["gemini", "codex", "grok"]
+    static TARGETS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    TARGETS.get_or_init(|| {
+        mcp_bridge::seat_profile::all_seats()
+            .iter()
+            .filter(|row| row.daemon_target)
+            .map(|row| row.key)
+            .collect()
+    })
 }
 
 /// Map a `spawn_daemon` / `ask_daemon` target onto a canonical agent key.
@@ -726,7 +737,12 @@ mod tests {
 mod seven_primes_characterization_tests {
     #[test]
     fn daemon_target_agents_exact() {
-        assert_eq!(super::daemon_target_agents(), &["gemini", "codex", "grok"]);
+        // T-202: derived from the seat table; the five existing seats' membership is unchanged (gemini, codex, grok)
+        // and the three new seats are added.
+        assert_eq!(
+            super::daemon_target_agents(),
+            &["gemini", "codex", "grok", "kimi", "mistral", "qwen"]
+        );
     }
 }
 

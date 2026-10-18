@@ -224,7 +224,13 @@ async fn run_with_trees(
     //
     // Filtered rather than failed, because the roster is a preference list and the next name is
     // a legitimate answer. Logged so an operator can see why their first choice was skipped.
-    const CANNOT_WRITE_HERE: &[&str] = &["grok", "deepseek"];
+    // Seven Primes T-202 (REQ-062): derived from SeatProfile rows with `can_write_test_file = false`. The three new
+    // seats are read-only, so they join grok and deepseek.
+    let cannot_write_here: Vec<&str> = mcp_bridge::seat_profile::all_seats()
+        .iter()
+        .filter(|row| !row.can_write_test_file)
+        .map(|row| row.key)
+        .collect();
     let requested = if req.roster.is_empty() {
         peer_review::default_reviewers()
     } else {
@@ -233,7 +239,7 @@ async fn run_with_trees(
     let roster: Vec<String> = requested
         .iter()
         .filter(|a| {
-            let keep = !CANNOT_WRITE_HERE.contains(&a.to_ascii_lowercase().as_str());
+            let keep = !cannot_write_here.contains(&mcp_bridge::normalize_agent_name(a).as_str());
             if !keep {
                 tracing::info!(
                     agent = %a,
@@ -248,7 +254,7 @@ async fn run_with_trees(
     if roster.is_empty() {
         return Err(format!(
             "no agent in the roster {requested:?} can write a test file on this dispatch. \
-             A blind validator must WRITE its tests, and {CANNOT_WRITE_HERE:?} cannot here."
+             A blind validator must WRITE its tests, and {cannot_write_here:?} cannot here."
         ));
     }
 
@@ -783,7 +789,9 @@ mod tests {
                 .block_on(run_with_trees(&req, base.path(), base.path()))
                 .expect_err("a roster of non-writers cannot validate");
             assert!(
-                err.contains(r#"["grok", "deepseek"] cannot here"#),
+                // T-202: derived from the seat table (roster order); grok and deepseek are unchanged, and the three
+                // new read-only seats are added.
+                err.contains(r#"["deepseek", "grok", "kimi", "mistral", "qwen"] cannot here"#),
                 "{roster:?}: {err}"
             );
         }
