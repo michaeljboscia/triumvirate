@@ -161,13 +161,28 @@ mod tests {
     /// RED IF: `--continue` (cross-talk, research/01) or any forbidden flag, plain or `=value`, slips through.
     #[test]
     fn forbidden_extra_args_are_rejected() {
+        // Independent of KIMI_FORBIDDEN_EXTRA_ARGS, so dropping any flag from that list turns this red.
         for bad in [
             "--continue",
             "-c",
             "--yolo",
+            "-y",
+            "--auto",
+            "--plan",
+            "--session",
             "--session=abc",
-            "--agent-file",
+            "-S",
             "-r",
+            "--resume",
+            "--output-format",
+            "--output-format=text",
+            "-p",
+            "--prompt",
+            "--agent",
+            "--agent-file",
+            "-m",
+            "--model",
+            "--model=kimi-k2",
         ] {
             let extra = vec![bad.to_string()];
             let err = build_kimi_invocation(&req("p", None, &extra, None)).unwrap_err();

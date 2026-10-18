@@ -189,8 +189,8 @@ impl KimiStreamParser {
     ///
     /// Outcome (BACKEND_STRUCTURE section 6, research/01 "a failed turn throws -> non-zero"): exit 0 with assistant
     /// text is `Success`; exit 0 with no text is `Failure("empty_or_unrecognized_stream:kimi")`; a non-zero exit is
-    /// `Failure("nonzero_exit:kimi:<code>")` with the last retry status appended when one was seen; no exit code
-    /// (killed by a signal) is `Failure("no_exit_code:kimi")`.
+    /// `Failure("nonzero_exit:kimi:<code>")`; no exit code (killed by a signal) is `Failure("no_exit_code:kimi")`. Both
+    /// failure codes get ` last_retry_status=<n>` appended when a retry was seen (the T-205 classifier contract).
     pub fn finish(self, exit_code: Option<i32>) -> Result<SeatParsed, String> {
         let response_text = self.text_chunks.join("\n");
         let retry = self
@@ -392,6 +392,10 @@ mod tests {
             p.parse_line(r#"{"role":"meta","type":"turn.mystery","x":1}"#)
                 .is_none()
         );
+        assert!(
+            p.events.is_empty(),
+            "an unknown meta type recorded an event"
+        );
         for line in FIXTURE.lines() {
             p.parse_line(line);
         }
@@ -427,6 +431,15 @@ mod tests {
         assert_eq!(
             parse("", None).outcome,
             SeatOutcome::Failure("no_exit_code:kimi".to_string())
+        );
+        // No retry seen: no suffix on a non-zero exit. A retry seen before a kill: the suffix rides on no_exit_code.
+        assert_eq!(
+            parse("", Some(1)).outcome,
+            SeatOutcome::Failure("nonzero_exit:kimi:1".to_string())
+        );
+        assert_eq!(
+            parse(stream, None).outcome,
+            SeatOutcome::Failure("no_exit_code:kimi last_retry_status=429".to_string())
         );
     }
 }
