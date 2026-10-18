@@ -71,7 +71,11 @@ pub fn format_working_state(event: &WorkingStateEvent) -> String {
             // left every grok tool line in the watch CLI showing the tool name instead of the
             // file. The grok parser was fixed for its own FileRead event; this generic
             // formatter was not, so the same bug survived on the other surface.
-            let path = extract_param(&event.tool_args_json, &["target_file", "file_path", "path"]);
+            // Seven Primes REQ-063: Mistral's effects carry `filePath` and Qwen's tool inputs may carry `absolute_path`.
+            let path = extract_param(
+                &event.tool_args_json,
+                &["target_file", "file_path", "path", "filePath", "absolute_path"],
+            );
             let cmd = extract_param(&event.tool_args_json, &["command"]);
             let pattern = extract_param(&event.tool_args_json, &["pattern", "query"]);
             if let Some(p) = path {
@@ -241,5 +245,35 @@ mod format_working_state_tests {
             line.contains(&expected),
             "the formatter must resolve {expected} from the live capture's rawInput; got: {line}"
         );
+    }
+}
+
+/// Seven Primes T-202 (REQ-063): the watch formatter shows the read path for the new seats' argument keys.
+/// RED IF: `filePath` or `absolute_path` stop being recognised, so a Mistral or Qwen read shows only the tool name.
+#[cfg(test)]
+mod seven_primes_format_tests {
+    use super::*;
+
+    fn read_event(agent: &str, args: &str) -> WorkingStateEvent {
+        WorkingStateEvent {
+            agent: agent.into(),
+            state: WorkingState::ToolCallStarted,
+            detail: "read_file".into(),
+            tool_name: Some("read_file".into()),
+            tool_args_json: Some(args.into()),
+            token_usage: None,
+            ts_ms: None,
+        }
+    }
+
+    #[test]
+    fn new_seat_read_keys_show_the_path() {
+        for (agent, args) in [
+            ("mistral", r#"{"filePath":"src/main.rs"}"#),
+            ("qwen", r#"{"absolute_path":"src/main.rs"}"#),
+        ] {
+            let line = format_working_state(&read_event(agent, args));
+            assert!(line.contains("(src/main.rs)"), "{agent}: {line}");
+        }
     }
 }
