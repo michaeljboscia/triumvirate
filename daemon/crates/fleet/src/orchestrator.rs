@@ -3871,9 +3871,10 @@ mod tests {
 }
 
 /// Seven Primes T-001 (REQ-010, REQ-011) characterization: the set of agents `fleet_agent_command` has an arm for.
-/// codex, gemini and grok are built (they may still fail on a scratch path for their own reasons, but never as
-/// "unsupported"); every other existing seat is refused by the `_` arm.
-/// RED IF: a seat gains or loses a fleet arm before T-204 moves this onto the SeatProfile table.
+/// codex, gemini and grok are built: in a real git repo each returns Ok with a program and an argv that carries the
+/// task prompt; every other existing seat is refused by the `_` arm.
+/// RED IF: a seat gains or loses a fleet arm before T-204 moves this onto the SeatProfile table, or a built arm
+/// stops assembling a command (an arm stubbed to return any error fails here).
 #[cfg(test)]
 mod seven_primes_characterization_tests {
     use super::fleet_agent_command;
@@ -3887,13 +3888,40 @@ mod seven_primes_characterization_tests {
                 .to_string();
             assert_eq!(err, format!("unsupported fleet agent: {refused}"));
         }
+        // A real LINKED worktree (what fleet spawns into), so the codex arm's git write dirs resolve and no built arm
+        // can fail for scratch-path reasons.
+        let main = dir.path().join("main");
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&main).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .expect("git must be on PATH")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "fleet/f1/t1",
+            wt.to_str().unwrap(),
+        ]);
         for built in ["codex", "gemini", "grok"] {
-            if let Err(e) = fleet_agent_command(built, dir.path(), "t") {
-                assert!(
-                    !e.to_string().contains("unsupported fleet agent"),
-                    "{built}: {e}"
-                );
-            }
+            let (cmd, args) = fleet_agent_command(built, &wt, "SEVEN-PRIMES-PROMPT")
+                .unwrap_or_else(|e| panic!("{built}: {e}"));
+            assert!(!cmd.is_empty(), "{built}: empty program");
+            assert!(
+                args.iter().any(|a| a.contains("SEVEN-PRIMES-PROMPT")),
+                "{built}: prompt missing from argv {args:?}"
+            );
         }
     }
 }
