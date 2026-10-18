@@ -97,6 +97,27 @@ task_commits() {
     done < <(git -C "$REPO" log --format=$'%H\t%s' "$BASE..HEAD")
 }
 
+# Commits in the range whose subject names NO task (amendment A-10). Ownership is by subject prefix, so a commit that
+# names no task would belong to no task and escape every task's file scope and Rust scope; any such commit is a FAIL.
+unowned_commits() {
+    local sha subject
+    while IFS=$'\t' read -r sha subject; do
+        if ! [[ "$subject" =~ ^([a-z]+(\([^\)]*\))?!?:\ )?T-[0-9]{3}([^0-9]|$) ]]; then printf '%s %s\n' "${sha:0:7}" "$subject"; fi
+    done < <(git -C "$REPO" log --format=$'%H\t%s' "$BASE..HEAD")
+}
+
+# check_ownership: records PASS when every commit in the range names its task, FAIL listing the ones that do not.
+check_ownership() {
+    local un=()
+    mapfile -t un < <(unowned_commits)
+    if [[ ${#un[@]} -eq 0 ]]; then
+        record PASS ownership "every commit in $BASE..HEAD names its task in the subject"
+    else
+        printf 'commits with no task id in the subject:\n'; printf '  %s\n' "${un[@]}"
+        record FAIL ownership "${#un[@]} commits name no task id in the subject (A-10)"
+    fi
+}
+
 # files_in <commit...>: every path touched by those commits, one per line, unique.
 files_in() {
     local c
@@ -271,6 +292,7 @@ floor_only() {
     mapfile -t rs < <(git -C "$REPO" diff --name-only "$BASE..HEAD" | daemon_rs)
     echo "floor-only over $BASE..HEAD: ${#rs[@]} daemon .rs files changed"
     floor_gitleaks
+    check_ownership
     # In floor-only mode there is no task id, so nothing can excuse an empty Rust scope: the non-Rust exemption is
     # per task, and the feat/seven-primes branch always carries daemon .rs changes. Zero is a FAIL (empty-set rule).
     if [[ ${#rs[@]} -eq 0 ]]; then
@@ -332,6 +354,7 @@ validate_task() {
     fi
 
     floor_gitleaks
+    check_ownership
     floor_semgrep "$nonrust" ${rs[@]+"${rs[@]}"}
     floor_dependencies
 
@@ -611,6 +634,19 @@ self_test() {
     expect_text check-fail "error[E0308]"
     expect_text check-fail "$(printf '%-5s %-14s ' FAIL check)exit"
     verdict "19 compile error -> the check gate itself records FAIL"
+
+    # 20. A commit whose subject names no task belongs to no task's scope, so it fails ownership (A-10), both for a task
+    # run and for --floor-only, even though the task's own commit is clean.
+    r="$(fresh_repo unowned)"
+    printf '\n// t-101\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-101: clean"
+    printf '\n// sneaked\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "wip: refs T-101 in passing"
+    run_case unowned 1 "$r" 0 T-101 daemon/fx/src/lib.rs
+    expect_text unowned "1 commits name no task id in the subject (A-10)"
+    expect_text unowned "wip: refs T-101 in passing"
+    verdict "20a a commit naming no task in its subject -> task run exit 1"
+    run_case unowned-floor 1 "$r" 0 --floor-only
+    expect_text unowned-floor "1 commits name no task id in the subject (A-10)"
+    verdict "20b the same commit -> --floor-only exit 1"
 
     echo
     echo "self-test: $pass passed, $fail failed"
