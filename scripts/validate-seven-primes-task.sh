@@ -338,18 +338,27 @@ validate_task() {
     run_in_daemon "$suite" "$cmd"
     floor_rustfmt "$nonrust" ${rs[@]+"${rs[@]}"}
 
-    # Stub markers in lines this task ADDED to daemon .rs files. T-003 is the declared scaffold task and is exempt.
+    # Stub markers anywhere in a touched daemon .rs file (spec: "in touched non-stub files"), counted against the same
+    # file on the base: more marker lines at HEAD than on the base fails, whether this task added the marker or left
+    # an earlier task's scaffold stub in place. The base count keeps legacy lines that only NAME the markers (the ABE
+    # post-exit validator's pattern list) from failing every task that touches them. T-003 is the declared scaffold.
     if [[ "$task" == T-003 ]]; then
         record N/A stubs "T-003 is the declared scaffold task"
     else
-        local hits
-        hits="$(for c in ${commits[@]+"${commits[@]}"}; do git -C "$REPO" show --format= -U0 "$c" -- 'daemon/*.rs'; done \
-            | grep -E '^\+[^+]' | grep -E "$STUB_PATTERN" || true)"
-        if [[ -n "$hits" ]]; then
-            printf 'stub markers added by %s:\n%s\n' "$task" "$hits"
-            record FAIL stubs "stub markers added to daemon .rs by $task"
+        local head_n base_n stubbed=()
+        for f in ${rs[@]+"${rs[@]}"}; do
+            head_n="$(grep -cE "$STUB_PATTERN" "$REPO/$f" || true)"
+            base_n="$(git -C "$REPO" show "$BASE:$f" 2>/dev/null | grep -cE "$STUB_PATTERN" || true)"
+            if [[ "${head_n:-0}" -gt "${base_n:-0}" ]]; then
+                stubbed+=("$f")
+                printf 'stub markers in %s (%s at HEAD, %s on %s):\n' "$f" "$head_n" "${base_n:-0}" "$BASE"
+                grep -nE "$STUB_PATTERN" "$REPO/$f" | sed 's/^/  /'
+            fi
+        done
+        if [[ ${#stubbed[@]} -gt 0 ]]; then
+            record FAIL stubs "stub markers in ${#stubbed[@]} touched daemon .rs files (more than on $BASE)"
         else
-            record PASS stubs "${#rs[@]} daemon .rs files, 0 stub markers added"
+            record PASS stubs "${#rs[@]} daemon .rs files, no stub markers beyond $BASE"
         fi
     fi
 
@@ -622,8 +631,8 @@ self_test() {
     r="$(fresh_repo stub-nested)"
     printf '\npub fn later() -> u32 {\n    todo!()\n}\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-101: stub"
     run_case stub-nested 1 "$r" 0 T-101 daemon/fx/src/lib.rs
-    expect_text stub-nested "stub markers added to daemon .rs by T-101"
-    expect_text stub-nested "+    todo!()"
+    expect_text stub-nested "stub markers in 1 touched daemon .rs files"
+    expect_text stub-nested "    todo!()"
     verdict "18 todo!() added under daemon/fx/src -> exit 1 naming the marker"
 
     # 19. Real cargo, a compile error: the check gate itself records FAIL with cargo's own diagnostic, so a validator
@@ -647,6 +656,20 @@ self_test() {
     run_case unowned-floor 1 "$r" 0 --floor-only
     expect_text unowned-floor "1 commits name no task id in the subject (A-10)"
     verdict "20b the same commit -> --floor-only exit 1"
+
+    # 21. A scaffold stub committed by T-003 and LEFT in place by a later task that touches the same file fails that
+    # later task, although the later task added no marker itself (spec: markers "in touched non-stub files").
+    r="$(fresh_repo stub-left)"
+    printf '\npub fn scaffold() -> Result<(), String> {\n    Err("not implemented: T-101".into())\n}\n' >>"$r/daemon/fx/src/lib.rs" \
+        && commit "$r" "T-003: scaffold stub"
+    run_case stub-left-003 0 "$r" 0 T-003 daemon/fx/src/lib.rs
+    expect_text stub-left-003 "T-003 is the declared scaffold task"
+    verdict "21a T-003 may commit a scaffold stub"
+    printf '\n// unrelated edit\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-101: touch the file, keep the stub"
+    run_case stub-left 1 "$r" 0 T-101 daemon/fx/src/lib.rs
+    expect_text stub-left "stub markers in 1 touched daemon .rs files"
+    expect_text stub-left "not implemented: T-101"
+    verdict "21b a later task leaving the scaffold stub in a touched file -> exit 1"
 
     echo
     echo "self-test: $pass passed, $fail failed"
