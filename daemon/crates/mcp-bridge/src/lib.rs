@@ -18,6 +18,8 @@ pub mod agy_resilience;
 /// Shared PostHog telemetry. Every crate that dispatches an agent emits through this.
 pub mod posthog;
 pub mod stall;
+/// The seat table (Seven Primes FEAT-001, REQ-011): one typed row per seat. Consumers move onto it in T-202/T-204.
+pub mod seat_profile;
 /// Whether that telemetry actually ARRIVES, which the sending side cannot tell (D-018).
 pub mod telemetry_delivery;
 
