@@ -564,4 +564,74 @@ mod tests {
             assert_eq!(p.as_str(), s);
         }
     }
+
+    /// The census (REQ-010, T-004): every roster key has exactly one row, every row is on the roster, keys are unique.
+    /// Takes the roster as an argument, which is the test-only injection hook the meta-test below uses.
+    fn census(roster: &[&str]) -> Vec<String> {
+        let mut problems = Vec::new();
+        for key in roster {
+            match all_seats().iter().filter(|s| s.key == *key).count() {
+                0 => problems.push(format!("missing SeatProfile row: {key}")),
+                1 => {}
+                n => problems.push(format!("duplicate SeatProfile rows ({n}): {key}")),
+            }
+        }
+        for s in all_seats() {
+            if !roster.contains(&s.key) {
+                problems.push(format!("SeatProfile row not on the roster: {}", s.key));
+            }
+        }
+        problems
+    }
+
+    /// RED IF: the roster (`supported_agent_names`) and the table disagree in either direction.
+    #[test]
+    fn census_roster_equals_profile_keys() {
+        assert_eq!(census(crate::supported_agent_names()), Vec::<String>::new());
+    }
+
+    /// The census must catch a missing row for ANY name, not a fixed one: the injected key is random per run.
+    /// RED IF: the census special-cases names, or stops checking the roster against the table.
+    #[test]
+    fn census_meta_test_catches_a_random_missing_row() {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let injected = format!("zzz-{:016x}", h.finish());
+        let mut roster: Vec<&str> = crate::supported_agent_names().to_vec();
+        roster.push(&injected);
+        assert_eq!(
+            census(&roster),
+            vec![format!("missing SeatProfile row: {injected}")]
+        );
+        // And the other direction: a row whose key left the roster is reported too.
+        let short: Vec<&str> = crate::supported_agent_names()
+            .iter()
+            .copied()
+            .filter(|k| *k != "grok")
+            .collect();
+        assert_eq!(
+            census(&short),
+            vec!["SeatProfile row not on the roster: grok".to_string()]
+        );
+    }
+
+    /// Every row's key is canonical (normalizing it is a no-op) and unique, so no alias can name two seats.
+    /// RED IF: a row is keyed by an alias, or two rows share a key.
+    #[test]
+    fn row_keys_are_canonical_and_unique() {
+        let keys: Vec<&str> = all_seats().iter().map(|s| s.key).collect();
+        for k in &keys {
+            assert_eq!(crate::normalize_agent_name(k), *k, "{k} must be canonical");
+        }
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "duplicate row keys: {keys:?}");
+    }
 }

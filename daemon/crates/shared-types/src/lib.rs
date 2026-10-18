@@ -1328,3 +1328,44 @@ mod origin_tests {
         assert!(serde_json::from_str::<Origin>("\"robot\"").is_err());
     }
 }
+
+/// Seven Primes T-004 (REQ-002): aliases normalize once, to exactly one canonical seat, and never collide with a key.
+/// RED IF: an alias stops mapping to its seat, a canonical key stops being a fixed point, or two seats share an alias.
+#[cfg(test)]
+mod alias_census_tests {
+    use super::normalize_agent_name;
+
+    const CANONICAL: [&str; 5] = ["gemini", "codex", "deepseek", "claude", "grok"];
+    const ALIASES: [(&str, &str); 5] = [
+        ("antigravity", "gemini"),
+        ("agy", "gemini"),
+        ("grok-build", "grok"),
+        ("xai", "grok"),
+        ("supergrok", "grok"),
+    ];
+
+    #[test]
+    fn aliases_normalize_once_to_one_seat() {
+        for k in CANONICAL {
+            assert_eq!(normalize_agent_name(k), k, "canonical {k} is a fixed point");
+            assert_eq!(
+                normalize_agent_name(&k.to_uppercase()),
+                k,
+                "case-insensitive {k}"
+            );
+        }
+        for (alias, seat) in ALIASES {
+            assert_eq!(normalize_agent_name(alias), seat, "{alias}");
+            // Normalizing is idempotent: an alias resolves in one step, never through a chain.
+            assert_eq!(
+                normalize_agent_name(&normalize_agent_name(alias)),
+                seat,
+                "{alias}"
+            );
+            assert!(
+                !CANONICAL.contains(&alias),
+                "alias {alias} collides with a canonical key"
+            );
+        }
+    }
+}
