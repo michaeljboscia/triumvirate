@@ -179,9 +179,15 @@ pub async fn launch(input: &RunWorkerInput) -> Result<(Option<tokio::process::Ch
 /// `TRIUMVIRATE_FLEET_STALL_SECS_<AGENT>` sets one; that override also changes a default, and
 /// `0` turns the rule off for that agent.
 pub fn stall_window(agent: &str) -> Option<Duration> {
-    let key = format!("TRIUMVIRATE_FLEET_STALL_SECS_{}", agent.to_ascii_uppercase());
+    let key = format!(
+        "TRIUMVIRATE_FLEET_STALL_SECS_{}",
+        agent.to_ascii_uppercase()
+    );
     // Seven Primes T-202: the default is the seat's `SeatProfile.fleet_stall_window` (A-7: read through `fleet`).
-    let secs = match std::env::var(&key).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+    let secs = match std::env::var(&key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
         Some(v) => v,
         None => match fleet::seat_profile::seat_profile(&shared_types::normalize_agent_name(agent))
             .map(|row| row.fleet_stall_window)

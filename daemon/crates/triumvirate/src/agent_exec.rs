@@ -3260,8 +3260,9 @@ fn enforce_reviewer_sight(
              file READ from a search or a shell command, so `required_sources` cannot be \
              enforced on it and a pass would be theatre. Drop required_sources for this agent \
              and rely on the weaker any-tool-call check, or route the review to a peer whose \
-             parser classifies reads ({})."
-        , parser_modes_that_classify_reads().join(", "));
+             parser classifies reads ({}).",
+            parser_modes_that_classify_reads().join(", ")
+        );
         lifecycle.push(LifecycleEvent {
             state: "REJECTED".to_string(),
             detail: detail.clone(),

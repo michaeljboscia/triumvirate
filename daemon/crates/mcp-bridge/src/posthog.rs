@@ -1412,9 +1412,6 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
             // quietly ran gemini-cli for four days against a config that said agy. Absent
             // (null) when the agent has only one backend, never invented.
             "tv_backend":          g.backend,
-            // Seven Primes REQ-043: requested and answering model, separately, for every seat. Null when unknown.
-            "tv_configured_model": g.configured_model,
-            "tv_served_model":     g.served_model,
             // Attempts spent against the PRIMARY provider only. gemini-cli's faildown chain
             // can burn 4 per request, so quota-vs-events is a 4x lie without this. Named
             // "primary" deliberately: the degraded cross-provider hop (agy -> codex) is NOT
@@ -1451,6 +1448,10 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
     if is_error {
         props["$ai_error"] = json!(cap_error_text(&error_text(g.outcome, g.error)));
     }
+    // Seven Primes REQ-043: requested and answering model, separately, for every seat; null when unknown. Inserted
+    // after the literal (like $ai_input below) so the column-aligned block above stays as its authors wrote it.
+    props["tv_configured_model"] = json!(g.configured_model);
+    props["tv_served_model"] = json!(g.served_model);
     if let Some(s) = g.input {
         props["$ai_input"] = json!([{ "role": "user", "content": mask_and_cap_content(s) }]);
     }
@@ -1528,11 +1529,26 @@ mod tests {
 
     fn generation(outcome: &str, error: Option<&str>) -> serde_json::Value {
         ai_generation_props(&AiGeneration {
-            agent: "codex", model: None, outcome, trace_id: "t", input_tokens: None,
-            output_tokens: None, cached_tokens: None, thinking_tokens: None, tool_calls: None,
-            duration_ms: 1, cost_usd: None, billing: "subscription", configured_model: None,
-            served_model: None, backend: None, attempts: 1,
-            repo: None, input: None, output: None, error,
+            agent: "codex",
+            model: None,
+            outcome,
+            trace_id: "t",
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            thinking_tokens: None,
+            tool_calls: None,
+            duration_ms: 1,
+            cost_usd: None,
+            billing: "subscription",
+            configured_model: None,
+            served_model: None,
+            backend: None,
+            attempts: 1,
+            repo: None,
+            input: None,
+            output: None,
+            error,
         })
     }
 
