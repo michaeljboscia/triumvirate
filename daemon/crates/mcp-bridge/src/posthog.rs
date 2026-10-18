@@ -346,11 +346,25 @@ enum Billing {
 /// Prices are USD per 1M tokens, from DeepSeek's official pricing page
 /// (https://api-docs.deepseek.com/quick_start/pricing/, checked 2026-07-12). If a model is not
 /// listed here we return UnknownPrice and emit no cost, a wrong cost is worse than no cost.
+///
+/// Seven Primes T-202: the billing CLASS is the seat's SeatProfile row (REQ-012), so a seat cannot be added without a
+/// billing decision; the DeepSeek per-model table below prices the metered class. A name with no row is UnknownPrice.
 fn billing_for(agent: &str, model: Option<&str>) -> Billing {
-    match agent {
-        // Subscription-backed: ChatGPT OAuth (codex), Max plan (claude), Google plan (gemini/agy).
-        "codex" | "claude" | "gemini" => Billing::Subscription,
-        "deepseek" => match model.unwrap_or("deepseek-v4-flash") {
+    match crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent)) {
+        Some(row) => billing_for_row(row, model),
+        None => Billing::UnknownPrice,
+    }
+}
+
+/// The pure mapping from a seat row (and the model, for the metered class) to its billing.
+fn billing_for_row(row: &crate::seat_profile::SeatProfile, model: Option<&str>) -> Billing {
+    use crate::seat_profile::BillingClass;
+    match row.billing {
+        // Subscription-backed: ChatGPT OAuth (codex), Max plan (claude), Google plan (gemini/agy), SuperGrok (grok),
+        // and the three new seats' plans. One more call on a fixed plan costs a real 0.0.
+        BillingClass::Subscription => Billing::Subscription,
+        // D-020 (an absent model priced as v4-flash) is deliberately NOT changed here: D-01 keeps it for its own PR.
+        BillingClass::Metered(_) => match model.unwrap_or("deepseek-v4-flash") {
             // deepseek-chat / deepseek-reasoner are the legacy aliases of v4-flash.
             "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => Billing::Metered {
                 cache_hit_in: 0.0028,
@@ -364,7 +378,6 @@ fn billing_for(agent: &str, model: Option<&str>) -> Billing {
             },
             _ => Billing::UnknownPrice,
         },
-        _ => Billing::UnknownPrice,
     }
 }
 
@@ -380,14 +393,26 @@ fn billing_for(agent: &str, model: Option<&str>) -> Billing {
 /// Observed live and impossible under the subset assumption: `input=46, cached=256`.
 ///
 /// Returns `(total_prompt, cache_hit, cache_miss)`, normalized.
+///
+/// Seven Primes T-202: the convention is the seat's `SeatProfile.prompt_usage`. A name with no row keeps the subset
+/// reading, which was this function's behavior for every non-deepseek name.
 fn normalize_prompt(agent: &str, input: u64, cached: u64) -> (u64, u64, u64) {
-    if agent == "deepseek" {
+    use crate::seat_profile::PromptUsage;
+    let usage = crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent))
+        .map_or(PromptUsage::CachedSubsetOfInput, |row| row.prompt_usage);
+    normalize_prompt_as(usage, input, cached)
+}
+
+/// The pure normalization for one convention.
+fn normalize_prompt_as(usage: crate::seat_profile::PromptUsage, input: u64, cached: u64) -> (u64, u64, u64) {
+    match usage {
         // disjoint: input IS the miss count
-        (input + cached, cached, input)
-    } else {
+        crate::seat_profile::PromptUsage::CachedDisjoint => (input + cached, cached, input),
         // subset: cached is part of input
-        let hit = cached.min(input);
-        (input, hit, input - hit)
+        crate::seat_profile::PromptUsage::CachedSubsetOfInput => {
+            let hit = cached.min(input);
+            (input, hit, input - hit)
+        }
     }
 }
 
@@ -416,14 +441,11 @@ fn cost_usd(
     }
 }
 
-/// Map an agent to the provider PostHog expects in `$ai_provider`.
+/// Map an agent to the provider PostHog expects in `$ai_provider`: the seat row's OpenRouter slug (D-022, A-7), or
+/// "unknown" for a name with no row, never the agent's own name.
 fn provider_for(agent: &str) -> &'static str {
-    match agent {
-        "gemini" => "google",
-        "codex" => "openai",
-        "deepseek" => "deepseek",
-        _ => "unknown",
-    }
+    crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent))
+        .map_or("unknown", |row| row.provider.as_str())
 }
 
 /// Emit a `$ai_generation` event. No-op unless POSTHOG_HOST and POSTHOG_API_KEY are both set.
@@ -1769,15 +1791,17 @@ mod tests {
         assert_eq!(provider("gemini"), "google");
         assert_eq!(provider("codex"), "openai");
         assert_eq!(provider("deepseek"), "deepseek");
-        assert_eq!(provider("claude"), "unknown");
-        assert_eq!(provider("grok"), "unknown");
+        // T-202 (D-01, D-022): the two intended fixes. Were "unknown" in T-001's pin.
+        assert_eq!(provider("claude"), "anthropic");
+        assert_eq!(provider("grok"), "x-ai");
 
         // The billing label as cost_usd reports it ("subscription" | "metered" | "unknown").
         let billing = |a, m| cost_usd(a, m, 0, 0, None).1;
         assert_eq!(billing("gemini", None), "subscription");
         assert_eq!(billing("codex", None), "subscription");
         assert_eq!(billing("claude", None), "subscription");
-        assert_eq!(billing("grok", None), "unknown");
+        // T-202 (D-01, D-023): the intended fix. Was "unknown" in T-001's pin.
+        assert_eq!(billing("grok", None), "subscription");
         assert_eq!(billing("deepseek", None), "metered");
         assert_eq!(billing("deepseek", Some("deepseek-v4-pro")), "metered");
         assert_eq!(billing("deepseek", Some("deepseek-chat")), "metered");
@@ -1791,5 +1815,115 @@ mod tests {
             // A cached count above input clamps to input under the subset convention.
             assert_eq!(normalize_prompt(subset, 10, 40), (10, 10, 0), "{subset}");
         }
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Agent attribution, ported from c1526bf (D-01: D-022 and D-023; D-020 stays for its own PR).
+    //
+    // All the defects below are the SAME shape: a match statement that enumerates agents, and an agent that was
+    // never added to it. Seven Primes T-202 removes the match: provider and billing are SeatProfile data. These tests
+    // walk `supported_agent_names()` rather than restating the roster.
+    // ----------------------------------------------------------------------------------------
+
+    /// Every supported seat maps to a real provider.
+    ///
+    /// D-022: `grok` and `claude` both fell through `_ => "unknown"`. Grok had 535 live rows; claude had none only
+    /// because the seat was unexercised.
+    ///
+    /// RED IF: a seat is added to the roster without a provider, or provider_for stops reading the row.
+    #[test]
+    fn every_supported_agent_has_a_provider() {
+        for agent in crate::supported_agent_names() {
+            let provider = provider_for(agent);
+            assert_ne!(provider, "unknown", "{agent} charts as an unattributed provider");
+            assert!(!provider.is_empty(), "{agent} maps to an empty provider");
+        }
+    }
+
+    /// Aliases resolve to the same provider as the canonical key.
+    /// RED IF: normalization stops being applied before telemetry.
+    #[test]
+    fn agent_aliases_resolve_to_the_same_provider() {
+        for (alias, canonical) in shared_types::AGENT_ALIASES {
+            assert_eq!(crate::normalize_agent_name(alias), *canonical, "{alias}");
+            assert_eq!(provider_for(alias), provider_for(canonical), "{alias} must chart as {canonical}");
+        }
+    }
+
+    /// Every supported seat is CLASSIFIED as subscription-backed or metered; the table covers the roster exactly, so
+    /// a new seat fails here with "no billing expectation" instead of charting as unknown.
+    /// RED IF: grok leaves the subscription class (D-023), or a seat is added without a billing decision.
+    #[test]
+    fn every_supported_agent_has_a_billing_classification() {
+        let expectations: &[(&str, Option<&str>)] = &[
+            ("gemini", None),
+            ("codex", None),
+            ("claude", None),
+            ("grok", None),
+            ("deepseek", Some("deepseek-v4-pro")),
+            ("kimi", None),
+            ("mistral", None),
+            ("qwen", None),
+        ];
+        let roster: std::collections::BTreeSet<&str> = crate::supported_agent_names().iter().copied().collect();
+        let covered: std::collections::BTreeSet<&str> = expectations.iter().map(|(a, _)| *a).collect();
+        assert_eq!(roster, covered, "a seat with no billing expectation is a seat whose cost nobody decided");
+        for (agent, model) in expectations {
+            match billing_for(agent, *model) {
+                Billing::Subscription => assert!(model.is_none(), "{agent} is subscription-backed"),
+                Billing::Metered { .. } => assert!(model.is_some(), "{agent} is metered: name its model"),
+                Billing::UnknownPrice => panic!("{agent} has no billing classification"),
+            }
+        }
+    }
+
+    /// Grok is a fixed-plan seat, so one more call costs a REAL zero, not an unknown (D-023).
+    /// RED IF: grok leaves the subscription class.
+    #[test]
+    fn grok_is_a_subscription_seat_priced_at_a_real_zero() {
+        let (usd, label) = cost_usd("grok", None, 1_000_000, 26_597_794, Some(3_644_973));
+        assert_eq!((usd, label), (Some(0.0), "subscription"));
+    }
+
+    /// A recognised model still prices.
+    #[test]
+    fn a_named_deepseek_model_still_prices() {
+        for model in ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro"] {
+            let (usd, label) = cost_usd("deepseek", Some(model), 0, 1_000_000, Some(1_000_000));
+            assert_eq!(label, "metered", "{model}");
+            assert!(usd.unwrap_or(0.0) > 0.0, "{model} must produce a real cost");
+        }
+    }
+
+    /// An agent nobody supports is refused in every mapping: the negative control for the roster tests above.
+    #[test]
+    fn an_unsupported_agent_is_refused_not_guessed() {
+        assert!(!crate::is_supported_agent_name("llama"));
+        assert_eq!(provider_for("llama"), "unknown");
+        assert!(matches!(billing_for("llama", None), Billing::UnknownPrice));
+        assert_eq!(cost_usd("llama", None, 0, 500, Some(500)), (None, "unknown"));
+    }
+
+    /// Seven Primes T-202 consumer tests: each consumer's output for a new seat equals that seat's row value, and
+    /// changing the row value changes the output (so the consumer reads the row, not a constant).
+    /// RED IF: provider, billing or the prompt convention stops being derived from SeatProfile.
+    #[test]
+    fn seven_primes_consumers_read_the_seat_row() {
+        use crate::seat_profile::{BillingClass, DeepSeekPricing, PromptUsage, Provider, seat_profile};
+        assert_eq!(provider_for("kimi"), "moonshotai");
+        assert_eq!(provider_for("mistral"), "mistralai");
+        assert_eq!(provider_for("qwen"), "qwen");
+        for seat in ["kimi", "mistral", "qwen"] {
+            assert_eq!(cost_usd(seat, None, 0, 9, Some(9)), (Some(0.0), "subscription"), "{seat}");
+            assert_eq!(normalize_prompt(seat, 100, 40), (100, 40, 60), "{seat}: provisional subset");
+        }
+        let mut row = seat_profile("kimi").unwrap().clone();
+        assert!(matches!(billing_for_row(&row, None), Billing::Subscription));
+        row.billing = BillingClass::Metered(DeepSeekPricing);
+        assert!(matches!(billing_for_row(&row, Some("deepseek-v4-pro")), Billing::Metered { .. }));
+        row.provider = Provider::OpenAi;
+        assert_eq!(row.provider.as_str(), "openai");
+        assert_eq!(normalize_prompt_as(PromptUsage::CachedDisjoint, 100, 40), (140, 40, 100));
+        assert_eq!(normalize_prompt_as(PromptUsage::CachedSubsetOfInput, 100, 40), (100, 40, 60));
     }
 }

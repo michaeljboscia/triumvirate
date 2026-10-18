@@ -49,7 +49,8 @@ impl Surface {
     ];
 }
 
-/// `$ai_provider` in telemetry (REQ-012, REQ-043).
+/// `$ai_provider` in telemetry (REQ-012, REQ-043). The strings are OpenRouter's provider slugs, because PostHog
+/// matches `$ai_provider` + `$ai_model` against OpenRouter pricing first (c1526bf, D-022; amendment A-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     OpenAi,
@@ -68,12 +69,12 @@ impl Provider {
         match self {
             Provider::OpenAi => "openai",
             Provider::Google => "google",
-            Provider::XAi => "xai",
+            Provider::XAi => "x-ai",
             Provider::Anthropic => "anthropic",
             Provider::DeepSeek => "deepseek",
-            Provider::Moonshot => "moonshot",
-            Provider::Mistral => "mistral",
-            Provider::Alibaba => "alibaba",
+            Provider::Moonshot => "moonshotai",
+            Provider::Mistral => "mistralai",
+            Provider::Alibaba => "qwen",
         }
     }
 }
@@ -336,7 +337,9 @@ pub const NEW_SEAT_LAUNCH_SURFACES: &[Surface] = &[
 const NEW_SEAT: SeatProfile = SeatProfile {
     key: "",
     display_name: "",
-    provider: Provider::Moonshot,
+    // A placeholder that is WRONG for every new seat, on purpose: each row must set its own provider, and a row that
+    // forgets fails `new_rows_carry_the_launch_contract` instead of inheriting a plausible value.
+    provider: Provider::OpenAi,
     billing: BillingClass::Subscription,
     stall_window: StallWindow::Secs(780),
     fleet_stall_window: StallWindow::Disabled,
@@ -637,7 +640,7 @@ mod tests {
         assert_eq!(row("gemini").provider.as_str(), "google");
         assert_eq!(row("codex").provider.as_str(), "openai");
         assert_eq!(row("deepseek").provider.as_str(), "deepseek");
-        assert_eq!(row("grok").provider.as_str(), "xai", "D-01 target");
+        assert_eq!(row("grok").provider.as_str(), "x-ai", "D-01 target");
         assert_eq!(row("claude").provider.as_str(), "anthropic", "D-01 target");
 
         assert_eq!(
@@ -734,12 +737,12 @@ mod tests {
         let all = [
             (Provider::OpenAi, "openai"),
             (Provider::Google, "google"),
-            (Provider::XAi, "xai"),
+            (Provider::XAi, "x-ai"),
             (Provider::Anthropic, "anthropic"),
             (Provider::DeepSeek, "deepseek"),
-            (Provider::Moonshot, "moonshot"),
-            (Provider::Mistral, "mistral"),
-            (Provider::Alibaba, "alibaba"),
+            (Provider::Moonshot, "moonshotai"),
+            (Provider::Mistral, "mistralai"),
+            (Provider::Alibaba, "qwen"),
         ];
         for (p, s) in all {
             assert_eq!(p.as_str(), s);
