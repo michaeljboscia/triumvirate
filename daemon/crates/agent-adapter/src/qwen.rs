@@ -61,17 +61,19 @@ impl QwenStreamParser {
                 return None;
             }
         };
-        let event = match value.get("type").and_then(Value::as_str) {
-            Some("system") => self.on_system(&value),
-            Some("assistant") => self.on_assistant(&value),
-            Some("user") => self.on_user(&value),
-            Some("result") => self.on_result(&value),
+        // assistant and user lines can carry several content blocks; their handlers record every block's event
+        // themselves and return the last one, so only single-event handlers are recorded here.
+        let (event, recorded) = match value.get("type").and_then(Value::as_str) {
+            Some("system") => (self.on_system(&value), false),
+            Some("assistant") => (self.on_assistant(&value), true),
+            Some("user") => (self.on_user(&value), true),
+            Some("result") => (self.on_result(&value), false),
             other => {
                 tracing::debug!(event_type = ?other, "qwen stream: ignoring unknown event type");
-                None
+                (None, true)
             }
         };
-        if let Some(ev) = &event {
+        if !recorded && let Some(ev) = &event {
             self.events.push(ev.clone());
         }
         event
@@ -163,7 +165,8 @@ impl QwenStreamParser {
 
     fn on_assistant(&mut self, value: &Value) -> Option<WorkingStateEvent> {
         self.recognized = true;
-        self.note_session(value);
+        // No note_session here: the id `--resume` takes is session_start's (BACKEND_STRUCTURE section 6), never an
+        // assistant or result line's.
         let message = value.get("message")?;
         if let Some(model) = message.get("model").and_then(Value::as_str)
             && !model.is_empty()
@@ -186,7 +189,9 @@ impl QwenStreamParser {
                         && !t.is_empty()
                     {
                         self.text_parts.push(t.to_string());
-                        last = Some(event(WorkingState::MessageDelta, t, None, None));
+                        let ev = event(WorkingState::MessageDelta, t, None, None);
+                        self.events.push(ev.clone());
+                        last = Some(ev);
                     }
                 }
                 Some("tool_use") => {
@@ -208,12 +213,14 @@ impl QwenStreamParser {
                         returned_lines: Vec::new(),
                         shown_output: None,
                     });
-                    last = Some(event(
+                    let ev = event(
                         WorkingState::ToolCallStarted,
                         &tool,
                         Some(tool.clone()),
                         args_json,
-                    ));
+                    );
+                    self.events.push(ev.clone());
+                    last = Some(ev);
                 }
                 _ => {}
             }
@@ -244,12 +251,14 @@ impl QwenStreamParser {
                 .find(|r| id.is_some() && r.id.as_deref() == id)
             {
                 rec.success = Some(!failed);
-                last = Some(event(
+                let ev = event(
                     WorkingState::ToolCallCompleted,
                     &rec.tool,
                     Some(rec.tool.clone()),
                     rec.args_json.clone(),
-                ));
+                );
+                self.events.push(ev.clone());
+                last = Some(ev);
             }
         }
         last
@@ -257,7 +266,6 @@ impl QwenStreamParser {
 
     fn on_result(&mut self, value: &Value) -> Option<WorkingStateEvent> {
         self.recognized = true;
-        self.note_session(value);
         let mut usage = value.get("usage").and_then(usage_from);
         if let (Some(u), Some(ms)) = (
             usage.as_mut(),
@@ -476,6 +484,40 @@ mod tests {
             parse(&no_result, Some(0)).outcome,
             SeatOutcome::Failure("missing_result:qwen".to_string())
         );
+    }
+
+    /// The session id comes ONLY from system/session_start (BACKEND_STRUCTURE section 6): ids on assistant or result
+    /// lines are never used, whether session_start lacks one or carries a different one.
+    /// RED IF: the parser takes a session id from any line other than session_start.
+    #[test]
+    fn session_id_comes_only_from_session_start() {
+        let lines = |start: &str| {
+            [
+                format!(r#"{{"type":"system","subtype":"session_start"{start},"model":"qwen3-coder-plus"}}"#),
+                r#"{"type":"assistant","session_id":"s-other","message":{"role":"assistant","model":"qwen3-coder-plus","content":[{"type":"text","text":"hi"}]}}"#.to_string(),
+                r#"{"type":"result","subtype":"success","session_id":"s-late","is_error":false,"result":"hi"}"#.to_string(),
+            ]
+            .join("\n")
+        };
+        assert_eq!(parse(&lines(""), Some(0)).result.session_id, None);
+        assert_eq!(
+            parse(&lines(r#","session_id":"s-1""#), Some(0))
+                .result
+                .session_id
+                .as_deref(),
+            Some("s-1")
+        );
+    }
+
+    /// RED IF: a line with several content blocks records only its last block's event.
+    #[test]
+    fn every_content_block_records_its_event() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","model":"qwen3-coder-plus","content":[{"type":"text","text":"looking"},{"type":"tool_use","id":"t1","name":"read_file","input":{"absolute_path":"/repo/a.rs"}}]}}"#;
+        let mut p = QwenStreamParser::new();
+        let last = p.parse_line(line).expect("an event");
+        assert!(matches!(last.state, WorkingState::ToolCallStarted));
+        let states: Vec<_> = p.events.iter().map(|e| format!("{:?}", e.state)).collect();
+        assert_eq!(states, ["MessageDelta", "ToolCallStarted"]);
     }
 
     /// RED IF: a malformed line, a partial trailing line or an unknown event aborts the parse or loses the rest.

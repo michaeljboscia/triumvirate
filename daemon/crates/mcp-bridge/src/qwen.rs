@@ -224,11 +224,13 @@ mod tests {
         r.model = Some("qwen3.7-plus");
         let inv = build_qwen_invocation(&r).unwrap();
         assert_eq!(after(&inv.args, "-m").as_deref(), Some("qwen3.7-plus"));
-        r.model = Some("glm-5");
-        assert_eq!(
-            build_qwen_invocation(&r).unwrap_err(),
-            "qwen_seat_configured_non_qwen_model: glm-5"
-        );
+        for other in ["glm-5", "claude-sonnet-4", "kimi-k2"] {
+            r.model = Some(other);
+            assert_eq!(
+                build_qwen_invocation(&r).unwrap_err(),
+                format!("qwen_seat_configured_non_qwen_model: {other}")
+            );
+        }
     }
 
     /// RED IF: the child env can inherit QWEN_CODE_UNATTENDED_RETRY from the daemon env.
@@ -264,13 +266,25 @@ mod tests {
     /// RED IF: an operator can smuggle a writer, resume or override flag through extra args.
     #[test]
     fn forbidden_extra_args_are_rejected() {
+        // Independent of FORBIDDEN_EXTRA_ARGS, so dropping any flag from that list turns this red.
         for bad in [
             "--continue",
             "--yolo",
             "-y",
+            "--approval-mode",
             "--approval-mode=yolo",
+            "--resume",
+            "--output-format",
+            "--output-format=json",
+            "-o",
+            "-p",
+            "--prompt",
+            "-m",
             "--model",
+            "--model=glm-5",
+            "--safe-mode",
             "--exclude-tools",
+            "--allowed-tools",
         ] {
             let extra = vec![bad.to_string()];
             assert_eq!(
@@ -326,5 +340,11 @@ mod tests {
         assert!(check_served_model("qwen3-coder-plus").is_ok());
         assert!(check_served_model("Qwen3.7-Plus").is_ok());
         assert!(check_served_model("").is_err());
+        for other in ["claude-sonnet-4", "kimi-k2", "gpt-5"] {
+            assert_eq!(
+                check_served_model(other).unwrap_err(),
+                format!("qwen_seat_served_non_qwen_model: {other}")
+            );
+        }
     }
 }
