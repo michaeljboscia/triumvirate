@@ -157,12 +157,14 @@ floor_rustfmt() {
     if [[ $rc -eq 0 ]]; then record PASS rustfmt "$# files formatted"; else record FAIL rustfmt "$# files, exit $rc"; fi
 }
 
-# No new crates: any Cargo.lock change, or any change to a dependency table of any Cargo.toml, in BASE..HEAD fails.
+# No new crates: any change to daemon/Cargo.lock, or to a dependency table of a Cargo.toml under daemon/, in BASE..HEAD fails.
+# Scoped to daemon/ like the Rust checks: the self-test fixture workspace under scripts/fixtures/ has its own manifests and
+# lockfile, which are fixtures, not dependencies of the build (amendment A-3).
 floor_dependencies() {
     local changed locks tomls f old new verdict rc
     changed="$(git -C "$REPO" diff --name-only "$BASE..HEAD")"
-    locks="$(printf '%s\n' "$changed" | grep -E '(^|/)Cargo\.lock$' || true)"
-    tomls="$(printf '%s\n' "$changed" | grep -E '(^|/)Cargo\.toml$' || true)"
+    locks="$(printf '%s\n' "$changed" | grep -E '^daemon/(.*/)?Cargo\.lock$' || true)"
+    tomls="$(printf '%s\n' "$changed" | grep -E '^daemon/(.*/)?Cargo\.toml$' || true)"
     if [[ -n "$locks" ]]; then
         echo "dependencies: Cargo.lock changed: $locks"
         record FAIL deps "Cargo.lock changed ($locks): the build adds no crates"
@@ -424,6 +426,15 @@ self_test() {
     run_case package-only 0 "$r" 0 T-000 daemon/fx/Cargo.toml
     expect_text package-only "no dependency-table change"
     verdict "7 [package] description edit only -> exit 0"
+
+    # 7b. A dependency change in a fixture workspace OUTSIDE daemon/ is not a build dependency and passes.
+    r="$(fresh_repo outside-daemon)"
+    mkdir -p "$r/scripts/fixtures" && cp -R "$r/daemon" "$r/scripts/fixtures/ws"
+    printf 'fz = { path = "../fz" }\n' >>"$r/scripts/fixtures/ws/fx/Cargo.toml" && printf '\n' >>"$r/scripts/fixtures/ws/Cargo.lock"
+    commit "$r" "T-000: fixture workspace outside daemon"
+    run_case outside-daemon 0 "$r" 0 T-000 scripts/fixtures/
+    expect_text outside-daemon "0 Cargo.lock changes, 0 Cargo.toml examined"
+    verdict "7b dependency edit in a fixture workspace outside daemon/ -> exit 0"
 
     # 8. No semgrep on PATH is a FAIL with the missing-tool message, not a skip. The shim PATH keeps every other tool.
     r="$(fresh_repo no-semgrep)"
