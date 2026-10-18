@@ -748,4 +748,38 @@ mod tests {
         let src = include_str!("main.rs");
         assert!(src.contains("blind_validate::tool_impl(req).await?"));
     }
+
+    /// Seven Primes T-001 (REQ-010, REQ-011) characterization of `CANNOT_WRITE_HERE`, the seats that can never be a
+    /// blind validator. The const is local to `run_with_trees`, so it is pinned through behavior: a roster of only
+    /// non-writers is refused with an error that prints the whole list. An empty baseline dir is enough, because
+    /// `cargo_test` returns a missing manifest as output, not as an error, and the roster filter runs next. No agent
+    /// is ever spawned: every roster here is filtered to empty.
+    /// RED IF: the list gains or loses a seat, or either current non-writer stops being refused on its own.
+    #[tokio::test]
+    async fn seven_primes_characterization_cannot_write_here() {
+        let _g = env_guard();
+        assert!(
+            have("cargo"),
+            "cargo must be on PATH: a skipped characterization pins nothing"
+        );
+        for roster in [vec!["grok"], vec!["deepseek"], vec!["GROK", "DeepSeek"]] {
+            let base = tempfile::tempdir().expect("tempdir");
+            let req = LiveBlindValidation {
+                project_root: base.path().to_path_buf(),
+                impl_worktree: base.path().to_path_buf(),
+                contract: "c".to_string(),
+                base_ref: "HEAD".to_string(),
+                worker_agent: "codex".to_string(),
+                roster: roster.iter().map(|s| s.to_string()).collect(),
+                package_dir: ".".to_string(),
+            };
+            let err = run_with_trees(&req, base.path(), base.path())
+                .await
+                .expect_err("a roster of non-writers cannot validate");
+            assert!(
+                err.contains(r#"["grok", "deepseek"] cannot here"#),
+                "{roster:?}: {err}"
+            );
+        }
+    }
 }

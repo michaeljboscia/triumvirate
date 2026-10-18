@@ -11467,3 +11467,96 @@ mod unexecuted_tool_marker_tests {
         assert!(unexecuted_tool_marker("Codex", junk).expect("still a marker").contains("(unparsed)"));
     }
 }
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization: today's per-agent dispatch policy for the five existing
+/// seats, pinned before T-202 moves these sites onto the SeatProfile table. Each assertion is the CURRENT value.
+/// RED IF: any seat's live-progress flag, parser-mode allowlist, sight-repair membership or attempt schedule changes.
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn streams_live_progress_per_seat() {
+        assert!(streams_live_progress("gemini", None));
+        assert!(streams_live_progress(
+            "gemini",
+            Some(GeminiBackend::GeminiCli)
+        ));
+        assert!(!streams_live_progress("gemini", Some(GeminiBackend::Agy)));
+        assert!(!streams_live_progress("deepseek", None));
+        for live in ["codex", "grok", "claude"] {
+            assert!(streams_live_progress(live, None), "{live}");
+        }
+    }
+
+    #[test]
+    fn parser_mode_allowlists_and_sight_repair_seats() {
+        assert_eq!(
+            PARSER_MODES_WITH_TOOL_RECORDS,
+            &[
+                "codex-exec-json",
+                "gemini-stream-json",
+                "grok-streaming-json",
+                "agy-stream-json",
+                "claude-stream-json"
+            ]
+        );
+        assert_eq!(
+            PARSER_MODES_THAT_CLASSIFY_READS,
+            &[
+                "gemini-stream-json",
+                "grok-streaming-json",
+                "agy-stream-json",
+                "codex-exec-json",
+                "claude-stream-json"
+            ]
+        );
+        assert_eq!(SIGHT_REPAIR_AGENTS, &["codex", "grok"]);
+    }
+
+    #[test]
+    fn attempt_schedule_per_seat() {
+        let single = vec![(Duration::ZERO, None)];
+        let retried = vec![
+            (Duration::from_millis(250), None),
+            (Duration::from_secs(1), None),
+            (Duration::from_secs(2), None),
+        ];
+        // A sight-gated review is one attempt for every seat.
+        for agent in ["gemini", "codex", "deepseek", "claude", "grok"] {
+            assert_eq!(
+                attempt_schedule_for(agent, None, true, false),
+                single,
+                "{agent} review"
+            );
+        }
+        assert_eq!(attempt_schedule_for("deepseek", None, false, false), single);
+        assert_eq!(attempt_schedule_for("grok", None, false, false), single);
+        assert_eq!(attempt_schedule_for("codex", None, false, false), retried);
+        assert_eq!(attempt_schedule_for("claude", None, false, false), retried);
+        // gemini: agy is single; gemini-cli strict pins the first model; non-strict walks the faildown chain.
+        assert_eq!(
+            attempt_schedule_for("gemini", Some(GeminiBackend::Agy), false, false),
+            single
+        );
+        assert_eq!(
+            attempt_schedule_for("gemini", Some(GeminiBackend::GeminiCli), false, true),
+            vec![(Duration::ZERO, Some(GEMINI_MODEL_FAILDOWN[0]))]
+        );
+        let chain = attempt_schedule_for("gemini", Some(GeminiBackend::GeminiCli), false, false);
+        assert_eq!(chain.len(), GEMINI_MODEL_FAILDOWN.len());
+        for (i, (backoff, model)) in chain.iter().enumerate() {
+            let want = if i == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(500)
+            };
+            assert_eq!(
+                (*backoff, *model),
+                (want, Some(GEMINI_MODEL_FAILDOWN[i])),
+                "gemini step {i}"
+            );
+        }
+    }
+}

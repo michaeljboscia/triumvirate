@@ -719,3 +719,27 @@ mod restart_index_tests {
         assert_eq!(state, "done");
     }
 }
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization of `fleet_spawn`'s default agents.
+///
+/// Pinned through the source, not behavior, on purpose: a dry run (the default) reports only the agent COUNT, and the
+/// names surface only in a real spawn, which launches workers. The same include_str! idiom pins dispatch arms in
+/// triumvirate/src/agent_exec.rs. The literal is assembled so this test does not match itself.
+/// RED IF: the default list changes, or a second default appears.
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    #[test]
+    fn fleet_spawn_default_agents_exact() {
+        let src = include_str!("fleet.rs");
+        let default = [
+            ".unwrap_or_else(|| vec![",
+            "\"codex\".to_string(), \"gemini\".to_string()]);",
+        ]
+        .concat();
+        assert_eq!(
+            src.matches(default.as_str()).count(),
+            1,
+            "fleet_spawn defaults to codex then gemini"
+        );
+    }
+}

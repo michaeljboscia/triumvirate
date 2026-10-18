@@ -3869,3 +3869,31 @@ mod tests {
         assert!(err.to_string().contains("refusing to reuse"), "{err}");
     }
 }
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization: the set of agents `fleet_agent_command` has an arm for.
+/// codex, gemini and grok are built (they may still fail on a scratch path for their own reasons, but never as
+/// "unsupported"); every other existing seat is refused by the `_` arm.
+/// RED IF: a seat gains or loses a fleet arm before T-204 moves this onto the SeatProfile table.
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    use super::fleet_agent_command;
+
+    #[test]
+    fn fleet_agent_command_arm_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for refused in ["deepseek", "claude"] {
+            let err = fleet_agent_command(refused, dir.path(), "t")
+                .expect_err(refused)
+                .to_string();
+            assert_eq!(err, format!("unsupported fleet agent: {refused}"));
+        }
+        for built in ["codex", "gemini", "grok"] {
+            if let Err(e) = fleet_agent_command(built, dir.path(), "t") {
+                assert!(
+                    !e.to_string().contains("unsupported fleet agent"),
+                    "{built}: {e}"
+                );
+            }
+        }
+    }
+}

@@ -1422,3 +1422,13 @@ mod tests {
         assert!(check.error.as_deref().unwrap_or_default().contains("no parseable JSON"));
     }
 }
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization of the default jury panel. D-04 keeps it unchanged at launch.
+/// RED IF: the default seats or their order change.
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    #[test]
+    fn default_seats_exact() {
+        assert_eq!(super::DEFAULT_SEATS, ["codex", "grok", "gemini"]);
+    }
+}

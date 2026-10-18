@@ -711,3 +711,13 @@ mod tests {
     }
 
 }
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization of the persistent-daemon target set.
+/// RED IF: the set changes before T-202 moves it onto the SeatProfile table.
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    #[test]
+    fn daemon_target_agents_exact() {
+        assert_eq!(super::daemon_target_agents(), &["gemini", "codex", "grok"]);
+    }
+}

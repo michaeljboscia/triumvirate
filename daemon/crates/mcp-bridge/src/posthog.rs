@@ -1756,4 +1756,40 @@ mod tests {
         let tel = CallTelemetry::new("deepseek", "trace-sync", None);
         assert_eq!(tel.effective_outcome(), "unreported");
     }
+
+    /// Seven Primes T-001 (REQ-010, REQ-011) characterization: today's per-agent telemetry values for the five
+    /// existing seats, pinned before T-202 moves these functions onto the SeatProfile table.
+    ///
+    /// grok and claude reporting provider "unknown", and grok billing "unknown", are the CURRENT values and are
+    /// pinned as such on purpose; T-202 fixes them and updates exactly those lines with the reason (D-01).
+    /// RED IF: any seat's provider, billing label or prompt-token convention changes without that update.
+    #[test]
+    fn seven_primes_characterization_provider_billing_and_prompt_convention() {
+        let provider = |a| provider_for(a);
+        assert_eq!(provider("gemini"), "google");
+        assert_eq!(provider("codex"), "openai");
+        assert_eq!(provider("deepseek"), "deepseek");
+        assert_eq!(provider("claude"), "unknown");
+        assert_eq!(provider("grok"), "unknown");
+
+        // The billing label as cost_usd reports it ("subscription" | "metered" | "unknown").
+        let billing = |a, m| cost_usd(a, m, 0, 0, None).1;
+        assert_eq!(billing("gemini", None), "subscription");
+        assert_eq!(billing("codex", None), "subscription");
+        assert_eq!(billing("claude", None), "subscription");
+        assert_eq!(billing("grok", None), "unknown");
+        assert_eq!(billing("deepseek", None), "metered");
+        assert_eq!(billing("deepseek", Some("deepseek-v4-pro")), "metered");
+        assert_eq!(billing("deepseek", Some("deepseek-chat")), "metered");
+        assert_eq!(billing("deepseek", Some("not-a-model")), "unknown");
+
+        // Prompt-token convention: deepseek is disjoint (input is the miss count), every other seat is
+        // cached-subset-of-input. T-002 encodes this as SeatProfile.prompt_usage.
+        assert_eq!(normalize_prompt("deepseek", 100, 40), (140, 40, 100));
+        for subset in ["gemini", "codex", "claude", "grok"] {
+            assert_eq!(normalize_prompt(subset, 100, 40), (100, 40, 60), "{subset}");
+            // A cached count above input clamps to input under the subset convention.
+            assert_eq!(normalize_prompt(subset, 10, 40), (10, 10, 0), "{subset}");
+        }
+    }
 }
