@@ -11,6 +11,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// Holds the seat's lock for as long as it lives. Dropping it closes the fd, which releases the flock.
@@ -34,16 +35,25 @@ fn lock_path(triumvirate_home: &Path, seat: &str) -> Result<PathBuf, String> {
     Ok(triumvirate_home.join("locks").join(seat))
 }
 
+/// Open (creating if needed) the lock file without following symlinks, so a planted `locks/<seat>` link or a
+/// `locks` directory that is itself a link cannot point the flock at a file outside `$TRIUMVIRATE_HOME/locks`.
 fn open_lock_file(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("seat_lock: cannot create {}: {e}", parent.display()))?;
+        let meta = std::fs::symlink_metadata(parent)
+            .map_err(|e| format!("seat_lock: cannot stat {}: {e}", parent.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("seat_lock: {} is a symlink", parent.display()));
+        }
     }
     OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        // O_NOFOLLOW: opening a symlink fails (ELOOP) instead of opening its target.
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| format!("seat_lock: cannot open {}: {e}", path.display()))
 }
@@ -99,24 +109,38 @@ mod tests {
             "a held lock must be visible to another fd"
         );
 
-        let (trying_tx, trying_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let (home_b, log_b) = (home.path().to_path_buf(), Arc::clone(&log));
         let b = std::thread::spawn(move || {
-            trying_tx.send(()).unwrap();
             let guard = acquire_seat_lock(&home_b, "kimi").unwrap();
             log_b.lock().unwrap().push("b acquired");
+            acquired_tx.send(()).unwrap();
+            // Hold the seat until the main thread has checked that B really owns the flock.
+            release_rx.recv().unwrap();
             drop(guard);
         });
-        trying_rx.recv().unwrap();
-        // Give B time to reach flock; the assertion below does not depend on this, it only makes the test meaningful.
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["a acquired"],
+        // While A holds the seat, B must not get through. A correct lock always times out here; this direction
+        // cannot flake. (It cannot prove B reached flock; the ownership check below is what a fake guard fails.)
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
             "B must not acquire while A holds the seat"
         );
+        assert_eq!(*log.lock().unwrap(), ["a acquired"]);
         log.lock().unwrap().push("a released");
         drop(guard_a);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("B acquires once A releases");
+        // Deterministic ownership check: with B's guard alive, another fd must see the seat held. A guard returned
+        // without taking the flock (or a lock that is not exclusive) fails here regardless of timing.
+        assert!(
+            held_elsewhere(home.path(), "kimi"),
+            "B's guard must actually hold the flock"
+        );
+        release_tx.send(()).unwrap();
         b.join().unwrap();
         assert_eq!(
             *log.lock().unwrap(),
@@ -125,6 +149,30 @@ mod tests {
         assert!(
             !held_elsewhere(home.path(), "kimi"),
             "no holder left after both guards dropped"
+        );
+    }
+
+    /// A planted symlink cannot redirect the lock outside locks/: neither `locks/<seat>` as a link to an outside file,
+    /// nor `locks` itself as a link to an outside directory.
+    /// RED IF: the lock file is opened through a symlink.
+    #[test]
+    fn symlinks_cannot_redirect_the_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim");
+        std::fs::write(&target, "x").unwrap();
+        std::fs::create_dir_all(home.path().join("locks")).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join("locks/kimi")).unwrap();
+        let err = acquire_seat_lock(home.path(), "kimi").unwrap_err();
+        assert!(err.starts_with("seat_lock: cannot open"), "{err}");
+
+        let home2 = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), home2.path().join("locks")).unwrap();
+        let err = acquire_seat_lock(home2.path(), "qwen").unwrap_err();
+        assert!(err.ends_with("is a symlink"), "{err}");
+        assert!(
+            !outside.path().join("qwen").exists(),
+            "nothing created outside"
         );
     }
 
