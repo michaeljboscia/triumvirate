@@ -97,20 +97,28 @@ const KIMI_RO_AGENT: &str = "---\nname: triumvirate-readonly\ntools: [Read, Grep
 ///
 /// Qwen and Mistral files are MERGED, not replaced: only the daemon's own keys are set, so anything the CLI recorded
 /// at login survives. Kimi's ro-agent.md is wholly the daemon's and is rewritten.
+///
+/// A seat can write inside its own home, so it could plant a symlink at any of these names. Every file is checked
+/// with `symlink_metadata` before it is read, and is replaced by a fresh temp file renamed over it (rename replaces a
+/// symlink itself, never its target), so the unsandboxed daemon never reads, chmods or writes through a link.
 pub fn write_seat_files(seat_home: &Path, profile: &SeatProfile) -> Result<(), String> {
+    check_seat_home_dir(seat_home)?;
     std::fs::create_dir_all(seat_home)
         .map_err(|e| format!("containment: cannot create {}: {e}", seat_home.display()))?;
+    check_seat_home_dir(seat_home)?;
     match profile.key {
         "kimi" => write_readonly(&seat_home.join(crate::kimi::RO_AGENT_FILE), KIMI_RO_AGENT),
         "qwen" => {
             let path = seat_home.join("settings.json");
             // Only a missing file starts empty; any other read failure stops, so a file the daemon cannot read is
             // never replaced by one that has lost the CLI's login settings.
-            let mut doc: serde_json::Value = match std::fs::read(&path) {
-                Ok(bytes) => serde_json::from_slice(&bytes)
-                    .map_err(|e| format!("containment: {} is not JSON: {e}", path.display()))?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-                Err(e) => return Err(format!("containment: cannot read {}: {e}", path.display())),
+            let (mut doc, mode): (serde_json::Value, Option<u32>) = match read_regular(&path)? {
+                Some((bytes, mode)) => (
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| format!("containment: {} is not JSON: {e}", path.display()))?,
+                    Some(mode),
+                ),
+                None => (serde_json::json!({}), None),
             };
             let (env_key, base_url) = crate::qwen::plan_auth(None)?;
             let obj = doc
@@ -153,21 +161,23 @@ pub fn write_seat_files(seat_home: &Path, profile: &SeatProfile) -> Result<(), S
                     serde_json::Value::Bool(false),
                 );
             let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-            std::fs::write(&path, text + "\n")
-                .map_err(|e| format!("containment: cannot write {}: {e}", path.display()))
+            replace_file(&path, (text + "\n").as_bytes(), mode)
         }
         "mistral" => {
             let path = seat_home.join("config.toml");
-            let old = match std::fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(e) => return Err(format!("containment: cannot read {}: {e}", path.display())),
+            let (old, mode) = match read_regular(&path)? {
+                Some((bytes, mode)) => (
+                    String::from_utf8(bytes)
+                        .map_err(|e| format!("containment: cannot read {}: {e}", path.display()))?,
+                    Some(mode),
+                ),
+                None => (String::new(), None),
             };
-            std::fs::write(
+            replace_file(
                 &path,
-                set_top_level_toml_bool(&old, "enable_telemetry", false),
+                set_top_level_toml_bool(&old, "enable_telemetry", false).as_bytes(),
+                mode,
             )
-            .map_err(|e| format!("containment: cannot write {}: {e}", path.display()))
         }
         other => Err(format!(
             "containment: seat {other} has no daemon-written files"
@@ -175,17 +185,117 @@ pub fn write_seat_files(seat_home: &Path, profile: &SeatProfile) -> Result<(), S
     }
 }
 
-/// Write a file the CLI must never change: make an existing copy writable, write, then chmod 0444.
+/// Write a file the CLI must never change: a fresh 0444 temp file renamed over the old one, so an existing 0444 copy
+/// needs no chmod and a planted symlink is refused, never followed.
 fn write_readonly(path: &Path, text: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    if path.exists() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| format!("containment: chmod {}: {e}", path.display()))?;
+    lstat_regular(path)?;
+    replace_file(path, text.as_bytes(), Some(0o444))
+}
+
+/// Refuse a seat home that is a symlink or not a directory. A missing home is fine (it is created next).
+fn check_seat_home_dir(seat_home: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(seat_home) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => Err(format!(
+            "containment: seat home {} is a symlink or not a directory",
+            seat_home.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "containment: cannot stat {}: {e}",
+            seat_home.display()
+        )),
     }
-    std::fs::write(path, text)
-        .map_err(|e| format!("containment: cannot write {}: {e}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
-        .map_err(|e| format!("containment: chmod {}: {e}", path.display()))
+}
+
+/// `symlink_metadata` of a daemon-owned file: `None` when missing, an error when it is a symlink or anything other
+/// than a regular file. A non-regular file keeps the "cannot read" prefix (the daemon never replaces what it could
+/// not read).
+fn lstat_regular(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "containment: {} is not a regular file",
+            path.display()
+        )),
+        Ok(m) if !m.is_file() => Err(format!(
+            "containment: cannot read {}: {} is not a regular file",
+            path.display(),
+            path.display()
+        )),
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("containment: cannot read {}: {e}", path.display())),
+    }
+}
+
+/// Read a daemon-owned file only after the symlink check passes: its bytes and permission bits, or `None` when it is
+/// missing. The opened file must be the same inode `symlink_metadata` saw, so a link swapped in between is refused.
+fn read_regular(path: &Path) -> Result<Option<(Vec<u8>, u32)>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(before) = lstat_regular(path)? else {
+        return Ok(None);
+    };
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("containment: cannot read {}: {e}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("containment: cannot read {}: {e}", path.display()))?;
+    if !opened.is_file() || opened.dev() != before.dev() || opened.ino() != before.ino() {
+        return Err(format!(
+            "containment: {} is not a regular file",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("containment: cannot read {}: {e}", path.display()))?;
+    Ok(Some((bytes, before.permissions().mode() & 0o7777)))
+}
+
+/// Process-wide counter that, with the pid, makes each temp file name unique.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replace `path` without writing in place: write a fresh temp file in the same directory (`create_new` refuses any
+/// existing path, a symlink included), set `mode` on it, then rename it over `path`. The temp file is removed on any
+/// error.
+fn replace_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("containment: {} has no parent", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("containment: {} has no file name", path.display()))?
+        .to_string_lossy();
+    let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.tmp.{}.{n}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("containment: cannot write {}: {e}", tmp.display()))?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|e| format!("containment: cannot write {}: {e}", tmp.display()))?;
+        if let Some(mode) = mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("containment: chmod {}: {e}", tmp.display()))?;
+        }
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| {
+            format!(
+                "containment: cannot write {}: rename {}: {e}",
+                path.display(),
+                tmp.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Set `key = <value>` in the top-level table of a TOML text (before the first `[table]` header), replacing an
@@ -621,6 +731,97 @@ mod tests {
             set_top_level_toml_bool("[a]\nx = 1\n", "enable_telemetry", false),
             "enable_telemetry = false\n[a]\nx = 1\n"
         );
+    }
+
+    /// Plant a symlink at `file` inside a seat home, pointing at a sentinel OUTSIDE it, and run write_seat_files.
+    fn assert_symlink_refused(key: &'static str, var: &'static str, file: &str) {
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("repo-file.rs");
+        std::fs::write(&sentinel, b"fn main() {}\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&sentinel, dir.join(file)).unwrap();
+        let err = write_seat_files(&dir, &seat(key, var)).unwrap_err();
+        assert!(err.contains("is not a regular file"), "{key}: {err}");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"fn main() {}\n");
+        assert!(
+            std::fs::symlink_metadata(dir.join(file))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// RED IF: a symlink planted at ro-agent.md makes the daemon chmod or overwrite the file it points to.
+    #[test]
+    fn kimi_ro_agent_symlink_is_refused() {
+        assert_symlink_refused("kimi", "KIMI_CODE_HOME", crate::kimi::RO_AGENT_FILE);
+    }
+
+    /// RED IF: a symlink planted at settings.json is followed on read or write.
+    #[test]
+    fn qwen_settings_symlink_is_refused() {
+        assert_symlink_refused("qwen", "QWEN_HOME", "settings.json");
+    }
+
+    /// RED IF: a symlink planted at config.toml is followed on read or write.
+    #[test]
+    fn mistral_config_symlink_is_refused() {
+        assert_symlink_refused("mistral", "VIBE_HOME", "config.toml");
+    }
+
+    /// RED IF: a seat home that is itself a symlink is followed, so the daemon writes its files elsewhere.
+    #[test]
+    fn symlinked_seat_home_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for (key, var) in [
+            ("kimi", "KIMI_CODE_HOME"),
+            ("qwen", "QWEN_HOME"),
+            ("mistral", "VIBE_HOME"),
+        ] {
+            let link = home.path().join(key);
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            let err = write_seat_files(&link, &seat(key, var)).unwrap_err();
+            assert!(err.contains("is a symlink"), "{key}: {err}");
+        }
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    /// RED IF: a rewrite writes in place (a hard link to the old inode sees the new bytes), leaves a temp file behind,
+    /// or loses an existing file's mode.
+    #[test]
+    fn seat_files_replace_via_rename_and_keep_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let outside = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("mistral");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "enable_telemetry = true\n").unwrap();
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A hard link to the old inode: an in-place write changes it, a rename leaves it alone.
+        let old_inode = outside.path().join("old-inode");
+        std::fs::hard_link(&cfg, &old_inode).unwrap();
+        write_seat_files(&dir, &seat("mistral", "VIBE_HOME")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "enable_telemetry = false\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old_inode).unwrap(),
+            "enable_telemetry = true\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
     }
 
     /// The profile allows exactly the seat home, the output dir and tmp, and refuses a path that could break out of
