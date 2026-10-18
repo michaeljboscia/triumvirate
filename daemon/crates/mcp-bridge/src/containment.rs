@@ -104,23 +104,46 @@ pub fn write_seat_files(seat_home: &Path, profile: &SeatProfile) -> Result<(), S
         "kimi" => write_readonly(&seat_home.join(crate::kimi::RO_AGENT_FILE), KIMI_RO_AGENT),
         "qwen" => {
             let path = seat_home.join("settings.json");
+            // Only a missing file starts empty; any other read failure stops, so a file the daemon cannot read is
+            // never replaced by one that has lost the CLI's login settings.
             let mut doc: serde_json::Value = match std::fs::read(&path) {
                 Ok(bytes) => serde_json::from_slice(&bytes)
                     .map_err(|e| format!("containment: {} is not JSON: {e}", path.display()))?,
-                Err(_) => serde_json::json!({}),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+                Err(e) => return Err(format!("containment: cannot read {}: {e}", path.display())),
             };
             let (env_key, base_url) = crate::qwen::plan_auth(None)?;
             let obj = doc
                 .as_object_mut()
                 .ok_or_else(|| format!("containment: {} is not a JSON object", path.display()))?;
-            obj.insert(
-                "modelProviders".into(),
-                serde_json::json!({ "openai": [{
-                    "id": crate::qwen::DEFAULT_QWEN_MODEL,
-                    "baseUrl": base_url,
-                    "envKey": env_key,
-                }]}),
-            );
+            // Merge, not replace: only the openai entry whose id is the pinned model is the daemon's. Other
+            // providers, other openai entries and any provider-level settings written at login are kept.
+            let ours = serde_json::json!({
+                "id": crate::qwen::DEFAULT_QWEN_MODEL,
+                "baseUrl": base_url,
+                "envKey": env_key,
+            });
+            let providers = obj
+                .entry("modelProviders")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    "containment: settings.json `modelProviders` is not an object".to_string()
+                })?;
+            let openai = providers
+                .entry("openai")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    "containment: settings.json `modelProviders.openai` is not an array".to_string()
+                })?;
+            match openai.iter_mut().find(|e| {
+                e.get("id").and_then(serde_json::Value::as_str)
+                    == Some(crate::qwen::DEFAULT_QWEN_MODEL)
+            }) {
+                Some(entry) => *entry = ours,
+                None => openai.push(ours),
+            }
             let agents = obj.entry("agents").or_insert_with(|| serde_json::json!({}));
             agents
                 .as_object_mut()
@@ -135,7 +158,11 @@ pub fn write_seat_files(seat_home: &Path, profile: &SeatProfile) -> Result<(), S
         }
         "mistral" => {
             let path = seat_home.join("config.toml");
-            let old = std::fs::read_to_string(&path).unwrap_or_default();
+            let old = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(format!("containment: cannot read {}: {e}", path.display())),
+            };
             std::fs::write(
                 &path,
                 set_top_level_toml_bool(&old, "enable_telemetry", false),
@@ -432,6 +459,10 @@ mod tests {
             ("OPENAI_API_KEY", "metered"),
             ("QWENCLOUD_TOKEN_PLAN_API_KEY", "inherited"),
             ("KIMI_FOO", "x"),
+            ("OPENAI_BASE_URL", "https://elsewhere"),
+            ("DASHSCOPE_API_KEY", "inherited"),
+            ("BAILIAN_TOKEN", "inherited"),
+            ("MOONSHOT_API_KEY", "inherited"),
         ]);
         let env = child_env(
             &base,
@@ -445,6 +476,15 @@ mod tests {
         assert_eq!(get("OPENAI_API_KEY"), None);
         assert_eq!(get("QWENCLOUD_TOKEN_PLAN_API_KEY"), None);
         assert_eq!(get("KIMI_FOO"), None);
+        // Every family on the scrub list, so dropping any pattern from SEAT_CREDENTIAL_SCRUB turns this red.
+        for k in [
+            "OPENAI_BASE_URL",
+            "DASHSCOPE_API_KEY",
+            "BAILIAN_TOKEN",
+            "MOONSHOT_API_KEY",
+        ] {
+            assert_eq!(get(k), None, "{k} reached the child");
+        }
         assert_eq!(get("VIBE_CLI"), Some("python"));
         assert_eq!(get("HOME"), Some("/th/homes/mistral"));
         assert_eq!(get("VIBE_HOME"), Some("/th/homes/mistral"));
@@ -487,10 +527,27 @@ mod tests {
         );
     }
 
+    /// RED IF: an unreadable seat config is silently treated as absent and overwritten.
+    #[test]
+    fn seat_files_refuse_an_unreadable_config() {
+        // A path that exists but cannot be read as a file (a directory here) is an error, never "start empty": the
+        // daemon must not replace a config it could not read.
+        let home = tempfile::tempdir().unwrap();
+        for (key, var, file) in [
+            ("qwen", "QWEN_HOME", "settings.json"),
+            ("mistral", "VIBE_HOME", "config.toml"),
+        ] {
+            let dir = home.path().join(key);
+            std::fs::create_dir_all(dir.join(file)).unwrap();
+            let err = write_seat_files(&dir, &seat(key, var)).unwrap_err();
+            assert!(err.starts_with("containment: cannot read"), "{key}: {err}");
+        }
+    }
+
     /// The daemon-written files have the shapes BACKEND_STRUCTURE section 5 fixes, and Qwen/Mistral files keep what
     /// the CLI had written.
     /// RED IF: ro-agent.md loses its tool limits or 0444 mode, Qwen settings stop pinning the plan endpoint and model,
-    /// or a merge drops a key the CLI wrote.
+    /// a merge drops a key or provider entry the CLI wrote, or a rewrite duplicates the daemon's entry.
     #[test]
     fn seat_files_are_written_and_merged() {
         use std::os::unix::fs::PermissionsExt;
@@ -513,13 +570,28 @@ mod tests {
         std::fs::create_dir_all(&qwen).unwrap();
         std::fs::write(
             qwen.join("settings.json"),
-            r#"{"security":{"auth":{"selectedType":"openai"}}}"#,
+            r#"{"security":{"auth":{"selectedType":"openai"}},"modelProviders":{"anthropic":[{"id":"keep-me"}],"openai":[{"id":"other-model","baseUrl":"https://x"},{"id":"qwen-stale","envKey":"OLD"}]}}"#,
         )
         .unwrap();
         write_seat_files(&qwen, &seat("qwen", "QWEN_HOME")).unwrap();
         let doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(qwen.join("settings.json")).unwrap()).unwrap();
-        let provider = &doc["modelProviders"]["openai"][0];
+        // Login-written providers survive the merge; the daemon's entry is added once.
+        assert_eq!(doc["modelProviders"]["anthropic"][0]["id"], "keep-me");
+        assert_eq!(doc["modelProviders"]["openai"][0]["id"], "other-model");
+        let openai = doc["modelProviders"]["openai"].as_array().unwrap();
+        let provider = openai
+            .iter()
+            .find(|e| e["id"] == crate::qwen::DEFAULT_QWEN_MODEL)
+            .expect("the daemon's entry");
+        // Writing again replaces the daemon's entry in place, never duplicates it.
+        write_seat_files(&qwen, &seat("qwen", "QWEN_HOME")).unwrap();
+        let again: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(qwen.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(
+            again["modelProviders"]["openai"].as_array().unwrap().len(),
+            openai.len()
+        );
         assert_eq!(
             provider["baseUrl"],
             "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
