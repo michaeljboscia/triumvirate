@@ -160,6 +160,24 @@ pub fn register_installed_cli_version(seat: &str, version: &str) {
 /// The gate at a call site: reads the seat's state now (configured from its profile, availability files from
 /// `$TRIUMVIRATE_HOME`), then decides.
 pub fn seat_gate(seat: &str, surface: Surface, origin: Origin, tty: bool) -> Result<(), Refusal> {
+    seat_gate_in(
+        crate::seat_state::triumvirate_home(),
+        seat,
+        surface,
+        origin,
+        tty,
+    )
+}
+
+/// `seat_gate` with the state directory already resolved. Tests pass a tempdir here instead of rewriting the
+/// process-global `TRIUMVIRATE_HOME`, which other modules' tests also rewrite under their own locks.
+fn seat_gate_in(
+    home: Result<std::path::PathBuf, String>,
+    seat: &str,
+    surface: Surface,
+    origin: Origin,
+    tty: bool,
+) -> Result<(), Refusal> {
     let Some(profile) = crate::seat_profile::seat_profile(seat) else {
         return seat_gate_with(
             seat,
@@ -182,7 +200,7 @@ pub fn seat_gate(seat: &str, surface: Surface, origin: Origin, tty: bool) -> Res
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(seat)
         .cloned();
-    let state = crate::seat_state::triumvirate_home()
+    let state = home
         .and_then(|home| {
             crate::seat_state::availability(&home, seat, configured, version.as_deref())
         })
@@ -370,7 +388,7 @@ mod tests {
         }
     }
 
-    /// The wrapper itself, through real state files: TRIUMVIRATE_HOME at a tempdir, kimi enabled by its env flag and
+    /// The wrapper itself, through real state files: the state directory at a tempdir, kimi enabled by its env flag and
     /// a verified.json written by seat_state. With no installed version registered (or a different one) seat_gate
     /// fails closed as unverified; the matching version makes it available; unsetting the flag is not configured.
     /// RED IF: seat_gate treats an unknown or mismatched installed CLI version as verified, stops reading
@@ -380,11 +398,10 @@ mod tests {
         let _lock = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvRestore::capture(&["TRIUMVIRATE_HOME", "TRIUMVIRATE_ENABLE_KIMI"]);
+        let _restore = EnvRestore::capture(&["TRIUMVIRATE_ENABLE_KIMI"]);
         let home = tempfile::tempdir().unwrap();
-        // SAFETY: serialised by env_lock(); _restore puts both values back.
+        // SAFETY: serialised by env_lock(); _restore puts the value back. No other test touches this flag.
         unsafe {
-            std::env::set_var("TRIUMVIRATE_HOME", home.path());
             std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1");
         }
         let rec = crate::seat_state::VerifiedRecord {
@@ -394,7 +411,17 @@ mod tests {
             served_model: None,
         };
         crate::seat_state::write_verified(home.path(), "kimi", &rec).unwrap();
-        let gate = || seat_gate("kimi", Surface::AskAgent, Origin::Interactive, true);
+        // The state directory is passed in, not set through TRIUMVIRATE_HOME (deepseek_config's tests rewrite that
+        // variable under their own lock, and the full suite raced them). seat_gate itself is one line over this.
+        let gate = || {
+            seat_gate_in(
+                Ok(home.path().to_path_buf()),
+                "kimi",
+                Surface::AskAgent,
+                Origin::Interactive,
+                true,
+            )
+        };
 
         // No other test registers kimi, so this is the fail-closed starting point.
         assert_eq!(installed_cli_version("kimi"), None);
