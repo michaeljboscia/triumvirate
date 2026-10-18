@@ -271,10 +271,11 @@ floor_only() {
     mapfile -t rs < <(git -C "$REPO" diff --name-only "$BASE..HEAD" | daemon_rs)
     echo "floor-only over $BASE..HEAD: ${#rs[@]} daemon .rs files changed"
     floor_gitleaks
-    # In floor-only mode there is no task, so an empty Rust scope is reported as N/A with its own reason.
+    # In floor-only mode there is no task id, so nothing can excuse an empty Rust scope: the non-Rust exemption is
+    # per task, and the feat/seven-primes branch always carries daemon .rs changes. Zero is a FAIL (empty-set rule).
     if [[ ${#rs[@]} -eq 0 ]]; then
-        record N/A rustfmt "0 daemon .rs files changed in $BASE..HEAD"
-        record N/A semgrep "0 daemon .rs files changed in $BASE..HEAD"
+        record FAIL rustfmt "0 daemon .rs files changed in $BASE..HEAD (floor-only has no task to excuse an empty Rust scope)"
+        record FAIL semgrep "0 daemon .rs files changed in $BASE..HEAD (floor-only has no task to excuse an empty Rust scope)"
     else
         floor_rustfmt 0 "${rs[@]}"
         floor_semgrep 0 "${rs[@]}"
@@ -585,6 +586,31 @@ self_test() {
     expect_text mention "1 commits reference T-107"
     expect_text mention "0 daemon .rs files touched by T-107"
     verdict "16 a commit that only mentions T-107 is not scoped to T-107"
+
+    # 17. --floor-only over a branch with no daemon .rs change fails: it has no task id to excuse an empty Rust scope.
+    r="$(fresh_repo floor-empty)"
+    printf 'z\n' >"$r/docs/notes.md" && commit "$r" "T-301: docs only"
+    run_case floor-empty 1 "$r" 0 --floor-only
+    expect_text floor-empty "floor-only has no task to excuse an empty Rust scope"
+    verdict "17 --floor-only with 0 daemon .rs files -> exit 1"
+
+    # 18. A stub marker added to a NESTED daemon .rs file (daemon/fx/src/) fails the stub gate. Also proves the
+    # 'daemon/*.rs' pathspec crosses directories (git wildcards match '/' unless :(glob) magic is used).
+    r="$(fresh_repo stub-nested)"
+    printf '\npub fn later() -> u32 {\n    todo!()\n}\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-101: stub"
+    run_case stub-nested 1 "$r" 0 T-101 daemon/fx/src/lib.rs
+    expect_text stub-nested "stub markers added to daemon .rs by T-101"
+    expect_text stub-nested "+    todo!()"
+    verdict "18 todo!() added under daemon/fx/src -> exit 1 naming the marker"
+
+    # 19. Real cargo, a compile error: the check gate itself records FAIL with cargo's own diagnostic, so a validator
+    # that ignored or hardcoded the cargo check exit would fail this case even though lint and tests also fail.
+    r="$(fresh_repo check-fail)"
+    printf '\npub fn broken() -> u32 {\n    "x"\n}\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-101: compile error"
+    run_case check-fail 1 "$r" 1 T-101 daemon/fx/src/lib.rs
+    expect_text check-fail "error[E0308]"
+    expect_text check-fail "$(printf '%-5s %-14s ' FAIL check)exit"
+    verdict "19 compile error -> the check gate itself records FAIL"
 
     echo
     echo "self-test: $pass passed, $fail failed"
