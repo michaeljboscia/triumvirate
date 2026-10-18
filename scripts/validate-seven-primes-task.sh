@@ -150,12 +150,57 @@ floor_rustfmt() {
         record FAIL rustfmt "0 daemon .rs files to format"
         return
     fi
-    echo "=== rustfmt: $# daemon .rs files"
-    out="$(cd "$REPO" && rustfmt --edition 2024 --check "$@" 2>&1)"
+    # NEW violations only (amendment A-4). Legacy files already fail rustfmt on origin/main (agent_exec.rs: 322 diffs),
+    # which is why CI's workspace format check is disabled, so a whole-file check would fail every task that touches
+    # one. The base tree is extracted whole with `git archive`, because rustfmt follows `mod x;` into child files and a
+    # lone base file would error and report zero base hunks, which reads as every legacy hunk being new.
+    local base_tree
+    base_tree="$(mktemp -d "${TMPDIR:-/tmp}/seven-primes-fmt-base.XXXXXX")"
+    git -C "$REPO" archive "$BASE" daemon | tar -x -C "$base_tree"
+    echo "=== rustfmt: $# daemon .rs files (new violations against $BASE only)"
+    out="$(python3 -I -c "$RUSTFMT_NEW_HUNKS" "$REPO" "$base_tree" "$@" 2>&1)"
     rc=$?
+    rm -rf "$base_tree"
     printf '%s\n' "$out"
-    if [[ $rc -eq 0 ]]; then record PASS rustfmt "$# files formatted"; else record FAIL rustfmt "$# files, exit $rc"; fi
+    if [[ $rc -eq 0 ]]; then record PASS rustfmt "$# files formatted, 0 new violations"; else record FAIL rustfmt "$# files, new rustfmt violations (exit $rc)"; fi
 }
+
+# rustfmt hunks present in HEAD's file but not in the base tree's copy, as a multiset of their CHANGED lines (context and
+# line numbers are ignored: both shift when unrelated code lands next to a legacy hunk). Exit 1 on any new hunk or when
+# rustfmt cannot parse the HEAD file.
+RUSTFMT_NEW_HUNKS='
+import collections, os, re, subprocess, sys
+ANSI = re.compile(r"\x1b\[[0-9;]*m|\x1b\(B")
+def hunks(root, rel):
+    p = subprocess.run(["rustfmt", "--edition", "2024", "--check", rel], cwd=root, capture_output=True, text=True)
+    res, cur = [], None
+    for line in ANSI.sub("", p.stdout).splitlines():
+        m = re.match(r"^Diff in (.*?)(?::\d+:| at line \d+:)$", line)
+        if m:
+            cur = (m.group(1), [])
+            res.append(cur)
+        elif cur is not None:
+            cur[1].append(line)
+    # realpath on both sides: macOS /var is a symlink to /private/var, and rustfmt prints the resolved path.
+    target = os.path.realpath(os.path.join(root, rel))
+    changed = lambda body: "\n".join(l for l in body if l.startswith(("+", "-")))
+    return collections.Counter(changed(b) for f, b in res if os.path.realpath(os.path.join(root, f)) == target), p
+repo, base_tree, files = sys.argv[1], sys.argv[2], sys.argv[3:]
+bad = 0
+for rel in files:
+    head, proc = hunks(repo, rel)
+    if proc.returncode not in (0, 1) or "error" in ANSI.sub("", proc.stderr).lower():
+        print(f"{rel}: rustfmt could not check the HEAD file:\n{proc.stderr}")
+        bad = 1
+        continue
+    old = hunks(base_tree, rel)[0] if os.path.exists(os.path.join(base_tree, rel)) else collections.Counter()
+    new = head - old
+    print(f"{rel}: {sum(old.values())} legacy hunks on base, {sum(head.values())} now, {sum(new.values())} new")
+    for h in new.elements():
+        print(f"  new rustfmt violation:\n{h}")
+        bad = 1
+sys.exit(bad)
+'
 
 # No new crates: any change to daemon/Cargo.lock, or to a dependency table of a Cargo.toml under daemon/, in BASE..HEAD fails.
 # Scoped to daemon/ like the Rust checks: the self-test fixture workspace under scripts/fixtures/ has its own manifests and
@@ -493,6 +538,36 @@ self_test() {
     run_case suite-105 0 "$r" 0 T-105 daemon/fx/src/lib.rs
     expect_text suite-105 "suite: FULL_TESTS_BASE"
     verdict "14b T-105 -> FULL_TESTS_BASE"
+
+    # 15. Format drift that is already on the base belongs to nobody's task (amendment A-4). A base file with a legacy
+    #     violation, a task that adds a clean function to it: passes. The same task adding a badly formatted line: fails.
+    #     The base also declares `mod child;`, so a check that formatted the base file alone would error on the missing
+    #     child and count zero legacy hunks.
+    local legacy
+    for variant in clean dirty; do
+        r="$(fresh_repo "fmt-$variant")"
+        git -C "$r" checkout -q main
+        legacy=$'mod child;\n\npub fn legacy( a:u32 )->u32{ a }\n'
+        printf '%s' "$legacy" >"$r/daemon/fx/src/legacy.rs" && printf 'pub fn c() {}\n' >"$r/daemon/fx/src/child.rs"
+        commit "$r" "legacy drift on base"
+        git -C "$r" checkout -q feat && git -C "$r" reset -q --hard main
+        if [[ "$variant" == clean ]]; then
+            printf '\npub fn added(b: u32) -> u32 {\n    b\n}\n' >>"$r/daemon/fx/src/legacy.rs"
+        else
+            printf '\npub fn added( b:u32 )->u32{ b }\n' >>"$r/daemon/fx/src/legacy.rs"
+        fi
+        commit "$r" "T-101: touch a legacy file ($variant)"
+        if [[ "$variant" == clean ]]; then
+            run_case fmt-clean 0 "$r" 0 T-101 daemon/fx/src/legacy.rs
+            expect_text fmt-clean "1 legacy hunks on base, 1 now, 0 new"
+            verdict "15a legacy drift on base + clean addition -> exit 0"
+        else
+            run_case fmt-dirty 1 "$r" 0 T-101 daemon/fx/src/legacy.rs
+            expect_text fmt-dirty "new rustfmt violation"
+            expect_text fmt-dirty "+pub fn added(b: u32) -> u32 {"
+            verdict "15b legacy drift on base + badly formatted addition -> exit 1"
+        fi
+    done
 
     echo
     echo "self-test: $pass passed, $fail failed"
