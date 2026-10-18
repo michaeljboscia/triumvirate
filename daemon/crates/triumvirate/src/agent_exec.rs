@@ -6636,7 +6636,7 @@ mod deepseek_dispatch_tests {
         // A comment may list agents freely. (Built from two statements so no single source line here is a list.)
         let trigger = "    // Supported: ";
         let comment = format!("{trigger}{}", "\"codex\", \"grok\"\n");
-        assert_eq!(hand_written_agent_lists(comment), Vec::<String>::new());
+        assert_eq!(hand_written_agent_lists(&comment), Vec::<String>::new());
     }
 
     /// The auth classifier must not fire on prose that merely mentions authentication.

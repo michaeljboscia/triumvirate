@@ -703,9 +703,7 @@ impl McpBridge {
         .await
     }
 
-    #[tool(
-        description = "Send a task to a specific agent. Supported: {SUPPORTED_AGENTS}."
-    )]
+    #[tool(description = "Send a task to a specific agent. Supported: {SUPPORTED_AGENTS}.")]
     // The root span of a call, in the MCP process. daemon-http injects this span's context as a
     // W3C `traceparent`, and the daemon adopts it — so one logical call is ONE trace across two
     // processes instead of two unrelated ones. Without a span here there is nothing to inject.
