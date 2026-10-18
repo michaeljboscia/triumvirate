@@ -161,7 +161,8 @@ pub(crate) fn note_attempt_child(child: &tokio::process::Child) {
 /// Seven Primes T-202: the seat's `SeatProfile.live_progress`. A name with no row keeps the old default, streaming.
 fn streams_live_progress(agent: &str, gemini_backend: Option<GeminiBackend>) -> bool {
     use mcp_bridge::seat_profile::LiveProgress;
-    let live = mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent)).map(|row| row.live_progress);
+    let live = mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent))
+        .map(|row| row.live_progress);
     match live {
         Some(LiveProgress::StreamsExceptAgy) => !matches!(gemini_backend, Some(GeminiBackend::Agy)),
         Some(LiveProgress::Buffered) => false,
@@ -1356,7 +1357,8 @@ async fn execute_ask_agent_inner(
                 // this, $ai_model falls back to the agent key and every Antigravity call
                 // charts as the model "gemini", which cannot answer which model ran.
                 // Seven Primes T-202 (REQ-043): which seats report a served model this way is SeatProfile data.
-                let reports_runtime_model = mcp_bridge::seat_profile::seat_profile(&agent).map(|row| row.served_model_evidence)
+                let reports_runtime_model = mcp_bridge::seat_profile::seat_profile(&agent)
+                    .map(|row| row.served_model_evidence)
                     == Some(mcp_bridge::seat_profile::ModelEvidence::AgyRuntimeReport);
                 if reports_runtime_model {
                     match parsed.cli_version.as_deref() {
@@ -2177,7 +2179,7 @@ fn require_peer_review_enabled() -> bool {
 // `records_tool_calls`. The per-mode history above is kept because it is the reason each mode is trusted; adding a mode now means
 // setting the field on its SeatProfile row, and the exact pin in the tests below still turns red until someone opens
 // the parser and confirms it. The comment block this replaced listed the modes inline:
-//// const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
+// const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
 //     // crates/agent-adapter/src/codex.rs: pushes on command_execution
 //     "codex-exec-json",
 //     // crates/agent-adapter/src/gemini.rs: pushes on tool_use
@@ -2299,7 +2301,7 @@ const AGENTS_WITH_NO_WRITE_CONTAINMENT: &[&str] = &[];
 // `classifies_reads`. The per-mode history above is kept because it is the reason each mode is trusted; adding a mode now means
 // setting the field on its SeatProfile row, and the exact pin in the tests below still turns red until someone opens
 // the parser and confirms it. The comment block this replaced listed the modes inline:
-//// const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
+// const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
 //     "gemini-stream-json",
 //     "grok-streaming-json",
 //     "agy-stream-json",
@@ -7802,8 +7804,7 @@ mod sight_gate_tests {
         ];
         want.sort_unstable();
         assert_eq!(
-            got,
-            want,
+            got, want,
             "the allowlist changed. Open the parser you are adding and confirm it actually \
              calls tool_calls.push on a real tool event. These are known NOT to: \
              agy-pipe-plain-text, agy-pty-plain-text, codex-app-server-jsonrpc, \
@@ -7839,8 +7840,7 @@ mod sight_gate_tests {
         ];
         want.sort_unstable();
         assert_eq!(
-            got,
-            want,
+            got, want,
             "the read-classifying allowlist changed. Open the parser and confirm it can tell a              file READ from a search or a shell command. If it stamps every call the same kind,              required_sources cannot be enforced on it and a pass would be theatre."
         );
     }
@@ -11711,22 +11711,41 @@ mod seven_primes_consumer_tests {
         for seat in ["kimi", "mistral", "qwen"] {
             let row = mcp_bridge::seat_profile::seat_profile(seat).unwrap();
             // REQ-050: single attempt.
-            assert_eq!(attempt_schedule_for(seat, None, false, false), vec![(Duration::ZERO, None)], "{seat}");
+            assert_eq!(
+                attempt_schedule_for(seat, None, false, false),
+                vec![(Duration::ZERO, None)],
+                "{seat}"
+            );
             assert_eq!(
                 streams_live_progress(seat, None),
                 row.live_progress == mcp_bridge::seat_profile::LiveProgress::Streams,
                 "{seat}"
             );
             for mode in row.parser_modes {
-                assert!(parser_modes_with_tool_records().contains(mode), "{seat} {mode}");
-                assert!(parser_modes_that_classify_reads().contains(mode), "{seat} {mode}");
+                assert!(
+                    parser_modes_with_tool_records().contains(mode),
+                    "{seat} {mode}"
+                );
+                assert!(
+                    parser_modes_that_classify_reads().contains(mode),
+                    "{seat} {mode}"
+                );
             }
-            assert!(!sight_repair_agents().contains(&seat), "{seat}: sight repair is off at launch");
+            assert!(
+                !sight_repair_agents().contains(&seat),
+                "{seat}: sight repair is off at launch"
+            );
         }
         // Aliases reach the same row.
-        assert_eq!(attempt_schedule_for("vibe", None, false, false), vec![(Duration::ZERO, None)]);
+        assert_eq!(
+            attempt_schedule_for("vibe", None, false, false),
+            vec![(Duration::ZERO, None)]
+        );
         // A name with no row keeps the old defaults.
-        assert_eq!(attempt_schedule_for("not-a-seat", None, false, false).len(), 3);
+        assert_eq!(
+            attempt_schedule_for("not-a-seat", None, false, false).len(),
+            3
+        );
         assert!(streams_live_progress("not-a-seat", None));
     }
 

@@ -25,7 +25,8 @@ use std::time::Duration;
 /// Seven Primes T-202: the window is the seat's `SeatProfile.stall_window` (REQ-051; the new seats start at 780 s, the
 /// grok value). Aliases normalize first, so `agy` and `antigravity` get gemini's window. A name with no row has none.
 pub fn default_stall_window_secs(agent: &str) -> Option<u64> {
-    crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent)).and_then(|row| window_secs(row.stall_window))
+    crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent))
+        .and_then(|row| window_secs(row.stall_window))
 }
 
 /// `Secs(n)` is `Some(n)`; `Disabled` is never stall-killed.
@@ -108,8 +109,16 @@ mod tests {
         use crate::seat_profile::{StallWindow, seat_profile};
         for seat in ["kimi", "mistral", "qwen"] {
             let row = seat_profile(seat).unwrap();
-            assert_eq!(default_stall_window_secs(seat), window_secs(row.stall_window), "{seat}");
-            assert_eq!(default_stall_window_secs(seat), Some(780), "{seat}: REQ-051 starting value");
+            assert_eq!(
+                default_stall_window_secs(seat),
+                window_secs(row.stall_window),
+                "{seat}"
+            );
+            assert_eq!(
+                default_stall_window_secs(seat),
+                Some(780),
+                "{seat}: REQ-051 starting value"
+            );
         }
         assert_eq!(window_secs(StallWindow::Secs(781)), Some(781));
         assert_eq!(window_secs(StallWindow::Disabled), None);

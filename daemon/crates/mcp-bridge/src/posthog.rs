@@ -418,7 +418,11 @@ fn normalize_prompt(agent: &str, input: u64, cached: u64) -> (u64, u64, u64) {
 }
 
 /// The pure normalization for one convention.
-fn normalize_prompt_as(usage: crate::seat_profile::PromptUsage, input: u64, cached: u64) -> (u64, u64, u64) {
+fn normalize_prompt_as(
+    usage: crate::seat_profile::PromptUsage,
+    input: u64,
+    cached: u64,
+) -> (u64, u64, u64) {
     match usage {
         // disjoint: input IS the miss count
         crate::seat_profile::PromptUsage::CachedDisjoint => (input + cached, cached, input),
@@ -1863,7 +1867,10 @@ mod tests {
     fn every_supported_agent_has_a_provider() {
         for agent in crate::supported_agent_names() {
             let provider = provider_for(agent);
-            assert_ne!(provider, "unknown", "{agent} charts as an unattributed provider");
+            assert_ne!(
+                provider, "unknown",
+                "{agent} charts as an unattributed provider"
+            );
             assert!(!provider.is_empty(), "{agent} maps to an empty provider");
         }
     }
@@ -1874,7 +1881,11 @@ mod tests {
     fn agent_aliases_resolve_to_the_same_provider() {
         for (alias, canonical) in shared_types::AGENT_ALIASES {
             assert_eq!(crate::normalize_agent_name(alias), *canonical, "{alias}");
-            assert_eq!(provider_for(alias), provider_for(canonical), "{alias} must chart as {canonical}");
+            assert_eq!(
+                provider_for(alias),
+                provider_for(canonical),
+                "{alias} must chart as {canonical}"
+            );
         }
     }
 
@@ -1893,13 +1904,20 @@ mod tests {
             ("mistral", None),
             ("qwen", None),
         ];
-        let roster: std::collections::BTreeSet<&str> = crate::supported_agent_names().iter().copied().collect();
-        let covered: std::collections::BTreeSet<&str> = expectations.iter().map(|(a, _)| *a).collect();
-        assert_eq!(roster, covered, "a seat with no billing expectation is a seat whose cost nobody decided");
+        let roster: std::collections::BTreeSet<&str> =
+            crate::supported_agent_names().iter().copied().collect();
+        let covered: std::collections::BTreeSet<&str> =
+            expectations.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            roster, covered,
+            "a seat with no billing expectation is a seat whose cost nobody decided"
+        );
         for (agent, model) in expectations {
             match billing_for(agent, *model) {
                 Billing::Subscription => assert!(model.is_none(), "{agent} is subscription-backed"),
-                Billing::Metered { .. } => assert!(model.is_some(), "{agent} is metered: name its model"),
+                Billing::Metered { .. } => {
+                    assert!(model.is_some(), "{agent} is metered: name its model")
+                }
                 Billing::UnknownPrice => panic!("{agent} has no billing classification"),
             }
         }
@@ -1916,7 +1934,12 @@ mod tests {
     /// A recognised model still prices.
     #[test]
     fn a_named_deepseek_model_still_prices() {
-        for model in ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro"] {
+        for model in [
+            "deepseek-v4-flash",
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v4-pro",
+        ] {
             let (usd, label) = cost_usd("deepseek", Some(model), 0, 1_000_000, Some(1_000_000));
             assert_eq!(label, "metered", "{model}");
             assert!(usd.unwrap_or(0.0) > 0.0, "{model} must produce a real cost");
@@ -1929,7 +1952,10 @@ mod tests {
         assert!(!crate::is_supported_agent_name("llama"));
         assert_eq!(provider_for("llama"), "unknown");
         assert!(matches!(billing_for("llama", None), Billing::UnknownPrice));
-        assert_eq!(cost_usd("llama", None, 0, 500, Some(500)), (None, "unknown"));
+        assert_eq!(
+            cost_usd("llama", None, 0, 500, Some(500)),
+            (None, "unknown")
+        );
     }
 
     /// Seven Primes T-202 consumer tests: each consumer's output for a new seat equals that seat's row value, and
@@ -1937,22 +1963,41 @@ mod tests {
     /// RED IF: provider, billing or the prompt convention stops being derived from SeatProfile.
     #[test]
     fn seven_primes_consumers_read_the_seat_row() {
-        use crate::seat_profile::{BillingClass, DeepSeekPricing, PromptUsage, Provider, seat_profile};
+        use crate::seat_profile::{
+            BillingClass, DeepSeekPricing, PromptUsage, Provider, seat_profile,
+        };
         assert_eq!(provider_for("kimi"), "moonshotai");
         assert_eq!(provider_for("mistral"), "mistralai");
         assert_eq!(provider_for("qwen"), "qwen");
         for seat in ["kimi", "mistral", "qwen"] {
-            assert_eq!(cost_usd(seat, None, 0, 9, Some(9)), (Some(0.0), "subscription"), "{seat}");
-            assert_eq!(normalize_prompt(seat, 100, 40), (100, 40, 60), "{seat}: provisional subset");
+            assert_eq!(
+                cost_usd(seat, None, 0, 9, Some(9)),
+                (Some(0.0), "subscription"),
+                "{seat}"
+            );
+            assert_eq!(
+                normalize_prompt(seat, 100, 40),
+                (100, 40, 60),
+                "{seat}: provisional subset"
+            );
         }
         let mut row = seat_profile("kimi").unwrap().clone();
         assert!(matches!(billing_for_row(&row, None), Billing::Subscription));
         row.billing = BillingClass::Metered(DeepSeekPricing);
-        assert!(matches!(billing_for_row(&row, Some("deepseek-v4-pro")), Billing::Metered { .. }));
+        assert!(matches!(
+            billing_for_row(&row, Some("deepseek-v4-pro")),
+            Billing::Metered { .. }
+        ));
         row.provider = Provider::OpenAi;
         assert_eq!(row.provider.as_str(), "openai");
-        assert_eq!(normalize_prompt_as(PromptUsage::CachedDisjoint, 100, 40), (140, 40, 100));
-        assert_eq!(normalize_prompt_as(PromptUsage::CachedSubsetOfInput, 100, 40), (100, 40, 60));
+        assert_eq!(
+            normalize_prompt_as(PromptUsage::CachedDisjoint, 100, 40),
+            (140, 40, 100)
+        );
+        assert_eq!(
+            normalize_prompt_as(PromptUsage::CachedSubsetOfInput, 100, 40),
+            (100, 40, 60)
+        );
     }
 
     /// Seven Primes T-202 (REQ-043): configured and served model are recorded separately, and the served model is
@@ -1984,14 +2029,23 @@ mod tests {
         };
         let props = ai_generation_props(&base(Some("qwen3-coder-plus"), None));
         assert_eq!(props["tv_configured_model"], "qwen3-coder-plus");
-        assert!(props["tv_served_model"].is_null(), "unknown served model stays null, never the configured one");
+        assert!(
+            props["tv_served_model"].is_null(),
+            "unknown served model stays null, never the configured one"
+        );
         let props = ai_generation_props(&base(Some("qwen3-coder-plus"), Some("glm-5")));
         assert_eq!(props["tv_served_model"], "glm-5");
 
         let mut tel = CallTelemetry::new("qwen", "trace", Some("qwen3-coder-plus"));
-        assert_eq!((tel.configured_model.as_deref(), tel.served_model.as_deref()), (Some("qwen3-coder-plus"), None));
+        assert_eq!(
+            (tel.configured_model.as_deref(), tel.served_model.as_deref()),
+            (Some("qwen3-coder-plus"), None)
+        );
         tel.set_model("glm-5");
-        assert_eq!((tel.configured_model.as_deref(), tel.served_model.as_deref()), (Some("qwen3-coder-plus"), Some("glm-5")));
+        assert_eq!(
+            (tel.configured_model.as_deref(), tel.served_model.as_deref()),
+            (Some("qwen3-coder-plus"), Some("glm-5"))
+        );
         tel.rejected("test: no emit expected to matter");
     }
 }

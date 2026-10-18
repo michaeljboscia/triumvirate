@@ -74,7 +74,13 @@ pub fn format_working_state(event: &WorkingStateEvent) -> String {
             // Seven Primes REQ-063: Mistral's effects carry `filePath` and Qwen's tool inputs may carry `absolute_path`.
             let path = extract_param(
                 &event.tool_args_json,
-                &["target_file", "file_path", "path", "filePath", "absolute_path"],
+                &[
+                    "target_file",
+                    "file_path",
+                    "path",
+                    "filePath",
+                    "absolute_path",
+                ],
             );
             let cmd = extract_param(&event.tool_args_json, &["command"]);
             let pattern = extract_param(&event.tool_args_json, &["pattern", "query"]);
