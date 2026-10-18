@@ -111,17 +111,21 @@ pub fn build_qwen_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, St
 }
 
 /// The key env var and international endpoint for a `qwen_plan` value (TECH_STACK.md, research/03 "Auth and plan").
-/// `None` is the default plan, `qwencloud`. The seat home's settings.json names this var as its `envKey`.
+/// `None` is the default plan, `qwencloud` (D-07). The seat home's settings.json names this var as its `envKey`.
+///
+/// `modelstudio` is REFUSED, not mapped: TECH_STACK.md says switching to the ModelStudio Token Plan relaxes the `sk-sp-`
+/// key check and is a contract change that stops the build (`blocked_on: scope-change`) until Mike decides. A helper
+/// that quietly returned its env var would let that change happen without the decision.
 pub fn plan_auth(qwen_plan: Option<&str>) -> Result<(&'static str, &'static str), String> {
     match qwen_plan.unwrap_or("qwencloud") {
         "qwencloud" => Ok((
             "QWENCLOUD_TOKEN_PLAN_API_KEY",
             "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1",
         )),
-        "modelstudio" => Ok((
-            "BAILIAN_TOKEN_PLAN_API_KEY",
-            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
-        )),
+        "modelstudio" => Err(
+            "qwen_plan_contract_change: modelstudio needs Mike's decision (TECH_STACK.md, blocked_on: scope-change)"
+                .to_string(),
+        ),
         other => Err(format!("unknown_qwen_plan: {other}")),
     }
 }
@@ -279,13 +283,19 @@ mod tests {
         assert!(inv.args.ends_with(&ok));
     }
 
-    /// RED IF: the plan-to-env-var mapping changes or an unknown plan is silently defaulted.
+    /// RED IF: the plan-to-env-var mapping changes, an unknown plan is silently defaulted, or the ModelStudio contract
+    /// change becomes reachable without a decision.
     #[test]
     fn plan_picks_env_var() {
         assert_eq!(plan_auth(None).unwrap().0, "QWENCLOUD_TOKEN_PLAN_API_KEY");
         assert_eq!(
-            plan_auth(Some("modelstudio")).unwrap().0,
-            "BAILIAN_TOKEN_PLAN_API_KEY"
+            plan_auth(Some("qwencloud")).unwrap().1,
+            "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
+        );
+        assert!(
+            plan_auth(Some("modelstudio"))
+                .unwrap_err()
+                .starts_with("qwen_plan_contract_change:")
         );
         assert_eq!(
             plan_auth(Some("coding")).unwrap_err(),
