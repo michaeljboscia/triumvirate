@@ -209,6 +209,8 @@ pub enum Invalidation {
 pub enum ModelEvidence {
     /// The CLI does not say which model answered (kimi).
     NotExposed,
+    /// agy reports the model it chose at runtime and the connector stashes it in `cli_version` (gemini).
+    AgyRuntimeReport,
     ExportConfig,
     MessageModel,
     Legacy,
@@ -386,6 +388,7 @@ static SEATS: &[SeatProfile] = &[
         live_progress: LiveProgress::StreamsExceptAgy,
         parser_modes: &["agy-stream-json", "gemini-stream-json"],
         usage_source: UsageSource::AgyEstimated,
+        served_model_evidence: ModelEvidence::AgyRuntimeReport,
         fleet_buildable: true,
         daemon_target: true,
         prewarm_policy: PrewarmPolicy::Always,

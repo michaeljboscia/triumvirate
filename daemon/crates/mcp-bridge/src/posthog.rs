@@ -41,6 +41,11 @@ pub struct AiGeneration<'a> {
     pub cost_usd: Option<f64>,
     /// "metered" | "subscription" | "unknown". Never aggregate cost across these without it.
     pub billing: &'a str,
+    /// The model the CALLER asked for (`-m`, a DeepSeek model override), when there was one (REQ-043).
+    pub configured_model: Option<&'a str>,
+    /// The model that ACTUALLY answered, when the response says so (agy's runtime report, Qwen's message.model,
+    /// Mistral's export). Never inferred from the configured model: Kimi stays None (REQ-043).
+    pub served_model: Option<&'a str>,
     /// Which backend actually served this call ("agy" | "gemini-cli"), None for agents
     /// that have only one. Both backends report the same agent and provider, so without
     /// this the two are indistinguishable in PostHog. That is not hypothetical: the daemon
@@ -98,6 +103,10 @@ pub struct CallTelemetry {
     agent: String,
     /// Only meaningful for metered agents (DeepSeek), where price varies by model.
     model: Option<String>,
+    /// Seven Primes REQ-043: the model requested at construction, kept even after `set_model` reports the served one.
+    configured_model: Option<String>,
+    /// Seven Primes REQ-043: set only by `set_model`, from what the response revealed.
+    served_model: Option<String>,
     trace_id: String,
     started: std::time::Instant,
     outcome: &'static str,
@@ -135,6 +144,8 @@ impl CallTelemetry {
         Self {
             agent: agent.to_string(),
             model: model.map(str::to_string),
+            configured_model: model.map(str::to_string),
+            served_model: None,
             trace_id: trace_id.to_string(),
             started: std::time::Instant::now(),
             outcome: "unreported",
@@ -195,6 +206,7 @@ impl CallTelemetry {
     /// question `$ai_model` exists to answer. The client is Agy; the model is a Gemini model.
     pub fn set_model(&mut self, model: &str) {
         self.model = Some(model.to_string());
+        self.served_model = Some(model.to_string());
     }
 
     /// Record which repo this call was made against, so cost and quota are sliceable by
@@ -296,6 +308,8 @@ impl Drop for CallTelemetry {
             duration_ms: self.started.elapsed().as_millis() as u64,
             cost_usd: usd,
             billing,
+            configured_model: self.configured_model.as_deref(),
+            served_model: self.served_model.as_deref(),
             backend: self.backend,
             attempts: self.attempts,
             repo: self.repo.as_deref(),
@@ -1302,6 +1316,8 @@ pub fn record_dispatch_generation(
         duration_ms,
         cost_usd: None,
         billing: "subscription",
+        configured_model: None,
+        served_model: None,
         backend: Some(surface),
         attempts: 0,
         repo: repo_basename.as_deref(),
@@ -1392,6 +1408,9 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
             // quietly ran gemini-cli for four days against a config that said agy. Absent
             // (null) when the agent has only one backend, never invented.
             "tv_backend":          g.backend,
+            // Seven Primes REQ-043: requested and answering model, separately, for every seat. Null when unknown.
+            "tv_configured_model": g.configured_model,
+            "tv_served_model":     g.served_model,
             // Attempts spent against the PRIMARY provider only. gemini-cli's faildown chain
             // can burn 4 per request, so quota-vs-events is a 4x lie without this. Named
             // "primary" deliberately: the degraded cross-provider hop (agy -> codex) is NOT
@@ -1494,6 +1513,8 @@ mod tests {
             agent: "codex", model: None, outcome: t.effective_outcome(), trace_id: "t",
             input_tokens: None, output_tokens: None, cached_tokens: None, thinking_tokens: None,
             tool_calls: None, duration_ms: 1, cost_usd: None, billing: "subscription",
+            configured_model: None,
+            served_model: None,
             backend: None, attempts: 1, repo: None, input: None, output: None,
             error: t.detail.as_deref(),
         });
@@ -1505,7 +1526,8 @@ mod tests {
         ai_generation_props(&AiGeneration {
             agent: "codex", model: None, outcome, trace_id: "t", input_tokens: None,
             output_tokens: None, cached_tokens: None, thinking_tokens: None, tool_calls: None,
-            duration_ms: 1, cost_usd: None, billing: "subscription", backend: None, attempts: 1,
+            duration_ms: 1, cost_usd: None, billing: "subscription", configured_model: None,
+            served_model: None, backend: None, attempts: 1,
             repo: None, input: None, output: None, error,
         })
     }
@@ -1560,6 +1582,8 @@ mod tests {
             agent: "codex", model: None, outcome: "failure", trace_id: "t", input_tokens: None,
             output_tokens: None, cached_tokens: None, thinking_tokens: None, tool_calls: None,
             duration_ms: 1, cost_usd: None, billing: "subscription",
+            configured_model: None,
+            served_model: None,
             backend: Some("dispatch_codex_worktree"), attempts: 0, repo: None,
             input: Some("told"), output: Some(produced), error: true.then_some(produced),
         });
@@ -1685,6 +1709,8 @@ mod tests {
             duration_ms: 10,
             cost_usd: None,
             billing: "subscription",
+            configured_model: None,
+            served_model: None,
             backend: None,
             attempts: 1,
             repo: None,
@@ -1746,6 +1772,8 @@ mod tests {
             duration_ms: 180_001,
             cost_usd: None,
             billing: "metered",
+            configured_model: None,
+            served_model: None,
             backend: None,
             attempts: 1,
             repo: None,
@@ -1925,5 +1953,45 @@ mod tests {
         assert_eq!(row.provider.as_str(), "openai");
         assert_eq!(normalize_prompt_as(PromptUsage::CachedDisjoint, 100, 40), (140, 40, 100));
         assert_eq!(normalize_prompt_as(PromptUsage::CachedSubsetOfInput, 100, 40), (100, 40, 60));
+    }
+
+    /// Seven Primes T-202 (REQ-043): configured and served model are recorded separately, and the served model is
+    /// never inferred from the configured one.
+    /// RED IF: tv_served_model starts echoing the requested model, or set_model stops recording what answered.
+    #[test]
+    fn configured_and_served_model_are_separate() {
+        let base = |configured, served| AiGeneration {
+            agent: "qwen",
+            model: served,
+            outcome: "success",
+            trace_id: "t",
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            thinking_tokens: None,
+            tool_calls: None,
+            duration_ms: 1,
+            cost_usd: Some(0.0),
+            billing: "subscription",
+            configured_model: configured,
+            served_model: served,
+            backend: None,
+            attempts: 1,
+            repo: None,
+            input: None,
+            output: None,
+            error: None,
+        };
+        let props = ai_generation_props(&base(Some("qwen3-coder-plus"), None));
+        assert_eq!(props["tv_configured_model"], "qwen3-coder-plus");
+        assert!(props["tv_served_model"].is_null(), "unknown served model stays null, never the configured one");
+        let props = ai_generation_props(&base(Some("qwen3-coder-plus"), Some("glm-5")));
+        assert_eq!(props["tv_served_model"], "glm-5");
+
+        let mut tel = CallTelemetry::new("qwen", "trace", Some("qwen3-coder-plus"));
+        assert_eq!((tel.configured_model.as_deref(), tel.served_model.as_deref()), (Some("qwen3-coder-plus"), None));
+        tel.set_model("glm-5");
+        assert_eq!((tel.configured_model.as_deref(), tel.served_model.as_deref()), (Some("qwen3-coder-plus"), Some("glm-5")));
+        tel.rejected("test: no emit expected to matter");
     }
 }

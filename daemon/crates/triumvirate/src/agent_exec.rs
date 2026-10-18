@@ -1355,7 +1355,10 @@ async fn execute_ask_agent_inner(
                 // (High)") and stashes it in cli_version (agy.rs::build_result). Without
                 // this, $ai_model falls back to the agent key and every Antigravity call
                 // charts as the model "gemini", which cannot answer which model ran.
-                if agent == "gemini" {
+                // Seven Primes T-202 (REQ-043): which seats report a served model this way is SeatProfile data.
+                let reports_runtime_model = mcp_bridge::seat_profile::seat_profile(&agent).map(|row| row.served_model_evidence)
+                    == Some(mcp_bridge::seat_profile::ModelEvidence::AgyRuntimeReport);
+                if reports_runtime_model {
                     match parsed.cli_version.as_deref() {
                         Some(model) if !model.trim().is_empty() => {
                             tel.set_model(model);
