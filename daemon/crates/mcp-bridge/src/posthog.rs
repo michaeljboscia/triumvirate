@@ -1515,16 +1515,35 @@ mod tests {
         // assertion used to be `t.detail.is_some()`, which checked the holder and passed while
         // the event itself never carried the reason at all (D-004).
         let props = ai_generation_props(&AiGeneration {
-            agent: "codex", model: None, outcome: t.effective_outcome(), trace_id: "t",
-            input_tokens: None, output_tokens: None, cached_tokens: None, thinking_tokens: None,
-            tool_calls: None, duration_ms: 1, cost_usd: None, billing: "subscription",
+            agent: "codex",
+            model: None,
+            outcome: t.effective_outcome(),
+            trace_id: "t",
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            thinking_tokens: None,
+            tool_calls: None,
+            duration_ms: 1,
+            cost_usd: None,
+            billing: "subscription",
             configured_model: None,
             served_model: None,
-            backend: None, attempts: 1, repo: None, input: None, output: None,
+            backend: None,
+            attempts: 1,
+            repo: None,
+            input: None,
+            output: None,
             error: t.detail.as_deref(),
         });
-        assert_eq!(props["tv_detail"], serde_json::json!("never opened the named source"));
-        assert!(props.get("$ai_error").is_none(), "a declined turn is not an error: {props}");
+        assert_eq!(
+            props["tv_detail"],
+            serde_json::json!("never opened the named source")
+        );
+        assert!(
+            props.get("$ai_error").is_none(),
+            "a declined turn is not an error: {props}"
+        );
     }
 
     fn generation(outcome: &str, error: Option<&str>) -> serde_json::Value {
@@ -1599,13 +1618,26 @@ mod tests {
         // `record_dispatch_generation` passes `produced` as the error on failure; mirror its call.
         let produced = "worker exited 1: cargo test failed in daemon/crates/fleet";
         let g = ai_generation_props(&AiGeneration {
-            agent: "codex", model: None, outcome: "failure", trace_id: "t", input_tokens: None,
-            output_tokens: None, cached_tokens: None, thinking_tokens: None, tool_calls: None,
-            duration_ms: 1, cost_usd: None, billing: "subscription",
+            agent: "codex",
+            model: None,
+            outcome: "failure",
+            trace_id: "t",
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            thinking_tokens: None,
+            tool_calls: None,
+            duration_ms: 1,
+            cost_usd: None,
+            billing: "subscription",
             configured_model: None,
             served_model: None,
-            backend: Some("dispatch_codex_worktree"), attempts: 0, repo: None,
-            input: Some("told"), output: Some(produced), error: true.then_some(produced),
+            backend: Some("dispatch_codex_worktree"),
+            attempts: 0,
+            repo: None,
+            input: Some("told"),
+            output: Some(produced),
+            error: true.then_some(produced),
         });
         assert_eq!(g["$ai_error"], serde_json::json!(produced));
     }
