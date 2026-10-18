@@ -25,9 +25,6 @@ pub mod pantheon_session;
 pub use version::{NAME, VERSION};
 pub use sequencer::EventSequencer;
 pub use pid::PidFile;
-
-// Seven Primes per-seat lock (T-003 scaffold; T-105 implements).
-pub mod seat_lock;
 pub use replay::{EventReplayBuffer, ReplayResult, DEFAULT_CAPACITY as REPLAY_BUFFER_DEFAULT_CAPACITY};
 pub use pantheon_session::{
     PANTHEON_SESSION, PantheonSessionContext, current_parent_session_id,
@@ -977,3 +974,7 @@ mod persist_json_atomic_tests {
         assert!(stray.is_empty(), "temp files left behind: {stray:?}");
     }
 }
+
+// Seven Primes per-seat lock (T-003 scaffold; T-105 implements). At the end of the file, in its own group, so the
+// legacy module and re-export order above is untouched.
+pub mod seat_lock;

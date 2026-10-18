@@ -1317,8 +1317,14 @@ mod origin_tests {
     #[test]
     fn origin_defaults_to_interactive_and_uses_snake_case() {
         assert_eq!(Origin::default(), Origin::Interactive);
-        assert_eq!(serde_json::to_string(&Origin::Unattended).unwrap(), "\"unattended\"");
-        assert_eq!(serde_json::from_str::<Origin>("\"interactive\"").unwrap(), Origin::Interactive);
+        assert_eq!(
+            serde_json::to_string(&Origin::Unattended).unwrap(),
+            "\"unattended\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Origin>("\"interactive\"").unwrap(),
+            Origin::Interactive
+        );
         assert!(serde_json::from_str::<Origin>("\"robot\"").is_err());
     }
 }
