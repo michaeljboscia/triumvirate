@@ -754,10 +754,16 @@ mod tests {
     /// non-writers is refused with an error that prints the whole list. An empty baseline dir is enough, because
     /// `cargo_test` returns a missing manifest as output, not as an error, and the roster filter runs next. No agent
     /// is ever spawned: every roster here is filtered to empty.
+    /// A sync test driving a current-thread runtime, so the env lock (cargo reads PATH) is held for the whole run
+    /// without ever crossing an await point.
     /// RED IF: the list gains or loses a seat, or either current non-writer stops being refused on its own.
-    #[tokio::test]
-    async fn seven_primes_characterization_cannot_write_here() {
+    #[test]
+    fn seven_primes_characterization_cannot_write_here() {
         let _g = env_guard();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
         assert!(
             have("cargo"),
             "cargo must be on PATH: a skipped characterization pins nothing"
@@ -773,8 +779,8 @@ mod tests {
                 roster: roster.iter().map(|s| s.to_string()).collect(),
                 package_dir: ".".to_string(),
             };
-            let err = run_with_trees(&req, base.path(), base.path())
-                .await
+            let err = rt
+                .block_on(run_with_trees(&req, base.path(), base.path()))
                 .expect_err("a roster of non-writers cannot validate");
             assert!(
                 err.contains(r#"["grok", "deepseek"] cannot here"#),
