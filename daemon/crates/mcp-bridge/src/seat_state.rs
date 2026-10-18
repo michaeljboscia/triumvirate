@@ -7,7 +7,9 @@
 //! "suspended", and an unknown installed CLI version cannot match a verified record. A seat is never made available
 //! by a file the daemon could not understand.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -67,12 +69,20 @@ impl SeatAvailability {
 /// `$TRIUMVIRATE_HOME`, else `~/.triumvirate` (the same rule as daemon-core's `triumvirate_home_dir`, which this crate
 /// does not depend on).
 pub fn triumvirate_home() -> Result<PathBuf, String> {
-    if let Ok(dir) = std::env::var("TRIUMVIRATE_HOME") {
+    resolve_home(
+        std::env::var("TRIUMVIRATE_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// The rule behind `triumvirate_home`, taking the two variables as values so it is testable without mutating the
+/// process environment (this crate has no single env lock shared by every test that touches HOME).
+fn resolve_home(triumvirate_home: Option<String>, home: Option<String>) -> Result<PathBuf, String> {
+    if let Some(dir) = triumvirate_home {
         return Ok(PathBuf::from(dir));
     }
-    std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".triumvirate"))
-        .map_err(|_| "seat_state: neither TRIUMVIRATE_HOME nor HOME is set".to_string())
+    home.map(|h| PathBuf::from(h).join(".triumvirate"))
+        .ok_or_else(|| "seat_state: neither TRIUMVIRATE_HOME nor HOME is set".to_string())
 }
 
 /// A seat key becomes a directory name, so it must not be able to address anything outside seats/.
@@ -96,17 +106,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .ok_or_else(|| format!("seat_state: {} has no parent", path.display()))?;
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("seat_state: cannot create {}: {e}", dir.display()))?;
+    // pid alone is not unique: two threads of one daemon writing the same record would share a temp file.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = dir.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("record"),
-        std::process::id()
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| format!("seat_state: cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("seat_state: cannot rename onto {}: {e}", path.display()))
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes))
+        .map_err(|e| format!("seat_state: cannot write {}: {e}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .map_err(|e| format!("seat_state: cannot rename onto {}: {e}", path.display()))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 fn remove_if_present(path: &Path) -> Result<(), String> {
@@ -327,6 +350,132 @@ mod tests {
         let back: VerifiedRecord =
             serde_json::from_slice(&std::fs::read(dir.join("verified.json")).unwrap()).unwrap();
         assert_eq!(back, rec("2.2.0"));
+    }
+
+    /// A real delete: verified.json exists and is honoured, delete_verified removes it, and the seat then reports
+    /// Unverified (configured, not suspended).
+    /// RED IF: delete_verified is a no-op, or removes something other than verified.json.
+    #[test]
+    fn delete_verified_removes_an_existing_record() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        write_verified(h, "kimi", &rec("2.2.0")).unwrap();
+        let file = h.join("seats/kimi/verified.json");
+        assert!(file.exists());
+        let a = availability(h, "kimi", true, Some("2.2.0")).unwrap();
+        assert!(a.verified && a.available());
+
+        delete_verified(h, "kimi").unwrap();
+        assert!(!file.exists(), "verified.json must be gone");
+        let a = availability(h, "kimi", true, Some("2.2.0")).unwrap();
+        assert!(a.configured && a.suspended.is_none());
+        assert_eq!(a.first_blocker(), Some(Blocker::Unverified));
+        assert!(!a.available());
+    }
+
+    /// A verified, unsuspended seat that is not configured is still unavailable.
+    /// RED IF: availability() ignores its `configured` argument, or NotConfigured stops ranking first.
+    #[test]
+    fn unconfigured_verified_seat_is_not_available() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        write_verified(h, "mistral", &rec("2.26.1")).unwrap();
+        let a = availability(h, "mistral", false, Some("2.26.1")).unwrap();
+        assert!(a.verified && a.suspended.is_none());
+        assert_eq!(a.first_blocker(), Some(Blocker::NotConfigured));
+        assert!(!a.available());
+    }
+
+    /// TRIUMVIRATE_HOME wins when set; otherwise $HOME/.triumvirate; neither set is an error. The live env reader
+    /// agrees with the rule (read only, no env mutation, so it cannot race tests that set HOME under other locks).
+    /// RED IF: TRIUMVIRATE_HOME is ignored, the HOME fallback changes, or triumvirate_home stops using the rule.
+    #[test]
+    fn triumvirate_home_prefers_env_then_falls_back_to_home() {
+        assert_eq!(
+            resolve_home(Some("/th".into()), Some("/u".into())).unwrap(),
+            PathBuf::from("/th")
+        );
+        assert_eq!(
+            resolve_home(None, Some("/u".into())).unwrap(),
+            PathBuf::from("/u/.triumvirate")
+        );
+        assert!(resolve_home(None, None).is_err());
+        assert_eq!(
+            triumvirate_home(),
+            resolve_home(
+                std::env::var("TRIUMVIRATE_HOME").ok(),
+                std::env::var("HOME").ok()
+            )
+        );
+    }
+
+    /// Many threads in one process rewrite the same verified.json while readers read it in a loop. Every read
+    /// parses as one complete record from a single writer, and no temp file survives.
+    /// RED IF: write_atomic writes the destination in place, or temp names collide across threads.
+    #[test]
+    fn concurrent_writes_never_expose_a_partial_record() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const LEN: usize = 512 * 1024;
+        let home = tempfile::tempdir().unwrap();
+        let h = Arc::new(home.path().to_path_buf());
+        // Large records widen the window in which a non-atomic write is visibly partial.
+        let big = |t: usize| VerifiedRecord {
+            cli_version: format!("v{t}"),
+            seat_home: std::iter::repeat_n(char::from(b'a' + t as u8), LEN).collect(),
+            probed_at: "2026-10-18T19:00:00Z".into(),
+            served_model: Some(format!("m{t}")),
+        };
+        write_verified(&h, "kimi", &big(0)).unwrap();
+        let file = h.join("seats/kimi/verified.json");
+
+        let done = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let done = done.clone();
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !done.load(Ordering::Relaxed) || reads < 50 {
+                        let bytes = std::fs::read(&file).expect("verified.json always exists");
+                        let r: VerifiedRecord = serde_json::from_slice(&bytes)
+                            .unwrap_or_else(|e| panic!("partial record after {reads} reads: {e}"));
+                        let t: usize = r.cli_version[1..].parse().unwrap();
+                        let c = char::from(b'a' + t as u8) as u8;
+                        let s = r.seat_home.as_bytes();
+                        assert!(s.len() == LEN && s[0] == c && s[LEN / 2] == c && s[LEN - 1] == c);
+                        assert_eq!(r.served_model, Some(format!("m{t}")));
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..8)
+            .map(|t| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    let r = big(t);
+                    for _ in 0..100 {
+                        write_verified(&h, "kimi", &r).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("a writer failed");
+        }
+        done.store(true, Ordering::Relaxed);
+        for r in readers {
+            assert!(r.join().expect("a reader saw a partial record") > 0);
+        }
+
+        let names: Vec<String> = std::fs::read_dir(h.join("seats/kimi"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["verified.json"], "no temp file may remain");
     }
 
     /// RED IF: a seat name can address a path outside seats/, or a non-"1" value enables a seat.
