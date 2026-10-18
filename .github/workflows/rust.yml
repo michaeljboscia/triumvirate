@@ -77,6 +77,31 @@ jobs:
       # so this is offline; the codex oracle tests among them use the CLI installed above.
       - name: Daemon binary and integration tests
         run: cargo test -p triumvirate --tests
+      # Seven Primes T-104: seat containment (env scrub, seat files, repo audit). Its seatbelt cases are
+      # cfg(target_os = "macos") and compile out here; the macOS job below runs them.
+      - name: Seat containment tests
+        run: cargo test -p mcp-bridge --test containment
+
+  # Seven Primes T-104 (REQ-035): the macOS seatbelt is the new seats' write barrier, and seatbelt only exists on
+  # macOS, so these tests would never run on the Linux jobs. Required for a green PR, which puts the real
+  # sandbox-exec cases in the authoritative verdict. T-206 adds the runner's integration tests to this job.
+  macos-containment:
+    name: macOS containment
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: daemon
+    steps:
+      - uses: actions/checkout@v4
+      # The Temporal SDK's build script needs protoc on every platform it builds on.
+      - name: Install system deps (macOS)
+        run: brew install protobuf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon
+      - name: Seat containment tests (real sandbox-exec)
+        run: cargo test -p mcp-bridge --test containment
 
   # Seven Primes T-000 (REQ-010): the security floor the local validator enforces per task, re-run on the PR head.
   # Only for the feature PR; T-301 adds the live-evidence step and widens the trigger. gitleaks comes from its release
