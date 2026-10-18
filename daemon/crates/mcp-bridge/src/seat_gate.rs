@@ -246,32 +246,39 @@ mod tests {
     /// RED IF: any new seat's answer changes for any surface or state, or origin/tty start mattering.
     #[test]
     fn launch_table_for_every_new_seat_surface_origin_tty_and_state() {
-        let seats = [
-            new_seat("kimi", "TRIUMVIRATE_ENABLE_KIMI"),
-            new_seat("mistral", "TRIUMVIRATE_ENABLE_MISTRAL"),
-            new_seat("qwen", "TRIUMVIRATE_ENABLE_QWEN"),
-        ];
+        // The REAL rows (T-201 landed): kimi, mistral and qwen exactly as seat_profile() returns them.
         let mut refused_codes = 0;
-        for p in &seats {
-            let k = p.key;
+        for k in ["kimi", "mistral", "qwen"] {
             for &surface in Surface::ALL {
-                for _origin in [Origin::Interactive, Origin::Unattended] {
-                    for _tty in [true, false] {
+                for origin in [Origin::Interactive, Origin::Unattended] {
+                    for tty in [true, false] {
+                        // Through the public pure decision, with origin and tty actually passed: under A-2 they must
+                        // not change any answer, and the payload must start with its code.
+                        let gate = |a: &SeatAvailability| {
+                            seat_gate_with(k, surface, origin, tty, a).map_err(|r| {
+                                assert!(
+                                    r.message.starts_with(r.code.as_str()),
+                                    "payload must start with its code: {}",
+                                    r.message
+                                );
+                                r.message
+                            })
+                        };
                         assert_eq!(
-                            msg(p, surface, &st(false, true, None)),
+                            gate(&st(false, true, None)),
                             Err(format!(
                                 "seat_not_configured: {k}: set TRIUMVIRATE_ENABLE_{}=1 and restart the daemon",
                                 k.to_uppercase()
                             ))
                         );
                         assert_eq!(
-                            msg(p, surface, &st(true, false, Some("403 suspended"))),
+                            gate(&st(true, false, Some("403 suspended"))),
                             Err(format!(
                                 "seat_suspended: {k}: 403 suspended (run: triumvirate seat clear {k})"
                             ))
                         );
-                        let unverified = msg(p, surface, &st(true, false, None));
-                        let available = msg(p, surface, &st(true, true, None));
+                        let unverified = gate(&st(true, false, None));
+                        let available = gate(&st(true, true, None));
                         let surface_rule = match surface {
                             Surface::AskAgent
                             | Surface::Session
