@@ -157,11 +157,15 @@ pub(crate) fn note_attempt_child(child: &tokio::process::Child) {
 /// The DeepSeek arm is never handed the events channel at all, and thinking mode legitimately runs
 /// past its 420 s window. codex, grok and gemini-cli emit per line. When agy streams its
 /// stream-json live, it can come back in here.
+///
+/// Seven Primes T-202: the seat's `SeatProfile.live_progress`. A name with no row keeps the old default, streaming.
 fn streams_live_progress(agent: &str, gemini_backend: Option<GeminiBackend>) -> bool {
-    match agent {
-        "gemini" => !matches!(gemini_backend, Some(GeminiBackend::Agy)),
-        "deepseek" => false,
-        _ => true,
+    use mcp_bridge::seat_profile::LiveProgress;
+    let live = mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent)).map(|row| row.live_progress);
+    match live {
+        Some(LiveProgress::StreamsExceptAgy) => !matches!(gemini_backend, Some(GeminiBackend::Agy)),
+        Some(LiveProgress::Buffered) => false,
+        Some(LiveProgress::Streams) | None => true,
     }
 }
 
@@ -228,6 +232,22 @@ fn read_contract_context(cwd: Option<&str>) -> (Option<String>, Option<i64>) {
     (Some(parsed.task_id), Some(i64::from(parsed.wave)))
 }
 
+/// The token record's `usage_source` (REQ-057, REQ-041). agy has no honest headless token count, so its dispatch is
+/// `unmetered` (excluded from cost sums) rather than a fake zero. A parse with NO usage block at all is `not_reported`
+/// (Seven Primes REQ-041: Kimi's stdout carries none), so its zero counts are labeled as absent, while a REPORTED zero
+/// stays `exact`.
+const USAGE_SOURCE_NOT_REPORTED: &str = "not_reported";
+
+fn usage_source_for(parsed: &ParsedAgentResult) -> &'static str {
+    if parsed.parser_mode.starts_with("agy") {
+        token_economics::USAGE_SOURCE_UNMETERED
+    } else if parsed.token_usage.is_none() {
+        USAGE_SOURCE_NOT_REPORTED
+    } else {
+        token_economics::USAGE_SOURCE_EXACT
+    }
+}
+
 fn persist_daemon_token_record(
     agent: &str,
     request_id: &str,
@@ -256,12 +276,7 @@ fn persist_daemon_token_record(
     // REQ-057: agy has no honest headless token count → record the dispatch as
     // `unmetered` (excluded from cost sums) rather than a fake zero. Other backends
     // carry exact counts.
-    let usage_source = if parsed.parser_mode.starts_with("agy") {
-        token_economics::USAGE_SOURCE_UNMETERED
-    } else {
-        token_economics::USAGE_SOURCE_EXACT
-    }
-    .to_string();
+    let usage_source = usage_source_for(parsed).to_string();
 
     let record = TokenRecord {
         agent: agent.to_string(),
@@ -534,8 +549,8 @@ pub(crate) fn wiki_evidence(
     cwd: &str,
 ) -> serde_json::Value {
     let mode = parsed.parser_mode.as_str();
-    let reads_classified = PARSER_MODES_THAT_CLASSIFY_READS.contains(&mode);
-    let tool_records = PARSER_MODES_WITH_TOOL_RECORDS.contains(&mode);
+    let reads_classified = parser_modes_that_classify_reads().contains(&mode);
+    let tool_records = parser_modes_with_tool_records().contains(&mode);
     let mut ev = serde_json::json!({
         "parser_mode": mode,
         "backend": backend,
@@ -737,7 +752,7 @@ async fn execute_ask_agent_inner(
              serve as a sighted reviewer. Refused before dispatch so the call is not spent. \
              Send it the material inline as a method question, or route the review to a peer \
              that can read: {}.",
-            PARSER_MODES_WITH_TOOL_RECORDS.join(", ")
+            parser_modes_with_tool_records().join(", ")
         );
         tel.rejected(&msg);
         return Err(msg);
@@ -2155,34 +2170,48 @@ fn require_peer_review_enabled() -> bool {
 ///
 /// To add a mode here, open its `finish`/`build_result` and confirm a `tool_calls.push` exists
 /// on a real tool event. Do not add one because its name looks capable.
-const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
-    // crates/agent-adapter/src/codex.rs: pushes on command_execution
-    "codex-exec-json",
-    // crates/agent-adapter/src/gemini.rs: pushes on tool_use
-    "gemini-stream-json",
-    // crates/agent-adapter/src/grok.rs: pushes on tool_call
-    "grok-streaming-json",
-    // crates/agent-adapter/src/agy_stream.rs: pushes on step_type="tool".
-    //
-    // Added 2026-09-01 after Grok found the gate was permanently closed against Antigravity:
-    // the live agy path emits agy-pipe-plain-text / agy-pty-plain-text, which record nothing,
-    // so every antigravity review was rejected however carefully it looked. Plain text has no
-    // tool events to record, so the fix was dispatching agy with --output-format stream-json
-    // rather than teaching the old parser to see something that was never there.
-    "agy-stream-json",
-    // crates/agent-adapter/src/claude_stream.rs: pushes on a content block of type "tool_use".
-    //
-    // Added 2026-09-02, and the reason is the same one as agy's, one seat over. `claude` is a
-    // DEFAULT reviewer and its runner built ParsedAgentResult from Default::default(): empty
-    // parser mode, empty tool_calls. So the claude seat was permanently closed against the
-    // sight gate, and turning sight on for the reviewer would have rejected roughly one review
-    // in three for a fault that is the harness's.
-    //
-    // `claude-plain-text` is deliberately NOT here. That mode is what the runner falls back to
-    // when no `result` event arrived, which means the turn was not stream-json and there is no
-    // receipt mechanism to trust.
-    "claude-stream-json",
-];
+// Seven Primes T-202 (REQ-063): DERIVED from the seat table, every parser mode of every seat whose row sets
+// `records_tool_calls`. The per-mode history above is kept because it is the reason each mode is trusted; adding a mode now means
+// setting the field on its SeatProfile row, and the exact pin in the tests below still turns red until someone opens
+// the parser and confirms it. The comment block this replaced listed the modes inline:
+//// const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
+//     // crates/agent-adapter/src/codex.rs: pushes on command_execution
+//     "codex-exec-json",
+//     // crates/agent-adapter/src/gemini.rs: pushes on tool_use
+//     "gemini-stream-json",
+//     // crates/agent-adapter/src/grok.rs: pushes on tool_call
+//     "grok-streaming-json",
+//     // crates/agent-adapter/src/agy_stream.rs: pushes on step_type="tool".
+//     //
+//     // Added 2026-09-01 after Grok found the gate was permanently closed against Antigravity:
+//     // the live agy path emits agy-pipe-plain-text / agy-pty-plain-text, which record nothing,
+//     // so every antigravity review was rejected however carefully it looked. Plain text has no
+//     // tool events to record, so the fix was dispatching agy with --output-format stream-json
+//     // rather than teaching the old parser to see something that was never there.
+//     "agy-stream-json",
+//     // crates/agent-adapter/src/claude_stream.rs: pushes on a content block of type "tool_use".
+//     //
+//     // Added 2026-09-02, and the reason is the same one as agy's, one seat over. `claude` is a
+//     // DEFAULT reviewer and its runner built ParsedAgentResult from Default::default(): empty
+//     // parser mode, empty tool_calls. So the claude seat was permanently closed against the
+//     // sight gate, and turning sight on for the reviewer would have rejected roughly one review
+//     // in three for a fault that is the harness's.
+//     //
+//     // `claude-plain-text` is deliberately NOT here. That mode is what the runner falls back to
+//     // when no `result` event arrived, which means the turn was not stream-json and there is no
+//     // receipt mechanism to trust.
+//     "claude-stream-json",
+// ];
+fn parser_modes_with_tool_records() -> &'static [&'static str] {
+    static MODES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    MODES.get_or_init(|| {
+        mcp_bridge::seat_profile::all_seats()
+            .iter()
+            .filter(|row| row.records_tool_calls)
+            .flat_map(|row| row.parser_modes.iter().copied())
+            .collect()
+    })
+}
 
 /// Agents that have no tools at all, so `require_sight` can never be satisfied by them.
 ///
@@ -2263,34 +2292,48 @@ const AGENTS_WITH_NO_WRITE_CONTAINMENT: &[&str] = &[];
 /// Fail closed: a parser not listed here cannot have `required_sources` enforced, and the gate
 /// says so rather than pretending. That is the same rule as the tool-record allowlist, applied
 /// one level finer.
-const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
-    "gemini-stream-json",
-    "grok-streaming-json",
-    "agy-stream-json",
-    // Added 2026-09-01. codex-exec-json used to stamp EVERY call ToolKind::Bash, so on that
-    // backend "opened the file" and "ran a command mentioning the file" were the same record
-    // and named sources were refused rather than faked. `codex.rs` now classifies a
-    // `command_execution` as a READ when its command is a pure content reader (cat, head, nl,
-    // ...) or one of the two RANGED shapes codex actually reads with (`sed -n 'a,bp' FILE` and
-    // `nl -ba FILE | sed -n 'a,bp'`), and leaves everything else as Bash. `rg` and `grep` are
-    // searches, not reads, and are NOT on the list. The allowlist is conservative and fails
-    // closed: `ls`, `find`, `stat`, compound commands, other pipes and redirections are all
-    // still Bash and still cannot satisfy a source.
-    //
-    // 2026-09-03: the ranged shapes were added after every source-gated codex review that day
-    // was rejected "never opened". Codex reads files in 260-line windows with `sed -n`, which
-    // the reader list did not contain, and the previous version of THIS comment claimed
-    // `sed -n` was on it. See `codex_ranged_reads_cover_source` for how windows add up.
-    //
-    // This closes Grok's "Codex can be sighted and cannot be source-gated", which mattered
-    // because codex is the peer most likely to be reviewing code.
-    "codex-exec-json",
-    // Added 2026-09-02. The claude stream names the tool directly ("Read", "Grep", "Bash"), so
-    // read against search against shell is a first-class distinction rather than something
-    // inferred from a command line. Verified against a live capture: an allowed Read records
-    // ToolKind::ReadFile with the path in args_json, and a DENIED one records success: false.
-    "claude-stream-json",
-];
+// Seven Primes T-202 (REQ-063): DERIVED from the seat table, every parser mode of every seat whose row sets
+// `classifies_reads`. The per-mode history above is kept because it is the reason each mode is trusted; adding a mode now means
+// setting the field on its SeatProfile row, and the exact pin in the tests below still turns red until someone opens
+// the parser and confirms it. The comment block this replaced listed the modes inline:
+//// const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
+//     "gemini-stream-json",
+//     "grok-streaming-json",
+//     "agy-stream-json",
+//     // Added 2026-09-01. codex-exec-json used to stamp EVERY call ToolKind::Bash, so on that
+//     // backend "opened the file" and "ran a command mentioning the file" were the same record
+//     // and named sources were refused rather than faked. `codex.rs` now classifies a
+//     // `command_execution` as a READ when its command is a pure content reader (cat, head, nl,
+//     // ...) or one of the two RANGED shapes codex actually reads with (`sed -n 'a,bp' FILE` and
+//     // `nl -ba FILE | sed -n 'a,bp'`), and leaves everything else as Bash. `rg` and `grep` are
+//     // searches, not reads, and are NOT on the list. The allowlist is conservative and fails
+//     // closed: `ls`, `find`, `stat`, compound commands, other pipes and redirections are all
+//     // still Bash and still cannot satisfy a source.
+//     //
+//     // 2026-09-03: the ranged shapes were added after every source-gated codex review that day
+//     // was rejected "never opened". Codex reads files in 260-line windows with `sed -n`, which
+//     // the reader list did not contain, and the previous version of THIS comment claimed
+//     // `sed -n` was on it. See `codex_ranged_reads_cover_source` for how windows add up.
+//     //
+//     // This closes Grok's "Codex can be sighted and cannot be source-gated", which mattered
+//     // because codex is the peer most likely to be reviewing code.
+//     "codex-exec-json",
+//     // Added 2026-09-02. The claude stream names the tool directly ("Read", "Grep", "Bash"), so
+//     // read against search against shell is a first-class distinction rather than something
+//     // inferred from a command line. Verified against a live capture: an allowed Read records
+//     // ToolKind::ReadFile with the path in args_json, and a DENIED one records success: false.
+//     "claude-stream-json",
+// ];
+fn parser_modes_that_classify_reads() -> &'static [&'static str] {
+    static MODES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    MODES.get_or_init(|| {
+        mcp_bridge::seat_profile::all_seats()
+            .iter()
+            .filter(|row| row.classifies_reads)
+            .flat_map(|row| row.parser_modes.iter().copied())
+            .collect()
+    })
+}
 
 /// Did any COMPLETED, SUCCESSFUL READ of this source happen?
 ///
@@ -3190,14 +3233,14 @@ fn enforce_reviewer_sight(
     // This is also what makes the allowlist FAIL CLOSED. Previously a parser that was not on
     // the list could still pass by recording one call, so an unvetted new parser was trusted by
     // default, which is the denylist behaviour the allowlist was meant to replace.
-    if !PARSER_MODES_WITH_TOOL_RECORDS.contains(&parser_mode) {
+    if !parser_modes_with_tool_records().contains(&parser_mode) {
         let detail = format!(
             "{agent_display} ran under parser mode `{parser_mode}`, which is not on the \
              allowlist of parsers verified to record tool calls, so this turn cannot produce \
              the receipt require_sight demands. This is the instrument's blind spot and not \
              evidence about the agent. Re-dispatch on a verified parser ({}), or confirm \
-             `{parser_mode}` records tool calls and add it to PARSER_MODES_WITH_TOOL_RECORDS.",
-            PARSER_MODES_WITH_TOOL_RECORDS.join(", ")
+             `{parser_mode}` records tool calls, then set records_tool_calls on its SeatProfile row.",
+            parser_modes_with_tool_records().join(", ")
         );
         lifecycle.push(LifecycleEvent {
             state: "REJECTED".to_string(),
@@ -3206,14 +3249,14 @@ fn enforce_reviewer_sight(
         return Err(detail);
     }
 
-    if !required_sources.is_empty() && !PARSER_MODES_THAT_CLASSIFY_READS.contains(&parser_mode) {
+    if !required_sources.is_empty() && !parser_modes_that_classify_reads().contains(&parser_mode) {
         let detail = format!(
             "{agent_display} ran under parser mode `{parser_mode}`, which does not distinguish a \
              file READ from a search or a shell command, so `required_sources` cannot be \
              enforced on it and a pass would be theatre. Drop required_sources for this agent \
              and rely on the weaker any-tool-call check, or route the review to a peer whose \
              parser classifies reads ({})."
-        , PARSER_MODES_THAT_CLASSIFY_READS.join(", "));
+        , parser_modes_that_classify_reads().join(", "));
         lifecycle.push(LifecycleEvent {
             state: "REJECTED".to_string(),
             detail: detail.clone(),
@@ -3365,7 +3408,17 @@ enum SightRepair {
 }
 
 /// Seats whose CLI resumes a session, which is what makes a second turn of ONE dispatch possible.
-const SIGHT_REPAIR_AGENTS: &[&str] = &["codex", "grok"];
+// Seven Primes T-202: derived from `SeatProfile.sight_repair` (was the literal ["codex", "grok"]).
+fn sight_repair_agents() -> &'static [&'static str] {
+    static AGENTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    AGENTS.get_or_init(|| {
+        mcp_bridge::seat_profile::all_seats()
+            .iter()
+            .filter(|row| row.sight_repair)
+            .map(|row| row.key)
+            .collect()
+    })
+}
 
 /// A repair turn is not started with less than this left of the review budget. A repair that
 /// the client abandons mid-turn is paid for and lost, which is worse than the rejection.
@@ -3377,8 +3430,8 @@ const SIGHT_REPAIR_MIN_BUDGET: Duration = Duration::from_secs(120);
 /// (Codex, consult: a reviewer that read nothing is not one to coax).
 fn sight_failure_is_repairable(tool_calls: &[ToolCallRecord], parser_mode: &str, required_sources: &[String]) -> bool {
     !required_sources.is_empty()
-        && PARSER_MODES_WITH_TOOL_RECORDS.contains(&parser_mode)
-        && PARSER_MODES_THAT_CLASSIFY_READS.contains(&parser_mode)
+        && parser_modes_with_tool_records().contains(&parser_mode)
+        && parser_modes_that_classify_reads().contains(&parser_mode)
         && !tool_calls.iter().any(|c| matches!(c.kind, ToolKind::WriteFile | ToolKind::EditFile))
         && !tool_calls.iter().any(|c| c.tool == agent_adapter::codex::COLLAB_TOOL)
         && tool_calls.iter().any(|c| matches!(c.kind, ToolKind::ReadFile) && c.success == Some(true))
@@ -3485,7 +3538,7 @@ async fn try_sight_repair(
     let Some(session) = first.session_id.as_deref().filter(|s| !s.trim().is_empty()) else {
         return SightRepair::NotTried;
     };
-    if !SIGHT_REPAIR_AGENTS.contains(&agent)
+    if !sight_repair_agents().contains(&agent)
         || !sight_failure_is_repairable(&first.tool_calls, &first.parser_mode, &req.required_sources)
     {
         return SightRepair::NotTried;
@@ -5510,7 +5563,12 @@ pub(crate) fn attempt_schedule_for(
     if review {
         return vec![(Duration::ZERO, None)];
     }
-    if agent == "gemini" {
+    // Seven Primes T-202 (REQ-050): the policy is the seat's `SeatProfile.attempt_policy`; new seats are Single. A
+    // name with no row keeps the old default, three attempts.
+    use mcp_bridge::seat_profile::AttemptPolicy;
+    let policy = mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent))
+        .map_or(AttemptPolicy::Retry3, |row| row.attempt_policy);
+    if policy == AttemptPolicy::GeminiFaildown {
         if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
             vec![(Duration::ZERO, None)]
         } else if strict {
@@ -5525,7 +5583,7 @@ pub(crate) fn attempt_schedule_for(
                 })
                 .collect()
         }
-    } else if agent == "deepseek" || agent == "grok" {
+    } else if policy == AttemptPolicy::Single {
         vec![(Duration::ZERO, None)]
     } else {
         vec![
@@ -7720,18 +7778,29 @@ mod sight_gate_tests {
     /// RED IF: any parser mode is added to or removed from the allowlist.
     #[test]
     fn sight_06_the_allowlist_is_exactly_the_verified_parsers() {
+        // Compared as a SET: the list is derived from the seat table in roster order, and order never mattered.
+        let mut got = parser_modes_with_tool_records().to_vec();
+        got.sort_unstable();
+        let mut want = vec![
+            "codex-exec-json",
+            "gemini-stream-json",
+            "grok-streaming-json",
+            "agy-stream-json",
+            // Added 2026-09-02. Confirmed the way this test demands: `claude_stream.rs`
+            // pushes a ToolCallRecord on every content block of type "tool_use", and that
+            // is exercised against a LIVE capture, not a hand-written fixture.
+            "claude-stream-json",
+            // Seven Primes (REQ-063), added 2026-10-18: each parser pushes a ToolCallRecord with the read path, proven
+            // so far against fixtures transcribed from VENDOR SOURCE only. T-302 must re-run this against live
+            // captures (REQ-044) before any of the three is trusted for a launch review.
+            "kimi-stream-json",
+            "mistral-streaming",
+            "qwen-stream-json",
+        ];
+        want.sort_unstable();
         assert_eq!(
-            PARSER_MODES_WITH_TOOL_RECORDS,
-            &[
-                "codex-exec-json",
-                "gemini-stream-json",
-                "grok-streaming-json",
-                "agy-stream-json",
-                // Added 2026-09-02. Confirmed the way this test demands: `claude_stream.rs`
-                // pushes a ToolCallRecord on every content block of type "tool_use", and that
-                // is exercised against a LIVE capture, not a hand-written fixture.
-                "claude-stream-json",
-            ],
+            got,
+            want,
             "the allowlist changed. Open the parser you are adding and confirm it actually \
              calls tool_calls.push on a real tool event. These are known NOT to: \
              agy-pipe-plain-text, agy-pty-plain-text, codex-app-server-jsonrpc, \
@@ -7752,15 +7821,23 @@ mod sight_gate_tests {
     /// RED IF: any parser mode is added to or removed from the read-classifying allowlist.
     #[test]
     fn sight_30_the_read_classifying_allowlist_is_pinned() {
+        let mut got = parser_modes_that_classify_reads().to_vec();
+        got.sort_unstable();
+        let mut want = vec![
+            "gemini-stream-json",
+            "grok-streaming-json",
+            "agy-stream-json",
+            "codex-exec-json",
+            "claude-stream-json",
+            // Seven Primes (REQ-063): vendor-source fixtures only until T-302's live captures (see sight_06).
+            "kimi-stream-json",
+            "mistral-streaming",
+            "qwen-stream-json",
+        ];
+        want.sort_unstable();
         assert_eq!(
-            PARSER_MODES_THAT_CLASSIFY_READS,
-            &[
-                "gemini-stream-json",
-                "grok-streaming-json",
-                "agy-stream-json",
-                "codex-exec-json",
-                "claude-stream-json",
-            ],
+            got,
+            want,
             "the read-classifying allowlist changed. Open the parser and confirm it can tell a              file READ from a search or a shell command. If it stamps every call the same kind,              required_sources cannot be enforced on it and a pass would be theatre."
         );
     }
@@ -7770,9 +7847,9 @@ mod sight_gate_tests {
     /// RED IF: the two lists drift apart.
     #[test]
     fn sight_31_read_classifiers_are_a_subset_of_recorders() {
-        for mode in PARSER_MODES_THAT_CLASSIFY_READS {
+        for mode in parser_modes_that_classify_reads() {
             assert!(
-                PARSER_MODES_WITH_TOOL_RECORDS.contains(mode),
+                parser_modes_with_tool_records().contains(mode),
                 "{mode} classifies reads but is not on the tool-record allowlist, so the                  stronger check would run on records the weaker one does not trust"
             );
         }
@@ -9200,7 +9277,7 @@ mod claude_runner_tests {
             "a turn that never streamed must not claim the trusted mode"
         );
         assert!(
-            !PARSER_MODES_WITH_TOOL_RECORDS.contains(&parsed.parser_mode.as_str()),
+            !parser_modes_with_tool_records().contains(&parsed.parser_mode.as_str()),
             "and that mode must fail closed on the sight gate"
         );
         assert!(parsed.response_text.contains("plain text"));
@@ -11550,27 +11627,26 @@ mod seven_primes_characterization_tests {
 
     #[test]
     fn parser_mode_allowlists_and_sight_repair_seats() {
+        // T-202: the lists are derived from the seat table. The five existing seats' modes are unchanged, the three
+        // new seats add one mode each, and order is roster order (it never carried meaning).
         assert_eq!(
-            PARSER_MODES_WITH_TOOL_RECORDS,
+            parser_modes_with_tool_records(),
             &[
-                "codex-exec-json",
-                "gemini-stream-json",
-                "grok-streaming-json",
                 "agy-stream-json",
-                "claude-stream-json"
+                "gemini-stream-json",
+                "codex-exec-json",
+                "claude-stream-json",
+                "grok-streaming-json",
+                "kimi-stream-json",
+                "mistral-streaming",
+                "qwen-stream-json",
             ]
         );
         assert_eq!(
-            PARSER_MODES_THAT_CLASSIFY_READS,
-            &[
-                "gemini-stream-json",
-                "grok-streaming-json",
-                "agy-stream-json",
-                "codex-exec-json",
-                "claude-stream-json"
-            ]
+            parser_modes_that_classify_reads(),
+            parser_modes_with_tool_records()
         );
-        assert_eq!(SIGHT_REPAIR_AGENTS, &["codex", "grok"]);
+        assert_eq!(sight_repair_agents(), &["codex", "grok"]);
     }
 
     #[test]
@@ -11616,5 +11692,60 @@ mod seven_primes_characterization_tests {
                 "gemini step {i}"
             );
         }
+    }
+}
+
+/// Seven Primes T-202 consumer tests for the dispatch-policy sites moved onto SeatProfile.
+/// RED IF: a new seat's attempt schedule, live-progress flag, parser-mode membership or usage label stops following
+/// its row.
+#[cfg(test)]
+mod seven_primes_consumer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn new_seats_follow_their_rows() {
+        for seat in ["kimi", "mistral", "qwen"] {
+            let row = mcp_bridge::seat_profile::seat_profile(seat).unwrap();
+            // REQ-050: single attempt.
+            assert_eq!(attempt_schedule_for(seat, None, false, false), vec![(Duration::ZERO, None)], "{seat}");
+            assert_eq!(
+                streams_live_progress(seat, None),
+                row.live_progress == mcp_bridge::seat_profile::LiveProgress::Streams,
+                "{seat}"
+            );
+            for mode in row.parser_modes {
+                assert!(parser_modes_with_tool_records().contains(mode), "{seat} {mode}");
+                assert!(parser_modes_that_classify_reads().contains(mode), "{seat} {mode}");
+            }
+            assert!(!sight_repair_agents().contains(&seat), "{seat}: sight repair is off at launch");
+        }
+        // Aliases reach the same row.
+        assert_eq!(attempt_schedule_for("vibe", None, false, false), vec![(Duration::ZERO, None)]);
+        // A name with no row keeps the old defaults.
+        assert_eq!(attempt_schedule_for("not-a-seat", None, false, false).len(), 3);
+        assert!(streams_live_progress("not-a-seat", None));
+    }
+
+    /// REQ-041: missing usage is labeled `not_reported`; a REPORTED zero stays `exact`; agy stays `unmetered`.
+    #[test]
+    fn usage_source_distinguishes_missing_from_zero() {
+        let mut parsed = ParsedAgentResult {
+            parser_mode: "kimi-stream-json".into(),
+            ..Default::default()
+        };
+        assert_eq!(usage_source_for(&parsed), "not_reported");
+        parsed.token_usage = Some(agent_adapter::TokenUsage {
+            input: Some(0),
+            output: Some(0),
+            cached: None,
+            thinking_tokens: None,
+            latency_ms: None,
+            tool_calls: None,
+            total: Some(0),
+        });
+        assert_eq!(usage_source_for(&parsed), "exact");
+        parsed.parser_mode = "agy-stream-json".into();
+        assert_eq!(usage_source_for(&parsed), "unmetered");
     }
 }
