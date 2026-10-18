@@ -21,13 +21,18 @@ use std::time::Duration;
 
 /// The production default for `agent`, in seconds. `None` for an agent with no measured window
 /// (it is never stall-killed). `gemini` covers both backends (gemini-cli and agy).
+///
+/// Seven Primes T-202: the window is the seat's `SeatProfile.stall_window` (REQ-051; the new seats start at 780 s, the
+/// grok value). Aliases normalize first, so `agy` and `antigravity` get gemini's window. A name with no row has none.
 pub fn default_stall_window_secs(agent: &str) -> Option<u64> {
-    match agent {
-        "codex" => Some(240),
-        "gemini" | "agy" | "antigravity" => Some(300),
-        "deepseek" => Some(420),
-        "grok" => Some(780),
-        _ => None,
+    crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent)).and_then(|row| window_secs(row.stall_window))
+}
+
+/// `Secs(n)` is `Some(n)`; `Disabled` is never stall-killed.
+fn window_secs(window: crate::seat_profile::StallWindow) -> Option<u64> {
+    match window {
+        crate::seat_profile::StallWindow::Secs(secs) => Some(secs),
+        crate::seat_profile::StallWindow::Disabled => None,
     }
 }
 
@@ -93,5 +98,21 @@ mod tests {
     fn the_message_carries_the_prefix_and_the_seconds() {
         assert_eq!(stalled_message(240), "stalled after 240 s without progress");
         assert!(stalled_message(1).starts_with(STALLED_PREFIX));
+    }
+
+    /// Seven Primes T-202 consumer test: the window is the row's, for the new seats too, and a different row value
+    /// gives a different window.
+    /// RED IF: the ask-path window stops being read from SeatProfile.
+    #[test]
+    fn seven_primes_windows_come_from_the_seat_row() {
+        use crate::seat_profile::{StallWindow, seat_profile};
+        for seat in ["kimi", "mistral", "qwen"] {
+            let row = seat_profile(seat).unwrap();
+            assert_eq!(default_stall_window_secs(seat), window_secs(row.stall_window), "{seat}");
+            assert_eq!(default_stall_window_secs(seat), Some(780), "{seat}: REQ-051 starting value");
+        }
+        assert_eq!(window_secs(StallWindow::Secs(781)), Some(781));
+        assert_eq!(window_secs(StallWindow::Disabled), None);
+        assert_eq!(default_stall_window_secs("not-a-seat"), None);
     }
 }

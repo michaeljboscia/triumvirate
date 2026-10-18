@@ -180,13 +180,14 @@ pub async fn launch(input: &RunWorkerInput) -> Result<(Option<tokio::process::Ch
 /// `0` turns the rule off for that agent.
 pub fn stall_window(agent: &str) -> Option<Duration> {
     let key = format!("TRIUMVIRATE_FLEET_STALL_SECS_{}", agent.to_ascii_uppercase());
+    // Seven Primes T-202: the default is the seat's `SeatProfile.fleet_stall_window` (A-7: read through `fleet`).
     let secs = match std::env::var(&key).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
         Some(v) => v,
-        None => match agent {
-            "codex" => 240,
-            "gemini" => 300,
-            "grok" => 780,
-            _ => return None,
+        None => match fleet::seat_profile::seat_profile(&shared_types::normalize_agent_name(agent))
+            .map(|row| row.fleet_stall_window)
+        {
+            Some(fleet::seat_profile::StallWindow::Secs(secs)) => secs,
+            Some(fleet::seat_profile::StallWindow::Disabled) | None => return None,
         },
     };
     (secs > 0).then(|| Duration::from_secs(secs))
@@ -335,5 +336,22 @@ mod stall_window_tests {
         assert_eq!(stall_window("stallwindowprobe"), None);
         unsafe { std::env::remove_var(key) };
         assert_eq!(stall_window("stallwindowprobe"), None);
+    }
+
+    /// Seven Primes T-202 consumer test: the fleet window is the row's `fleet_stall_window`; the new seats are not on
+    /// the fleet at launch and get none.
+    /// RED IF: the fleet window stops being read from SeatProfile.
+    #[test]
+    fn seven_primes_fleet_windows_come_from_the_seat_row() {
+        for seat in ["kimi", "mistral", "qwen"] {
+            assert_eq!(stall_window(seat), None, "{seat}");
+        }
+        for row in fleet::seat_profile::all_seats() {
+            let want = match row.fleet_stall_window {
+                fleet::seat_profile::StallWindow::Secs(s) => Some(Duration::from_secs(s)),
+                fleet::seat_profile::StallWindow::Disabled => None,
+            };
+            assert_eq!(stall_window(row.key), want, "{}", row.key);
+        }
     }
 }
