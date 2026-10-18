@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "outcome": "finished",
+  "stop_reason": "end_turn",
+  "error": null,
+  "session_id": "vibe-sess-7f3a",
+  "usage": {
+    "input_tokens": 1834,
+    "output_tokens": 212,
+    "cached_input_tokens": 640,
+    "total_tokens": 2046
+  },
+  "cost_usd": 0.0041,
+  "steps": 3,
+  "config": {"active_model": "redacted"},
+  "warnings": [],
+  "vibe_version": "2.26.1",
+  "journal_dir": "/th/homes/mistral/logs/session/vibe-sess-7f3a",
+  "started_at": "2026-10-18T14:00:00Z",
+  "ended_at": "2026-10-18T14:00:06Z",
+  "limits": {"max_turns": 12, "time_limit": 600}
+}
