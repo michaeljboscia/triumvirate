@@ -32,6 +32,13 @@ pub mod deepseek;
 
 /// The seat table (Seven Primes FEAT-001, REQ-011): one typed row per seat. Consumers move onto it in T-202/T-204.
 pub mod seat_profile;
+// Seven Primes new modules (T-003 scaffold; Wave 1 implements each in its own file).
+pub mod containment;
+pub mod kimi;
+pub mod mistral;
+pub mod qwen;
+pub mod seat_gate;
+pub mod seat_state;
 
 
 #[derive(Debug, Clone, PartialEq, Eq)]

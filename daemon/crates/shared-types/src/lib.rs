@@ -27,6 +27,17 @@ pub struct LifecycleEvent {
     pub detail: String,
 }
 
+/// Who is behind a call (Seven Primes FEAT-007, REQ-090). An optional request field, default `interactive`; autonomous
+/// callers send `unattended` (F-3). Lives here, not in mcp-bridge's seat_gate.rs, because request structs in this crate
+/// carry it from T-204 and mcp-bridge already depends on shared-types (the reverse would be a crate cycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Interactive,
+    Unattended,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AskAgentRequest {
     pub agent: String,
@@ -1294,5 +1305,20 @@ mod tests {
                 serde_json::from_str(&raw).expect("parse");
             assert_eq!(&parsed, expected);
         }
+    }
+}
+
+/// Seven Primes T-003: `Origin` is final, not a stub.
+/// RED IF: the default stops being Interactive, or the wire names stop being snake_case.
+#[cfg(test)]
+mod origin_tests {
+    use super::Origin;
+
+    #[test]
+    fn origin_defaults_to_interactive_and_uses_snake_case() {
+        assert_eq!(Origin::default(), Origin::Interactive);
+        assert_eq!(serde_json::to_string(&Origin::Unattended).unwrap(), "\"unattended\"");
+        assert_eq!(serde_json::from_str::<Origin>("\"interactive\"").unwrap(), Origin::Interactive);
+        assert!(serde_json::from_str::<Origin>("\"robot\"").is_err());
     }
 }

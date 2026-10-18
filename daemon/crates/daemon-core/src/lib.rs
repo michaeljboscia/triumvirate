@@ -25,6 +25,9 @@ pub mod pantheon_session;
 pub use version::{NAME, VERSION};
 pub use sequencer::EventSequencer;
 pub use pid::PidFile;
+
+// Seven Primes per-seat lock (T-003 scaffold; T-105 implements).
+pub mod seat_lock;
 pub use replay::{EventReplayBuffer, ReplayResult, DEFAULT_CAPACITY as REPLAY_BUFFER_DEFAULT_CAPACITY};
 pub use pantheon_session::{
     PANTHEON_SESSION, PantheonSessionContext, current_parent_session_id,

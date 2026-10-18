@@ -11,6 +11,12 @@ pub mod grok;
 pub mod stuck;
 pub mod types;
 
+// Seven Primes new seats (T-003 scaffold; T-101..T-103 implement). Kept in their own group so the legacy module order
+// above is untouched.
+pub mod kimi;
+pub mod mistral;
+pub mod qwen;
+
 pub use claude_stream::{ClaudeStreamParser, PARSER_MODE_STREAM as CLAUDE_PARSER_MODE_STREAM};
 pub use codex::CodexExecParser;
 pub use agy_stream::{AgyStreamParser, PARSER_MODE_STREAM as AGY_PARSER_MODE_STREAM};
@@ -26,6 +32,33 @@ pub use types::{
     numbered_line_runs,
     WorkingStateEvent, should_display,
 };
+
+/// How a new seat's dispatch ended (Seven Primes REQ-052). The exit-code tables per seat are in BACKEND_STRUCTURE section 6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeatOutcome {
+    Success,
+    /// Usable output that stopped early (Mistral exit 3, Qwen 53/55), with the reason.
+    Partial(String),
+    /// A failure code first, for example `empty_or_unrecognized_stream:kimi` or `missing_export:mistral`.
+    Failure(String),
+}
+
+/// Usage as the seat reports it (REQ-041). `NotReported` persists as `not_reported`, never as zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageReport {
+    Exact(TokenUsage),
+    NotReported,
+}
+
+/// A new seat's parsed dispatch.
+#[derive(Debug, Clone)]
+pub struct SeatParsed {
+    pub result: ParsedAgentResult,
+    pub outcome: SeatOutcome,
+    pub usage: UsageReport,
+    /// The model that actually answered, when the stream says (REQ-043).
+    pub served_model: Option<String>,
+}
 
 pub fn format_working_state(event: &WorkingStateEvent) -> String {
     match event.state {
