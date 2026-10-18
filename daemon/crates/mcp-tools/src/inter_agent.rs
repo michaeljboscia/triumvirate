@@ -308,6 +308,53 @@ pub async fn list_sessions(
     Json(SessionListResponse { sessions: out })
 }
 
+/// Seven Primes T-203 (REQ-080, REQ-091): every seat that needs `doctor --live` verification, with its state read NOW
+/// (configured from its env flag, verified/suspended from `$TRIUMVIRATE_HOME/seats/<seat>/`), and `reason` set to the
+/// exact refusal the gate would give an ask.
+pub fn seats_status() -> std::collections::BTreeMap<String, shared_types::SeatStatus> {
+    use mcp_bridge::seat_profile::{Configured, VerifyPolicy, all_seats};
+    let home = mcp_bridge::seat_state::triumvirate_home().ok();
+    all_seats()
+        .iter()
+        .filter(|row| row.verify_policy == VerifyPolicy::DoctorLive)
+        .map(|row| {
+            let configured = match row.configured {
+                Configured::Always => true,
+                Configured::EnvFlag(var) => std::env::var(var).is_ok_and(|v| v.trim() == "1"),
+            };
+            let version = mcp_bridge::seat_gate::installed_cli_version(row.key);
+            let state = home
+                .as_deref()
+                .and_then(|h| {
+                    mcp_bridge::seat_state::availability(h, row.key, configured, version.as_deref())
+                        .ok()
+                })
+                .unwrap_or(mcp_bridge::seat_state::SeatAvailability {
+                    configured,
+                    verified: false,
+                    suspended: None,
+                });
+            let reason = mcp_bridge::seat_gate::seat_gate_with(
+                row.key,
+                mcp_bridge::seat_gate::Surface::AskAgent,
+                shared_types::Origin::Interactive,
+                true,
+                &state,
+            )
+            .err()
+            .map(|refusal| refusal.message);
+            let status = shared_types::SeatStatus {
+                configured: state.configured,
+                verified: state.verified,
+                suspended: state.suspended.is_some(),
+                available: state.available(),
+                reason,
+            };
+            (row.key.to_string(), status)
+        })
+        .collect()
+}
+
 pub async fn get_status(
     sessions: &Sessions,
     mcp_daemon_proxy_enabled: bool,
@@ -334,6 +381,7 @@ pub async fn get_status(
             pending_fallbacks: snapshot.pending_fallbacks.unwrap_or(0),
             fallback_tickets: snapshot.fallback_tickets.unwrap_or_default(),
             daemon_bind_addr: snapshot.daemon_bind_addr.unwrap_or(local_bind_addr),
+            seats: snapshot.seats.unwrap_or_else(seats_status),
         });
     }
     let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
@@ -353,6 +401,7 @@ pub async fn get_status(
             .map(|p| p.display().to_string())
             .collect(),
         daemon_bind_addr: local_bind_addr,
+        seats: seats_status(),
     })
 }
 

@@ -989,8 +989,22 @@ pub struct DaemonHealthResponse {
     pub daemon_bind_addr: Option<String>,
 }
 
+/// One seat's availability as /status reports it (Seven Primes REQ-080, REQ-091). `reason` is the exact refusal
+/// payload the gate would return for an ask right now, or null when the seat is available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SeatStatus {
+    pub configured: bool,
+    pub verified: bool,
+    pub suspended: bool,
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonStatusSnapshot {
+    /// Seven Primes: absent from an older daemon, so optional here.
+    #[serde(default)]
+    pub seats: Option<std::collections::BTreeMap<String, SeatStatus>>,
     pub daemon_mode: Option<String>,
     pub supported_agents: Option<Vec<String>>,
     pub pending_fallbacks: Option<usize>,
@@ -1006,6 +1020,10 @@ pub struct StatusResponse {
     pub pending_fallbacks: usize,
     pub fallback_tickets: Vec<String>,
     pub daemon_bind_addr: String,
+    /// Seven Primes REQ-080: every seat that needs verification (the new seats), keyed by seat. `default` so a
+    /// response from before this field still deserializes.
+    #[serde(default)]
+    pub seats: std::collections::BTreeMap<String, SeatStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1168,6 +1186,7 @@ mod tests {
             pending_fallbacks: 1,
             fallback_tickets: vec!["ticket-1.md".to_string()],
             daemon_bind_addr: "127.0.0.1:8080".to_string(),
+            seats: Default::default(),
         };
 
         let json = serde_json::to_string(&status).expect("serialize");
@@ -1412,5 +1431,49 @@ mod alias_census_tests {
             "duplicate alias in AGENT_ALIASES"
         );
         assert_eq!(super::AGENT_ALIASES.len(), ALIASES.len());
+    }
+}
+
+/// Seven Primes T-203 (REQ-080): the `seats` map round-trips, and a status body without it still parses.
+/// RED IF: the map is dropped from serialization, or an older daemon's body stops deserializing.
+#[cfg(test)]
+mod seat_status_tests {
+    use super::{DaemonStatusSnapshot, SeatStatus, StatusResponse};
+
+    #[test]
+    fn seats_round_trip_and_old_bodies_still_parse() {
+        let mut status = StatusResponse {
+            daemon_mode: "incremental-dev".into(),
+            active_sessions: 0,
+            supported_agents: vec!["kimi".into()],
+            pending_fallbacks: 0,
+            fallback_tickets: vec![],
+            daemon_bind_addr: "127.0.0.1:8080".into(),
+            seats: Default::default(),
+        };
+        let kimi = SeatStatus {
+            configured: false,
+            verified: false,
+            suspended: false,
+            available: false,
+            reason: Some(
+                "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+                    .into(),
+            ),
+        };
+        status.seats.insert("kimi".into(), kimi.clone());
+        let back: StatusResponse =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(back.seats["kimi"], kimi);
+
+        let old = r#"{"daemon_mode":"x","active_sessions":0,"supported_agents":[],"pending_fallbacks":0,"fallback_tickets":[],"daemon_bind_addr":"a"}"#;
+        assert!(
+            serde_json::from_str::<StatusResponse>(old)
+                .unwrap()
+                .seats
+                .is_empty()
+        );
+        let snap: DaemonStatusSnapshot = serde_json::from_str(r#"{"daemon_mode":"x"}"#).unwrap();
+        assert!(snap.seats.is_none());
     }
 }

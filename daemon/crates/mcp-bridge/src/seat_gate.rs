@@ -140,6 +140,15 @@ fn installed_versions() -> &'static Mutex<HashMap<String, String>> {
     VERSIONS.get_or_init(Mutex::default)
 }
 
+/// The installed CLI version registered for a seat, if any (read by /status, Seven Primes T-203).
+pub fn installed_cli_version(seat: &str) -> Option<String> {
+    installed_versions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(seat)
+        .cloned()
+}
+
 /// Record the installed CLI version for a seat (called at daemon start and after a CLI upgrade is detected).
 pub fn register_installed_cli_version(seat: &str, version: &str) {
     installed_versions()

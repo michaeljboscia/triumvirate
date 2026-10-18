@@ -162,7 +162,9 @@ enum CliCommand {
     /// Print daemon health and status snapshot.
     Status,
     /// Run local diagnostics for daemon readiness.
-    Doctor,
+    Doctor(DoctorArgs),
+    /// Seven Primes seat controls (REQ-091).
+    Seat(SeatArgs),
     /// Bridge stdio MCP to daemon HTTP endpoint.
     Proxy,
     /// Watch live agent streaming events.
@@ -171,6 +173,25 @@ enum CliCommand {
     /// activity). Not for hand use.
     #[command(hide = true)]
     FleetShim(FleetShimArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct DoctorArgs {
+    /// Also run each new seat's live probe (one cheap call), which writes verified.json on a pass (REQ-054).
+    #[arg(long)]
+    live: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SeatArgs {
+    #[command(subcommand)]
+    command: SeatCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SeatCommand {
+    /// Lift a seat's suspension: removes $TRIUMVIRATE_HOME/seats/<seat>/suspended.json.
+    Clear { seat: String },
 }
 
 #[derive(Debug, clap::Args)]
@@ -1867,9 +1888,14 @@ async fn main() -> anyhow::Result<()> {
             })?;
             std::process::exit(code);
         }
-        CliCommand::Doctor => {
-            run_doctor().await?;
+        CliCommand::Doctor(args) => {
+            run_doctor(args.live).await?;
         }
+        CliCommand::Seat(args) => match args.command {
+            SeatCommand::Clear { seat } => {
+                cli_ops::run_seat_clear(&mcp_bridge::normalize_agent_name(&seat))?
+            }
+        },
         CliCommand::Proxy => {
             proxy::run_proxy().await?;
         }
@@ -1889,8 +1915,8 @@ fn run_uninstall() -> anyhow::Result<()> {
     cli_ops::run_uninstall()
 }
 
-async fn run_doctor() -> anyhow::Result<()> {
-    cli_ops::run_doctor().await
+async fn run_doctor(live: bool) -> anyhow::Result<()> {
+    cli_ops::run_doctor(live).await
 }
 
 async fn run_status() -> anyhow::Result<()> {
@@ -2576,6 +2602,8 @@ async fn run_daemon() -> anyhow::Result<()> {
             "auth": "bearer-required",
             "daemon_mode": "incremental-dev",
             "supported_agents": mcp_bridge::supported_agent_names(),
+            // Seven Primes REQ-080: per-seat configured/verified/suspended/available with the gate's reason.
+            "seats": mcp_tools::inter_agent::seats_status(),
             "pending_fallbacks": pending,
             "fallback_tickets": tickets,
             "daemon_bind_addr": state.bind_addr
@@ -3296,6 +3324,9 @@ async fn run_daemon() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(%bind_addr, "daemon listener bound");
     tokio::spawn(async {
+        // Seven Primes T-203: the gate needs each installed seat CLI's version to honor verified.json (REQ-091).
+        // `--version` is a blocking subprocess, so it runs off the async workers.
+        let _ = tokio::task::spawn_blocking(cli_ops::register_installed_seat_versions).await;
         prewarm_daemon_workers().await;
     });
     // M9: periodically reap leaked agy temp files (the fleet path can't RAII-clean them
@@ -5730,7 +5761,21 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     #[test]
     fn cli_parses_doctor_subcommand() {
         let cli = Cli::try_parse_from(["triumvirate", "doctor"]).expect("doctor should parse");
-        assert!(matches!(cli.command, CliCommand::Doctor));
+        assert!(matches!(
+            cli.command,
+            CliCommand::Doctor(DoctorArgs { live: false })
+        ));
+        let cli = Cli::try_parse_from(["triumvirate", "doctor", "--live"])
+            .expect("doctor --live should parse");
+        assert!(matches!(
+            cli.command,
+            CliCommand::Doctor(DoctorArgs { live: true })
+        ));
+        let cli = Cli::try_parse_from(["triumvirate", "seat", "clear", "kimi"])
+            .expect("seat clear should parse");
+        assert!(
+            matches!(cli.command, CliCommand::Seat(SeatArgs { command: SeatCommand::Clear { ref seat } }) if seat == "kimi")
+        );
     }
 
     // TODO(issue #24): core_project_queue_key was refactored out.
@@ -5821,6 +5866,7 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                 daemon_bind_addr: None,
             }),
             Some(DaemonStatusSnapshot {
+                seats: None,
                 daemon_mode: Some("daemon-snapshot".to_string()),
                 supported_agents: Some(vec!["gemini".to_string()]),
                 pending_fallbacks: Some(3),
@@ -8942,6 +8988,72 @@ mod seven_primes_description_tests {
             ("agy", "Antigravity"),
         ] {
             assert_eq!(mcp_bridge::display_agent_name(alias), display, "{alias}");
+        }
+    }
+}
+
+/// Seven Primes T-203 (REQ-080, REQ-091): the seats map both /status paths render (the daemon's HTTP handler and the
+/// MCP get_status tool call the same `seats_status()`).
+#[cfg(test)]
+mod seven_primes_status_tests {
+    /// RED IF: a new seat is missing from /status, its reason is not the gate's exact payload, or the env flag stops
+    /// being read per request (configured must flip without a restart).
+    #[test]
+    fn seats_map_reports_state_and_follows_the_env_flag() {
+        let _g = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: env mutation under the crate's env lock, restored below.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", home.path());
+            std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI");
+        }
+        let seats = mcp_tools::inter_agent::seats_status();
+        assert_eq!(
+            seats.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["kimi", "mistral", "qwen"]
+        );
+        let kimi = &seats["kimi"];
+        assert_eq!(
+            (
+                kimi.configured,
+                kimi.verified,
+                kimi.suspended,
+                kimi.available
+            ),
+            (false, false, false, false)
+        );
+        assert_eq!(
+            kimi.reason.as_deref(),
+            Some("seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon")
+        );
+
+        unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") };
+        let kimi = mcp_tools::inter_agent::seats_status()["kimi"].clone();
+        assert!(kimi.configured && !kimi.available);
+        assert!(
+            kimi.reason
+                .as_deref()
+                .unwrap()
+                .starts_with("seat_unverified: kimi"),
+            "{kimi:?}"
+        );
+
+        mcp_bridge::seat_state::write_suspended(home.path(), "kimi", "403 terminated").unwrap();
+        let kimi = mcp_tools::inter_agent::seats_status()["kimi"].clone();
+        assert!(kimi.suspended);
+        assert!(
+            kimi.reason
+                .as_deref()
+                .unwrap()
+                .starts_with("seat_suspended: kimi: 403 terminated"),
+            "{kimi:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI");
+            std::env::remove_var("TRIUMVIRATE_HOME");
         }
     }
 }
