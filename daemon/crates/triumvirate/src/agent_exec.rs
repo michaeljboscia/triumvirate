@@ -6546,38 +6546,92 @@ mod deepseek_dispatch_tests {
     /// antigravity/codex/deepseek/claude. An agent read that, concluded grok was unsupported, and
     /// routed to DeepSeek instead. A stale list in a description excludes an agent exactly as
     /// effectively as the allowlist does.
+    /// Every logical line of `src` that states a hand-written list of agents, as `"<line no>: <text>"`.
+    ///
+    /// Seven Primes REQ-004: a physical-line scan was evaded by wrapping the list across lines with `\`
+    /// continuations, two names per line, each line under the threshold. So lines are joined while a string literal
+    /// is still open (an odd count of unescaped quotes), and the check runs on the joined text. Names come from the
+    /// roster, so a new seat is covered the moment it gets a row. Comments are skipped: they explain, and match arms
+    /// and fixtures legitimately name agents one at a time. What must not exist is PROSE listing several.
+    fn hand_written_agent_lists(src: &str) -> Vec<String> {
+        let mut names: Vec<String> = mcp_bridge::supported_agent_names().iter().map(|n| n.to_string()).collect();
+        names.push("antigravity".to_string());
+        let unescaped_quotes = |t: &str| t.matches('"').count() - t.matches("\\\"").count();
+        let mut found = Vec::new();
+        let mut logical = String::new();
+        let mut first = 0;
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim();
+            if logical.is_empty() {
+                if l.starts_with("//") {
+                    continue;
+                }
+                first = i + 1;
+            }
+            logical.push_str(l.trim_end_matches('\\'));
+            logical.push(' ');
+            if unescaped_quotes(&logical) % 2 == 1 {
+                continue;
+            }
+            let text = std::mem::take(&mut logical);
+            let prose = text.contains("supports only")
+                || text.contains("Supported:")
+                || text.contains("must be one of")
+                || text.contains("default seats:");
+            if !prose || !text.contains('"') {
+                continue;
+            }
+            let lower = text.to_lowercase();
+            let named = names.iter().filter(|n| lower.contains(n.as_str())).count();
+            if named >= 2 {
+                found.push(format!("{first}: {}", text.trim()));
+            }
+        }
+        found
+    }
+
+    /// The scan that would have caught the three stale lists a morning session tripped over.
+    ///
+    /// grok was dispatchable, but the ask_agent MCP tool DESCRIPTION still named only
+    /// antigravity/codex/deepseek/claude. An agent read that, concluded grok was unsupported, and
+    /// routed to DeepSeek instead. A stale list in a description excludes an agent exactly as
+    /// effectively as the allowlist does.
+    /// RED IF: a source states a hand-written agent list (descriptions render from data, REQ-004).
     #[test]
     fn no_hand_written_agent_lists_in_daemon_sources() {
         for (label, src) in [
             ("agent_exec.rs", include_str!("agent_exec.rs")),
             ("main.rs", include_str!("main.rs")),
+            ("aliases.rs", include_str!("../../mcp-tools/src/aliases.rs")),
+            ("jury.rs", include_str!("../../mcp-tools/src/jury.rs")),
         ] {
-            for (i, line) in src.lines().enumerate() {
-                let l = line.trim();
-                // Comments explain; match arms and test fixtures legitimately name agents one at a
-                // time. What must not exist is PROSE listing several, which is always a copy that
-                // will drift.
-                if l.starts_with("//") || !l.contains('"') {
-                    continue;
-                }
-                let prose = l.contains("supports only")
-                    || l.contains("Supported:")
-                    || l.contains("must be one of");
-                if !prose {
-                    continue;
-                }
-                let named = ["codex", "deepseek", "claude", "grok", "antigravity"]
-                    .iter()
-                    .filter(|a| l.contains(*a))
-                    .count();
-                assert!(
-                    named < 2,
-                    "{label} line {} states a hand-written agent list; build it from \
-                     mcp_bridge::supported_agent_names() so it cannot go stale: {l}",
-                    i + 1
-                );
-            }
+            let found = hand_written_agent_lists(src);
+            assert!(
+                found.is_empty(),
+                "{label} states a hand-written agent list; build it from mcp_bridge::supported_agent_names() \
+                 so it cannot go stale: {found:?}"
+            );
         }
+    }
+
+    /// RED IF: the scan is per physical line again (a wrapped list passes), or fails on everything (prose fails).
+    #[test]
+    fn hand_written_list_scan_catches_wrapped_lists_and_passes_prose() {
+        // Each physical line names ONE agent; only the joined literal is a list. The old scan passed this.
+        let wrapped = concat!(
+            "    description = \"Supported: 'codex', \\\n",
+            "                   'kimi'.\"\n",
+        );
+        assert_eq!(hand_written_agent_lists(wrapped).len(), 1, "wrapped list must fail: {wrapped}");
+        // Ordinary prose that happens to name several agents is not a list.
+        let prose = "    let note = \"codex and grok disagreed about the lock, and qwen agreed with codex\";\n";
+        assert_eq!(hand_written_agent_lists(prose), Vec::<String>::new());
+        // A comment may list agents freely. (Split so this test's own source line is not itself a list.)
+        let comment = concat!(
+            "    // Supported: ",
+            "\"codex\", \"grok\"\n",
+        );
+        assert_eq!(hand_written_agent_lists(comment), Vec::<String>::new());
     }
 
 

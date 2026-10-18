@@ -17,9 +17,17 @@ pub enum AliasMappingError {
 impl std::fmt::Display for AliasMappingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTarget(t) => {
-                write!(f, "invalid target '{t}' — expected 'gemini' or 'codex'")
-            }
+            // Seven Primes REQ-004: rendered from the accepted set, so the message cannot drift from it. It named
+            // only gemini and codex while grok was also accepted.
+            Self::InvalidTarget(t) => write!(
+                f,
+                "invalid target '{t}': expected one of {}",
+                daemon_target_agents()
+                    .iter()
+                    .map(|a| format!("'{a}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::MissingRequired(field) => write!(f, "missing required field '{field}'"),
             Self::InvalidDaemonId(id) => write!(
                 f,
@@ -719,5 +727,23 @@ mod seven_primes_characterization_tests {
     #[test]
     fn daemon_target_agents_exact() {
         assert_eq!(super::daemon_target_agents(), &["gemini", "codex", "grok"]);
+    }
+}
+
+/// Seven Primes T-201 (REQ-004): the InvalidTarget message names exactly the accepted daemon targets.
+/// RED IF: the message and the accepted target set ever disagree.
+#[cfg(test)]
+mod seven_primes_invalid_target_tests {
+    use super::{AliasMappingError, daemon_target_agents};
+
+    #[test]
+    fn invalid_target_message_matches_the_accepted_set() {
+        let msg = AliasMappingError::InvalidTarget("nope".into()).to_string();
+        let listed = msg
+            .split("expected one of ")
+            .nth(1)
+            .expect("message names the accepted set");
+        let names: Vec<&str> = listed.split(", ").map(|n| n.trim_matches('\'')).collect();
+        assert_eq!(names, daemon_target_agents());
     }
 }

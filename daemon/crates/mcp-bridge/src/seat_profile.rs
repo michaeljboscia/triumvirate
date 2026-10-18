@@ -11,7 +11,8 @@
 //! - Two rows are deliberately the D-01 TARGET, not today's value: grok's and claude's `provider` (today both report
 //!   "unknown") and grok's `billing` (today "unknown"). provider_for/billing_for keep returning the old values until
 //!   T-202 switches them to this table, which is the intended fix, and T-001's pins change in that commit.
-//! - New seats (kimi, mistral, qwen) get rows in T-201. The enum variants they need exist now so T-002 fixes the shape.
+//! - New seats (kimi, mistral, qwen) got rows in T-201 (REQ-001). Their surfaces follow amendment A-2: Mistral's launch
+//!   set for all three. They stay unconfigured until `TRIUMVIRATE_ENABLE_<SEAT>=1`.
 //!
 //! Deviations from BACKEND_STRUCTURE.md section 2 (amendment A-5): `live_progress` is an enum, not a bool, and
 //! `parser_mode` is `parser_modes`, a list. Both because gemini's value depends on its backend (agy buffers its
@@ -321,7 +322,56 @@ const EXISTING: SeatProfile = SeatProfile {
     prompt_usage: PromptUsage::CachedSubsetOfInput,
 };
 
-/// Every row, in roster order. T-201 appends kimi, mistral and qwen.
+/// The launch surfaces of every new seat (amendment A-2): read-only asks, sessions, jury seats and the doctor probe.
+pub const NEW_SEAT_LAUNCH_SURFACES: &[Surface] = &[
+    Surface::AskAgent,
+    Surface::Session,
+    Surface::Jury,
+    Surface::DoctorLiveProbe,
+];
+
+/// What every new seat shares at launch: off until enabled, verified by `doctor --live`, one process per seat,
+/// seatbelt plus repo audit, inherited vendor credentials scrubbed, single attempt with a terminal quota breaker,
+/// 780 s stall window (REQ-051 starting value), no fleet, ABE, prewarm or blind-validator role.
+const NEW_SEAT: SeatProfile = SeatProfile {
+    key: "",
+    display_name: "",
+    provider: Provider::Moonshot,
+    billing: BillingClass::Subscription,
+    stall_window: StallWindow::Secs(780),
+    fleet_stall_window: StallWindow::Disabled,
+    attempt_policy: AttemptPolicy::Single,
+    quota_policy: QuotaPolicy::TerminalTripBreaker,
+    live_progress: LiveProgress::Streams,
+    parser_modes: &[],
+    records_tool_calls: true,
+    classifies_reads: true,
+    sight_repair: false,
+    can_write_test_file: false,
+    read_only_containment: Containment::SeatbeltPlusAudit,
+    usage_source: UsageSource::Exact,
+    abe_buildable: false,
+    fleet_buildable: false,
+    daemon_target: true,
+    surfaces_allowed: NEW_SEAT_LAUNCH_SURFACES,
+    configured: Configured::EnvFlag(""),
+    verify_policy: VerifyPolicy::DoctorLive,
+    suspension_policy: SuspensionPolicy::Classified,
+    concurrency_limit: ConcurrencyLimit::One,
+    resume_strategy: ResumeStrategy::Legacy,
+    session_id_publication: IdPublication::Legacy,
+    session_invalidation: Invalidation::VendorRejectedIdMarksBroken,
+    home_env_var: None,
+    env_remove: crate::containment::SEAT_CREDENTIAL_SCRUB,
+    served_model_evidence: ModelEvidence::Legacy,
+    exit_outcome_policy: OutcomePolicy::Legacy,
+    prompt_transport: PromptTransport::ArgvMax64KiB,
+    prewarm_policy: PrewarmPolicy::Never,
+    // Provisional for all three new seats: confirmed against live usage at T-302.
+    prompt_usage: PromptUsage::CachedSubsetOfInput,
+};
+
+/// Every row, in roster order.
 static SEATS: &[SeatProfile] = &[
     SeatProfile {
         key: "gemini",
@@ -395,6 +445,47 @@ static SEATS: &[SeatProfile] = &[
         daemon_target: true,
         ..EXISTING
     },
+    SeatProfile {
+        key: "kimi",
+        display_name: "Kimi",
+        provider: Provider::Moonshot,
+        parser_modes: &[agent_adapter::kimi::PARSER_MODE],
+        // research/01: stdout carries no usage; the wire-file reader is not live-verified (REQ-041).
+        usage_source: UsageSource::NotReported,
+        configured: Configured::EnvFlag("TRIUMVIRATE_ENABLE_KIMI"),
+        resume_strategy: ResumeStrategy::KimiSessionFlagSameCwd,
+        session_id_publication: IdPublication::AfterCompletedTurn,
+        home_env_var: Some("KIMI_CODE_HOME"),
+        served_model_evidence: ModelEvidence::NotExposed,
+        exit_outcome_policy: OutcomePolicy::KimiStream,
+        ..NEW_SEAT
+    },
+    SeatProfile {
+        key: "mistral",
+        display_name: "Mistral",
+        provider: Provider::Mistral,
+        parser_modes: &[agent_adapter::mistral::PARSER_MODE],
+        configured: Configured::EnvFlag("TRIUMVIRATE_ENABLE_MISTRAL"),
+        resume_strategy: ResumeStrategy::VibeResume,
+        session_id_publication: IdPublication::ExportJson,
+        home_env_var: Some("VIBE_HOME"),
+        served_model_evidence: ModelEvidence::ExportConfig,
+        exit_outcome_policy: OutcomePolicy::VibeExitCodes,
+        ..NEW_SEAT
+    },
+    SeatProfile {
+        key: "qwen",
+        display_name: "Qwen",
+        provider: Provider::Alibaba,
+        parser_modes: &[agent_adapter::qwen::PARSER_MODE],
+        configured: Configured::EnvFlag("TRIUMVIRATE_ENABLE_QWEN"),
+        resume_strategy: ResumeStrategy::QwenResume,
+        session_id_publication: IdPublication::SessionStart,
+        home_env_var: Some("QWEN_HOME"),
+        served_model_evidence: ModelEvidence::MessageModel,
+        exit_outcome_policy: OutcomePolicy::QwenExitCodes,
+        ..NEW_SEAT
+    },
 ];
 
 /// The row for a canonical seat key, or `None` for anything else (aliases are normalized before lookup).
@@ -415,12 +506,102 @@ mod tests {
         seat_profile(key).unwrap_or_else(|| panic!("no row for {key}"))
     }
 
-    /// RED IF: the roster gains, loses or reorders a seat before T-201.
-    #[test]
-    fn all_seats_is_exactly_the_five_existing_keys() {
-        let keys: Vec<&str> = all_seats().iter().map(|s| s.key).collect();
+    /// The five existing seats, the only rows T-001's pins describe: the first five in roster order.
+    fn existing_seats() -> &'static [SeatProfile] {
+        let five = &all_seats()[..5];
+        let keys: Vec<&str> = five.iter().map(|s| s.key).collect();
         assert_eq!(keys, ["gemini", "codex", "deepseek", "claude", "grok"]);
-        assert!(seat_profile("kimi").is_none() && seat_profile("agy").is_none());
+        five
+    }
+
+    /// RED IF: the roster gains, loses or reorders a seat (REQ-001: the five existing seats, then the three new ones).
+    #[test]
+    fn all_seats_is_exactly_the_eight_keys() {
+        let keys: Vec<&str> = all_seats().iter().map(|s| s.key).collect();
+        assert_eq!(
+            keys,
+            [
+                "gemini", "codex", "deepseek", "claude", "grok", "kimi", "mistral", "qwen"
+            ]
+        );
+        assert!(
+            seat_profile("agy").is_none(),
+            "aliases are normalized before lookup"
+        );
+    }
+
+    /// The new rows carry the launch contract (REQ-001, REQ-030, REQ-041, REQ-050, REQ-051, REQ-053, REQ-091; A-2).
+    /// RED IF: a new seat gains a writer, fleet, ABE or prewarm role, loses containment or the credential scrub, or
+    /// becomes configured, verified or retried by default.
+    #[test]
+    fn new_rows_carry_the_launch_contract() {
+        for (key, display, provider, home, flag) in [
+            (
+                "kimi",
+                "Kimi",
+                Provider::Moonshot,
+                "KIMI_CODE_HOME",
+                "TRIUMVIRATE_ENABLE_KIMI",
+            ),
+            (
+                "mistral",
+                "Mistral",
+                Provider::Mistral,
+                "VIBE_HOME",
+                "TRIUMVIRATE_ENABLE_MISTRAL",
+            ),
+            (
+                "qwen",
+                "Qwen",
+                Provider::Alibaba,
+                "QWEN_HOME",
+                "TRIUMVIRATE_ENABLE_QWEN",
+            ),
+        ] {
+            let s = row(key);
+            assert_eq!(
+                (s.display_name, s.provider, s.home_env_var),
+                (display, provider, Some(home)),
+                "{key}"
+            );
+            assert_eq!(s.configured, Configured::EnvFlag(flag), "{key}");
+            assert_eq!(s.surfaces_allowed, NEW_SEAT_LAUNCH_SURFACES, "{key}");
+            assert_eq!(s.stall_window, StallWindow::Secs(780), "{key}");
+            assert_eq!(s.fleet_stall_window, StallWindow::Disabled, "{key}");
+            assert_eq!(s.attempt_policy, AttemptPolicy::Single, "{key}");
+            assert_eq!(s.quota_policy, QuotaPolicy::TerminalTripBreaker, "{key}");
+            assert_eq!(s.verify_policy, VerifyPolicy::DoctorLive, "{key}");
+            assert_eq!(s.suspension_policy, SuspensionPolicy::Classified, "{key}");
+            assert_eq!(s.concurrency_limit, ConcurrencyLimit::One, "{key}");
+            assert_eq!(
+                s.read_only_containment,
+                Containment::SeatbeltPlusAudit,
+                "{key}"
+            );
+            assert_eq!(
+                s.env_remove,
+                crate::containment::SEAT_CREDENTIAL_SCRUB,
+                "{key}"
+            );
+            assert_eq!(s.prompt_transport, PromptTransport::ArgvMax64KiB, "{key}");
+            assert!(
+                !s.can_write_test_file && !s.abe_buildable && !s.fleet_buildable,
+                "{key}"
+            );
+            assert_eq!(s.prewarm_policy, PrewarmPolicy::Never, "{key}");
+        }
+        assert_eq!(row("kimi").usage_source, UsageSource::NotReported);
+        assert_eq!(row("mistral").usage_source, UsageSource::Exact);
+        assert_eq!(row("qwen").usage_source, UsageSource::Exact);
+        let mode = |k| row(k).parser_modes;
+        assert_eq!(
+            [mode("kimi"), mode("mistral"), mode("qwen")],
+            [
+                &["kimi-stream-json"][..],
+                &["mistral-streaming"][..],
+                &["qwen-stream-json"][..]
+            ]
+        );
     }
 
     /// Every row agrees field by field with what T-001 pinned at the census sites (posthog.rs, stall.rs, agent_exec.rs,
@@ -491,7 +672,7 @@ mod tests {
         // The parser-mode allowlists in agent_exec.rs are exactly the modes of seats that record tool calls and
         // classify reads (set equality: the consts' order is pinned by T-001 itself).
         let modes = |pick: fn(&SeatProfile) -> bool| {
-            let mut m: Vec<&str> = all_seats()
+            let mut m: Vec<&str> = existing_seats()
                 .iter()
                 .filter(|s| pick(s))
                 .flat_map(|s| s.parser_modes.iter().copied())
@@ -510,7 +691,7 @@ mod tests {
         assert_eq!(modes(|s| s.classifies_reads), want);
 
         let keys = |pick: fn(&SeatProfile) -> bool| -> Vec<&str> {
-            all_seats()
+            existing_seats()
                 .iter()
                 .filter(|s| pick(s))
                 .map(|s| s.key)
@@ -526,14 +707,14 @@ mod tests {
             ["gemini", "codex"]
         );
 
-        let display: Vec<&str> = all_seats().iter().map(|s| s.display_name).collect();
+        let display: Vec<&str> = existing_seats().iter().map(|s| s.display_name).collect();
         assert_eq!(
             display,
             ["Antigravity", "Codex", "DeepSeek", "Claude", "Grok"]
         );
 
         // Existing seats run everywhere, need no verification, and are not locked per seat today.
-        for s in all_seats() {
+        for s in existing_seats() {
             assert_eq!(s.surfaces_allowed, Surface::ALL, "{}", s.key);
             assert_eq!(s.configured, Configured::Always, "{}", s.key);
             assert_eq!(s.verify_policy, VerifyPolicy::NotRequired, "{}", s.key);

@@ -206,7 +206,8 @@ pub struct AskJuryRequest {
     /// The same message goes to every seat, verbatim.
     pub message: String,
     pub cwd: Option<String>,
-    /// Which agents sit. Default `codex`, `grok`, `gemini`. At least two, and no agent twice:
+    /// Which agents sit. Default: the jury default set (`mcp_tools::jury::DEFAULT_SEATS`, rendered into the ask_jury
+    /// tool description). At least two, and no agent twice:
     /// `gemini` and `antigravity` are ONE seat, and asking both is one agent voting twice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seats: Vec<String>,
@@ -1052,13 +1053,35 @@ pub struct SessionState {
 /// while dispatch canonicalized them, so the author and the reviewer were the same seat under
 /// different names (D-030). Lives here so peer-review and mcp-bridge share it rather than each
 /// keeping a copy.
+/// Every alias and the canonical seat key it names, in one table so the normalizer and the rendered tool descriptions
+/// cannot disagree (Seven Primes REQ-002, REQ-004).
+///
+/// - `antigravity`, `agy`: the Antigravity product and CLI names for the `gemini` seat.
+/// - REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an alias only. The canonical
+///   execution key is `grok` and the binary is `grok`.
+/// - Seven Primes: the vendor CLI and product names of the three new seats.
+pub const AGENT_ALIASES: &[(&str, &str)] = &[
+    ("antigravity", "gemini"),
+    ("agy", "gemini"),
+    ("grok-build", "grok"),
+    ("xai", "grok"),
+    ("supergrok", "grok"),
+    ("kimi-code", "kimi"),
+    ("moonshot", "kimi"),
+    ("vibe", "mistral"),
+    ("mistral-vibe", "mistral"),
+    ("devstral", "mistral"),
+    ("le-chat", "mistral"),
+    ("qwen-code", "qwen"),
+    ("alibaba", "qwen"),
+    ("bailian", "qwen"),
+];
+
 pub fn normalize_agent_name(agent: &str) -> String {
-    match agent.to_lowercase().as_str() {
-        "antigravity" | "agy" => "gemini".to_string(),
-        // REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an
-        // alias only. The canonical execution key is `grok` and the binary is `grok`.
-        "grok-build" | "xai" | "supergrok" => "grok".to_string(),
-        other => other.to_string(),
+    let lower = agent.to_lowercase();
+    match AGENT_ALIASES.iter().find(|(alias, _)| *alias == lower) {
+        Some((_, canonical)) => canonical.to_string(),
+        None => lower,
     }
 }
 
@@ -1335,13 +1358,25 @@ mod origin_tests {
 mod alias_census_tests {
     use super::normalize_agent_name;
 
-    const CANONICAL: [&str; 5] = ["gemini", "codex", "deepseek", "claude", "grok"];
-    const ALIASES: [(&str, &str); 5] = [
+    const CANONICAL: [&str; 8] = [
+        "gemini", "codex", "deepseek", "claude", "grok", "kimi", "mistral", "qwen",
+    ];
+    // Pinned independently of AGENT_ALIASES, so a deleted or retargeted alias turns this red.
+    const ALIASES: [(&str, &str); 14] = [
         ("antigravity", "gemini"),
         ("agy", "gemini"),
         ("grok-build", "grok"),
         ("xai", "grok"),
         ("supergrok", "grok"),
+        ("kimi-code", "kimi"),
+        ("moonshot", "kimi"),
+        ("vibe", "mistral"),
+        ("mistral-vibe", "mistral"),
+        ("devstral", "mistral"),
+        ("le-chat", "mistral"),
+        ("qwen-code", "qwen"),
+        ("alibaba", "qwen"),
+        ("bailian", "qwen"),
     ];
 
     #[test]
@@ -1367,5 +1402,11 @@ mod alias_census_tests {
                 "alias {alias} collides with a canonical key"
             );
         }
+        // The table itself: no alias twice (an alias naming two seats would resolve to whichever came first).
+        let mut names: Vec<&str> = super::AGENT_ALIASES.iter().map(|(a, _)| *a).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), super::AGENT_ALIASES.len(), "duplicate alias in AGENT_ALIASES");
+        assert_eq!(super::AGENT_ALIASES.len(), ALIASES.len());
     }
 }

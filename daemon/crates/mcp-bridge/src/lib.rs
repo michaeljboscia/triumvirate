@@ -79,7 +79,13 @@ pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
 pub fn display_agent_name(agent: &str) -> String {
     // Normalize first so the alias inputs (antigravity/agy) render the product
     // label instead of falling through to the generic capitaliser ("Agy").
-    match normalize_agent_name(agent).as_str() {
+    let canonical = normalize_agent_name(agent);
+    // Seven Primes REQ-003: a seat's display name is data on its SeatProfile row ("Kimi", "Mistral", "Qwen").
+    // The arms below are the rows' values for the existing seats, kept as the fallback for a name with no row.
+    if let Some(row) = seat_profile::seat_profile(&canonical) {
+        return row.display_name.to_string();
+    }
+    match canonical.as_str() {
         "codex" => "Codex".to_string(),
         // The internal execution key is still `gemini`, but the operator-facing
         // product name is Antigravity — never render "Gemini" to a human.
@@ -113,8 +119,12 @@ pub fn normalize_agent_name(agent: &str) -> String {
 /// MUST validate against it. Before this existed the four surfaces had drifted into three
 /// different answers, none matching the allowlist: `claude` was dispatchable while advertised
 /// nowhere. A literal list in a second place is how that happened, so do not add one.
+///
+/// Seven Primes REQ-001: rendered from the SeatProfile table, so a seat with a row is on the roster and a roster
+/// entry without a row cannot exist (the T-004 census pins both directions).
 pub fn supported_agent_names() -> &'static [&'static str] {
-    &["gemini", "codex", "deepseek", "claude", "grok"]
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| seat_profile::all_seats().iter().map(|s| s.key).collect())
 }
 
 #[instrument(skip_all)]

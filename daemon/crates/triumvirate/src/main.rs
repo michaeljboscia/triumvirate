@@ -374,7 +374,7 @@ impl McpBridge {
             }
         });
         Self {
-            tool_router: Self::tool_router(),
+            tool_router: render_tool_descriptions(Self::tool_router()),
             sessions: Arc::new(Mutex::new(sessions)),
             sessions_file,
             fleet_states: Arc::new(Mutex::new(HashMap::new())),
@@ -586,6 +586,51 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
     }
 }
 
+/// Seven Primes REQ-004: the agent lists in tool descriptions are DATA, not prose. The `#[tool]` attribute only takes
+/// a string literal (rmcp-macros 1.3 stores `description` as a `String`), so the literals carry `{SUPPORTED_AGENTS}` and
+/// `{DEFAULT_SEATS}` placeholders and this fills them once, when the router is built, from the seat table, the alias
+/// table and the jury default set. A stale hand-written list is how grok was once advertised as unsupported.
+fn render_tool_descriptions<S>(mut router: ToolRouter<S>) -> ToolRouter<S> {
+    let fills = [
+        ("ask_agent", "{SUPPORTED_AGENTS}", supported_agents_text()),
+        ("ask_jury", "{DEFAULT_SEATS}", mcp_tools::jury::DEFAULT_SEATS.join(", ")),
+    ];
+    for (tool, placeholder, text) in fills {
+        if let Some(route) = router.map.get_mut(tool)
+            && let Some(desc) = route.attr.description.as_mut()
+        {
+            *desc = desc.replace(placeholder, &text).into();
+        }
+    }
+    router
+}
+
+/// `'kimi' (Kimi; aliases: kimi-code, moonshot), 'codex' (Codex), ...` for every roster seat, in roster order.
+fn supported_agents_text() -> String {
+    supported_agents_text_for(mcp_bridge::supported_agent_names())
+}
+
+/// The rendering itself, over an explicit roster: the seam the test uses to prove the text comes from the roster.
+fn supported_agents_text_for(roster: &[&str]) -> String {
+    roster
+        .iter()
+        .map(|seat| {
+            let aliases: Vec<&str> = shared_types::AGENT_ALIASES
+                .iter()
+                .filter(|(_, canonical)| canonical == seat)
+                .map(|(alias, _)| *alias)
+                .collect();
+            let display = mcp_bridge::display_agent_name(seat);
+            if aliases.is_empty() {
+                format!("'{seat}' ({display})")
+            } else {
+                format!("'{seat}' ({display}; aliases: {})", aliases.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[tool_router]
 impl McpBridge {
     #[tool(description = "Health check tool for MCP connectivity")]
@@ -655,9 +700,7 @@ impl McpBridge {
     }
 
     #[tool(
-        description = "Send a task to a specific agent. Supported: 'antigravity' (aliases: agy, \
-                       gemini), 'codex', 'grok' (aliases: grok-build, xai, supergrok), 'deepseek', \
-                       'claude'."
+        description = "Send a task to a specific agent. Supported: {SUPPORTED_AGENTS}."
     )]
     // The root span of a call, in the MCP process. daemon-http injects this span's context as a
     // W3C `traceparent`, and the daemon adopts it — so one logical call is ONE trace across two
@@ -680,7 +723,7 @@ impl McpBridge {
 
     #[tool(
         description = "Put ONE brief to several agents at once and tally their verdicts (default \
-                       seats: codex, grok, gemini). Unlike ask_agent, a seat is NEVER answered by \
+                       seats: {DEFAULT_SEATS}). Unlike ask_agent, a seat is NEVER answered by \
                        another agent or backend: a seat whose backend is down comes back \
                        `unavailable`, and a reply that something else answered comes back \
                        `invalid` with its text withheld. `unanimous` means EVERY requested seat \
@@ -8811,5 +8854,72 @@ mod pantheon_ws_replay_tests {
         let _ = stream.close(None).await;
         handle.abort();
         let _ = handle.await;
+    }
+}
+
+/// Seven Primes T-201 (REQ-001, REQ-002, REQ-003, REQ-004): tool descriptions render from the roster, aliases and jury
+/// default set.
+#[cfg(test)]
+mod seven_primes_description_tests {
+    use super::*;
+
+    fn rendered(tool: &str) -> String {
+        let router = render_tool_descriptions(McpBridge::tool_router());
+        router.map[tool].attr.description.as_deref().unwrap_or_default().to_string()
+    }
+
+    /// RED IF: a new seat, its display name or an alias is missing from ask_agent, or a placeholder survives.
+    #[test]
+    fn ask_agent_description_names_every_seat_with_its_aliases() {
+        let d = rendered("ask_agent");
+        for part in [
+            "'kimi' (Kimi; aliases: kimi-code, moonshot)",
+            "'mistral' (Mistral; aliases: vibe, mistral-vibe, devstral, le-chat)",
+            "'qwen' (Qwen; aliases: qwen-code, alibaba, bailian)",
+            "'gemini' (Antigravity; aliases: antigravity, agy)",
+            "'claude' (Claude)",
+        ] {
+            assert!(d.contains(part), "missing {part:?} in {d}");
+        }
+        assert!(!d.contains('{'), "unfilled placeholder: {d}");
+        let jury = rendered("ask_jury");
+        assert!(jury.contains("(default seats: codex, grok, gemini)"), "{jury}");
+        assert!(!jury.contains("{DEFAULT_SEATS}"));
+    }
+
+    /// The text comes from the roster, not from a constant: a key that exists only for this test run appears.
+    /// RED IF: the description is a hardcoded string again.
+    #[test]
+    fn a_roster_key_injected_at_test_time_is_rendered() {
+        let injected = format!(
+            "zzz-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut roster: Vec<&str> = mcp_bridge::supported_agent_names().to_vec();
+        roster.push(&injected);
+        let text = supported_agents_text_for(&roster);
+        assert!(text.contains(&format!("'{injected}'")), "{text}");
+        assert_eq!(
+            supported_agents_text_for(mcp_bridge::supported_agent_names()),
+            supported_agents_text()
+        );
+    }
+
+    /// REQ-001..003 at the shared entry points.
+    #[test]
+    fn roster_aliases_and_display_names() {
+        assert_eq!(
+            mcp_bridge::supported_agent_names(),
+            ["gemini", "codex", "deepseek", "claude", "grok", "kimi", "mistral", "qwen"]
+        );
+        for (alias, seat) in [("vibe", "mistral"), ("moonshot", "kimi"), ("bailian", "qwen"), ("Le-Chat", "mistral")] {
+            assert_eq!(mcp_bridge::normalize_agent_name(alias), seat);
+        }
+        for (alias, display) in [("kimi-code", "Kimi"), ("devstral", "Mistral"), ("qwen-code", "Qwen"), ("agy", "Antigravity")] {
+            assert_eq!(mcp_bridge::display_agent_name(alias), display, "{alias}");
+        }
     }
 }
