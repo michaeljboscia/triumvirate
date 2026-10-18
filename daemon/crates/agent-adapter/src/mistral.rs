@@ -389,6 +389,19 @@ mod tests {
         );
         let r = parse(STREAM, Some(3), Some(&with_outcome("")));
         assert!(matches!(r.outcome, SeatOutcome::Partial(_)));
+        // The exit-code arms when the export names no outcome: every row of the table, by its own failure code.
+        for (exit, code) in [
+            (1, "usage_or_config_error"),
+            (4, "aborted"),
+            (9, "unexpected_exit"),
+        ] {
+            let r = parse(STREAM, Some(exit), Some(&with_outcome("")));
+            assert!(
+                matches!(&r.outcome, SeatOutcome::Failure(m) if m.starts_with(&format!("{code}:mistral"))),
+                "exit {exit}: {:?}",
+                r.outcome
+            );
+        }
         let r = parse(STREAM, Some(2), Some(EXPORT));
         assert!(
             matches!(&r.outcome, SeatOutcome::Failure(m) if m.starts_with("exit_outcome_mismatch:mistral"))

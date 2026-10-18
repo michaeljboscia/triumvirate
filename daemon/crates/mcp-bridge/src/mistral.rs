@@ -168,7 +168,12 @@ mod tests {
             "edit",
             "bash",
         ] {
-            assert!(!a.iter().any(|x| x == writer), "{writer} in argv {a:?}");
+            // A writer flag must not appear in any form, plain or `--flag=value`.
+            assert!(
+                !a.iter()
+                    .any(|x| x == writer || x.starts_with(&format!("{writer}="))),
+                "{writer} in argv {a:?}"
+            );
         }
     }
 
