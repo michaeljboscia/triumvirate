@@ -338,25 +338,27 @@ validate_task() {
     run_in_daemon "$suite" "$cmd"
     floor_rustfmt "$nonrust" ${rs[@]+"${rs[@]}"}
 
-    # Stub markers anywhere in a touched daemon .rs file (spec: "in touched non-stub files"), counted against the same
-    # file on the base: more marker lines at HEAD than on the base fails, whether this task added the marker or left
-    # an earlier task's scaffold stub in place. The base count keeps legacy lines that only NAME the markers (the ABE
-    # post-exit validator's pattern list) from failing every task that touches them. T-003 is the declared scaffold.
+    # Stub markers anywhere in a touched daemon .rs file (spec: "in touched non-stub files"), compared against the same
+    # file on the base as a MULTISET of marker lines (whitespace-trimmed text, line numbers ignored): any marker line at
+    # HEAD that the base does not have fails, whether this task added it, left an earlier task's scaffold stub in place,
+    # or swapped a legacy marker line for a new one (a count would miss that). Legacy lines that only NAME the markers
+    # (the ABE post-exit validator's pattern list) are on the base and pass. T-003 is the declared scaffold task.
     if [[ "$task" == T-003 ]]; then
         record N/A stubs "T-003 is the declared scaffold task"
     else
-        local head_n base_n stubbed=()
+        local new_markers line stubbed=()
         for f in ${rs[@]+"${rs[@]}"}; do
-            head_n="$(grep -cE "$STUB_PATTERN" "$REPO/$f" || true)"
-            base_n="$(git -C "$REPO" show "$BASE:$f" 2>/dev/null | grep -cE "$STUB_PATTERN" || true)"
-            if [[ "${head_n:-0}" -gt "${base_n:-0}" ]]; then
+            new_markers="$(comm -13 \
+                <(git -C "$REPO" show "$BASE:$f" 2>/dev/null | grep -E "$STUB_PATTERN" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | LC_ALL=C sort) \
+                <(grep -E "$STUB_PATTERN" "$REPO/$f" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | LC_ALL=C sort))"
+            if [[ -n "$new_markers" ]]; then
                 stubbed+=("$f")
-                printf 'stub markers in %s (%s at HEAD, %s on %s):\n' "$f" "$head_n" "${base_n:-0}" "$BASE"
-                grep -nE "$STUB_PATTERN" "$REPO/$f" | sed 's/^/  /'
+                printf 'stub markers in %s not on %s:\n' "$f" "$BASE"
+                while IFS= read -r line; do printf '  %s\n' "$line"; done <<<"$new_markers"
             fi
         done
         if [[ ${#stubbed[@]} -gt 0 ]]; then
-            record FAIL stubs "stub markers in ${#stubbed[@]} touched daemon .rs files (more than on $BASE)"
+            record FAIL stubs "stub markers in ${#stubbed[@]} touched daemon .rs files (not on $BASE)"
         else
             record PASS stubs "${#rs[@]} daemon .rs files, no stub markers beyond $BASE"
         fi
@@ -632,7 +634,7 @@ self_test() {
     printf '\npub fn later() -> u32 {\n    todo!()\n}\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "T-101: stub"
     run_case stub-nested 1 "$r" 0 T-101 daemon/fx/src/lib.rs
     expect_text stub-nested "stub markers in 1 touched daemon .rs files"
-    expect_text stub-nested "    todo!()"
+    expect_text stub-nested "  todo!()"
     verdict "18 todo!() added under daemon/fx/src -> exit 1 naming the marker"
 
     # 19. Real cargo, a compile error: the check gate itself records FAIL with cargo's own diagnostic, so a validator
@@ -670,6 +672,19 @@ self_test() {
     expect_text stub-left "stub markers in 1 touched daemon .rs files"
     expect_text stub-left "not implemented: T-101"
     verdict "21b a later task leaving the scaffold stub in a touched file -> exit 1"
+
+    # 22. Equal-count substitution: the base holds a benign line that names a marker; the task replaces it with a real
+    # stub, so the marker COUNT is unchanged but the marker LINE is new, and the gate fails.
+    r="$(fresh_repo stub-swap)"
+    git -C "$r" checkout -q main
+    printf '\n// legacy: todo!() is banned in this crate\n' >>"$r/daemon/fx/src/lib.rs" && commit "$r" "base: legacy marker comment"
+    git -C "$r" checkout -q feat && git -C "$r" reset -q --hard main
+    perl -pi -e 's|^// legacy: todo!\(\) is banned in this crate$|pub fn later() -> u32 {\n    todo!()\n}|' "$r/daemon/fx/src/lib.rs"
+    commit "$r" "T-101: swap the legacy marker line for a stub"
+    run_case stub-swap 1 "$r" 0 T-101 daemon/fx/src/lib.rs
+    expect_text stub-swap "stub markers in 1 touched daemon .rs files (not on main)"
+    expect_text stub-swap "  todo!()"
+    verdict "22 same marker count, new marker line -> exit 1"
 
     echo
     echo "self-test: $pass passed, $fail failed"
