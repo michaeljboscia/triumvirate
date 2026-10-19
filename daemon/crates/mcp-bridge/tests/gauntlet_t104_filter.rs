@@ -391,11 +391,16 @@ fn test_should_leave_no_stray_temp_files_after_write() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("kimi");
     write_seat_files(&home, seat_profile("kimi").unwrap()).unwrap();
-    let names: Vec<String> = fs::read_dir(&home)
+    let mut names: Vec<String> = fs::read_dir(&home)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, vec!["ro-agent.md".to_string()]);
+    names.sort();
+    // W-1: Kimi's writer agent file is daemon-written next to the read-only one.
+    assert_eq!(
+        names,
+        vec!["ro-agent.md".to_string(), "rw-agent.md".to_string()]
+    );
 }
 
 // ---------------------------------------------------------------- child_env (REQ-030, REQ-033)

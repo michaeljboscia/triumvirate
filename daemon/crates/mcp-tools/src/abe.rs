@@ -1131,6 +1131,8 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         &setup.worktree_path.display().to_string(),
         &extra_dirs,
         req.contract_fields.sandbox_permissions.as_deref(),
+        Some(req.contract_fields.commit_format.as_str()),
+        Some(req.contract_fields.task_timeout_sec),
     )?;
 
     let mut worker_env = (callbacks.completion_env)();
@@ -1830,8 +1832,16 @@ pub fn build_worker_argv(
     prompt: &str,
     cwd: &str,
 ) -> Result<(String, Vec<String>), String> {
+    // Seven Primes W-1: a new seat only writes through `triumvirate seat-run`, which needs a worktree to contain the
+    // seat and to commit in. This path has none, so it refuses before the gate and spawns nothing.
+    let canonical = mcp_bridge::normalize_agent_name(agent);
+    if mcp_bridge::seat_run::is_writer_seat(&canonical) {
+        return Err(format!(
+            "seat_requires_worktree:{canonical}: a {canonical} ABE worker runs only through dispatch_codex_worktree"
+        ));
+    }
     check_abe_worker(agent)?;
-    match mcp_bridge::normalize_agent_name(agent).as_str() {
+    match canonical.as_str() {
         "grok" => {
             let (bin, extra) = command_for("grok");
             // An ABE worker is single-turn in a fresh worktree: no session id, so it can never
@@ -1948,9 +1958,36 @@ pub fn build_worktree_worker_argv(
     worktree_path: &str,
     extra_dirs: &[String],
     sandbox_permissions: Option<&[String]>,
+    // Seven Primes W-1: the contract's commit_format, the message `seat-run` commits a new seat's work with. Every
+    // existing arm ignores it (those workers commit themselves); a new seat without one is refused.
+    commit_message: Option<&str>,
+    // W-1: the task timeout ABE's enforce_timeout applies to this worker; seat-run's own deadline sits inside it.
+    timeout_secs: Option<u64>,
 ) -> Result<(String, Vec<String>), String> {
     check_abe_worker(agent)?;
     match mcp_bridge::normalize_agent_name(agent).as_str() {
+        // Seven Primes W-1: kimi, mistral and qwen run no shell, so they cannot commit. `triumvirate seat-run` runs
+        // the seat under the writer seatbelt, audits for writes outside the worktree, and commits on its behalf, so
+        // the commit-or-fail contract sees a normal commit. The prompt goes to a file seat-run reads and deletes.
+        // `--timeout-secs` sits strictly inside ABE's task timeout (`inner_timeout_secs`), so seat-run kills the
+        // vendor's process group itself before ABE's enforce_timeout ever signals it.
+        seat @ ("kimi" | "mistral" | "qwen") => {
+            let message = commit_message.filter(|m| !m.trim().is_empty()).ok_or_else(|| {
+                format!("seat_requires_commit_format:{seat}: a {seat} worktree worker needs the contract's commit_format")
+            })?;
+            let outer = timeout_secs.ok_or_else(|| {
+                format!("seat_requires_task_timeout:{seat}: a {seat} worktree worker needs the task timeout")
+            })?;
+            let _ = (extra_dirs, sandbox_permissions);
+            mcp_bridge::seat_run::seat_run_command(
+                "abe",
+                seat,
+                std::path::Path::new(worktree_path),
+                prompt,
+                message,
+                mcp_bridge::seat_run::inner_timeout_secs(outer),
+            )
+        }
         "grok" => {
             // `workspace` rather than the consult default of `read-only`: a worktree worker
             // exists to write code and commit it. No session id, so it cannot attach to another
@@ -2114,7 +2151,9 @@ fn abe_buildable_for_row(
 ///
 /// Deliberately narrower than `mcp_bridge::supported_agent_names()`. Adding a name here without
 /// adding the matching arm reintroduces FIND-ABE-01, so `abe_09` asserts the two agree.
-pub const ABE_BUILDABLE_AGENTS: &[&str] = &["codex", "claude", "grok"];
+/// W-1: kimi, mistral and qwen are buildable on the worktree path only (`build_worktree_worker_argv`, through
+/// `triumvirate seat-run`); `build_worker_argv` refuses them with `seat_requires_worktree:<seat>`.
+pub const ABE_BUILDABLE_AGENTS: &[&str] = &["codex", "claude", "grok", "kimi", "mistral", "qwen"];
 
 #[cfg(test)]
 mod abe_agent_tests {
@@ -2269,10 +2308,21 @@ mod abe_worktree_tests {
     #[test]
     fn abe_11_codex_worktree_argv_is_unchanged() {
         let _guard = env_guard();
-        let dirs = vec!["/repo/.git".to_string(), "/repo/.git/worktrees/t".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("codex", &resolver, "do the task", "/wt", &dirs, None)
-                .expect("codex worktree");
+        let dirs = vec![
+            "/repo/.git".to_string(),
+            "/repo/.git/worktrees/t".to_string(),
+        ];
+        let (cmd, args) = build_worktree_worker_argv(
+            "codex",
+            &resolver,
+            "do the task",
+            "/wt",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("codex worktree");
         assert_eq!(cmd, "/bin/codex");
         assert_eq!(args[0], "exec");
         assert_eq!(&args[1..3], ["--sandbox", "workspace-write"], "got: {args:?}");
@@ -2294,9 +2344,17 @@ mod abe_worktree_tests {
     fn abe_12_claude_worktree_worker_can_write_and_reach_the_parent_git() {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("claude", &resolver, "do the task", "/wt", &dirs, None)
-                .expect("claude worktree");
+        let (cmd, args) = build_worktree_worker_argv(
+            "claude",
+            &resolver,
+            "do the task",
+            "/wt",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("claude worktree");
         assert_eq!(cmd, "/bin/claude");
         let joined = args.join(" ");
         assert!(
@@ -2326,9 +2384,17 @@ mod abe_worktree_tests {
     fn abe_13_grok_worktree_worker_is_writable_and_cannot_reach_the_parent_git() {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("grok", &resolver, "do the task", "/wt", &dirs, None)
-                .expect("grok worktree");
+        let (cmd, args) = build_worktree_worker_argv(
+            "grok",
+            &resolver,
+            "do the task",
+            "/wt",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("grok worktree");
         assert_eq!(cmd, "/bin/grok");
         let joined = args.join(" ");
         assert!(joined.contains("--sandbox workspace"), "a worker writes; got: {joined}");
@@ -2348,7 +2414,14 @@ mod abe_worktree_tests {
     fn abe_15_grok_gets_the_absolute_worktree_path_not_a_dot() {
         let _guard = env_guard();
         let (_, args) = build_worktree_worker_argv(
-            "grok", &resolver, "task", "/abs/worktree/path", &[], None,
+            "grok",
+            &resolver,
+            "task",
+            "/abs/worktree/path",
+            &[],
+            None,
+            None,
+            None,
         )
         .expect("grok worktree");
         let cwd = args
@@ -2375,9 +2448,10 @@ mod abe_worktree_tests {
             "/repo/.git".to_string(),
             "/repo/.git/worktrees/task-7".to_string(),
         ];
-        let (_, args) =
-            build_worktree_worker_argv("claude", &resolver, "the task", "/wt", &dirs, None)
-                .expect("claude worktree");
+        let (_, args) = build_worktree_worker_argv(
+            "claude", &resolver, "the task", "/wt", &dirs, None, None, None,
+        )
+        .expect("claude worktree");
 
         let at = args.iter().position(|a| a == "--add-dir").expect("--add-dir present");
         assert_eq!(
@@ -2407,7 +2481,7 @@ mod abe_worktree_tests {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string(), "/repo/.git/worktrees/t".to_string()];
         let (_, args) =
-            build_worktree_worker_argv("codex", &resolver, "task", "/wt", &dirs, None)
+            build_worktree_worker_argv("codex", &resolver, "task", "/wt", &dirs, None, None, None)
                 .expect("codex worktree");
         assert_eq!(
             args.iter().filter(|a| *a == "--add-dir").count(),
@@ -2422,8 +2496,9 @@ mod abe_worktree_tests {
     fn abe_14_an_unbuildable_worktree_agent_is_refused() {
         let _guard = env_guard();
         for agent in ["gemini", "deepseek"] {
-            let err = build_worktree_worker_argv(agent, &resolver, "task", "/wt", &[], None)
-                .expect_err("must refuse rather than spawn codex");
+            let err =
+                build_worktree_worker_argv(agent, &resolver, "task", "/wt", &[], None, None, None)
+                    .expect_err("must refuse rather than spawn codex");
             assert!(err.contains("cannot dispatch"), "got: {err}");
         }
     }
@@ -2518,6 +2593,17 @@ mod abe_label_honesty_tests {
     fn abe_09_the_buildable_list_matches_the_builder() {
         let _guard = env_guard();
         for agent in ABE_BUILDABLE_AGENTS {
+            // W-1: a new seat is buildable on the worktree path only; this path refuses it by name, never as codex.
+            if mcp_bridge::seat_run::is_writer_seat(agent) {
+                assert_eq!(
+                    build_worker_argv(agent, &resolver, "task", "/tmp").unwrap_err(),
+                    format!(
+                        "seat_requires_worktree:{agent}: a {agent} ABE worker runs only through \
+                         dispatch_codex_worktree"
+                    )
+                );
+                continue;
+            }
             let (cmd, _) = build_worker_argv(agent, &resolver, "task", "/tmp")
                 .unwrap_or_else(|e| {
                     panic!("{agent} is listed as buildable but build_worker_argv refuses it: {e}")
@@ -2657,8 +2743,18 @@ mod abe_binary_oracle_tests {
             "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it exists to close. \
              Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
         );
-        let resolver = |agent: &str| (if agent == "codex" { bin.clone() } else { format!("/bin/{agent}") }, Vec::new());
-        let (cmd, args) = build_worker_argv("codex", &resolver, "noop task", "/tmp").expect("codex argv");
+        let resolver = |agent: &str| {
+            (
+                if agent == "codex" {
+                    bin.clone()
+                } else {
+                    format!("/bin/{agent}")
+                },
+                Vec::new(),
+            )
+        };
+        let (cmd, args) =
+            build_worker_argv("codex", &resolver, "noop task", "/tmp").expect("codex argv");
         parses_on_installed_binary(&cmd, &args).unwrap();
     }
 
@@ -2673,10 +2769,28 @@ mod abe_binary_oracle_tests {
             "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it exists to close. \
              Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
         );
-        let resolver = |agent: &str| (if agent == "codex" { bin.clone() } else { format!("/bin/{agent}") }, Vec::new());
+        let resolver = |agent: &str| {
+            (
+                if agent == "codex" {
+                    bin.clone()
+                } else {
+                    format!("/bin/{agent}")
+                },
+                Vec::new(),
+            )
+        };
         let dirs = vec!["/tmp".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("codex", &resolver, "noop task", "/tmp", &dirs, None).expect("codex argv");
+        let (cmd, args) = build_worktree_worker_argv(
+            "codex",
+            &resolver,
+            "noop task",
+            "/tmp",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("codex argv");
         parses_on_installed_binary(&cmd, &args).unwrap();
     }
 }
@@ -2997,17 +3111,115 @@ mod seven_primes_abe_gate_tests {
                 "{agent}: nothing may be spawned or set up"
             );
         }
-        // kimi enabled AND verified: the gate's own surface rule, deferred on AbeDispatch (A-2).
+        // kimi enabled AND verified (W-1, A-16): AbeDispatch is open. The plain path has no worktree, so it refuses
+        // with seat_requires_worktree and spawns nothing; the worktree path passes the gate and reaches setup (which
+        // this stub refuses), so it still spawns nothing.
         kimi_available(&home);
         let (plain, worktree, spawns, setups) = run("kimi").await;
-        for got in [plain, worktree] {
-            assert_eq!(
-                got.expect_err("deferred"),
-                "seat_surface_deferred: kimi on AbeDispatch ships in v1.1"
-            );
-        }
-        assert_eq!((spawns, setups), (0, 0));
+        let plain = plain.expect_err("no worktree");
+        assert!(plain.starts_with("seat_requires_worktree:kimi:"), "{plain}");
+        let worktree = worktree.expect_err("the stub setup fails");
+        assert!(worktree.starts_with("SETUP_FAILED"), "{worktree}");
+        assert_eq!((spawns, setups), (0, 1));
         assert!(!marker.exists(), "no mock agent ever ran");
+    }
+
+    /// W-1: an ABE worktree worker for a new seat is `triumvirate seat-run` with the contract's commit format, the
+    /// prompt in `.triumvirate/seat-prompt-<seat>.txt`; without a commit format it is refused and writes nothing.
+    /// RED IF: a new seat gets a vendor argv from ABE (bypassing seat-run's containment), the commit message is not the
+    /// one passed, the surface is not `abe`, or a missing commit format is not an error.
+    #[test]
+    fn worktree_worker_for_a_new_seat_is_seat_run() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture(&[
+            "TRIUMVIRATE_ENABLE_KIMI",
+            "TRIUMVIRATE_HOME",
+            "TRIUMVIRATE_SELF_BIN",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        kimi_available(&home);
+        // SAFETY: under env_guard; restored by _restore. The path is never executed here.
+        unsafe { std::env::set_var("TRIUMVIRATE_SELF_BIN", "/nonexistent/w1-triumvirate") };
+        let resolver = |a: &str| (format!("/bin/{a}"), Vec::new());
+        let wt_s = wt.display().to_string();
+        let err =
+            build_worktree_worker_argv("kimi", &resolver, "p", &wt_s, &[], None, None, Some(600))
+                .unwrap_err();
+        assert!(
+            err.starts_with("seat_requires_commit_format:kimi:"),
+            "{err}"
+        );
+        let err = build_worktree_worker_argv(
+            "kimi",
+            &resolver,
+            "p",
+            &wt_s,
+            &[],
+            None,
+            Some("feat: x"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("seat_requires_task_timeout:kimi:"), "{err}");
+        let prompt_file = wt.join(".triumvirate/seat-prompt-kimi.txt");
+        assert!(!prompt_file.exists());
+        let (cmd, args) = build_worktree_worker_argv(
+            "kimi",
+            &resolver,
+            "BRIEF",
+            &wt_s,
+            &[],
+            None,
+            Some("feat: x"),
+            Some(600),
+        )
+        .expect("seat-run argv");
+        assert_eq!(cmd, "/nonexistent/w1-triumvirate");
+        assert_eq!(
+            args,
+            [
+                "seat-run".to_string(),
+                "--seat".into(),
+                "kimi".into(),
+                "--surface".into(),
+                "abe".into(),
+                "--worktree".into(),
+                wt_s.clone(),
+                "--prompt-file".into(),
+                prompt_file.display().to_string(),
+                "--commit-message".into(),
+                "feat: x".into(),
+                "--timeout-secs".into(),
+                // Strictly inside ABE's 600 s task timeout.
+                "540".into(),
+            ]
+        );
+        // The argv's own --timeout-secs is strictly inside the outer deadline passed, on both sides of the 120 s rule.
+        for outer in [600u64, 121, 120, 60] {
+            std::fs::remove_file(&prompt_file).unwrap();
+            let (_, args) = build_worktree_worker_argv(
+                "kimi",
+                &resolver,
+                "BRIEF",
+                &wt_s,
+                &[],
+                None,
+                Some("feat: x"),
+                Some(outer),
+            )
+            .expect("seat-run argv");
+            let inner: u64 = args[args.iter().position(|a| a == "--timeout-secs").unwrap() + 1]
+                .parse()
+                .unwrap();
+            assert!(inner < outer, "inner {inner} must be < outer {outer}");
+            let want = if outer <= 120 { outer / 2 } else { outer - 60 };
+            assert_eq!(inner, want, "outer {outer}");
+        }
+        assert_eq!(std::fs::read_to_string(&prompt_file).unwrap(), "BRIEF");
     }
 
     /// One HTTP request's JSON body, answered 200. A minimal PostHog capture endpoint.

@@ -12,7 +12,7 @@
 //! The model is not on the argv: the contract names no model flag, and the seat home's daemon-written config.toml
 //! (`active_model`, T-104) selects it.
 
-use crate::containment::{SeatInvocation, SeatRequest};
+use crate::containment::{SeatInvocation, SeatMode, SeatRequest};
 
 /// The CLI binary (research/02: PyPI package `mistral-vibe`, binary `vibe`).
 pub const MISTRAL_PROGRAM: &str = "vibe";
@@ -22,6 +22,10 @@ pub const MAX_PROMPT_BYTES: usize = 65536;
 
 /// The read-only tool allowlist (research/02, round 1 additions: built-in tool modules).
 pub const ENABLED_TOOLS: [&str; 3] = ["read_file", "grep", "todo"];
+
+/// The writer tool allowlist (W-1): file read, search, write and in-place edit. No `bash`, so the seat cannot run a
+/// shell; `seat-run` commits on its behalf.
+pub const WRITER_ENABLED_TOOLS: [&str; 4] = ["read_file", "grep", "write_file", "search_replace"];
 
 /// Operator extra args the builder refuses (BACKEND_STRUCTURE section 6, Mistral column). Each also matches its
 /// `--flag=value` form, and a single-dash short flag also matches with its value attached (`-pfoo`).
@@ -54,6 +58,10 @@ fn forbidden(arg: &str) -> bool {
 }
 
 /// The read-only argv for one dispatch. Errors carry a code first, for example `prompt_too_large_for_mistral`.
+///
+/// Writer (W-1): the read-only argv with exactly two changes, `--agent auto-approve` instead of `--agent plan` and the
+/// `WRITER_ENABLED_TOOLS` allowlist. NOT live-proven: the orchestrator's live probe was blocked by its own permission
+/// classifier (WRITER_SEATS_PLAN.md "Live writer probes"); only the mock tests cover it until W-4.
 pub fn build_mistral_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, String> {
     let bytes = req.prompt.len();
     if bytes > MAX_PROMPT_BYTES {
@@ -80,11 +88,18 @@ pub fn build_mistral_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation,
         "--time-limit".into(),
         time_limit_secs.to_string(),
         "--agent".into(),
-        "plan".into(),
+        match req.mode {
+            SeatMode::ReadOnly => "plan".into(),
+            SeatMode::Writer => "auto-approve".into(),
+        },
     ];
-    for tool in ENABLED_TOOLS {
+    let tools: &[&str] = match req.mode {
+        SeatMode::ReadOnly => &ENABLED_TOOLS,
+        SeatMode::Writer => &WRITER_ENABLED_TOOLS,
+    };
+    for tool in tools {
         args.push("--enabled-tools".into());
-        args.push(tool.into());
+        args.push((*tool).into());
     }
     if let Some(id) = req.resume_session_id {
         args.push("--resume".into());
@@ -118,6 +133,7 @@ mod tests {
             extra_args: extra,
             max_turns: 12,
             time_limit: Duration::from_secs(600),
+            mode: SeatMode::ReadOnly,
         }
     }
 
@@ -229,5 +245,28 @@ mod tests {
         assert_eq!(flag_value(&inv.args, "--max-price"), Some("0.50"));
         let extra = vec!["--output-format".to_string()];
         assert!(build_mistral_invocation(&req("p", &extra, None)).is_ok());
+    }
+
+    /// RED IF: the writer argv differs from the read-only argv in anything but `--agent auto-approve` and the
+    /// read_file, grep, write_file, search_replace allowlist, or `bash` reaches it.
+    #[test]
+    fn writer_argv_is_read_only_plus_two_changes() {
+        let ro = build_mistral_invocation(&req("do it", &[], None)).expect("builds");
+        let mut r = req("do it", &[], None);
+        r.mode = SeatMode::Writer;
+        let w = build_mistral_invocation(&r).expect("builds");
+        assert_eq!(w.program, "vibe");
+        assert_eq!(w.env_add, ro.env_add);
+        let mut want = ro.args.clone();
+        let agent = want.iter().position(|a| a == "--agent").unwrap();
+        want[agent + 1] = "auto-approve".into();
+        want.retain(|a| a != "--enabled-tools" && !ENABLED_TOOLS.contains(&a.as_str()));
+        for t in ["read_file", "grep", "write_file", "search_replace"] {
+            want.push("--enabled-tools".into());
+            want.push(t.into());
+        }
+        assert_eq!(w.args, want);
+        assert!(!w.args.iter().any(|a| a.contains("bash")), "{:?}", w.args);
+        assert!(!w.args.iter().any(|a| a == "plan"));
     }
 }

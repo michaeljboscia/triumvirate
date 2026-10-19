@@ -774,6 +774,7 @@ pub(crate) fn seat_static_checks(seat: &str, ctx: &SeatDoctorCtx) -> Vec<SeatChe
         extra_args: &[],
         max_turns: 1,
         time_limit: std::time::Duration::from_secs(60),
+        mode: mcp_bridge::containment::SeatMode::ReadOnly,
     };
     let built = match seat {
         "kimi" => mcp_bridge::kimi::build_kimi_invocation(&req),
@@ -873,11 +874,37 @@ pub(crate) fn seat_static_checks(seat: &str, ctx: &SeatDoctorCtx) -> Vec<SeatChe
 /// spawned and then failed on credentials, billing or quota, suspension or the served model deletes verified.json and
 /// returns the error; any other failure leaves the state as it was and returns the error.
 pub(crate) async fn seat_live_probe(seat: &str) -> Result<(), String> {
+    // P-1: one tv_seat_doctor_probe per probe result, whichever step decided it.
+    let mut detected: Option<String> = None;
+    let result = seat_live_probe_inner(seat, &mut detected).await;
+    let pinned = SEAT_CLIS
+        .iter()
+        .find(|(s, _, _)| *s == seat)
+        .map(|(_, _, v)| *v);
+    let cli_version = mcp_bridge::posthog::cli_version_bucket(detected.as_deref(), pinned);
+    match &result {
+        Ok(served) => mcp_bridge::posthog::record_seat_doctor_probe(
+            seat,
+            None,
+            cli_version,
+            mcp_bridge::posthog::served_model_bucket(served.as_deref()),
+        ),
+        Err(e) => mcp_bridge::posthog::record_seat_doctor_probe(seat, Some(e), cli_version, None),
+    }
+    result.map(|_| ())
+}
+
+/// The probe itself; returns the served model on a pass, and leaves the detected CLI version in `detected`.
+async fn seat_live_probe_inner(
+    seat: &str,
+    detected: &mut Option<String>,
+) -> Result<Option<String>, String> {
     let th = mcp_bridge::seat_state::triumvirate_home()?;
     let seat_home = mcp_bridge::containment::seat_home(&th, seat)?;
     let bin = mcp_bridge::new_seat_bin(seat)?;
     let cli_version = installed_version(std::path::Path::new(&bin))
         .ok_or_else(|| format!("seat_unverified: {seat}: no version from `{bin} --version`"))?;
+    *detected = Some(cli_version.clone());
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let cwd = std::env::temp_dir().join(format!(
         "triumvirate-probe-{seat}-{}-{}",
@@ -904,9 +931,10 @@ pub(crate) async fn seat_live_probe(seat: &str) -> Result<(), String> {
                 cli_version,
                 seat_home: seat_home.to_string_lossy().into_owned(),
                 probed_at: chrono::Utc::now().to_rfc3339(),
-                served_model: answer.served_model,
+                served_model: answer.served_model.clone(),
             },
-        ),
+        )
+        .map(|()| answer.served_model),
         Err(e) => {
             let msg = e.to_string();
             if probe_failure_unverifies(&msg) {
@@ -957,6 +985,10 @@ pub(crate) async fn print_seat_doctor(ctx: &SeatDoctorCtx, live: bool) -> anyhow
                 Err(e) => write_line_stdout(&format!("  {seat}.live: FAIL ({e})"))?,
             }
         }
+    }
+    if live {
+        // P-1: doctor exits next; deliver the probe events first (bounded, never fails the doctor).
+        mcp_bridge::posthog::flush(std::time::Duration::from_secs(5)).await;
     }
     Ok(())
 }

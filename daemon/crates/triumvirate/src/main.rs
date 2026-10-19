@@ -147,6 +147,10 @@ enum CliCommand {
     Doctor(DoctorArgs),
     /// Seven Primes seat controls (REQ-091).
     Seat(SeatArgs),
+    /// Internal (W-1): run one new seat (kimi, mistral, qwen) as a WRITER in a git worktree and commit its work.
+    /// Launched by ABE and fleet. Not for hand use.
+    #[command(hide = true)]
+    SeatRun(SeatRunCliArgs),
     /// Bridge stdio MCP to daemon HTTP endpoint.
     Proxy,
     /// Watch live agent streaming events.
@@ -174,6 +178,24 @@ struct SeatArgs {
 enum SeatCommand {
     /// Lift a seat's suspension: removes $TRIUMVIRATE_HOME/seats/<seat>/suspended.json.
     Clear { seat: String },
+}
+
+#[derive(Debug, clap::Args)]
+struct SeatRunCliArgs {
+    #[arg(long)]
+    seat: String,
+    /// abe, fleet or fleet-temporal.
+    #[arg(long)]
+    surface: String,
+    #[arg(long)]
+    worktree: PathBuf,
+    /// Read, then deleted before the seat runs.
+    #[arg(long)]
+    prompt_file: PathBuf,
+    #[arg(long)]
+    commit_message: String,
+    #[arg(long)]
+    timeout_secs: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1890,6 +1912,18 @@ async fn main() -> anyhow::Result<()> {
         CliCommand::Doctor(args) => {
             run_doctor(args.live).await?;
         }
+        CliCommand::SeatRun(a) => {
+            let code = agent_exec::run_seat_run(agent_exec::SeatRunArgs {
+                seat: a.seat,
+                surface: a.surface,
+                worktree: a.worktree,
+                prompt_file: a.prompt_file,
+                commit_message: a.commit_message,
+                timeout_secs: a.timeout_secs,
+            })
+            .await;
+            std::process::exit(code);
+        }
         CliCommand::Seat(args) => match args.command {
             SeatCommand::Clear { seat } => {
                 cli_ops::run_seat_clear(&mcp_bridge::normalize_agent_name(&seat))?
@@ -2665,8 +2699,8 @@ async fn session_ask_route(
         }
         sessions.get(&req.name).map(|session| session.agent.clone())
     };
-    if session_agent.as_deref().is_some_and(session_seat_is_new) {
-        return new_seat_session_ask_route(state, req).await;
+    if let Some(agent) = session_agent.as_deref().filter(|a| session_seat_is_new(a)) {
+        return new_seat_session_ask_route(state, req, agent).await;
     }
     let (agent, cwd, prior_cli_session) = {
         let sessions = state.sessions.lock().await;
@@ -2756,6 +2790,8 @@ async fn session_ask_route(
 async fn new_seat_session_ask_route(
     state: DaemonRuntimeState,
     req: AskSessionRequest,
+    // P-1 telemetry only: the session's seat as the caller read it, for the busy refusal (before the lock).
+    session_agent: &str,
 ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
     let home = state
         .sessions_file
@@ -2773,6 +2809,11 @@ async fn new_seat_session_ask_route(
         .await
         .map_err(|error| {
             let error = if error == "session_busy" {
+                mcp_bridge::posthog::record_seat_session(
+                    session_agent,
+                    "busy",
+                    Some("session_busy"),
+                );
                 format!("session_busy: {}", req.name)
             } else {
                 error
@@ -2806,6 +2847,11 @@ async fn new_seat_session_ask_route(
             let error = format!(
                 "session_broken: {}; dismiss_session and spawn a new one",
                 session.broken_reason.as_deref().unwrap_or("unknown")
+            );
+            mcp_bridge::posthog::record_seat_session(
+                &session.agent,
+                "broken_refused",
+                Some("session_broken"),
             );
             return Err((
                 StatusCode::CONFLICT,
@@ -2852,6 +2898,7 @@ async fn new_seat_session_ask_route(
             AxumJson(serde_json::json!({ "error": format!("session '{}' not found", req.name) })),
         )
     })?;
+    let was_ready = matches!(session.phase, SessionPhase::Ready);
     let publish = match &turn {
         Ok(response) => daemon_core::publish_turn(
             session,
@@ -2873,6 +2920,20 @@ async fn new_seat_session_ask_route(
             "session_generation_conflict"
         );
     }
+    mcp_bridge::posthog::record_seat_session_publish(
+        &agent,
+        match &publish {
+            PublishResult::Conflict => mcp_bridge::posthog::SessionPublish::Conflict,
+            PublishResult::NotResumable(reason) => {
+                mcp_bridge::posthog::SessionPublish::NotResumable(reason)
+            }
+            PublishResult::Applied => mcp_bridge::posthog::SessionPublish::Applied {
+                was_ready,
+                now_broken: matches!(session.phase, SessionPhase::Broken),
+                turn_error: turn.as_ref().err().map(String::as_str),
+            },
+        },
+    );
     let result = match turn {
         Ok(response) => {
             let mut answer = response.response;

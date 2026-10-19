@@ -326,11 +326,17 @@ const EXISTING: SeatProfile = SeatProfile {
 };
 
 /// The launch surfaces of every new seat (amendment A-2): read-only asks, sessions, jury seats and the doctor probe.
+/// W-1 (amendment A-16): plus the writer surfaces AbeDispatch, FleetSpawn and FleetTemporal, which run the seat
+/// through `triumvirate seat-run` in a worktree. PeerReviewRotation and Prewarm stay deferred; BlindValidate stays
+/// `seat_cannot_write_here`.
 pub const NEW_SEAT_LAUNCH_SURFACES: &[Surface] = &[
     Surface::AskAgent,
     Surface::Session,
     Surface::Jury,
     Surface::DoctorLiveProbe,
+    Surface::AbeDispatch,
+    Surface::FleetSpawn,
+    Surface::FleetTemporal,
 ];
 
 /// What every new seat shares at launch: off until enabled, verified by `doctor --live`, one process per seat,
@@ -355,8 +361,9 @@ const NEW_SEAT: SeatProfile = SeatProfile {
     can_write_test_file: false,
     read_only_containment: Containment::SeatbeltPlusAudit,
     usage_source: UsageSource::Exact,
-    abe_buildable: false,
-    fleet_buildable: false,
+    // W-1 (A-16): writers through `triumvirate seat-run`.
+    abe_buildable: true,
+    fleet_buildable: true,
     daemon_target: true,
     surfaces_allowed: NEW_SEAT_LAUNCH_SURFACES,
     configured: Configured::EnvFlag(""),
@@ -537,8 +544,8 @@ mod tests {
     }
 
     /// The new rows carry the launch contract (REQ-001, REQ-030, REQ-041, REQ-050, REQ-051, REQ-053, REQ-091; A-2).
-    /// RED IF: a new seat gains a writer, fleet, ABE or prewarm role, loses containment or the credential scrub, or
-    /// becomes configured, verified or retried by default.
+    /// RED IF: a new seat gains a prewarm or blind-validator role, loses its ABE and fleet writer role (W-1), loses
+    /// containment or the credential scrub, or becomes configured, verified or retried by default.
     #[test]
     fn new_rows_carry_the_launch_contract() {
         for (key, display, provider, home, flag) in [
@@ -590,8 +597,9 @@ mod tests {
                 "{key}"
             );
             assert_eq!(s.prompt_transport, PromptTransport::ArgvMax64KiB, "{key}");
+            // W-1 (A-16): ABE and fleet writers through seat-run; still no blind-validator test file.
             assert!(
-                !s.can_write_test_file && !s.abe_buildable && !s.fleet_buildable,
+                !s.can_write_test_file && s.abe_buildable && s.fleet_buildable,
                 "{key}"
             );
             assert_eq!(s.prewarm_policy, PrewarmPolicy::Never, "{key}");
@@ -939,8 +947,8 @@ mod tests {
                 can_write_test_file: false,
                 read_only_containment: Containment::SeatbeltPlusAudit,
                 usage_source: UsageSource::NotReported,
-                abe_buildable: false,
-                fleet_buildable: false,
+                abe_buildable: true,
+                fleet_buildable: true,
                 daemon_target: true,
                 surfaces_allowed: NEW_SEAT_LAUNCH_SURFACES,
                 configured: Configured::EnvFlag("TRIUMVIRATE_ENABLE_KIMI"),
@@ -975,8 +983,8 @@ mod tests {
                 can_write_test_file: false,
                 read_only_containment: Containment::SeatbeltPlusAudit,
                 usage_source: UsageSource::Exact,
-                abe_buildable: false,
-                fleet_buildable: false,
+                abe_buildable: true,
+                fleet_buildable: true,
                 daemon_target: true,
                 surfaces_allowed: NEW_SEAT_LAUNCH_SURFACES,
                 configured: Configured::EnvFlag("TRIUMVIRATE_ENABLE_MISTRAL"),
@@ -1011,8 +1019,8 @@ mod tests {
                 can_write_test_file: false,
                 read_only_containment: Containment::SeatbeltPlusAudit,
                 usage_source: UsageSource::Exact,
-                abe_buildable: false,
-                fleet_buildable: false,
+                abe_buildable: true,
+                fleet_buildable: true,
                 daemon_target: true,
                 surfaces_allowed: NEW_SEAT_LAUNCH_SURFACES,
                 configured: Configured::EnvFlag("TRIUMVIRATE_ENABLE_QWEN"),

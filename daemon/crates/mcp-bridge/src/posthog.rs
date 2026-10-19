@@ -504,6 +504,12 @@ fn capture(event: &str, properties: serde_json::Value) {
 /// SESSION id (not the daemon id), because PostHog's MCP Analytics dashboard is per-session:
 /// it groups a client's tool calls into one session, which a shared daemon id would collapse.
 fn capture_as(distinct_id: &str, event: &str, properties: serde_json::Value) {
+    // P-1 recording seam: a test that started recording on THIS thread sees the event, configured or not.
+    let _ = RECORDER.try_with(|r| {
+        if let Some(events) = r.borrow_mut().as_mut() {
+            events.push((event.to_string(), properties.clone()));
+        }
+    });
     let (Ok(host), Ok(key)) = (
         std::env::var("POSTHOG_HOST"),
         std::env::var("POSTHOG_API_KEY"),
@@ -531,7 +537,10 @@ fn capture_as(distinct_id: &str, event: &str, properties: serde_json::Value) {
         return;
     };
     let event_name = event.to_string();
+    // Counted until the task ends or is dropped unrun, so a short-lived command can `flush` before it exits.
+    let in_flight = InFlight::new();
     handle.spawn(async move {
+        let _in_flight = in_flight;
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -1122,6 +1131,583 @@ pub fn record_deepseek_breaker(to_state: &str, from_state: &str) {
             "tv_out_of_balance": to_state == "hard_open_insufficient_balance",
         }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Seven Primes P-1: tv_seat_* events for every new-seat and writer-seat path.
+//
+// One record_* helper per event, called at the one place each thing happens, each with a pure
+// `*_props` builder the tests assert. Every value is from a bounded vocabulary: agents with no
+// SeatProfile row, codes outside SEAT_CODES, served models outside SERVED_MODELS and CLI versions
+// that are not the pinned one all report `other`. No prompt, answer, path, file content,
+// credential or session id is ever a property.
+// ---------------------------------------------------------------------------
+
+/// The leading code tokens a tv_seat_* event may report (tv_reason_code, tv_code, tv_containment_code).
+/// Add a code here in the same commit that adds it to the daemon.
+pub const SEAT_CODES: &[&str] = &[
+    "seat_not_configured",
+    "seat_suspended",
+    "seat_unverified",
+    "seat_surface_refused",
+    "seat_surface_deferred",
+    "seat_cannot_write_here",
+    "seat_quota_exhausted",
+    "seat_lock_unavailable",
+    "seat_output_dir",
+    "seatbelt_unavailable",
+    "read_only_violation",
+    "read_only_audit_unavailable",
+    "writer_escaped_worktree",
+    "seat_made_no_changes",
+    "seat_requires_worktree",
+    "nonzero_exit",
+    "exit_error",
+    "empty_or_unrecognized_stream",
+    "missing_export",
+    "qwen_seat_served_non_qwen_model",
+    "missing_session_id",
+    "session_busy",
+    "session_broken",
+    "session_generation_conflict",
+    "vendor_rejected_session",
+    "prompt_too_large_for_kimi",
+    "prompt_too_large_for_mistral",
+    "prompt_too_large_for_qwen",
+];
+
+/// The Qwen plan's live model list (LAUNCH_REPORT). Any other served model reports `other`.
+pub const SERVED_MODELS: &[&str] = &[
+    "qwen3.7-plus",
+    "qwen3.7-max",
+    "qwen3.8-max",
+    "qwen3.8-flash",
+    "qwen3.6-flash",
+];
+
+/// The error's leading code token (the run of `[a-z0-9_]` it starts with) when it is in SEAT_CODES, else `other`.
+pub fn seat_code(err: &str) -> &'static str {
+    let token = err
+        .split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+        .next()
+        .unwrap_or_default();
+    bounded(token, SEAT_CODES)
+}
+
+/// `value` when it is exactly one of `allowed`, else `other`.
+fn bounded(value: &str, allowed: &[&'static str]) -> &'static str {
+    allowed
+        .iter()
+        .find(|a| **a == value)
+        .copied()
+        .unwrap_or("other")
+}
+
+/// The served model when it is one of SERVED_MODELS, `other` for any other model, None when none was reported.
+pub fn served_model_bucket(served: Option<&str>) -> Option<&'static str> {
+    served.map(|m| bounded(m, SERVED_MODELS))
+}
+
+/// The pinned CLI version when the detected one equals it, else `other`.
+pub fn cli_version_bucket(detected: Option<&str>, pinned: Option<&'static str>) -> &'static str {
+    match (detected, pinned) {
+        (Some(d), Some(p)) if d == p => p,
+        _ => "other",
+    }
+}
+
+/// The seat key when it has a SeatProfile row, else `other` (a caller-supplied name is never reported verbatim).
+fn bounded_agent(agent: &str) -> &'static str {
+    crate::seat_profile::seat_profile(agent).map_or("other", |row| row.key)
+}
+
+/// The gate surface as its telemetry name.
+pub fn surface_name(surface: crate::seat_profile::Surface) -> &'static str {
+    use crate::seat_profile::Surface;
+    match surface {
+        Surface::AskAgent => "ask_agent",
+        Surface::Session => "session",
+        Surface::Jury => "jury",
+        Surface::BlindValidate => "blind_validate",
+        Surface::DoctorLiveProbe => "doctor_live_probe",
+        Surface::PeerReviewRotation => "peer_review_rotation",
+        Surface::FleetSpawn => "fleet_spawn",
+        Surface::FleetTemporal => "fleet_temporal",
+        Surface::AbeDispatch => "abe_dispatch",
+        Surface::Prewarm => "prewarm",
+    }
+}
+
+fn origin_name(origin: shared_types::Origin) -> &'static str {
+    match origin {
+        shared_types::Origin::Interactive => "interactive",
+        shared_types::Origin::Unattended => "unattended",
+    }
+}
+
+/// The run tag when it matches `^[a-z0-9-]{1,32}$`, else None.
+pub fn valid_run_tag(raw: Option<&str>) -> Option<&str> {
+    raw.filter(|t| {
+        (1..=32).contains(&t.len())
+            && t.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
+}
+
+/// `TRIUMVIRATE_TELEMETRY_RUN_TAG` when valid: live verification filters its read-back on it.
+fn run_tag() -> Option<String> {
+    let raw = std::env::var("TRIUMVIRATE_TELEMETRY_RUN_TAG").ok();
+    valid_run_tag(raw.as_deref()).map(str::to_string)
+}
+
+/// tv_agent, tv_agent_display, the event's own fields, and tv_run_tag when a valid one is set.
+fn seat_event_props(
+    agent: &str,
+    fields: serde_json::Value,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    let agent = bounded_agent(agent);
+    let mut props = json!({
+        "tv_agent":         agent,
+        "tv_agent_display": crate::display_agent_name(agent),
+    });
+    if let (Some(out), serde_json::Value::Object(fields)) = (props.as_object_mut(), fields) {
+        out.extend(fields);
+        if let Some(tag) = run_tag {
+            out.insert("tv_run_tag".into(), json!(tag));
+        }
+    }
+    props
+}
+
+/// `tv_seat_gate_refused` properties.
+pub fn seat_gate_refused_props(
+    agent: &str,
+    code: crate::seat_gate::RefusalCode,
+    surface: crate::seat_profile::Surface,
+    origin: shared_types::Origin,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({
+            "tv_refusal_code": code.as_str(),
+            "tv_surface":      surface_name(surface),
+            "tv_origin":       origin_name(origin),
+        }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_gate_refused`: the seat gate refused a call (called inside the gate, so every surface reports).
+pub fn record_seat_gate_refused(
+    agent: &str,
+    code: crate::seat_gate::RefusalCode,
+    surface: crate::seat_profile::Surface,
+    origin: shared_types::Origin,
+) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_gate_refused",
+        seat_gate_refused_props(agent, code, surface, origin, tag.as_deref()),
+    );
+}
+
+/// `tv_seat_lock_wait` properties.
+pub fn seat_lock_wait_props(
+    agent: &str,
+    waited_ms: u64,
+    acquired: bool,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({
+            "tv_waited_ms": waited_ms,
+            "tv_outcome":   if acquired { "acquired" } else { "unavailable" },
+        }),
+        run_tag,
+    )
+}
+
+/// The wait at or above which an acquired seat lock is reported (`TRIUMVIRATE_SEAT_LOCK_EVENT_MS`, default 1000).
+fn seat_lock_event_ms() -> u64 {
+    std::env::var("TRIUMVIRATE_SEAT_LOCK_EVENT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1000)
+}
+
+/// Emit `tv_seat_lock_wait`: always when the seat lock could not be taken, and on acquisition only when the call
+/// waited at least the threshold.
+pub fn record_seat_lock_wait(agent: &str, waited_ms: u64, acquired: bool) {
+    if acquired && waited_ms < seat_lock_event_ms() {
+        return;
+    }
+    let tag = run_tag();
+    capture(
+        "tv_seat_lock_wait",
+        seat_lock_wait_props(agent, waited_ms, acquired, tag.as_deref()),
+    );
+}
+
+/// `tv_seat_quota` properties. `from_status`: the 429 came from the CLI's structured status (`http_429`), not
+/// only from its error text (`quota_text`).
+pub fn seat_quota_props(
+    agent: &str,
+    from_status: bool,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({ "tv_quota_signal": if from_status { "http_429" } else { "quota_text" } }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_quota`: a new seat hit its quota.
+pub fn record_seat_quota(agent: &str, from_status: bool) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_quota",
+        seat_quota_props(agent, from_status, tag.as_deref()),
+    );
+}
+
+/// `tv_seat_suspended` properties. `from_status`: the 403 came from the CLI's structured status (`http_403`), not
+/// only from its error text (`suspension_text`).
+pub fn seat_suspended_props(
+    agent: &str,
+    from_status: bool,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({ "tv_suspend_signal": if from_status { "http_403" } else { "suspension_text" } }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_suspended`: a run classified as a suspension wrote suspended.json.
+pub fn record_seat_suspended(agent: &str, from_status: bool) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_suspended",
+        seat_suspended_props(agent, from_status, tag.as_deref()),
+    );
+}
+
+/// The containment codes tv_seat_containment reports.
+const CONTAINMENT_CODES: &[&str] = &[
+    "seatbelt_unavailable",
+    "read_only_violation",
+    "read_only_audit_unavailable",
+    "writer_escaped_worktree",
+];
+
+/// `tv_seat_containment` properties: the code and how many paths it named (never the paths).
+pub fn seat_containment_props(
+    agent: &str,
+    code: &str,
+    paths_count: u64,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({
+            "tv_containment_code": bounded(code, CONTAINMENT_CODES),
+            "tv_paths_count":      paths_count,
+        }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_containment`: the seatbelt was missing, the read-only audit failed or found a write, or a writer
+/// escaped its worktree.
+pub fn record_seat_containment(agent: &str, code: &str, paths_count: u64) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_containment",
+        seat_containment_props(agent, code, paths_count, tag.as_deref()),
+    );
+}
+
+/// `tv_seat_doctor_probe` properties. `error` is the probe's failure (None on a pass); `cli_version` and
+/// `served_model` are already bucketed.
+pub fn seat_doctor_probe_props(
+    agent: &str,
+    error: Option<&str>,
+    cli_version: &'static str,
+    served_model: Option<&'static str>,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({
+            "tv_outcome":       if error.is_none() { "pass" } else { "fail" },
+            "tv_code":          error.map(seat_code),
+            "tv_cli_version":   cli_version,
+            "tv_served_model":  served_model,
+        }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_doctor_probe`: one `doctor --live` probe result.
+pub fn record_seat_doctor_probe(
+    agent: &str,
+    error: Option<&str>,
+    cli_version: &'static str,
+    served_model: Option<&'static str>,
+) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_doctor_probe",
+        seat_doctor_probe_props(agent, error, cli_version, served_model, tag.as_deref()),
+    );
+}
+
+/// The tv_session_event values.
+const SESSION_EVENTS: &[&str] = &[
+    "ready",
+    "broken",
+    "generation_conflict",
+    "busy",
+    "broken_refused",
+];
+
+/// `tv_seat_session` properties. `reason` is an error (or code) reduced through `seat_code`.
+pub fn seat_session_props(
+    agent: &str,
+    event: &str,
+    reason: Option<&str>,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({
+            "tv_session_event": bounded(event, SESSION_EVENTS),
+            "tv_reason_code":   reason.map(seat_code),
+        }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_session` for a busy or already-broken refusal (`busy` / `broken_refused`).
+pub fn record_seat_session(agent: &str, event: &str, reason: Option<&str>) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_session",
+        seat_session_props(agent, event, reason, tag.as_deref()),
+    );
+}
+
+/// What one `publish_turn` did, as the session caller saw it (daemon-core's types are out of reach here).
+#[derive(Debug, Clone, Copy)]
+pub enum SessionPublish<'a> {
+    /// The stored generation moved during the turn; nothing was applied.
+    Conflict,
+    /// A first turn succeeded without a vendor session id; the reason is publish_turn's.
+    NotResumable(&'a str),
+    /// The turn was applied. `was_ready`: the phase before; `now_broken`: the phase after is Broken;
+    /// `turn_error`: the turn's error, None when it succeeded.
+    Applied {
+        was_ready: bool,
+        now_broken: bool,
+        turn_error: Option<&'a str>,
+    },
+}
+
+/// The (tv_session_event, tv_reason_code) a publish reports, or None when it changed nothing worth an event (a failed
+/// turn that left a Ready session Ready).
+pub fn session_publish_event(
+    p: SessionPublish<'_>,
+) -> Option<(&'static str, Option<&'static str>)> {
+    match p {
+        SessionPublish::Conflict => {
+            Some(("generation_conflict", Some("session_generation_conflict")))
+        }
+        SessionPublish::NotResumable(reason) => Some(("broken", Some(seat_code(reason)))),
+        // publish_turn breaks a Ready session only on a vendor-rejected id.
+        SessionPublish::Applied {
+            was_ready: true,
+            now_broken: true,
+            ..
+        } => Some(("broken", Some("vendor_rejected_session"))),
+        SessionPublish::Applied {
+            now_broken: true,
+            turn_error,
+            ..
+        } => Some(("broken", Some(seat_code(turn_error.unwrap_or_default())))),
+        SessionPublish::Applied {
+            turn_error: None, ..
+        } => Some(("ready", None)),
+        SessionPublish::Applied { .. } => None,
+    }
+}
+
+/// Emit `tv_seat_session` for one publish_turn result.
+pub fn record_seat_session_publish(agent: &str, p: SessionPublish<'_>) {
+    if let Some((event, reason)) = session_publish_event(p) {
+        record_seat_session(agent, event, reason);
+    }
+}
+
+/// `tv_seat_served_model_mismatch` properties.
+pub fn seat_served_model_mismatch_props(
+    agent: &str,
+    served: Option<&str>,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({ "tv_served_model": served_model_bucket(served) }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_served_model_mismatch`: the Qwen seat was answered by a non-Qwen model.
+pub fn record_seat_served_model_mismatch(agent: &str, served: Option<&str>) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_served_model_mismatch",
+        seat_served_model_mismatch_props(agent, served, tag.as_deref()),
+    );
+}
+
+/// The writer surfaces and outcomes tv_seat_writer_run reports.
+const WRITER_SURFACES: &[&str] = &["abe_dispatch", "fleet_spawn", "fleet_temporal"];
+const WRITER_OUTCOMES: &[&str] = &[
+    "committed",
+    "no_changes",
+    "escaped",
+    "timeout",
+    "killed",
+    "failed",
+];
+
+/// `tv_seat_writer_run` properties.
+pub fn seat_writer_run_props(
+    agent: &str,
+    surface: &str,
+    outcome: &str,
+    files_changed: u64,
+    duration_ms: u64,
+    run_tag: Option<&str>,
+) -> serde_json::Value {
+    seat_event_props(
+        agent,
+        json!({
+            "tv_surface":       bounded(surface, WRITER_SURFACES),
+            "tv_outcome":       bounded(outcome, WRITER_OUTCOMES),
+            "tv_files_changed": files_changed,
+            "tv_duration_ms":   duration_ms,
+        }),
+        run_tag,
+    )
+}
+
+/// Emit `tv_seat_writer_run`: one `triumvirate seat-run` exit.
+pub fn record_seat_writer_run(
+    agent: &str,
+    surface: &str,
+    outcome: &str,
+    files_changed: u64,
+    duration_ms: u64,
+) {
+    let tag = run_tag();
+    capture(
+        "tv_seat_writer_run",
+        seat_writer_run_props(
+            agent,
+            surface,
+            outcome,
+            files_changed,
+            duration_ms,
+            tag.as_deref(),
+        ),
+    );
+}
+
+/// Events handed to the runtime and not yet finished (sent, failed or dropped unrun).
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One in-flight capture; decrements on drop, including when the runtime drops the task before it runs.
+struct InFlight;
+
+impl InFlight {
+    fn new() -> Self {
+        IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Wait until every captured event has been sent (or failed), at most `limit`. For short-lived commands
+/// (`seat-run`, `doctor --live`) whose runtime would otherwise drop the fire-and-forget POSTs at exit.
+pub async fn flush(limit: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+type Recorded = Vec<(String, serde_json::Value)>;
+
+thread_local! {
+    /// The P-1 recording seam: Some while a RecordingGuard lives on this thread.
+    static RECORDER: std::cell::RefCell<Option<Recorded>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, every event captured on this thread is also recorded as `(event, properties)`. Thread-local, so
+/// parallel tests never see each other's events; it records whether or not PostHog is configured, and the HTTP
+/// send still requires POSTHOG_HOST and POSTHOG_API_KEY. Unused, it changes nothing.
+pub struct RecordingGuard {
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+/// Start recording on this thread. Nesting is not supported: a second start on the same thread panics.
+pub fn start_recording() -> RecordingGuard {
+    RECORDER.with(|r| {
+        let mut r = r.borrow_mut();
+        assert!(
+            r.is_none(),
+            "posthog recording is already started on this thread"
+        );
+        *r = Some(Vec::new());
+    });
+    RecordingGuard {
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+impl RecordingGuard {
+    /// Every `(event, properties)` recorded so far.
+    pub fn events(&self) -> Recorded {
+        RECORDER.with(|r| r.borrow().clone().unwrap_or_default())
+    }
+
+    /// The recorded events with this name, properties only.
+    pub fn named(&self, event: &str) -> Vec<serde_json::Value> {
+        self.events()
+            .into_iter()
+            .filter(|(e, _)| e == event)
+            .map(|(_, p)| p)
+            .collect()
+    }
+}
+
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        let _ = RECORDER.try_with(|r| *r.borrow_mut() = None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2236,5 +2822,295 @@ mod tests {
             (Some("qwen3-coder-plus"), Some("glm-5"))
         );
         tel.rejected("test: no emit expected to matter");
+    }
+}
+
+#[cfg(test)]
+mod seat_event_tests {
+    //! Seven Primes P-1: the pure property builders and the recording seam. The call sites are driven in the
+    //! triumvirate, mcp-tools and seat_gate tests.
+    use super::*;
+    use crate::seat_gate::RefusalCode;
+    use crate::seat_profile::Surface;
+    use shared_types::Origin;
+
+    const UPPER: &str = "ZQX-LEAK-7731";
+    const LOWER: &str = "customer_secret_zqx";
+
+    fn no_sentinel(props: &serde_json::Value) {
+        let text = props.to_string();
+        assert!(
+            !text.contains(UPPER) && !text.contains(LOWER),
+            "a sentinel reached the properties: {text}"
+        );
+    }
+
+    /// Every builder returns exactly its documented property set, with tv_run_tag only when a tag is given.
+    /// RED IF: a builder adds, drops or renames a property, or reports a value outside its vocabulary.
+    #[test]
+    fn each_builder_has_exactly_its_documented_properties() {
+        let kimi = || json!({"tv_agent": "kimi", "tv_agent_display": "Kimi"});
+        let with = |extra: serde_json::Value| {
+            let mut p = kimi();
+            p.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            p
+        };
+        assert_eq!(
+            seat_gate_refused_props(
+                "kimi",
+                RefusalCode::SeatSurfaceDeferred,
+                Surface::Prewarm,
+                Origin::Unattended,
+                None
+            ),
+            with(
+                json!({"tv_refusal_code": "seat_surface_deferred", "tv_surface": "prewarm", "tv_origin": "unattended"})
+            )
+        );
+        assert_eq!(
+            seat_lock_wait_props("kimi", 1500, true, None),
+            with(json!({"tv_waited_ms": 1500, "tv_outcome": "acquired"}))
+        );
+        assert_eq!(
+            seat_lock_wait_props("kimi", 3, false, None),
+            with(json!({"tv_waited_ms": 3, "tv_outcome": "unavailable"}))
+        );
+        assert_eq!(
+            seat_quota_props("kimi", true, None),
+            with(json!({"tv_quota_signal": "http_429"}))
+        );
+        assert_eq!(
+            seat_quota_props("kimi", false, None),
+            with(json!({"tv_quota_signal": "quota_text"}))
+        );
+        assert_eq!(
+            seat_suspended_props("kimi", true, None),
+            with(json!({"tv_suspend_signal": "http_403"}))
+        );
+        assert_eq!(
+            seat_suspended_props("kimi", false, None),
+            with(json!({"tv_suspend_signal": "suspension_text"}))
+        );
+        assert_eq!(
+            seat_containment_props("kimi", "read_only_violation", 2, None),
+            with(json!({"tv_containment_code": "read_only_violation", "tv_paths_count": 2}))
+        );
+        assert_eq!(
+            seat_doctor_probe_props("kimi", None, "2.2.0", None, None),
+            with(
+                json!({"tv_outcome": "pass", "tv_code": null, "tv_cli_version": "2.2.0", "tv_served_model": null})
+            )
+        );
+        assert_eq!(
+            seat_doctor_probe_props("kimi", Some("nonzero_exit:kimi:1"), "other", None, None),
+            with(
+                json!({"tv_outcome": "fail", "tv_code": "nonzero_exit", "tv_cli_version": "other", "tv_served_model": null})
+            )
+        );
+        assert_eq!(
+            seat_session_props("kimi", "ready", None, None),
+            with(json!({"tv_session_event": "ready", "tv_reason_code": null}))
+        );
+        assert_eq!(
+            seat_served_model_mismatch_props("qwen", Some("glm-5"), None),
+            json!({"tv_agent": "qwen", "tv_agent_display": "Qwen", "tv_served_model": "other"})
+        );
+        assert_eq!(
+            seat_writer_run_props("kimi", "fleet_spawn", "committed", 1, 42, None),
+            with(
+                json!({"tv_surface": "fleet_spawn", "tv_outcome": "committed", "tv_files_changed": 1, "tv_duration_ms": 42})
+            )
+        );
+        assert_eq!(
+            seat_quota_props("kimi", true, Some("p1-run")),
+            with(json!({"tv_quota_signal": "http_429", "tv_run_tag": "p1-run"}))
+        );
+    }
+
+    /// The code, served-model, CLI-version, agent and run-tag vocabularies are closed.
+    /// RED IF: a code outside SEAT_CODES, an unlisted served model, an unpinned CLI version, an unknown agent or a
+    /// malformed run tag is reported verbatim.
+    #[test]
+    fn vocabularies_are_closed() {
+        for code in SEAT_CODES {
+            assert_eq!(seat_code(&format!("{code}:kimi: detail")), *code);
+            assert_eq!(seat_code(&format!("{code}: kimi")), *code);
+        }
+        assert_eq!(
+            seat_code("nonzero_exit:kimi:1 last_retry_status=429"),
+            "nonzero_exit"
+        );
+        for other in ["", "kimi connector timed out after 5s", "not_a_new_seat: x"] {
+            assert_eq!(seat_code(other), "other", "{other:?}");
+        }
+        assert_eq!(served_model_bucket(None), None);
+        for m in SERVED_MODELS {
+            assert_eq!(served_model_bucket(Some(m)), Some(*m));
+        }
+        assert_eq!(served_model_bucket(Some("qwen3-coder-plus")), Some("other"));
+        assert_eq!(cli_version_bucket(Some("2.2.0"), Some("2.2.0")), "2.2.0");
+        assert_eq!(cli_version_bucket(Some("2.2.1"), Some("2.2.0")), "other");
+        assert_eq!(cli_version_bucket(None, Some("2.2.0")), "other");
+        assert_eq!(cli_version_bucket(Some("2.2.0"), None), "other");
+        assert_eq!(valid_run_tag(Some("p1-live-01")), Some("p1-live-01"));
+        for bad in ["", "Upper", "has space", "a_b", &"x".repeat(33)] {
+            assert_eq!(valid_run_tag(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(
+            seat_quota_props("zzz-unknown", true, None)["tv_agent"],
+            "other"
+        );
+        assert_eq!(
+            seat_containment_props("kimi", "seat_quota_exhausted", 0, None)["tv_containment_code"],
+            "other"
+        );
+        assert_eq!(
+            seat_session_props("kimi", "exploded", None, None)["tv_session_event"],
+            "other"
+        );
+        assert_eq!(
+            seat_writer_run_props("kimi", "ask_agent", "rolled", 0, 0, None)["tv_surface"],
+            "other"
+        );
+    }
+
+    /// Both sentinels, as an agent name, an error's leading token, a served model, a code, a surface and an outcome,
+    /// come out as `other` and never appear in any builder's properties.
+    /// RED IF: any builder passes caller text through.
+    #[test]
+    fn sentinels_never_reach_properties() {
+        for s in [UPPER, LOWER] {
+            let err = format!("{s}: boom {s}");
+            assert_eq!(seat_code(&err), "other");
+            assert_eq!(served_model_bucket(Some(s)), Some("other"));
+            let all = [
+                seat_gate_refused_props(
+                    s,
+                    RefusalCode::SeatNotConfigured,
+                    Surface::AskAgent,
+                    Origin::Interactive,
+                    None,
+                ),
+                seat_lock_wait_props(s, 1, false, None),
+                seat_quota_props(s, false, None),
+                seat_suspended_props(s, false, None),
+                seat_containment_props(s, s, 1, None),
+                seat_doctor_probe_props(s, Some(&err), "other", served_model_bucket(Some(s)), None),
+                seat_session_props(s, s, Some(&err), None),
+                seat_served_model_mismatch_props(s, Some(s), None),
+                seat_writer_run_props(s, s, s, 0, 0, None),
+                seat_quota_props("kimi", true, valid_run_tag(Some(s))),
+            ];
+            for props in &all {
+                no_sentinel(props);
+            }
+            assert_eq!(all[7]["tv_served_model"], "other");
+            assert_eq!(all[5]["tv_code"], "other");
+            assert_eq!(all[6]["tv_reason_code"], "other");
+        }
+    }
+
+    /// Each publish shape maps to its documented (tv_session_event, tv_reason_code).
+    /// RED IF: a publish reports the wrong event or code, or a Ready session's ordinary failed turn reports anything.
+    #[test]
+    fn session_publish_shapes() {
+        assert_eq!(
+            session_publish_event(SessionPublish::Conflict),
+            Some(("generation_conflict", Some("session_generation_conflict")))
+        );
+        assert_eq!(
+            session_publish_event(SessionPublish::NotResumable("missing_session_id:kimi")),
+            Some(("broken", Some("missing_session_id")))
+        );
+        let applied = |was_ready, now_broken, turn_error| SessionPublish::Applied {
+            was_ready,
+            now_broken,
+            turn_error,
+        };
+        assert_eq!(
+            session_publish_event(applied(true, true, Some("session not found"))),
+            Some(("broken", Some("vendor_rejected_session")))
+        );
+        assert_eq!(
+            session_publish_event(applied(false, true, Some("nonzero_exit:kimi:1"))),
+            Some(("broken", Some("nonzero_exit")))
+        );
+        assert_eq!(
+            session_publish_event(applied(false, true, Some(LOWER))),
+            Some(("broken", Some("other")))
+        );
+        assert_eq!(
+            session_publish_event(applied(false, false, None)),
+            Some(("ready", None))
+        );
+        assert_eq!(
+            session_publish_event(applied(true, false, None)),
+            Some(("ready", None))
+        );
+        assert_eq!(
+            session_publish_event(applied(true, false, Some("rate limited"))),
+            None
+        );
+    }
+
+    /// The seam records on its own thread only, with PostHog unconfigured, and stops when the guard drops.
+    /// RED IF: recording needs POSTHOG_HOST, leaks across threads, or outlives its guard.
+    #[test]
+    fn recording_is_thread_local_and_scoped() {
+        {
+            let rec = start_recording();
+            record_seat_quota("kimi", true);
+            std::thread::spawn(|| record_seat_quota("mistral", false))
+                .join()
+                .unwrap();
+            let events = rec.events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].0, "tv_seat_quota");
+            assert_eq!(events[0].1["tv_agent"], "kimi");
+            assert_eq!(rec.named("tv_seat_quota").len(), 1);
+        }
+        record_seat_quota("kimi", true);
+        let rec = start_recording();
+        assert!(
+            rec.events().is_empty(),
+            "the previous guard stopped recording"
+        );
+    }
+
+    /// RED IF: a second start on one thread silently replaces the first recorder.
+    #[test]
+    #[should_panic(expected = "already started")]
+    fn nested_recording_panics() {
+        let _a = start_recording();
+        let _b = start_recording();
+    }
+
+    /// The lock event: below the threshold an acquisition is silent; at or above it, and on every failure, it emits.
+    /// RED IF: every acquisition is reported (event volume tracks traffic) or a failure is ever silent.
+    #[test]
+    fn lock_wait_threshold() {
+        let rec = start_recording();
+        record_seat_lock_wait("kimi", 5, true);
+        record_seat_lock_wait("kimi", 5, false);
+        record_seat_lock_wait("kimi", 1000, true);
+        let got: Vec<(u64, String)> = rec
+            .named("tv_seat_lock_wait")
+            .iter()
+            .map(|p| {
+                (
+                    p["tv_waited_ms"].as_u64().unwrap(),
+                    p["tv_outcome"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (5, "unavailable".to_string()),
+                (1000, "acquired".to_string())
+            ]
+        );
     }
 }

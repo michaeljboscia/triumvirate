@@ -158,10 +158,10 @@ pub(crate) fn is_exporter_self_telemetry(target: &str) -> bool {
 }
 
 fn should_write_logs_to_stderr() -> bool {
-    // Keep MCP/proxy stdout reserved for JSON-RPC frames only.
+    // Keep MCP/proxy stdout reserved for JSON-RPC frames only, and seat-run's stdout for the vendor child's (W-1).
     matches!(
         std::env::args().nth(1).as_deref(),
-        Some("mcp") | Some("proxy")
+        Some("mcp") | Some("proxy") | Some("seat-run")
     )
 }
 

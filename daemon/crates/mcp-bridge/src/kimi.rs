@@ -4,13 +4,16 @@
 //! The builder only shapes argv. It never spawns (T-205), never writes the seat home (T-104 writes ro-agent.md), and
 //! leaves the env scrub to `containment::child_env`.
 
-use crate::containment::{SeatInvocation, SeatRequest};
+use crate::containment::{SeatInvocation, SeatMode, SeatRequest};
 
 /// The binary name. research/01: "Binary name is still `kimi`."
 pub const KIMI_PROGRAM: &str = "kimi";
 
 /// The read-only agent file inside the seat home, written by T-104 (BACKEND_STRUCTURE section 5).
 pub const RO_AGENT_FILE: &str = "ro-agent.md";
+
+/// The writer agent file inside the seat home (W-1), written next to ro-agent.md by `containment::write_seat_files`.
+pub const RW_AGENT_FILE: &str = "rw-agent.md";
 
 /// The prompt travels in argv (`-p <prompt>`), capped at 64 KiB of prompt text (REQ-024, `PromptTransport::ArgvMax64KiB`).
 pub const KIMI_PROMPT_LIMIT_BYTES: usize = 65_536;
@@ -44,6 +47,9 @@ pub const KIMI_FORBIDDEN_EXTRA_ARGS: &[&str] = &[
 /// Resume: `kimi -p <p> --output-format stream-json --session <id> [-m <model>] [extra...]`, with no `--agent-file`,
 /// because research/01 says `--agent`/`--agent-file` "cannot combine with `--session`" and the resumed session restores
 /// its bound agent. There is no `--work-dir` flag in 2.2.0, so the runner sets the cwd (research/01).
+///
+/// Writer (W-1): the same argv with `--agent-file <seat_home>/rw-agent.md` (file tools, no shell), live-proven per
+/// WRITER_SEATS_PLAN.md "Live writer probes".
 pub fn build_kimi_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, String> {
     let prompt_bytes = req.prompt.len();
     if prompt_bytes > KIMI_PROMPT_LIMIT_BYTES {
@@ -70,9 +76,13 @@ pub fn build_kimi_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, St
         }
         None => {
             args.push("--agent-file".to_string());
+            let agent_file = match req.mode {
+                SeatMode::ReadOnly => RO_AGENT_FILE,
+                SeatMode::Writer => RW_AGENT_FILE,
+            };
             args.push(
                 req.seat_home
-                    .join(RO_AGENT_FILE)
+                    .join(agent_file)
                     .to_string_lossy()
                     .into_owned(),
             );
@@ -123,6 +133,7 @@ mod tests {
             extra_args: extra,
             max_turns: 8,
             time_limit: Duration::from_secs(60),
+            mode: SeatMode::ReadOnly,
         }
     }
 
@@ -205,5 +216,41 @@ mod tests {
         );
         let at_limit = "x".repeat(KIMI_PROMPT_LIMIT_BYTES);
         assert!(build_kimi_invocation(&req(&at_limit, None, &[], None)).is_ok());
+    }
+
+    /// RED IF: the writer argv drifts from the live-proven mode (rw-agent.md instead of ro-agent.md, everything else
+    /// as read-only), or the read-only argv picks up the writer agent file.
+    #[test]
+    fn writer_argv_uses_rw_agent_file() {
+        let mut r = req("write it", None, &[], Some("kimi-code/kimi-for-coding"));
+        r.mode = SeatMode::Writer;
+        let inv = build_kimi_invocation(&r).expect("builds");
+        assert_eq!(inv.program, "kimi");
+        assert_eq!(
+            inv.args,
+            [
+                "-p",
+                "write it",
+                "--output-format",
+                "stream-json",
+                "--agent-file",
+                "/th/homes/kimi/rw-agent.md",
+                "-m",
+                "kimi-code/kimi-for-coding"
+            ]
+        );
+        let ro = build_kimi_invocation(&req(
+            "write it",
+            None,
+            &[],
+            Some("kimi-code/kimi-for-coding"),
+        ))
+        .expect("builds");
+        assert!(has_pair(
+            &ro.args,
+            "--agent-file",
+            "/th/homes/kimi/ro-agent.md"
+        ));
+        assert!(!ro.args.iter().any(|a| a.contains("rw-agent")));
     }
 }

@@ -10,7 +10,16 @@ use std::time::Duration;
 
 use crate::seat_profile::SeatProfile;
 
-/// One read-only dispatch to a new seat, as the per-seat builders (kimi.rs, mistral.rs, qwen.rs) receive it.
+/// Which argv a per-seat builder emits (Seven Primes W-1). `ReadOnly` is every ask, session, jury and doctor call;
+/// `Writer` is only `triumvirate seat-run` (ABE and fleet), which runs the seat in a worktree under the writer seatbelt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SeatMode {
+    #[default]
+    ReadOnly,
+    Writer,
+}
+
+/// One dispatch to a new seat, as the per-seat builders (kimi.rs, mistral.rs, qwen.rs) receive it.
 #[derive(Debug, Clone)]
 pub struct SeatRequest<'a> {
     pub prompt: &'a str,
@@ -27,6 +36,8 @@ pub struct SeatRequest<'a> {
     pub extra_args: &'a [String],
     pub max_turns: u32,
     pub time_limit: Duration,
+    /// Read-only (the default) or writer argv (W-1).
+    pub mode: SeatMode,
 }
 
 /// What a builder returns: the program, its argv, and the env changes the runner applies on top of the scrubbed env.
@@ -96,7 +107,11 @@ pub fn seat_home(triumvirate_home: &Path, seat: &str) -> Result<PathBuf, String>
 /// \"description\"").
 const KIMI_RO_AGENT: &str = "---\nname: triumvirate-readonly\ndescription: Read-only reviewer that answers questions and never writes files.\ntools: [Read, Grep, Glob]\ndisallowedTools: [Agent, AgentSwarm]\nsubagents: []\n---\nRead-only reviewer: never write files.\n";
 
-/// Write the daemon-owned files into a seat home: Kimi ro-agent.md (0444), Qwen settings.json, Mistral config.toml.
+/// Kimi's writer agent file (W-1, live-proven on Kimi Code 2.2.0 per WRITER_SEATS_PLAN.md "Live writer probes": it
+/// wrote a file and refused a shell command). File tools only; no shell, so `seat-run` commits on the seat's behalf.
+const KIMI_RW_AGENT: &str = "---\nname: triumvirate-writer\ndescription: Writer that edits files inside its working directory only.\ntools: [Read, Grep, Glob, Write, Edit]\ndisallowedTools: [Agent, AgentSwarm, Bash, Shell]\nsubagents: []\n---\nWriter: edit files inside the current directory only; never run shell commands.\n";
+
+/// Write the daemon-owned files into a seat home: Kimi ro-agent.md and rw-agent.md (0444), Qwen settings.json, Mistral config.toml.
 ///
 /// Qwen and Mistral files are MERGED, not replaced: only the daemon's own keys are set, so anything the CLI recorded
 /// at login survives. Kimi's ro-agent.md is wholly the daemon's and is rewritten.
@@ -110,7 +125,10 @@ pub fn write_seat_files(seat_home: &Path, profile: &SeatProfile) -> Result<(), S
         .map_err(|e| format!("containment: cannot create {}: {e}", seat_home.display()))?;
     check_seat_home_dir(seat_home)?;
     match profile.key {
-        "kimi" => write_readonly(&seat_home.join(crate::kimi::RO_AGENT_FILE), KIMI_RO_AGENT),
+        "kimi" => {
+            write_readonly(&seat_home.join(crate::kimi::RO_AGENT_FILE), KIMI_RO_AGENT)?;
+            write_readonly(&seat_home.join(crate::kimi::RW_AGENT_FILE), KIMI_RW_AGENT)
+        }
         "qwen" => {
             let path = seat_home.join("settings.json");
             // Only a missing file starts empty; any other read failure stops, so a file the daemon cannot read is
@@ -410,6 +428,33 @@ pub fn render_seatbelt_profile(
     ))
 }
 
+/// The writer seatbelt (W-1): exactly the read-only profile plus one `(allow file-write* (subpath <worktree>))`, the
+/// worktree canonicalized. Nothing else: no git dir is writable by the vendor child, because `seat-run` commits after
+/// the child exits, outside the sandbox.
+pub fn render_writer_seatbelt_profile(
+    seat_home: &Path,
+    output_dir: &Path,
+    tmpdir: &Path,
+    worktree: &Path,
+) -> Result<String, String> {
+    let base = render_seatbelt_profile(seat_home, output_dir, tmpdir)?;
+    let real = std::fs::canonicalize(worktree).map_err(|e| {
+        format!(
+            "containment: cannot resolve worktree {}: {e}",
+            worktree.display()
+        )
+    })?;
+    let s = real
+        .to_str()
+        .ok_or_else(|| format!("containment: {} is not UTF-8", worktree.display()))?;
+    if s.contains('"') || s.contains('\\') || !s.starts_with('/') || s == "/" {
+        return Err(format!(
+            "containment: refusing to put {s:?} in a seatbelt profile"
+        ));
+    }
+    Ok(format!("{base}(allow file-write* (subpath \"{s}\"))\n"))
+}
+
 fn git(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>, String> {
     use std::io::Write;
     let mut child = std::process::Command::new("git")
@@ -603,6 +648,168 @@ pub fn snapshot_repo(cwd: &Path) -> Result<RepoSnapshot, String> {
         };
         entries.insert(path.clone(), format!("{xy}:{hash}"));
     }
+    Ok(RepoSnapshot { entries })
+}
+
+/// Where a linked worktree's git state lives (W-1): its git dir, the shared common dir, the main worktree (the parent
+/// repo's working tree) and the branch it has checked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeGitDirs {
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+    pub main_worktree: PathBuf,
+    /// `refs/heads/<branch>`, or `None` on a detached HEAD.
+    pub branch_ref: Option<String>,
+}
+
+/// Resolve `worktree`'s git dirs with `git rev-parse --git-dir --git-common-dir`. Refuses a worktree that is not a
+/// LINKED worktree of a non-bare repo: for the main checkout the parent repo and the work are the same tree, so the
+/// escape audit could not tell them apart.
+pub fn worktree_git_dirs(worktree: &Path) -> Result<WorktreeGitDirs, String> {
+    let out = git(
+        worktree,
+        &["rev-parse", "--git-dir", "--git-common-dir"],
+        None,
+    )?;
+    let text = String::from_utf8_lossy(&out);
+    let mut lines = text.lines();
+    let abs = |p: Option<&str>| -> Result<PathBuf, String> {
+        let p = p.ok_or_else(|| "containment: git rev-parse printed too little".to_string())?;
+        let path = Path::new(p);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            worktree.join(path)
+        };
+        std::fs::canonicalize(&joined)
+            .map_err(|e| format!("containment: cannot resolve {}: {e}", joined.display()))
+    };
+    let git_dir = abs(lines.next())?;
+    let common_dir = abs(lines.next())?;
+    if git_dir == common_dir {
+        return Err(format!(
+            "seat_requires_linked_worktree: {} is not a linked git worktree",
+            worktree.display()
+        ));
+    }
+    if common_dir.file_name().is_none_or(|n| n != ".git") {
+        return Err(format!(
+            "seat_requires_linked_worktree: {} has no main working tree (common dir {})",
+            worktree.display(),
+            common_dir.display()
+        ));
+    }
+    let main_worktree = common_dir
+        .parent()
+        .ok_or_else(|| format!("containment: {} has no parent", common_dir.display()))?
+        .to_path_buf();
+    let branch_ref = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|b| !b.is_empty());
+    Ok(WorktreeGitDirs {
+        git_dir,
+        common_dir,
+        main_worktree,
+        branch_ref,
+    })
+}
+
+/// Every regular file under `dir` (relative path -> hash marker) inserted with `prefix`; a missing dir adds nothing.
+fn add_tree(
+    entries: &mut std::collections::BTreeMap<String, String>,
+    prefix: &str,
+    dir: &Path,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for (rel, value) in snapshot_dir(dir)?.entries {
+        if keep(&rel) {
+            entries.insert(format!("{prefix}{rel}"), value);
+        }
+    }
+    Ok(())
+}
+
+/// One file's marker: its content hash, `absent`, `dir`, or `symlink:<target>`; with `stat_only`, `mtime:size`.
+fn file_marker(path: &Path, stat_only: bool) -> Result<String, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("absent".into()),
+        Err(e) => return Err(format!("containment: cannot stat {}: {e}", path.display())),
+    };
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(path)
+            .map_err(|e| format!("containment: cannot read link {}: {e}", path.display()))?;
+        return Ok(format!("symlink:{}", target.display()));
+    }
+    if meta.is_dir() {
+        return Ok("dir".into());
+    }
+    if stat_only {
+        use std::os::unix::fs::MetadataExt;
+        return Ok(format!(
+            "{}.{}:{}",
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.len()
+        ));
+    }
+    Ok(format!("file:{:016x}", hash_file(path, meta.len())?))
+}
+
+/// The git metadata a writer seat must never touch (W-1 audit items ii and iii): the worktree's `.git` entry, and in
+/// its git dir HEAD, index (mtime and size), refs/ and hooks/; in the common dir HEAD, config, hooks/ and refs/.
+///
+/// In the common dir, `refs/heads/*` is kept only for this worktree's own branch: sibling fleet members and ABE
+/// workers commit to their own branches in the same repo while this seat runs, so their refs move legitimately. The
+/// common dir's index belongs to the main worktree, whose content is audited by `snapshot_cwd` (item i), and a plain
+/// `git status` there may refresh it, so it is not compared.
+pub fn snapshot_git_metadata(
+    worktree: &Path,
+    dirs: &WorktreeGitDirs,
+) -> Result<RepoSnapshot, String> {
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "worktree:.git".into(),
+        file_marker(&worktree.join(".git"), false)?,
+    );
+    let g = &dirs.git_dir;
+    entries.insert("git-dir:HEAD".into(), file_marker(&g.join("HEAD"), false)?);
+    entries.insert("git-dir:index".into(), file_marker(&g.join("index"), true)?);
+    add_tree(&mut entries, "git-dir:refs/", &g.join("refs"), &|_| true)?;
+    add_tree(&mut entries, "git-dir:hooks/", &g.join("hooks"), &|_| true)?;
+    let c = &dirs.common_dir;
+    entries.insert(
+        "git-common:HEAD".into(),
+        file_marker(&c.join("HEAD"), false)?,
+    );
+    entries.insert(
+        "git-common:config".into(),
+        file_marker(&c.join("config"), false)?,
+    );
+    add_tree(&mut entries, "git-common:hooks/", &c.join("hooks"), &|_| {
+        true
+    })?;
+    let own = dirs.branch_ref.clone();
+    add_tree(
+        &mut entries,
+        "git-common:refs/",
+        &c.join("refs"),
+        &|rel| match rel.strip_prefix("heads/") {
+            Some(_) => own.as_deref() == Some(format!("refs/{rel}").as_str()),
+            None => true,
+        },
+    )?;
     Ok(RepoSnapshot { entries })
 }
 
@@ -972,5 +1179,49 @@ mod tests {
             .is_err()
         );
         assert!(seat_home(Path::new("/th"), "../etc").is_err());
+    }
+
+    /// RED IF: Kimi's rw-agent.md drifts from the live-proven writer agent (W-1) by one byte, gains a shell tool,
+    /// loses its 0444 mode, or is not written next to ro-agent.md.
+    #[test]
+    fn kimi_rw_agent_is_pinned() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let kimi = home.path().join("kimi");
+        write_seat_files(&kimi, &seat("kimi", "KIMI_CODE_HOME")).unwrap();
+        write_seat_files(&kimi, &seat("kimi", "KIMI_CODE_HOME")).unwrap();
+        let rw = kimi.join(crate::kimi::RW_AGENT_FILE);
+        assert_eq!(
+            std::fs::read_to_string(&rw).unwrap(),
+            "---\nname: triumvirate-writer\ndescription: Writer that edits files inside its working directory only.\n\
+             tools: [Read, Grep, Glob, Write, Edit]\ndisallowedTools: [Agent, AgentSwarm, Bash, Shell]\nsubagents: []\n\
+             ---\nWriter: edit files inside the current directory only; never run shell commands.\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&rw).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert!(kimi.join(crate::kimi::RO_AGENT_FILE).is_file());
+    }
+
+    /// RED IF: the writer profile differs from the read-only profile by anything but one allow line for the
+    /// canonical worktree, or accepts a worktree path that could break out of its string.
+    #[test]
+    fn writer_seatbelt_is_read_only_plus_the_worktree() {
+        let wt = tempfile::tempdir().unwrap();
+        let (h, o, t) = (
+            Path::new("/th/homes/kimi"),
+            Path::new("/th/out/1"),
+            Path::new("/th/tmp"),
+        );
+        let ro = render_seatbelt_profile(h, o, t).unwrap();
+        let w = render_writer_seatbelt_profile(h, o, t, wt.path()).unwrap();
+        let real = std::fs::canonicalize(wt.path()).unwrap();
+        assert_eq!(
+            w,
+            format!("{ro}(allow file-write* (subpath \"{}\"))\n", real.display())
+        );
+        assert!(!w.contains(".git"));
+        assert!(render_writer_seatbelt_profile(h, o, t, Path::new("/nonexistent-w1-dir")).is_err());
     }
 }

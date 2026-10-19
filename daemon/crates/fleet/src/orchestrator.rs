@@ -131,7 +131,8 @@ pub fn fleet_agent_command_on(
 ) -> anyhow::Result<(String, Vec<String>)> {
     use mcp_bridge::seat_gate::{Origin, seat_gate};
     seat_gate(agent, surface, Origin::Unattended, false).map_err(|r| anyhow::anyhow!(r.message))?;
-    fleet_agent_command_for_row(
+    fleet_agent_command_for_row_on(
+        surface,
         mcp_bridge::seat_profile::seat_profile(agent),
         agent,
         worktree_path,
@@ -141,7 +142,21 @@ pub fn fleet_agent_command_on(
 
 /// The row half of `fleet_agent_command_on`, taking the row so a test can hand it a mutated one. Each built arm's
 /// argv is exactly what the per-agent match built before T-204; the row decides WHETHER an arm may be used.
+/// (Production enters through `fleet_agent_command_on`, which names its surface; tests hand this a mutated row.)
+#[cfg_attr(not(test), allow(dead_code))]
 fn fleet_agent_command_for_row(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    agent: &str,
+    worktree_path: &Path,
+    task_prompt: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    fleet_agent_command_for_row_on(Surface::FleetSpawn, row, agent, worktree_path, task_prompt)
+}
+
+/// `fleet_agent_command_for_row` for a named fleet surface: the surface only reaches the new seats' `seat-run`
+/// argv (`--surface fleet` or `--surface fleet-temporal`), so seat-run gates on the engine that launched it.
+fn fleet_agent_command_for_row_on(
+    surface: Surface,
     row: Option<&mcp_bridge::seat_profile::SeatProfile>,
     agent: &str,
     worktree_path: &Path,
@@ -151,6 +166,35 @@ fn fleet_agent_command_for_row(
         anyhow::bail!("unsupported fleet agent: {agent}");
     }
     let (cmd, args): (String, Vec<String>) = match agent {
+        // Seven Primes W-1: a new seat is a writer through `triumvirate seat-run`, which owns its containment and
+        // commits on its behalf (none of the three runs a shell). The prompt goes to a file in the worktree, read and
+        // deleted by seat-run before the seat starts. The commit message is unique per member: each member's
+        // worktree directory is unique.
+        "kimi" | "mistral" | "qwen" => {
+            let surface_flag = if surface == Surface::FleetTemporal {
+                "fleet-temporal"
+            } else {
+                "fleet"
+            };
+            let dir_name = worktree_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "seat_requires_worktree:{agent}: {} has no directory name",
+                        worktree_path.display()
+                    )
+                })?;
+            mcp_bridge::seat_run::seat_run_command(
+                surface_flag,
+                agent,
+                worktree_path,
+                task_prompt,
+                &format!("fleet({agent}): {dir_name}"),
+                fleet_seat_run_timeout_secs(surface),
+            )
+            .map_err(anyhow::Error::msg)?
+        }
         // The SAME binary the consult path runs (TRIUMVIRATE_CODEX_BIN, else PATH). A bare
         // "codex" here let the launchd daemon's PATH pick /opt/homebrew/bin/codex 0.133.0 while
         // every consult ran the pinned ~/.local/bin/codex 0.154.0; the old CLI refused the
@@ -1661,6 +1705,19 @@ pub fn fleet_agy_timeout() -> std::time::Duration {
         .filter(|&s| s > 0)
         .map(std::time::Duration::from_secs)
         .unwrap_or(MEMBER_WALL_LIMIT - std::time::Duration::from_secs(300))
+}
+
+/// W-1: seat-run's `--timeout-secs` for a fleet member, strictly inside the bound the engine kills the member at, so
+/// seat-run always kills the vendor's group itself. The legacy engine bounds a non-agy member by
+/// `fleet_task_timeout()`; the Temporal engine by the `run_worker` activity's `MEMBER_WALL_LIMIT`, inside which
+/// `fleet_agy_timeout()` is the member budget (the smaller of the two is used, so an env override cannot pass it).
+pub fn fleet_seat_run_timeout_secs(surface: Surface) -> u64 {
+    let outer = if surface == Surface::FleetTemporal {
+        fleet_agy_timeout().min(MEMBER_WALL_LIMIT)
+    } else {
+        fleet_task_timeout()
+    };
+    mcp_bridge::seat_run::inner_timeout_secs(outer.as_secs())
 }
 
 /// Wall-clock bound for one non-agy fleet worker. `TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS`,
@@ -3983,7 +4040,8 @@ mod seven_primes_characterization_tests {
 #[cfg(test)]
 mod seven_primes_fleet_gate_tests {
     use super::{
-        Surface, fleet_agent_command, fleet_agent_command_for_row, fleet_agent_command_on,
+        Surface, fleet_agent_command_for_row, fleet_agent_command_on, fleet_seat_run_timeout_secs,
+        fleet_task_timeout,
     };
     use std::path::{Path, PathBuf};
 
@@ -4001,6 +4059,10 @@ mod seven_primes_fleet_gate_tests {
         "TRIUMVIRATE_GROK_BIN",
         "TRIUMVIRATE_CLAUDE_BIN",
         "TRIUMVIRATE_ENABLE_KIMI",
+        "TRIUMVIRATE_ENABLE_QWEN",
+        "TRIUMVIRATE_SELF_BIN",
+        "TRIUMVIRATE_FLEET_AGY_TIMEOUT_SECS",
+        "TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS",
         "TRIUMVIRATE_HOME",
     ];
 
@@ -4109,8 +4171,8 @@ mod seven_primes_fleet_gate_tests {
         assert!(fleet_agent_command_for_row(None, "codex", &wt, "p").is_err());
     }
 
-    /// The whole matrix on both fleet surfaces. Refused seats return the gate's exact payload (kimi unconfigured,
-    /// then enabled and verified, where it is deferred ON THAT SURFACE); permitted but unbuildable existing seats
+    /// The whole matrix on both fleet surfaces. Refused seats return the gate's exact payload (kimi unconfigured;
+    /// enabled and verified, kimi and qwen get the W-1 `seat-run` argv naming THAT SURFACE); permitted but unbuildable existing seats
     /// (claude, deepseek) are `unsupported fleet agent: <seat>`; and neither ever runs a mock. Every buildable seat
     /// (codex, gemini, grok) produces a command that, when run, runs ITS OWN mock and no other.
     /// RED IF: the builder stops gating, gates on the wrong surface, ignores the row, or routes a seat to another
@@ -4174,33 +4236,71 @@ mod seven_primes_fleet_gate_tests {
             }
             let _ = std::fs::remove_file(&marker);
         }
-        // kimi enabled and verified: the gate's surface rule names the engine's own surface.
+        // W-1 (A-16): kimi and qwen enabled and verified are writers through `triumvirate seat-run`, gated on the
+        // engine's own surface and naming it in `--surface`. The self binary is a path that is never executed here.
         // SAFETY: under env_lock(); restored by _restore.
-        unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") };
-        mcp_bridge::seat_state::write_verified(
-            &home,
-            "kimi",
-            &mcp_bridge::seat_state::VerifiedRecord {
-                cli_version: "t204-fleet".into(),
-                seat_home: "/x".into(),
-                probed_at: "t".into(),
-                served_model: None,
-            },
-        )
-        .unwrap();
-        mcp_bridge::seat_gate::register_installed_cli_version("kimi", "t204-fleet");
-        assert_eq!(
-            fleet_agent_command("kimi", &wt, "p")
-                .unwrap_err()
-                .to_string(),
-            "seat_surface_deferred: kimi on FleetSpawn ships in v1.1"
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1");
+            std::env::set_var("TRIUMVIRATE_ENABLE_QWEN", "1");
+            std::env::set_var("TRIUMVIRATE_SELF_BIN", "/nonexistent/w1-triumvirate");
+            std::env::set_var("TRIUMVIRATE_FLEET_AGY_TIMEOUT_SECS", "7000");
+            std::env::set_var("TRIUMVIRATE_FLEET_TASK_TIMEOUT_SECS", "900");
+        }
+        // Inner strictly inside each engine's outer kill bound (legacy: the task timeout; Temporal: agy's budget
+        // inside MEMBER_WALL_LIMIT).
+        assert_eq!(fleet_seat_run_timeout_secs(Surface::FleetSpawn), 840);
+        assert_eq!(fleet_seat_run_timeout_secs(Surface::FleetTemporal), 6940);
+        assert!(fleet_seat_run_timeout_secs(Surface::FleetSpawn) < fleet_task_timeout().as_secs());
+        assert!(
+            fleet_seat_run_timeout_secs(Surface::FleetTemporal)
+                < super::MEMBER_WALL_LIMIT.as_secs()
         );
-        assert_eq!(
-            fleet_agent_command_on(Surface::FleetTemporal, "kimi", &wt, "p")
-                .unwrap_err()
-                .to_string(),
-            "seat_surface_deferred: kimi on FleetTemporal ships in v1.1"
-        );
+        for seat in ["kimi", "qwen"] {
+            mcp_bridge::seat_state::write_verified(
+                &home,
+                seat,
+                &mcp_bridge::seat_state::VerifiedRecord {
+                    cli_version: "t204-fleet".into(),
+                    seat_home: "/x".into(),
+                    probed_at: "t".into(),
+                    served_model: None,
+                },
+            )
+            .unwrap();
+            mcp_bridge::seat_gate::register_installed_cli_version(seat, "t204-fleet");
+        }
+        let wt_name = wt.file_name().unwrap().to_string_lossy().into_owned();
+        for (surface, flag, seat) in [
+            (Surface::FleetSpawn, "fleet", "kimi"),
+            (Surface::FleetTemporal, "fleet-temporal", "kimi"),
+            (Surface::FleetSpawn, "fleet", "qwen"),
+        ] {
+            let (cmd, args) = fleet_agent_command_on(surface, seat, &wt, "W1-PROMPT")
+                .unwrap_or_else(|e| panic!("{seat} on {surface:?}: {e}"));
+            let prompt_file = wt.join(format!(".triumvirate/seat-prompt-{seat}.txt"));
+            assert_eq!(cmd, "/nonexistent/w1-triumvirate");
+            assert_eq!(
+                args,
+                [
+                    "seat-run".to_string(),
+                    "--seat".into(),
+                    seat.into(),
+                    "--surface".into(),
+                    flag.into(),
+                    "--worktree".into(),
+                    wt.to_string_lossy().into_owned(),
+                    "--prompt-file".into(),
+                    prompt_file.to_string_lossy().into_owned(),
+                    "--commit-message".into(),
+                    format!("fleet({seat}): {wt_name}"),
+                    "--timeout-secs".into(),
+                    fleet_seat_run_timeout_secs(surface).to_string(),
+                ],
+                "{seat} on {surface:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&prompt_file).unwrap(), "W1-PROMPT");
+            std::fs::remove_file(&prompt_file).unwrap();
+        }
         assert!(!marker.exists());
     }
 }

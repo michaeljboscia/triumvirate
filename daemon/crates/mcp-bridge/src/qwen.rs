@@ -1,7 +1,7 @@
 //! Qwen invocation builder (Seven Primes REQ-023, REQ-024, REQ-043). BACKEND_STRUCTURE.md section 6 holds the argv
 //! contract; research/03-qwen-code-contract.md holds the CLI behavior each flag relies on.
 
-use crate::containment::{SeatInvocation, SeatRequest};
+use crate::containment::{SeatInvocation, SeatMode, SeatRequest};
 
 /// The prompt limit (REQ-024): larger prompts are refused before spawning, never truncated.
 pub const MAX_PROMPT_BYTES: usize = 65536;
@@ -56,7 +56,14 @@ pub const FORBIDDEN_EXTRA_ARGS: &[&str] = &[
 /// breaker can trip, so the builder always strips it from the inherited env.
 pub const UNATTENDED_RETRY_ENV: &str = "QWEN_CODE_UNATTENDED_RETRY";
 
+/// The writer's denylist (W-1): the shell only. Live-proven with `--approval-mode yolo` (WRITER_SEATS_PLAN.md "Live
+/// writer probes": Qwen 0.25.2 wrote a file, no trustedFolders entry needed).
+pub const WRITER_EXCLUDED_TOOLS: &[&str] = &["run_shell_command"];
+
 /// The read-only argv for one dispatch. Errors carry a code first, for example `prompt_too_large_for_qwen`.
+///
+/// Writer (W-1): the same argv with `--approval-mode yolo` instead of `plan` and `--exclude-tools run_shell_command`;
+/// `--safe-mode`, `--auth-type openai` and the pinned model stay.
 pub fn build_qwen_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, String> {
     if req.prompt.len() > MAX_PROMPT_BYTES {
         return Err(format!(
@@ -76,6 +83,10 @@ pub fn build_qwen_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, St
     }
     // research/03 (headless.md:299): `--max-wall-time` takes `90`/`30s`/`5m`, minimum 1 second.
     let wall_secs = req.time_limit.as_secs().max(1);
+    let (approval, excluded) = match req.mode {
+        SeatMode::ReadOnly => ("plan", EXCLUDED_TOOLS),
+        SeatMode::Writer => ("yolo", WRITER_EXCLUDED_TOOLS),
+    };
     let mut args: Vec<String> = [
         "-p",
         req.prompt,
@@ -95,9 +106,9 @@ pub fn build_qwen_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, St
         &format!("{wall_secs}s"),
         // research/03 "Invocation": plan = "Read-only analysis only; shell not executed".
         "--approval-mode",
-        "plan",
+        approval,
         "--exclude-tools",
-        &EXCLUDED_TOOLS.join(","),
+        &excluded.join(","),
     ]
     .iter()
     .map(|s| s.to_string())
@@ -170,6 +181,7 @@ mod tests {
             extra_args: extra,
             max_turns: 12,
             time_limit: Duration::from_secs(600),
+            mode: SeatMode::ReadOnly,
         }
     }
 
@@ -353,5 +365,40 @@ mod tests {
                 format!("qwen_seat_served_non_qwen_model: {other}")
             );
         }
+    }
+
+    /// RED IF: the writer argv keeps `--approval-mode plan`, loses `--safe-mode`, `--auth-type openai` or the pinned
+    /// model, or excludes anything but the shell tool.
+    #[test]
+    fn writer_argv_is_yolo_without_shell() {
+        let mut r = req("write it", None, &[]);
+        r.mode = SeatMode::Writer;
+        let a = build_qwen_invocation(&r).unwrap().args;
+        assert_eq!(
+            a,
+            [
+                "-p",
+                "write it",
+                "--output-format",
+                "stream-json",
+                "--safe-mode",
+                "--auth-type",
+                "openai",
+                "-m",
+                DEFAULT_QWEN_MODEL,
+                "--max-session-turns",
+                "12",
+                "--max-wall-time",
+                "600s",
+                "--approval-mode",
+                "yolo",
+                "--exclude-tools",
+                "run_shell_command"
+            ]
+        );
+        assert!(
+            !a.windows(2)
+                .any(|w| w[0] == "--approval-mode" && w[1] == "plan")
+        );
     }
 }
