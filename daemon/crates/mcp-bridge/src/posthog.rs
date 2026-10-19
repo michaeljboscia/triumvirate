@@ -209,6 +209,11 @@ impl CallTelemetry {
         self.served_model = Some(model.to_string());
     }
 
+    /// The served model recorded so far (`tv_served_model`), so a caller's routing into `set_model` is testable.
+    pub fn served_model(&self) -> Option<&str> {
+        self.served_model.as_deref()
+    }
+
     /// Record which repo this call was made against, so cost and quota are sliceable by
     /// project. Stores the NAME only; the caller may pass a full path.
     pub fn set_repo(&mut self, repo: &str) {
@@ -411,9 +416,23 @@ fn billing_for_row(row: &crate::seat_profile::SeatProfile, model: Option<&str>) 
 /// Seven Primes T-202: the convention is the seat's `SeatProfile.prompt_usage`. A name with no row keeps the subset
 /// reading, which was this function's behavior for every non-deepseek name.
 fn normalize_prompt(agent: &str, input: u64, cached: u64) -> (u64, u64, u64) {
-    use crate::seat_profile::PromptUsage;
-    let usage = crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent))
-        .map_or(PromptUsage::CachedSubsetOfInput, |row| row.prompt_usage);
+    normalize_prompt_for_row(
+        crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent)),
+        input,
+        cached,
+    )
+}
+
+/// The row-taking half of `normalize_prompt`: the convention is `row.prompt_usage`, and no row reads as the subset.
+fn normalize_prompt_for_row(
+    row: Option<&crate::seat_profile::SeatProfile>,
+    input: u64,
+    cached: u64,
+) -> (u64, u64, u64) {
+    let usage = row.map_or(
+        crate::seat_profile::PromptUsage::CachedSubsetOfInput,
+        |row| row.prompt_usage,
+    );
     normalize_prompt_as(usage, input, cached)
 }
 
@@ -462,8 +481,14 @@ fn cost_usd(
 /// Map an agent to the provider PostHog expects in `$ai_provider`: the seat row's OpenRouter slug (D-022, A-7), or
 /// "unknown" for a name with no row, never the agent's own name.
 fn provider_for(agent: &str) -> &'static str {
-    crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent))
-        .map_or("unknown", |row| row.provider.as_str())
+    provider_for_row(crate::seat_profile::seat_profile(
+        &crate::normalize_agent_name(agent),
+    ))
+}
+
+/// The row-taking half of `provider_for`: the row's slug, or "unknown" with no row.
+fn provider_for_row(row: Option<&crate::seat_profile::SeatProfile>) -> &'static str {
+    row.map_or("unknown", |row| row.provider.as_str())
 }
 
 /// Emit a `$ai_generation` event. No-op unless POSTHOG_HOST and POSTHOG_API_KEY are both set.
@@ -1452,6 +1477,25 @@ fn ai_generation_props(g: &AiGeneration<'_>) -> serde_json::Value {
     // after the literal (like $ai_input below) so the column-aligned block above stays as its authors wrote it.
     props["tv_configured_model"] = json!(g.configured_model);
     props["tv_served_model"] = json!(g.served_model);
+    // Seven Primes REQ-041: a count the seat never reported is ABSENT from the event, never a 0 that a chart sums
+    // into the real totals; a reported zero is kept. Removed after the literal for the same reason as the model props.
+    if let Some(obj) = props.as_object_mut() {
+        let absent = [
+            ("$ai_input_tokens", g.input_tokens.is_none()),
+            ("$ai_output_tokens", g.output_tokens.is_none()),
+            ("tv_cached_tokens", g.cached_tokens.is_none()),
+            ("tv_thinking_tokens", g.thinking_tokens.is_none()),
+            (
+                "tv_total_tokens",
+                g.input_tokens.is_none() && g.output_tokens.is_none(),
+            ),
+        ];
+        for (key, is_absent) in absent {
+            if is_absent {
+                obj.remove(key);
+            }
+        }
+    }
     if let Some(s) = g.input {
         props["$ai_input"] = json!([{ "role": "user", "content": mask_and_cap_content(s) }]);
     }
@@ -2036,8 +2080,9 @@ mod tests {
             billing_for_row(&row, Some("deepseek-v4-pro")),
             Billing::Metered { .. }
         ));
+        assert_eq!(provider_for_row(Some(&row)), "moonshotai");
         row.provider = Provider::OpenAi;
-        assert_eq!(row.provider.as_str(), "openai");
+        assert_eq!(provider_for_row(Some(&row)), "openai");
         assert_eq!(
             normalize_prompt_as(PromptUsage::CachedDisjoint, 100, 40),
             (140, 40, 100)
@@ -2046,6 +2091,97 @@ mod tests {
             normalize_prompt_as(PromptUsage::CachedSubsetOfInput, 100, 40),
             (100, 40, 60)
         );
+    }
+
+    /// The provider consumer reads the row it is handed: a cloned kimi row with a different provider charts as that
+    /// provider, and no row is "unknown".
+    /// RED IF: provider_for_row returns a constant or a per-agent match instead of `row.provider`.
+    #[test]
+    fn provider_follows_a_mutated_row() {
+        use crate::seat_profile::{Provider, seat_profile};
+        let mut row = seat_profile("kimi").unwrap().clone();
+        assert_eq!(provider_for_row(Some(&row)), provider_for("kimi"));
+        for (provider, slug) in [
+            (Provider::Mistral, "mistralai"),
+            (Provider::XAi, "x-ai"),
+            (Provider::Alibaba, "qwen"),
+        ] {
+            row.provider = provider;
+            assert_eq!(provider_for_row(Some(&row)), slug);
+        }
+        assert_eq!(provider_for_row(None), "unknown");
+    }
+
+    /// The prompt convention consumer reads `prompt_usage` from the row it is handed, including CachedDisjoint.
+    /// RED IF: normalize_prompt_for_row ignores `row.prompt_usage` (a cloned subset row switched to CachedDisjoint
+    /// must price input as the miss count), or deepseek stops being disjoint through the live path.
+    #[test]
+    fn prompt_convention_follows_a_mutated_row() {
+        use crate::seat_profile::{PromptUsage, seat_profile};
+        let mut row = seat_profile("qwen").unwrap().clone();
+        assert_eq!(row.prompt_usage, PromptUsage::CachedSubsetOfInput);
+        assert_eq!(normalize_prompt_for_row(Some(&row), 100, 40), (100, 40, 60));
+        row.prompt_usage = PromptUsage::CachedDisjoint;
+        assert_eq!(
+            normalize_prompt_for_row(Some(&row), 100, 40),
+            (140, 40, 100)
+        );
+        let mut ds = seat_profile("deepseek").unwrap().clone();
+        assert_eq!(
+            normalize_prompt("deepseek", 100, 40),
+            normalize_prompt_for_row(Some(&ds), 100, 40)
+        );
+        assert_eq!(normalize_prompt("deepseek", 100, 40), (140, 40, 100));
+        ds.prompt_usage = PromptUsage::CachedSubsetOfInput;
+        assert_eq!(normalize_prompt_for_row(Some(&ds), 100, 40), (100, 40, 60));
+        assert_eq!(normalize_prompt_for_row(None, 100, 40), (100, 40, 60));
+    }
+
+    /// REQ-041 at the PostHog persistence boundary: a generation with no usage carries NO token numbers, while a
+    /// reported zero is recorded as 0.
+    /// RED IF: absent counts are written as 0 (`unwrap_or(0)` with no removal), or a reported zero is dropped.
+    #[test]
+    fn not_reported_usage_has_no_numbers_and_a_reported_zero_stays_zero() {
+        let token_keys = [
+            "$ai_input_tokens",
+            "$ai_output_tokens",
+            "tv_cached_tokens",
+            "tv_thinking_tokens",
+            "tv_total_tokens",
+        ];
+        let base = |n: Option<u64>| AiGeneration {
+            agent: "kimi",
+            model: None,
+            outcome: "success",
+            trace_id: "t",
+            input_tokens: n,
+            output_tokens: n,
+            cached_tokens: n,
+            thinking_tokens: n,
+            tool_calls: None,
+            duration_ms: 1,
+            cost_usd: Some(0.0),
+            billing: "subscription",
+            configured_model: None,
+            served_model: None,
+            backend: None,
+            attempts: 1,
+            repo: None,
+            input: None,
+            output: None,
+            error: None,
+        };
+        let absent = ai_generation_props(&base(None));
+        for key in token_keys {
+            assert!(
+                absent.get(key).is_none(),
+                "{key} must be absent when not reported: {absent}"
+            );
+        }
+        let zero = ai_generation_props(&base(Some(0)));
+        for key in token_keys {
+            assert_eq!(zero[key], 0, "{key}: a reported zero stays 0");
+        }
     }
 
     /// Seven Primes T-202 (REQ-043): configured and served model are recorded separately, and the served model is
