@@ -170,7 +170,7 @@ fn t103_req024_prompt_at_limit_accepted() {
 #[test]
 fn t103_req024_prompt_one_byte_over_refused() {
     let prompt = "a".repeat(MAX_PROMPT_BYTES + 1);
-    let err = build(&prompt, None, None, &[], 5, 120).err().expect("refused");
+    let err = build(&prompt, None, None, &[], 5, 120).expect_err("refused");
     assert!(
         err.starts_with("prompt_too_large_for_qwen"),
         "wrong code: {err}"
@@ -181,7 +181,7 @@ fn t103_req024_prompt_one_byte_over_refused() {
 #[test]
 fn t103_req024_65_kib_prompt_refused() {
     let prompt = "b".repeat(65 * 1024);
-    let err = build(&prompt, None, None, &[], 5, 120).err().expect("refused");
+    let err = build(&prompt, None, None, &[], 5, 120).expect_err("refused");
     assert!(
         err.starts_with("prompt_too_large_for_qwen"),
         "wrong code: {err}"
@@ -196,14 +196,14 @@ fn t103_req024_limit_counts_bytes_not_chars() {
     assert!(build(&at_limit, None, None, &[], 5, 120).is_ok());
 
     let over = format!("{at_limit}x");
-    let err = build(&over, None, None, &[], 5, 120).err().expect("refused");
+    let err = build(&over, None, None, &[], 5, 120).expect_err("refused");
     assert!(err.starts_with("prompt_too_large_for_qwen"), "wrong code: {err}");
 }
 
 // REQ-023 (scope): every forbidden extra arg is rejected by the builder.
 #[test]
 fn t103_req023_every_forbidden_extra_arg_rejected() {
-    for arg in FORBIDDEN_EXTRA_ARGS.iter().copied() {
+    for arg in FORBIDDEN_EXTRA_ARGS {
         let extra = vec![arg.to_string()];
         let res = build("hi", None, None, &extra, 5, 120);
         assert!(res.is_err(), "forbidden extra arg accepted: {arg}");
@@ -235,13 +235,13 @@ fn t103_req043_qwen_served_model_passes() {
 // REQ-043: a fixture answered by glm-5 returns the exact code and model name.
 #[test]
 fn t103_req043_glm5_served_model_fails_exact_code() {
-    let err = check_served_model("glm-5").err().expect("non-qwen refused");
+    let err = check_served_model("glm-5").expect_err("non-qwen refused");
     assert_eq!(err, "qwen_seat_served_non_qwen_model: glm-5");
 }
 
 // REQ-043: another lab's model (kimi-k2) is refused with the same code.
 #[test]
 fn t103_req043_other_lab_model_refused_exact_code() {
-    let err = check_served_model("kimi-k2").err().expect("non-qwen refused");
+    let err = check_served_model("kimi-k2").expect_err("non-qwen refused");
     assert_eq!(err, "qwen_seat_served_non_qwen_model: kimi-k2");
 }

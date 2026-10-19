@@ -339,7 +339,7 @@ fn test_should_not_mention_unattended_retry_in_args() {
 fn test_should_refuse_65_kib_prompt() {
     let d = dirs();
     let prompt = "a".repeat(65 * 1024);
-    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).err().expect("must refuse");
+    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).expect_err("must refuse");
     assert!(err.starts_with("prompt_too_large_for_qwen"), "got {err}");
 }
 
@@ -357,7 +357,7 @@ fn test_should_accept_exactly_64_kib_without_truncation() {
 fn test_should_refuse_one_byte_over_the_limit() {
     let d = dirs();
     let prompt = "c".repeat(MAX_PROMPT_BYTES + 1);
-    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).err().expect("must refuse");
+    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).expect_err("must refuse");
     assert!(err.starts_with("prompt_too_large_for_qwen"), "got {err}");
 }
 
@@ -368,7 +368,7 @@ fn test_should_count_bytes_not_chars_for_prompt_limit() {
     let prompt = "\u{e9}".repeat(MAX_PROMPT_BYTES / 2 + 1);
     assert!(prompt.chars().count() <= MAX_PROMPT_BYTES);
     assert!(prompt.len() > MAX_PROMPT_BYTES);
-    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).err().expect("must refuse");
+    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).expect_err("must refuse");
     assert!(err.starts_with("prompt_too_large_for_qwen"), "got {err}");
 }
 
@@ -497,7 +497,7 @@ fn test_should_require_qwen_prefix_not_substring() {
 // REQ-043: an empty served model fails loud.
 #[test]
 fn test_should_reject_empty_served_model() {
-    let e = check_served_model("").err().expect("empty must fail");
+    let e = check_served_model("").expect_err("empty must fail");
     assert!(e.starts_with("qwen_seat_served_non_qwen_model"), "got {e}");
 }
 
