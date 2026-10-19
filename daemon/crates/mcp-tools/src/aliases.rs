@@ -194,13 +194,15 @@ pub struct ReviewRequestLike {
 /// call to one fails loudly with "unsupported agent", never silently as another seat.
 pub fn daemon_target_agents() -> &'static [&'static str] {
     static TARGETS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    TARGETS.get_or_init(|| {
-        mcp_bridge::seat_profile::all_seats()
-            .iter()
-            .filter(|row| row.daemon_target)
-            .map(|row| row.key)
-            .collect()
-    })
+    TARGETS.get_or_init(|| daemon_targets_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `daemon_target_agents`: the keys of the rows with `daemon_target`, in row order.
+fn daemon_targets_from(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.daemon_target)
+        .map(|row| row.key)
+        .collect()
 }
 
 /// Map a `spawn_daemon` / `ask_daemon` target onto a canonical agent key.
@@ -743,6 +745,29 @@ mod seven_primes_characterization_tests {
             super::daemon_target_agents(),
             &["gemini", "codex", "grok", "kimi", "mistral", "qwen"]
         );
+    }
+
+    /// The daemon-target consumer reads `daemon_target` from the rows it is handed: flipping it on a cloned roster
+    /// removes kimi and adds deepseek.
+    /// RED IF: daemon targets are a literal list or ignore `row.daemon_target`.
+    #[test]
+    fn daemon_targets_follow_mutated_rows() {
+        let mut rows = mcp_bridge::seat_profile::all_seats().to_vec();
+        assert_eq!(
+            super::daemon_targets_from(&rows),
+            super::daemon_target_agents()
+        );
+        for row in &mut rows {
+            match row.key {
+                "kimi" => row.daemon_target = false,
+                "deepseek" => row.daemon_target = true,
+                _ => {}
+            }
+        }
+        let got = super::daemon_targets_from(&rows);
+        assert!(!got.contains(&"kimi"), "{got:?}");
+        assert!(got.contains(&"deepseek"), "{got:?}");
+        assert_eq!(got.len(), super::daemon_target_agents().len());
     }
 }
 

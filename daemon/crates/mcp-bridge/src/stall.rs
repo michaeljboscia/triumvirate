@@ -25,8 +25,14 @@ use std::time::Duration;
 /// Seven Primes T-202: the window is the seat's `SeatProfile.stall_window` (REQ-051; the new seats start at 780 s, the
 /// grok value). Aliases normalize first, so `agy` and `antigravity` get gemini's window. A name with no row has none.
 pub fn default_stall_window_secs(agent: &str) -> Option<u64> {
-    crate::seat_profile::seat_profile(&crate::normalize_agent_name(agent))
-        .and_then(|row| window_secs(row.stall_window))
+    stall_window_secs_for_row(crate::seat_profile::seat_profile(
+        &crate::normalize_agent_name(agent),
+    ))
+}
+
+/// The row-taking half of `default_stall_window_secs`: the ask-path window is `row.stall_window`; no row has none.
+fn stall_window_secs_for_row(row: Option<&crate::seat_profile::SeatProfile>) -> Option<u64> {
+    row.and_then(|row| window_secs(row.stall_window))
 }
 
 /// `Secs(n)` is `Some(n)`; `Disabled` is never stall-killed.
@@ -123,5 +129,25 @@ mod tests {
         assert_eq!(window_secs(StallWindow::Secs(781)), Some(781));
         assert_eq!(window_secs(StallWindow::Disabled), None);
         assert_eq!(default_stall_window_secs("not-a-seat"), None);
+    }
+
+    /// The ask consumer reads `stall_window` from the row it is handed: a cloned kimi row set to 781 s gives 781,
+    /// Disabled gives none, and changing only `fleet_stall_window` changes nothing on the ask path.
+    /// RED IF: the ask-path window is a constant, a per-agent match, or read from the fleet field.
+    #[test]
+    fn ask_window_follows_a_mutated_row() {
+        use crate::seat_profile::{StallWindow, seat_profile};
+        let mut row = seat_profile("kimi").unwrap().clone();
+        assert_eq!(
+            stall_window_secs_for_row(Some(&row)),
+            default_stall_window_secs("kimi")
+        );
+        row.stall_window = StallWindow::Secs(781);
+        assert_eq!(stall_window_secs_for_row(Some(&row)), Some(781));
+        row.fleet_stall_window = StallWindow::Secs(5);
+        assert_eq!(stall_window_secs_for_row(Some(&row)), Some(781));
+        row.stall_window = StallWindow::Disabled;
+        assert_eq!(stall_window_secs_for_row(Some(&row)), None);
+        assert_eq!(stall_window_secs_for_row(None), None);
     }
 }

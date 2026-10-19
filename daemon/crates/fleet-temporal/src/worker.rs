@@ -189,14 +189,24 @@ pub fn stall_window(agent: &str) -> Option<Duration> {
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         Some(v) => v,
-        None => match fleet::seat_profile::seat_profile(&shared_types::normalize_agent_name(agent))
-            .map(|row| row.fleet_stall_window)
-        {
-            Some(fleet::seat_profile::StallWindow::Secs(secs)) => secs,
-            Some(fleet::seat_profile::StallWindow::Disabled) | None => return None,
-        },
+        None => {
+            return fleet_window_for_row(fleet::seat_profile::seat_profile(
+                &shared_types::normalize_agent_name(agent),
+            ));
+        }
     };
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// The row-taking half of `stall_window` (no env override): the row's `fleet_stall_window`, none for Disabled, no
+/// row, or 0 s.
+fn fleet_window_for_row(row: Option<&fleet::seat_profile::SeatProfile>) -> Option<Duration> {
+    match row.map(|row| row.fleet_stall_window) {
+        Some(fleet::seat_profile::StallWindow::Secs(secs)) if secs > 0 => {
+            Some(Duration::from_secs(secs))
+        }
+        _ => None,
+    }
 }
 
 /// Bytes the member has written so far, stdout and stderr together.
@@ -359,5 +369,32 @@ mod stall_window_tests {
             };
             assert_eq!(stall_window(row.key), want, "{}", row.key);
         }
+    }
+
+    /// The fleet consumer reads `fleet_stall_window` from the row it is handed: a cloned kimi row (Disabled at launch)
+    /// set to 781 s gives 781 s, 0 s gives none, and changing only the ask-path `stall_window` changes nothing here.
+    /// RED IF: the fleet window is a constant, a per-agent match, or read from the ask-path field.
+    #[test]
+    fn fleet_window_follows_a_mutated_row() {
+        use fleet::seat_profile::{StallWindow, seat_profile};
+        let mut row = seat_profile("kimi").unwrap().clone();
+        assert_eq!(
+            super::fleet_window_for_row(Some(&row)),
+            stall_window("kimi")
+        );
+        assert_eq!(super::fleet_window_for_row(Some(&row)), None);
+        row.fleet_stall_window = StallWindow::Secs(781);
+        assert_eq!(
+            super::fleet_window_for_row(Some(&row)),
+            Some(Duration::from_secs(781))
+        );
+        row.stall_window = StallWindow::Secs(5);
+        assert_eq!(
+            super::fleet_window_for_row(Some(&row)),
+            Some(Duration::from_secs(781))
+        );
+        row.fleet_stall_window = StallWindow::Secs(0);
+        assert_eq!(super::fleet_window_for_row(Some(&row)), None);
+        assert_eq!(super::fleet_window_for_row(None), None);
     }
 }

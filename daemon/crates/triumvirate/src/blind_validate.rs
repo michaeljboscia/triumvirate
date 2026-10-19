@@ -184,6 +184,14 @@ pub async fn run_live(req: LiveBlindValidation) -> Result<BlindReport, String> {
     run_with_trees(&req, &validator_dir, &baseline_tree).await
 }
 
+/// Seven Primes T-202 (REQ-062): the keys of the rows with `can_write_test_file = false`, in row order.
+fn cannot_write_here_from(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| !row.can_write_test_file)
+        .map(|row| row.key)
+        .collect()
+}
+
 async fn run_with_trees(
     req: &LiveBlindValidation,
     validator_dir: &Path,
@@ -226,11 +234,7 @@ async fn run_with_trees(
     // a legitimate answer. Logged so an operator can see why their first choice was skipped.
     // Seven Primes T-202 (REQ-062): derived from SeatProfile rows with `can_write_test_file = false`. The three new
     // seats are read-only, so they join grok and deepseek.
-    let cannot_write_here: Vec<&str> = mcp_bridge::seat_profile::all_seats()
-        .iter()
-        .filter(|row| !row.can_write_test_file)
-        .map(|row| row.key)
-        .collect();
+    let cannot_write_here = cannot_write_here_from(mcp_bridge::seat_profile::all_seats());
     let requested = if req.roster.is_empty() {
         peer_review::default_reviewers()
     } else {
@@ -466,6 +470,28 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blind-validator exclusion reads `can_write_test_file` from the rows it is handed: flipping it on a cloned
+    /// roster lets kimi write and stops codex.
+    /// RED IF: the exclusion is a literal list or ignores `row.can_write_test_file`.
+    #[test]
+    fn cannot_write_here_follows_mutated_rows() {
+        let mut rows = mcp_bridge::seat_profile::all_seats().to_vec();
+        let live = cannot_write_here_from(&rows);
+        assert!(
+            live.contains(&"kimi") && !live.contains(&"codex"),
+            "{live:?}"
+        );
+        for row in &mut rows {
+            match row.key {
+                "kimi" => row.can_write_test_file = true,
+                "codex" => row.can_write_test_file = false,
+                _ => {}
+            }
+        }
+        let got = cannot_write_here_from(&rows);
+        assert!(!got.contains(&"kimi") && got.contains(&"codex"), "{got:?}");
+    }
 
     /// Every test here runs `cargo` or `git` through `Command::new`, which reads `PATH`.
     ///
@@ -792,6 +818,16 @@ mod tests {
                 // T-202: derived from the seat table (roster order); grok and deepseek are unchanged, and the three
                 // new read-only seats are added.
                 err.contains(r#"["deepseek", "grok", "kimi", "mistral", "qwen"] cannot here"#),
+                "{roster:?}: {err}"
+            );
+            // The message names exactly the seat rows that cannot write, built by the same filter.
+            let from_rows: Vec<&str> = mcp_bridge::seat_profile::all_seats()
+                .iter()
+                .filter(|row| !row.can_write_test_file)
+                .map(|row| row.key)
+                .collect();
+            assert!(
+                err.contains(&format!("{from_rows:?} cannot here")),
                 "{roster:?}: {err}"
             );
         }
