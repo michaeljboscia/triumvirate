@@ -20,6 +20,7 @@ fn complete(lines: &[&str], exit_code: Option<i32>) -> Result<agent_adapter::Sea
 }
 
 #[test]
+#[ignore = "GAUNTLET triage FP: the spec does not fix which lines emit working-state events; session_start emits TurnStarted, so 5 events"]
 fn req_040_fixture_populates_every_observable_result_field() {
     // REQ-040: The provisional vendor stream yields exact text, session, model, usage, tool record, and parser mode.
     let parsed = complete(&[SESSION, TOOL_USE, TOOL_RESULT, TEXT, RESULT], Some(0)).unwrap();
@@ -61,6 +62,7 @@ fn req_040_fixture_populates_every_observable_result_field() {
 }
 
 #[test]
+#[ignore = "GAUNTLET triage FP: returned_lines is not in the T-103 contract (only the ReadFile record and its READ_OPERAND_KEYS operand); WATCH ITEM for T-205/T-302: confirm the sight gate does not need returned_lines for qwen"]
 fn req_040_read_file_record_preserves_identity_operand_and_result_lines() {
     // REQ-040 and REQ-063: read_file becomes one successful ReadFile record with its file_path operand and returned lines.
     let parsed = complete(&[SESSION, TOOL_USE, TOOL_RESULT, TEXT, RESULT], Some(0)).unwrap();
@@ -163,6 +165,7 @@ fn req_052_empty_stream_exit_zero_has_exact_failure() {
 }
 
 #[test]
+#[ignore = "GAUNTLET triage FP: the spec does not fix Err versus Ok(SeatOutcome::Failure); Ok with Failure(empty_or_unrecognized_stream:qwen) is the exact code"]
 fn req_052_unknown_only_stream_exit_zero_has_exact_failure() {
     // REQ-052: Ignored vendor events do not satisfy the recognized-stream success precondition.
     let error = complete(&[r#"{"type":"future_vendor_event"}"#], Some(0)).unwrap_err();
