@@ -5,6 +5,10 @@
 //! mock named by TRIUMVIRATE_<SEAT>_BIN. A mock records its argv, its env and one line per spawn, then replays a
 //! fixture from agent-adapter/tests/fixtures. No real kimi, vibe or qwen can run, and no real credential is read:
 //! the Qwen key is a fake written into the tempdir seat home.
+//!
+//! T-206 adds the seatbelt wrap and the repo audit around every dispatch (REQ-031, REQ-035): on macOS each mock runs
+//! under the real `/usr/bin/sandbox-exec`, and each mock may source a per-seat `action` snippet (a write attempt, a
+//! read) in the dispatch cwd.
 
 use std::{
     collections::BTreeMap,
@@ -177,6 +181,7 @@ echo spawn >> "$D/count"
 : > "$D/argv"
 for a in "$@"; do printf '%s\n' "$a" >> "$D/argv"; done
 env > "$D/env"
+if [ -f "$D/action" ]; then . "$D/action"; fi
 prev=""
 for a in "$@"; do
   if [ "$prev" = --output-dir ] && [ -f "$D/export.json" ]; then cp "$D/export.json" "$a/export.json"; fi
@@ -206,6 +211,15 @@ exit "$(cat "$D/exit")"
                 let _ = fs::remove_file(&ex);
             }
         }
+    }
+
+    /// A shell snippet the mock sources after recording its argv and env, run in the dispatch cwd (T-206).
+    fn set_action(&self, seat: &str, script: &str) {
+        fs::write(self.mock_dir(seat).join("action"), script).unwrap();
+    }
+
+    fn mock_file(&self, seat: &str, name: &str) -> String {
+        fs::read_to_string(self.mock_dir(seat).join(name)).unwrap_or_default()
     }
 
     fn write_verified(&self, seat: &str) {
@@ -343,11 +357,16 @@ exit "$(cat "$D/exit")"
 
     /// POST /ask-agent: Ok(response json) or Err(error text).
     async fn ask(&self, seat: &str, message: &str) -> Result<Value, String> {
+        self.ask_in(seat, message, &self.cwd).await
+    }
+
+    /// POST /ask-agent with an explicit cwd.
+    async fn ask_in(&self, seat: &str, message: &str, cwd: &Path) -> Result<Value, String> {
         let token = fs::read_to_string(self.th.join("daemon.token")).expect("token");
         let resp = client()
             .post(format!("{}/ask-agent", self.base()))
             .bearer_auth(token.trim())
-            .json(&serde_json::json!({"agent": seat, "message": message, "cwd": self.cwd}))
+            .json(&serde_json::json!({"agent": seat, "message": message, "cwd": cwd}))
             .send()
             .await
             .expect("ask-agent");
@@ -805,4 +824,346 @@ async fn doctor_live_spawns_each_seat_and_writes_verified() {
         "served-model failure deletes it"
     );
     assert!(rig.th.join("seats/kimi/verified.json").exists());
+}
+
+// Seven Primes T-206: the seatbelt wrap and the repo audit around every new-seat dispatch.
+
+/// Run git in `repo` with a throwaway identity and no signing (HOME is the rig's, so no user config is read).
+fn git_in(repo: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .stdout(Stdio::null())
+        .status()
+        .expect("git must be on PATH")
+        .success();
+    assert!(ok, "git {args:?} in {}", repo.display());
+}
+
+/// `dir` becomes a git repo holding `files`, all committed.
+fn git_repo(dir: &Path, files: &[(&str, &str)]) {
+    fs::create_dir_all(dir).unwrap();
+    for (name, text) in files {
+        let path = dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    git_in(dir, &["init", "-q"]);
+    git_in(dir, &["add", "-A"]);
+    git_in(dir, &["commit", "-qm", "base"]);
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+}
+
+/// The hostile fixture copied into `dir` and committed there, so the fixture tree itself is never the cwd.
+fn hostile_repo(dir: &Path) {
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hostile-repo"),
+        dir,
+    );
+    git_repo(dir, &[]);
+}
+
+/// Every file under `dir` except `.git/` and `.triumvirate/`, with its bytes: the state a read-only call must leave
+/// untouched. `.triumvirate/` is the daemon's own ledger dir (ledger/src/store.rs), not the seat's.
+fn tree_bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == ".git" || entry.file_name() == ".triumvirate" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(entry.path());
+            } else {
+                out.insert(
+                    entry.path().strip_prefix(dir).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The mock tries to write pwned.txt into the cwd and records the attempt's exit status and stderr.
+const WRITE_PWNED: &str = r#"{ echo x > "$(pwd -P)/pwned.txt"; } 2> "$D/write_err"
+echo "write_exit=$?" > "$D/write_record"
+"#;
+
+/// Under the real seatbelt a mock's write into a repo outside every allowed root is refused: pwned.txt is absent, the
+/// mock's own record shows the write failed, and the call returns the mock's answer (nothing changed, so no
+/// violation). The repo lives under CARGO_TARGET_TMPDIR because the profile allows the system temp roots.
+/// RED IF: the seat runs unwrapped (pwned.txt exists and the call fails read_only_violation), the mock never ran
+/// (no write record), or a clean seatbelted call is reported as a violation.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn seatbelt_refuses_a_repo_write() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    let outside = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("target tmp");
+    let repo = fs::canonicalize(outside.path()).unwrap().join("repo");
+    for root in [
+        "/private/var/folders",
+        "/private/tmp",
+        "/var/folders",
+        "/tmp",
+    ] {
+        assert!(
+            !repo.starts_with(root),
+            "{} is seat-writable",
+            repo.display()
+        );
+    }
+    git_repo(&repo, &[("README.md", "hello\n")]);
+    rig.set_action("kimi", WRITE_PWNED);
+    rig.start_daemon().await;
+    let resp = rig
+        .ask_in("kimi", "review", &repo)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", rig.log_text()));
+    assert_eq!(resp["response"], fixture("kimi").0);
+    assert!(
+        !repo.join("pwned.txt").exists(),
+        "the seatbelt let the write through"
+    );
+    let record = rig.mock_file("kimi", "write_record");
+    assert!(
+        record.starts_with("write_exit=") && record.trim() != "write_exit=0",
+        "the mock's failed write is recorded: {record:?}"
+    );
+    let err = rig.mock_file("kimi", "write_err");
+    assert!(err.contains("not permitted"), "{err:?}");
+}
+
+/// Seatbelt bypass simulated: the repo sits under the system temp root, which the profile allows, so the mock's write
+/// lands. The audit catches it and the call fails `read_only_violation:<seat>: pwned.txt` for every seat; nothing is
+/// reverted.
+/// RED IF: the post-run audit is missing or ignores untracked files, or the seat's answer is returned anyway.
+#[tokio::test]
+async fn a_write_past_the_seatbelt_is_a_read_only_violation() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.start_daemon().await;
+    for seat in SEATS {
+        let repo = rig.root.join(format!("bypass-{seat}"));
+        git_repo(&repo, &[("README.md", "hello\n")]);
+        rig.set_action(seat, WRITE_PWNED);
+        let err = rig
+            .ask_in(seat, "review", &repo)
+            .await
+            .expect_err("a write is a violation");
+        assert!(
+            err.contains(&format!("read_only_violation:{seat}: pwned.txt;")),
+            "{seat}: {err}"
+        );
+        assert!(
+            repo.join("pwned.txt").exists(),
+            "{seat}: nothing is reverted"
+        );
+    }
+}
+
+/// Per seat, with the hostile fixture repo as the cwd, the call returns that seat mock's own answer (all three
+/// distinct), the argv carries the read-only controls (Kimi's agent file listing only Read, Grep, Glob; Qwen
+/// `--safe-mode` and `--auth-type openai`; Mistral no `--trust`), and no file in the repo changed.
+/// RED IF: a hostile project file changes what the runner launches, an answer is canned or crossed between seats, a
+/// read-only control drops, or the call writes into the repo.
+#[tokio::test]
+async fn hostile_repo_cwd_keeps_each_seat_read_only() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.start_daemon().await;
+    let mut answers = Vec::new();
+    for seat in SEATS {
+        let repo = rig.root.join(format!("hostile-{seat}"));
+        hostile_repo(&repo);
+        assert!(repo.join(".kimi-code/agents/coder.md").is_file());
+        let before = tree_bytes(&repo);
+        let resp = rig
+            .ask_in(seat, "review", &repo)
+            .await
+            .unwrap_or_else(|e| panic!("{seat}: {e}"));
+        assert_eq!(resp["response"], fixture(seat).0, "{seat}");
+        answers.push(resp["response"].as_str().unwrap().to_string());
+        let argv = rig.recorded_argv(seat);
+        let after = |flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .and_then(|i| argv.get(i + 1))
+                .cloned()
+        };
+        match seat {
+            "kimi" => {
+                let file = after("--agent-file").expect("--agent-file");
+                assert_eq!(PathBuf::from(&file), rig.th.join("homes/kimi/ro-agent.md"));
+                let text = fs::read_to_string(&file).unwrap();
+                assert!(text.contains("tools: [Read, Grep, Glob]"), "{text}");
+            }
+            "mistral" => assert!(!argv.iter().any(|a| a == "--trust"), "{argv:?}"),
+            _ => {
+                assert!(argv.iter().any(|a| a == "--safe-mode"), "{argv:?}");
+                assert_eq!(after("--auth-type").as_deref(), Some("openai"), "{argv:?}");
+            }
+        }
+        // The daemon's ledger (not the seat) adds `.triumvirate/` to the cwd's .gitignore on its first call there
+        // (ledger/src/init.rs ensure_triumvirate_gitignore); every other byte must be as it was.
+        let mut now = tree_bytes(&repo);
+        if !before.contains_key(Path::new(".gitignore"))
+            && now.get(Path::new(".gitignore")).map(Vec::as_slice)
+                == Some(b".triumvirate/\n".as_slice())
+        {
+            now.remove(Path::new(".gitignore"));
+        }
+        assert_eq!(now, before, "{seat}: a repo file changed");
+        assert!(!repo.join("pwned.txt").exists());
+    }
+    answers.sort();
+    answers.dedup();
+    assert_eq!(
+        answers.len(),
+        3,
+        "each seat answers with its own mock's answer"
+    );
+}
+
+/// A NEW gitignored path counts: a mock that creates `out/new.txt` in a repo whose .gitignore ignores `out/` fails
+/// the call `read_only_violation`.
+/// RED IF: the git-mode snapshot drops `--ignored=matching`, so writes into ignored paths are invisible.
+#[tokio::test]
+async fn a_new_gitignored_write_is_a_violation() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    let repo = rig.root.join("ignored");
+    git_repo(&repo, &[(".gitignore", "out/\n"), ("README.md", "hello\n")]);
+    rig.set_action("kimi", "mkdir -p out && echo x > out/new.txt\n");
+    rig.start_daemon().await;
+    let err = rig
+        .ask_in("kimi", "review", &repo)
+        .await
+        .expect_err("violation");
+    assert!(err.contains("read_only_violation:kimi: out/;"), "{err}");
+    assert!(repo.join("out/new.txt").is_file());
+}
+
+/// With MISTRAL_API_KEY set in the test process (and so in the daemon), the mistral mock's recorded env has HOME ==
+/// its seat home and no MISTRAL_API_KEY, through the seatbelt wrap on macOS.
+/// RED IF: the wrap drops the child env (HOME reverts) or the scrub is skipped.
+#[tokio::test]
+async fn the_wrapped_child_keeps_the_seat_env() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    // SAFETY: ENV_LOCK is held.
+    unsafe {
+        std::env::set_var("MISTRAL_API_KEY", fake_key("metered-"));
+    }
+    rig.start_daemon().await;
+    let result = rig.ask("mistral", "q").await;
+    // SAFETY: ENV_LOCK is held.
+    unsafe {
+        std::env::remove_var("MISTRAL_API_KEY");
+    }
+    result.unwrap_or_else(|e| panic!("{e}"));
+    let env = rig.recorded_env("mistral");
+    assert_eq!(
+        env.get("HOME").map(PathBuf::from),
+        Some(rig.th.join("homes/mistral"))
+    );
+    assert!(!env.contains_key("MISTRAL_API_KEY"), "{env:?}");
+}
+
+/// A clean read-only call (the mock cats a repo file and writes nothing) returns the mock's answer verbatim.
+/// RED IF: the runner reports `read_only_violation` (or any error) for a call that changed nothing.
+#[tokio::test]
+async fn a_clean_read_only_call_returns_the_answer() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    let repo = rig.root.join("clean");
+    git_repo(&repo, &[("README.md", "the readme\n")]);
+    rig.set_action("kimi", "cat README.md > \"$D/catted\"\n");
+    rig.start_daemon().await;
+    let resp = rig
+        .ask_in("kimi", "review", &repo)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(resp["response"], fixture("kimi").0);
+    assert_eq!(rig.mock_file("kimi", "catted"), "the readme\n");
+}
+
+/// A cwd that is not a git repo falls back to the walk: a written file is a `read_only_violation`.
+/// RED IF: a non-git cwd goes unaudited, or the walk misses a new file.
+#[tokio::test]
+async fn a_non_git_cwd_walk_detects_a_write() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    let dir = rig.root.join("plain");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    fs::write(dir.join("sub/a.txt"), "a\n").unwrap();
+    let not_a_repo = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !not_a_repo.success(),
+        "the test dir must not be inside a git repo"
+    );
+    rig.set_action("kimi", "echo x > sub/a.txt; echo y > pwned.txt\n");
+    rig.start_daemon().await;
+    let err = rig
+        .ask_in("kimi", "review", &dir)
+        .await
+        .expect_err("violation");
+    assert!(
+        err.contains("read_only_violation:kimi: pwned.txt, sub/a.txt;"),
+        "{err}"
+    );
+}
+
+/// A non-git cwd over the 10,000 entry cap fails `read_only_audit_unavailable:<seat>` and spawns nothing.
+/// RED IF: the cap is missing (an unbounded walk), a partial snapshot is used, or the seat spawns unaudited.
+#[tokio::test]
+async fn over_the_walk_cap_is_audit_unavailable_and_spawns_nothing() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    let dir = rig.root.join("huge");
+    fs::create_dir_all(&dir).unwrap();
+    for i in 0..10_001 {
+        fs::write(dir.join(format!("f{i}")), b"").unwrap();
+    }
+    rig.start_daemon().await;
+    let err = rig
+        .ask_in("kimi", "review", &dir)
+        .await
+        .expect_err("over the cap");
+    assert!(
+        err.contains("read_only_audit_unavailable:kimi: more than 10000 files;"),
+        "{err}"
+    );
+    assert_eq!(rig.spawns("kimi"), 0, "nothing spawned");
 }

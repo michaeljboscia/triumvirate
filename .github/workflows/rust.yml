@@ -102,6 +102,9 @@ jobs:
           workspaces: daemon
       - name: Seat containment tests (real sandbox-exec)
         run: cargo test -p mcp-bridge --test containment
+      # Seven Primes T-206: the new-seat runner under the real seatbelt (mock CLIs only, never a vendor binary).
+      - name: New-seat runner integration tests (real sandbox-exec)
+        run: cargo test -p triumvirate --test integration_seven_primes
 
   # Seven Primes T-000 (REQ-010): the security floor the local validator enforces per task, re-run on the PR head.
   # Only for the feature PR; T-301 adds the live-evidence step and widens the trigger. gitleaks comes from its release

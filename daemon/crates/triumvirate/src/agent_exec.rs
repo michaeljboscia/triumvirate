@@ -6664,136 +6664,212 @@ async fn run_new_seat_in(
     // REQ-034 marker: every new-seat dispatch is read-only, whatever the caller's flag said.
     tracing::info!("read_only_seat: {seat} (answers only, never edits)");
 
-    emit_working_event(
-        events_tx.as_ref(),
-        WorkingStateEvent {
-            agent: seat.to_string(),
-            state: WorkingState::TurnStarted,
-            detail: format!("{seat} process started"),
-            tool_name: None,
-            tool_args_json: None,
-            token_usage: None,
-            ts_ms: Some(core_unix_time_ms()),
-        },
-    );
-
-    let mut command = Command::new(bin);
-    command
-        .args(&invocation.args)
-        .current_dir(&invocation.cwd)
-        .env_clear()
-        .envs(child_env)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    configure_process_group(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn_failed:{seat}: {bin}: {e}"))?;
-    note_attempt_child(&child);
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("{seat} stdout missing"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("{seat} stderr missing"))?;
-    let stderr_task = tokio::spawn(async move {
-        let mut tail: VecDeque<String> = VecDeque::new();
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if tail.len() == 40 {
-                tail.pop_front();
-            }
-            tail.push_back(trimmed.to_string());
-        }
-        tail.into_iter().collect::<Vec<_>>().join("\n")
-    });
-
-    let mut reader = BufReader::new(stdout).lines();
-    let read = async {
-        while let Some(line) = reader.next_line().await? {
-            if let Some(event) = parser.parse_line(&line) {
-                emit_working_event(events_tx.as_ref(), event);
-            }
-        }
-        anyhow::Ok(())
-    };
-    let status = match timeout(timeout_duration, async {
-        read.await?;
-        Ok::<_, anyhow::Error>(child.wait().await?)
-    })
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            kill_process_group(&mut child);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            anyhow::bail!(
-                "{seat} connector timed out after {}s",
-                timeout_duration.as_secs()
-            );
-        }
-    };
-    let stderr_text = stderr_task.await.unwrap_or_default();
-
-    let seat_parsed = parser
-        .finish(status.code(), output_dir)
+    // T-206 (REQ-031): the seatbelt wraps the child. It is the PRIMARY write barrier; the repo audit below is the
+    // backstop. Resolved before the first snapshot, so a missing seatbelt spawns nothing.
+    let (program, program_args) = seatbelt_wrap(seat, bin, &invocation.args, seat_home, output_dir)
         .map_err(anyhow::Error::msg)?;
-    let served_model = seat_parsed.served_model.clone();
-    let mut parsed = seat_parsed.result;
-    match seat_parsed.outcome {
-        agent_adapter::SeatOutcome::Success => {}
-        agent_adapter::SeatOutcome::Partial(reason) => {
-            parsed.response_text = format!("{}\n\n[partial: {reason}]", parsed.response_text);
-        }
-        agent_adapter::SeatOutcome::Failure(code) => {
-            let tail = stderr_text
-                .lines()
-                .rev()
-                .take(3)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let said = if tail.is_empty() {
-                String::new()
-            } else {
-                format!("; {seat} said: {tail}")
-            };
-            match classify_new_seat_failure(&code, &stderr_text) {
-                NewSeatFailureClass::Suspended => {
-                    let reason = format!("403 from provider: {code}");
-                    if let Err(e) = mcp_bridge::seat_state::write_suspended(
-                        &mcp_bridge::seat_state::triumvirate_home().map_err(anyhow::Error::msg)?,
-                        seat,
-                        &reason,
-                    ) {
-                        tracing::error!(seat, error = %e, "could not write suspended.json");
+
+    // T-206 (REQ-035): snapshot the cwd before the child exists. An audit that cannot run fails the call unspawned.
+    let audit_cwd = invocation.cwd.clone();
+    let before = snapshot_cwd_off_runtime(audit_cwd.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("read_only_audit_unavailable:{seat}: {e}"))?;
+
+    let outcome: anyhow::Result<NewSeatAnswer> = async {
+        emit_working_event(
+            events_tx.as_ref(),
+            WorkingStateEvent {
+                agent: seat.to_string(),
+                state: WorkingState::TurnStarted,
+                detail: format!("{seat} process started"),
+                tool_name: None,
+                tool_args_json: None,
+                token_usage: None,
+                ts_ms: Some(core_unix_time_ms()),
+            },
+        );
+
+        let mut command = Command::new(&program);
+        command
+            .args(&program_args)
+            .current_dir(&invocation.cwd)
+            .env_clear()
+            .envs(child_env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        configure_process_group(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn_failed:{seat}: {bin}: {e}"))?;
+        note_attempt_child(&child);
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("{seat} stdout missing"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("{seat} stderr missing"))?;
+        let stderr_task = tokio::spawn(async move {
+            let mut tail: VecDeque<String> = VecDeque::new();
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if tail.len() == 40 {
+                    tail.pop_front();
+                }
+                tail.push_back(trimmed.to_string());
+            }
+            tail.into_iter().collect::<Vec<_>>().join("\n")
+        });
+
+        let mut reader = BufReader::new(stdout).lines();
+        let read = async {
+            while let Some(line) = reader.next_line().await? {
+                if let Some(event) = parser.parse_line(&line) {
+                    emit_working_event(events_tx.as_ref(), event);
+                }
+            }
+            anyhow::Ok(())
+        };
+        let status = match timeout(timeout_duration, async {
+            read.await?;
+            Ok::<_, anyhow::Error>(child.wait().await?)
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                kill_process_group(&mut child);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                anyhow::bail!(
+                    "{seat} connector timed out after {}s",
+                    timeout_duration.as_secs()
+                );
+            }
+        };
+        let stderr_text = stderr_task.await.unwrap_or_default();
+
+        let seat_parsed = parser
+            .finish(status.code(), output_dir)
+            .map_err(anyhow::Error::msg)?;
+        let served_model = seat_parsed.served_model.clone();
+        let mut parsed = seat_parsed.result;
+        match seat_parsed.outcome {
+            agent_adapter::SeatOutcome::Success => {}
+            agent_adapter::SeatOutcome::Partial(reason) => {
+                parsed.response_text = format!("{}\n\n[partial: {reason}]", parsed.response_text);
+            }
+            agent_adapter::SeatOutcome::Failure(code) => {
+                let tail = stderr_text
+                    .lines()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let said = if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {seat} said: {tail}")
+                };
+                match classify_new_seat_failure(&code, &stderr_text) {
+                    NewSeatFailureClass::Suspended => {
+                        let reason = format!("403 from provider: {code}");
+                        if let Err(e) = mcp_bridge::seat_state::write_suspended(
+                            &mcp_bridge::seat_state::triumvirate_home()
+                                .map_err(anyhow::Error::msg)?,
+                            seat,
+                            &reason,
+                        ) {
+                            tracing::error!(seat, error = %e, "could not write suspended.json");
+                        }
+                        anyhow::bail!("seat_suspended: {seat}: {reason}{said}");
                     }
-                    anyhow::bail!("seat_suspended: {seat}: {reason}{said}");
+                    NewSeatFailureClass::Quota => {
+                        trip_new_seat_breaker(seat);
+                        anyhow::bail!("seat_quota_exhausted:{seat}: {code}{said}");
+                    }
+                    NewSeatFailureClass::Other => anyhow::bail!("{code}{said}"),
                 }
-                NewSeatFailureClass::Quota => {
-                    trip_new_seat_breaker(seat);
-                    anyhow::bail!("seat_quota_exhausted:{seat}: {code}{said}");
-                }
-                NewSeatFailureClass::Other => anyhow::bail!("{code}{said}"),
             }
         }
+        Ok(NewSeatAnswer {
+            parsed,
+            served_model,
+        })
     }
-    Ok(NewSeatAnswer {
-        parsed,
-        served_model,
-    })
+    .await;
+
+    // After the child exits, whatever its outcome: any change in the cwd replaces the seat's answer (or its error).
+    // Nothing is reverted; the violation names the paths so the operator can look.
+    let after = snapshot_cwd_off_runtime(audit_cwd)
+        .await
+        .map_err(|e| anyhow::anyhow!("read_only_audit_unavailable:{seat}: {e}"))?;
+    let changed = mcp_bridge::containment::audit_repo(&before, &after)
+        .map_err(|e| anyhow::anyhow!("read_only_audit_unavailable:{seat}: {e}"))?;
+    if !changed.is_empty() {
+        anyhow::bail!("read_only_violation:{seat}: {}", changed.join(", "));
+    }
+    outcome
+}
+
+/// `containment::snapshot_cwd` on a blocking thread: it runs git or walks up to `WALK_CAP` files.
+async fn snapshot_cwd_off_runtime(
+    cwd: PathBuf,
+) -> Result<mcp_bridge::containment::RepoSnapshot, String> {
+    tokio::task::spawn_blocking(move || mcp_bridge::containment::snapshot_cwd(&cwd))
+        .await
+        .map_err(|e| format!("snapshot task failed: {e}"))?
+}
+
+/// The program and argv that run a new seat (T-206, REQ-031). On macOS: `/usr/bin/sandbox-exec -p <profile> <bin>
+/// <args>...`, the BACKEND_STRUCTURE section 5 profile rendered for this call's seat home, output dir and temp dir. A
+/// missing sandbox-exec is `seatbelt_unavailable:<seat>`; the seat never runs unwrapped on macOS.
+#[cfg(target_os = "macos")]
+fn seatbelt_wrap(
+    seat: &str,
+    bin: &str,
+    args: &[String],
+    seat_home: &Path,
+    output_dir: &Path,
+) -> Result<(String, Vec<String>), String> {
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+    if !Path::new(SANDBOX_EXEC).is_file() {
+        return Err(format!(
+            "seatbelt_unavailable:{seat}: {SANDBOX_EXEC} not found; refusing to run the seat unwrapped"
+        ));
+    }
+    let profile = mcp_bridge::containment::render_seatbelt_profile(
+        seat_home,
+        output_dir,
+        &std::env::temp_dir(),
+    )?;
+    let mut wrapped = vec!["-p".to_string(), profile, bin.to_string()];
+    wrapped.extend(args.iter().cloned());
+    Ok((SANDBOX_EXEC.to_string(), wrapped))
+}
+
+/// Off macOS there is no seatbelt (the Linux CI job): the seat runs unwrapped and the repo audit is the only check.
+/// Production seats run on macOS, where the wrap above is mandatory.
+#[cfg(not(target_os = "macos"))]
+fn seatbelt_wrap(
+    _seat: &str,
+    bin: &str,
+    args: &[String],
+    _seat_home: &Path,
+    _output_dir: &Path,
+) -> Result<(String, Vec<String>), String> {
+    Ok((bin.to_string(), args.to_vec()))
 }
 
 async fn run_agent_process_with_session(
@@ -12815,6 +12891,9 @@ pub(crate) mod seven_primes_gate_tests {
             let marker = dir.path().join("marker");
             let home = dir.path().join("home");
             std::fs::create_dir_all(&home).expect("home");
+            // T-206: the dispatch cwd is its own empty dir. The new-seat repo audit fails a call whose cwd changes, and
+            // the marker and the daemon's outbox under `home` both change during every call.
+            std::fs::create_dir_all(dir.path().join("cwd")).expect("cwd");
             let connector = |name: &str| {
                 let bin = dir.path().join(format!("mock-{name}"));
                 let script = format!(
@@ -12902,7 +12981,7 @@ pub(crate) mod seven_primes_gate_tests {
         }
 
         pub(crate) fn cwd(&self) -> String {
-            self.dir.path().display().to_string()
+            self.dir.path().join("cwd").display().to_string()
         }
 
         /// kimi enabled and verified, so the gate reaches its surface rule.

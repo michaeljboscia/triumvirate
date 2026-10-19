@@ -44,7 +44,8 @@ pub struct SeatInvocation {
 /// The tracked and untracked state of a repo before or after a run (REQ-035).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoSnapshot {
-    /// Path -> content hash (or a marker for a deletion), from `git status --porcelain=v1 -z --untracked-files=all`.
+    /// Path -> content hash (or a marker for a deletion, an ignored path, or a symlink), from `git status
+    /// --porcelain=v1 -z --untracked-files=all --ignored=matching`, or from the walk fallback (`snapshot_dir`).
     pub entries: std::collections::BTreeMap<String, String>,
 }
 
@@ -441,11 +442,122 @@ fn git(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>, Strin
     Ok(out.stdout)
 }
 
-/// Status plus content hash of every changed, staged or untracked path. Two snapshots differ wherever the run wrote.
+/// The entry cap for the walk fallback (`snapshot_dir`): past it the audit is unavailable, not partial.
+pub const WALK_CAP: usize = 10_000;
+
+/// The before or after snapshot of a dispatch's cwd (Seven Primes T-206, REQ-035), whatever the cwd is.
+///
+/// Detection: `git -C <cwd> rev-parse --is-inside-work-tree`. Exit 0 with stdout `true` is git mode
+/// (`snapshot_repo`); a non-zero exit (not a repo) is walk mode (`snapshot_dir`); exit 0 with any other stdout (the
+/// cwd is a `.git` dir or a bare repo, so there is no work tree to ask git about) is walk mode too. Failing to run
+/// git at all is an Err, so the call fails rather than going unaudited.
+///
+/// Known residual, accepted because the macOS seatbelt is the primary barrier and this is the backstop: in git mode a
+/// write inside an ALREADY ignored directory is not visible (`--ignored=matching` lists that directory as one entry,
+/// with no content hash), and in either mode a write restored to identical bytes before the child exits is not
+/// visible.
+pub fn snapshot_cwd(cwd: &Path) -> Result<RepoSnapshot, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("containment: cannot run git: {e}"))?;
+    if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true" {
+        snapshot_repo(cwd)
+    } else {
+        snapshot_dir(cwd)
+    }
+}
+
+/// Walk mode for a cwd that is not a git work tree: every regular file keyed by its path relative to `cwd` with a
+/// content hash, every symlink as `symlink:<target>` (never followed), directories skipped. More than `WALK_CAP`
+/// entries is an Err, never a partial snapshot.
+///
+/// The hash is `std::hash::DefaultHasher` over (length, bytes). Its keys are fixed, and both snapshots of one call run
+/// in the same process, so equal content always hashes equal; it is not a cryptographic hash and need not be.
+pub fn snapshot_dir(cwd: &Path) -> Result<RepoSnapshot, String> {
+    let mut entries = std::collections::BTreeMap::new();
+    let mut stack: Vec<PathBuf> = vec![cwd.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = std::fs::read_dir(&dir)
+            .map_err(|e| format!("containment: cannot list {}: {e}", dir.display()))?;
+        for item in read {
+            let item =
+                item.map_err(|e| format!("containment: cannot list {}: {e}", dir.display()))?;
+            let path = item.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("containment: cannot stat {}: {e}", path.display()))?;
+            let kind = meta.file_type();
+            if kind.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(cwd)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let value = if kind.is_symlink() {
+                let target = std::fs::read_link(&path).map_err(|e| {
+                    format!("containment: cannot read link {}: {e}", path.display())
+                })?;
+                format!("symlink:{}", target.display())
+            } else if kind.is_file() {
+                format!("file:{:016x}", hash_file(&path, meta.len())?)
+            } else {
+                // A fifo, socket or device node: not content, but its appearance is still a change.
+                "special".to_string()
+            };
+            entries.insert(rel, value);
+            if entries.len() > WALK_CAP {
+                return Err(format!("more than {WALK_CAP} files"));
+            }
+        }
+    }
+    Ok(RepoSnapshot { entries })
+}
+
+/// `DefaultHasher` over the file's length then its bytes, read in chunks so a large file is never held whole.
+fn hash_file(path: &Path, len: u64) -> Result<u64, String> {
+    use std::hash::Hasher;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("containment: cannot read {}: {e}", path.display()))?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write_u64(len);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("containment: cannot read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.write(&buf[..n]);
+    }
+    Ok(hasher.finish())
+}
+
+/// Status plus content hash of every changed, staged or untracked path, plus every ignored path (T-206). Two
+/// snapshots differ wherever the run wrote.
+///
+/// Ignored entries come from `--ignored=matching` and carry the marker `ignored` instead of a hash: `matching` lists a
+/// wholly ignored directory as one entry (`target/`), so a big build dir costs one line, and a NEW ignored file or
+/// directory shows in the audit. A write inside an already ignored directory does not (see `snapshot_cwd`).
 pub fn snapshot_repo(cwd: &Path) -> Result<RepoSnapshot, String> {
     let raw = git(
         cwd,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
         None,
     )?;
     // -z entries are "XY path\0"; a rename or copy carries its source as one more NUL-terminated field.
@@ -464,7 +576,7 @@ pub fn snapshot_repo(cwd: &Path) -> Result<RepoSnapshot, String> {
     }
     let present: Vec<&str> = statuses
         .iter()
-        .filter(|(p, _)| cwd.join(p).is_file())
+        .filter(|(p, xy)| xy != "!!" && cwd.join(p).is_file())
         .map(|(p, _)| p.as_str())
         .collect();
     let hashes_raw = if present.is_empty() {
@@ -480,6 +592,10 @@ pub fn snapshot_repo(cwd: &Path) -> Result<RepoSnapshot, String> {
     let mut hashes = hashes_text.lines();
     let mut entries = std::collections::BTreeMap::new();
     for (path, xy) in &statuses {
+        if xy == "!!" {
+            entries.insert(path.clone(), "ignored".to_string());
+            continue;
+        }
         let hash = if present.contains(&path.as_str()) {
             hashes.next().unwrap_or("?").to_string()
         } else {
