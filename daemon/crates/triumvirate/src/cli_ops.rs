@@ -487,12 +487,27 @@ pub(crate) struct SeatDoctorCtx {
     pub sandbox_exec: std::path::PathBuf,
 }
 
+/// The doctor resolves a seat's CLI the way the runner does (`mcp_bridge::new_seat_bin`): `TRIUMVIRATE_<SEAT>_BIN`
+/// first, then PATH. Before this the doctor read PATH only, so on the launchd daemon (whose PATH has no ~/.local/bin)
+/// `binary` and `version` FAILED for seats the runner spawned and answered with (live --launch, 2026-10-19).
+fn seat_bin_override(
+    program: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    let (seat, _, _) = SEAT_CLIS.iter().find(|(_, p, _)| *p == program)?;
+    let path = std::path::PathBuf::from(env(&mcp_bridge::new_seat_bin_env(seat))?);
+    path.is_file().then_some(path)
+}
+
 impl SeatDoctorCtx {
     /// The real machine: `$TRIUMVIRATE_HOME`, PATH lookup, this process's env, macOS seatbelt.
     pub(crate) fn from_process() -> anyhow::Result<Self> {
         Ok(Self {
             triumvirate_home: core_triumvirate_home_dir()?,
-            lookup: Box::new(find_on_path),
+            lookup: Box::new(|program| {
+                seat_bin_override(program, |k| std::env::var(k).ok())
+                    .or_else(|| find_on_path(program))
+            }),
             base_env: std::env::vars().collect(),
             sandbox_exec: std::path::PathBuf::from("/usr/bin/sandbox-exec"),
         })
@@ -1416,6 +1431,20 @@ mod seven_primes_doctor_tests {
         std::os::unix::fs::symlink(&kimi, kimi.join("loop")).unwrap();
         assert_eq!(stray_key_files(&kimi, &[]), Vec::<String>::new());
         assert!(failing("kimi", &ctx(&f, vec![], sandbox())).is_empty());
+    }
+
+    /// The doctor's binary lookup honors TRIUMVIRATE_<SEAT>_BIN like the runner, and ignores an override that is not a
+    /// file. RED IF: the doctor reads PATH only, so a seat the runner spawns fails `binary` on the launchd daemon.
+    #[test]
+    fn doctor_binary_lookup_honors_the_seat_override() {
+        let f = good();
+        let fake = f.home.join("fake-vibe");
+        fs::write(&fake, "#!/bin/sh\n").unwrap();
+        let env = |k: &str| (k == "TRIUMVIRATE_MISTRAL_BIN").then(|| fake.display().to_string());
+        assert_eq!(seat_bin_override("vibe", env), Some(fake.clone()));
+        assert_eq!(seat_bin_override("kimi", env), None, "no override for kimi");
+        let missing = |_: &str| Some("/nonexistent/vibe".to_string());
+        assert_eq!(seat_bin_override("vibe", missing), None);
     }
 
     /// A vendor's documentation placeholder is not a key (Vibe's downloaded plugin docs, live 2026-10-19), but a
