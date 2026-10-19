@@ -147,7 +147,7 @@ pub fn is_configured(seat: &str) -> Result<bool, String> {
         "TRIUMVIRATE_ENABLE_{}",
         seat.to_ascii_uppercase().replace('-', "_")
     );
-    Ok(std::env::var(var).is_ok_and(|v| v.trim() == "1"))
+    Ok(std::env::var(var).is_ok_and(|v| v == "1"))
 }
 
 /// Read verified.json and suspended.json now. A verified.json whose `cli_version` differs from `installed_cli_version`
@@ -491,7 +491,14 @@ mod tests {
         }
         // A seat name no other test uses, so this env key cannot race another test.
         let var = "TRIUMVIRATE_ENABLE_SEATSTATEPROBE";
-        for (value, want) in [("1", true), ("true", false), ("0", false), (" 1 ", true)] {
+        // Exactly "1": whitespace is a typo too (GAUNTLET T-106 filter caught the old trim, which contradicted the doc).
+        for (value, want) in [
+            ("1", true),
+            ("true", false),
+            ("0", false),
+            (" 1 ", false),
+            ("1\n", false),
+        ] {
             // SAFETY: this variable is read only by this test.
             unsafe { std::env::set_var(var, value) };
             assert_eq!(is_configured("seatstateprobe").unwrap(), want, "{value:?}");
