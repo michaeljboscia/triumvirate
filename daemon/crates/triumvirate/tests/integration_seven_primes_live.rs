@@ -122,14 +122,16 @@ fn answer(v: &Value) -> String {
 /// accepts the call, so the seat really opened the file.
 async fn file_grounded_answer(seat: &str) {
     let dir = repo(&format!("{seat}-sight"));
-    let token = unique("TOKEN").replace('-', "");
-    let file = dir.join("secret.txt");
-    std::fs::write(&file, format!("The token is {token}\n")).unwrap();
+    // A neutral file: a model may refuse to read anything that looks like a credential (a Kimi run refused
+    // "secret.txt" holding "The token is ..."), which tests its safety policy, not the sight gate.
+    let token = unique("CODENAME").replace('-', "");
+    let file = dir.join("release-notes.txt");
+    std::fs::write(&file, format!("Release notes\nThe release codename is {token}\n")).unwrap();
     let (status, out) = post(
         "/ask-agent",
         serde_json::json!({
             "agent": seat,
-            "message": "Read secret.txt in this directory and reply with only the token it contains.",
+            "message": "Read release-notes.txt in this directory and reply with only the release codename it contains.",
             "cwd": dir,
             "strict_agent": true,
             "required_sources": [file],
