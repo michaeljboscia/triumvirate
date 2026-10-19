@@ -83,6 +83,17 @@ for part in sys.argv[1].split("."):
 print(str(value).lower() if isinstance(value, bool) else "" if value is None else value)' "$1"
 }
 
+# Exit 0 when the dotted key EXISTS, whatever its value: /status sends "reason": null for an available seat
+# (BACKEND_STRUCTURE section 4: string|null), so a schema check must not read null as missing.
+json_has() {
+    python3 -I -c 'import json, sys
+value = json.load(sys.stdin)
+for part in sys.argv[1].split("."):
+    if not isinstance(value, dict) or part not in value:
+        sys.exit(1)
+    value = value[part]' "$1"
+}
+
 refusal_code() {
     local seat="$1" token body response
     token="$(daemon_token)" || return 1
@@ -170,7 +181,7 @@ run_new_seat_guards() {
     status="$(status_json)" || { echo "FAIL  daemon unreachable"; return 1; }
     for seat in "${NEW_SEATS[@]}"; do
         for field in configured verified suspended available reason; do
-            [ -n "$(printf '%s' "$status" | json_field "seats.$seat.$field")" ] || { echo "FAIL  /status schema missing seats.$seat.$field"; return 1; }
+            printf '%s' "$status" | json_has "seats.$seat.$field" || { echo "FAIL  /status schema missing seats.$seat.$field"; return 1; }
         done
     done
     for seat in "${NEW_SEATS[@]}"; do
