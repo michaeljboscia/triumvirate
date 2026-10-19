@@ -7448,9 +7448,26 @@ async fn seat_run_in(
             outside.join(", ")
         )));
     }
-    git_in_worktree(worktree, &["add", "-A", "--", ".", ":!.triumvirate"])
+    // `git add -A -- . ':!.triumvirate'` FAILS ("paths are ignored") once `.triumvirate/` is gitignored, which the
+    // daemon itself writes into every repo it touches (found live: a fleet member wrote its file and committed
+    // nothing). Stage everything (ignored paths are skipped), then unstage `.triumvirate` if it was not ignored.
+    git_in_worktree(worktree, &["add", "-A"])
         .await
         .map_err(git_fail)?;
+    git_in_worktree(
+        worktree,
+        &[
+            "rm",
+            "-r",
+            "-q",
+            "--cached",
+            "--ignore-unmatch",
+            "--",
+            ".triumvirate",
+        ],
+    )
+    .await
+    .map_err(git_fail)?;
     git_in_worktree(worktree, &["commit", "-q", "-m", &a.commit_message])
         .await
         .map_err(git_fail)?;

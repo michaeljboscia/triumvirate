@@ -361,6 +361,28 @@ fn writer_commits_its_work_for_every_seat() {
     }
 }
 
+/// The daemon writes `.triumvirate/` into every repo's .gitignore; with that committed, seat-run still commits the
+/// seat's work (and never `.triumvirate/`). Found live: `git add -A -- . ':!.triumvirate'` failed "paths are ignored"
+/// and a fleet member's file was left uncommitted.
+/// RED IF: an ignored `.triumvirate/` makes the commit step fail, or `.triumvirate/` content lands in the commit.
+#[test]
+fn an_ignored_triumvirate_dir_does_not_block_the_commit() {
+    let w = World::new(None);
+    fs::write(w.wt.join(".gitignore"), ".triumvirate/\n").unwrap();
+    git(&w.wt, &["add", ".gitignore"]);
+    git(&w.wt, &["commit", "-qm", "ignore the daemon dir"]);
+    w.set_action("kimi", "echo hello > out.txt\n");
+    let before = w.head();
+    let out = w.run("kimi", "W1-PROMPT-ignored");
+    let line = last_stderr_line(&out);
+    assert_eq!(out.status.code(), Some(0), "{line}\n{out:?}");
+    assert_ne!(w.head(), before, "no new commit");
+    assert_eq!(
+        git(&w.wt, &["show", "--name-only", "--format=", "HEAD"]),
+        "out.txt"
+    );
+}
+
 /// A mock that writes into the PARENT repo (allowed by the seatbelt through the temp-root seam) and into the worktree:
 /// `writer_escaped_worktree:kimi: parent:escape.txt`, exit 1, nothing committed, nothing reverted.
 /// RED IF: the parent-repo audit is missing, the escape is committed alongside the work, or the exit is 0.
