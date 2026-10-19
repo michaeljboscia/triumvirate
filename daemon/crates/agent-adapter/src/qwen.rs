@@ -149,10 +149,16 @@ impl QwenStreamParser {
 
     fn on_system(&mut self, value: &Value) -> Option<WorkingStateEvent> {
         self.recognized = true;
-        if value.get("subtype").and_then(Value::as_str) != Some("session_start") {
+        // T-302 (live, qwen 0.25.2, fixtures qwen-0.25.2-live-*-20261019.jsonl): the CLI announces the session as
+        // `system`/`init`, not the documented `session_start`, and `--resume <that id>` resumes it (proven live: the
+        // second turn recalled the first turn's codeword). Accept both shapes.
+        if !matches!(
+            value.get("subtype").and_then(Value::as_str),
+            Some("session_start" | "init")
+        ) {
             return None;
         }
-        // research/03: `session_start.session_id` is the id `--resume` takes. Its `model` is the configured model,
+        // research/03: `session_start.session_id` (live: `init.session_id`) is the id `--resume` takes. Its `model` is the configured model,
         // not proof of what answered; the served model comes from `assistant.message.model` (REQ-043).
         self.note_session(value);
         Some(event(
@@ -484,6 +490,30 @@ mod tests {
             parse(&no_result, Some(0)).outcome,
             SeatOutcome::Failure("missing_result:qwen".to_string())
         );
+    }
+
+    /// Live capture (qwen 0.25.2): the first turn announces its id on `system`/`init`; the second turn, run with
+    /// `--resume <that id>`, recalls the first turn's codeword and reports the same id.
+    /// RED IF: the parser ignores the live `init` line, so a real Qwen session is never resumable.
+    #[test]
+    fn live_init_line_carries_the_resumable_session_id() {
+        let parse = |raw: &str| {
+            let mut p = QwenStreamParser::new();
+            for line in raw.lines() {
+                p.parse_line(line);
+            }
+            p.finish(Some(0)).expect("live stream parses")
+        };
+        let t1 = parse(include_str!("../tests/fixtures/qwen-0.25.2-live-turn1-20261019.jsonl"));
+        let t2 = parse(include_str!(
+            "../tests/fixtures/qwen-0.25.2-live-turn2-resume-20261019.jsonl"
+        ));
+        let id = "cc464f2e-adc8-481c-9bca-1773a78a8f8c";
+        assert_eq!(t1.result.session_id.as_deref(), Some(id));
+        assert_eq!(t2.result.session_id.as_deref(), Some(id));
+        assert_eq!(t1.result.response_text.trim(), "OK");
+        assert_eq!(t2.result.response_text.trim(), "CONDOR-31");
+        assert_eq!(t2.served_model.as_deref(), Some("qwen3.7-plus"));
     }
 
     /// The session id comes ONLY from system/session_start (BACKEND_STRUCTURE section 6): ids on assistant or result
