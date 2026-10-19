@@ -320,7 +320,7 @@ pub fn seats_status() -> std::collections::BTreeMap<String, shared_types::SeatSt
         .map(|row| {
             let configured = match row.configured {
                 Configured::Always => true,
-                Configured::EnvFlag(var) => std::env::var(var).is_ok_and(|v| v.trim() == "1"),
+                Configured::EnvFlag(var) => std::env::var(var).is_ok_and(|v| v == "1"),
             };
             let version = mcp_bridge::seat_gate::installed_cli_version(row.key);
             let state = home
