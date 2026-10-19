@@ -257,6 +257,13 @@ impl QwenStreamParser {
                 .find(|r| id.is_some() && r.id.as_deref() == id)
             {
                 rec.success = Some(!failed);
+                // T-302 (live, qwen 0.25.2, fixture qwen-0.25.2-live-read-20261019.jsonl): a `read_file` result is the
+                // raw text, unnumbered, so the lines it SHOWED come from the call's 0-based `offset` plus the result's
+                // line count, or from a truncation notice's "Showing lines A-B" when Qwen cut the file.
+                if !failed && rec.tool == "read_file" {
+                    let text = block.get("content").and_then(Value::as_str).unwrap_or_default();
+                    rec.returned_lines = qwen_returned_lines(rec.args_json.as_deref(), text);
+                }
                 let ev = event(
                     WorkingState::ToolCallCompleted,
                     &rec.tool,
@@ -302,6 +309,31 @@ impl QwenStreamParser {
             None,
         ))
     }
+}
+
+/// The lines a successful `read_file` result showed: "Showing lines A-B" when present (a truncated read), else
+/// `offset + 1 ..= offset + line_count`. An empty result showed nothing.
+fn qwen_returned_lines(args_json: Option<&str>, text: &str) -> Vec<(u64, u64)> {
+    if let Some(i) = text.find("Showing lines ") {
+        let rest = &text[i + "Showing lines ".len()..];
+        let mut parts = rest.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty());
+        if let (Some(a), Some(b)) = (parts.next(), parts.next())
+            && let (Ok(a), Ok(b)) = (a.parse::<u64>(), b.parse::<u64>())
+            && a >= 1
+            && b >= a
+        {
+            return vec![(a, b)];
+        }
+    }
+    let count = text.lines().count() as u64;
+    if count == 0 {
+        return Vec::new();
+    }
+    let offset = args_json
+        .and_then(|a| serde_json::from_str::<Value>(a).ok())
+        .and_then(|v| v.get("offset").and_then(Value::as_u64))
+        .unwrap_or(0);
+    vec![(offset + 1, offset + count)]
 }
 
 fn event(
@@ -514,6 +546,32 @@ mod tests {
         assert_eq!(t1.result.response_text.trim(), "OK");
         assert_eq!(t2.result.response_text.trim(), "CONDOR-31");
         assert_eq!(t2.served_model.as_deref(), Some("qwen3.7-plus"));
+    }
+
+    /// Live capture (qwen 0.25.2): `read_file` of a 3-line file returns the raw text; the record carries lines 1-3 and
+    /// success, so the sight gate can credit the whole read. Offsets and truncation notices are honored.
+    /// RED IF: Qwen reads carry no returned_lines, so no Qwen read can ever satisfy the sight gate.
+    #[test]
+    fn live_read_result_records_the_lines_it_showed() {
+        let mut p = QwenStreamParser::new();
+        for line in include_str!("../tests/fixtures/qwen-0.25.2-live-read-20261019.jsonl").lines() {
+            p.parse_line(line);
+        }
+        let parsed = p.finish(Some(0)).expect("live stream parses");
+        let call = parsed
+            .result
+            .tool_calls
+            .iter()
+            .find(|c| c.tool == "read_file")
+            .expect("a read_file call");
+        assert_eq!(call.returned_lines, vec![(1, 3)]);
+        assert_eq!(call.success, Some(true));
+        assert_eq!(qwen_returned_lines(Some(r#"{"offset":10}"#), "a\nb\n"), vec![(11, 12)]);
+        assert_eq!(
+            qwen_returned_lines(None, "IMPORTANT: truncated. Status: Showing lines 1-2000 of 9000 total lines.\nx"),
+            vec![(1, 2000)]
+        );
+        assert!(qwen_returned_lines(None, "").is_empty());
     }
 
     /// The session id comes ONLY from system/session_start (BACKEND_STRUCTURE section 6): ids on assistant or result

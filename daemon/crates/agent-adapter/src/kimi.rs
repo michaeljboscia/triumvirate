@@ -122,6 +122,18 @@ impl KimiStreamParser {
     fn on_tool_result(&mut self, value: &Value) -> Option<WorkingStateEvent> {
         self.recognized_lines += 1;
         let id = value.get("tool_call_id").and_then(Value::as_str);
+        // T-302 (live, kimi 2.2.0, fixture kimi-2.2.0-live-read-20261019.jsonl): a `Read` result numbers its lines
+        // (`1\talpha ...`), so the lines it SHOWED are recoverable. The result carries no outcome (#4241); numbered
+        // lines are the evidence the read succeeded, and an unnumbered result (an error message) earns no credit.
+        let content = value.get("content").and_then(Value::as_str).unwrap_or_default();
+        let runs = crate::types::numbered_line_runs(content);
+        if let Some(call) = id
+            .and_then(|id| self.tool_calls.iter_mut().find(|c| c.id.as_deref() == Some(id)))
+            && !runs.is_empty()
+        {
+            call.returned_lines = runs;
+            call.success = Some(true);
+        }
         let call = id.and_then(|id| self.tool_calls.iter().find(|c| c.id.as_deref() == Some(id)));
         let mut ev = event(WorkingState::ToolCallCompleted, "tool result");
         if let Some(call) = call {
@@ -300,6 +312,22 @@ mod tests {
 
     // Fixtures here are PROVISIONAL: transcribed from research/01's PromptJsonWriter shapes, nothing is installed.
     /// RED IF: the parser drops assistant text, the Read call, its path, the resume_hint id, or claims usage.
+    /// Live capture (kimi 2.2.0): a `Read` with `n_lines: 2` returned lines 1-2 numbered; the record carries exactly
+    /// those lines and counts as a successful read, so the sight gate can credit (or rightly refuse) it.
+    /// RED IF: Kimi read results are not turned into returned_lines, so no Kimi read can ever satisfy the sight gate.
+    #[test]
+    fn live_read_result_records_the_lines_it_showed() {
+        let parsed = parse(
+            include_str!("../tests/fixtures/kimi-2.2.0-live-read-20261019.jsonl"),
+            Some(0),
+        );
+        let call = &parsed.result.tool_calls[0];
+        assert_eq!(call.tool, "Read");
+        assert_eq!(call.returned_lines, vec![(1, 2)]);
+        assert_eq!(call.success, Some(true));
+        assert_eq!(parsed.result.response_text.trim(), "beta line two");
+    }
+
     #[test]
     fn fixture_yields_text_read_session_and_no_usage() {
         let parsed = parse(FIXTURE, Some(0));
@@ -311,7 +339,8 @@ mod tests {
         let call = &parsed.result.tool_calls[0];
         assert_eq!(call.tool, "Read");
         assert_eq!(call.kind, ToolKind::ReadFile);
-        assert_eq!(call.success, None);
+        // T-302: a numbered result is the evidence the read succeeded (the line itself carries no outcome, #4241).
+        assert_eq!(call.success, Some(true));
         assert_eq!(
             read_operand(call.args_json.as_deref().expect("args")).as_deref(),
             Some("/repo/src/main.rs")

@@ -6528,13 +6528,33 @@ impl NewSeatParser {
     ) -> Result<agent_adapter::SeatParsed, String> {
         match self {
             Self::Kimi(p) => p.finish(exit_code),
-            Self::Mistral(p) => {
+            Self::Mistral(mut p) => {
                 let export = fs::read_to_string(output_dir.join("export.json")).ok();
+                // T-302: read results live only in the session journal, which is removed with the output dir.
+                p.ingest_journal(&read_mistral_journal(output_dir));
                 p.finish(exit_code, export.as_deref())
             }
             Self::Qwen(p) => p.finish(exit_code),
         }
     }
+}
+
+/// Every `<output-dir>/session/journal/*.jsonl` file, in name order, concatenated (empty when Vibe wrote none).
+fn read_mistral_journal(output_dir: &Path) -> String {
+    let dir = output_dir.join("session").join("journal");
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|f| fs::read_to_string(f).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn build_new_seat_invocation(

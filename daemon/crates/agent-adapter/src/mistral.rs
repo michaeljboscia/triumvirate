@@ -187,6 +187,68 @@ impl MistralStreamParser {
     }
 
     /// Finish the dispatch given the exit code and the contents of the per-call export.json (`None` when missing).
+    /// T-302 (live, vibe 2.26.1, fixture mistral-2.26.1-live-read-journal-20261019.jsonl): the read RESULTS are not in
+    /// the stream or export.json; they are `role: tool` messages in the session journal
+    /// (`<output-dir>/session/journal/*.jsonl`), whose `read_file` body carries `offset` and `lines_read`. The journal
+    /// ids differ from the stream's effect ids and its model requests repeat earlier messages, so results are
+    /// deduplicated by `tool_call_id` and paired in order with this parser's file-read records. A result whose
+    /// `outcome` is not `success` earns no lines.
+    pub fn ingest_journal(&mut self, journal_jsonl: &str) {
+        let mut seen: Vec<String> = Vec::new();
+        let mut reads: Vec<(bool, Vec<(u64, u64)>)> = Vec::new();
+        fn walk(v: &Value, out: &mut Vec<Value>) {
+            match v {
+                Value::Object(m) => {
+                    if m.get("role").and_then(Value::as_str) == Some("tool") && m.contains_key("tool_call_id") {
+                        out.push(v.clone());
+                        return;
+                    }
+                    for x in m.values() {
+                        walk(x, out);
+                    }
+                }
+                Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        for line in journal_jsonl.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let mut found = Vec::new();
+            walk(&v, &mut found);
+            for m in found {
+                let id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or_default().to_string();
+                if id.is_empty() || seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
+                if m.get("name").and_then(Value::as_str) != Some("read_file") {
+                    continue;
+                }
+                let ok = m.get("outcome").and_then(Value::as_str) == Some("success");
+                let body = m
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|c| c.iter().find_map(|b| b.get("text").and_then(Value::as_str)))
+                    .and_then(|t| serde_json::from_str::<Value>(t).ok());
+                let lines = body
+                    .as_ref()
+                    .and_then(|b| {
+                        let read = b.get("lines_read")?.as_u64()?;
+                        let offset = b.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                        (read > 0).then(|| vec![(offset + 1, offset + read)])
+                    })
+                    .unwrap_or_default();
+                reads.push((ok, if ok { lines } else { Vec::new() }));
+            }
+        }
+        let mut results = reads.into_iter();
+        for rec in self.tool_calls.iter_mut().filter(|r| r.kind == ToolKind::ReadFile) {
+            let Some((ok, lines)) = results.next() else { break };
+            rec.success = Some(ok);
+            rec.returned_lines = lines;
+        }
+    }
+
     pub fn finish(
         self,
         exit_code: Option<i32>,
@@ -515,4 +577,26 @@ mod tests {
                 .contains("filePath")
         );
     }
+    /// Live capture (vibe 2.26.1): the stream records the read; its result lives only in the session journal. After
+    /// ingesting the journal, the read carries lines 1-3 and success, so the sight gate can credit it; a repeated
+    /// journal message (later model requests replay history) does not shift the pairing.
+    /// RED IF: Mistral reads carry no returned_lines, so no Mistral read can ever satisfy the sight gate.
+    #[test]
+    fn live_journal_read_result_records_the_lines_it_showed() {
+        let mut p = MistralStreamParser::new();
+        for line in include_str!("../tests/fixtures/mistral-2.26.1-live-read-20261019.jsonl").lines() {
+            p.parse_line(line);
+        }
+        p.ingest_journal(include_str!(
+            "../tests/fixtures/mistral-2.26.1-live-read-journal-20261019.jsonl"
+        ));
+        let read = p
+            .tool_calls
+            .iter()
+            .find(|c| c.kind == ToolKind::ReadFile)
+            .expect("a read record");
+        assert_eq!(read.returned_lines, vec![(1, 3)]);
+        assert_eq!(read.success, Some(true));
+    }
+
 }
