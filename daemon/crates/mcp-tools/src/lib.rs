@@ -66,7 +66,11 @@ impl ProgressEmitter {
             return;
         }
         let message = message.into();
-        if let Err(err) = self
+        // rmcp 1.8 deprecates MCP logging (SEP-2577). It still works and clients still render it; the progress
+        // notification below is the replacement path. Moving off logging entirely is follow-up work, so the
+        // deprecation is allowed at this one call rather than across the crate.
+        #[allow(deprecated)]
+        let logged = self
             .peer
             .notify_logging_message(
                 LoggingMessageNotificationParam::new(
@@ -75,8 +79,8 @@ impl ProgressEmitter {
                 )
                 .with_logger("triumvirate"),
             )
-            .await
-        {
+            .await;
+        if let Err(err) = logged {
             tracing::debug!("progress logging notification failed: {err}");
         }
 
