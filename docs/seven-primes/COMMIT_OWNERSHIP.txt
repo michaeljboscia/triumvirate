@@ -5,3 +5,4 @@ b65015c T-302 doctor resolves seat CLIs like the runner (found by the --launch r
 581eeec T-302 stray-key scan skips documentation placeholders (found by the --launch run)
 71c718e deps merge of the approved dependency security bump (Mike: "Bump deps first")
 a24ac84 deps merge of the approved actions sha-pinning (chore/dep-security-bump ec2ee261, merged to main as #90)
+4be11dc C-1 stability fix: a new-seat call with no cwd ran its read-only audit on the filesystem root (Mike: "stable and usable")
