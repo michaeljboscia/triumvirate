@@ -160,10 +160,19 @@ pub(crate) fn note_attempt_child(child: &tokio::process::Child) {
 ///
 /// Seven Primes T-202: the seat's `SeatProfile.live_progress`. A name with no row keeps the old default, streaming.
 fn streams_live_progress(agent: &str, gemini_backend: Option<GeminiBackend>) -> bool {
+    streams_live_progress_for_row(
+        mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent)),
+        gemini_backend,
+    )
+}
+
+/// The row-taking half of `streams_live_progress`: `row.live_progress`, with no row read as streaming.
+fn streams_live_progress_for_row(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    gemini_backend: Option<GeminiBackend>,
+) -> bool {
     use mcp_bridge::seat_profile::LiveProgress;
-    let live = mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent))
-        .map(|row| row.live_progress);
-    match live {
+    match row.map(|row| row.live_progress) {
         Some(LiveProgress::StreamsExceptAgy) => !matches!(gemini_backend, Some(GeminiBackend::Agy)),
         Some(LiveProgress::Buffered) => false,
         Some(LiveProgress::Streams) | None => true,
@@ -246,6 +255,63 @@ fn usage_source_for(parsed: &ParsedAgentResult) -> &'static str {
         USAGE_SOURCE_NOT_REPORTED
     } else {
         token_economics::USAGE_SOURCE_EXACT
+    }
+}
+
+/// What the success path records as the model that answered (Seven Primes REQ-043).
+#[derive(Debug, PartialEq, Eq)]
+enum ServedModelRecord<'a> {
+    /// `CallTelemetry::set_model` with this name.
+    Model(&'a str),
+    /// The seat reports a served model, but this response carried none: the span says "unknown".
+    Missing,
+    /// The seat does not report a served model this way (kimi, Legacy rows): nothing is recorded.
+    NotExposed,
+}
+
+/// Which served model to record, from the row's `served_model_evidence`: agy's runtime report rides in
+/// `parsed.cli_version` (agy.rs::build_result); Mistral's export config and Qwen's message.model arrive as the new
+/// seats' `SeatParsed.served_model`, passed here as `seat_served_model`. A blank name is no name.
+fn served_model_record<'a>(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    parsed: &'a ParsedAgentResult,
+    seat_served_model: Option<&'a str>,
+) -> ServedModelRecord<'a> {
+    use mcp_bridge::seat_profile::ModelEvidence;
+    let candidate = match row.map(|row| row.served_model_evidence) {
+        Some(ModelEvidence::AgyRuntimeReport) => parsed.cli_version.as_deref(),
+        Some(ModelEvidence::ExportConfig | ModelEvidence::MessageModel) => seat_served_model,
+        Some(ModelEvidence::NotExposed | ModelEvidence::Legacy) | None => {
+            return ServedModelRecord::NotExposed;
+        }
+    };
+    match candidate {
+        Some(model) if !model.trim().is_empty() => ServedModelRecord::Model(model),
+        _ => ServedModelRecord::Missing,
+    }
+}
+
+/// The served-model step of the success path: records what `served_model_record` decides on the telemetry guard and
+/// the span.
+fn record_served_model(
+    tel: &mut mcp_bridge::posthog::CallTelemetry,
+    span: &Span,
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    parsed: &ParsedAgentResult,
+    seat_served_model: Option<&str>,
+) {
+    match served_model_record(row, parsed, seat_served_model) {
+        ServedModelRecord::Model(model) => {
+            tel.set_model(model);
+            span.record("agent.model", model);
+        }
+        // Record "unknown" rather than leaving the field Empty. An absent field is indistinguishable from a span
+        // that never reached here, so silence would hide the very parse regression worth catching: agy changing its
+        // log format and us quietly losing the model forever.
+        ServedModelRecord::Missing => {
+            span.record("agent.model", "unknown");
+        }
+        ServedModelRecord::NotExposed => {}
     }
 }
 
@@ -1356,25 +1422,17 @@ async fn execute_ask_agent_inner(
                 // (High)") and stashes it in cli_version (agy.rs::build_result). Without
                 // this, $ai_model falls back to the agent key and every Antigravity call
                 // charts as the model "gemini", which cannot answer which model ran.
-                // Seven Primes T-202 (REQ-043): which seats report a served model this way is SeatProfile data.
-                let reports_runtime_model = mcp_bridge::seat_profile::seat_profile(&agent)
-                    .map(|row| row.served_model_evidence)
-                    == Some(mcp_bridge::seat_profile::ModelEvidence::AgyRuntimeReport);
-                if reports_runtime_model {
-                    match parsed.cli_version.as_deref() {
-                        Some(model) if !model.trim().is_empty() => {
-                            tel.set_model(model);
-                            span.record("agent.model", model);
-                        }
-                        // Record "unknown" rather than leaving the field Empty. An absent
-                        // field is indistinguishable from a span that never reached here, so
-                        // silence would hide the very parse regression worth catching: agy
-                        // changing its log format and us quietly losing the model forever.
-                        _ => {
-                            span.record("agent.model", "unknown");
-                        }
-                    }
-                }
+                // Seven Primes T-202 (REQ-043): which seats report a served model, and where it is read from, is
+                // SeatProfile data (`served_model_evidence`). The new seats' SeatParsed.served_model reaches this
+                // path once their dispatch arms land (T-205); until then no dispatch here carries one.
+                let seat_served_model: Option<&str> = None;
+                record_served_model(
+                    &mut tel,
+                    &span,
+                    mcp_bridge::seat_profile::seat_profile(&agent),
+                    &parsed,
+                    seat_served_model,
+                );
                 tel.success(parsed.token_usage.clone());
                 // $ai_output: the completion the model actually returned.
                 tel.set_output(&parsed.response_text);
@@ -2209,13 +2267,17 @@ fn require_peer_review_enabled() -> bool {
 // ];
 fn parser_modes_with_tool_records() -> &'static [&'static str] {
     static MODES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    MODES.get_or_init(|| {
-        mcp_bridge::seat_profile::all_seats()
-            .iter()
-            .filter(|row| row.records_tool_calls)
-            .flat_map(|row| row.parser_modes.iter().copied())
-            .collect()
-    })
+    MODES.get_or_init(|| modes_with_tool_records_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `parser_modes_with_tool_records`: every parser mode of every row with `records_tool_calls`.
+fn modes_with_tool_records_from(
+    rows: &[mcp_bridge::seat_profile::SeatProfile],
+) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.records_tool_calls)
+        .flat_map(|row| row.parser_modes.iter().copied())
+        .collect()
 }
 
 /// Agents that have no tools at all, so `require_sight` can never be satisfied by them.
@@ -2331,13 +2393,17 @@ const AGENTS_WITH_NO_WRITE_CONTAINMENT: &[&str] = &[];
 // ];
 fn parser_modes_that_classify_reads() -> &'static [&'static str] {
     static MODES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    MODES.get_or_init(|| {
-        mcp_bridge::seat_profile::all_seats()
-            .iter()
-            .filter(|row| row.classifies_reads)
-            .flat_map(|row| row.parser_modes.iter().copied())
-            .collect()
-    })
+    MODES.get_or_init(|| modes_that_classify_reads_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `parser_modes_that_classify_reads`: every parser mode of every row with `classifies_reads`.
+fn modes_that_classify_reads_from(
+    rows: &[mcp_bridge::seat_profile::SeatProfile],
+) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.classifies_reads)
+        .flat_map(|row| row.parser_modes.iter().copied())
+        .collect()
 }
 
 /// Did any COMPLETED, SUCCESSFUL READ of this source happen?
@@ -3417,13 +3483,15 @@ enum SightRepair {
 // Seven Primes T-202: derived from `SeatProfile.sight_repair` (was the literal ["codex", "grok"]).
 fn sight_repair_agents() -> &'static [&'static str] {
     static AGENTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    AGENTS.get_or_init(|| {
-        mcp_bridge::seat_profile::all_seats()
-            .iter()
-            .filter(|row| row.sight_repair)
-            .map(|row| row.key)
-            .collect()
-    })
+    AGENTS.get_or_init(|| sight_repair_agents_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `sight_repair_agents`: the keys of the rows with `sight_repair`.
+fn sight_repair_agents_from(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.sight_repair)
+        .map(|row| row.key)
+        .collect()
 }
 
 /// A repair turn is not started with less than this left of the review budget. A repair that
@@ -5566,14 +5634,28 @@ pub(crate) fn attempt_schedule_for(
     // It is ONE attempt: three retries of a review that timed out are three more reviews that
     // time out, and the first failure ends up buried under the last. 2026-09-13: a codex review
     // ran 3 x 180s, failed at 543s, and the caller was told only about the third.
+    attempt_schedule_for_row(
+        mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent)),
+        gemini_backend_selected,
+        review,
+        strict,
+    )
+}
+
+/// The row-taking half of `attempt_schedule_for`: the schedule follows `row.attempt_policy`.
+fn attempt_schedule_for_row(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    gemini_backend_selected: Option<GeminiBackend>,
+    review: bool,
+    strict: bool,
+) -> Vec<(Duration, Option<&'static str>)> {
     if review {
         return vec![(Duration::ZERO, None)];
     }
     // Seven Primes T-202 (REQ-050): the policy is the seat's `SeatProfile.attempt_policy`; new seats are Single. A
     // name with no row keeps the old default, three attempts.
     use mcp_bridge::seat_profile::AttemptPolicy;
-    let policy = mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent))
-        .map_or(AttemptPolicy::Retry3, |row| row.attempt_policy);
+    let policy = row.map_or(AttemptPolicy::Retry3, |row| row.attempt_policy);
     if policy == AttemptPolicy::GeminiFaildown {
         if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
             vec![(Duration::ZERO, None)]
@@ -11707,15 +11789,81 @@ mod seven_primes_consumer_tests {
     use super::*;
     use std::time::Duration;
 
+    /// The schedule a policy means, spelled out with its delays (the expectation side of the attempt tests).
+    fn expected_schedule(
+        policy: mcp_bridge::seat_profile::AttemptPolicy,
+    ) -> Vec<(Duration, Option<&'static str>)> {
+        use mcp_bridge::seat_profile::AttemptPolicy;
+        match policy {
+            AttemptPolicy::Single => vec![(Duration::ZERO, None)],
+            AttemptPolicy::Retry3 => vec![
+                (Duration::from_millis(250), None),
+                (Duration::from_secs(1), None),
+                (Duration::from_secs(2), None),
+            ],
+            // gemini-cli backend (None), not strict: the whole faildown chain.
+            AttemptPolicy::GeminiFaildown => GEMINI_MODEL_FAILDOWN
+                .iter()
+                .enumerate()
+                .map(|(i, model)| {
+                    let backoff = if i == 0 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(500)
+                    };
+                    (backoff, Some(*model))
+                })
+                .collect(),
+        }
+    }
+
+    /// The live consumers follow each new seat's row: the attempt schedule is the one `row.attempt_policy` means
+    /// (with its delays), sight repair matches `row.sight_repair`, and a cloned row with either field changed changes
+    /// the consumer's output. An unknown name gets the Retry3 schedule element by element.
+    /// RED IF: the schedule or sight-repair membership stops following the row, or the no-row default changes.
     #[test]
     fn new_seats_follow_their_rows() {
+        use mcp_bridge::seat_profile::AttemptPolicy;
         for seat in ["kimi", "mistral", "qwen"] {
             let row = mcp_bridge::seat_profile::seat_profile(seat).unwrap();
-            // REQ-050: single attempt.
             assert_eq!(
                 attempt_schedule_for(seat, None, false, false),
-                vec![(Duration::ZERO, None)],
+                expected_schedule(row.attempt_policy),
                 "{seat}"
+            );
+            assert_eq!(row.attempt_policy, AttemptPolicy::Single, "{seat}: REQ-050");
+            let mut mutated = row.clone();
+            for policy in [
+                AttemptPolicy::Single,
+                AttemptPolicy::Retry3,
+                AttemptPolicy::GeminiFaildown,
+            ] {
+                mutated.attempt_policy = policy;
+                assert_eq!(
+                    attempt_schedule_for_row(Some(&mutated), None, false, false),
+                    expected_schedule(policy),
+                    "{seat} {policy:?}"
+                );
+            }
+            assert_eq!(
+                sight_repair_agents().contains(&seat),
+                row.sight_repair,
+                "{seat}"
+            );
+            let flipped: Vec<_> = mcp_bridge::seat_profile::all_seats()
+                .iter()
+                .cloned()
+                .map(|mut r| {
+                    if r.key == seat {
+                        r.sight_repair = !r.sight_repair;
+                    }
+                    r
+                })
+                .collect();
+            assert_eq!(
+                sight_repair_agents_from(&flipped).contains(&seat),
+                !row.sight_repair,
+                "{seat}: flipping the row flips membership"
             );
             assert_eq!(
                 streams_live_progress(seat, None),
@@ -11740,12 +11888,20 @@ mod seven_primes_consumer_tests {
         // Aliases reach the same row.
         assert_eq!(
             attempt_schedule_for("vibe", None, false, false),
-            vec![(Duration::ZERO, None)]
+            expected_schedule(
+                mcp_bridge::seat_profile::seat_profile("mistral")
+                    .unwrap()
+                    .attempt_policy
+            )
         );
-        // A name with no row keeps the old defaults.
+        // A name with no row keeps the old default, three attempts at 250 ms, 1 s, 2 s.
         assert_eq!(
-            attempt_schedule_for("not-a-seat", None, false, false).len(),
-            3
+            attempt_schedule_for("not-a-seat", None, false, false),
+            vec![
+                (Duration::from_millis(250), None),
+                (Duration::from_secs(1), None),
+                (Duration::from_secs(2), None),
+            ]
         );
         assert!(streams_live_progress("not-a-seat", None));
     }
@@ -11770,5 +11926,170 @@ mod seven_primes_consumer_tests {
         assert_eq!(usage_source_for(&parsed), "exact");
         parsed.parser_mode = "agy-stream-json".into();
         assert_eq!(usage_source_for(&parsed), "unmetered");
+    }
+
+    fn row(key: &str) -> mcp_bridge::seat_profile::SeatProfile {
+        mcp_bridge::seat_profile::seat_profile(key).unwrap().clone()
+    }
+
+    /// REQ-043: Mistral (ExportConfig) and Qwen (MessageModel) record the seat's parsed served model; gemini keeps
+    /// agy's runtime report from cli_version; kimi (NotExposed) and Legacy rows record nothing; a blank name is Missing.
+    /// RED IF: SeatParsed.served_model is ignored for ExportConfig or MessageModel seats, or the agy path breaks.
+    #[test]
+    fn served_model_record_follows_the_evidence_row() {
+        let parsed = ParsedAgentResult {
+            cli_version: Some("Gemini 3.1 Pro (High)".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            served_model_record(Some(&row("gemini")), &parsed, Some("ignored")),
+            ServedModelRecord::Model("Gemini 3.1 Pro (High)")
+        );
+        assert_eq!(
+            served_model_record(Some(&row("mistral")), &parsed, Some("devstral-2")),
+            ServedModelRecord::Model("devstral-2")
+        );
+        assert_eq!(
+            served_model_record(Some(&row("qwen")), &parsed, Some("qwen3-coder-plus")),
+            ServedModelRecord::Model("qwen3-coder-plus")
+        );
+        assert_eq!(
+            served_model_record(Some(&row("qwen")), &parsed, Some("  ")),
+            ServedModelRecord::Missing
+        );
+        assert_eq!(
+            served_model_record(Some(&row("mistral")), &parsed, None),
+            ServedModelRecord::Missing
+        );
+        assert_eq!(
+            served_model_record(Some(&row("kimi")), &parsed, Some("k2")),
+            ServedModelRecord::NotExposed
+        );
+        assert_eq!(
+            served_model_record(Some(&row("codex")), &parsed, Some("gpt")),
+            ServedModelRecord::NotExposed
+        );
+        assert_eq!(
+            served_model_record(None, &parsed, Some("x")),
+            ServedModelRecord::NotExposed
+        );
+        // A mutated row moves the source: kimi switched to MessageModel records the seat's model.
+        let mut kimi = row("kimi");
+        kimi.served_model_evidence = mcp_bridge::seat_profile::ModelEvidence::MessageModel;
+        assert_eq!(
+            served_model_record(Some(&kimi), &parsed, Some("k2")),
+            ServedModelRecord::Model("k2")
+        );
+        let empty = ParsedAgentResult::default();
+        assert_eq!(
+            served_model_record(Some(&row("gemini")), &empty, None),
+            ServedModelRecord::Missing
+        );
+    }
+
+    /// The call site's step reaches CallTelemetry::set_model for an ExportConfig / MessageModel seat and for agy, and
+    /// leaves the served model unset for kimi.
+    /// RED IF: record_served_model stops calling set_model with the parsed served model.
+    #[test]
+    fn record_served_model_sets_the_telemetry_model() {
+        let span = Span::none();
+        let parsed = ParsedAgentResult {
+            cli_version: Some("Gemini 3.1 Pro (High)".into()),
+            ..Default::default()
+        };
+        let cases: [(&str, Option<&str>, Option<&str>); 4] = [
+            ("mistral", Some("devstral-2"), Some("devstral-2")),
+            ("qwen", Some("qwen3-coder-plus"), Some("qwen3-coder-plus")),
+            ("gemini", None, Some("Gemini 3.1 Pro (High)")),
+            ("kimi", Some("k2"), None),
+        ];
+        for (seat, seat_model, want) in cases {
+            let mut tel = mcp_bridge::posthog::CallTelemetry::new(seat, "trace", None);
+            record_served_model(&mut tel, &span, Some(&row(seat)), &parsed, seat_model);
+            assert_eq!(tel.served_model(), want, "{seat}");
+            tel.rejected("test: the emitted event does not matter");
+        }
+    }
+
+    /// Each dispatch-policy consumer reads the row it is handed: a cloned row with the field changed changes the
+    /// output (attempt schedule, live progress, both parser-mode lists, sight repair).
+    /// RED IF: any of these consumers is a constant or per-agent match instead of reading the row field.
+    #[test]
+    fn dispatch_consumers_follow_mutated_rows() {
+        use mcp_bridge::seat_profile::{AttemptPolicy, LiveProgress};
+        let single = vec![(Duration::ZERO, None)];
+
+        let mut kimi = row("kimi");
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false),
+            attempt_schedule_for("kimi", None, false, false)
+        );
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false),
+            single
+        );
+        kimi.attempt_policy = AttemptPolicy::Retry3;
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false).len(),
+            3
+        );
+        kimi.attempt_policy = AttemptPolicy::GeminiFaildown;
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false).len(),
+            GEMINI_MODEL_FAILDOWN.len()
+        );
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, true, false),
+            single,
+            "a review stays one attempt"
+        );
+
+        let mut seat = row("kimi");
+        assert_eq!(
+            streams_live_progress_for_row(Some(&seat), None),
+            streams_live_progress("kimi", None)
+        );
+        seat.live_progress = LiveProgress::Buffered;
+        assert!(!streams_live_progress_for_row(Some(&seat), None));
+        seat.live_progress = LiveProgress::Streams;
+        assert!(streams_live_progress_for_row(Some(&seat), None));
+        seat.live_progress = LiveProgress::StreamsExceptAgy;
+        assert!(!streams_live_progress_for_row(
+            Some(&seat),
+            Some(GeminiBackend::Agy)
+        ));
+        assert!(streams_live_progress_for_row(
+            Some(&seat),
+            Some(GeminiBackend::GeminiCli)
+        ));
+
+        let mut rows = mcp_bridge::seat_profile::all_seats().to_vec();
+        assert_eq!(
+            modes_with_tool_records_from(&rows),
+            parser_modes_with_tool_records()
+        );
+        assert_eq!(
+            modes_that_classify_reads_from(&rows),
+            parser_modes_that_classify_reads()
+        );
+        assert_eq!(sight_repair_agents_from(&rows), sight_repair_agents());
+        for r in &mut rows {
+            match r.key {
+                "kimi" => {
+                    r.records_tool_calls = false;
+                    r.sight_repair = true;
+                }
+                "qwen" => r.classifies_reads = false,
+                "codex" => r.sight_repair = false,
+                _ => {}
+            }
+        }
+        let tool = modes_with_tool_records_from(&rows);
+        assert!(!tool.contains(&"kimi-stream-json"), "{tool:?}");
+        assert!(tool.contains(&"qwen-stream-json"), "{tool:?}");
+        let reads = modes_that_classify_reads_from(&rows);
+        assert!(!reads.contains(&"qwen-stream-json"), "{reads:?}");
+        assert!(reads.contains(&"kimi-stream-json"), "{reads:?}");
+        assert_eq!(sight_repair_agents_from(&rows), vec!["grok", "kimi"]);
     }
 }
