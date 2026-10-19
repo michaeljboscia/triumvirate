@@ -6705,7 +6705,31 @@ mod deepseek_dispatch_tests {
             .map(|n| n.to_string())
             .collect();
         names.push("antigravity".to_string());
-        let unescaped_quotes = |t: &str| t.matches('"').count() - t.matches("\\\"").count();
+        // Whether a double-quoted string literal is still open at the end of `t`. Inside a string a backslash escapes
+        // the next character; outside one, the char literals `'"'` and `'\"'` are not quotes.
+        let string_open = |t: &str| {
+            let c: Vec<char> = t.chars().collect();
+            let (mut open, mut i) = (false, 0);
+            while i < c.len() {
+                match c[i] {
+                    '\\' if open => i += 1,
+                    '"' => open = !open,
+                    '\'' if !open && c.get(i + 1) == Some(&'"') && c.get(i + 2) == Some(&'\'') => {
+                        i += 2
+                    }
+                    '\'' if !open
+                        && c.get(i + 1) == Some(&'\\')
+                        && c.get(i + 2) == Some(&'"')
+                        && c.get(i + 3) == Some(&'\'') =>
+                    {
+                        i += 3
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            open
+        };
         let mut found = Vec::new();
         let mut logical = String::new();
         let mut first = 0;
@@ -6719,10 +6743,15 @@ mod deepseek_dispatch_tests {
             }
             logical.push_str(l.trim_end_matches('\\'));
             logical.push(' ');
-            if unescaped_quotes(&logical) % 2 == 1 {
+            if string_open(&logical) {
                 continue;
             }
-            let text = std::mem::take(&mut logical);
+            // Collapse every whitespace run (repeated spaces, tabs, the seam of a joined line) to one space, so a
+            // trigger phrase cannot evade the match by spacing.
+            let text = std::mem::take(&mut logical)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             let prose = text.contains("supports only")
                 || text.contains("Supported:")
                 || text.contains("must be one of")
@@ -6783,6 +6812,46 @@ mod deepseek_dispatch_tests {
         let trigger = "    // Supported: ";
         let comment = format!("{trigger}{}", "\"codex\", \"grok\"\n");
         assert_eq!(hand_written_agent_lists(&comment), Vec::<String>::new());
+    }
+
+    /// Spacing must not hide a trigger phrase. The phrase pieces are held apart from the agent names so no single
+    /// source line of this test is itself a list.
+    /// RED IF: the scan matches trigger phrases without collapsing whitespace runs first (repeated spaces, tabs, or a
+    /// phrase split across a `\` continuation evade it).
+    #[test]
+    fn hand_written_list_scan_collapses_whitespace_runs() {
+        let names = "'codex', 'grok'";
+        let spaces = "must  be   one of";
+        let tabs = "must\tbe\t\tone of";
+        let fixtures = [
+            format!("    d = \"agent {spaces} {names}\";\n"),
+            format!("    d = \"agent {tabs} {names}\";\n"),
+            format!("    d = \"agent must \\\n        be one of {names}\";\n"),
+            format!("    d = \"agent must\t\\\n\tbe\tone of {names}\";\n"),
+        ];
+        for fixture in &fixtures {
+            assert_eq!(
+                hand_written_agent_lists(fixture).len(),
+                1,
+                "spaced list must fail: {fixture:?}"
+            );
+        }
+    }
+
+    /// A `'"'` char literal is not the start of a string: counting it as one keeps a phantom literal open, joins every
+    /// following line into it, and the list after it is never checked.
+    /// RED IF: the quote tracking counts the double quote inside a char literal.
+    #[test]
+    fn hand_written_list_scan_ignores_quote_char_literals() {
+        let names = "'codex', 'grok'";
+        for char_lit in ["'\"'", "'\\\"'"] {
+            let fixture = format!("    let q = {char_lit};\n    let d = \"Supported: {names}\";\n");
+            assert_eq!(
+                hand_written_agent_lists(&fixture).len(),
+                1,
+                "list after a quote char literal must fail: {fixture:?}"
+            );
+        }
     }
 
     /// The auth classifier must not fire on prose that merely mentions authentication.
