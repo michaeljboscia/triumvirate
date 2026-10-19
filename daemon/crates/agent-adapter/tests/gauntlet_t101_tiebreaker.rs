@@ -185,10 +185,10 @@ fn tool_start_and_completion_events_are_exact() {
 
     assert!(matches!(
         started.map(|event| event.state),
-        Some(WorkingState::ToolCallStarted { .. })
+        Some(WorkingState::ToolCallStarted)
     ));
     assert!(matches!(
         completed.map(|event| event.state),
-        Some(WorkingState::ToolCallCompleted { .. })
+        Some(WorkingState::ToolCallCompleted)
     ));
 }

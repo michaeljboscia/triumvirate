@@ -127,7 +127,7 @@ fn prompt_limit_accepts_exactly_64_kib() {
     );
 
     let invocation = build_kimi_invocation(&req).expect("prompt at byte limit is accepted");
-    assert_eq!(invocation.args[1].as_bytes().len(), 65_536);
+    assert_eq!(invocation.args[1].len(), 65_536);
 }
 
 #[test]
