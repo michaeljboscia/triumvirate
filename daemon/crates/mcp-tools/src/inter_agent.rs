@@ -1,17 +1,15 @@
 use crate::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use agent_worker::{WorkerAcquireMode, acquire_worker, dismiss_worker};
 use daemon_core::{
-    PublishResult, TurnOutcome, acquire_session_lock,
-    daemon_bind_addr as core_daemon_bind_addr,
+    PublishResult, TurnOutcome, acquire_session_lock, daemon_bind_addr as core_daemon_bind_addr,
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
     reload_session_if_enabled as core_reload_session_if_enabled, session_busy_wait,
     triumvirate_home_dir,
 };
 use daemon_http::{
-    DaemonRequestError, DaemonRequestFailure, daemon_ask_timeout_secs,
-    fetch_daemon_ask_agent, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
-    fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
-    fetch_daemon_status_snapshot,
+    DaemonRequestError, DaemonRequestFailure, daemon_ask_timeout_secs, fetch_daemon_ask_agent,
+    fetch_daemon_session_ask, fetch_daemon_session_dismiss, fetch_daemon_session_list,
+    fetch_daemon_session_spawn, fetch_daemon_status, fetch_daemon_status_snapshot,
 };
 use fallback_outbox::{count_pending_fallbacks, list_pending_fallback_paths};
 use mcp_bridge::{caller_driver_identity, is_supported_agent_name, normalize_agent_name};
@@ -21,21 +19,14 @@ use rmcp::{
 };
 use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest, DaemonHealthResponse,
-    DismissSessionRequest, SessionInfo, SessionListResponse, SessionPhase, SessionState, SpawnSessionRequest,
-    StatusResponse,
+    DismissSessionRequest, SessionInfo, SessionListResponse, SessionPhase, SessionState,
+    SpawnSessionRequest, StatusResponse,
 };
-use std::{
-    collections::HashMap,
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::{
     sync::Mutex,
     time::{Duration, Instant, sleep},
 };
-
 pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 pub type ExecuteAskAgentFn = for<'a> fn(
     &'a AskAgentRequest,

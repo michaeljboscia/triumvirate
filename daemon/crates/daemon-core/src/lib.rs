@@ -36,9 +36,7 @@ pub use replay::{
     DEFAULT_CAPACITY as REPLAY_BUFFER_DEFAULT_CAPACITY, EventReplayBuffer, ReplayResult,
 };
 pub use sequencer::EventSequencer;
-pub use version::{NAME, VERSION
-};
-
+pub use version::{NAME, VERSION};
 #[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
     root.join("dead-drop")

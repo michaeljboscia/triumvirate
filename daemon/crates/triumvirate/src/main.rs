@@ -2,58 +2,25 @@
 // issue for follow-up cleanup; remove the allow once the underlying lint is fixed.
 #![allow(clippy::collapsible_if, clippy::too_many_arguments, dead_code)]
 
-use clap::{Parser, Subcommand};
-use agent_worker::{
-    WorkerAcquireMode, acquire_worker, dismiss_worker,
-};
+use agent_worker::{WorkerAcquireMode, acquire_worker, dismiss_worker};
 #[cfg(test)]
 use agent_worker::{reset_worker_registry_for_tests, update_worker_session};
-use daemon_core::{
-    DaemonState,
-    daemon_bind_addr as core_daemon_bind_addr,
-    observability::ObservabilityBus,
-    publish_ws_event,
-    metrics::DaemonMetrics,
-    triumvirate_home_dir as core_triumvirate_home_dir,
-    ensure_daemon_token as core_ensure_daemon_token,
-    sessions_file_path as core_sessions_file_path,
-    load_json_file_if_exists as core_load_json_file_if_exists,
-    persist_json_file_if_enabled as core_persist_json_file_if_enabled,
-};
+use clap::{Parser, Subcommand};
 #[cfg(test)]
 #[cfg(test)]
 use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
+use daemon_core::{
+    DaemonState, daemon_bind_addr as core_daemon_bind_addr,
+    ensure_daemon_token as core_ensure_daemon_token,
+    load_json_file_if_exists as core_load_json_file_if_exists, metrics::DaemonMetrics,
+    observability::ObservabilityBus,
+    persist_json_file_if_enabled as core_persist_json_file_if_enabled, publish_ws_event,
+    sessions_file_path as core_sessions_file_path,
+    triumvirate_home_dir as core_triumvirate_home_dir,
+};
 #[cfg(test)]
 use daemon_http::{fetch_daemon_ask_agent, fetch_daemon_status};
 // T-208: new-seat session state machine (cross-process session lock, CAS publish).
-use daemon_core::{
-    PublishResult, TurnOutcome, acquire_session_lock,
-    reload_session_if_enabled as core_reload_session_if_enabled, session_busy_wait,
-};
-use shared_types::SessionPhase;
-#[cfg(test)]
-use daemon_http::{attempt_daemon_autostart_once, reset_daemon_autostart_flag_for_tests};
-use daemon_http::DaemonHttpState;
-use fallback_outbox::{
-    append_outbox_event, count_pending_fallbacks, list_pending_fallback_paths,
-    spawn_dead_drop as create_dead_drop_fallback,
-};
-use ledger::LedgerStore;
-#[cfg(test)]
-use peer_review::PeerReviewEngine;
-use mcp_bridge::{
-    codex_command, is_bearer_authorized, is_supported_agent_name, normalize_agent_name,
-};
-#[cfg(not(test))]
-use mcp_bridge::use_daemon_for_mcp_from_env;
-#[cfg(test)]
-use mcp_bridge::should_use_daemon_proxy;
-use mcp_tools::{
-    aliases as mcp_aliases,
-    ProgressEmitter, fleet as mcp_fleet,
-    gemini_query as mcp_gemini_query, knowledge, review as mcp_review,
-    token_tools as mcp_token_tools,
-};
 use axum::{
     Json as AxumJson, Router,
     body::Body,
@@ -64,13 +31,34 @@ use axum::{
     response::Response,
     routing::{get, get_service, post, post_service},
 };
+use daemon_core::{
+    PublishResult, TurnOutcome, acquire_session_lock,
+    reload_session_if_enabled as core_reload_session_if_enabled, session_busy_wait,
+};
+use daemon_http::DaemonHttpState;
+#[cfg(test)]
+use daemon_http::{attempt_daemon_autostart_once, reset_daemon_autostart_flag_for_tests};
+use fallback_outbox::{
+    append_outbox_event, count_pending_fallbacks, list_pending_fallback_paths,
+    spawn_dead_drop as create_dead_drop_fallback,
+};
+use ledger::LedgerStore;
+#[cfg(test)]
+use mcp_bridge::should_use_daemon_proxy;
+#[cfg(not(test))]
+use mcp_bridge::use_daemon_for_mcp_from_env;
+use mcp_bridge::{
+    codex_command, is_bearer_authorized, is_supported_agent_name, normalize_agent_name,
+};
+use mcp_tools::{
+    ProgressEmitter, aliases as mcp_aliases, fleet as mcp_fleet, gemini_query as mcp_gemini_query,
+    knowledge, review as mcp_review, token_tools as mcp_token_tools,
+};
+#[cfg(test)]
+use peer_review::PeerReviewEngine;
 use rmcp::{
     ErrorData as McpError, Json, ServerHandler, ServiceExt,
-    handler::server::{
-        router::tool::ToolRouter,
-        tool::ToolCallContext,
-        wrapper::Parameters,
-    },
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
         CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
         ServerCapabilities, ServerInfo, Tool,
@@ -79,38 +67,29 @@ use rmcp::{
     tool, tool_router,
     transport::stdio,
 };
-use shared_types::{
-    AskAgentRequest, AskAgentResponse, AskSessionRequest,
-    CancelTaskRequest as AbeCancelTaskRequest, CancelTaskResponse as AbeCancelTaskResponse,
-    DispatchCodexRequest, DispatchCodexResponse,
-    DispatchCodexWorktreeRequest, DispatchCodexWorktreeResponse, GetTaskOutputRequest,
-    GetTaskOutputResponse, GetTaskStatusRequest, GetTaskStatusResponse,
-    QueryGeminiRequest, QueryGeminiResponse, QueryGeminiReviewRequest, QueryGeminiReviewResponse,
-    TaskCompleteRequest,
-    DismissSessionRequest,
-    FallbackAckRequest, FallbackGcRequest, FallbackGcResponse, FallbackListRequest,
-    FallbackListResponse, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest,
-    FleetCancelRequest, FleetCancelResponse, FleetClaimTaskRequest, FleetClaimTaskResponse,
-    FleetSpawnRequest, FleetSpawnResponse, FleetStatusRequest, FleetStatusResponse, FleetTaskListRequest,
-    FleetTaskListResponse,
-    ReviewRequestResponse, ReviewRequestTool, ReviewStatusRequest, ReviewStatusResponse,
-    BlindValidateRequest,
-    BlindValidateResponse,
-    ReviewSubmitRequest,
-    LessonAddResponse, LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse,
-    LessonValidateRequest, ManualRecord,
-    MemoryReadRequest, MemoryReadResponse,
-    NewLesson,
-    MemoryWriteRequest, MemoryWriteResponse, OutboxRecentRequest,
-    OutboxRecentResponse, SessionInfo, SessionListResponse, SpawnSessionRequest,
-    ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
-    ScratchpadWriteResponse, StatusResponse, DaemonHealthResponse,
-    GcResult, HealthStatus, SessionDetail,
-    SessionState,
-};
-use token_economics::{TokenDb, TokenRecord};
 #[cfg(test)]
 use shared_types::GeminiReviewVerdict;
+use shared_types::SessionPhase;
+use shared_types::{
+    AskAgentRequest, AskAgentResponse, AskSessionRequest, BlindValidateRequest,
+    BlindValidateResponse, CancelTaskRequest as AbeCancelTaskRequest,
+    CancelTaskResponse as AbeCancelTaskResponse, DaemonHealthResponse, DismissSessionRequest,
+    DispatchCodexRequest, DispatchCodexResponse, DispatchCodexWorktreeRequest,
+    DispatchCodexWorktreeResponse, FallbackAckRequest, FallbackGcRequest, FallbackGcResponse,
+    FallbackListRequest, FallbackListResponse, FleetCancelRequest, FleetCancelResponse,
+    FleetClaimTaskRequest, FleetClaimTaskResponse, FleetSpawnRequest, FleetSpawnResponse,
+    FleetStatusRequest, FleetStatusResponse, FleetTaskListRequest, FleetTaskListResponse, GcResult,
+    GetTaskOutputRequest, GetTaskOutputResponse, GetTaskStatusRequest, GetTaskStatusResponse,
+    HealthStatus, LedgerQueryRequest, LedgerQueryResponse, LedgerSessionRequest, LessonAddResponse,
+    LessonListRequest, LessonListResponse, LessonQueryRequest, LessonQueryResponse,
+    LessonValidateRequest, ManualRecord, MemoryReadRequest, MemoryReadResponse, MemoryWriteRequest,
+    MemoryWriteResponse, NewLesson, OutboxRecentRequest, OutboxRecentResponse, QueryGeminiRequest,
+    QueryGeminiResponse, QueryGeminiReviewRequest, QueryGeminiReviewResponse,
+    ReviewRequestResponse, ReviewRequestTool, ReviewStatusRequest, ReviewStatusResponse,
+    ReviewSubmitRequest, ScratchpadListRequest, ScratchpadListResponse, ScratchpadWriteRequest,
+    ScratchpadWriteResponse, SessionDetail, SessionInfo, SessionListResponse, SessionState,
+    SpawnSessionRequest, StatusResponse, TaskCompleteRequest,
+};
 #[cfg(test)]
 use shared_types::{DaemonStatusSnapshot, LifecycleEvent, OutboxEvent};
 use std::{
@@ -120,11 +99,9 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
-    sync::{
-        Arc,
-        OnceLock,
-    },
+    sync::{Arc, OnceLock},
 };
+use token_economics::{TokenDb, TokenRecord};
 use tokio::{
     sync::{Mutex, broadcast},
     time::{Duration, Instant, sleep},
@@ -132,20 +109,19 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-mod agent_exec;
-mod wiki_usage;
-mod wiki_search;
-mod blind_validate;
-mod agy;
-mod streaming;
-mod http_mcp;
 mod abe;
+mod agent_exec;
+mod agy;
+mod blind_validate;
 mod cli_ops;
 mod git_ops_impl;
+mod http_mcp;
 mod proxy;
+mod streaming;
 mod tracing_setup;
 mod watch;
-
+mod wiki_search;
+mod wiki_usage;
 #[derive(Debug, Parser)]
 #[command(name = "triumvirate")]
 #[command(about = "Triumvirate v2 daemon + MCP bridge binary")]

@@ -7166,9 +7166,10 @@ mod deepseek_dispatch_tests {
             message: "what is 2+2".to_string(),
             ..Default::default()
         };
-        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
-            .await
-            .expect("dispatch ok");
+        let parsed =
+            run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+                .await
+                .expect("dispatch ok");
 
         assert_eq!(parsed.response_text, "clean final answer");
         assert!(
@@ -7212,9 +7213,10 @@ mod deepseek_dispatch_tests {
             deepseek_include_reasoning: Some(true),
             ..Default::default()
         };
-        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
-            .await
-            .expect("dispatch ok");
+        let parsed =
+            run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+                .await
+                .expect("dispatch ok");
 
         assert!(
             parsed
