@@ -6600,6 +6600,35 @@ fn seat_queue_heartbeat() -> Duration {
         .unwrap_or(Duration::from_secs(30))
 }
 
+fn effective_cwd_for(canonical: &Path, seat_home: &Path) -> PathBuf {
+    if canonical.parent().is_none() {
+        seat_home.join("workdir")
+    } else {
+        canonical.to_path_buf()
+    }
+}
+
+fn new_seat_effective_cwd(cwd: &str, seat_home: &Path) -> anyhow::Result<String> {
+    let cwd_path = Path::new(cwd);
+    let absolute = if cwd_path.is_absolute() {
+        cwd_path.to_path_buf()
+    } else {
+        let Ok(current_dir) = std::env::current_dir() else {
+            return Ok(cwd.to_string());
+        };
+        current_dir.join(cwd_path)
+    };
+    let Ok(canonical) = absolute.canonicalize() else {
+        return Ok(cwd.to_string());
+    };
+    let effective = effective_cwd_for(&canonical, seat_home);
+    if effective == canonical {
+        return Ok(cwd.to_string());
+    }
+    fs::create_dir_all(&effective)?;
+    Ok(effective.to_string_lossy().into_owned())
+}
+
 pub(crate) async fn run_new_seat(
     seat: &str,
     message: &str,
@@ -6622,6 +6651,10 @@ pub(crate) async fn run_new_seat(
     let th = mcp_bridge::seat_state::triumvirate_home().map_err(anyhow::Error::msg)?;
     let seat_home = mcp_bridge::containment::seat_home(&th, seat).map_err(anyhow::Error::msg)?;
     mcp_bridge::containment::write_seat_files(&seat_home, profile).map_err(anyhow::Error::msg)?;
+    let cwd_buf = new_seat_effective_cwd(cwd, &seat_home)?;
+    if cwd_buf != cwd {
+        tracing::info!(seat, "new-seat root cwd replaced with seat workdir");
+    }
     // Resolved BEFORE the child's HOME moves to the seat home.
     let bin = mcp_bridge::new_seat_bin(seat).map_err(anyhow::Error::msg)?;
     // A test build never falls through to a real CLI: the binary must be named explicitly (a mock).
@@ -6700,7 +6733,7 @@ pub(crate) async fn run_new_seat(
         &output_dir,
         env_add,
         message,
-        cwd,
+        &cwd_buf,
         session_id,
         model,
         events_tx,
@@ -14641,6 +14674,68 @@ pub(crate) mod seven_primes_gate_tests {
         crate::tests::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// RED IF: a canonical root cwd is not mapped to the seat workdir, or the workdir is not created.
+    #[test]
+    fn new_seat_effective_cwd_maps_root_to_created_seat_workdir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seat_home = dir.path().join("seat-home");
+
+        let effective = new_seat_effective_cwd("/", &seat_home).expect("effective cwd");
+
+        assert_eq!(Path::new(&effective), seat_home.join("workdir"));
+        assert!(seat_home.join("workdir").is_dir());
+    }
+
+    /// RED IF: an explicit non-root cwd is rewritten, or a missing cwd bypasses the existing error path.
+    #[test]
+    fn new_seat_effective_cwd_preserves_non_root_and_missing_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seat_home = dir.path().join("seat-home");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let missing = dir.path().join("missing");
+
+        assert_eq!(
+            new_seat_effective_cwd(&cwd.to_string_lossy(), &seat_home).expect("existing cwd"),
+            cwd.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            new_seat_effective_cwd(&missing.to_string_lossy(), &seat_home).expect("missing cwd"),
+            missing.to_string_lossy().as_ref()
+        );
+        assert!(!missing.exists());
+    }
+
+    /// RED IF: the pure root predicate or its non-root identity behavior changes.
+    #[test]
+    fn new_seat_effective_cwd_core_maps_only_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seat_home = dir.path().join("seat-home");
+        let non_root = dir.path().join("cwd");
+
+        assert_eq!(
+            effective_cwd_for(Path::new("/"), &seat_home),
+            seat_home.join("workdir")
+        );
+        assert_eq!(effective_cwd_for(&non_root, &seat_home), non_root);
+    }
+
+    /// RED IF: run_new_seat audits the filesystem root instead of the isolated seat workdir.
+    #[tokio::test]
+    async fn run_new_seat_with_root_cwd_uses_seat_workdir() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+
+        let answer = run_new_seat("kimi", "root cwd", "/", None, None, None, true)
+            .await
+            .expect("root cwd dispatch");
+
+        assert_eq!(answer.parsed.response_text, "kimi answered");
+        assert_eq!(m.ran(), ["kimi"]);
+        assert!(m.home.join("homes/kimi/workdir").is_dir());
     }
 
     fn ask(agent: &str, cwd: &str, surface: AskSurface, origin: Origin) -> AskAgentRequest {
