@@ -17,13 +17,13 @@ jobs:
       run:
         working-directory: daemon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system deps
         run: sudo apt-get update -qq && sudo apt-get install -y libglib2.0-dev protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: daemon
       - name: Check
@@ -44,18 +44,18 @@ jobs:
       run:
         working-directory: daemon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system deps
         run: sudo apt-get update -qq && sudo apt-get install -y libglib2.0-dev protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: daemon
       # The ABE binary-oracle tests parse the argv Triumvirate builds against the REAL codex
       # binary (`codex exec <flags> --help`, no login needed). They fail loud when codex is
       # absent, on purpose: a skipped oracle is the quiet pass that let three dispatch surfaces
       # ship flags codex 0.154 rejects. Latest on purpose too, so a removed flag goes red here.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Install codex CLI for the binary oracle
@@ -94,7 +94,7 @@ jobs:
       run:
         working-directory: daemon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y libglib2.0-dev protobuf-compiler
@@ -102,16 +102,16 @@ jobs:
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: daemon
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p triumvirate
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: daemon/target/${{ matrix.target }}/release/triumvirate
