@@ -20,11 +20,12 @@ for seat in ("kimi","mistral","qwen"):
  if not isinstance(row,dict): print(f"RESULT: FAIL missing seat: {seat}"); raise SystemExit(1)
  if row.get("status")=="PASS":
   n=row.get("tests_run"); m=re.search(r"test result: ok\. ([1-9][0-9]*) passed",row.get("cargo_summary",""))
-  if not isinstance(n,int) or n<1 or not m or int(m.group(1))!=n or not all(row.get(k) for k in ("cli_version","served_model","timestamp")): print(f"RESULT: FAIL incomplete PASS: {seat}"); raise SystemExit(1)
+  if not isinstance(n,int) or n<1 or not m or int(m.group(1))!=n or not all(row.get(k) for k in ("cli_version","timestamp")) or "served_model" not in row: print(f"RESULT: FAIL incomplete PASS: {seat}"); raise SystemExit(1)
   passed+=1
  elif row.get("status")=="NOT LAUNCHED":
   if not row.get("reason"): print(f"RESULT: FAIL missing reason: {seat}"); raise SystemExit(1)
  else: print(f"RESULT: FAIL invalid status: {seat}"); raise SystemExit(1)
 if not passed: print("RESULT: FAIL zero PASS seats"); raise SystemExit(1)
-print(f"RESULT: PASS code_tree matches; seats=3; pass={passed}")
+# served_model may be null: REQ-043, a seat whose stream names no model (kimi, mistral) records it as unknown.
+print(f"RESULT: PASS code_tree matches; {passed} of 3 seats PASS")
 PY
