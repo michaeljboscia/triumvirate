@@ -59,10 +59,11 @@ fn a_second_acquisition_waits_until_the_first_guard_drops() {
         .recv()
         .expect("observe second acquisition attempt");
 
-    assert_eq!(
+    // Orchestrator compile fix (GAUNTLET triage): the Result holds a guard, which has no PartialEq; same assertion.
+    assert!(matches!(
         acquired_rx.recv_timeout(Duration::from_millis(250)),
         Err(mpsc::RecvTimeoutError::Timeout)
-    );
+    ));
 
     drop(first_guard);
 
@@ -179,7 +180,9 @@ fn killing_the_holding_process_releases_the_lock() {
             .read_line(&mut line)
             .expect("read child readiness output");
         assert_ne!(bytes, 0, "child exited before reporting lock acquisition");
-        if line.trim() == CHILD_READY_LINE {
+        // Orchestrator fix (GAUNTLET triage): libtest prints "test <name> ... " with no newline before the child's output,
+        // so the ready marker shares a line; an exact match never fired and the parent waited forever.
+        if line.contains(CHILD_READY_LINE) {
             break;
         }
     }
@@ -202,10 +205,11 @@ fn killing_the_holding_process_releases_the_lock() {
         .recv()
         .expect("observe parent acquisition attempt");
 
-    assert_eq!(
+    // Orchestrator compile fix (GAUNTLET triage): the Result holds a guard, which has no PartialEq; same assertion.
+    assert!(matches!(
         acquired_rx.recv_timeout(Duration::from_millis(250)),
         Err(mpsc::RecvTimeoutError::Timeout)
-    );
+    ));
 
     child.kill().expect("kill child lock holder");
     let status = child.wait().expect("reap child lock holder");
