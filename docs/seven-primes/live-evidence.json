@@ -1,29 +1,29 @@
 {
-  "code_tree": "cb2bc94c4087965427f2338ac19f473a3bb44944",
+  "code_tree": "b29e191c65c757483200f9de14d88744478941d0",
   "seats": {
     "kimi": {
-      "cargo_summary": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 24.06s",
+      "cargo_summary": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 35.99s",
       "cli_version": "2.2.0",
       "served_model": null,
       "status": "PASS",
       "tests_run": 4,
-      "timestamp": "2026-10-19T11:50:31Z"
+      "timestamp": "2026-10-19T12:13:18Z"
     },
     "mistral": {
-      "cargo_summary": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 53.42s",
+      "cargo_summary": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 41.34s",
       "cli_version": "2.26.1",
       "served_model": null,
       "status": "PASS",
       "tests_run": 4,
-      "timestamp": "2026-10-19T11:51:30Z"
+      "timestamp": "2026-10-19T12:14:06Z"
     },
     "qwen": {
-      "cargo_summary": "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 19.48s",
+      "cargo_summary": "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 29.57s",
       "cli_version": "0.25.2",
       "served_model": "qwen3.7-plus",
       "status": "PASS",
       "tests_run": 3,
-      "timestamp": "2026-10-19T11:51:59Z"
+      "timestamp": "2026-10-19T12:14:41Z"
     }
   }
 }
