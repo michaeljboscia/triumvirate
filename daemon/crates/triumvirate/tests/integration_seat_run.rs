@@ -110,7 +110,14 @@ impl World {
         let wt = repo_root.join("wt-member-1");
         git(
             &parent,
-            &["worktree", "add", "-q", "-b", "writer", &wt.to_string_lossy()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "writer",
+                &wt.to_string_lossy(),
+            ],
         );
         let w = Self {
             _sys: sys,
@@ -291,7 +298,10 @@ fn assert_pid_gone(pid: &str) {
 /// The parent repo is exactly its base commit, with nothing untracked.
 fn assert_parent_untouched(w: &World) {
     assert_eq!(
-        git(&w.parent, &["status", "--porcelain", "--untracked-files=all"]),
+        git(
+            &w.parent,
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
         ""
     );
     assert_eq!(
@@ -337,7 +347,10 @@ fn writer_commits_its_work_for_every_seat() {
             "{seat}: the seat saw its prompt file"
         );
         let argv = w.mock_file(seat, "argv");
-        assert!(argv.contains(&format!("W1-PROMPT-{seat}")), "{seat}: {argv}");
+        assert!(
+            argv.contains(&format!("W1-PROMPT-{seat}")),
+            "{seat}: {argv}"
+        );
         let writer_marker = match seat {
             "kimi" => "rw-agent.md",
             "mistral" => "auto-approve",
@@ -354,7 +367,10 @@ fn writer_commits_its_work_for_every_seat() {
 #[test]
 fn a_write_into_the_parent_repo_is_an_escape_and_commits_nothing() {
     let w = World::new(None);
-    w.set_action("kimi", "echo x > \"$W1_PARENT/escape.txt\"\necho ok > out.txt\n");
+    w.set_action(
+        "kimi",
+        "echo x > \"$W1_PARENT/escape.txt\"\necho ok > out.txt\n",
+    );
     let before = w.head();
     let out = w.run("kimi", "p");
     let line = last_stderr_line(&out);
@@ -508,7 +524,11 @@ fn real_seatbelt_blocks_the_parent_and_allows_the_worktree() {
         "/var/folders",
         "/tmp",
     ] {
-        assert!(!w.parent.starts_with(root), "{} is seat-writable", w.parent.display());
+        assert!(
+            !w.parent.starts_with(root),
+            "{} is seat-writable",
+            w.parent.display()
+        );
     }
     w.set_action(
         "kimi",
@@ -517,7 +537,10 @@ fn real_seatbelt_blocks_the_parent_and_allows_the_worktree() {
     let before = w.head();
     let out = w.run("kimi", "p");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(!w.parent.join("escape.txt").exists(), "the seatbelt let the write through");
+    assert!(
+        !w.parent.join("escape.txt").exists(),
+        "the seatbelt let the write through"
+    );
     let record = w.mock_file("kimi", "write_record");
     assert!(
         record.starts_with("write_exit=") && record.trim() != "write_exit=0",
