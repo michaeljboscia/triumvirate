@@ -2308,10 +2308,21 @@ mod abe_worktree_tests {
     #[test]
     fn abe_11_codex_worktree_argv_is_unchanged() {
         let _guard = env_guard();
-        let dirs = vec!["/repo/.git".to_string(), "/repo/.git/worktrees/t".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("codex", &resolver, "do the task", "/wt", &dirs, None, None, None)
-                .expect("codex worktree");
+        let dirs = vec![
+            "/repo/.git".to_string(),
+            "/repo/.git/worktrees/t".to_string(),
+        ];
+        let (cmd, args) = build_worktree_worker_argv(
+            "codex",
+            &resolver,
+            "do the task",
+            "/wt",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("codex worktree");
         assert_eq!(cmd, "/bin/codex");
         assert_eq!(args[0], "exec");
         assert_eq!(&args[1..3], ["--sandbox", "workspace-write"], "got: {args:?}");
@@ -2333,9 +2344,17 @@ mod abe_worktree_tests {
     fn abe_12_claude_worktree_worker_can_write_and_reach_the_parent_git() {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("claude", &resolver, "do the task", "/wt", &dirs, None, None, None)
-                .expect("claude worktree");
+        let (cmd, args) = build_worktree_worker_argv(
+            "claude",
+            &resolver,
+            "do the task",
+            "/wt",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("claude worktree");
         assert_eq!(cmd, "/bin/claude");
         let joined = args.join(" ");
         assert!(
@@ -2365,9 +2384,17 @@ mod abe_worktree_tests {
     fn abe_13_grok_worktree_worker_is_writable_and_cannot_reach_the_parent_git() {
         let _guard = env_guard();
         let dirs = vec!["/repo/.git".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("grok", &resolver, "do the task", "/wt", &dirs, None, None, None)
-                .expect("grok worktree");
+        let (cmd, args) = build_worktree_worker_argv(
+            "grok",
+            &resolver,
+            "do the task",
+            "/wt",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("grok worktree");
         assert_eq!(cmd, "/bin/grok");
         let joined = args.join(" ");
         assert!(joined.contains("--sandbox workspace"), "a worker writes; got: {joined}");
@@ -2421,9 +2448,10 @@ mod abe_worktree_tests {
             "/repo/.git".to_string(),
             "/repo/.git/worktrees/task-7".to_string(),
         ];
-        let (_, args) =
-            build_worktree_worker_argv("claude", &resolver, "the task", "/wt", &dirs, None, None, None)
-                .expect("claude worktree");
+        let (_, args) = build_worktree_worker_argv(
+            "claude", &resolver, "the task", "/wt", &dirs, None, None, None,
+        )
+        .expect("claude worktree");
 
         let at = args.iter().position(|a| a == "--add-dir").expect("--add-dir present");
         assert_eq!(
@@ -2468,8 +2496,9 @@ mod abe_worktree_tests {
     fn abe_14_an_unbuildable_worktree_agent_is_refused() {
         let _guard = env_guard();
         for agent in ["gemini", "deepseek"] {
-            let err = build_worktree_worker_argv(agent, &resolver, "task", "/wt", &[], None, None, None)
-                .expect_err("must refuse rather than spawn codex");
+            let err =
+                build_worktree_worker_argv(agent, &resolver, "task", "/wt", &[], None, None, None)
+                    .expect_err("must refuse rather than spawn codex");
             assert!(err.contains("cannot dispatch"), "got: {err}");
         }
     }
@@ -2714,8 +2743,18 @@ mod abe_binary_oracle_tests {
             "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it exists to close. \
              Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
         );
-        let resolver = |agent: &str| (if agent == "codex" { bin.clone() } else { format!("/bin/{agent}") }, Vec::new());
-        let (cmd, args) = build_worker_argv("codex", &resolver, "noop task", "/tmp").expect("codex argv");
+        let resolver = |agent: &str| {
+            (
+                if agent == "codex" {
+                    bin.clone()
+                } else {
+                    format!("/bin/{agent}")
+                },
+                Vec::new(),
+            )
+        };
+        let (cmd, args) =
+            build_worker_argv("codex", &resolver, "noop task", "/tmp").expect("codex argv");
         parses_on_installed_binary(&cmd, &args).unwrap();
     }
 
@@ -2730,10 +2769,28 @@ mod abe_binary_oracle_tests {
             "no codex on PATH: this oracle cannot run, and a skipped oracle is the quiet pass it exists to close. \
              Install codex or set TRIUMVIRATE_SKIP_CODEX_ORACLE=1 to skip loudly.",
         );
-        let resolver = |agent: &str| (if agent == "codex" { bin.clone() } else { format!("/bin/{agent}") }, Vec::new());
+        let resolver = |agent: &str| {
+            (
+                if agent == "codex" {
+                    bin.clone()
+                } else {
+                    format!("/bin/{agent}")
+                },
+                Vec::new(),
+            )
+        };
         let dirs = vec!["/tmp".to_string()];
-        let (cmd, args) =
-            build_worktree_worker_argv("codex", &resolver, "noop task", "/tmp", &dirs, None, None, None).expect("codex argv");
+        let (cmd, args) = build_worktree_worker_argv(
+            "codex",
+            &resolver,
+            "noop task",
+            "/tmp",
+            &dirs,
+            None,
+            None,
+            None,
+        )
+        .expect("codex argv");
         parses_on_installed_binary(&cmd, &args).unwrap();
     }
 }
