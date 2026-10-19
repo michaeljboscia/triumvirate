@@ -289,7 +289,7 @@ fn test_should_reject_prompt_one_byte_over_max() {
     // REQ-024 boundary: 65537 bytes rejected with the code first
     let d = dirs();
     let p = "a".repeat(MAX_PROMPT_BYTES + 1);
-    let err = build(&d, &p, None, None, &[]).err().expect("must be rejected");
+    let err = build(&d, &p, None, None, &[]).expect_err("must be rejected");
     assert!(err.starts_with("prompt_too_large_for_mistral"), "was {err:?}");
 }
 
@@ -298,7 +298,7 @@ fn test_should_reject_65_kib_prompt() {
     // REQ-024 reality test: 65 KiB prompt
     let d = dirs();
     let p = "x".repeat(65 * 1024);
-    let err = build(&d, &p, None, None, &[]).err().expect("must be rejected");
+    let err = build(&d, &p, None, None, &[]).expect_err("must be rejected");
     assert!(err.starts_with("prompt_too_large_for_mistral"), "was {err:?}");
 }
 
@@ -310,7 +310,7 @@ fn test_should_measure_prompt_size_in_bytes_not_chars() {
     assert_eq!(at.len(), 65536);
     assert!(build(&d, &at, None, None, &[]).is_ok());
     let over = "\u{e9}".repeat(32769);
-    let err = build(&d, &over, None, None, &[]).err().expect("must be rejected");
+    let err = build(&d, &over, None, None, &[]).expect_err("must be rejected");
     assert!(err.starts_with("prompt_too_large_for_mistral"), "was {err:?}");
 }
 

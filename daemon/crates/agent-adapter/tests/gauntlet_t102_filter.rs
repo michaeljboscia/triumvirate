@@ -337,7 +337,7 @@ fn test_should_keep_each_read_file_effect_as_its_own_record_in_order() {
         .result
         .tool_calls
         .iter()
-        .map(|r| serde_json::from_str::<Value>((r.args_json.as_deref().unwrap())).unwrap()["filePath"].as_str().unwrap().to_string())
+        .map(|r| serde_json::from_str::<Value>(r.args_json.as_deref().unwrap()).unwrap()["filePath"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(paths, vec!["/a/one.rs", "/a/two.rs", "/a/three.rs"]);
 }
