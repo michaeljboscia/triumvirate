@@ -345,16 +345,15 @@ fn is_configured_only_enables_on_exact_one() {
     let var = "TRIUMVIRATE_ENABLE_GAUNTLETPROBE";
 
     unsafe { std::env::remove_var(var) };
-    assert_eq!(seat_state::is_configured("gauntletprobe").unwrap(), false);
+    assert!(!seat_state::is_configured("gauntletprobe").unwrap());
 
     unsafe { std::env::set_var(var, "1") };
-    assert_eq!(seat_state::is_configured("gauntletprobe").unwrap(), true);
+    assert!(seat_state::is_configured("gauntletprobe").unwrap());
 
     for not_enabled in ["true", "yes", "0", "", "11"] {
         unsafe { std::env::set_var(var, not_enabled) };
-        assert_eq!(
-            seat_state::is_configured("gauntletprobe").unwrap(),
-            false,
+        assert!(
+            !seat_state::is_configured("gauntletprobe").unwrap(),
             "value {not_enabled:?} must not enable the seat"
         );
     }
