@@ -6552,6 +6552,17 @@ fn build_new_seat_invocation(
 /// One read-only dispatch to a new seat (kimi, mistral, qwen). The builder always emits the read-only argv; `read_only`
 /// only picks the timeout, as the claude arm does. Exactly one attempt: a quota failure is terminal and opens the seat's
 /// breaker, a 403 writes suspended.json.
+/// How often a call queued on a seat lock reports progress (TRIUMVIRATE_SEAT_QUEUE_HEARTBEAT_SECS, default 30 s). It
+/// must stay well under every seat's stall window (780 s) so queued calls are never stall-killed.
+fn seat_queue_heartbeat() -> Duration {
+    std::env::var("TRIUMVIRATE_SEAT_QUEUE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30))
+}
+
 pub(crate) async fn run_new_seat(
     seat: &str,
     message: &str,
@@ -6597,13 +6608,36 @@ pub(crate) async fn run_new_seat(
     {
         let (lock_home, lock_seat) = (th.clone(), seat.to_string());
         let waited = Instant::now();
-        let guard = tokio::task::spawn_blocking(move || {
+        let mut acquire = tokio::task::spawn_blocking(move || {
             daemon_core::seat_lock::acquire_seat_lock(&lock_home, &lock_seat)
-        })
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|r| r)
-        .map_err(|e| anyhow::anyhow!("seat_lock_unavailable:{seat}: {e}"))?;
+        });
+        // A call queued behind another call on the same seat is not stalled: the ask-path stall clock reads silence
+        // on events_tx as a hang, so a long run ahead of us would get this call killed before it ever spawned. Emit a
+        // "queued" heartbeat while waiting. The connector timeout still bounds the wait. If this future is dropped,
+        // the blocking task finishes, and the guard it returns is dropped with the discarded handle.
+        let mut heartbeat = tokio::time::interval(seat_queue_heartbeat());
+        heartbeat.tick().await;
+        let joined = loop {
+            tokio::select! {
+                r = &mut acquire => break r,
+                _ = heartbeat.tick() => emit_working_event(
+                    events_tx.as_ref(),
+                    WorkingStateEvent {
+                        agent: seat.to_string(),
+                        state: WorkingState::Unknown,
+                        detail: format!("queued: waiting for the {seat} seat lock"),
+                        tool_name: None,
+                        tool_args_json: None,
+                        token_usage: None,
+                        ts_ms: Some(core_unix_time_ms()),
+                    },
+                ),
+            }
+        };
+        let guard = joined
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
+            .map_err(|e| anyhow::anyhow!("seat_lock_unavailable:{seat}: {e}"))?;
         tracing::debug!(
             seat,
             waited_ms = waited.elapsed().as_millis() as u64,

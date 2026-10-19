@@ -1377,6 +1377,47 @@ async fn a_stall_killed_call_releases_the_seat() {
     );
 }
 
+/// A call queued on the seat lock behind a long, progressing run is NOT stall-killed while it waits: the queued call
+/// emits a heartbeat (TRIUMVIRATE_SEAT_QUEUE_HEARTBEAT_SECS) that the stall clock reads as progress.
+/// RED IF: the lock wait counts as silence, so a call queued longer than the stall window fails "stalled after" before
+/// its mock ever ran.
+#[tokio::test]
+async fn a_queued_call_is_not_stall_killed_while_waiting() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.extra_env
+        .push(("TRIUMVIRATE_STALL_SECS_KIMI".into(), "3".into()));
+    rig.extra_env
+        .push(("TRIUMVIRATE_SEAT_QUEUE_HEARTBEAT_SECS".into(), "1".into()));
+    // The first run streams a progress line every second for 6 s (never stalled); later runs answer at once.
+    rig.set_action(
+        "kimi",
+        &timed_action(
+            "if mkdir \"$D/first.d\" 2>/dev/null; then for i in 1 2 3 4 5 6; do echo '{\"role\":\"assistant\",\"content\":\"tick\"}'; sleep 1; done; fi",
+        ),
+    );
+    rig.start_daemon().await;
+    let (a, b) = (fresh_cwd(&rig, "cwd-a"), fresh_cwd(&rig, "cwd-b"));
+    let first = rig.ask_in("kimi", "first", &a);
+    let second = async {
+        wait_for_starts(&rig, "kimi", 1).await;
+        rig.ask_in("kimi", "second", &b).await
+    };
+    let (ra, rb) = tokio::join!(first, second);
+    ra.unwrap_or_else(|e| panic!("first call (it streamed progress): {e}\n{}", rig.log_text()));
+    let resp =
+        rb.unwrap_or_else(|e| panic!("queued second call was killed: {e}\n{}", rig.log_text()));
+    assert_eq!(resp["response"], fixture("kimi").0);
+    let runs = intervals(&rig, "kimi");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    // It really was queued longer than the 3 s window: the second mock started about 6 s after the first.
+    assert!(
+        runs[1].0 >= runs[0].0 + 4_000_000_000,
+        "second started {} ms after the first",
+        (runs[1].0 - runs[0].0) / 1_000_000
+    );
+}
+
 /// A kimi call and a qwen call overlap in time: the lock is per seat, not global.
 /// RED IF: the lock becomes global (one file for every seat) or new seats are serialized some other way.
 #[tokio::test]
