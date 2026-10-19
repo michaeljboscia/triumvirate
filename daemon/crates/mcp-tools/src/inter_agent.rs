@@ -1,8 +1,11 @@
 use crate::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use agent_worker::{WorkerAcquireMode, acquire_worker, dismiss_worker};
 use daemon_core::{
+    PublishResult, TurnOutcome, acquire_session_lock,
     daemon_bind_addr as core_daemon_bind_addr,
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
+    reload_session_if_enabled as core_reload_session_if_enabled, session_busy_wait,
+    triumvirate_home_dir,
 };
 use daemon_http::{
     DaemonRequestError, DaemonRequestFailure, daemon_ask_timeout_secs,
@@ -18,7 +21,7 @@ use rmcp::{
 };
 use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest, DaemonHealthResponse,
-    DismissSessionRequest, SessionInfo, SessionListResponse, SessionState, SpawnSessionRequest,
+    DismissSessionRequest, SessionInfo, SessionListResponse, SessionPhase, SessionState, SpawnSessionRequest,
     StatusResponse,
 };
 use std::{
@@ -38,6 +41,12 @@ pub type ExecuteAskAgentFn = for<'a> fn(
     &'a AskAgentRequest,
     Option<ProgressEmitter>,
 ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>>;
+
+fn is_new_seat(agent: &str) -> bool {
+    mcp_bridge::seat_profile::seat_profile(agent).is_some_and(|profile| {
+        profile.resume_strategy != mcp_bridge::seat_profile::ResumeStrategy::Legacy
+    })
+}
 
 /// Describes an `ask_agent` failure without asserting a cause we have not checked.
 ///
@@ -232,6 +241,13 @@ pub async fn spawn_session(
             root_session_id: None,
             pantheon_session_id: None,
             cli_session_id: None,
+            phase: if is_new_seat(&agent) {
+                SessionPhase::Pending
+            } else {
+                SessionPhase::Ready
+            },
+            broken_reason: None,
+            generation: 0,
         },
     );
     core_persist_json_file_if_enabled(sessions_file, &*sessions)
@@ -259,6 +275,21 @@ pub async fn ask_session(
         return fetch_daemon_session_ask(req)
             .await
             .map_err(|e| format!("ask_session via daemon failed: {e}"));
+    }
+
+    let session_agent = {
+        let mut sessions = sessions.lock().await;
+        if !sessions.contains_key(&req.name) {
+            core_reload_session_if_enabled(sessions_file, &req.name, &mut sessions)
+                .map_err(|e| format!("failed to reload sessions: {e}"))?;
+        }
+        sessions
+            .get(&req.name)
+            .map(|state| normalize_agent_name(&state.agent))
+            .ok_or_else(|| format!("session '{}' not found", req.name))?
+    };
+    if is_new_seat(&session_agent) {
+        return ask_new_seat_session(sessions, sessions_file, req, execute_ask_agent).await;
     }
 
     let (agent, cwd, had_history, prior_cli_session) = {
@@ -337,6 +368,115 @@ pub async fn ask_session(
         .map_err(|e| format!("failed to persist sessions: {e}"))?;
 
     Ok(response)
+}
+
+async fn ask_new_seat_session(
+    sessions: &Sessions,
+    sessions_file: Option<&PathBuf>,
+    req: &AskSessionRequest,
+    execute_ask_agent: ExecuteAskAgentFn,
+) -> Result<String, String> {
+    let home = sessions_file
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .map(Ok)
+        .unwrap_or_else(triumvirate_home_dir)
+        .map_err(|e| format!("session_lock: {e}"))?;
+    let _session_guard = acquire_session_lock(&home, &req.name, session_busy_wait())
+        .await
+        .map_err(|e| {
+            if e == "session_busy" {
+                format!("session_busy: {}", req.name)
+            } else {
+                e
+            }
+        })?;
+
+    let (agent, cwd, generation, prior_cli_session) = {
+        let mut all = sessions.lock().await;
+        core_reload_session_if_enabled(sessions_file, &req.name, &mut all)
+            .map_err(|e| format!("failed to reload sessions: {e}"))?;
+        let state = all
+            .get(&req.name)
+            .ok_or_else(|| format!("session '{}' not found", req.name))?;
+        if matches!(state.phase, SessionPhase::Broken) {
+            return Err(format!(
+                "session_broken: {}; dismiss_session and spawn a new one",
+                state.broken_reason.as_deref().unwrap_or("unknown")
+            ));
+        }
+        (
+            normalize_agent_name(&state.agent),
+            state.cwd.clone(),
+            state.generation,
+            if matches!(state.phase, SessionPhase::Ready) {
+                state.cli_session_id.clone()
+            } else {
+                None
+            },
+        )
+    };
+
+    let turn = execute_ask_agent(
+        &AskAgentRequest {
+            agent: agent.clone(),
+            message: req.message.clone(),
+            cwd,
+            repo: None,
+            branch: None,
+            reuse_session: Some(true),
+            session_key: Some(req.name.clone()),
+            prior_cli_session_id: prior_cli_session,
+            required_sources: req.required_sources.clone(),
+            require_sight: req.require_sight,
+            grok_depth: req.grok_depth,
+            origin: req.origin,
+            ask_surface: shared_types::AskSurface::Session,
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+
+    let mut all = sessions.lock().await;
+    let state = all
+        .get_mut(&req.name)
+        .ok_or_else(|| format!("session '{}' not found", req.name))?;
+    let publish = match &turn {
+        Ok(response) => daemon_core::publish_turn(
+            state,
+            generation,
+            &agent,
+            TurnOutcome::Success {
+                cli_session_id: response.cli_session_id.as_deref(),
+            },
+        ),
+        Err(error) => {
+            daemon_core::publish_turn(state, generation, &agent, TurnOutcome::Failure(error))
+        }
+    };
+    if matches!(publish, PublishResult::Conflict) {
+        tracing::warn!(
+            name = %req.name,
+            start_generation = generation,
+            stored_generation = state.generation,
+            "session_generation_conflict"
+        );
+    }
+    let result = match turn {
+        Ok(response) => {
+            let mut answer = response.response;
+            if let PublishResult::NotResumable(reason) = publish {
+                answer.push_str(&format!("\n(session not resumable: {reason})"));
+            }
+            state.history.push(format!("user: {}", req.message));
+            state.history.push(format!("assistant: {answer}"));
+            Ok(answer)
+        }
+        Err(error) => Err(format!("ask_session failed: {error}")),
+    };
+    core_persist_json_file_if_enabled(sessions_file, &*all)
+        .map_err(|e| format!("failed to persist sessions: {e}"))?;
+    result
 }
 
 pub async fn dismiss_session(
@@ -495,6 +635,81 @@ pub async fn daemon_health() -> Result<Json<DaemonHealthResponse>, String> {
 #[cfg(test)]
 mod ask_agent_failure_message_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE_NEW_SEAT_TURNS: AtomicUsize = AtomicUsize::new(0);
+    static MAX_ACTIVE_NEW_SEAT_TURNS: AtomicUsize = AtomicUsize::new(0);
+    static NEW_SEAT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static NEW_SEAT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    fn overlapping_probe_executor<'a>(
+        req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            NEW_SEAT_CALLS.fetch_add(1, Ordering::SeqCst);
+            let active = ACTIVE_NEW_SEAT_TURNS.fetch_add(1, Ordering::SeqCst) + 1;
+            MAX_ACTIVE_NEW_SEAT_TURNS.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ACTIVE_NEW_SEAT_TURNS.fetch_sub(1, Ordering::SeqCst);
+            let mut response = AskAgentResponse::direct(
+                "request".to_string(),
+                req.agent.clone(),
+                "answer".to_string(),
+                Vec::new(),
+            );
+            response.cli_session_id = Some("vendor-id".to_string());
+            Ok(response)
+        })
+    }
+
+    fn no_id_executor<'a>(
+        req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            NEW_SEAT_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(AskAgentResponse::direct(
+                "request".to_string(),
+                req.agent.clone(),
+                "answer".to_string(),
+                Vec::new(),
+            ))
+        })
+    }
+
+    fn slow_executor<'a>(
+        req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            NEW_SEAT_CALLS.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let mut response = AskAgentResponse::direct(
+                "request".to_string(),
+                req.agent.clone(),
+                "answer".to_string(),
+                Vec::new(),
+            );
+            response.cli_session_id = Some("vendor-id".to_string());
+            Ok(response)
+        })
+    }
+
+    fn pending_session(agent: &str) -> SessionState {
+        SessionState {
+            agent: agent.to_string(),
+            cwd: None,
+            history: Vec::new(),
+            cli_session_id: None,
+            phase: SessionPhase::Pending,
+            broken_reason: None,
+            generation: 0,
+            parent_session_id: None,
+            root_session_id: None,
+            pantheon_session_id: None,
+        }
+    }
 
     fn daemon_error(failure: DaemonRequestFailure) -> anyhow::Error {
         anyhow::Error::new(DaemonRequestError {
@@ -514,7 +729,219 @@ mod ask_agent_failure_message_tests {
             "the daemon was never down; this line is what sent the operator hunting a corpse: {message}"
         );
         assert!(message.contains("may still be finishing"), "{message}");
-        assert!(message.contains("TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS"), "{message}");
+        assert!(
+            message.contains("TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS"),
+            "{message}"
+        );
+    }
+
+    /// RED IF: two in-process asks for one new-seat session overlap child lifetimes.
+    #[tokio::test]
+    async fn new_seat_session_asks_are_serialized() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        ACTIVE_NEW_SEAT_TURNS.store(0, Ordering::SeqCst);
+        MAX_ACTIVE_NEW_SEAT_TURNS.store(0, Ordering::SeqCst);
+        NEW_SEAT_CALLS.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+            "same".to_string(),
+            pending_session("kimi"),
+        )])));
+        core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+        let req = AskSessionRequest {
+            name: "same".to_string(),
+            message: "turn".to_string(),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(
+            ask_session(
+                &sessions,
+                Some(&file),
+                &req,
+                false,
+                overlapping_probe_executor
+            ),
+            ask_session(
+                &sessions,
+                Some(&file),
+                &req,
+                false,
+                overlapping_probe_executor
+            )
+        );
+        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+        assert_eq!(MAX_ACTIVE_NEW_SEAT_TURNS.load(Ordering::SeqCst), 1);
+        assert_eq!(NEW_SEAT_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    /// RED IF: an in-process contender waits past its configured lock limit or invokes its executor.
+    #[tokio::test]
+    async fn in_process_lock_timeout_returns_session_busy_without_second_spawn() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        NEW_SEAT_CALLS.store(0, Ordering::SeqCst);
+        let prior = std::env::var_os("TRIUMVIRATE_SESSION_BUSY_SECS");
+        unsafe { std::env::set_var("TRIUMVIRATE_SESSION_BUSY_SECS", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+            "busy".to_string(),
+            pending_session("kimi"),
+        )])));
+        core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+        let req = AskSessionRequest {
+            name: "busy".to_string(),
+            message: "turn".to_string(),
+            ..Default::default()
+        };
+        let first = ask_session(&sessions, Some(&file), &req, false, slow_executor);
+        let second = async {
+            while NEW_SEAT_CALLS.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            ask_session(&sessions, Some(&file), &req, false, slow_executor).await
+        };
+        let (first, second) = tokio::join!(first, second);
+        match prior {
+            Some(value) => unsafe { std::env::set_var("TRIUMVIRATE_SESSION_BUSY_SECS", value) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_SESSION_BUSY_SECS") },
+        }
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(second.unwrap_err(), "session_busy: busy");
+        assert_eq!(NEW_SEAT_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    /// RED IF: a first successful turn without an id stays usable or spawns again.
+    #[tokio::test]
+    async fn each_new_seat_missing_first_id_breaks_session_and_blocks_next_spawn() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        for seat in ["kimi", "mistral", "qwen"] {
+            NEW_SEAT_CALLS.store(0, Ordering::SeqCst);
+            let dir = tempfile::tempdir().unwrap();
+            let file = daemon_core::sessions_file_path(dir.path());
+            let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+                "missing".to_string(),
+                pending_session(seat),
+            )])));
+            core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+            let req = AskSessionRequest {
+                name: "missing".to_string(),
+                message: "turn".to_string(),
+                ..Default::default()
+            };
+            let answer = ask_session(&sessions, Some(&file), &req, false, no_id_executor)
+                .await
+                .unwrap();
+            assert!(answer.contains(&format!("session not resumable: missing_session_id:{seat}")));
+            let error = ask_session(&sessions, Some(&file), &req, false, no_id_executor)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "session_broken: missing_session_id:{seat}; dismiss_session and spawn a new one"
+                )
+            );
+            assert_eq!(NEW_SEAT_CALLS.load(Ordering::SeqCst), 1, "{seat}");
+        }
+    }
+
+    /// RED IF: in-process spawn does not create and persist a Pending new-seat record before any ask.
+    #[tokio::test]
+    async fn in_process_spawn_persists_pending_before_first_ask() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("empty-cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let prior_home = std::env::var_os("TRIUMVIRATE_HOME");
+        let prior_enable = std::env::var_os("TRIUMVIRATE_ENABLE_KIMI");
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", dir.path());
+            std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1");
+        }
+        mcp_bridge::seat_state::write_verified(
+            dir.path(),
+            "kimi",
+            &mcp_bridge::seat_state::VerifiedRecord {
+                cli_version: "2.2.0".to_string(),
+                seat_home: dir.path().join("homes/kimi").display().to_string(),
+                probed_at: "2026-10-19T00:00:00Z".to_string(),
+                served_model: None,
+            },
+        )
+        .unwrap();
+        mcp_bridge::seat_gate::register_installed_cli_version("kimi", "2.2.0");
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let result = spawn_session(
+            &sessions,
+            Some(&file),
+            &SpawnSessionRequest {
+                agent: "kimi".to_string(),
+                name: "pending".to_string(),
+                cwd: Some(cwd.display().to_string()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        match prior_home {
+            Some(value) => unsafe { std::env::set_var("TRIUMVIRATE_HOME", value) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_HOME") },
+        }
+        match prior_enable {
+            Some(value) => unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", value) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI") },
+        }
+        result.unwrap();
+        let state = sessions.lock().await.get("pending").cloned().unwrap();
+        assert_eq!(state.phase, SessionPhase::Pending);
+        assert_eq!(state.generation, 0);
+        let disk: HashMap<String, SessionState> = daemon_core::load_json_file(&file).unwrap();
+        assert_eq!(disk["pending"].phase, SessionPhase::Pending);
+    }
+
+    /// RED IF: a Codex session enters the new-seat state machine or creates a session lock file.
+    #[tokio::test]
+    async fn codex_session_keeps_legacy_path_without_phase_or_lock_change() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+            "legacy".to_string(),
+            SessionState {
+                agent: "codex".to_string(),
+                cwd: Some(dir.path().join("empty-cwd").display().to_string()),
+                history: Vec::new(),
+                cli_session_id: None,
+                phase: SessionPhase::Ready,
+                broken_reason: None,
+                generation: 0,
+                parent_session_id: None,
+                root_session_id: None,
+                pantheon_session_id: None,
+            },
+        )])));
+        std::fs::create_dir(dir.path().join("empty-cwd")).unwrap();
+        core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+        let answer = ask_session(
+            &sessions,
+            Some(&file),
+            &AskSessionRequest {
+                name: "legacy".to_string(),
+                message: "turn".to_string(),
+                ..Default::default()
+            },
+            false,
+            no_id_executor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "answer");
+        let state = sessions.lock().await.get("legacy").cloned().unwrap();
+        assert_eq!(state.phase, SessionPhase::Ready);
+        assert_eq!(state.generation, 0);
+        assert!(!dir.path().join("locks").exists());
     }
 
     #[test]
@@ -631,6 +1058,9 @@ mod session_sight_tests {
                 cwd: Some("/repo".to_string()),
                 history: Vec::new(),
                 cli_session_id: None,
+                phase: SessionPhase::Ready,
+                broken_reason: None,
+                generation: 0,
                 parent_session_id: None,
                 root_session_id: None,
                 pantheon_session_id: None,
@@ -702,6 +1132,9 @@ mod session_sight_tests {
                     cwd: Some("/repo".to_string()),
                     history: Vec::new(),
                     cli_session_id: None,
+                    phase: SessionPhase::Ready,
+                    broken_reason: None,
+                    generation: 0,
                     parent_session_id: None,
                     root_session_id: None,
                     pantheon_session_id: None,

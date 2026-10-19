@@ -25,6 +25,12 @@ use daemon_core::{
 use daemon_core::render_launch_agent_plist as core_render_launch_agent_plist;
 #[cfg(test)]
 use daemon_http::{fetch_daemon_ask_agent, fetch_daemon_status};
+// T-208: new-seat session state machine (cross-process session lock, CAS publish).
+use daemon_core::{
+    PublishResult, TurnOutcome, acquire_session_lock,
+    reload_session_if_enabled as core_reload_session_if_enabled, session_busy_wait,
+};
+use shared_types::SessionPhase;
 #[cfg(test)]
 use daemon_http::{attempt_daemon_autostart_once, reset_daemon_autostart_flag_for_tests};
 use daemon_http::DaemonHttpState;
@@ -2629,6 +2635,13 @@ async fn session_spawn_route(
             root_session_id: None,
             pantheon_session_id: None,
             cli_session_id: None,
+            phase: if session_seat_is_new(&agent) {
+                SessionPhase::Pending
+            } else {
+                SessionPhase::Ready
+            },
+            broken_reason: None,
+            generation: 0,
         },
     );
     core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
@@ -2641,6 +2654,12 @@ async fn session_spawn_route(
         "status": "ok",
         "message": format!("session '{}' {} for {}", req.name, if worker.mode == WorkerAcquireMode::Spawned { "spawned" } else { "reused" }, agent)
     })))
+}
+
+fn session_seat_is_new(agent: &str) -> bool {
+    mcp_bridge::seat_profile::seat_profile(agent).is_some_and(|profile| {
+        profile.resume_strategy != mcp_bridge::seat_profile::ResumeStrategy::Legacy
+    })
 }
 
 async fn session_ask_route(
@@ -2656,6 +2675,22 @@ async fn session_ask_route(
             StatusCode::UNAUTHORIZED,
             AxumJson(serde_json::json!({ "error": "unauthorized" })),
         ));
+    }
+    let session_agent = {
+        let mut sessions = state.sessions.lock().await;
+        if !sessions.contains_key(&req.name) {
+            core_reload_session_if_enabled(state.sessions_file.as_ref(), &req.name, &mut sessions)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        AxumJson(serde_json::json!({ "error": e.to_string() })),
+                    )
+                })?;
+        }
+        sessions.get(&req.name).map(|session| session.agent.clone())
+    };
+    if session_agent.as_deref().is_some_and(session_seat_is_new) {
+        return new_seat_session_ask_route(state, req).await;
     }
     let (agent, cwd, prior_cli_session) = {
         let sessions = state.sessions.lock().await;
@@ -2740,6 +2775,152 @@ async fn session_ask_route(
     Ok(AxumJson(
         serde_json::json!({ "status": "ok", "response": response }),
     ))
+}
+
+async fn new_seat_session_ask_route(
+    state: DaemonRuntimeState,
+    req: AskSessionRequest,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    let home = state
+        .sessions_file
+        .as_ref()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .map(Ok)
+        .unwrap_or_else(core_triumvirate_home_dir)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+    let _session_guard = acquire_session_lock(&home, &req.name, session_busy_wait())
+        .await
+        .map_err(|error| {
+            let error = if error == "session_busy" {
+                format!("session_busy: {}", req.name)
+            } else {
+                error
+            };
+            let status = if error.starts_with("session_busy:") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, AxumJson(serde_json::json!({ "error": error })))
+        })?;
+
+    let (agent, cwd, generation, prior_cli_session) = {
+        let mut sessions = state.sessions.lock().await;
+        core_reload_session_if_enabled(state.sessions_file.as_ref(), &req.name, &mut sessions)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(serde_json::json!({ "error": e.to_string() })),
+                )
+            })?;
+        let session = sessions.get(&req.name).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                AxumJson(
+                    serde_json::json!({ "error": format!("session '{}' not found", req.name) }),
+                ),
+            )
+        })?;
+        if matches!(session.phase, SessionPhase::Broken) {
+            let error = format!(
+                "session_broken: {}; dismiss_session and spawn a new one",
+                session.broken_reason.as_deref().unwrap_or("unknown")
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                AxumJson(serde_json::json!({ "error": error })),
+            ));
+        }
+        (
+            session.agent.clone(),
+            session.cwd.clone(),
+            session.generation,
+            if matches!(session.phase, SessionPhase::Ready) {
+                session.cli_session_id.clone()
+            } else {
+                None
+            },
+        )
+    };
+
+    let turn = execute_ask_agent(
+        &AskAgentRequest {
+            agent: agent.clone(),
+            message: req.message.clone(),
+            cwd,
+            repo: None,
+            branch: None,
+            reuse_session: Some(true),
+            session_key: Some(req.name.clone()),
+            prior_cli_session_id: prior_cli_session,
+            required_sources: req.required_sources.clone(),
+            require_sight: req.require_sight,
+            grok_depth: req.grok_depth,
+            origin: req.origin,
+            ask_surface: shared_types::AskSurface::Session,
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(&req.name).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            AxumJson(serde_json::json!({ "error": format!("session '{}' not found", req.name) })),
+        )
+    })?;
+    let publish = match &turn {
+        Ok(response) => daemon_core::publish_turn(
+            session,
+            generation,
+            &agent,
+            TurnOutcome::Success {
+                cli_session_id: response.cli_session_id.as_deref(),
+            },
+        ),
+        Err(error) => {
+            daemon_core::publish_turn(session, generation, &agent, TurnOutcome::Failure(error))
+        }
+    };
+    if matches!(publish, PublishResult::Conflict) {
+        tracing::warn!(
+            name = %req.name,
+            start_generation = generation,
+            stored_generation = session.generation,
+            "session_generation_conflict"
+        );
+    }
+    let result = match turn {
+        Ok(response) => {
+            let mut answer = response.response;
+            if let PublishResult::NotResumable(reason) = publish {
+                answer.push_str(&format!("\n(session not resumable: {reason})"));
+            }
+            session.history.push(format!("user: {}", req.message));
+            session.history.push(format!("assistant: {answer}"));
+            Ok(AxumJson(
+                serde_json::json!({ "status": "ok", "response": answer }),
+            ))
+        }
+        Err(error) => Err((
+            StatusCode::BAD_GATEWAY,
+            AxumJson(serde_json::json!({ "error": error })),
+        )),
+    };
+    core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    result
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
@@ -3185,7 +3366,9 @@ async fn run_daemon() -> anyhow::Result<()> {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) else { continue };
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) else {
+                            continue;
+                        };
                         if v.get("type").and_then(|t| t.as_str()) != Some("token_scan") {
                             continue;
                         }
@@ -3587,13 +3770,13 @@ fn spawn_dead_drop(
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use rmcp::{ClientHandler, model::ClientInfo};
     use rmcp::model::{
         CallToolRequestParams, LoggingMessageNotificationParam, ProgressNotificationParam,
     };
+    use rmcp::{ClientHandler, model::ClientInfo};
     use std::{
-        future::Future,
         fs,
+        future::Future,
         net::SocketAddr,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
@@ -7267,6 +7450,9 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
                     root_session_id: None,
                     pantheon_session_id: None,
             cli_session_id: None,
+                    phase: SessionPhase::Ready,
+                    broken_reason: None,
+                    generation: 0,
                 },
             );
             core_persist_json_file_if_enabled(first.sessions_file.as_ref(), &*sessions)?;
@@ -8096,7 +8282,7 @@ mod pantheon_rest_tests {
     // If these symbols ever move or rename, this test module refuses to
     // compile, which is the whole point of binding the tests to the real
     // entry points rather than shadowing them.
-    use super::{api_fleet, api_fleet_by_id, api_workers, DaemonRuntimeState};
+    use super::{DaemonRuntimeState, api_fleet, api_fleet_by_id, api_workers};
 
     /// Shared bearer token for the pantheon REST test module. Every test
     /// builds a fresh `DaemonState` with this value, so collisions are
