@@ -6483,13 +6483,30 @@ fn read_qwen_plan_key(seat_home: &Path) -> Result<(String, String), String> {
 /// A fresh per-call directory under the system temp dir (Mistral writes export.json here). Removed after `finish`.
 fn new_seat_output_dir(seat: &str) -> Result<PathBuf, String> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "triumvirate-seat-{seat}-{}-{n}",
-        std::process::id()
-    ));
-    fs::create_dir(&dir).map_err(|e| format!("seat_output_dir: {}: {e}", dir.display()))?;
-    Ok(dir)
+    // pid + counter alone collided with a directory a previous process (same recycled pid) left behind: "File exists"
+    // failed the call. Add the clock, and never reuse an existing directory: on AlreadyExists, take the next name.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut last_err = String::new();
+    for _ in 0..16 {
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "triumvirate-seat-{seat}-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = format!("{}: {e}", dir.display());
+            }
+            Err(e) => return Err(format!("seat_output_dir: {}: {e}", dir.display())),
+        }
+    }
+    Err(format!(
+        "seat_output_dir: no free name after 16 attempts ({last_err})"
+    ))
 }
 
 /// The per-seat parser behind one runner.
@@ -7199,8 +7216,13 @@ mod deepseek_dispatch_tests {
             .await
             .expect("dispatch ok");
 
-        assert!(parsed.response_text.contains("the model is thinking carefully"),
-            "include_reasoning=true must surface reasoning; got: {}", parsed.response_text);
+        assert!(
+            parsed
+                .response_text
+                .contains("the model is thinking carefully"),
+            "include_reasoning=true must surface reasoning; got: {}",
+            parsed.response_text
+        );
         assert!(parsed.response_text.contains("clean final answer"));
         assert!(parsed.response_text.contains("<reasoning>"));
     }
@@ -7333,7 +7355,8 @@ mod deepseek_dispatch_tests {
 
         let req = shared_types::AskAgentRequest {
             agent: "deepseek".to_string(),
-            message: "<triumvirate_tool name=\"ledger_session\">test</triumvirate_tool>".to_string(),
+            message: "<triumvirate_tool name=\"ledger_session\">test</triumvirate_tool>"
+                .to_string(),
             ..Default::default()
         };
         // The mock server returns canned content regardless of what we send,
@@ -7341,9 +7364,10 @@ mod deepseek_dispatch_tests {
         // mock — the test is asserting that ADDING a system message to the
         // messages array (and increasing prompt_chars_estimate accordingly)
         // doesn't break the dispatch flow.
-        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
-            .await
-            .expect("dispatch must succeed with system message prepended");
+        let parsed =
+            run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+                .await
+                .expect("dispatch must succeed with system message prepended");
         assert!(!parsed.response_text.is_empty());
 
         // The per-request log captures the FINAL state. We can't directly
@@ -7354,7 +7378,8 @@ mod deepseek_dispatch_tests {
             messages: vec![
                 ds::RequestMessage {
                     role: "system".to_string(),
-                    content: "placeholder — the real runner injects the real system prompt".to_string(),
+                    content: "placeholder — the real runner injects the real system prompt"
+                        .to_string(),
                 },
                 ds::RequestMessage {
                     role: "user".to_string(),
@@ -7377,7 +7402,6 @@ mod deepseek_dispatch_tests {
     // T-013 (REQ-DS-026): attempt_schedule + persist-before-Err.
     // ─────────────────────────────────────────────────────────────────────
 
-
     // ---- Slice D: grok dispatch. Claude proves two dispatch layers can drift, so BOTH are
     // asserted here rather than trusting that adding one arm covered it. ----
 
@@ -7395,9 +7419,11 @@ mod deepseek_dispatch_tests {
     fn both_dispatch_layers_have_a_grok_arm() {
         let src = include_str!("agent_exec.rs");
         let arms = src.matches("\"grok\" => {").count();
-        assert!(arms >= 2,
+        assert!(
+            arms >= 2,
             "expected a grok arm in BOTH run_named_agent_with_session_and_model and \
-             run_agent_process_with_session, found {arms}");
+             run_agent_process_with_session, found {arms}"
+        );
     }
 
 
@@ -7621,12 +7647,21 @@ mod deepseek_dispatch_tests {
     fn attempt_schedule_is_single_for_metered_and_context_heavy_agents() {
         use super::attempt_schedule_for;
         // Single attempt: the runner owns its retries, or a retry is genuinely expensive.
-        assert_eq!(attempt_schedule_for("deepseek", None, false, false).len(), 1,
-            "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)");
-        assert_eq!(attempt_schedule_for("grok", None, false, false).len(), 1,
-            "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)");
-        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false, false).len(), 1,
-            "agy runs its own internal retry (REQ-013)");
+        assert_eq!(
+            attempt_schedule_for("deepseek", None, false, false).len(),
+            1,
+            "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)"
+        );
+        assert_eq!(
+            attempt_schedule_for("grok", None, false, false).len(),
+            1,
+            "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)"
+        );
+        assert_eq!(
+            attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false, false).len(),
+            1,
+            "agy runs its own internal retry (REQ-013)"
+        );
 
         // Everything else keeps the generic ladder. This is the regression guard: adding a
         // single-attempt agent must not silently convert the default.
@@ -7634,20 +7669,35 @@ mod deepseek_dispatch_tests {
         // A sight-gated review is one attempt for every agent: a review that timed out is
         // not improved by two more, and the first failure would be buried under the last.
         for agent in ["codex", "claude", "gemini", "grok"] {
-            assert_eq!(attempt_schedule_for(agent, None, true, false).len(), 1, "{agent} review must be one attempt");
+            assert_eq!(
+                attempt_schedule_for(agent, None, true, false).len(),
+                1,
+                "{agent} review must be one attempt"
+            );
         }
         assert_eq!(attempt_schedule_for("claude", None, false, false).len(), 3);
 
         // STRICT pins the model. The gemini-cli chain answers as `gemini` on any of four
         // models, so a seat that asked for one voter could get a different one and no field
         // said so (Grok). RED IF: strict keeps the faildown chain.
-        let loose = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, false);
+        let loose = attempt_schedule_for(
+            "gemini",
+            Some(super::GeminiBackend::GeminiCli),
+            false,
+            false,
+        );
         assert_eq!(loose.len(), 4, "the chain is still there for ordinary Q&A");
-        let strict = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, true);
+        let strict =
+            attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, true);
         assert_eq!(strict.len(), 1, "strict is one attempt, no faildown");
-        assert_eq!(strict[0].1, loose[0].1, "and it is the PRIMARY model, not some other one");
-        assert!(attempt_schedule_for("gemini", None, false, false).len() > 1,
-            "gemini-cli uses the model faildown chain");
+        assert_eq!(
+            strict[0].1, loose[0].1,
+            "and it is the PRIMARY model, not some other one"
+        );
+        assert!(
+            attempt_schedule_for("gemini", None, false, false).len() > 1,
+            "gemini-cli uses the model faildown chain"
+        );
     }
 
     #[test]
@@ -7743,7 +7793,9 @@ mod deepseek_dispatch_tests {
     async fn deepseek_anti_bulk_rejects_oversized_payload() {
         let _g = BULK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Clear any env override so the default 16KB applies.
-        unsafe { std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES"); }
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES");
+        }
         let big = "x".repeat(20_000);
         let req = shared_types::AskAgentRequest {
             agent: "deepseek".to_string(),
@@ -7754,7 +7806,10 @@ mod deepseek_dispatch_tests {
             .await
             .expect_err("oversized deepseek payload must Err");
         let lower = err.to_lowercase();
-        assert!(lower.contains("payload too large"), "missing 'payload too large': {err}");
+        assert!(
+            lower.contains("payload too large"),
+            "missing 'payload too large': {err}"
+        );
         assert!(lower.contains("metered"), "missing 'metered': {err}");
     }
 
@@ -7783,9 +7838,9 @@ mod deepseek_dispatch_tests {
         // production call site (not the test reference) and confirm the
         // preceding ~200 chars contain the deepseek gate.
         let needle = "req.message.len() > cap";
-        let abs = production_src.find(needle).expect(
-            "expected the anti-bulk intercept `req.message.len() > cap` in agent_exec.rs"
-        );
+        let abs = production_src
+            .find(needle)
+            .expect("expected the anti-bulk intercept `req.message.len() > cap` in agent_exec.rs");
         let lookback = &production_src[abs.saturating_sub(300)..abs];
         assert!(
             lookback.contains("if agent == \"deepseek\""),
@@ -7800,7 +7855,9 @@ mod deepseek_dispatch_tests {
     #[tokio::test]
     async fn deepseek_anti_bulk_cap_is_env_configurable() {
         let _g = BULK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe { std::env::set_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES", "32768"); }
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES", "32768");
+        }
         let big = "x".repeat(20_000);
         let req = shared_types::AskAgentRequest {
             agent: "deepseek".to_string(),
@@ -7808,7 +7865,9 @@ mod deepseek_dispatch_tests {
             ..Default::default()
         };
         let err = execute_ask_agent(&req, None).await.err();
-        unsafe { std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES"); }
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES");
+        }
         // Whatever error surfaces, it must NOT be "payload too large".
         if let Some(msg) = err {
             assert!(
@@ -7920,10 +7979,7 @@ mod deepseek_dispatch_tests {
         let fn_start = src
             .find("pub(crate) async fn prewarm_daemon_workers()")
             .expect("prewarm_daemon_workers exists");
-        let body_start = src[fn_start..]
-            .find('{')
-            .expect("function body opens")
-            + fn_start;
+        let body_start = src[fn_start..].find('{').expect("function body opens") + fn_start;
         // Find the matching closing brace.
         let bytes = src.as_bytes();
         let mut depth = 0i32;
@@ -8040,7 +8096,11 @@ mod sight_gate_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(rel);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, (1..=lines).map(|i| format!("l{i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &file,
+            (1..=lines).map(|i| format!("l{i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let root = dir.path().to_string_lossy().into_owned();
         (dir, root)
     }
@@ -8056,11 +8116,19 @@ mod sight_gate_tests {
         if let Some(l) = limit {
             args["limit"] = serde_json::json!(l);
         }
-        let total = std::fs::read_to_string(path).map(|t| t.lines().count() as u64).unwrap_or(0);
+        let total = std::fs::read_to_string(path)
+            .map(|t| t.lines().count() as u64)
+            .unwrap_or(0);
         let first = offset.unwrap_or(1).max(1);
         let last = limit.map_or(total, |l| (first + l).saturating_sub(1).min(total));
-        let returned_lines = if limit == Some(0) || first > last { Vec::new() } else { vec![(first, last)] };
-        ToolCallRecord { shown_output: None, returned_lines,
+        let returned_lines = if limit == Some(0) || first > last {
+            Vec::new()
+        } else {
+            vec![(first, last)]
+        };
+        ToolCallRecord {
+            shown_output: None,
+            returned_lines,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -8078,7 +8146,11 @@ mod sight_gate_tests {
     fn sight_39_structured_windows_that_tile_the_file_are_a_whole_read() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("big.rs");
-        std::fs::write(&src, (1..=100).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=100).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let src = src.to_string_lossy().into_owned();
         let cwd = dir.path().to_string_lossy().into_owned();
 
@@ -8087,8 +8159,15 @@ mod sight_gate_tests {
             structured_read(&src, Some(61), Some(40)),
         ];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &calls, "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect("windows 1..60 and 61..100 cover a 100-line file");
+        enforce_reviewer_sight(
+            "Grok",
+            &calls,
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("windows 1..60 and 61..100 cover a 100-line file");
 
         // NEGATIVE CONTROL: leave a gap and the gate must still reject.
         let gapped = vec![
@@ -8096,8 +8175,15 @@ mod sight_gate_tests {
             structured_read(&src, Some(70), Some(31)),
         ];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &gapped, "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("lines 61..69 were never read");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &gapped,
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("lines 61..69 were never read");
         assert!(err.contains("read PART"), "{err}");
 
         // NEGATIVE CONTROL 2: a full-coverage window set naming a DIFFERENT file proves nothing.
@@ -8105,8 +8191,15 @@ mod sight_gate_tests {
         std::fs::write(&other, "x\n").unwrap();
         let wrong_file = vec![structured_read(&other, Some(1), Some(100))];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &wrong_file, "grok-streaming-json", &[src], &cwd, &mut lifecycle)
-            .expect_err("reading another file is not reading this one");
+        enforce_reviewer_sight(
+            "Grok",
+            &wrong_file,
+            "grok-streaming-json",
+            &[src],
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("reading another file is not reading this one");
     }
 
     /// D-032, unnumbered results. agy `view_file` delivers at most 800 lines a call (measured):
@@ -8117,7 +8210,13 @@ mod sight_gate_tests {
     fn sight_d032_unnumbered_reads_are_capped_or_earn_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("long.rs");
-        std::fs::write(&src, (1..=1000).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=1000)
+                .map(|i| format!("line {i}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
         let src = src.to_string_lossy().into_owned();
         let cwd = dir.path().to_string_lossy().into_owned();
         let view = |args: serde_json::Value, tool: &str| ToolCallRecord {
@@ -8132,22 +8231,52 @@ mod sight_gate_tests {
         };
         let whole_ask = view(serde_json::json!({ "AbsolutePath": src }), "view_file");
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Antigravity", &[whole_ask], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("view_file returns 800 lines, not 1000");
+        let err = enforce_reviewer_sight(
+            "Antigravity",
+            &[whole_ask],
+            "agy-stream-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("view_file returns 800 lines, not 1000");
         assert!(err.contains("read PART"), "{err}");
 
         let tiled = vec![
-            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 1, "EndLine": 800 }), "view_file"),
-            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 801, "EndLine": 1000 }), "view_file"),
+            view(
+                serde_json::json!({ "AbsolutePath": src, "StartLine": 1, "EndLine": 800 }),
+                "view_file",
+            ),
+            view(
+                serde_json::json!({ "AbsolutePath": src, "StartLine": 801, "EndLine": 1000 }),
+                "view_file",
+            ),
         ];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Antigravity", &tiled, "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect("1..800 and 801..1000 are the whole file");
+        enforce_reviewer_sight(
+            "Antigravity",
+            &tiled,
+            "agy-stream-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("1..800 and 801..1000 are the whole file");
 
-        let unknown = view(serde_json::json!({ "path": src, "offset": 1, "limit": 1000 }), "mystery_reader");
+        let unknown = view(
+            serde_json::json!({ "path": src, "offset": 1, "limit": 1000 }),
+            "mystery_reader",
+        );
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Antigravity", &[unknown], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("an unmeasured unnumbered read proves nothing");
+        enforce_reviewer_sight(
+            "Antigravity",
+            &[unknown],
+            "agy-stream-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("an unmeasured unnumbered read proves nothing");
     }
 
     /// D-032. A read that ASKED for the whole file but RECEIVED only part of it (a capped tool)
@@ -8156,31 +8285,56 @@ mod sight_gate_tests {
     fn sight_d032_a_truncated_read_is_credited_with_what_came_back() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("big.rs");
-        std::fs::write(&src, (1..=100).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=100).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let src = src.to_string_lossy().into_owned();
         let cwd = dir.path().to_string_lossy().into_owned();
 
         let mut capped = structured_read(&src, Some(1), Some(100));
         capped.returned_lines = vec![(1, 60)];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &[capped], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("asked for 1..100, received 1..60");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &[capped],
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("asked for 1..100, received 1..60");
         assert!(err.contains("read PART"), "{err}");
 
         // An elided middle: lines 1..50 and 90..100 came back. Two runs, not 1..100.
         let mut elided = structured_read(&src, Some(1), Some(100));
         elided.returned_lines = vec![(1, 50), (90, 100)];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &[elided], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("51..89 never came back");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &[elided],
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("51..89 never came back");
         assert!(err.contains("read PART"), "{err}");
 
         // Twin: the tool numbered every line, so the whole file was received.
         let mut whole = structured_read(&src, Some(1), Some(100));
         whole.returned_lines = vec![(1, 100)];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &[whole], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect("received 1..100 of a 100-line file");
+        enforce_reviewer_sight(
+            "Grok",
+            &[whole],
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("received 1..100 of a 100-line file");
     }
 
     /// A relative source is rejected UP FRONT, naming the absolute path to pass instead.
@@ -8202,7 +8356,10 @@ mod sight_gate_tests {
             .expect_err("a relative required_source must be refused, not dispatched");
         assert!(err.contains("must be ABSOLUTE"), "{err}");
         // It must say WHICH path to use, or the caller is left guessing.
-        assert!(err.contains("/Users/someone/repo/daemon/src/lib.rs"), "{err}");
+        assert!(
+            err.contains("/Users/someone/repo/daemon/src/lib.rs"),
+            "{err}"
+        );
     }
 
     /// Defence in depth for the same bug: candidates now expand relative -> absolute too.
@@ -10119,7 +10276,10 @@ mod claude_runner_tests {
             !argv.contains("--allowedTools"),
             "a consult must keep its tools; the allow-list is containment for reviews only"
         );
-        assert!(argv.contains("stream-json"), "observability still applies to every call");
+        assert!(
+            argv.contains("stream-json"),
+            "observability still applies to every call"
+        );
     }
 
     /// An operator who chose an output format keeps it, and the turn then FAILS CLOSED on the
@@ -10130,7 +10290,11 @@ mod claude_runner_tests {
     async fn u_cr_04_a_non_streaming_claude_cannot_claim_a_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
         let argv_log = dir.path().join("argv.txt");
-        let bin = fake_claude(dir.path(), &argv_log, "just some plain text, no events at all");
+        let bin = fake_claude(
+            dir.path(),
+            &argv_log,
+            "just some plain text, no events at all",
+        );
 
         let parsed = run_claude_cli_process_with_session(
             bin.to_str().expect("utf8"),
@@ -10187,7 +10351,10 @@ mod grok_panel_route_tests {
     }
 
     fn flag_value(argv: &[String], flag: &str) -> Option<String> {
-        argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1)).cloned()
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
     }
 
     async fn dispatch(is_peer_review: bool) -> Vec<String> {
@@ -10287,7 +10454,11 @@ mod grok_panel_route_tests {
 
         // The daemon is Deep (the helper sets it). A consult asking for Fast gets Fast.
         let fast = dispatch_with_depth(false, Some(GrokDepthOverride::Fast)).await;
-        assert_eq!(flag_value(&fast, "--effort").as_deref(), Some("low"), "argv was {fast:?}");
+        assert_eq!(
+            flag_value(&fast, "--effort").as_deref(),
+            Some("low"),
+            "argv was {fast:?}"
+        );
         assert_eq!(flag_value(&fast, "--max-turns").as_deref(), Some("12"));
 
         // And asking for Deep on a Deep daemon is Deep, which is also the "absent" control.
@@ -10317,7 +10488,11 @@ mod grok_panel_route_tests {
         // defaults are what is under test here rather than an operator value left by a sibling.
         unsafe { std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS") };
         let panel = dispatch(true).await;
-        assert_eq!(flag_value(&panel, "--effort").as_deref(), Some("low"), "argv was {panel:?}");
+        assert_eq!(
+            flag_value(&panel, "--effort").as_deref(),
+            Some("low"),
+            "argv was {panel:?}"
+        );
         assert_eq!(flag_value(&panel, "--max-turns").as_deref(), Some("12"));
         assert!(panel.iter().any(|a| a == "--no-subagents"));
 
@@ -10341,10 +10516,16 @@ mod grok_tool_surface_tests {
     #[test]
     fn u_ts_01_the_threshold_is_exclusive() {
         assert!(!grok_tool_surface_is_bloated(0));
-        assert!(!grok_tool_surface_is_bloated(26), "the no-MCP fixture must stay quiet");
+        assert!(
+            !grok_tool_surface_is_bloated(26),
+            "the no-MCP fixture must stay quiet"
+        );
         assert!(!grok_tool_surface_is_bloated(GROK_TOOL_SURFACE_WARN_AT));
         assert!(grok_tool_surface_is_bloated(GROK_TOOL_SURFACE_WARN_AT + 1));
-        assert!(grok_tool_surface_is_bloated(420), "the full-inheritance capture must trip it");
+        assert!(
+            grok_tool_surface_is_bloated(420),
+            "the full-inheritance capture must trip it"
+        );
     }
 
     /// Driven through the real parser, from a real `available_commands` line shape, because the
@@ -10412,7 +10593,12 @@ mod mandatory_review_tests {
     /// RED IF: the fallback arm stops being Indeterminate, or Indeterminate stops blocking.
     #[test]
     fn review_01_unusable_output_blocks_rather_than_passing() {
-        for junk in ["", "I think this looks fine overall.", "Sure, seems reasonable.", "  \n "] {
+        for junk in [
+            "",
+            "I think this looks fine overall.",
+            "Sure, seems reasonable.",
+            "  \n ",
+        ] {
             let (v, _) = classify_review_verdict(junk);
             assert_eq!(v, ReviewVerdict::Indeterminate, "junk: {junk:?}");
             assert!(v.blocks(), "no usable verdict must stop the turn: {junk:?}");
@@ -10481,7 +10667,10 @@ mod mandatory_review_tests {
             ("> REJECT", ReviewVerdict::Reject),
             ("`APPROVE`", ReviewVerdict::Approve),
             ("APPROVE.", ReviewVerdict::Approve),
-            ("**REJECT**: the count is wrong", ReviewVerdict::Indeterminate),
+            (
+                "**REJECT**: the count is wrong",
+                ReviewVerdict::Indeterminate,
+            ),
         ] {
             let (v, _) = classify_review_verdict(line);
             assert_eq!(v, want, "line: {line:?}");
@@ -10496,7 +10685,10 @@ mod mandatory_review_tests {
     #[test]
     fn review_05_only_reject_and_indeterminate_block() {
         assert!(!ReviewVerdict::Approve.blocks());
-        assert!(!ReviewVerdict::Concerns.blocks(), "a considered concern does not block");
+        assert!(
+            !ReviewVerdict::Concerns.blocks(),
+            "a considered concern does not block"
+        );
         assert!(ReviewVerdict::Reject.blocks());
         assert!(
             ReviewVerdict::Indeterminate.blocks(),
@@ -10621,7 +10813,11 @@ mod mandatory_review_tests {
     ) -> PathBuf {
         let bin = dir.join(format!(
             "fake-codex-{}-{}-{}",
-            if reader.is_empty() || !echo_nonce { "blind" } else { reader },
+            if reader.is_empty() || !echo_nonce {
+                "blind"
+            } else {
+                reader
+            },
             if echo_nonce { "nonce" } else { "nononce" },
             std::process::id()
         ));
@@ -10647,7 +10843,9 @@ mod mandatory_review_tests {
             // and nothing else, so the stand-in can only quote what its own read saw. A
             // `head -1` therefore satisfies the sight gate and still fails the nonce check,
             // which is the exact attack Grok described.
-            script.push_str(&format!("  READ_OUTPUT=\"$({reader} \"$ARTIFACT\" 2>/dev/null)\"\n"));
+            script.push_str(&format!(
+                "  READ_OUTPUT=\"$({reader} \"$ARTIFACT\" 2>/dev/null)\"\n"
+            ));
             script.push_str("  RC=$?\n");
             script.push_str(&format!(
                 "  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\",\"exit_code\":%d,\"aggregated_output\":\"%s\"}}}}\\n' \"$ARTIFACT\" \"$RC\" \"$(jesc \"$READ_OUTPUT\")\"\n"
@@ -10734,7 +10932,11 @@ mod mandatory_review_tests {
             std::env::set_var("TRIUMVIRATE_PEER_REVIEWERS", "codex");
             std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
         }
-        ReviewFixture { _dir: dir, root, counts }
+        ReviewFixture {
+            _dir: dir,
+            root,
+            counts,
+        }
     }
 
     fn clear_review_env() {
@@ -10817,7 +11019,10 @@ mod mandatory_review_tests {
             err.contains("reasoning follows"),
             "the reviewer's own words must come back, or a block is unactionable; got: {err}"
         );
-        assert!(fx.counts.exists(), "the reviewer process must actually have run");
+        assert!(
+            fx.counts.exists(),
+            "the reviewer process must actually have run"
+        );
     }
 
     /// GOAL 1.5, the headline: a reviewer that approves without opening anything is REJECTED.
@@ -10937,8 +11142,7 @@ mod mandatory_review_tests {
         let nested = dir.path().join("crates").join("deep");
         std::fs::create_dir_all(&nested).expect("nested");
 
-        let root = resolve_absolute_project_root(nested.to_str().expect("utf8"))
-            .expect("resolves");
+        let root = resolve_absolute_project_root(nested.to_str().expect("utf8")).expect("resolves");
         assert_eq!(
             root,
             std::fs::canonicalize(&nested).expect("canonical"),
@@ -10977,7 +11181,8 @@ mod mandatory_review_tests {
         let (v, _) = classify_review_verdict("APPROVE\nreasoning\nREVIEW-NONCE: TV-abc");
         assert_eq!(v, ReviewVerdict::Approve, "line 1 decides the verdict");
 
-        let (buried, _) = classify_review_verdict("I would say APPROVE here.\nREVIEW-NONCE: TV-abc");
+        let (buried, _) =
+            classify_review_verdict("I would say APPROVE here.\nREVIEW-NONCE: TV-abc");
         assert_eq!(
             buried,
             ReviewVerdict::Indeterminate,
@@ -10986,7 +11191,10 @@ mod mandatory_review_tests {
 
         // And the containment check itself, which is what the dispatch applies.
         let answer = "APPROVE\n\nlots of reasoning\n\nREVIEW-NONCE: TV-deadbeef\n";
-        assert!(answer.contains("TV-deadbeef"), "position must not matter to the proof");
+        assert!(
+            answer.contains("TV-deadbeef"),
+            "position must not matter to the proof"
+        );
     }
 
     /// The nonce check itself, now that no partial read can reach it.
@@ -11055,7 +11263,9 @@ mod mandatory_review_tests {
             r#"{"file_path":"/repo/a.md","offset":9000}"#,
             r#"{"file_path":"/repo/a.md","limit":1,"offset":9000}"#,
         ] {
-            let calls = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+            let calls = vec![ToolCallRecord {
+                shown_output: None,
+                returned_lines: Vec::new(),
                 id: Some("t".into()),
                 tool: "Read".into(),
                 kind: ToolKind::ReadFile,
@@ -11089,7 +11299,9 @@ mod mandatory_review_tests {
         std::fs::write(&src, "one\ntwo\nthree\n").unwrap();
         let src = src.to_string_lossy().into_owned();
         let root = dir.path().to_string_lossy().into_owned();
-        let calls = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 3)],
+        let calls = vec![ToolCallRecord {
+            shown_output: None,
+            returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "Read".into(),
             kind: ToolKind::ReadFile,
@@ -11109,13 +11321,18 @@ mod mandatory_review_tests {
         .expect("an unbounded read of the named source must pass");
 
         // An explicit null is not a slice either: grok's own capture records "offset":null.
-        let with_nulls = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 3)],
+        let with_nulls = vec![ToolCallRecord {
+            shown_output: None,
+            returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "read_file".into(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(serde_json::json!({ "target_file": src, "offset": null, "limit": null }).to_string()),
+            args_json: Some(
+                serde_json::json!({ "target_file": src, "offset": null, "limit": null })
+                    .to_string(),
+            ),
         }];
         let mut lifecycle2 = Vec::new();
         enforce_reviewer_sight(
@@ -11134,7 +11351,9 @@ mod mandatory_review_tests {
     /// RED IF: the partial branch is removed and both fall through to the same message.
     #[test]
     fn review_24_a_peek_and_a_miss_report_differently() {
-        let peek = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        let peek = vec![ToolCallRecord {
+            shown_output: None,
+            returned_lines: Vec::new(),
             id: Some("t".into()),
             tool: "command_execution".into(),
             kind: ToolKind::ReadFile,
@@ -11144,13 +11363,23 @@ mod mandatory_review_tests {
         }];
         let mut a = Vec::new();
         let peeked = enforce_reviewer_sight(
-            "Codex", &peek, "codex-exec-json", &["/repo/a.md".to_string()], "/repo", &mut a,
+            "Codex",
+            &peek,
+            "codex-exec-json",
+            &["/repo/a.md".to_string()],
+            "/repo",
+            &mut a,
         )
         .unwrap_err();
 
         let mut b = Vec::new();
         let missed = enforce_reviewer_sight(
-            "Codex", &[], "codex-exec-json", &["/repo/a.md".to_string()], "/repo", &mut b,
+            "Codex",
+            &[],
+            "codex-exec-json",
+            &["/repo/a.md".to_string()],
+            "/repo",
+            &mut b,
         )
         .unwrap_err();
 
@@ -11197,7 +11426,10 @@ mod mandatory_review_tests {
         let _guard = review_env_lock();
         let fx = setup_review_with_reader("APPROVE", "cat");
         let out = run_review(&fx, "a claim that needs checking").await;
-        assert!(out.is_ok(), "an honest full read must still pass; got: {out:?}");
+        assert!(
+            out.is_ok(),
+            "an honest full read must still pass; got: {out:?}"
+        );
     }
 
     /// A missing nonce must never turn a REJECT into something else. The check runs after
@@ -11259,7 +11491,10 @@ mod mandatory_review_tests {
                 dispatch_owned: true,
             })
             .expect("occupy the slot");
-        assert_eq!(occupying.state, "in_progress", "the fixture must actually fill the cap");
+        assert_eq!(
+            occupying.state, "in_progress",
+            "the fixture must actually fill the cap"
+        );
 
         let out = run_review(&fx, "work that arrives while the queue is full").await;
 
@@ -11412,9 +11647,19 @@ mod codex_error_tail_tests {
         );
         let out = codex_error_tail(raw, &tail(&["Reading additional input from stdin..."]));
         assert!(out.contains("usage limit"), "got: {out}");
-        assert!(!out.contains("Skill descriptions"), "item-level notices are not the failure: {out}");
-        assert!(!out.contains("Reading additional input"), "stdin notice is noise: {out}");
-        assert_eq!(out.matches("usage limit").count(), 1, "error and turn.failed carry the same text once: {out}");
+        assert!(
+            !out.contains("Skill descriptions"),
+            "item-level notices are not the failure: {out}"
+        );
+        assert!(
+            !out.contains("Reading additional input"),
+            "stdin notice is noise: {out}"
+        );
+        assert_eq!(
+            out.matches("usage limit").count(),
+            1,
+            "error and turn.failed carry the same text once: {out}"
+        );
     }
 
     #[test]
@@ -11457,12 +11702,18 @@ mod codex_error_tail_tests {
     #[test]
     fn plain_error_line_and_stderr_still_count() {
         let out = codex_error_tail("OK\nERROR: something broke\n", &tail(&["fatal: boom"]));
-        assert!(out.contains("ERROR: something broke") && out.contains("fatal: boom"), "got: {out}");
+        assert!(
+            out.contains("ERROR: something broke") && out.contains("fatal: boom"),
+            "got: {out}"
+        );
     }
 
     #[test]
     fn nothing_useful_adds_nothing() {
-        assert_eq!(codex_error_tail("{\"type\":\"turn.started\"}\n", &tail(&[])), "");
+        assert_eq!(
+            codex_error_tail("{\"type\":\"turn.started\"}\n", &tail(&[])),
+            ""
+        );
     }
 }
 
@@ -11481,13 +11732,17 @@ mod grok_shell_read_gate_tests {
     }
 
     fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
-        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
+        ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(command)),
+            returned_lines: Vec::new(),
             id: None,
             tool: "run_terminal_command".to_string(),
             kind,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(serde_json::json!({ "command": command, "description": "x" }).to_string()),
+            args_json: Some(
+                serde_json::json!({ "command": command, "description": "x" }).to_string(),
+            ),
         }
     }
 
@@ -11499,7 +11754,9 @@ mod grok_shell_read_gate_tests {
     /// this file tests are ever reached. A helper that skips the step under test is not a test.
     fn codex_shell(command: &str) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
-        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
+        ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(command)),
+            returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -11523,7 +11780,14 @@ mod grok_shell_read_gate_tests {
         let tools: Vec<ToolCallRecord> = cmds.iter().map(|c| codex_shell(c)).collect();
         let sources = vec![source.to_string()];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &sources, cwd, &mut lifecycle)
+        enforce_reviewer_sight(
+            "Codex",
+            &tools,
+            "codex-exec-json",
+            &sources,
+            cwd,
+            &mut lifecycle,
+        )
     }
 
     /// D-017, THE LIVE CASE. On the first real `ask_jury` run, codex read a 97-line brief with
@@ -11553,7 +11817,8 @@ mod grok_shell_read_gate_tests {
             // the line count will always do.
             format!("wc -l {src} && sed -n '1,99999p' {src}"),
         ] {
-            gate_codex(&[&cmd], &src, &cwd).unwrap_or_else(|e| panic!("must count as a read: {cmd}\n  gate said: {e}"));
+            gate_codex(&[&cmd], &src, &cwd)
+                .unwrap_or_else(|e| panic!("must count as a read: {cmd}\n  gate said: {e}"));
         }
     }
 
@@ -11574,7 +11839,11 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
         });
-        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
+        let call = ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(
+                args["command"].as_str().unwrap_or_default(),
+            )),
+            returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -11582,11 +11851,22 @@ mod grok_shell_read_gate_tests {
             duration_ms: None,
             args_json: Some(args.to_string()),
         };
-        assert_eq!(call.kind, ToolKind::ReadFile, "the classifier must see a chained read at all");
+        assert_eq!(
+            call.kind,
+            ToolKind::ReadFile,
+            "the classifier must see a chained read at all"
+        );
         let sources = vec![src.clone()];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
-            .expect("the window over the SOURCE must count, whatever the other link read");
+        enforce_reviewer_sight(
+            "Codex",
+            &[call],
+            "codex-exec-json",
+            &sources,
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("the window over the SOURCE must count, whatever the other link read");
     }
 
     /// A rejection must explain itself. The receipt that sent me hunting printed the command
@@ -11596,7 +11876,9 @@ mod grok_shell_read_gate_tests {
     fn a_rejection_receipt_names_the_operand_and_window_each_read_bound_to() {
         let (dir, src) = source_file(400);
         let cwd = dir.path().to_string_lossy().into_owned();
-        let other = dir.path().join("other-with-a-deliberately-long-name-to-push-past-the-old-limit.md");
+        let other = dir
+            .path()
+            .join("other-with-a-deliberately-long-name-to-push-past-the-old-limit.md");
         std::fs::write(&other, "x\n".repeat(40)).expect("write other");
         let other = other.to_string_lossy().into_owned();
 
@@ -11605,7 +11887,11 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
         });
-        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
+        let call = ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(
+                args["command"].as_str().unwrap_or_default(),
+            )),
+            returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -11615,10 +11901,20 @@ mod grok_shell_read_gate_tests {
         };
         let sources = vec![src.clone()];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
-            .expect_err("50 of 400 lines is not the source");
+        let err = enforce_reviewer_sight(
+            "Codex",
+            &[call],
+            "codex-exec-json",
+            &sources,
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("50 of 400 lines is not the source");
 
-        assert!(err.contains("lines 1-50"), "the receipt must name the window it got: {err}");
+        assert!(
+            err.contains("lines 1-50"),
+            "the receipt must name the window it got: {err}"
+        );
         assert!(err.contains(&src), "and the operand it bound to: {err}");
         assert!(
             !err.contains("/bin/zsh"),
@@ -11634,22 +11930,47 @@ mod grok_shell_read_gate_tests {
         let (dir, src) = source_file(97);
         let cwd = dir.path().to_string_lossy().into_owned();
         for (cmd, why) in [
-            (format!("wc -l {src} && head -5 {src}"), "a peek in a chain is still only PART"),
-            (format!("sed -n '1,50p' {src} && wc -l {src}"), "half the file in a chain is still PART"),
-            (format!("cat /dev/null < {src} && wc -l {src}"), "a redirect still reads nothing"),
-            (format!("cat /etc/hostname # {src} && wc -l {src}"), "a comment still names nothing"),
+            (
+                format!("wc -l {src} && head -5 {src}"),
+                "a peek in a chain is still only PART",
+            ),
+            (
+                format!("sed -n '1,50p' {src} && wc -l {src}"),
+                "half the file in a chain is still PART",
+            ),
+            (
+                format!("cat /dev/null < {src} && wc -l {src}"),
+                "a redirect still reads nothing",
+            ),
+            (
+                format!("cat /etc/hostname # {src} && wc -l {src}"),
+                "a comment still names nothing",
+            ),
             // `;` and `||` mask a failed read: both exit zero having read nothing, so the
             // success flag the gate trusts would be a lie. They stay refused whole.
-            (format!("cat /nonexistent ; cat {src}"), "a semicolon chain is still refused"),
-            (format!("cat /nonexistent || cat {src}"), "an or-chain is still refused"),
-            (format!("echo {src} && cat /etc/hostname"), "naming the file is not reading it"),
+            (
+                format!("cat /nonexistent ; cat {src}"),
+                "a semicolon chain is still refused",
+            ),
+            (
+                format!("cat /nonexistent || cat {src}"),
+                "an or-chain is still refused",
+            ),
+            (
+                format!("echo {src} && cat /etc/hostname"),
+                "naming the file is not reading it",
+            ),
             // An UNTERMINATED quote is a parse error for the whole line, so the shell runs
             // NOTHING, including the read that precedes it. Splitting would credit a read that
             // never happened. (The mirror case, `echo 'oops && cat SRC`, needs no guard: the
             // scanner is inside the quote when it reaches the `&&`, so it never splits there.)
-            (format!("cat {src} && echo 'oops"), "an unterminated quote runs nothing"),
+            (
+                format!("cat {src} && echo 'oops"),
+                "an unterminated quote runs nothing",
+            ),
         ] {
-            let err = gate_codex(&[&cmd], &src, &cwd).expect_err(&format!("must NOT pass: {why}\n  {cmd}"));
+            let err = gate_codex(&[&cmd], &src, &cwd)
+                .expect_err(&format!("must NOT pass: {why}\n  {cmd}"));
             assert!(
                 err.contains("never successfully opened") || err.contains("only read PART"),
                 "{why}: unexpected rejection text: {err}"
@@ -11667,8 +11988,15 @@ mod grok_shell_read_gate_tests {
         let tools = vec![grok_shell(&format!("cat {src}"), ToolKind::ReadFile)];
         let sources = vec![src];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle)
-            .expect("a whole-file cat is the source");
+        enforce_reviewer_sight(
+            "Grok",
+            &tools,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut lifecycle,
+        )
+        .expect("a whole-file cat is the source");
     }
 
     /// D-032 shell half. The CLIs truncate one call's output (codex near 10k tokens, grok to the
@@ -11686,21 +12014,45 @@ mod grok_shell_read_gate_tests {
         let sources = vec![big.clone()];
 
         let cat = vec![grok_shell(&format!("cat {big}"), ToolKind::ReadFile)];
-        let err = enforce_reviewer_sight("Grok", &cat, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("60 KB through one call: the middle was truncated away");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &cat,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("60 KB through one call: the middle was truncated away");
         assert!(err.contains("PART"), "{err}");
 
-        let chained = vec![grok_shell(&format!("sed -n '1,300p' {big} && sed -n '301,600p' {big}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Grok", &chained, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("two windows in ONE call still print 60 KB into one output");
+        let chained = vec![grok_shell(
+            &format!("sed -n '1,300p' {big} && sed -n '301,600p' {big}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Grok",
+            &chained,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("two windows in ONE call still print 60 KB into one output");
 
         let tiled = vec![
             grok_shell(&format!("sed -n '1,250p' {big}"), ToolKind::ReadFile),
             grok_shell(&format!("sed -n '251,500p' {big}"), ToolKind::ReadFile),
             grok_shell(&format!("sed -n '501,600p' {big}"), ToolKind::ReadFile),
         ];
-        enforce_reviewer_sight("Grok", &tiled, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect("25 KB, 25 KB and 10 KB calls each fit and together cover the file");
+        enforce_reviewer_sight(
+            "Grok",
+            &tiled,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect("25 KB, 25 KB and 10 KB calls each fit and together cover the file");
     }
 
     /// Codex, D-032 third pass: the budget is on PRINTED bytes. 5000 two-byte lines are 10 KB of
@@ -11715,26 +12067,76 @@ mod grok_shell_read_gate_tests {
         let root = dir.path().to_string_lossy().into_owned();
         let sources = vec![src.clone()];
 
-        let numbered = vec![grok_shell(&format!("nl -ba {src} | sed -n '1,5000p'"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &numbered, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("10 KB of source, 45 KB printed: truncated");
+        let numbered = vec![grok_shell(
+            &format!("nl -ba {src} | sed -n '1,5000p'"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &numbered,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("10 KB of source, 45 KB printed: truncated");
 
-        let plain = vec![grok_shell(&format!("sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &plain, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect("the same window, undecorated, prints 10 KB");
+        let plain = vec![grok_shell(
+            &format!("sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &plain,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect("the same window, undecorated, prints 10 KB");
 
         // A segment whose output cannot be bounded poisons the call; `wc` (D-017's live habit)
         // is bounded and does not.
-        let unbounded = vec![grok_shell(&format!("find {root} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &unbounded, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("find's output cannot be sized and shares the output");
+        let unbounded = vec![grok_shell(
+            &format!("find {root} && sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &unbounded,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("find's output cannot be sized and shares the output");
         // Brace expansion: a short command, a huge output (Codex, fourth pass).
-        let braces = vec![grok_shell(&format!("echo {{1..40000}} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &braces, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("echo {1..40000} prints far more than its text");
-        let with_wc = vec![grok_shell(&format!("wc -l {src} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &with_wc, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect("wc prints a bounded line");
+        let braces = vec![grok_shell(
+            &format!("echo {{1..40000}} && sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &braces,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("echo {1..40000} prints far more than its text");
+        let with_wc = vec![grok_shell(
+            &format!("wc -l {src} && sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &with_wc,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect("wc prints a bounded line");
     }
 
     /// RED IF: a peek passes as the source. `head -5` is the FIND-REVIEW-07 shape.
@@ -11743,8 +12145,15 @@ mod grok_shell_read_gate_tests {
         let tools = vec![grok_shell("head -5 /repo/a.rs", ToolKind::ReadFile)];
         let sources = vec!["/repo/a.rs".to_string()];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
-            .expect_err("a peek is not the source");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &tools,
+            "grok-streaming-json",
+            &sources,
+            "/repo",
+            &mut lifecycle,
+        )
+        .expect_err("a peek is not the source");
         assert!(err.contains("only read PART"), "got: {err}");
     }
 
@@ -11753,13 +12162,27 @@ mod grok_shell_read_gate_tests {
     /// RED IF: any of these passes as "opened".
     #[test]
     fn a_read_of_something_else_that_mentions_the_source_does_not_open_it() {
-        for cmd in ["cat /dev/null < /repo/a.rs", "cat /repo/b.rs # /repo/a.rs", "cat /dev/null"] {
+        for cmd in [
+            "cat /dev/null < /repo/a.rs",
+            "cat /repo/b.rs # /repo/a.rs",
+            "cat /dev/null",
+        ] {
             let mut rec = grok_shell(cmd, ToolKind::ReadFile);
-            rec.args_json = Some(serde_json::json!({ "command": cmd, "description": "reading /repo/a.rs" }).to_string());
+            rec.args_json = Some(
+                serde_json::json!({ "command": cmd, "description": "reading /repo/a.rs" })
+                    .to_string(),
+            );
             let sources = vec!["/repo/a.rs".to_string()];
             let mut lifecycle = Vec::new();
-            let err = enforce_reviewer_sight("Grok", &[rec], "grok-streaming-json", &sources, "/repo", &mut lifecycle)
-                .expect_err(cmd);
+            let err = enforce_reviewer_sight(
+                "Grok",
+                &[rec],
+                "grok-streaming-json",
+                &sources,
+                "/repo",
+                &mut lifecycle,
+            )
+            .expect_err(cmd);
             assert!(
                 err.contains("never successfully opened") || err.contains("only read PART"),
                 "{cmd}: {err}"
@@ -11779,7 +12202,9 @@ mod grok_shell_read_gate_tests {
             ("bash", serde_json::json!({ "command": cmd })),
             ("command_execution", serde_json::json!({ "command": cmd })),
         ] {
-            let rec = ToolCallRecord { shown_output: Some(super::honest_shown_output(&cmd)), returned_lines: Vec::new(),
+            let rec = ToolCallRecord {
+                shown_output: Some(super::honest_shown_output(&cmd)),
+                returned_lines: Vec::new(),
                 id: None,
                 tool: tool.to_string(),
                 kind: ToolKind::ReadFile,
@@ -11789,8 +12214,15 @@ mod grok_shell_read_gate_tests {
             };
             let sources = vec![src.clone()];
             let mut lifecycle = Vec::new();
-            enforce_reviewer_sight("X", &[rec], "grok-streaming-json", &sources, &root, &mut lifecycle)
-                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            enforce_reviewer_sight(
+                "X",
+                &[rec],
+                "grok-streaming-json",
+                &sources,
+                &root,
+                &mut lifecycle,
+            )
+            .unwrap_or_else(|e| panic!("{tool}: {e}"));
         }
     }
 
@@ -11801,8 +12233,15 @@ mod grok_shell_read_gate_tests {
         let tools = vec![grok_shell("wc -l /repo/a.rs", ToolKind::Bash)];
         let sources = vec!["/repo/a.rs".to_string()];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
-            .expect_err("wc is not a read");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &tools,
+            "grok-streaming-json",
+            &sources,
+            "/repo",
+            &mut lifecycle,
+        )
+        .expect_err("wc is not a read");
         assert!(err.contains("never successfully opened"), "got: {err}");
     }
 }
@@ -11846,7 +12285,8 @@ mod strict_agent_tests {
     }
 
     fn write_script(path: &std::path::Path, body: &str) {
-        crate::write_test_executable(path, format!("#!/bin/sh\n{body}\n")).expect("write test executable");
+        crate::write_test_executable(path, format!("#!/bin/sh\n{body}\n"))
+            .expect("write test executable");
     }
 
     /// agy always fails on quota. codex always answers, and leaves a file saying it ran.
@@ -11855,7 +12295,10 @@ mod strict_agent_tests {
         let codex_ran = dir.path().join("codex-ran");
         let agy = dir.path().join("mock-agy");
         let codex = dir.path().join("mock-codex");
-        write_script(&agy, "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2");
+        write_script(
+            &agy,
+            "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2",
+        );
         write_script(
             &codex,
             &format!(
@@ -11893,14 +12336,18 @@ mod strict_agent_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
     async fn strict_00_default_route_never_substitutes_codex() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _agy = crate::agy::tests::ENV_LOCK.lock().await;
         let fx = setup();
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
 
         execute_ask_agent(&request(&fx, None), None)
             .await
-            .expect_err("an unavailable Gemini backend is a failure by default, not codex's answer");
+            .expect_err(
+                "an unavailable Gemini backend is a failure by default, not codex's answer",
+            );
 
         assert!(
             !fx.codex_ran.exists(),
@@ -12094,7 +12541,9 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
     async fn stall_01_a_silent_codex_is_killed_at_its_window_with_the_stalled_outcome() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fx = setup("echo '{\"type\":\"turn.started\"}'\nsleep 60", 2);
 
         let started = std::time::Instant::now();
@@ -12139,7 +12588,9 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
     async fn stall_02_a_slow_codex_inside_its_window_is_not_killed() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fx = setup(
             "for i in 1 2 3 4; do echo '{\"type\":\"turn.started\"}'; sleep 1; done\n\
              echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'\n\
@@ -12714,7 +13165,9 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REV
     /// RED IF: a repair turn that errors is reported as turn 1's error alone (Antigravity).
     #[tokio::test]
     async fn a_repair_that_does_not_finish_says_so() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = stub("exit 3");
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
