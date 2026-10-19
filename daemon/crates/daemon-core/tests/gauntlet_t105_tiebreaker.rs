@@ -25,7 +25,7 @@ fn creates_an_empty_lock_file_at_the_contract_path() {
 
     let guard = acquire_seat_lock(home.path(), "kimi").expect("acquire kimi seat lock");
 
-    assert_eq!(lock_path.is_file(), true);
+    assert!(lock_path.is_file());
     assert_eq!(
         fs::read(&lock_path).expect("read created seat lock file"),
         Vec::<u8>::new()
@@ -118,7 +118,7 @@ fn rejects_a_lock_file_symlink_without_changing_its_target() {
             drop(guard);
             panic!("acquisition followed a planted locks/<seat> symlink");
         }
-        Err(error) => assert_eq!(error.is_empty(), false),
+        Err(error) => assert!(!error.is_empty()),
     }
 
     assert_eq!(
@@ -144,10 +144,10 @@ fn rejects_a_symlinked_locks_directory_without_creating_an_external_lock() {
             drop(guard);
             panic!("acquisition followed a planted locks directory symlink");
         }
-        Err(error) => assert_eq!(error.is_empty(), false),
+        Err(error) => assert!(!error.is_empty()),
     }
 
-    assert_eq!(external_lock.exists(), false);
+    assert!(!external_lock.exists());
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn killing_the_holding_process_releases_the_lock() {
 
     child.kill().expect("kill child lock holder");
     let status = child.wait().expect("reap child lock holder");
-    assert_eq!(status.success(), false);
+    assert!(!status.success());
 
     let guard = acquired_rx
         .recv_timeout(Duration::from_secs(5))

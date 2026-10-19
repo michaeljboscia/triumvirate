@@ -245,7 +245,7 @@ fn symlinked_seat_file_is_refused_and_outside_target_untouched() {
     std::fs::write(&target, "outside-original").expect("write outside target");
     symlink(&target, home.path().join("locks").join("kimi")).expect("plant symlink");
 
-    let err = acquire_seat_lock(home.path(), "kimi").err().expect("symlinked seat file must be refused");
+    let err = acquire_seat_lock(home.path(), "kimi").expect_err("symlinked seat file must be refused");
     assert!(!err.is_empty(), "refusal must carry a message");
     assert_eq!(std::fs::read_to_string(&target).expect("read outside target"), "outside-original");
 }
@@ -257,7 +257,7 @@ fn symlinked_locks_directory_is_refused_and_outside_dir_untouched() {
     let outside = tempfile::tempdir().expect("outside tempdir");
     symlink(outside.path(), home.path().join("locks")).expect("plant locks symlink");
 
-    let err = acquire_seat_lock(home.path(), "kimi").err().expect("symlinked locks dir must be refused");
+    let err = acquire_seat_lock(home.path(), "kimi").expect_err("symlinked locks dir must be refused");
     assert!(!err.is_empty(), "refusal must carry a message");
     let entries = std::fs::read_dir(outside.path()).expect("read outside dir").count();
     assert_eq!(entries, 0, "no lock file may be created outside the locks directory");
