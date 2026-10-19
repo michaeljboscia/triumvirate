@@ -1459,6 +1459,64 @@ mod seven_primes_doctor_tests {
         assert_eq!(seat_bin_override("vibe", missing), None);
     }
 
+    /// `find_on_path` returns the first PATH entry that is an executable regular file. Earlier on PATH sit a directory
+    /// with the program's name (mode 0755, so it has execute bits) and a regular file without execute bits; both are
+    /// skipped. A program on no PATH entry is None.
+    /// RED IF: the execute-bit test is weakened (`|`, `^`) or inverted (`==`), the is_file test is OR-ed instead of
+    /// AND-ed, or the lookup returns None or an empty path for a program that is on PATH.
+    #[test]
+    fn find_on_path_returns_the_first_executable_regular_file() {
+        let _g = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let program = "t-p6-find-on-path-prog";
+        let (a, b, c) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("c"),
+        );
+        fs::create_dir_all(a.join(program)).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join(program), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(b.join(program), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir_all(&c).unwrap();
+        crate::write_test_executable(&c.join(program), "#!/bin/sh\n").unwrap();
+        let saved = std::env::var_os("PATH");
+        // SAFETY: under the crate env lock; restored below before any assert.
+        unsafe {
+            std::env::set_var("PATH", std::env::join_paths([&a, &b, &c]).unwrap());
+        }
+        let found = find_on_path(program);
+        let missing = find_on_path("t-p6-find-on-path-absent");
+        // SAFETY: under the crate env lock.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert_eq!(found, Some(c.join(program)));
+        assert_eq!(missing, None);
+    }
+
+    /// A seat home that cannot be resolved for a reason other than not existing (here a path through a regular file,
+    /// ENOTDIR) is a finding; only a home that does not exist at all has nothing to scan.
+    /// RED IF: every canonicalize error, not only NotFound, makes the scan report nothing (fails open).
+    #[test]
+    fn stray_scan_reports_an_unresolvable_seat_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain-file");
+        fs::write(&file, "x").unwrap();
+        let found = stray_key_files(&file.join("home"), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("unreadable"), "{found:?}");
+        assert_eq!(
+            stray_key_files(&dir.path().join("absent"), &[]),
+            Vec::<String>::new()
+        );
+    }
+
     /// A vendor's documentation placeholder is not a key (Vibe's downloaded plugin docs, live 2026-10-19), but a
     /// real-shaped value on the same kind of line still fails.
     /// RED IF: placeholders fail a clean seat's stray_keys, or the placeholder rule lets a real key through.

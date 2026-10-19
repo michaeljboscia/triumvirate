@@ -2122,3 +2122,54 @@ async fn t208_7_each_new_seat_publishes_and_resumes_exact_id() {
         );
     }
 }
+
+/// `triumvirate doctor` (no `--live`) through the real binary prints the Seats section with each seat's static checks
+/// against the rig's mocks, and spawns no seat (only `--version` runs, which the mock does not count).
+/// RED IF: `main`, either `run_doctor` (main.rs or cli_ops.rs) or `print_seat_doctor` returns Ok without printing the
+/// Seats section, or the doctor exits nonzero.
+#[tokio::test]
+async fn doctor_prints_the_seats_section() {
+    let _g = ENV_LOCK.lock().await;
+    let rig = Rig::new();
+    let log = rig.root.join("doctor-static.log");
+    let status = rig
+        .command(&["doctor"], &log)
+        .status()
+        .expect("doctor");
+    let out = fs::read_to_string(&log).unwrap();
+    assert!(status.success(), "{out}");
+    assert!(out.contains("\nSeats:\n"), "{out}");
+    for seat in SEATS {
+        let binary = format!("  {seat}.binary: PASS ({})", rig.mock_bin(seat).display());
+        assert!(out.contains(&binary), "{seat}: {out}");
+        let pinned = format!("  {seat}.version: PASS ({})", version(seat));
+        assert!(out.contains(&pinned), "{seat}: {out}");
+        assert!(!out.contains(&format!("{seat}.live:")), "{seat}: {out}");
+        assert_eq!(rig.spawns(seat), 0, "{seat}: no live probe without --live");
+    }
+}
+
+/// `triumvirate seat clear <seat>` through the real binary removes that seat's suspended.json and leaves another
+/// seat's suspension in place.
+/// RED IF: `main` or `run_seat_clear` returns Ok without clearing the suspension, or clears the wrong seat.
+#[tokio::test]
+async fn seat_clear_command_removes_suspended_json() {
+    let _g = ENV_LOCK.lock().await;
+    let rig = Rig::new();
+    for seat in ["qwen", "kimi"] {
+        mcp_bridge::seat_state::write_suspended(&rig.th, seat, "403 from provider").unwrap();
+    }
+    let qwen = rig.th.join("seats/qwen/suspended.json");
+    let kimi = rig.th.join("seats/kimi/suspended.json");
+    assert!(qwen.exists() && kimi.exists());
+    let log = rig.root.join("seat-clear.log");
+    let status = rig
+        .command(&["seat", "clear", "qwen"], &log)
+        .status()
+        .expect("seat clear");
+    let out = fs::read_to_string(&log).unwrap();
+    assert!(status.success(), "{out}");
+    assert!(out.contains("qwen: suspension cleared"), "{out}");
+    assert!(!qwen.exists(), "seat clear removes suspended.json");
+    assert!(kimi.exists(), "another seat's suspension is untouched");
+}
