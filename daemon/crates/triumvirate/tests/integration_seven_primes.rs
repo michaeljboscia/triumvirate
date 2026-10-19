@@ -1950,9 +1950,14 @@ async fn t208_4_broken_first_turn_requires_dismiss_before_recovery() {
     assert_eq!(rig.spawns("kimi"), 1);
     let blocked = http_ask(&rig, token.trim(), "recover", "blocked").await;
     assert_eq!(blocked.0, reqwest::StatusCode::CONFLICT);
-    assert_eq!(
-        blocked.1["error"],
-        "session_broken: first turn exploded; dismiss_session and spawn a new one"
+    // The reason is the failed turn's first error line (the dispatcher wraps the vendor text), so assert the shape
+    // and the vendor text rather than one exact wrapper.
+    let blocked_err = blocked.1["error"].as_str().unwrap_or_default();
+    assert!(
+        blocked_err.starts_with("session_broken: ")
+            && blocked_err.contains("first turn exploded")
+            && blocked_err.ends_with("; dismiss_session and spawn a new one"),
+        "{blocked_err}"
     );
     assert_eq!(rig.spawns("kimi"), 1);
 
@@ -2015,7 +2020,8 @@ async fn t208_5_vendor_rejected_ready_session_becomes_broken() {
     let persisted: Value =
         serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap()).unwrap();
     assert_eq!(persisted["rejected"]["phase"], "broken");
-    assert_eq!(persisted["rejected"]["broken_reason"], "Session not found");
+    let reason = persisted["rejected"]["broken_reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("Session not found"), "{reason}");
     let blocked = http_ask(&rig, token.trim(), "rejected", "blocked").await;
     assert_eq!(blocked.0, reqwest::StatusCode::CONFLICT);
     assert_eq!(rig.spawns("kimi"), 2);
@@ -2037,7 +2043,11 @@ async fn t208_6_each_new_seat_missing_first_id_breaks_and_blocks() {
         "",
         None,
     );
-    rig.set_fixture("mistral", MISTRAL_STREAM, 0, "", None);
+    // Mistral's id lives in export.json, so "success without an id" is an export with no session_id (a missing
+    // export is a different failure, missing_export:mistral).
+    let mut export: Value = serde_json::from_str(MISTRAL_EXPORT).unwrap();
+    export.as_object_mut().unwrap().remove("session_id");
+    rig.set_fixture("mistral", MISTRAL_STREAM, 0, "", Some(&export.to_string()));
     rig.set_fixture(
         "qwen",
         &QWEN_STREAM
