@@ -6,3 +6,5 @@ b65015c T-302 doctor resolves seat CLIs like the runner (found by the --launch r
 71c718e deps merge of the approved dependency security bump (Mike: "Bump deps first")
 a24ac84 deps merge of the approved actions sha-pinning (chore/dep-security-bump ec2ee261, merged to main as #90)
 4be11dc P6.4 C-1 stability fix: a new-seat call with no cwd ran its read-only audit on the filesystem root (Mike: "stable and usable")
+d53889b P6.4 L-1 ledger fix: the daemon wrote `.triumvirate/` into the tracked .gitignore of every repo it ran in, client repos included (Mike: "That ledger bug sounds pretty bad")
+1116802 P6.4 L-1 ownership map entry for d53889b (the map commit itself)

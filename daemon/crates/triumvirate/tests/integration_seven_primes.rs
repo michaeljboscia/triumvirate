@@ -1110,8 +1110,8 @@ async fn a_write_past_the_seatbelt_is_a_read_only_violation() {
 /// Per seat, with the hostile fixture repo as the cwd, the call returns that seat mock's own answer (all three
 /// distinct), the argv carries the read-only controls (Kimi's agent file listing only Read, Grep, Glob; Qwen
 /// `--safe-mode` and `--auth-type openai`; Mistral no `--trust`), and no file in the repo changed.
-/// RED IF: a hostile project file changes what the runner launches, an answer is canned or crossed between seats, a
-/// read-only control drops, or the call writes into the repo.
+/// Test g. RED IF: a hostile project file changes what the runner launches, an answer is canned or crossed
+/// between seats, a read-only control drops, or the call writes into the repo.
 #[tokio::test]
 async fn hostile_repo_cwd_keeps_each_seat_read_only() {
     let _g = ENV_LOCK.lock().await;
@@ -1149,15 +1149,7 @@ async fn hostile_repo_cwd_keeps_each_seat_read_only() {
                 assert_eq!(after("--auth-type").as_deref(), Some("openai"), "{argv:?}");
             }
         }
-        // The daemon's ledger (not the seat) adds `.triumvirate/` to the cwd's .gitignore on its first call there
-        // (ledger/src/init.rs ensure_triumvirate_gitignore); every other byte must be as it was.
-        let mut now = tree_bytes(&repo);
-        if !before.contains_key(Path::new(".gitignore"))
-            && now.get(Path::new(".gitignore")).map(Vec::as_slice)
-                == Some(b".triumvirate/\n".as_slice())
-        {
-            now.remove(Path::new(".gitignore"));
-        }
+        let now = tree_bytes(&repo);
         assert_eq!(now, before, "{seat}: a repo file changed");
         assert!(!repo.join("pwned.txt").exists());
     }
