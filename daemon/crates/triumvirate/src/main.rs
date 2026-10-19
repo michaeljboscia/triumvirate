@@ -2525,6 +2525,36 @@ async fn ws_v2_handshake(
     }
 }
 
+/// GET /status. Module scope (not nested in `run_daemon`) so the Seven Primes HTTP test mounts this exact handler.
+async fn status(
+    State(state): State<DaemonRuntimeState>,
+    headers: HeaderMap,
+) -> Result<AxumJson<serde_json::Value>, StatusCode> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let pending = count_pending_fallbacks().unwrap_or(0);
+    let tickets = list_pending_fallback_paths(10)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    Ok(AxumJson(serde_json::json!({
+        "daemon": "running",
+        "auth": "bearer-required",
+        "daemon_mode": "incremental-dev",
+        "supported_agents": mcp_bridge::supported_agent_names(),
+        // Seven Primes REQ-080: per-seat configured/verified/suspended/available with the gate's reason.
+        "seats": mcp_tools::inter_agent::seats_status(),
+        "pending_fallbacks": pending,
+        "fallback_tickets": tickets,
+        "daemon_bind_addr": state.bind_addr
+    })))
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
 
     async fn metrics_middleware(
@@ -2582,32 +2612,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         body["telemetry_delivery_consecutive_misses"] = serde_json::json!(t.consecutive_misses);
         body["telemetry_delivery_last_check_unix_ms"] = serde_json::json!(t.last_check_unix_ms);
         Ok(AxumJson(body))
-    }
-
-    async fn status(
-        State(state): State<DaemonRuntimeState>,
-        headers: HeaderMap,
-    ) -> Result<AxumJson<serde_json::Value>, StatusCode> {
-        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-        let pending = count_pending_fallbacks().unwrap_or(0);
-        let tickets = list_pending_fallback_paths(10)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>();
-        Ok(AxumJson(serde_json::json!({
-            "daemon": "running",
-            "auth": "bearer-required",
-            "daemon_mode": "incremental-dev",
-            "supported_agents": mcp_bridge::supported_agent_names(),
-            // Seven Primes REQ-080: per-seat configured/verified/suspended/available with the gate's reason.
-            "seats": mcp_tools::inter_agent::seats_status(),
-            "pending_fallbacks": pending,
-            "fallback_tickets": tickets,
-            "daemon_bind_addr": state.bind_addr
-        })))
     }
 
     fn ledger_sweep_interval() -> Duration {
@@ -3321,12 +3325,28 @@ async fn run_daemon() -> anyhow::Result<()> {
         .route("/{*path}", get(daemon_http::dashboard_spa_fallback_route))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
+    // Seven Primes T-203: the gate needs each installed seat CLI's version to honor verified.json (REQ-091). This
+    // completes BEFORE the listener binds, so no request can see an empty registry and report a verified seat as
+    // unverified. `--version` is a blocking subprocess, so it runs off the async workers; a missing CLI registers
+    // nothing, and a failed or hung probe is logged and leaves that seat unregistered (fails closed) instead of
+    // holding the daemon down.
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::task::spawn_blocking(cli_ops::register_installed_seat_versions),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "seat CLI version registration failed; seats stay unverified")
+        }
+        Err(_) => tracing::error!(
+            "seat CLI version registration timed out; unregistered seats stay unverified"
+        ),
+    }
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(%bind_addr, "daemon listener bound");
     tokio::spawn(async {
-        // Seven Primes T-203: the gate needs each installed seat CLI's version to honor verified.json (REQ-091).
-        // `--version` is a blocking subprocess, so it runs off the async workers.
-        let _ = tokio::task::spawn_blocking(cli_ops::register_installed_seat_versions).await;
         prewarm_daemon_workers().await;
     });
     // M9: periodically reap leaked agy temp files (the fleet path can't RAII-clean them
@@ -8996,6 +9016,114 @@ mod seven_primes_description_tests {
 /// MCP get_status tool call the same `seats_status()`).
 #[cfg(test)]
 mod seven_primes_status_tests {
+    /// The reality test over HTTP: a real axum server on 127.0.0.1:0 serving the production `/status` handler
+    /// (`super::status`, the same fn `run_daemon` routes) with a real `DaemonRuntimeState`, hit with an authenticated
+    /// reqwest GET, body deserialized through the shared `SeatStatus` type.
+    /// RED IF: GET /status drops the `seats` map, a new seat's fields or reason drift from the gate, the bearer check
+    /// stops guarding it, or the env flag stops flipping `configured` without a restart.
+    // The env lock is held across awaits on purpose (as in `mod tests`): the handler reads the env per request.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn http_get_status_reports_seats_and_follows_the_env_flag() {
+        use std::collections::{BTreeMap, HashMap, VecDeque};
+        use std::sync::Arc;
+        let _g = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["TRIUMVIRATE_HOME", "TRIUMVIRATE_ENABLE_KIMI"]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect();
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: env mutation under the crate's env lock, restored below.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", home.path());
+            std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI");
+        }
+
+        let token = "t203-status-token";
+        let metrics = Arc::new(daemon_core::metrics::DaemonMetrics::new().unwrap());
+        let ws_events = tokio::sync::broadcast::channel::<String>(16).0;
+        let state = daemon_core::DaemonState::new(
+            token.to_string(),
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            "127.0.0.1:0".to_string(),
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            None,
+            crate::abe::task_tracker::TaskTracker::with_observability(
+                metrics.clone(),
+                Some(ws_events.clone()),
+            ),
+            Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            metrics,
+            ws_events,
+        );
+        let app = axum::Router::new()
+            .route("/status", axum::routing::get(super::status))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let get_seats = || async {
+            let resp = client
+                .get(format!("http://{addr}/status"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            serde_json::from_value::<BTreeMap<String, shared_types::SeatStatus>>(
+                body["seats"].clone(),
+            )
+            .unwrap_or_else(|e| panic!("seats missing or malformed in {body}: {e}"))
+        };
+
+        let unauth = client
+            .get(format!("http://{addr}/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status().as_u16(), 401);
+
+        let seats = get_seats().await;
+        let kimi = &seats["kimi"];
+        assert_eq!(
+            (
+                kimi.configured,
+                kimi.verified,
+                kimi.suspended,
+                kimi.available
+            ),
+            (false, false, false, false)
+        );
+        assert!(
+            kimi.reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("seat_not_configured"),
+            "{kimi:?}"
+        );
+
+        unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") };
+        let kimi = get_seats().await["kimi"].clone();
+        assert!(kimi.configured, "{kimi:?}");
+        assert!(!kimi.available, "{kimi:?}");
+
+        server.abort();
+        let _ = server.await;
+        for (k, v) in prior {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// RED IF: a new seat is missing from /status, its reason is not the gate's exact payload, or the env flag stops
     /// being read per request (configured must flip without a restart).
     #[test]
