@@ -342,3 +342,215 @@ fn test_should_not_block_across_distinct_triumvirate_homes() {
     assert!(probe_is_held(&lock_path(h2.path(), "kimi")));
     drop(b);
 }
+
+// ===== Round 2 (survivor feedback): seat-name validation and flock success =====
+
+fn tree_listing(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            out.push(p.strip_prefix(root).unwrap().to_string_lossy().into_owned());
+            if p.is_dir() {
+                walk(&p, root, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn assert_invalid_seat(seat: &str) {
+    let home = home_with_locks();
+    let before = tree_listing(home.path());
+    let err = match acquire_seat_lock(home.path(), seat) {
+        Ok(_) => panic!("seat {seat:?} must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.starts_with("invalid_seat_name:"), "seat {seat:?} gave error {err:?}");
+    assert_eq!(tree_listing(home.path()), before, "seat {seat:?} must create nothing under home");
+}
+
+// Spec sharpening: empty seat is invalid.
+#[test]
+fn test_should_reject_empty_seat_name() {
+    assert_invalid_seat("");
+}
+
+// Spec sharpening: uppercase is invalid (whole-name and mixed).
+#[test]
+fn test_should_reject_uppercase_seat_names() {
+    assert_invalid_seat("Kimi");
+    assert_invalid_seat("KIMI");
+    assert_invalid_seat("kImi");
+    assert_invalid_seat("kimI");
+}
+
+// Spec sharpening: '/' is invalid (traversal and nesting).
+#[test]
+fn test_should_reject_slash_in_seat_name() {
+    assert_invalid_seat("a/b");
+    assert_invalid_seat("/kimi");
+    assert_invalid_seat("kimi/");
+    assert_invalid_seat("/etc/passwd");
+}
+
+// Spec sharpening: '.' and '..' are invalid.
+#[test]
+fn test_should_reject_dot_names() {
+    assert_invalid_seat(".");
+    assert_invalid_seat("..");
+    assert_invalid_seat("../kimi");
+    assert_invalid_seat("ki.mi");
+    assert_invalid_seat(".kimi");
+    assert_invalid_seat("kimi.");
+}
+
+// Spec sharpening: '_' is invalid.
+#[test]
+fn test_should_reject_underscore_in_seat_name() {
+    assert_invalid_seat("a_b");
+    assert_invalid_seat("_kimi");
+    assert_invalid_seat("kimi_");
+}
+
+// Spec sharpening: space and other whitespace are invalid.
+#[test]
+fn test_should_reject_whitespace_in_seat_name() {
+    assert_invalid_seat(" ");
+    assert_invalid_seat("a b");
+    assert_invalid_seat("kimi ");
+    assert_invalid_seat(" kimi");
+    assert_invalid_seat("a\tb");
+    assert_invalid_seat("a\nb");
+}
+
+// Spec sharpening: non-ASCII is invalid, including letters and digits outside ASCII.
+#[test]
+fn test_should_reject_non_ascii_seat_names() {
+    assert_invalid_seat("kim\u{00ef}");
+    assert_invalid_seat("\u{043a}imi");
+    assert_invalid_seat("kimi\u{1F600}");
+    assert_invalid_seat("\u{0663}");
+}
+
+// Spec sharpening: other punctuation and NUL are invalid.
+#[test]
+fn test_should_reject_other_punctuation_and_nul() {
+    for s in ["a:b", "a*b", "a\\b", "a$b", "a@b", "a+b", "a=b", "a;b", "ki\0mi", "kimi~"] {
+        assert_invalid_seat(s);
+    }
+}
+
+// Spec sharpening: one invalid character among valid ones rejects the whole name.
+#[test]
+fn test_should_reject_seat_with_single_invalid_char_among_valid() {
+    assert_invalid_seat("kimi-2/x");
+    assert_invalid_seat("9-a_");
+    assert_invalid_seat("-A-");
+}
+
+// Spec sharpening: a rejected name creates nothing even when `locks` is absent.
+#[test]
+fn test_should_create_nothing_when_rejecting_in_empty_home() {
+    let home = tempfile::tempdir().unwrap();
+    let err = match acquire_seat_lock(home.path(), "Bad/Seat") {
+        Ok(_) => panic!("must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.starts_with("invalid_seat_name:"), "{err:?}");
+    assert_eq!(tree_listing(home.path()), Vec::<String>::new());
+}
+
+// Spec sharpening: a traversal name must not create a file outside locks.
+#[test]
+fn test_should_not_create_file_outside_locks_for_traversal_name() {
+    let home = home_with_locks();
+    let r = acquire_seat_lock(home.path(), "../escaped");
+    assert!(r.is_err());
+    assert!(!home.path().join("escaped").exists());
+}
+
+// Spec sharpening: lowercase letters, digits and '-' are valid.
+#[test]
+fn test_should_accept_lowercase_digits_and_hyphen_seat_names() {
+    for s in ["kimi", "mistral", "qwen", "a", "z", "0", "9", "seat-1", "a-b-c", "-", "--", "-a", "a-", "0123456789", "abcdefghijklmnopqrstuvwxyz", "k2-0"] {
+        let home = home_with_locks();
+        let g = match acquire_seat_lock(home.path(), s) {
+            Ok(g) => g,
+            Err(e) => panic!("seat {s:?} must be accepted, got {e:?}"),
+        };
+        assert!(lock_path(home.path(), s).is_file(), "seat {s:?}");
+        drop(g);
+    }
+}
+
+// Spec sharpening: boundary characters of the allowed ranges are accepted, their ASCII neighbors rejected.
+#[test]
+fn test_should_enforce_range_boundaries_of_allowed_characters() {
+    for s in ["a", "z", "0", "9", "-"] {
+        let home = home_with_locks();
+        assert!(acquire_seat_lock(home.path(), s).is_ok(), "{s:?} must be accepted");
+    }
+    for s in ["`", "{", "/", ":", "@", "[", "A", "Z", ",", "."] {
+        assert_invalid_seat(s);
+    }
+}
+
+// Spec sharpening: a successful acquire holds an exclusive flock (second acquirer blocks until drop).
+#[test]
+fn test_should_block_second_thread_after_successful_acquire_until_drop() {
+    let home = home_with_locks();
+    let hp = home.path().to_path_buf();
+    let first = acquire_seat_lock(&hp, "seat-7").expect("first");
+    let (tx, rx) = mpsc::channel();
+    let hp2 = hp.clone();
+    let t = thread::spawn(move || {
+        let g = acquire_seat_lock(&hp2, "seat-7");
+        tx.send(g.is_ok()).unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "second acquirer got through a held lock");
+    drop(first);
+    assert!(rx.recv_timeout(Duration::from_secs(10)).expect("second acquirer proceeds after drop"));
+    t.join().unwrap();
+}
+
+// Spec sharpening: an Ok guard really holds the flock (result not inverted), none after drop.
+#[test]
+fn test_should_hold_exclusive_flock_after_ok_and_none_after_drop() {
+    let home = home_with_locks();
+    let path = lock_path(home.path(), "seat-8");
+    fs::write(&path, b"").unwrap();
+    assert!(!probe_is_held(&path));
+    let g = acquire_seat_lock(home.path(), "seat-8").expect("acquire");
+    assert!(probe_is_held(&path), "Ok guard must really hold the flock");
+    drop(g);
+    assert!(!probe_is_held(&path), "flock must be gone after drop");
+}
+
+// Spec sharpening: acquire waits for a foreign holder, then really holds the lock itself.
+#[test]
+fn test_should_wait_for_foreign_holder_then_really_hold_lock() {
+    let home = home_with_locks();
+    let path = lock_path(home.path(), "seat-9");
+    fs::write(&path, b"").unwrap();
+    let mut child = spawn_holder(&path);
+    let hp = home.path().to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let t = thread::spawn(move || {
+        let g = acquire_seat_lock(&hp, "seat-9").expect("acquire after foreign release");
+        tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(g);
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "acquire returned while a foreign process held the lock");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    rx.recv_timeout(Duration::from_secs(10)).expect("acquire completes after foreign release");
+    assert!(probe_is_held(&path), "guard returned Ok but does not hold the flock");
+    release_tx.send(()).unwrap();
+    t.join().unwrap();
+    assert!(!probe_is_held(&path));
+}
