@@ -2132,10 +2132,7 @@ async fn doctor_prints_the_seats_section() {
     let _g = ENV_LOCK.lock().await;
     let rig = Rig::new();
     let log = rig.root.join("doctor-static.log");
-    let status = rig
-        .command(&["doctor"], &log)
-        .status()
-        .expect("doctor");
+    let status = rig.command(&["doctor"], &log).status().expect("doctor");
     let out = fs::read_to_string(&log).unwrap();
     assert!(status.success(), "{out}");
     assert!(out.contains("\nSeats:\n"), "{out}");

@@ -126,7 +126,11 @@ async fn file_grounded_answer(seat: &str) {
     // "secret.txt" holding "The token is ..."), which tests its safety policy, not the sight gate.
     let token = unique("CODENAME").replace('-', "");
     let file = dir.join("release-notes.txt");
-    std::fs::write(&file, format!("Release notes\nThe release codename is {token}\n")).unwrap();
+    std::fs::write(
+        &file,
+        format!("Release notes\nThe release codename is {token}\n"),
+    )
+    .unwrap();
     let (status, out) = post(
         "/ask-agent",
         serde_json::json!({

@@ -9,7 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mcp_bridge::containment::{audit_repo, render_seatbelt_profile, snapshot_repo};
+use mcp_bridge::containment::{audit_repo, snapshot_repo};
+// The seatbelt cases are macOS-only, so the profile renderer is imported only there (Linux clippy: unused import).
+#[cfg(target_os = "macos")]
+use mcp_bridge::containment::render_seatbelt_profile;
 
 /// A fresh directory under the crate's target tmp dir, unique per test.
 fn root(name: &str) -> PathBuf {

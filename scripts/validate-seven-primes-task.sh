@@ -106,6 +106,8 @@ unowned_commits() {
     local sha subject map="$REPO/docs/seven-primes/COMMIT_OWNERSHIP.txt"
     while IFS=$'\t' read -r sha subject; do
         if [[ "$subject" =~ ^([a-z]+(\([^\)]*\))?!?:\ )?(T-[0-9]{3}|P[0-9]+(\.[0-9]+)?)([^0-9]|$) ]]; then continue; fi
+        # GitHub's synthetic PR merge commit (CI checks out refs/pull/N/merge) is not a build commit.
+        if [[ "$subject" =~ ^Merge\ [0-9a-f]{40}\ into\ [0-9a-f]{40}$ ]]; then continue; fi
         if [[ -f "$map" ]] && grep -Eq "^${sha:0:7} (T-[0-9]{3}|P[0-9]+(\.[0-9]+)?|deps) .+" "$map"; then continue; fi
         printf '%s %s\n' "${sha:0:7}" "$subject"
     done < <(git -C "$REPO" log --format=$'%H\t%s' "$BASE..HEAD")
