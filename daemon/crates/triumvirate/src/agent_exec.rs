@@ -7072,7 +7072,7 @@ async fn run_agent_process_with_session(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// T-012 (REQ-DS-014, REQ-DS-023) tests — dispatch arm + CoT bifurcation.
+// T-012 (REQ-DS-014, REQ-DS-023) tests: dispatch arm + CoT bifurcation.
 //
 // These tests use the testable inner `run_deepseek_with_runtime` so the
 // process-static OnceLock cache stays untouched. The mock server is a
@@ -7229,7 +7229,7 @@ mod deepseek_dispatch_tests {
         assert!(parsed.response_text.contains("<reasoning>"));
     }
 
-    /// cfg_with_overrides — every Effort variant collapses correctly.
+    /// cfg_with_overrides: every Effort variant collapses correctly.
     #[test]
     fn cfg_with_overrides_collapses_effort_levels() {
         use shared_types::{AskAgentRequest, DeepSeekEffort, DeepSeekThinking};
@@ -7312,7 +7312,7 @@ mod deepseek_dispatch_tests {
             "empty/whitespace deepseek_model must not blank the cfg default"
         );
 
-        // Arbitrary string passes through — the API will reject unknown
+        // Arbitrary string passes through; the API will reject unknown
         // models with 400 via the runner's HardProvider classification.
         let req = AskAgentRequest {
             agent: "deepseek".to_string(),
@@ -7363,7 +7363,7 @@ mod deepseek_dispatch_tests {
         };
         // The mock server returns canned content regardless of what we send,
         // so the actual content of the request body doesn't matter to the
-        // mock — the test is asserting that ADDING a system message to the
+        // mock: the test is asserting that ADDING a system message to the
         // messages array (and increasing prompt_chars_estimate accordingly)
         // doesn't break the dispatch flow.
         let parsed =
@@ -7380,7 +7380,7 @@ mod deepseek_dispatch_tests {
             messages: vec![
                 ds::RequestMessage {
                     role: "system".to_string(),
-                    content: "placeholder — the real runner injects the real system prompt"
+                    content: "placeholder: the real runner injects the real system prompt"
                         .to_string(),
                 },
                 ds::RequestMessage {
