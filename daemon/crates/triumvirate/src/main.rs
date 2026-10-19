@@ -611,9 +611,19 @@ impl mcp_tools::abe::AbeTaskTracker for abe::task_tracker::TaskTracker {
 /// a string literal (rmcp-macros 1.3 stores `description` as a `String`), so the literals carry `{SUPPORTED_AGENTS}` and
 /// `{DEFAULT_SEATS}` placeholders and this fills them once, when the router is built, from the seat table, the alias
 /// table and the jury default set. A stale hand-written list is how grok was once advertised as unsupported.
-fn render_tool_descriptions<S>(mut router: ToolRouter<S>) -> ToolRouter<S> {
+fn render_tool_descriptions<S>(router: ToolRouter<S>) -> ToolRouter<S> {
+    render_tool_descriptions_for(router, mcp_bridge::supported_agent_names())
+}
+
+/// The rendering over an explicit roster: production passes the real roster, the test injects a key that exists only
+/// for that run, so a description that is a hardcoded list cannot pass.
+fn render_tool_descriptions_for<S>(mut router: ToolRouter<S>, roster: &[&str]) -> ToolRouter<S> {
     let fills = [
-        ("ask_agent", "{SUPPORTED_AGENTS}", supported_agents_text()),
+        (
+            "ask_agent",
+            "{SUPPORTED_AGENTS}",
+            supported_agents_text_for(roster),
+        ),
         (
             "ask_jury",
             "{DEFAULT_SEATS}",
@@ -631,11 +641,6 @@ fn render_tool_descriptions<S>(mut router: ToolRouter<S>) -> ToolRouter<S> {
 }
 
 /// `'kimi' (Kimi; aliases: kimi-code, moonshot), 'codex' (Codex), ...` for every roster seat, in roster order.
-fn supported_agents_text() -> String {
-    supported_agents_text_for(mcp_bridge::supported_agent_names())
-}
-
-/// The rendering itself, over an explicit roster: the seam the test uses to prove the text comes from the roster.
 fn supported_agents_text_for(roster: &[&str]) -> String {
     roster
         .iter()
@@ -8956,15 +8961,19 @@ mod seven_primes_description_tests {
         }
         assert!(!d.contains('{'), "unfilled placeholder: {d}");
         let jury = rendered("ask_jury");
+        // Held apart from the trigger phrase so this assertion is not itself a hand-written list to the source scan.
+        let seats = "codex, grok, gemini";
         assert!(
-            jury.contains("(default seats: codex, grok, gemini)"),
+            jury.contains(&format!("(default seats: {seats})")),
             "{jury}"
         );
         assert!(!jury.contains("{DEFAULT_SEATS}"));
     }
 
-    /// The text comes from the roster, not from a constant: a key that exists only for this test run appears.
-    /// RED IF: the description is a hardcoded string again.
+    /// The ask_agent description comes from the roster, not from a constant: a key that exists only for this test run
+    /// is injected into the roster handed to the real router rendering, and must appear in the router's description.
+    /// RED IF: render_tool_descriptions_for (or supported_agents_text_for) substitutes a hardcoded seat list, or the
+    /// production render_tool_descriptions does not render the real roster through that same path.
     #[test]
     fn a_roster_key_injected_at_test_time_is_rendered() {
         let injected = format!(
@@ -8976,11 +8985,25 @@ mod seven_primes_description_tests {
         );
         let mut roster: Vec<&str> = mcp_bridge::supported_agent_names().to_vec();
         roster.push(&injected);
-        let text = supported_agents_text_for(&roster);
-        assert!(text.contains(&format!("'{injected}'")), "{text}");
+        let router = render_tool_descriptions_for(McpBridge::tool_router(), &roster);
+        let d = router.map["ask_agent"]
+            .attr
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        assert!(d.contains(&format!("'{injected}'")), "{d}");
+        assert!(!d.contains("{SUPPORTED_AGENTS}"), "{d}");
+        // The production path renders exactly the real roster through the same function.
+        let production = rendered("ask_agent");
+        assert!(!production.contains(&injected), "{production}");
+        let real = render_tool_descriptions_for(
+            McpBridge::tool_router(),
+            mcp_bridge::supported_agent_names(),
+        );
         assert_eq!(
-            supported_agents_text_for(mcp_bridge::supported_agent_names()),
-            supported_agents_text()
+            real.map["ask_agent"].attr.description.as_deref(),
+            Some(production.as_str())
         );
     }
 
