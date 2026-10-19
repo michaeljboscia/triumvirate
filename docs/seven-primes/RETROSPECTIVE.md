@@ -4,13 +4,18 @@ Curated from the private planning archive. The full archive (specs, dispatch bri
 public repo.
 
 ## Outcome
-- **Seats.** Kimi (Moonshot), Mistral (Vibe) and Qwen (QwenCloud) are live Triumvirate seats. They answer through ask_agent, named sessions, jury and `doctor --live`, and run read-only under a macOS seatbelt plus a repo audit.
+- **Seats.** Kimi (Moonshot), Mistral (Vibe) and Qwen (QwenCloud) are live Triumvirate seats. They answer through
+  ask_agent, named sessions, jury and `doctor --live`, and run read-only under a macOS seatbelt plus a repo audit.
 - **Gating.** Each call is gated per (seat, surface, origin), with one call per seat at a time. Quota and suspension are handled, and sight-gated reviews work.
-- **Writer seats (W-1).** `triumvirate seat-run` lets the seats write in git worktrees for ABE and fleet, under a worktree-only seatbelt and an audit of the parent tree and git metadata. Kimi and Qwen are proven live. Mistral is mock-tested only.
+- **Writer seats (W-1).** `triumvirate seat-run` lets the seats write in git worktrees for ABE and fleet, under a
+  worktree-only seatbelt and an audit of the parent tree and git metadata. Kimi and Qwen are proven live. Mistral is
+  mock-tested only.
 - **PostHog (P-1).** Every new path emits a `tv_seat_*` event with bounded values only. These were read back from PostHog Cloud on a tagged live run.
 
 ## What it cost
-- **Ceremony.** The full plan-review ceremony (blind verifiers, bake-offs) cost a day with no working seat. The trimmed loop took the seats from zero to live in one night. That loop is a three-peer brief review, one builder, tests with a mutation kill rate, and the validator. Default to the trimmed loop and ship a live-smoked slice early.
+- **Ceremony.** The full plan-review ceremony (blind verifiers, bake-offs) cost a day with no working seat. The trimmed
+  loop took the seats from zero to live in one night. That loop is a three-peer brief review, one builder, tests with a
+  mutation kill rate, and the validator. Default to the trimmed loop and ship a live-smoked slice early.
 - **Size.** About 30k lines landed, more than half of them tests.
 
 ## What actually found the defects
@@ -47,7 +52,8 @@ public repo.
 19. **Map every builder diff to the brief yourself.** A builder pass reporting only "did not commit" hid missing tests and a scope violation. Run its verify command yourself.
 20. **The landing suite is `cargo test --workspace --exclude pantheon --tests` plus clippy.** Narrower suites skipped crates' integration tests.
 21. **Gate commits with `&&` on the check's exit status, never `;`.** Live fixtures use neutral names, never secret, token or key wording, because a model may refuse to read them.
-22. **Push with a private `CARGO_TARGET_DIR`.** The pre-push hook otherwise compiles in a shared target. A hook failure naming code that plainly exists is a target-dir collision until proven otherwise.
+22. **Push with a private `CARGO_TARGET_DIR`.** The pre-push hook otherwise compiles in a shared target. A hook failure
+    naming code that plainly exists is a target-dir collision until proven otherwise.
 
 ## Open items
 - **Ledger writes into reviewed repos.** The ledger appends `.triumvirate/` to a reviewed repo's .gitignore and writes ledger.db into crate dirs during tests. This predates Seven Primes.
