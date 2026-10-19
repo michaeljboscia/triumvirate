@@ -36,7 +36,17 @@ const METERED: [&str; 5] = [
 ];
 const CONNECTOR_TIMEOUT_SECS: u64 = 60;
 /// Set by `sh` itself, or by macOS at every exec (`__CF_USER_TEXT_ENCODING`), never by the runner.
-const SHELL_ADDED: [&str; 5] = ["PWD", "SHLVL", "_", "OLDPWD", "__CF_USER_TEXT_ENCODING"];
+// The last two are the LLVM coverage runtime's own variables: under `cargo llvm-cov` the instrumented daemon carries
+// them and they reach every child. They are tooling, never a credential.
+const SHELL_ADDED: [&str; 7] = [
+    "PWD",
+    "SHLVL",
+    "_",
+    "OLDPWD",
+    "__CF_USER_TEXT_ENCODING",
+    "__LLVM_PROFILE_RT_INIT_ONCE",
+    "LLVM_PROFILE_FILE",
+];
 
 /// Every test mutates this process's HOME and TRIUMVIRATE_HOME, so they run one at a time.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
