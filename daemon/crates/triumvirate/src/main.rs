@@ -9053,11 +9053,27 @@ mod seven_primes_status_tests {
         let _g = crate::tests::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prior: Vec<(&str, Option<std::ffi::OsString>)> =
+        // Restores both variables on drop, so a failed assert cannot leak them into later tests (Grok, T-203 round 2).
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    // SAFETY: still under the crate's env lock held by `_g`, declared before this guard.
+                    unsafe {
+                        match v {
+                            Some(v) => std::env::set_var(k, v),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
             ["TRIUMVIRATE_HOME", "TRIUMVIRATE_ENABLE_KIMI"]
                 .into_iter()
                 .map(|k| (k, std::env::var_os(k)))
-                .collect();
+                .collect(),
+        );
         let home = tempfile::tempdir().unwrap();
         // SAFETY: env mutation under the crate's env lock, restored below.
         unsafe {
@@ -9130,6 +9146,14 @@ mod seven_primes_status_tests {
             "{kimi:?}"
         );
 
+        // Only an exact "1" enables: whitespace is a typo, not consent (GAUNTLET T-106 rule, through the /status path).
+        for near_miss in [" 1", "1\n", "true"] {
+            unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", near_miss) };
+            assert!(
+                !get_seats().await["kimi"].configured,
+                "{near_miss:?} must not enable"
+            );
+        }
         unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") };
         let kimi = get_seats().await["kimi"].clone();
         assert!(kimi.configured, "{kimi:?}");
@@ -9137,14 +9161,6 @@ mod seven_primes_status_tests {
 
         server.abort();
         let _ = server.await;
-        for (k, v) in prior {
-            unsafe {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
     }
 
     /// RED IF: a new seat is missing from /status, its reason is not the gate's exact payload, or the env flag stops
