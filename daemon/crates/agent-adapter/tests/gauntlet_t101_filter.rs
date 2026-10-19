@@ -7,7 +7,7 @@
 // SPEC_AMBIGUITY: whether whitespace-only assistant content counts as text is unspecified; not asserted.
 
 use agent_adapter::kimi::{KimiStreamParser, PARSER_MODE};
-use agent_adapter::{SeatOutcome, SeatParsed, ToolKind, UsageReport};
+use agent_adapter::{SeatOutcome, SeatParsed, ToolKind, UsageReport, WorkingState};
 use std::path::PathBuf;
 
 fn fixture_lines() -> Vec<String> {
@@ -346,4 +346,218 @@ fn should_preserve_unicode_answer_text() {
     // text passes through untouched
     let parsed = run(&stream("/u/x.rs", "caf\\u00e9 done", Some("sess-u")), Some(0)).unwrap();
     assert_eq!(parsed.result.response_text, "caf\u{e9} done");
+}
+
+// ---- Round 2 (survivor feedback): contract-derived ToolKind, growing counts, tool_result pairing ----
+
+fn one_call(name: &str) -> Vec<String> {
+    vec![
+        format!(
+            r#"{{"role":"assistant","content":"","tool_calls":[{{"type":"function","id":"c1","function":{{"name":"{name}","arguments":"{{}}"}}}}]}}"#
+        ),
+        r#"{"role":"assistant","content":"done"}"#.to_string(),
+    ]
+}
+
+fn kind_of(name: &str) -> (String, ToolKind) {
+    let parsed = run(&one_call(name), Some(0)).unwrap();
+    assert_eq!(parsed.result.tool_calls.len(), 1, "one record for {name}");
+    let tc = &parsed.result.tool_calls[0];
+    (tc.tool.clone(), tc.kind.clone())
+}
+
+#[test]
+fn should_map_read_to_readfile_kind() {
+    // reference_tools.md: Read is a file read
+    assert_eq!(kind_of("Read"), ("Read".to_string(), ToolKind::ReadFile));
+}
+
+#[test]
+fn should_map_write_to_writefile_kind() {
+    // reference_tools.md: Write creates or overwrites a file
+    assert_eq!(kind_of("Write"), ("Write".to_string(), ToolKind::WriteFile));
+}
+
+#[test]
+fn should_map_edit_to_editfile_kind() {
+    // reference_tools.md: Edit is string replacement
+    assert_eq!(kind_of("Edit"), ("Edit".to_string(), ToolKind::EditFile));
+}
+
+#[test]
+fn should_map_bash_to_bash_kind() {
+    // reference_tools.md: Bash executes a shell command
+    assert_eq!(kind_of("Bash"), ("Bash".to_string(), ToolKind::Bash));
+}
+
+#[test]
+fn should_map_grep_to_grep_kind() {
+    // reference_tools.md: Grep is ripgrep search
+    assert_eq!(kind_of("Grep"), ("Grep".to_string(), ToolKind::Grep));
+}
+
+#[test]
+fn should_map_glob_to_glob_kind() {
+    // reference_tools.md: Glob matches files by pattern
+    assert_eq!(kind_of("Glob"), ("Glob".to_string(), ToolKind::Glob));
+}
+
+#[test]
+fn should_map_ask_user_question_to_request_user_input_kind() {
+    // task contract: AskUserQuestion is interactive
+    assert_eq!(
+        kind_of("AskUserQuestion"),
+        ("AskUserQuestion".to_string(), ToolKind::RequestUserInput)
+    );
+}
+
+#[test]
+fn should_map_unlisted_tool_to_unknown_kind() {
+    // a name outside the mapped set must not be classed as a read or write
+    assert_eq!(kind_of("FetchURL"), ("FetchURL".to_string(), ToolKind::Unknown));
+}
+
+#[test]
+fn should_keep_distinct_kinds_across_one_message_in_order() {
+    // each call keeps its own kind, in stream order
+    let lines = s(&[
+        r#"{"role":"assistant","content":"","tool_calls":[{"id":"a","function":{"name":"Grep","arguments":"{}"}},{"id":"b","function":{"name":"Write","arguments":"{}"}},{"id":"c","function":{"name":"Read","arguments":"{}"}}]}"#,
+        r#"{"role":"assistant","content":"x"}"#,
+    ]);
+    let r = run(&lines, Some(0)).unwrap().result;
+    let kinds: Vec<ToolKind> = r.tool_calls.iter().map(|c| c.kind.clone()).collect();
+    assert_eq!(kinds, vec![ToolKind::Grep, ToolKind::WriteFile, ToolKind::ReadFile]);
+}
+
+#[test]
+fn should_record_five_tool_calls_across_messages() {
+    // counts grow past one
+    let mut lines = Vec::new();
+    for i in 0..5 {
+        lines.push(format!(
+            r#"{{"role":"assistant","content":"","tool_calls":[{{"id":"c{i}","function":{{"name":"Read","arguments":"{{\"path\":\"/f/{i}.rs\"}}"}}}}]}}"#
+        ));
+        lines.push(format!(r#"{{"role":"tool","tool_call_id":"c{i}","content":"body {i}"}}"#));
+    }
+    lines.push(r#"{"role":"assistant","content":"all read"}"#.to_string());
+    let parsed = run(&lines, Some(0)).unwrap();
+    assert!(matches!(parsed.outcome, SeatOutcome::Success));
+    assert_eq!(parsed.result.tool_calls.len(), 5);
+    for i in 0..5 {
+        assert_eq!(parsed.result.tool_calls[i].id.as_deref(), Some(format!("c{i}").as_str()));
+        assert!(args_of(&parsed, i).contains(&format!("/f/{i}.rs")));
+    }
+}
+
+#[test]
+fn should_emit_tool_call_started_event_per_call() {
+    // 01-kimi-code-contract: assistant tool_call maps to ToolCallStarted
+    let mut p = KimiStreamParser::new();
+    let ev = p
+        .parse_line(r#"{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"Read","arguments":"{}"}}]}"#)
+        .expect("event for tool call");
+    assert!(matches!(ev.state, WorkingState::ToolCallStarted));
+    assert_eq!(ev.tool_name.as_deref(), Some("Read"));
+}
+
+#[test]
+fn should_emit_tool_call_completed_for_each_of_several_results() {
+    // 01-kimi-code-contract: tool result maps to ToolCallCompleted, every time (counts past one)
+    let mut p = KimiStreamParser::new();
+    let _ = p.parse_line(
+        r#"{"role":"assistant","content":"","tool_calls":[{"id":"a","function":{"name":"Read","arguments":"{}"}},{"id":"b","function":{"name":"Grep","arguments":"{}"}},{"id":"c","function":{"name":"Glob","arguments":"{}"}}]}"#,
+    );
+    for id in ["a", "b", "c"] {
+        let ev = p
+            .parse_line(&format!(r#"{{"role":"tool","tool_call_id":"{id}","content":"r"}}"#))
+            .expect("completed event");
+        assert!(matches!(ev.state, WorkingState::ToolCallCompleted), "result {id}");
+    }
+}
+
+#[test]
+fn should_pair_tool_result_with_its_call_by_id() {
+    // tool result pairs to the call with the same tool_call_id, not the first or last call
+    let mut p = KimiStreamParser::new();
+    let _ = p.parse_line(
+        r#"{"role":"assistant","content":"","tool_calls":[{"id":"a","function":{"name":"Read","arguments":"{}"}},{"id":"b","function":{"name":"Grep","arguments":"{}"}},{"id":"c","function":{"name":"Glob","arguments":"{}"}}]}"#,
+    );
+    let ev = p.parse_line(r#"{"role":"tool","tool_call_id":"b","content":"r"}"#).expect("event");
+    assert!(matches!(ev.state, WorkingState::ToolCallCompleted));
+    assert_eq!(ev.tool_name.as_deref(), Some("Grep"));
+    let ev = p.parse_line(r#"{"role":"tool","tool_call_id":"a","content":"r"}"#).expect("event");
+    assert_eq!(ev.tool_name.as_deref(), Some("Read"));
+}
+
+#[test]
+fn should_not_pair_tool_result_with_unknown_id() {
+    // a result whose id matches no call must not borrow another call's name
+    let mut p = KimiStreamParser::new();
+    let _ = p.parse_line(
+        r#"{"role":"assistant","content":"","tool_calls":[{"id":"a","function":{"name":"Read","arguments":"{}"}}]}"#,
+    );
+    if let Some(ev) = p.parse_line(r#"{"role":"tool","tool_call_id":"zzz","content":"r"}"#) {
+        assert_ne!(ev.tool_name.as_deref(), Some("Read"));
+    }
+}
+
+#[test]
+fn should_keep_tool_success_none_after_several_results() {
+    // #4241: no outcome in tool result lines, for every call
+    let lines = s(&[
+        r#"{"role":"assistant","content":"","tool_calls":[{"id":"a","function":{"name":"Read","arguments":"{}"}},{"id":"b","function":{"name":"Bash","arguments":"{}"}}]}"#,
+        r#"{"role":"tool","tool_call_id":"a","content":"ok"}"#,
+        r#"{"role":"tool","tool_call_id":"b","content":"Error: failed"}"#,
+        r#"{"role":"assistant","content":"x"}"#,
+    ]);
+    let r = run(&lines, Some(0)).unwrap().result;
+    assert_eq!(r.tool_calls.len(), 2);
+    assert!(r.tool_calls.iter().all(|c| c.success.is_none()));
+}
+
+#[test]
+fn should_emit_event_for_each_of_several_retries() {
+    // retry lines are surfaced each time (counts past one)
+    let mut p = KimiStreamParser::new();
+    for n in [429, 429, 500] {
+        let ev = p.parse_line(&format!(r#"{{"role":"meta","type":"turn.step.retrying","status_code":{n}}}"#));
+        assert!(ev.is_some(), "retry {n}");
+    }
+}
+
+#[test]
+fn should_report_last_retry_after_many_retries_and_many_lines() {
+    // last_retry_status survives a long stream with several retries; the most recent in stream order wins
+    let mut lines = fixture_lines();
+    for n in [500, 502, 429, 503, 429] {
+        lines.insert(2, format!(r#"{{"role":"meta","type":"turn.step.retrying","status_code":{n}}}"#));
+    }
+    // inserting at index 2 each time reverses order, so the last in stream order is the first inserted: 500
+    let parsed = run(&lines, Some(7)).unwrap();
+    assert_eq!(failure_of(&parsed), "nonzero_exit:kimi:7 last_retry_status=500");
+}
+
+#[test]
+fn should_fail_unrecognized_stream_made_only_of_unknown_lines() {
+    // unknown role and unknown meta only: nothing recognized, exit 0 is a failure
+    let lines = s(&[
+        r#"{"role":"meta","type":"future.a"}"#,
+        r#"{"role":"meta","type":"future.b"}"#,
+        r#"{"role":"observer","content":"hi"}"#,
+    ]);
+    assert_eq!(failure_of(&run(&lines, Some(0)).unwrap()), "empty_or_unrecognized_stream:kimi");
+}
+
+#[test]
+fn should_succeed_with_text_after_many_meta_and_tool_lines() {
+    // many recognized lines of mixed kinds, then text: Success
+    let mut lines = Vec::new();
+    for _ in 0..4 {
+        lines.push(r#"{"role":"meta","type":"turn.step.retrying","status_code":429}"#.to_string());
+        lines.push(r#"{"role":"tool","tool_call_id":"nope","content":"r"}"#.to_string());
+    }
+    lines.push(r#"{"role":"assistant","content":"final"}"#.to_string());
+    let parsed = run(&lines, Some(0)).unwrap();
+    assert!(matches!(parsed.outcome, SeatOutcome::Success));
+    assert_eq!(parsed.result.response_text, "final");
 }
