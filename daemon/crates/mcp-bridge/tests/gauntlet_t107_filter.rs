@@ -36,7 +36,7 @@ fn surface_name(s: Surface) -> &'static str {
 }
 
 fn all_surfaces() -> Vec<Surface> {
-    Surface::ALL.iter().map(|s| *s).collect()
+    Surface::ALL.to_vec()
 }
 
 fn healthy() -> SeatAvailability {

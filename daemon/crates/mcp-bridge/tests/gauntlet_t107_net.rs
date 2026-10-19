@@ -138,11 +138,10 @@ fn new_seats_full_matrix_exact_payloads() {
                         let surface = surface_at(i);
                         let expected = expected_new_seat(seat, &surface, st);
                         let got = describe(seat_gate_with(seat, surface, origin, tty, st));
-                        if let Some((code, _)) = &got {
-                            if code == "seat_surface_refused" {
+                        if let Some((code, _)) = &got
+                            && code == "seat_surface_refused" {
                                 refused += 1;
                             }
-                        }
                         assert_eq!(got, expected, "seat {seat} surface {name} tty {tty}");
                         cells += 1;
                     }
