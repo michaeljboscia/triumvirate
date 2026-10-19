@@ -90,6 +90,8 @@ struct Rig {
     port: u16,
     daemon: Option<Child>,
     log: PathBuf,
+    /// Extra variables for the daemon's env (T-207: a per-seat stall window).
+    extra_env: Vec<(String, String)>,
 }
 
 impl Rig {
@@ -126,6 +128,7 @@ impl Rig {
             port: free_port(),
             daemon: None,
             log: PathBuf::new(),
+            extra_env: Vec::new(),
         };
         rig.assert_home_inside();
         for seat in SEATS {
@@ -292,6 +295,7 @@ exit "$(cat "$D/exit")"
         for k in METERED {
             env.push((k.to_string(), fake_key("metered-")));
         }
+        env.extend(self.extra_env.iter().cloned());
         env
     }
 
@@ -362,11 +366,24 @@ exit "$(cat "$D/exit")"
 
     /// POST /ask-agent with an explicit cwd.
     async fn ask_in(&self, seat: &str, message: &str, cwd: &Path) -> Result<Value, String> {
+        self.ask_body(serde_json::json!({"agent": seat, "message": message, "cwd": cwd}))
+            .await
+    }
+
+    /// POST /ask-agent as a jury seat would send it (`ask_surface: jury`, T-204), with an explicit cwd.
+    async fn ask_jury_in(&self, seat: &str, message: &str, cwd: &Path) -> Result<Value, String> {
+        self.ask_body(serde_json::json!({
+            "agent": seat, "message": message, "cwd": cwd, "ask_surface": "jury"
+        }))
+        .await
+    }
+
+    async fn ask_body(&self, body: Value) -> Result<Value, String> {
         let token = fs::read_to_string(self.th.join("daemon.token")).expect("token");
         let resp = client()
             .post(format!("{}/ask-agent", self.base()))
             .bearer_auth(token.trim())
-            .json(&serde_json::json!({"agent": seat, "message": message, "cwd": cwd}))
+            .json(&body)
             .send()
             .await
             .expect("ask-agent");
@@ -1166,4 +1183,260 @@ async fn over_the_walk_cap_is_audit_unavailable_and_spawns_nothing() {
         "{err}"
     );
     assert_eq!(rig.spawns("kimi"), 0, "nothing spawned");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// T-207 (REQ-053, REQ-051): one call per seat at a time (the seat lock), and the stall window applied to new seats.
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The mock records `start <pid> <ns>` before its work and `end <pid> <ns>` after it, in `$D/times`.
+fn timed_action(work: &str) -> String {
+    format!(
+        "echo \"start $$ $(/bin/date +%s%N)\" >> \"$D/times\"\n{work}\necho \"end $$ $(/bin/date +%s%N)\" >> \"$D/times\"\n"
+    )
+}
+
+/// Each mock run's [start, end] in wall-clock nanoseconds, keyed by its pid, in start order. `end` is None for a run
+/// that never reached its end line (killed).
+fn intervals(rig: &Rig, seat: &str) -> Vec<(u128, Option<u128>)> {
+    let text = rig.mock_file(seat, "times");
+    let mut runs: Vec<(String, u128, Option<u128>)> = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let [kind, pid, ns] = parts[..] else {
+            panic!("bad times line {line:?}")
+        };
+        let ns: u128 = ns.parse().unwrap_or_else(|_| panic!("bad ns {line:?}"));
+        match kind {
+            "start" => runs.push((pid.to_string(), ns, None)),
+            "end" => {
+                let run = runs
+                    .iter_mut()
+                    .find(|r| r.0 == pid)
+                    .unwrap_or_else(|| panic!("end before start: {text}"));
+                run.2 = Some(ns);
+            }
+            _ => panic!("bad times line {line:?}"),
+        }
+    }
+    runs.sort_by_key(|r| r.1);
+    runs.into_iter().map(|(_, s, e)| (s, e)).collect()
+}
+
+fn now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+/// A fresh empty cwd per call, so neither the daemon's ledger nor a concurrent call can change a cwd under audit,
+/// and two calls never share a project lane.
+fn fresh_cwd(rig: &Rig, name: &str) -> PathBuf {
+    let dir = rig.root.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Non-blocking probe on a fresh fd of `$TRIUMVIRATE_HOME/locks/<seat>` (seat_lock.rs's own probe pattern): true
+/// when someone else holds the seat right now. The probe's own lock, if taken, is released when the file drops.
+fn seat_held(rig: &Rig, seat: &str) -> bool {
+    use std::os::fd::AsRawFd;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(rig.th.join("locks").join(seat))
+        .expect("the lock file exists once a call has taken the seat");
+    // SAFETY: the fd belongs to `file`, alive for this call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    rc != 0
+}
+
+/// Wait until the seat's mock has written `n` start lines.
+async fn wait_for_starts(rig: &Rig, seat: &str, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.mock_file(seat, "times").matches("start ").count() < n {
+        assert!(
+            Instant::now() < deadline,
+            "{seat}: mock never started: {}",
+            rig.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Two concurrent calls to one seat, one plain ask_agent and one on the Jury surface, against a mock that records its
+/// start and end and sleeps 1 s: the two [start, end] intervals never overlap, and both calls return the answer.
+/// RED IF: the seat lock is missing or not held for the child's whole life (the mocks overlap), or a queued call is
+/// failed instead of waiting its turn.
+#[tokio::test]
+async fn one_seat_runs_one_call_at_a_time() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.set_action("kimi", &timed_action("sleep 1"));
+    rig.start_daemon().await;
+    let (a, b) = (fresh_cwd(&rig, "cwd-a"), fresh_cwd(&rig, "cwd-b"));
+    let (ra, rb) = tokio::join!(
+        rig.ask_in("kimi", "review a", &a),
+        rig.ask_jury_in("kimi", "review b", &b)
+    );
+    for r in [ra, rb] {
+        let resp = r.unwrap_or_else(|e| panic!("{e}\n{}", rig.log_text()));
+        assert_eq!(resp["response"], fixture("kimi").0);
+    }
+    let runs = intervals(&rig, "kimi");
+    assert_eq!(runs.len(), 2, "two mock runs: {runs:?}");
+    let (s1, e1) = (runs[0].0, runs[0].1.expect("first run ended"));
+    let (s2, e2) = (runs[1].0, runs[1].1.expect("second run ended"));
+    assert!(s1 < e1 && s2 < e2, "{runs:?}");
+    assert!(
+        e1 <= s2,
+        "the two kimi runs overlapped: first [{s1}, {e1}], second [{s2}, {e2}]"
+    );
+}
+
+/// While a call's mock is sleeping, a non-blocking probe on the seat's lock file reports it taken; after the call
+/// returns normally the same probe acquires it.
+/// RED IF: the lock is not held while the child runs, or is leaked after a normal return.
+#[tokio::test]
+async fn the_seat_lock_is_held_during_the_call_and_free_after() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.set_action("kimi", &timed_action("sleep 2"));
+    rig.start_daemon().await;
+    let cwd = fresh_cwd(&rig, "cwd-held");
+    let call = rig.ask_in("kimi", "review", &cwd);
+    let probe = async {
+        wait_for_starts(&rig, "kimi", 1).await;
+        let held = seat_held(&rig, "kimi");
+        let ended = rig.mock_file("kimi", "times").contains("end ");
+        (held, ended)
+    };
+    let (resp, (held, ended_before_probe)) = tokio::join!(call, probe);
+    assert!(!ended_before_probe, "the probe ran while the mock slept");
+    assert!(held, "the seat lock must be held while the mock runs");
+    let resp = resp.unwrap_or_else(|e| panic!("{e}\n{}", rig.log_text()));
+    assert_eq!(resp["response"], fixture("kimi").0);
+    assert!(
+        !seat_held(&rig, "kimi"),
+        "the seat lock must be free after the call returns"
+    );
+}
+
+/// Two concurrent calls to one seat with a 2 s stall window. The first call's mock prints nothing and sleeps (it is
+/// stall-killed); the second is sent while the first is running. The second mock starts only after the first was
+/// killed (it waited at least the first's stall window), and it answers: the lock was released on the failure path.
+/// RED IF: a stall kill leaks the seat lock (the second call hangs or fails), or the second call does not wait.
+#[tokio::test]
+async fn a_stall_killed_call_releases_the_seat() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.extra_env
+        .push(("TRIUMVIRATE_STALL_SECS_KIMI".into(), "2".into()));
+    // The first run to get the seat (mkdir is atomic) sleeps silently; any later run answers at once.
+    rig.set_action(
+        "kimi",
+        &timed_action("if mkdir \"$D/first.d\" 2>/dev/null; then sleep 60; fi"),
+    );
+    rig.start_daemon().await;
+    let (a, b) = (fresh_cwd(&rig, "cwd-a"), fresh_cwd(&rig, "cwd-b"));
+    let first = async {
+        let r = rig.ask_in("kimi", "first", &a).await;
+        (r, now_ns())
+    };
+    let second = async {
+        wait_for_starts(&rig, "kimi", 1).await;
+        // Sent 1 s into the first run, so it is queued behind it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        rig.ask_in("kimi", "second", &b).await
+    };
+    let ((ra, a_failed_ns), rb) = tokio::join!(first, second);
+    let err = ra.expect_err("the first call is stall-killed");
+    assert!(err.contains("stalled after 2 s"), "{err}");
+    let resp = rb.unwrap_or_else(|e| panic!("second call: {e}\n{}", rig.log_text()));
+    assert_eq!(resp["response"], fixture("kimi").0);
+    let runs = intervals(&rig, "kimi");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    let (a_start, a_end) = runs[0];
+    let b_start = runs[1].0;
+    assert!(
+        a_end.is_none(),
+        "the first mock was killed before its end line"
+    );
+    // The first call cannot be killed before its 2 s window runs out; its window starts just before its mock does,
+    // so 300 ms covers the spawn. Without the lock the second mock would start about 1 s after the first.
+    assert!(
+        b_start >= a_start + 1_700_000_000,
+        "the second mock started {} ms after the first, before the first's stall kill",
+        (b_start - a_start) / 1_000_000
+    );
+    // And it started close to the moment the first call failed, not at some later timeout.
+    assert!(
+        b_start <= a_failed_ns + 5_000_000_000,
+        "second start {b_start}, first failed {a_failed_ns}"
+    );
+}
+
+/// A kimi call and a qwen call overlap in time: the lock is per seat, not global.
+/// RED IF: the lock becomes global (one file for every seat) or new seats are serialized some other way.
+#[tokio::test]
+async fn different_seats_run_concurrently() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    for seat in ["kimi", "qwen"] {
+        rig.set_action(seat, &timed_action("sleep 1"));
+    }
+    rig.start_daemon().await;
+    let (k, q) = (fresh_cwd(&rig, "cwd-k"), fresh_cwd(&rig, "cwd-q"));
+    let (rk, rq) = tokio::join!(rig.ask_in("kimi", "k", &k), rig.ask_in("qwen", "q", &q));
+    for (seat, r) in [("kimi", rk), ("qwen", rq)] {
+        let resp = r.unwrap_or_else(|e| panic!("{seat}: {e}\n{}", rig.log_text()));
+        assert_eq!(resp["response"], fixture(seat).0);
+    }
+    let kimi = intervals(&rig, "kimi");
+    let qwen = intervals(&rig, "qwen");
+    assert_eq!((kimi.len(), qwen.len()), (1, 1));
+    let (ks, ke) = (kimi[0].0, kimi[0].1.unwrap());
+    let (qs, qe) = (qwen[0].0, qwen[0].1.unwrap());
+    assert!(
+        ks < qe && qs < ke,
+        "kimi [{ks}, {ke}] and qwen [{qs}, {qe}] must overlap"
+    );
+}
+
+/// A mock that prints nothing and sleeps 60 s is killed and the call fails `stalled after <n> s`, and the time to
+/// failure tracks TRIUMVIRATE_STALL_SECS_KIMI: about 2 s with =2, about 5 s with =5.
+/// RED IF: new seats get no stall kill (the call waits out the 60 s connector timeout), the window is a constant, or
+/// it is read from anywhere but `mcp_bridge::stall::stall_window`.
+#[tokio::test]
+async fn the_stall_kill_follows_the_seat_window() {
+    let _g = ENV_LOCK.lock().await;
+    let mut took = Vec::new();
+    for secs in [2u64, 5] {
+        let mut rig = Rig::new();
+        rig.extra_env
+            .push(("TRIUMVIRATE_STALL_SECS_KIMI".into(), secs.to_string()));
+        rig.set_action("kimi", "sleep 60\n");
+        rig.start_daemon().await;
+        let cwd = fresh_cwd(&rig, "cwd-stall");
+        let started = Instant::now();
+        let err = rig
+            .ask_in("kimi", "review", &cwd)
+            .await
+            .expect_err("a silent mock is stall-killed");
+        let elapsed = started.elapsed();
+        assert!(err.contains("stalled after"), "{err}");
+        assert!(err.contains(&format!("stalled after {secs} s")), "{err}");
+        took.push(elapsed);
+    }
+    let (two, five) = (took[0], took[1]);
+    assert!(
+        two >= Duration::from_millis(1_800) && two < Duration::from_millis(4_500),
+        "=2 took {two:?}"
+    );
+    assert!(
+        five >= Duration::from_millis(4_800) && five < Duration::from_millis(9_000),
+        "=5 took {five:?}"
+    );
+    assert!(five > two + Duration::from_secs(2), "{two:?} then {five:?}");
 }

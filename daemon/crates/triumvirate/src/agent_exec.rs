@@ -6589,6 +6589,31 @@ pub(crate) async fn run_new_seat(
         env_add.push(read_qwen_plan_key(&seat_home).map_err(anyhow::Error::msg)?);
     }
 
+    // T-207 (REQ-053): one process per seat machine-wide. The guard is bound here so it lives until this function
+    // returns on every path: after `run_new_seat_in` (spawn, wait, parse, seatbelt run and repo audit), the output-dir
+    // removal and the Qwen served-model check. A stall kill drops this future, which drops the guard and closes the
+    // fd, so the seat is released on the failure path too. The flock blocks, so it runs off the async runtime.
+    let _seat_lock = if profile.concurrency_limit == mcp_bridge::seat_profile::ConcurrencyLimit::One
+    {
+        let (lock_home, lock_seat) = (th.clone(), seat.to_string());
+        let waited = Instant::now();
+        let guard = tokio::task::spawn_blocking(move || {
+            daemon_core::seat_lock::acquire_seat_lock(&lock_home, &lock_seat)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
+        .map_err(|e| anyhow::anyhow!("seat_lock_unavailable:{seat}: {e}"))?;
+        tracing::debug!(
+            seat,
+            waited_ms = waited.elapsed().as_millis() as u64,
+            "seat lock acquired"
+        );
+        Some(guard)
+    } else {
+        None
+    };
+
     let output_dir = new_seat_output_dir(seat).map_err(anyhow::Error::msg)?;
     let result = run_new_seat_in(
         seat,

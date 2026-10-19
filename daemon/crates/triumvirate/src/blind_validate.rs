@@ -253,6 +253,10 @@ fn requested_validators(roster: &[String]) -> Vec<String> {
 
 /// Seven Primes T-204: every candidate through the seat gate on BlindValidate with the request's origin, one
 /// (seat, surface, origin) triple each. Returns the admitted candidates in roster order and the refusals verbatim.
+///
+/// Seven Primes T-207 (REQ-053): no seat lock is taken on this path. The gate refuses every new seat on BlindValidate
+/// (`seat_cannot_write_here`, amendment A-2), so a seat whose row has `concurrency_limit: One` never reaches a dispatch
+/// from here; the lock lives in `agent_exec::run_new_seat`, which this module never calls.
 fn gate_validators(roster: &[String], origin: shared_types::Origin) -> (Vec<String>, Vec<String>) {
     let mut refusals = Vec::new();
     let admitted = requested_validators(roster)
@@ -986,5 +990,54 @@ mod tests {
                 select_validators(&["kimi".to_string(), "codex".to_string()], origin).unwrap();
             assert_eq!(picked, ["codex"]);
         }
+    }
+
+    /// Seven Primes T-207 (REQ-053, A-2): a kimi BlindValidate request is refused at the gate before any seat lock
+    /// exists: with kimi enabled and verified under a tempdir TRIUMVIRATE_HOME, the call fails
+    /// `seat_cannot_write_here`, nothing is spawned, and neither `locks/` nor `locks/kimi` is created.
+    /// RED IF: the BlindValidate path takes (or creates) a seat lock before the gate refuses, or a new seat reaches a
+    /// dispatch from here.
+    #[test]
+    fn t207_kimi_blind_validate_is_refused_before_any_seat_lock() {
+        use crate::agent_exec::seven_primes_gate_tests::{EnvRestore, Mocks};
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        m.kimi_available();
+        assert_eq!(
+            mcp_bridge::seat_state::triumvirate_home().unwrap(),
+            m.home,
+            "TRIUMVIRATE_HOME is the test's tempdir"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let base = tempfile::tempdir().expect("tempdir");
+        let validator = tempfile::tempdir().expect("tempdir");
+        let baseline = tempfile::tempdir().expect("tempdir");
+        let req = LiveBlindValidation {
+            project_root: base.path().to_path_buf(),
+            impl_worktree: base.path().to_path_buf(),
+            contract: "c".to_string(),
+            base_ref: "HEAD".to_string(),
+            worker_agent: "nobody".to_string(),
+            roster: vec!["kimi".to_string()],
+            package_dir: ".".to_string(),
+            origin: shared_types::Origin::Interactive,
+        };
+        let err = rt
+            .block_on(run_with_trees(&req, validator.path(), baseline.path()))
+            .expect_err("kimi cannot be a blind validator");
+        assert_eq!(
+            err,
+            "seat_cannot_write_here: kimi: blind validators must write test files and kimi is read-only"
+        );
+        assert!(m.ran().is_empty(), "nothing spawned: {:?}", m.ran());
+        assert!(
+            !m.home.join("locks").exists(),
+            "no lock directory was created under TRIUMVIRATE_HOME"
+        );
+        assert!(!m.home.join("locks/kimi").exists());
     }
 }
