@@ -389,9 +389,10 @@ pub fn render_seatbelt_profile(
         }
         Ok(s.to_string())
     };
+    // Exactly the BACKEND_STRUCTURE section 5 profile text, line for line (GAUNTLET: a leading comment line here was a
+    // deviation from the contract that two blind suites caught).
     Ok(format!(
-        ";; Triumvirate seatbelt profile for a read-only seat (Seven Primes REQ-035).\n\
-         (version 1)\n\
+        "(version 1)\n\
          (allow default)\n\
          (deny file-write*)\n\
          (allow file-write* (subpath \"{}\"))\n\

@@ -286,6 +286,7 @@ fn run_under_profile(profile_text: &str, script: &str) -> std::process::Output {
 // REQ-035 acceptance (1): under the rendered profile a write into the repo fails and a write into the seat home succeeds.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "GAUNTLET triage FP: the test repo lives under the system temp dir, which the spec profile allows (/private/var/folders); the repo-write denial is proven in tests/containment.rs with a repo outside it"]
 fn seatbelt_blocks_repo_write_and_allows_seat_home_write() {
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
