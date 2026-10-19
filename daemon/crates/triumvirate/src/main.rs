@@ -9298,8 +9298,8 @@ mod seven_primes_status_tests {
 /// Seven Primes T-204 (REQ-090): `origin` reaches the seat gate through every entry point. Under amendment A-2 no
 /// gate answer depends on origin, so each test proves arrival twice: the gate trail records the exact
 /// (seat, surface, origin) the entry point produced, and the call's outcome is the one that triple implies (a
-/// permitted kimi passes the gate and then fails `unsupported agent: kimi` until T-205; a refused one returns the
-/// gate's exact payload).
+/// permitted kimi passes the gate and, since T-205, spawns its own mock and answers; a refused one returns the gate's
+/// exact payload).
 #[cfg(test)]
 // The env lock is held across awaits on purpose: these tests repoint every agent binary through process env.
 #[allow(clippy::await_holding_lock)]
@@ -9382,12 +9382,9 @@ mod seven_primes_origin_tests {
         assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
         m.kimi_available();
         let (is_error, text) = call("ask_agent", args).await;
-        assert!(
-            is_error && text.contains("unsupported agent: kimi"),
-            "{text}"
-        );
+        assert!(!is_error && text.contains("kimi answered"), "{text}");
         assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
-        assert!(m.ran().is_empty(), "{:?}", m.ran());
+        assert_eq!(m.ran(), ["kimi"], "only kimi's own mock ran");
     }
 
     async fn http_state() -> (
@@ -9477,16 +9474,13 @@ mod seven_primes_origin_tests {
         assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
         m.kimi_available();
         let (status, out) = post(format!("{base}/ask-agent"), body).await;
-        assert_eq!(status, 502);
-        assert!(
-            out["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("unsupported agent: kimi"),
+        assert_eq!(
+            (status, out["response"].as_str()),
+            (200, Some("kimi answered")),
             "{out}"
         );
         assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
-        assert!(m.ran().is_empty());
+        assert_eq!(m.ran(), ["kimi"], "only kimi's own mock ran");
         server.abort();
     }
 
@@ -9552,7 +9546,7 @@ mod seven_primes_origin_tests {
                 .await
                 .unwrap(),
         );
-        assert!(is_error && out.contains("unsupported agent: kimi"), "{out}");
+        assert!(!is_error && out.contains("kimi answered"), "{out}");
         assert_eq!(
             last_call(),
             kimi(Surface::Session, Origin::Unattended),
@@ -9567,7 +9561,7 @@ mod seven_primes_origin_tests {
                 .await
                 .unwrap(),
         );
-        assert!(is_error && out.contains("unsupported agent: kimi"), "{out}");
+        assert!(!is_error && out.contains("kimi answered"), "{out}");
         assert_eq!(last_call(), kimi(Surface::Session, Origin::Interactive));
         let (is_error, out) = text(
             client
@@ -9578,7 +9572,7 @@ mod seven_primes_origin_tests {
                 .await
                 .unwrap(),
         );
-        assert!(is_error && out.contains("unsupported agent: kimi"), "{out}");
+        assert!(!is_error && out.contains("kimi answered"), "{out}");
         assert_eq!(
             last_call(),
             kimi(Surface::Session, Origin::Unattended),
@@ -9586,7 +9580,7 @@ mod seven_primes_origin_tests {
         );
         let _ = client.cancel().await;
         let _ = server.await;
-        assert!(m.ran().is_empty(), "{:?}", m.ran());
+        assert_eq!(m.ran(), ["kimi"; 3], "only kimi's own mock ran");
     }
 
     /// HTTP /session/spawn and /session/ask. RED IF: either route drops origin, or a refused spawn creates a session.
@@ -9617,21 +9611,18 @@ mod seven_primes_origin_tests {
             serde_json::json!({"name": "k204h", "message": "m", "origin": "unattended"}),
         )
         .await;
-        assert_eq!(status, 502);
-        assert!(
-            out["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("unsupported agent: kimi"),
+        assert_eq!(
+            (status, out["response"].as_str()),
+            (200, Some("kimi answered")),
             "{out}"
         );
         assert_eq!(last_call(), kimi(Surface::Session, Origin::Unattended));
-        assert!(m.ran().is_empty());
+        assert_eq!(m.ran(), ["kimi"], "only kimi's own mock ran");
         server.abort();
     }
 
     /// MCP ask_jury: every seat inherits the jury's origin on the Jury surface. The existing seat answers with its own
-    /// mock; the permitted new seat is unavailable with `unsupported agent: kimi`, never answered by another seat.
+    /// mock; the permitted new seat answers with its own mock (T-205), never answered by another seat.
     /// RED IF: a seat loses the jury's origin or surface, or kimi's seat is filled by anyone.
     #[tokio::test]
     async fn origin_through_mcp_ask_jury() {
@@ -9648,15 +9639,9 @@ mod seven_primes_origin_tests {
         assert!(!is_error, "{text}");
         let out: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(out["seats"]["codex"]["response"], "codex answered", "{out}");
-        assert_ne!(out["seats"]["kimi"]["status"], "answered", "{out}");
-        assert!(out["seats"]["kimi"]["answered_by_agent"].is_null(), "{out}");
-        assert!(
-            out["seats"]["kimi"]["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("unsupported agent: kimi"),
-            "{out}"
-        );
+        assert_eq!(out["seats"]["kimi"]["status"], "answered", "{out}");
+        assert_eq!(out["seats"]["kimi"]["answered_by_agent"], "kimi", "{out}");
+        assert_eq!(out["seats"]["kimi"]["response"], "kimi answered", "{out}");
         let calls = gate_trail::calls();
         for seat in ["codex", "kimi"] {
             assert!(
@@ -9664,7 +9649,9 @@ mod seven_primes_origin_tests {
                 "{seat}: {calls:?}"
             );
         }
-        assert_eq!(m.ran(), ["codex"]);
+        let mut ran = m.ran();
+        ran.sort();
+        assert_eq!(ran, ["codex", "kimi"], "each seat ran its own mock once");
     }
 
     /// blind_validate: the candidate is gated on BlindValidate with the request's origin, FIRST: the exact

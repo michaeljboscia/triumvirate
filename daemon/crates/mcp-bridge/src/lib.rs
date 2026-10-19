@@ -377,6 +377,46 @@ pub fn agy_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_AGY_BIN", "TRIUMVIRATE_AGY_ARGS", "agy")
 }
 
+/// The CLI program a new seat's builder emits (Seven Primes T-205), or `None` for any other seat.
+pub fn new_seat_program(seat: &str) -> Option<&'static str> {
+    match seat {
+        "kimi" => Some(kimi::KIMI_PROGRAM),
+        "mistral" => Some(mistral::MISTRAL_PROGRAM),
+        "qwen" => Some("qwen"),
+        _ => None,
+    }
+}
+
+/// The env var that overrides a new seat's binary: `TRIUMVIRATE_<SEAT>_BIN`.
+pub fn new_seat_bin_env(seat: &str) -> String {
+    format!(
+        "TRIUMVIRATE_{}_BIN",
+        seat.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// Resolve a new seat's binary BEFORE the child's HOME is relocated to the seat home (BACKEND_STRUCTURE section 5):
+/// `TRIUMVIRATE_<SEAT>_BIN` wins, else the builder's program on this process's PATH (as an absolute path), else the
+/// known install directory under this process's HOME. No extra args: a new seat's argv is the builder's alone.
+pub fn new_seat_bin(seat: &str) -> Result<String, String> {
+    let program = new_seat_program(seat).ok_or_else(|| format!("not_a_new_seat: {seat}"))?;
+    if let Some(explicit) = std::env::var(new_seat_bin_env(seat))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return Ok(explicit);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(program);
+            if candidate.is_absolute() && is_executable(&candidate) {
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(resolve_on_path_or_fallback(program))
+}
+
 /// Shadow-compare mode (Slice 6, opt-in via `TRIUMVIRATE_GEMINI_SHADOW`). When on,
 /// every `gemini` request ALSO dispatches the other Gemini backend for comparison;
 /// the primary still answers. Off by default — it doubles usage of the shared Google
@@ -575,6 +615,32 @@ mod tests {
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "anything-else") };
         assert_eq!(super::gemini_backend(), super::GeminiBackend::Agy);
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
+    }
+
+    /// Seven Primes T-205. RED IF: the per-seat override stops winning, a non-new seat resolves to a binary, or the
+    /// override name drifts from `TRIUMVIRATE_<SEAT>_BIN`.
+    #[test]
+    fn new_seat_bin_override_wins_and_only_new_seats_resolve() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        assert_eq!(super::new_seat_bin_env("kimi"), "TRIUMVIRATE_KIMI_BIN");
+        let saved = std::env::var_os("TRIUMVIRATE_KIMI_BIN");
+        // SAFETY: under this module's env lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_KIMI_BIN", "/tmp/mock-kimi") };
+        let got = super::new_seat_bin("kimi");
+        // SAFETY: under this module's env lock.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("TRIUMVIRATE_KIMI_BIN", v),
+                None => std::env::remove_var("TRIUMVIRATE_KIMI_BIN"),
+            }
+        }
+        assert_eq!(got.as_deref(), Ok("/tmp/mock-kimi"));
+        assert_eq!(super::new_seat_program("mistral"), Some("vibe"));
+        assert!(
+            super::new_seat_bin("codex")
+                .unwrap_err()
+                .starts_with("not_a_new_seat")
+        );
     }
 
     #[test]

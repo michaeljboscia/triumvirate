@@ -4489,6 +4489,41 @@ pub(crate) async fn run_named_agent_with_session_and_model(
             .await
         }
         "deepseek" => run_deepseek_agent(message, req_overrides).await,
+        // Seven Primes T-205: the new seats share one runner. Read-only by construction (the builder always emits
+        // the read-only argv); `read_only` only picks the timeout.
+        "kimi" => run_new_seat(
+            "kimi",
+            message,
+            cwd,
+            session_id,
+            model_override,
+            events_tx,
+            read_only,
+        )
+        .await
+        .map(|a| a.parsed),
+        "mistral" => run_new_seat(
+            "mistral",
+            message,
+            cwd,
+            session_id,
+            model_override,
+            events_tx,
+            read_only,
+        )
+        .await
+        .map(|a| a.parsed),
+        "qwen" => run_new_seat(
+            "qwen",
+            message,
+            cwd,
+            session_id,
+            model_override,
+            events_tx,
+            read_only,
+        )
+        .await
+        .map(|a| a.parsed),
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
@@ -6309,6 +6344,458 @@ async fn run_claude_cli_process_with_session(
     Ok(parsed)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Seven Primes T-205: the shared dispatch runner for the new seats (kimi, mistral, qwen).
+// BACKEND_STRUCTURE sections 5 and 6 are the contract. The seatbelt and the repo audit are T-206.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What one new-seat dispatch returns: the parsed turn plus the model the stream says answered (REQ-043).
+pub(crate) struct NewSeatAnswer {
+    pub(crate) parsed: ParsedAgentResult,
+    pub(crate) served_model: Option<String>,
+}
+
+/// Seats whose quota breaker is open, with the instant it opened (REQ-050, QuotaPolicy::TerminalTripBreaker).
+fn new_seat_breakers() -> &'static Mutex<std::collections::HashMap<String, Instant>> {
+    static OPEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    OPEN.get_or_init(Mutex::default)
+}
+
+/// How long a new seat's quota breaker stays open (`TRIUMVIRATE_SEAT_QUOTA_COOLDOWN_SECS`, default 1800).
+fn new_seat_quota_cooldown() -> Duration {
+    std::env::var("TRIUMVIRATE_SEAT_QUOTA_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(1800))
+}
+
+/// Seconds until the seat's quota breaker closes, or `None` when it is closed (an elapsed one is cleared here).
+fn new_seat_breaker_remaining(seat: &str) -> Option<u64> {
+    let mut open = new_seat_breakers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let opened = *open.get(seat)?;
+    let cooldown = new_seat_quota_cooldown();
+    let elapsed = opened.elapsed();
+    if elapsed >= cooldown {
+        open.remove(seat);
+        return None;
+    }
+    Some((cooldown - elapsed).as_secs().max(1))
+}
+
+/// Open the seat's quota breaker: one quota failure is terminal for a new seat (no retry loop).
+fn trip_new_seat_breaker(seat: &str) {
+    new_seat_breakers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(seat.to_string(), Instant::now());
+    mcp_bridge::posthog::record_breaker_event(
+        "tripped_quota",
+        seat,
+        "seat quota exhausted: one attempt, breaker open",
+        None,
+    );
+}
+
+/// The quota or suspension class of a failed new-seat run, read from the failure code and the CLI's stderr
+/// (BACKEND_STRUCTURE section 6 "quota signal" row): kimi reports the status in `last_retry_status=<n>`, mistral in
+/// the export.json error the failure code carries, qwen in its error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewSeatFailureClass {
+    Suspended,
+    Quota,
+    Other,
+}
+
+fn classify_new_seat_failure(failure: &str, stderr: &str) -> NewSeatFailureClass {
+    let text = format!("{failure}\n{stderr}");
+    let has = |code: &str| {
+        regex_lite::Regex::new(&format!(r"(^|[^0-9]){code}([^0-9]|$)"))
+            .is_ok_and(|re| re.is_match(&text))
+    };
+    if has("403") {
+        NewSeatFailureClass::Suspended
+    } else if has("429") {
+        NewSeatFailureClass::Quota
+    } else {
+        NewSeatFailureClass::Other
+    }
+}
+
+/// True when `name` matches an `env_remove` entry: an exact name, or a `PREFIX*` pattern (the containment rule).
+fn env_name_matches(name: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pattern,
+    }
+}
+
+/// The Qwen plan key from `homes/qwen/credentials.env` (0600). One `NAME=value` line; a trailing newline is optional
+/// (A-9). The name must be the plan's env var. The value is never logged or put in an error.
+fn read_qwen_plan_key(seat_home: &Path) -> Result<(String, String), String> {
+    let (env_key, _) = mcp_bridge::qwen::plan_auth(None)?;
+    let path = seat_home.join("credentials.env");
+    mcp_bridge::containment::check_credentials_file(&path)?;
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("credentials_unreadable: {}: {e}", path.display()))?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(format!(
+                "credentials_malformed: {}: expected NAME=value",
+                path.display()
+            ));
+        };
+        let name = name.trim();
+        if name != env_key {
+            return Err(format!(
+                "credentials_wrong_var: {}: holds {name}, the plan needs {env_key}",
+                path.display()
+            ));
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        if value.is_empty() {
+            return Err(format!(
+                "credentials_empty: {}: {env_key} has no value",
+                path.display()
+            ));
+        }
+        return Ok((env_key.to_string(), value.to_string()));
+    }
+    Err(format!(
+        "credentials_empty: {}: no {env_key} line",
+        path.display()
+    ))
+}
+
+/// A fresh per-call directory under the system temp dir (Mistral writes export.json here). Removed after `finish`.
+fn new_seat_output_dir(seat: &str) -> Result<PathBuf, String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "triumvirate-seat-{seat}-{}-{n}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).map_err(|e| format!("seat_output_dir: {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// The per-seat parser behind one runner.
+enum NewSeatParser {
+    Kimi(agent_adapter::kimi::KimiStreamParser),
+    Mistral(agent_adapter::mistral::MistralStreamParser),
+    Qwen(Box<agent_adapter::qwen::QwenStreamParser>),
+}
+
+impl NewSeatParser {
+    fn for_seat(seat: &str) -> Option<Self> {
+        match seat {
+            "kimi" => Some(Self::Kimi(agent_adapter::kimi::KimiStreamParser::new())),
+            "mistral" => Some(Self::Mistral(
+                agent_adapter::mistral::MistralStreamParser::new(),
+            )),
+            "qwen" => Some(Self::Qwen(Box::new(
+                agent_adapter::qwen::QwenStreamParser::new(),
+            ))),
+            _ => None,
+        }
+    }
+
+    fn parse_line(&mut self, line: &str) -> Option<WorkingStateEvent> {
+        match self {
+            Self::Kimi(p) => p.parse_line(line),
+            Self::Mistral(p) => p.parse_line(line),
+            Self::Qwen(p) => p.parse_line(line),
+        }
+    }
+
+    fn finish(
+        self,
+        exit_code: Option<i32>,
+        output_dir: &Path,
+    ) -> Result<agent_adapter::SeatParsed, String> {
+        match self {
+            Self::Kimi(p) => p.finish(exit_code),
+            Self::Mistral(p) => {
+                let export = fs::read_to_string(output_dir.join("export.json")).ok();
+                p.finish(exit_code, export.as_deref())
+            }
+            Self::Qwen(p) => p.finish(exit_code),
+        }
+    }
+}
+
+fn build_new_seat_invocation(
+    seat: &str,
+    req: &mcp_bridge::containment::SeatRequest<'_>,
+) -> Result<mcp_bridge::containment::SeatInvocation, String> {
+    match seat {
+        "kimi" => mcp_bridge::kimi::build_kimi_invocation(req),
+        "mistral" => mcp_bridge::mistral::build_mistral_invocation(req),
+        "qwen" => mcp_bridge::qwen::build_qwen_invocation(req),
+        other => Err(format!("not_a_new_seat: {other}")),
+    }
+}
+
+/// One read-only dispatch to a new seat (kimi, mistral, qwen). The builder always emits the read-only argv; `read_only`
+/// only picks the timeout, as the claude arm does. Exactly one attempt: a quota failure is terminal and opens the seat's
+/// breaker, a 403 writes suspended.json.
+pub(crate) async fn run_new_seat(
+    seat: &str,
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    model: Option<&str>,
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    read_only: bool,
+) -> anyhow::Result<NewSeatAnswer> {
+    let profile = mcp_bridge::seat_profile::seat_profile(seat)
+        .ok_or_else(|| anyhow::anyhow!("not_a_new_seat: {seat}"))?;
+    let Some(parser) = NewSeatParser::for_seat(seat) else {
+        anyhow::bail!("not_a_new_seat: {seat}");
+    };
+    if let Some(secs) = new_seat_breaker_remaining(seat) {
+        anyhow::bail!(
+            "seat_quota_exhausted:{seat}: quota breaker open, {secs}s until it closes; no process spawned"
+        );
+    }
+    let th = mcp_bridge::seat_state::triumvirate_home().map_err(anyhow::Error::msg)?;
+    let seat_home = mcp_bridge::containment::seat_home(&th, seat).map_err(anyhow::Error::msg)?;
+    mcp_bridge::containment::write_seat_files(&seat_home, profile).map_err(anyhow::Error::msg)?;
+    // Resolved BEFORE the child's HOME moves to the seat home.
+    let bin = mcp_bridge::new_seat_bin(seat).map_err(anyhow::Error::msg)?;
+    // A test build never falls through to a real CLI: the binary must be named explicitly (a mock).
+    #[cfg(test)]
+    if std::env::var(mcp_bridge::new_seat_bin_env(seat)).is_err() {
+        anyhow::bail!(
+            "test build: {} must point at a mock before a {seat} dispatch",
+            mcp_bridge::new_seat_bin_env(seat)
+        );
+    }
+    let mut env_add: Vec<(String, String)> = Vec::new();
+    if seat == "qwen" {
+        env_add.push(read_qwen_plan_key(&seat_home).map_err(anyhow::Error::msg)?);
+    }
+
+    let output_dir = new_seat_output_dir(seat).map_err(anyhow::Error::msg)?;
+    let result = run_new_seat_in(
+        seat,
+        profile,
+        parser,
+        &bin,
+        &seat_home,
+        &output_dir,
+        env_add,
+        message,
+        cwd,
+        session_id,
+        model,
+        events_tx,
+        read_only,
+    )
+    .await;
+    let _ = fs::remove_dir_all(&output_dir);
+    let answer = result?;
+
+    // Qwen REQ-043: the model that answered must be a Qwen model.
+    if seat == "qwen"
+        && let Some(served) = answer.served_model.as_deref()
+    {
+        mcp_bridge::qwen::check_served_model(served).map_err(anyhow::Error::msg)?;
+    }
+    Ok(answer)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_new_seat_in(
+    seat: &str,
+    profile: &mcp_bridge::seat_profile::SeatProfile,
+    mut parser: NewSeatParser,
+    bin: &str,
+    seat_home: &Path,
+    output_dir: &Path,
+    mut env_add: Vec<(String, String)>,
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    model: Option<&str>,
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    read_only: bool,
+) -> anyhow::Result<NewSeatAnswer> {
+    let timeout_duration = if read_only {
+        review_timeout()
+    } else {
+        connector_timeout()
+    };
+    let cwd_path = Path::new(cwd);
+    let req = mcp_bridge::containment::SeatRequest {
+        prompt: message,
+        cwd: cwd_path,
+        seat_home,
+        output_dir,
+        model,
+        resume_session_id: session_id,
+        extra_args: &[],
+        max_turns: 12,
+        time_limit: timeout_duration,
+    };
+    // The builder's errors (prompt over 64 KiB, forbidden extra args) surface verbatim.
+    let invocation = build_new_seat_invocation(seat, &req).map_err(anyhow::Error::msg)?;
+    let base: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| !invocation.env_remove.iter().any(|p| env_name_matches(k, p)))
+        .collect();
+    let mut add = invocation.env_add.clone();
+    add.append(&mut env_add);
+    let child_env = mcp_bridge::containment::child_env(&base, profile, seat_home, &add)
+        .map_err(anyhow::Error::msg)?;
+
+    // REQ-034 marker: every new-seat dispatch is read-only, whatever the caller's flag said.
+    tracing::info!("read_only_seat: {seat} (answers only, never edits)");
+
+    emit_working_event(
+        events_tx.as_ref(),
+        WorkingStateEvent {
+            agent: seat.to_string(),
+            state: WorkingState::TurnStarted,
+            detail: format!("{seat} process started"),
+            tool_name: None,
+            tool_args_json: None,
+            token_usage: None,
+            ts_ms: Some(core_unix_time_ms()),
+        },
+    );
+
+    let mut command = Command::new(bin);
+    command
+        .args(&invocation.args)
+        .current_dir(&invocation.cwd)
+        .env_clear()
+        .envs(child_env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn_failed:{seat}: {bin}: {e}"))?;
+    note_attempt_child(&child);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("{seat} stdout missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("{seat} stderr missing"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut tail: VecDeque<String> = VecDeque::new();
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if tail.len() == 40 {
+                tail.pop_front();
+            }
+            tail.push_back(trimmed.to_string());
+        }
+        tail.into_iter().collect::<Vec<_>>().join("\n")
+    });
+
+    let mut reader = BufReader::new(stdout).lines();
+    let read = async {
+        while let Some(line) = reader.next_line().await? {
+            if let Some(event) = parser.parse_line(&line) {
+                emit_working_event(events_tx.as_ref(), event);
+            }
+        }
+        anyhow::Ok(())
+    };
+    let status = match timeout(timeout_duration, async {
+        read.await?;
+        Ok::<_, anyhow::Error>(child.wait().await?)
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            kill_process_group(&mut child);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!(
+                "{seat} connector timed out after {}s",
+                timeout_duration.as_secs()
+            );
+        }
+    };
+    let stderr_text = stderr_task.await.unwrap_or_default();
+
+    let seat_parsed = parser
+        .finish(status.code(), output_dir)
+        .map_err(anyhow::Error::msg)?;
+    let served_model = seat_parsed.served_model.clone();
+    let mut parsed = seat_parsed.result;
+    match seat_parsed.outcome {
+        agent_adapter::SeatOutcome::Success => {}
+        agent_adapter::SeatOutcome::Partial(reason) => {
+            parsed.response_text = format!("{}\n\n[partial: {reason}]", parsed.response_text);
+        }
+        agent_adapter::SeatOutcome::Failure(code) => {
+            let tail = stderr_text
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let said = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("; {seat} said: {tail}")
+            };
+            match classify_new_seat_failure(&code, &stderr_text) {
+                NewSeatFailureClass::Suspended => {
+                    let reason = format!("403 from provider: {code}");
+                    if let Err(e) = mcp_bridge::seat_state::write_suspended(
+                        &mcp_bridge::seat_state::triumvirate_home().map_err(anyhow::Error::msg)?,
+                        seat,
+                        &reason,
+                    ) {
+                        tracing::error!(seat, error = %e, "could not write suspended.json");
+                    }
+                    anyhow::bail!("seat_suspended: {seat}: {reason}{said}");
+                }
+                NewSeatFailureClass::Quota => {
+                    trip_new_seat_breaker(seat);
+                    anyhow::bail!("seat_quota_exhausted:{seat}: {code}{said}");
+                }
+                NewSeatFailureClass::Other => anyhow::bail!("{code}{said}"),
+            }
+        }
+    }
+    Ok(NewSeatAnswer {
+        parsed,
+        served_model,
+    })
+}
+
 async fn run_agent_process_with_session(
     agent: &str,
     bin: &str,
@@ -6386,6 +6873,19 @@ async fn run_agent_process_with_session(
             )
             .await
         }
+        // Seven Primes T-205: a new seat resolves its own binary and argv (the builder's), so `bin` and `args` are
+        // not used.
+        "kimi" => run_new_seat("kimi", message, cwd, session_id, None, events_tx, read_only)
+            .await
+            .map(|a| a.parsed),
+        "mistral" => run_new_seat(
+            "mistral", message, cwd, session_id, None, events_tx, read_only,
+        )
+        .await
+        .map(|a| a.parsed),
+        "qwen" => run_new_seat("qwen", message, cwd, session_id, None, events_tx, read_only)
+            .await
+            .map(|a| a.parsed),
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
@@ -12266,6 +12766,9 @@ pub(crate) mod seven_primes_gate_tests {
         "TRIUMVIRATE_CLAUDE_ARGS",
         "TRIUMVIRATE_GROK_BIN",
         "TRIUMVIRATE_GROK_ARGS",
+        "TRIUMVIRATE_KIMI_BIN",
+        "TRIUMVIRATE_MISTRAL_BIN",
+        "TRIUMVIRATE_QWEN_BIN",
         "TRIUMVIRATE_HOME",
         "TRIUMVIRATE_ENABLE_KIMI",
         "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
@@ -12344,6 +12847,23 @@ pub(crate) mod seven_primes_gate_tests {
             .expect("agy mock");
             let (codex, gemini, claude) =
                 (connector("codex"), connector("gemini"), connector("claude"));
+            // T-205: the new seats get mocks too, so no dispatch from this module can reach a real kimi, vibe or qwen.
+            let new_seat = |seat: &str, stdout: &str| {
+                let bin = dir.path().join(format!("fake-{seat}"));
+                crate::write_test_executable(
+                    &bin,
+                    format!(
+                        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.0.0; exit 0; fi\n\
+                         echo {seat} >> '{m}'\nprintf '%s\\n' '{stdout}'\n",
+                        m = marker.display()
+                    ),
+                )
+                .expect("new seat mock");
+                bin
+            };
+            let kimi = new_seat("kimi", r#"{"role":"assistant","content":"kimi answered"}"#);
+            let mistral = new_seat("mistral", "{}");
+            let qwen = new_seat("qwen", "{}");
             // SAFETY: the caller holds the crate env lock and an EnvRestore over ENV.
             unsafe {
                 std::env::set_var("TRIUMVIRATE_CODEX_BIN", &codex);
@@ -12352,6 +12872,9 @@ pub(crate) mod seven_primes_gate_tests {
                 std::env::set_var("TRIUMVIRATE_AGY_BIN", &agy);
                 std::env::set_var("TRIUMVIRATE_CLAUDE_BIN", &claude);
                 std::env::set_var("TRIUMVIRATE_GROK_BIN", &grok);
+                std::env::set_var("TRIUMVIRATE_KIMI_BIN", &kimi);
+                std::env::set_var("TRIUMVIRATE_MISTRAL_BIN", &mistral);
+                std::env::set_var("TRIUMVIRATE_QWEN_BIN", &qwen);
                 for k in [
                     "TRIUMVIRATE_CODEX_ARGS",
                     "TRIUMVIRATE_GEMINI_ARGS",
@@ -12482,12 +13005,13 @@ pub(crate) mod seven_primes_gate_tests {
     /// THE PERMITTED HALF, at `execute_ask_agent_inner`. Every existing seat with a local process on AskAgent,
     /// Session and Jury, for both origins, spawns ITS OWN mock and returns that mock's answer, with the request's
     /// (seat, surface, origin) seen by the gate. A permitted NEW seat (kimi, enabled and verified) passes the gate
-    /// and then fails `unsupported agent: kimi` with no mock run and no other seat substituted (A-9). deepseek (an
-    /// HTTP seat with no local process) is admitted by the same gate on the same triples.
+    /// and, since T-205, spawns ITS OWN mock and answers (A-9: the spawn-and-answer half moved to T-205), with no
+    /// other seat substituted. deepseek (an HTTP seat with no local process) is admitted by the same gate on the same
+    /// triples.
     /// RED IF: a permitted seat stops spawning (a dispatcher that never spawns), answers as another seat, or the
     /// request's origin or surface stops reaching the gate.
     #[tokio::test]
-    async fn permitted_seats_spawn_their_own_mock_and_new_seats_fail_unsupported() {
+    async fn permitted_seats_spawn_their_own_mock_including_new_seats() {
         let _g = env_guard();
         let _restore = EnvRestore::capture();
         let m = Mocks::install();
@@ -12498,12 +13022,15 @@ pub(crate) mod seven_primes_gate_tests {
         let reached = dispatch_count("kimi");
         for (surface, gate_surface) in ASK_SURFACES {
             for origin in ORIGINS {
-                let err = execute_ask_agent(&ask("kimi", &m.cwd(), surface, origin), None)
+                let before = m.ran().len();
+                let resp = execute_ask_agent(&ask("kimi", &m.cwd(), surface, origin), None)
                     .await
-                    .expect_err("no kimi arm until T-205");
-                assert!(
-                    err.contains("unsupported agent: kimi"),
-                    "{surface:?} {origin:?}: {err}"
+                    .unwrap_or_else(|e| panic!("kimi {surface:?} {origin:?}: {e}"));
+                assert_eq!(resp.response, "kimi answered", "{surface:?} {origin:?}");
+                assert_eq!(
+                    m.ran()[before..].to_vec(),
+                    ["kimi"],
+                    "only kimi's own mock ran"
                 );
                 assert!(mcp_tools::inter_agent::gate_trail::saw(
                     "kimi",
@@ -12517,10 +13044,10 @@ pub(crate) mod seven_primes_gate_tests {
             reached + 6,
             "permitted: it passed the gate and reached dispatch"
         );
-        assert!(
-            m.ran().is_empty(),
-            "and nothing ran in its place: {:?}",
-            m.ran()
+        assert_eq!(
+            m.ran(),
+            ["kimi"; 6],
+            "kimi ran six times and nothing ran in its place"
         );
         let mut spawned = 0;
         for seat in ["codex", "gemini", "claude", "grok"] {

@@ -388,7 +388,7 @@ pub(crate) async fn run_doctor(live: bool) -> anyhow::Result<()> {
         )?;
     }
     // Seven Primes T-203 (REQ-054): the new seats' static checks, and with `--live` the live probe.
-    print_seat_doctor(&SeatDoctorCtx::from_process()?, live)?;
+    print_seat_doctor(&SeatDoctorCtx::from_process()?, live).await?;
     Ok(())
 }
 
@@ -817,16 +817,79 @@ pub(crate) fn seat_static_checks(seat: &str, ctx: &SeatDoctorCtx) -> Vec<SeatChe
     checks
 }
 
-/// `doctor --live` for a new seat. The live probe needs T-205's dispatch runner; until then it reports unverified and
-/// writes nothing, so a seat can never become available before it can actually be dispatched.
-pub(crate) fn seat_live_probe(seat: &str) -> Result<(), String> {
-    Err(format!(
-        "seat_unverified: {seat}: live probe runner not wired (T-205)"
-    ))
+/// `doctor --live` for a new seat (Seven Primes T-205): one tiny prompt through the real dispatch runner in a fresh temp
+/// cwd. A pass writes verified.json (`cli_version` is the installed version as the doctor detects it). A run that
+/// spawned and then failed on credentials, billing or quota, suspension or the served model deletes verified.json and
+/// returns the error; any other failure leaves the state as it was and returns the error.
+pub(crate) async fn seat_live_probe(seat: &str) -> Result<(), String> {
+    let th = mcp_bridge::seat_state::triumvirate_home()?;
+    let seat_home = mcp_bridge::containment::seat_home(&th, seat)?;
+    let bin = mcp_bridge::new_seat_bin(seat)?;
+    let cli_version = installed_version(std::path::Path::new(&bin))
+        .ok_or_else(|| format!("seat_unverified: {seat}: no version from `{bin} --version`"))?;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cwd = std::env::temp_dir().join(format!(
+        "triumvirate-probe-{seat}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir(&cwd).map_err(|e| format!("seat_probe_cwd: {}: {e}", cwd.display()))?;
+    let result = crate::agent_exec::run_new_seat(
+        seat,
+        "Reply with the single word OK.",
+        &cwd.to_string_lossy(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
+    let _ = fs::remove_dir_all(&cwd);
+    match result {
+        Ok(answer) => mcp_bridge::seat_state::write_verified(
+            &th,
+            seat,
+            &mcp_bridge::seat_state::VerifiedRecord {
+                cli_version,
+                seat_home: seat_home.to_string_lossy().into_owned(),
+                probed_at: chrono::Utc::now().to_rfc3339(),
+                served_model: answer.served_model,
+            },
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            if probe_failure_unverifies(&msg) {
+                mcp_bridge::seat_state::delete_verified(&th, seat)?;
+            }
+            Err(msg)
+        }
+    }
+}
+
+/// The probe failures that delete verified.json (BACKEND_STRUCTURE section 4): credential, billing or quota,
+/// suspension, served model.
+pub(crate) fn probe_failure_unverifies(err: &str) -> bool {
+    const CODES: &[&str] = &[
+        "credentials_",
+        "seat_quota_exhausted",
+        "seat_suspended",
+        "qwen_seat_served_non_qwen_model",
+    ];
+    let lower = err.to_ascii_lowercase();
+    CODES.iter().any(|c| err.starts_with(c))
+        || regex_lite::Regex::new(r"(^|[^0-9])(401|402)([^0-9]|$)").is_ok_and(|re| re.is_match(err))
+        || [
+            "unauthorized",
+            "not logged in",
+            "billing",
+            "payment required",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
 }
 
 /// Print every new seat's checks (and the live probe with `--live`).
-pub(crate) fn print_seat_doctor(ctx: &SeatDoctorCtx, live: bool) -> anyhow::Result<()> {
+pub(crate) async fn print_seat_doctor(ctx: &SeatDoctorCtx, live: bool) -> anyhow::Result<()> {
     write_line_stdout("Seats:")?;
     for (seat, _, _) in SEAT_CLIS {
         for c in seat_static_checks(seat, ctx) {
@@ -838,7 +901,7 @@ pub(crate) fn print_seat_doctor(ctx: &SeatDoctorCtx, live: bool) -> anyhow::Resu
             ))?;
         }
         if live {
-            match seat_live_probe(seat) {
+            match seat_live_probe(seat).await {
                 Ok(()) => write_line_stdout(&format!("  {seat}.live: PASS"))?,
                 Err(e) => write_line_stdout(&format!("  {seat}.live: FAIL ({e})"))?,
             }
@@ -848,10 +911,15 @@ pub(crate) fn print_seat_doctor(ctx: &SeatDoctorCtx, live: bool) -> anyhow::Resu
 }
 
 /// Register each installed new-seat CLI's version with the gate, so a verified.json written for that version counts.
-/// Called at daemon start; a seat whose CLI is absent stays unregistered and therefore unverified (fails closed).
+/// Called at daemon start; a seat whose CLI is absent stays unregistered and therefore unverified (fails closed). The
+/// binary is resolved the way the dispatch runner resolves it (`TRIUMVIRATE_<SEAT>_BIN` wins), so the version the gate
+/// compares is the version of the binary that will actually run.
 pub(crate) fn register_installed_seat_versions() {
-    for (seat, program, _) in SEAT_CLIS {
-        if let Some(version) = find_on_path(program).as_deref().and_then(installed_version) {
+    for (seat, _, _) in SEAT_CLIS {
+        if let Some(version) = mcp_bridge::new_seat_bin(seat)
+            .ok()
+            .and_then(|bin| installed_version(std::path::Path::new(&bin)))
+        {
             mcp_bridge::seat_gate::register_installed_cli_version(seat, &version);
         }
     }
@@ -1137,16 +1205,133 @@ mod seven_primes_doctor_tests {
         );
     }
 
-    /// The T-203 placeholder T-205 flips: until the runner is wired, a live probe cannot verify a seat.
-    /// RED IF: `doctor --live` reports a new seat verified before T-205 wires the runner.
+    /// A mock seat CLI: `--version` prints `version`; any other call appends one line to `<dir>/<seat>.spawns` and
+    /// replays `stdout`.
+    fn mock_seat(dir: &Path, seat: &str, version: &str, stdout: &str) -> PathBuf {
+        let fixture = dir.join(format!("{seat}.out"));
+        fs::write(&fixture, stdout).unwrap();
+        let bin = dir.join(format!("mock-seat-{seat}"));
+        crate::write_test_executable(
+            &bin,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+                 echo spawn >> '{spawns}'\ncat '{fixture}'\n",
+                spawns = dir.join(format!("{seat}.spawns")).display(),
+                fixture = fixture.display()
+            ),
+        )
+        .unwrap();
+        bin
+    }
+
+    /// T-205 flipped the T-203 placeholder: `doctor --live` runs the seat through the dispatch runner. A kimi mock that
+    /// answers gets verified.json (installed version, seat home, no served model); a qwen mock served by `glm-5` fails
+    /// `qwen_seat_served_non_qwen_model` and its old verified.json is deleted.
+    /// RED IF: the live probe is still the unwired placeholder, writes nothing on a pass, spawns nothing, or keeps a
+    /// verified.json after a served-model failure.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn live_probe_runs_the_seat_and_writes_or_deletes_verified() {
+        let _g = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keys = [
+            "TRIUMVIRATE_HOME",
+            "TRIUMVIRATE_KIMI_BIN",
+            "TRIUMVIRATE_QWEN_BIN",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let th = dir.path().join("th");
+        let kimi_stream = include_str!(
+            "../../agent-adapter/tests/fixtures/kimi-2.2.0-provisional-20261018.jsonl"
+        );
+        let glm = include_str!(
+            "../../agent-adapter/tests/fixtures/qwen-0.25.2-provisional-20261018.jsonl"
+        )
+        .replace("qwen3-coder-plus", "glm-5");
+        let kimi = mock_seat(dir.path(), "kimi", "2.2.0", kimi_stream);
+        let qwen = mock_seat(dir.path(), "qwen", "0.25.2", &glm);
+        let qwen_home = th.join("homes").join("qwen");
+        fs::create_dir_all(&qwen_home).unwrap();
+        let creds = qwen_home.join("credentials.env");
+        fs::write(
+            &creds,
+            format!("QWENCLOUD_TOKEN_PLAN_API_KEY={}", fake_secret("sk-sp-")),
+        )
+        .unwrap();
+        fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+        // SAFETY: under the crate env lock; restored below.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", &th);
+            std::env::set_var("TRIUMVIRATE_KIMI_BIN", &kimi);
+            std::env::set_var("TRIUMVIRATE_QWEN_BIN", &qwen);
+        }
+        assert!(
+            mcp_bridge::seat_state::triumvirate_home()
+                .unwrap()
+                .starts_with(dir.path())
+        );
+
+        let kimi_result = seat_live_probe("kimi").await;
+        let rec: mcp_bridge::seat_state::VerifiedRecord = serde_json::from_slice(
+            &fs::read(th.join("seats/kimi/verified.json")).expect("verified.json written"),
+        )
+        .unwrap();
+
+        mcp_bridge::seat_state::write_verified(&th, "qwen", &rec).unwrap();
+        let qwen_result = seat_live_probe("qwen").await;
+        let qwen_verified_left = th.join("seats/qwen/verified.json").exists();
+        let spawns = |seat: &str| {
+            fs::read_to_string(dir.path().join(format!("{seat}.spawns")))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let (kimi_spawns, qwen_spawns) = (spawns("kimi"), spawns("qwen"));
+        // SAFETY: under the crate env lock.
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(kimi_result, Ok(()));
+        assert_eq!(rec.cli_version, "2.2.0");
+        assert_eq!(rec.seat_home, th.join("homes/kimi").to_string_lossy());
+        assert_eq!(rec.served_model, None);
+        assert_eq!(kimi_spawns, 1, "the probe spawned the seat once");
+        let err = qwen_result.unwrap_err();
+        assert!(
+            err.starts_with("qwen_seat_served_non_qwen_model: glm-5"),
+            "{err}"
+        );
+        assert_eq!(qwen_spawns, 1);
+        assert!(
+            !qwen_verified_left,
+            "a served-model failure deletes verified.json"
+        );
+    }
+
+    /// RED IF: a credential, quota, suspension or served-model failure keeps verified.json, or a timeout deletes it.
     #[test]
-    fn live_probe_is_not_wired_until_t205() {
-        for (seat, _, _) in SEAT_CLIS {
-            let err = seat_live_probe(seat).unwrap_err();
-            assert!(
-                err.starts_with("seat_unverified:") && err.contains("runner not wired"),
-                "{err}"
-            );
+    fn probe_failures_that_unverify() {
+        for e in [
+            "credentials_mode: /x is 0644, must be 0600",
+            "seat_quota_exhausted:kimi: nonzero_exit:kimi:1 last_retry_status=429",
+            "seat_suspended: qwen: 403 from provider",
+            "qwen_seat_served_non_qwen_model: glm-5",
+            "nonzero_exit:kimi:1; kimi said: 401 Unauthorized",
+        ] {
+            assert!(probe_failure_unverifies(e), "{e}");
+        }
+        for e in [
+            "kimi connector timed out after 180s",
+            "empty_or_unrecognized_stream:kimi",
+        ] {
+            assert!(!probe_failure_unverifies(e), "{e}");
         }
     }
 
