@@ -40,7 +40,6 @@ pub mod qwen;
 pub mod seat_gate;
 pub mod seat_state;
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
     pub name: &'static str,
@@ -81,28 +80,15 @@ pub fn display_agent_name(agent: &str) -> String {
     // label instead of falling through to the generic capitaliser ("Agy").
     let canonical = normalize_agent_name(agent);
     // Seven Primes REQ-003: a seat's display name is data on its SeatProfile row ("Kimi", "Mistral", "Qwen").
-    // The arms below are the rows' values for the existing seats, kept as the fallback for a name with no row.
+    // Every seat has a row (gemini renders "Antigravity", deepseek "DeepSeek"), so only a name with no row reaches
+    // the generic capitaliser below.
     if let Some(row) = seat_profile::seat_profile(&canonical) {
         return row.display_name.to_string();
     }
-    match canonical.as_str() {
-        "codex" => "Codex".to_string(),
-        // The internal execution key is still `gemini`, but the operator-facing
-        // product name is Antigravity — never render "Gemini" to a human.
-        "gemini" => "Antigravity".to_string(),
-        // T-001: explicit arm — the generic first-letter capitaliser below would produce
-        // "Deepseek" (wrong); the canonical brand spelling is "DeepSeek".
-        "deepseek" => "DeepSeek".to_string(),
-        // REQ-GROK-002: explicit arm so alias inputs (grok-build/xai/supergrok) render "Grok".
-        // SuperGrok is a billing plan, never an operator-facing agent name.
-        "grok" => "Grok".to_string(),
-        other => {
-            let mut chars = other.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => "Agent".to_string(),
-            }
-        }
+    let mut chars = canonical.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Agent".to_string(),
     }
 }
 
