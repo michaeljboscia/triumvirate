@@ -40,6 +40,8 @@ pub struct LiveBlindValidation {
     pub roster: Vec<String>,
     /// Where the Cargo package lives, relative to each worktree root. Defaults to ".".
     pub package_dir: String,
+    /// Who is behind this call (Seven Primes T-204, REQ-090). Every candidate validator is gated with it.
+    pub origin: shared_types::Origin,
 }
 
 /// Where a job's scratch space lives: OUTSIDE the repository entirely.
@@ -134,6 +136,14 @@ impl Drop for BaselineWorktree {
 /// EVERY STEP CAN REFUSE, and the refusals are the point. See
 /// `mcp_tools::blind_validation::run_blind_validation` for the ordering and why it is that way.
 pub async fn run_live(req: LiveBlindValidation) -> Result<BlindReport, String> {
+    // Seven Primes T-204 (REQ-062, REQ-090): the seat gate on BlindValidate for every candidate, FIRST, before the
+    // baseline worktree is created and before cargo runs (both spawn processes). When the gate refuses every
+    // candidate the call ends here with the gate's exact payload(s). The can-it-write filter stays where it was, in
+    // run_with_trees.
+    let (admitted, refusals) = gate_validators(&req.roster, req.origin);
+    if admitted.is_empty() {
+        return Err(refusals.join("; "));
+    }
     if !req.impl_worktree.is_dir() {
         return Err(format!(
             "the implementation worktree {} does not exist",
@@ -184,6 +194,99 @@ pub async fn run_live(req: LiveBlindValidation) -> Result<BlindReport, String> {
     run_with_trees(&req, &validator_dir, &baseline_tree).await
 }
 
+/// The validators a blind validation may use, in roster order (an empty roster means the default panel). Seven
+/// Primes T-204 (REQ-062, REQ-090): each candidate is gated on BlindValidate with the request's origin, per
+/// (seat, surface, origin) triple; a refused seat is skipped with its exact refusal kept. A seat the gate permits but
+/// that cannot write its test file (T-202, the SeatProfile row) is skipped as before. With nobody left the call fails:
+/// with the refusal payload(s) verbatim when every candidate was refused by the gate, else with the old message,
+/// followed by any refusals.
+fn select_validators(
+    roster: &[String],
+    origin: shared_types::Origin,
+) -> Result<Vec<String>, String> {
+    let cannot_write_here = cannot_write_here_from(mcp_bridge::seat_profile::all_seats());
+    let requested = requested_validators(roster);
+    let (admitted, refusals) = gate_validators(roster, origin);
+    let mut unwritable = 0;
+    let selected: Vec<String> = admitted
+        .iter()
+        .filter(|a| {
+            let seat = mcp_bridge::normalize_agent_name(a);
+            let keep = !cannot_write_here.contains(&seat.as_str());
+            if !keep {
+                unwritable += 1;
+                tracing::info!(
+                    agent = %a,
+                    "skipped as a blind validator: it cannot write its test file on this \
+                     dispatch (read-only sandbox, or no filesystem at all)"
+                );
+            }
+            keep
+        })
+        .cloned()
+        .collect();
+    if !selected.is_empty() {
+        return Ok(selected);
+    }
+    if unwritable == 0 && !refusals.is_empty() {
+        return Err(refusals.join("; "));
+    }
+    let mut err = format!(
+        "no agent in the roster {requested:?} can write a test file on this dispatch. \
+         A blind validator must WRITE its tests, and {cannot_write_here:?} cannot here."
+    );
+    if !refusals.is_empty() {
+        err.push_str("; ");
+        err.push_str(&refusals.join("; "));
+    }
+    Err(err)
+}
+
+/// The candidate list: the roster as given, or the default panel when it is empty.
+fn requested_validators(roster: &[String]) -> Vec<String> {
+    if roster.is_empty() {
+        peer_review::default_reviewers()
+    } else {
+        roster.to_vec()
+    }
+}
+
+/// Seven Primes T-204: every candidate through the seat gate on BlindValidate with the request's origin, one
+/// (seat, surface, origin) triple each. Returns the admitted candidates in roster order and the refusals verbatim.
+///
+/// Seven Primes T-207 (REQ-053): no seat lock is taken on this path. The gate refuses every new seat on BlindValidate
+/// (`seat_cannot_write_here`, amendment A-2), so a seat whose row has `concurrency_limit: One` never reaches a dispatch
+/// from here; the lock lives in `agent_exec::run_new_seat`, which this module never calls.
+fn gate_validators(roster: &[String], origin: shared_types::Origin) -> (Vec<String>, Vec<String>) {
+    let mut refusals = Vec::new();
+    let admitted = requested_validators(roster)
+        .into_iter()
+        .filter(|a| {
+            match mcp_tools::inter_agent::gate_seat(
+                &mcp_bridge::normalize_agent_name(a),
+                mcp_bridge::seat_gate::Surface::BlindValidate,
+                origin,
+            ) {
+                Ok(()) => true,
+                Err(refusal) => {
+                    tracing::info!(agent = %a, %refusal, "skipped as a blind validator: refused by the seat gate");
+                    refusals.push(refusal);
+                    false
+                }
+            }
+        })
+        .collect();
+    (admitted, refusals)
+}
+
+/// Seven Primes T-202 (REQ-062): the keys of the rows with `can_write_test_file = false`, in row order.
+fn cannot_write_here_from(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| !row.can_write_test_file)
+        .map(|row| row.key)
+        .collect()
+}
+
 async fn run_with_trees(
     req: &LiveBlindValidation,
     validator_dir: &Path,
@@ -224,37 +327,14 @@ async fn run_with_trees(
     //
     // Filtered rather than failed, because the roster is a preference list and the next name is
     // a legitimate answer. Logged so an operator can see why their first choice was skipped.
-    const CANNOT_WRITE_HERE: &[&str] = &["grok", "deepseek"];
-    let requested = if req.roster.is_empty() {
-        peer_review::default_reviewers()
-    } else {
-        req.roster.clone()
-    };
-    let roster: Vec<String> = requested
-        .iter()
-        .filter(|a| {
-            let keep = !CANNOT_WRITE_HERE.contains(&a.to_ascii_lowercase().as_str());
-            if !keep {
-                tracing::info!(
-                    agent = %a,
-                    "skipped as a blind validator: it cannot write its test file on this \
-                     dispatch (read-only sandbox, or no filesystem at all)"
-                );
-            }
-            keep
-        })
-        .cloned()
-        .collect();
-    if roster.is_empty() {
-        return Err(format!(
-            "no agent in the roster {requested:?} can write a test file on this dispatch. \
-             A blind validator must WRITE its tests, and {CANNOT_WRITE_HERE:?} cannot here."
-        ));
-    }
+    // Seven Primes T-202 (REQ-062): derived from SeatProfile rows with `can_write_test_file = false`. The three new
+    // seats are read-only, so they join grok and deepseek. T-204: and every candidate passes the seat gate first.
+    let roster = select_validators(&req.roster, req.origin)?;
 
     // The validator agent, run for real. `run_named_agent_with_session_and_model` is used rather
     // than `execute_ask_agent` because its result carries the TOOL CALLS, which is what the
     // blindness scan reads. See the module docs.
+    let origin = req.origin;
     let run_agent = move |agent: &str, prompt: &str, cwd: &Path| {
         let agent = agent.to_string();
         let prompt = prompt.to_string();
@@ -280,6 +360,7 @@ async fn run_with_trees(
                             agent: agent.clone(),
                             message: prompt.clone(),
                             cwd: Some(cwd.clone()),
+                            origin,
                             ..Default::default()
                         };
                         run_named_agent_with_session_and_model(
@@ -351,6 +432,7 @@ pub async fn tool_impl(req: BlindValidateRequest) -> Result<BlindValidateRespons
         worker_agent: req.worker_agent,
         roster: req.roster,
         package_dir: req.package_dir.unwrap_or_else(|| ".".to_string()),
+        origin: req.origin,
     })
     .await?;
 
@@ -460,6 +542,28 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blind-validator exclusion reads `can_write_test_file` from the rows it is handed: flipping it on a cloned
+    /// roster lets kimi write and stops codex.
+    /// RED IF: the exclusion is a literal list or ignores `row.can_write_test_file`.
+    #[test]
+    fn cannot_write_here_follows_mutated_rows() {
+        let mut rows = mcp_bridge::seat_profile::all_seats().to_vec();
+        let live = cannot_write_here_from(&rows);
+        assert!(
+            live.contains(&"kimi") && !live.contains(&"codex"),
+            "{live:?}"
+        );
+        for row in &mut rows {
+            match row.key {
+                "kimi" => row.can_write_test_file = true,
+                "codex" => row.can_write_test_file = false,
+                _ => {}
+            }
+        }
+        let got = cannot_write_here_from(&rows);
+        assert!(!got.contains(&"kimi") && got.contains(&"codex"), "{got:?}");
+    }
 
     /// Every test here runs `cargo` or `git` through `Command::new`, which reads `PATH`.
     ///
@@ -680,6 +784,7 @@ mod tests {
             worker_agent: "codex".to_string(),
             roster: vec![],
             package_dir: "daemon".to_string(),
+            origin: Default::default(),
         };
         // The exact expression `run_live` uses to decide what to clean up.
         let copied = req
@@ -715,6 +820,7 @@ mod tests {
             worker_agent: "codex".to_string(),
             roster: vec!["grok".to_string(), "deepseek".to_string()],
             package_dir: None,
+            origin: Default::default(),
         })
         .await
         .expect_err("a roster of non-writers cannot validate");
@@ -739,6 +845,7 @@ mod tests {
             worker_agent: "codex".to_string(),
             roster: vec![],
             package_dir: None,
+            origin: Default::default(),
         })
         .await
         .expect_err("a missing worktree must be refused");
@@ -747,5 +854,190 @@ mod tests {
         // And the bridge really delegates here rather than reimplementing.
         let src = include_str!("main.rs");
         assert!(src.contains("blind_validate::tool_impl(req).await?"));
+    }
+
+    /// Seven Primes T-001 (REQ-010, REQ-011) characterization of `CANNOT_WRITE_HERE`, the seats that can never be a
+    /// blind validator. The const is local to `run_with_trees`, so it is pinned through behavior: a roster of only
+    /// non-writers is refused with an error that prints the whole list. An empty baseline dir is enough, because
+    /// `cargo_test` returns a missing manifest as output, not as an error, and the roster filter runs next. No agent
+    /// is ever spawned: every roster here is filtered to empty.
+    /// A sync test driving a current-thread runtime, so the env lock (cargo reads PATH) is held for the whole run
+    /// without ever crossing an await point.
+    /// RED IF: the list gains or loses a seat, or either current non-writer stops being refused on its own.
+    #[test]
+    fn seven_primes_characterization_cannot_write_here() {
+        let _g = env_guard();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert!(
+            have("cargo"),
+            "cargo must be on PATH: a skipped characterization pins nothing"
+        );
+        for roster in [vec!["grok"], vec!["deepseek"], vec!["GROK", "DeepSeek"]] {
+            let base = tempfile::tempdir().expect("tempdir");
+            let req = LiveBlindValidation {
+                project_root: base.path().to_path_buf(),
+                impl_worktree: base.path().to_path_buf(),
+                contract: "c".to_string(),
+                base_ref: "HEAD".to_string(),
+                worker_agent: "codex".to_string(),
+                roster: roster.iter().map(|s| s.to_string()).collect(),
+                package_dir: ".".to_string(),
+                origin: Default::default(),
+            };
+            let err = rt
+                .block_on(run_with_trees(&req, base.path(), base.path()))
+                .expect_err("a roster of non-writers cannot validate");
+            assert!(
+                // T-202: derived from the seat table (roster order); grok and deepseek are unchanged, and the three
+                // new read-only seats are added.
+                err.contains(r#"["deepseek", "grok", "kimi", "mistral", "qwen"] cannot here"#),
+                "{roster:?}: {err}"
+            );
+            // The message names exactly the seat rows that cannot write, built by the same filter.
+            let from_rows: Vec<&str> = mcp_bridge::seat_profile::all_seats()
+                .iter()
+                .filter(|row| !row.can_write_test_file)
+                .map(|row| row.key)
+                .collect();
+            assert!(
+                err.contains(&format!("{from_rows:?} cannot here")),
+                "{roster:?}: {err}"
+            );
+        }
+    }
+
+    /// Seven Primes T-204 (REQ-062, REQ-090): the BlindValidate gate matrix on the real orchestration. For both
+    /// origins: every existing seat that can write a test file (codex, gemini, claude) is selected and its own mock
+    /// is spawned as the validator; grok and deepseek (gate-permitted, cannot write) are refused with the existing
+    /// message and spawn nothing; kimi is refused with its exact gate payload (not configured, then, enabled and
+    /// verified, seat_cannot_write_here) and spawns nothing.
+    /// RED IF: a writer stops being dispatched as validator, a refused or non-writing seat spawns anything, or the
+    /// per-candidate gate stops returning its exact payload.
+    #[test]
+    fn seven_primes_blind_validate_gate_matrix() {
+        use crate::agent_exec::seven_primes_gate_tests::{EnvRestore, Mocks};
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        assert!(
+            have("cargo"),
+            "cargo must be on PATH: the baseline run uses it"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let run = |roster: &str, origin| {
+            let base = tempfile::tempdir().expect("tempdir");
+            let req = LiveBlindValidation {
+                project_root: base.path().to_path_buf(),
+                impl_worktree: base.path().to_path_buf(),
+                contract: "c".to_string(),
+                base_ref: "HEAD".to_string(),
+                worker_agent: "nobody".to_string(),
+                roster: vec![roster.to_string()],
+                package_dir: ".".to_string(),
+                origin,
+            };
+            // Three separate roots, as run_live lays them out: run_blind_validation refuses an overlap.
+            let validator = tempfile::tempdir().expect("tempdir");
+            let baseline = tempfile::tempdir().expect("tempdir");
+            let before = m.ran().len();
+            let out = rt.block_on(run_with_trees(&req, validator.path(), baseline.path()));
+            (out, m.ran()[before..].to_vec())
+        };
+        for origin in [
+            shared_types::Origin::Interactive,
+            shared_types::Origin::Unattended,
+        ] {
+            for seat in ["codex", "gemini", "claude"] {
+                let (out, ran) = run(seat, origin);
+                assert_eq!(
+                    ran,
+                    [seat],
+                    "{seat} {origin:?}: its own mock is the validator, and only it ({:?})",
+                    out.map(|r| r.validator_agent)
+                );
+            }
+            for seat in ["grok", "deepseek"] {
+                let (out, ran) = run(seat, origin);
+                assert!(out.unwrap_err().contains("cannot here"), "{seat}");
+                assert!(ran.is_empty(), "{seat}: {ran:?}");
+            }
+            let (out, ran) = run("kimi", origin);
+            assert_eq!(
+                out.unwrap_err(),
+                "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+            );
+            assert!(ran.is_empty());
+        }
+        m.kimi_available();
+        for origin in [
+            shared_types::Origin::Interactive,
+            shared_types::Origin::Unattended,
+        ] {
+            let (out, ran) = run("kimi", origin);
+            assert_eq!(
+                out.unwrap_err(),
+                "seat_cannot_write_here: kimi: blind validators must write test files and kimi is read-only"
+            );
+            assert!(ran.is_empty());
+            // A mixed roster skips the refused seat and validates with the writer, never as kimi.
+            let picked =
+                select_validators(&["kimi".to_string(), "codex".to_string()], origin).unwrap();
+            assert_eq!(picked, ["codex"]);
+        }
+    }
+
+    /// Seven Primes T-207 (REQ-053, A-2): a kimi BlindValidate request is refused at the gate before any seat lock
+    /// exists: with kimi enabled and verified under a tempdir TRIUMVIRATE_HOME, the call fails
+    /// `seat_cannot_write_here`, nothing is spawned, and neither `locks/` nor `locks/kimi` is created.
+    /// RED IF: the BlindValidate path takes (or creates) a seat lock before the gate refuses, or a new seat reaches a
+    /// dispatch from here.
+    #[test]
+    fn t207_kimi_blind_validate_is_refused_before_any_seat_lock() {
+        use crate::agent_exec::seven_primes_gate_tests::{EnvRestore, Mocks};
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        m.kimi_available();
+        assert_eq!(
+            mcp_bridge::seat_state::triumvirate_home().unwrap(),
+            m.home,
+            "TRIUMVIRATE_HOME is the test's tempdir"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let base = tempfile::tempdir().expect("tempdir");
+        let validator = tempfile::tempdir().expect("tempdir");
+        let baseline = tempfile::tempdir().expect("tempdir");
+        let req = LiveBlindValidation {
+            project_root: base.path().to_path_buf(),
+            impl_worktree: base.path().to_path_buf(),
+            contract: "c".to_string(),
+            base_ref: "HEAD".to_string(),
+            worker_agent: "nobody".to_string(),
+            roster: vec!["kimi".to_string()],
+            package_dir: ".".to_string(),
+            origin: shared_types::Origin::Interactive,
+        };
+        let err = rt
+            .block_on(run_with_trees(&req, validator.path(), baseline.path()))
+            .expect_err("kimi cannot be a blind validator");
+        assert_eq!(
+            err,
+            "seat_cannot_write_here: kimi: blind validators must write test files and kimi is read-only"
+        );
+        assert!(m.ran().is_empty(), "nothing spawned: {:?}", m.ran());
+        assert!(
+            !m.home.join("locks").exists(),
+            "no lock directory was created under TRIUMVIRATE_HOME"
+        );
+        assert!(!m.home.join("locks/kimi").exists());
     }
 }

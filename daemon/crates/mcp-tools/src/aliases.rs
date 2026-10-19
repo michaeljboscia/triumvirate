@@ -17,9 +17,17 @@ pub enum AliasMappingError {
 impl std::fmt::Display for AliasMappingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTarget(t) => {
-                write!(f, "invalid target '{t}' — expected 'gemini' or 'codex'")
-            }
+            // Seven Primes REQ-004: rendered from the accepted set, so the message cannot drift from it. It named
+            // only gemini and codex while grok was also accepted.
+            Self::InvalidTarget(t) => write!(
+                f,
+                "invalid target '{t}': expected one of {}",
+                daemon_target_agents()
+                    .iter()
+                    .map(|a| format!("'{a}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::MissingRequired(field) => write!(f, "missing required field '{field}'"),
             Self::InvalidDaemonId(id) => write!(
                 f,
@@ -44,6 +52,9 @@ pub struct AskDaemonParams {
     pub daemon_id: String,
     pub question: String,
     pub timeout_ms: Option<u64>,
+    /// Who is behind this turn (Seven Primes T-204, REQ-090). Default `interactive`, so a legacy caller is unchanged.
+    #[serde(default)]
+    pub origin: shared_types::Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -121,6 +132,8 @@ pub struct AskSessionRequestLike {
     pub name: String,
     pub message: String,
     pub timeout_ms: Option<u64>,
+    /// Carried to the session turn's seat gate (T-204). `send_message` has no such field and maps Interactive.
+    pub origin: shared_types::Origin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,8 +193,21 @@ pub struct ReviewRequestLike {
 ///
 /// Both exclusions predate grok and are preserved, now with a reason attached. `grok` joins
 /// `gemini` and `codex` because it IS a spawnable CLI. REQ-GROK-003.
+///
+/// Seven Primes T-202 (REQ-004, REQ-061): derived from SeatProfile rows with `daemon_target = true`. The three new seats
+/// are session-capable, so they are targets; their session flow is T-208, and until their dispatch arms land (T-205) a
+/// call to one fails loudly with "unsupported agent", never silently as another seat.
 pub fn daemon_target_agents() -> &'static [&'static str] {
-    &["gemini", "codex", "grok"]
+    static TARGETS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    TARGETS.get_or_init(|| daemon_targets_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `daemon_target_agents`: the keys of the rows with `daemon_target`, in row order.
+fn daemon_targets_from(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.daemon_target)
+        .map(|row| row.key)
+        .collect()
 }
 
 /// Map a `spawn_daemon` / `ask_daemon` target onto a canonical agent key.
@@ -228,6 +254,7 @@ pub fn map_ask_daemon_params(p: AskDaemonParams) -> Result<AskSessionRequestLike
         name: validate_daemon_id(p.daemon_id)?,
         message: p.question,
         timeout_ms: p.timeout_ms,
+        origin: p.origin,
     })
 }
 
@@ -268,6 +295,8 @@ pub fn map_send_message_params(
         name: p.target,
         message: p.question,
         timeout_ms: p.timeout_ms,
+        // The legacy send_message schema has no origin field.
+        origin: shared_types::Origin::Interactive,
     })
 }
 
@@ -399,6 +428,7 @@ mod tests {
             daemon_id: "gd_session_abc".into(),
             question: "hi".into(),
             timeout_ms: None,
+            origin: Default::default(),
         };
         let out = map_ask_daemon_params(p).unwrap();
         assert_eq!(out.name, "gd_session_abc");
@@ -411,11 +441,32 @@ mod tests {
             daemon_id: "cd_session_xyz".into(),
             question: "hello".into(),
             timeout_ms: Some(50),
+            origin: Default::default(),
         };
         let out = map_ask_daemon_params(p).unwrap();
         assert_eq!(out.name, "cd_session_xyz");
         assert_eq!(out.message, "hello");
         assert_eq!(out.timeout_ms, Some(50));
+    }
+
+    /// Seven Primes T-204: ask_daemon carries `origin` to the session turn, defaulting to interactive when absent.
+    /// RED IF: map_ask_daemon_params drops the field, or a legacy body without it stops parsing.
+    #[test]
+    fn u_al_t204_ask_daemon_carries_origin() {
+        let legacy: AskDaemonParams =
+            serde_json::from_value(serde_json::json!({"daemon_id": "s", "question": "q"})).unwrap();
+        assert_eq!(
+            map_ask_daemon_params(legacy).unwrap().origin,
+            shared_types::Origin::Interactive
+        );
+        let unattended: AskDaemonParams = serde_json::from_value(
+            serde_json::json!({"daemon_id": "s", "question": "q", "origin": "unattended"}),
+        )
+        .unwrap();
+        assert_eq!(
+            map_ask_daemon_params(unattended).unwrap().origin,
+            shared_types::Origin::Unattended
+        );
     }
 
     #[test]
@@ -424,6 +475,7 @@ mod tests {
             daemon_id: "".into(),
             question: "hello".into(),
             timeout_ms: None,
+            origin: Default::default(),
         };
         let err = map_ask_daemon_params(p).unwrap_err();
         assert!(matches!(err, AliasMappingError::InvalidDaemonId(id) if id.is_empty()));
@@ -435,6 +487,7 @@ mod tests {
             daemon_id: "daemon-peritia".into(),
             question: "hello".into(),
             timeout_ms: None,
+            origin: Default::default(),
         };
         let out = map_ask_daemon_params(p).unwrap();
         assert_eq!(out.name, "daemon-peritia");
@@ -642,6 +695,7 @@ mod tests {
             daemon_id: "gd_ok".into(),
             question: "q".into(),
             timeout_ms: None,
+            origin: Default::default(),
         }));
         assert_dismiss_type(map_dismiss_daemon_params(DismissDaemonParams {
             daemon_id: "cd_ok".into(),
@@ -710,4 +764,60 @@ mod tests {
         assert!(super::map_target_to_agent("not-an-agent".to_string()).is_err());
     }
 
+}
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization of the persistent-daemon target set.
+/// RED IF: the set changes before T-202 moves it onto the SeatProfile table.
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    #[test]
+    fn daemon_target_agents_exact() {
+        // T-202: derived from the seat table; the five existing seats' membership is unchanged (gemini, codex, grok)
+        // and the three new seats are added.
+        assert_eq!(
+            super::daemon_target_agents(),
+            &["gemini", "codex", "grok", "kimi", "mistral", "qwen"]
+        );
+    }
+
+    /// The daemon-target consumer reads `daemon_target` from the rows it is handed: flipping it on a cloned roster
+    /// removes kimi and adds deepseek.
+    /// RED IF: daemon targets are a literal list or ignore `row.daemon_target`.
+    #[test]
+    fn daemon_targets_follow_mutated_rows() {
+        let mut rows = mcp_bridge::seat_profile::all_seats().to_vec();
+        assert_eq!(
+            super::daemon_targets_from(&rows),
+            super::daemon_target_agents()
+        );
+        for row in &mut rows {
+            match row.key {
+                "kimi" => row.daemon_target = false,
+                "deepseek" => row.daemon_target = true,
+                _ => {}
+            }
+        }
+        let got = super::daemon_targets_from(&rows);
+        assert!(!got.contains(&"kimi"), "{got:?}");
+        assert!(got.contains(&"deepseek"), "{got:?}");
+        assert_eq!(got.len(), super::daemon_target_agents().len());
+    }
+}
+
+/// Seven Primes T-201 (REQ-004): the InvalidTarget message names exactly the accepted daemon targets.
+/// RED IF: the message and the accepted target set ever disagree.
+#[cfg(test)]
+mod seven_primes_invalid_target_tests {
+    use super::{AliasMappingError, daemon_target_agents};
+
+    #[test]
+    fn invalid_target_message_matches_the_accepted_set() {
+        let msg = AliasMappingError::InvalidTarget("nope".into()).to_string();
+        let listed = msg
+            .split("expected one of ")
+            .nth(1)
+            .expect("message names the accepted set");
+        let names: Vec<&str> = listed.split(", ").map(|n| n.trim_matches('\'')).collect();
+        assert_eq!(names, daemon_target_agents());
+    }
 }

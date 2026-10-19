@@ -1,22 +1,22 @@
 //! Shared DTOs for MCP bridge <-> daemon communication.
 
+mod abe;
 mod api;
 mod git_ops;
 mod ledger;
-mod abe;
 mod streaming;
 
 pub use abe::*;
 pub use api::{
-    WorkersResponse, WorkerInfo, FleetResponse, FleetBuild, FleetTask,
-    StateResponse, ReplayRequest, ReplayResponse,
+    FleetBuild, FleetResponse, FleetTask, ReplayRequest, ReplayResponse, StateResponse, WorkerInfo,
+    WorkersResponse,
 };
 pub use git_ops::{GitOps, MergeResult};
-pub use streaming::{AgentStreamEvent, WorkerLifecycleType};
 pub use ledger::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
     Summary,
 };
+pub use streaming::{AgentStreamEvent, WorkerLifecycleType};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,38 @@ pub struct LifecycleEvent {
     pub detail: String,
 }
 
+/// Who is behind a call (Seven Primes FEAT-007, REQ-090). An optional request field, default `interactive`; autonomous
+/// callers send `unattended` (F-3). Lives here, not in mcp-bridge's seat_gate.rs, because request structs in this crate
+/// carry it from T-204 and mcp-bridge already depends on shared-types (the reverse would be a crate cycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Interactive,
+    Unattended,
+}
+
+/// Which ask-family surface an `AskAgentRequest` came in on (Seven Primes T-204, REQ-090): plain `ask_agent`, a turn
+/// of a named session, or a jury seat. Set by the ENTRY POINT that builds the request, never inferred from other
+/// fields. It crosses the wire because a jury seat reaches the daemon over HTTP `/ask` like any other ask. Only these
+/// three values exist: the unattended surfaces (peer-review rotation, fleet, ABE, prewarm) are internal classes that
+/// no request can name, and at launch these three have the same answer for every seat (amendment A-2), so a caller
+/// that mislabels one cannot widen what it may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AskSurface {
+    #[default]
+    AskAgent,
+    Session,
+    Jury,
+}
+
+impl AskSurface {
+    fn is_ask_agent(&self) -> bool {
+        *self == AskSurface::AskAgent
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AskAgentRequest {
     pub agent: String,
@@ -34,6 +66,17 @@ pub struct AskAgentRequest {
     pub cwd: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
+
+    /// Who is behind this call (Seven Primes T-204, REQ-090): `interactive` (the default, so an old caller that sends
+    /// nothing is unchanged) or `unattended`. Read by the seat gate before anything is spawned.
+    #[serde(default)]
+    pub origin: Origin,
+
+    /// The ask-family surface this request arrived on. See `AskSurface`. Absent means plain `ask_agent`. Not in the
+    /// tool schema: the session and jury entry points set it, a caller has no reason to.
+    #[serde(default, skip_serializing_if = "AskSurface::is_ask_agent")]
+    #[schemars(skip)]
+    pub ask_surface: AskSurface,
 
     /// Resume the cached worker session for (agent, cwd) instead of starting a
     /// fresh one. Opt-in, and `None`/`false` for every one-shot caller.
@@ -195,7 +238,11 @@ pub struct AskJuryRequest {
     /// The same message goes to every seat, verbatim.
     pub message: String,
     pub cwd: Option<String>,
-    /// Which agents sit. Default `codex`, `grok`, `gemini`. At least two, and no agent twice:
+    /// Who is behind this call (T-204, REQ-090). Every seat inherits it. Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
+    /// Which agents sit. Default: the jury default set (`mcp_tools::jury::DEFAULT_SEATS`, rendered into the ask_jury
+    /// tool description). At least two, and no agent twice:
     /// `gemini` and `antigravity` are ONE seat, and asking both is one agent voting twice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seats: Vec<String>,
@@ -557,11 +604,14 @@ impl AskAgentResponse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SpawnSessionRequest {
     pub agent: String,
     pub name: String,
     pub cwd: Option<String>,
+    /// Who is behind this call (T-204, REQ-090). Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -576,10 +626,14 @@ pub struct SessionListResponse {
     pub sessions: Vec<SessionInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AskSessionRequest {
     pub name: String,
     pub message: String,
+
+    /// Who is behind this turn (T-204, REQ-090). Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
 
     /// The primary sources this turn must actually open, by path.
     ///
@@ -926,6 +980,9 @@ pub struct BlindValidateRequest {
     /// Candidate validators in preference order. Omit for the default panel.
     #[serde(default)]
     pub roster: Vec<String>,
+    /// Who is behind this call (T-204, REQ-090). Every candidate validator is gated with it. Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -977,8 +1034,22 @@ pub struct DaemonHealthResponse {
     pub daemon_bind_addr: Option<String>,
 }
 
+/// One seat's availability as /status reports it (Seven Primes REQ-080, REQ-091). `reason` is the exact refusal
+/// payload the gate would return for an ask right now, or null when the seat is available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SeatStatus {
+    pub configured: bool,
+    pub verified: bool,
+    pub suspended: bool,
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DaemonStatusSnapshot {
+    /// Seven Primes: absent from an older daemon, so optional here.
+    #[serde(default)]
+    pub seats: Option<std::collections::BTreeMap<String, SeatStatus>>,
     pub daemon_mode: Option<String>,
     pub supported_agents: Option<Vec<String>>,
     pub pending_fallbacks: Option<usize>,
@@ -994,6 +1065,19 @@ pub struct StatusResponse {
     pub pending_fallbacks: usize,
     pub fallback_tickets: Vec<String>,
     pub daemon_bind_addr: String,
+    /// Seven Primes REQ-080: every seat that needs verification (the new seats), keyed by seat. `default` so a
+    /// response from before this field still deserializes.
+    #[serde(default)]
+    pub seats: std::collections::BTreeMap<String, SeatStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPhase {
+    Pending,
+    #[default]
+    Ready,
+    Broken,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1016,6 +1100,14 @@ pub struct SessionState {
     /// migration in `hydrate_session_ids_from_workers` fills it from the old registry once.
     #[serde(default)]
     pub cli_session_id: Option<String>,
+    /// Named `phase` rather than `state` to avoid colliding with the many runtime state locals.
+    /// Existing persisted records default to Ready and retain their previous behavior.
+    #[serde(default)]
+    pub phase: SessionPhase,
+    #[serde(default)]
+    pub broken_reason: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
     /// The immediate session that triggered this session's dispatch.
     /// For Pantheon-spawned Claude Code sessions, this is the panel_id.
     /// For Codex/Gemini workers dispatched via MCP, this is the caller's session_id.
@@ -1041,13 +1133,35 @@ pub struct SessionState {
 /// while dispatch canonicalized them, so the author and the reviewer were the same seat under
 /// different names (D-030). Lives here so peer-review and mcp-bridge share it rather than each
 /// keeping a copy.
+/// Every alias and the canonical seat key it names, in one table so the normalizer and the rendered tool descriptions
+/// cannot disagree (Seven Primes REQ-002, REQ-004).
+///
+/// - `antigravity`, `agy`: the Antigravity product and CLI names for the `gemini` seat.
+/// - REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an alias only. The canonical
+///   execution key is `grok` and the binary is `grok`.
+/// - Seven Primes: the vendor CLI and product names of the three new seats.
+pub const AGENT_ALIASES: &[(&str, &str)] = &[
+    ("antigravity", "gemini"),
+    ("agy", "gemini"),
+    ("grok-build", "grok"),
+    ("xai", "grok"),
+    ("supergrok", "grok"),
+    ("kimi-code", "kimi"),
+    ("moonshot", "kimi"),
+    ("vibe", "mistral"),
+    ("mistral-vibe", "mistral"),
+    ("devstral", "mistral"),
+    ("le-chat", "mistral"),
+    ("qwen-code", "qwen"),
+    ("alibaba", "qwen"),
+    ("bailian", "qwen"),
+];
+
 pub fn normalize_agent_name(agent: &str) -> String {
-    match agent.to_lowercase().as_str() {
-        "antigravity" | "agy" => "gemini".to_string(),
-        // REQ-GROK-001: `supergrok` is a SUBSCRIPTION TIER, not an executable, so it is an
-        // alias only. The canonical execution key is `grok` and the binary is `grok`.
-        "grok-build" | "xai" | "supergrok" => "grok".to_string(),
-        other => other.to_string(),
+    let lower = agent.to_lowercase();
+    match AGENT_ALIASES.iter().find(|(alias, _)| *alias == lower) {
+        Some((_, canonical)) => canonical.to_string(),
+        None => lower,
     }
 }
 
@@ -1070,6 +1184,9 @@ mod tests {
             root_session_id: Some("sess-pantheon-panel-1".to_string()),
             pantheon_session_id: Some("pantheon-uuid-abc-123".to_string()),
             cli_session_id: None,
+            phase: super::SessionPhase::Ready,
+            broken_reason: None,
+            generation: 0,
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -1084,6 +1201,8 @@ mod tests {
         assert_eq!(parsed.pantheon_session_id, Some("pantheon-uuid-abc-123".to_string()));
     }
 
+    /// RED IF: a sessions.json record from before T-208 does not default to Ready, None, and generation zero.
+
     #[test]
     fn session_state_backwards_compatible_missing_lineage() {
         // Verify existing sessions.json files (without lineage fields) still
@@ -1096,6 +1215,9 @@ mod tests {
         assert_eq!(parsed.parent_session_id, None);
         assert_eq!(parsed.root_session_id, None);
         assert_eq!(parsed.pantheon_session_id, None);
+        assert_eq!(parsed.phase, super::SessionPhase::Ready);
+        assert_eq!(parsed.broken_reason, None);
+        assert_eq!(parsed.generation, 0);
     }
 
     #[test]
@@ -1134,6 +1256,7 @@ mod tests {
             pending_fallbacks: 1,
             fallback_tickets: vec!["ticket-1.md".to_string()],
             daemon_bind_addr: "127.0.0.1:8080".to_string(),
+            seats: Default::default(),
         };
 
         let json = serde_json::to_string(&status).expect("serialize");
@@ -1294,5 +1417,189 @@ mod tests {
                 serde_json::from_str(&raw).expect("parse");
             assert_eq!(&parsed, expected);
         }
+    }
+}
+
+/// Seven Primes T-003: `Origin` is final, not a stub.
+/// RED IF: the default stops being Interactive, or the wire names stop being snake_case.
+#[cfg(test)]
+mod origin_tests {
+    use super::Origin;
+
+    #[test]
+    fn origin_defaults_to_interactive_and_uses_snake_case() {
+        assert_eq!(Origin::default(), Origin::Interactive);
+        assert_eq!(
+            serde_json::to_string(&Origin::Unattended).unwrap(),
+            "\"unattended\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Origin>("\"interactive\"").unwrap(),
+            Origin::Interactive
+        );
+        assert!(serde_json::from_str::<Origin>("\"robot\"").is_err());
+    }
+
+    /// Seven Primes T-204: every request type that reaches the seat gate carries `origin`; an old caller that sends
+    /// no field is Interactive, and `unattended` on the wire is read, not dropped.
+    /// RED IF: any of the five requests loses the field, defaults it to anything but Interactive, or ignores it.
+    #[test]
+    fn every_gated_request_carries_origin_with_an_interactive_default() {
+        use super::{
+            AskAgentRequest, AskJuryRequest, AskSessionRequest, AskSurface, BlindValidateRequest,
+            SpawnSessionRequest,
+        };
+        fn both<T: serde::de::DeserializeOwned>(
+            base: serde_json::Value,
+            origin: impl Fn(&T) -> Origin,
+        ) {
+            let old: T = serde_json::from_value(base.clone()).expect("old shape");
+            assert_eq!(origin(&old), Origin::Interactive, "{base}");
+            let mut new = base;
+            new["origin"] = serde_json::json!("unattended");
+            let new: T = serde_json::from_value(new).expect("new shape");
+            assert_eq!(origin(&new), Origin::Unattended);
+        }
+        both::<AskAgentRequest>(
+            serde_json::json!({"agent": "codex", "message": "m", "cwd": null, "repo": null, "branch": null}),
+            |r| r.origin,
+        );
+        both::<AskSessionRequest>(serde_json::json!({"name": "s", "message": "m"}), |r| {
+            r.origin
+        });
+        both::<SpawnSessionRequest>(
+            serde_json::json!({"agent": "codex", "name": "s", "cwd": null}),
+            |r| r.origin,
+        );
+        both::<AskJuryRequest>(serde_json::json!({"message": "m", "cwd": null}), |r| {
+            r.origin
+        });
+        both::<BlindValidateRequest>(
+            serde_json::json!({"project_root": "/r", "impl_worktree": "/w", "contract": "c",
+                               "base_ref": "HEAD", "worker_agent": "codex"}),
+            |r| r.origin,
+        );
+        // The ask surface: absent is AskAgent and is not written back, so the wire shape of a plain ask is unchanged.
+        let plain = AskAgentRequest::default();
+        assert_eq!(plain.ask_surface, AskSurface::AskAgent);
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("ask_surface")
+        );
+        let jury = AskAgentRequest {
+            ask_surface: AskSurface::Jury,
+            ..Default::default()
+        };
+        let back: AskAgentRequest =
+            serde_json::from_str(&serde_json::to_string(&jury).unwrap()).unwrap();
+        assert_eq!(back.ask_surface, AskSurface::Jury);
+    }
+}
+
+/// Seven Primes T-004 (REQ-002): aliases normalize once, to exactly one canonical seat, and never collide with a key.
+/// RED IF: an alias stops mapping to its seat, a canonical key stops being a fixed point, or two seats share an alias.
+#[cfg(test)]
+mod alias_census_tests {
+    use super::normalize_agent_name;
+
+    const CANONICAL: [&str; 8] = [
+        "gemini", "codex", "deepseek", "claude", "grok", "kimi", "mistral", "qwen",
+    ];
+    // Pinned independently of AGENT_ALIASES, so a deleted or retargeted alias turns this red.
+    const ALIASES: [(&str, &str); 14] = [
+        ("antigravity", "gemini"),
+        ("agy", "gemini"),
+        ("grok-build", "grok"),
+        ("xai", "grok"),
+        ("supergrok", "grok"),
+        ("kimi-code", "kimi"),
+        ("moonshot", "kimi"),
+        ("vibe", "mistral"),
+        ("mistral-vibe", "mistral"),
+        ("devstral", "mistral"),
+        ("le-chat", "mistral"),
+        ("qwen-code", "qwen"),
+        ("alibaba", "qwen"),
+        ("bailian", "qwen"),
+    ];
+
+    #[test]
+    fn aliases_normalize_once_to_one_seat() {
+        for k in CANONICAL {
+            assert_eq!(normalize_agent_name(k), k, "canonical {k} is a fixed point");
+            assert_eq!(
+                normalize_agent_name(&k.to_uppercase()),
+                k,
+                "case-insensitive {k}"
+            );
+        }
+        for (alias, seat) in ALIASES {
+            assert_eq!(normalize_agent_name(alias), seat, "{alias}");
+            // Normalizing is idempotent: an alias resolves in one step, never through a chain.
+            assert_eq!(
+                normalize_agent_name(&normalize_agent_name(alias)),
+                seat,
+                "{alias}"
+            );
+            assert!(
+                !CANONICAL.contains(&alias),
+                "alias {alias} collides with a canonical key"
+            );
+        }
+        // The table itself: no alias twice (an alias naming two seats would resolve to whichever came first).
+        let mut names: Vec<&str> = super::AGENT_ALIASES.iter().map(|(a, _)| *a).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            super::AGENT_ALIASES.len(),
+            "duplicate alias in AGENT_ALIASES"
+        );
+        assert_eq!(super::AGENT_ALIASES.len(), ALIASES.len());
+    }
+}
+
+/// Seven Primes T-203 (REQ-080): the `seats` map round-trips, and a status body without it still parses.
+/// RED IF: the map is dropped from serialization, or an older daemon's body stops deserializing.
+#[cfg(test)]
+mod seat_status_tests {
+    use super::{DaemonStatusSnapshot, SeatStatus, StatusResponse};
+
+    #[test]
+    fn seats_round_trip_and_old_bodies_still_parse() {
+        let mut status = StatusResponse {
+            daemon_mode: "incremental-dev".into(),
+            active_sessions: 0,
+            supported_agents: vec!["kimi".into()],
+            pending_fallbacks: 0,
+            fallback_tickets: vec![],
+            daemon_bind_addr: "127.0.0.1:8080".into(),
+            seats: Default::default(),
+        };
+        let kimi = SeatStatus {
+            configured: false,
+            verified: false,
+            suspended: false,
+            available: false,
+            reason: Some(
+                "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+                    .into(),
+            ),
+        };
+        status.seats.insert("kimi".into(), kimi.clone());
+        let back: StatusResponse =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(back.seats["kimi"], kimi);
+
+        let old = r#"{"daemon_mode":"x","active_sessions":0,"supported_agents":[],"pending_fallbacks":0,"fallback_tickets":[],"daemon_bind_addr":"a"}"#;
+        assert!(
+            serde_json::from_str::<StatusResponse>(old)
+                .unwrap()
+                .seats
+                .is_empty()
+        );
+        let snap: DaemonStatusSnapshot = serde_json::from_str(r#"{"daemon_mode":"x"}"#).unwrap();
+        assert!(snap.seats.is_none());
     }
 }

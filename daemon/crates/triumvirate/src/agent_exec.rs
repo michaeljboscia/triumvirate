@@ -157,11 +157,25 @@ pub(crate) fn note_attempt_child(child: &tokio::process::Child) {
 /// The DeepSeek arm is never handed the events channel at all, and thinking mode legitimately runs
 /// past its 420 s window. codex, grok and gemini-cli emit per line. When agy streams its
 /// stream-json live, it can come back in here.
+///
+/// Seven Primes T-202: the seat's `SeatProfile.live_progress`. A name with no row keeps the old default, streaming.
 fn streams_live_progress(agent: &str, gemini_backend: Option<GeminiBackend>) -> bool {
-    match agent {
-        "gemini" => !matches!(gemini_backend, Some(GeminiBackend::Agy)),
-        "deepseek" => false,
-        _ => true,
+    streams_live_progress_for_row(
+        mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent)),
+        gemini_backend,
+    )
+}
+
+/// The row-taking half of `streams_live_progress`: `row.live_progress`, with no row read as streaming.
+fn streams_live_progress_for_row(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    gemini_backend: Option<GeminiBackend>,
+) -> bool {
+    use mcp_bridge::seat_profile::LiveProgress;
+    match row.map(|row| row.live_progress) {
+        Some(LiveProgress::StreamsExceptAgy) => !matches!(gemini_backend, Some(GeminiBackend::Agy)),
+        Some(LiveProgress::Buffered) => false,
+        Some(LiveProgress::Streams) | None => true,
     }
 }
 
@@ -228,6 +242,79 @@ fn read_contract_context(cwd: Option<&str>) -> (Option<String>, Option<i64>) {
     (Some(parsed.task_id), Some(i64::from(parsed.wave)))
 }
 
+/// The token record's `usage_source` (REQ-057, REQ-041). agy has no honest headless token count, so its dispatch is
+/// `unmetered` (excluded from cost sums) rather than a fake zero. A parse with NO usage block at all is `not_reported`
+/// (Seven Primes REQ-041: Kimi's stdout carries none), so its zero counts are labeled as absent, while a REPORTED zero
+/// stays `exact`.
+const USAGE_SOURCE_NOT_REPORTED: &str = "not_reported";
+
+fn usage_source_for(parsed: &ParsedAgentResult) -> &'static str {
+    if parsed.parser_mode.starts_with("agy") {
+        token_economics::USAGE_SOURCE_UNMETERED
+    } else if parsed.token_usage.is_none() {
+        USAGE_SOURCE_NOT_REPORTED
+    } else {
+        token_economics::USAGE_SOURCE_EXACT
+    }
+}
+
+/// What the success path records as the model that answered (Seven Primes REQ-043).
+#[derive(Debug, PartialEq, Eq)]
+enum ServedModelRecord<'a> {
+    /// `CallTelemetry::set_model` with this name.
+    Model(&'a str),
+    /// The seat reports a served model, but this response carried none: the span says "unknown".
+    Missing,
+    /// The seat does not report a served model this way (kimi, Legacy rows): nothing is recorded.
+    NotExposed,
+}
+
+/// Which served model to record, from the row's `served_model_evidence`: agy's runtime report rides in
+/// `parsed.cli_version` (agy.rs::build_result); Mistral's export config and Qwen's message.model arrive as the new
+/// seats' `SeatParsed.served_model`, passed here as `seat_served_model`. A blank name is no name.
+fn served_model_record<'a>(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    parsed: &'a ParsedAgentResult,
+    seat_served_model: Option<&'a str>,
+) -> ServedModelRecord<'a> {
+    use mcp_bridge::seat_profile::ModelEvidence;
+    let candidate = match row.map(|row| row.served_model_evidence) {
+        Some(ModelEvidence::AgyRuntimeReport) => parsed.cli_version.as_deref(),
+        Some(ModelEvidence::ExportConfig | ModelEvidence::MessageModel) => seat_served_model,
+        Some(ModelEvidence::NotExposed | ModelEvidence::Legacy) | None => {
+            return ServedModelRecord::NotExposed;
+        }
+    };
+    match candidate {
+        Some(model) if !model.trim().is_empty() => ServedModelRecord::Model(model),
+        _ => ServedModelRecord::Missing,
+    }
+}
+
+/// The served-model step of the success path: records what `served_model_record` decides on the telemetry guard and
+/// the span.
+fn record_served_model(
+    tel: &mut mcp_bridge::posthog::CallTelemetry,
+    span: &Span,
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    parsed: &ParsedAgentResult,
+    seat_served_model: Option<&str>,
+) {
+    match served_model_record(row, parsed, seat_served_model) {
+        ServedModelRecord::Model(model) => {
+            tel.set_model(model);
+            span.record("agent.model", model);
+        }
+        // Record "unknown" rather than leaving the field Empty. An absent field is indistinguishable from a span
+        // that never reached here, so silence would hide the very parse regression worth catching: agy changing its
+        // log format and us quietly losing the model forever.
+        ServedModelRecord::Missing => {
+            span.record("agent.model", "unknown");
+        }
+        ServedModelRecord::NotExposed => {}
+    }
+}
+
 fn persist_daemon_token_record(
     agent: &str,
     request_id: &str,
@@ -256,12 +343,7 @@ fn persist_daemon_token_record(
     // REQ-057: agy has no honest headless token count → record the dispatch as
     // `unmetered` (excluded from cost sums) rather than a fake zero. Other backends
     // carry exact counts.
-    let usage_source = if parsed.parser_mode.starts_with("agy") {
-        token_economics::USAGE_SOURCE_UNMETERED
-    } else {
-        token_economics::USAGE_SOURCE_EXACT
-    }
-    .to_string();
+    let usage_source = usage_source_for(parsed).to_string();
 
     let record = TokenRecord {
         agent: agent.to_string(),
@@ -534,8 +616,8 @@ pub(crate) fn wiki_evidence(
     cwd: &str,
 ) -> serde_json::Value {
     let mode = parsed.parser_mode.as_str();
-    let reads_classified = PARSER_MODES_THAT_CLASSIFY_READS.contains(&mode);
-    let tool_records = PARSER_MODES_WITH_TOOL_RECORDS.contains(&mode);
+    let reads_classified = parser_modes_that_classify_reads().contains(&mode);
+    let tool_records = parser_modes_with_tool_records().contains(&mode);
     let mut ev = serde_json::json!({
         "parser_mode": mode,
         "backend": backend,
@@ -722,6 +804,21 @@ async fn execute_ask_agent_inner(
     // $ai_input: the actual prompt for this call, so PostHog's LLM trace view shows what we sent.
     tel.set_input(&req.message);
 
+    // Seven Primes T-204 (REQ-090, REQ-091): the seat gate, FIRST among the pre-dispatch checks and before any
+    // worker, process or credential is touched. The surface is the one the entry point named on the request
+    // (ask_agent and HTTP /ask: AskAgent; a session turn: Session; a jury seat: Jury), never inferred here. A
+    // refusal returns the gate's exact payload. A new seat the gate permits continues to dispatch, which has no arm
+    // for it until T-205 and fails loudly with `unsupported agent: <seat>` (amendment A-9), never another seat.
+    if let Err(refusal) =
+        mcp_tools::inter_agent::gate_seat(&agent, ask_surface(req.ask_surface), req.origin)
+    {
+        span.record("agent.outcome", "rejected_seat_gate");
+        span.record("agent.tokens", 0_u64);
+        span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+        tel.rejected(&refusal);
+        return Err(refusal);
+    }
+
     // A capability mismatch should cost nothing to discover. DeepSeek has no filesystem tools
     // at all and its parser (`deepseek-sse`) hardcodes an empty `tool_calls`, so a review
     // dispatched to it can never satisfy require_sight. Rejecting on the way OUT would spend a
@@ -737,7 +834,7 @@ async fn execute_ask_agent_inner(
              serve as a sighted reviewer. Refused before dispatch so the call is not spent. \
              Send it the material inline as a method question, or route the review to a peer \
              that can read: {}.",
-            PARSER_MODES_WITH_TOOL_RECORDS.join(", ")
+            parser_modes_with_tool_records().join(", ")
         );
         tel.rejected(&msg);
         return Err(msg);
@@ -1340,21 +1437,17 @@ async fn execute_ask_agent_inner(
                 // (High)") and stashes it in cli_version (agy.rs::build_result). Without
                 // this, $ai_model falls back to the agent key and every Antigravity call
                 // charts as the model "gemini", which cannot answer which model ran.
-                if agent == "gemini" {
-                    match parsed.cli_version.as_deref() {
-                        Some(model) if !model.trim().is_empty() => {
-                            tel.set_model(model);
-                            span.record("agent.model", model);
-                        }
-                        // Record "unknown" rather than leaving the field Empty. An absent
-                        // field is indistinguishable from a span that never reached here, so
-                        // silence would hide the very parse regression worth catching: agy
-                        // changing its log format and us quietly losing the model forever.
-                        _ => {
-                            span.record("agent.model", "unknown");
-                        }
-                    }
-                }
+                // Seven Primes T-202 (REQ-043): which seats report a served model, and where it is read from, is
+                // SeatProfile data (`served_model_evidence`). The new seats' SeatParsed.served_model reaches this
+                // path once their dispatch arms land (T-205); until then no dispatch here carries one.
+                let seat_served_model: Option<&str> = None;
+                record_served_model(
+                    &mut tel,
+                    &span,
+                    mcp_bridge::seat_profile::seat_profile(&agent),
+                    &parsed,
+                    seat_served_model,
+                );
                 tel.success(parsed.token_usage.clone());
                 // $ai_output: the completion the model actually returned.
                 tel.set_output(&parsed.response_text);
@@ -2155,34 +2248,52 @@ fn require_peer_review_enabled() -> bool {
 ///
 /// To add a mode here, open its `finish`/`build_result` and confirm a `tool_calls.push` exists
 /// on a real tool event. Do not add one because its name looks capable.
-const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
-    // crates/agent-adapter/src/codex.rs: pushes on command_execution
-    "codex-exec-json",
-    // crates/agent-adapter/src/gemini.rs: pushes on tool_use
-    "gemini-stream-json",
-    // crates/agent-adapter/src/grok.rs: pushes on tool_call
-    "grok-streaming-json",
-    // crates/agent-adapter/src/agy_stream.rs: pushes on step_type="tool".
-    //
-    // Added 2026-09-01 after Grok found the gate was permanently closed against Antigravity:
-    // the live agy path emits agy-pipe-plain-text / agy-pty-plain-text, which record nothing,
-    // so every antigravity review was rejected however carefully it looked. Plain text has no
-    // tool events to record, so the fix was dispatching agy with --output-format stream-json
-    // rather than teaching the old parser to see something that was never there.
-    "agy-stream-json",
-    // crates/agent-adapter/src/claude_stream.rs: pushes on a content block of type "tool_use".
-    //
-    // Added 2026-09-02, and the reason is the same one as agy's, one seat over. `claude` is a
-    // DEFAULT reviewer and its runner built ParsedAgentResult from Default::default(): empty
-    // parser mode, empty tool_calls. So the claude seat was permanently closed against the
-    // sight gate, and turning sight on for the reviewer would have rejected roughly one review
-    // in three for a fault that is the harness's.
-    //
-    // `claude-plain-text` is deliberately NOT here. That mode is what the runner falls back to
-    // when no `result` event arrived, which means the turn was not stream-json and there is no
-    // receipt mechanism to trust.
-    "claude-stream-json",
-];
+// Seven Primes T-202 (REQ-063): DERIVED from the seat table, every parser mode of every seat whose row sets
+// `records_tool_calls`. The per-mode history above is kept because it is the reason each mode is trusted; adding a mode now means
+// setting the field on its SeatProfile row, and the exact pin in the tests below still turns red until someone opens
+// the parser and confirms it. The comment block this replaced listed the modes inline:
+// const PARSER_MODES_WITH_TOOL_RECORDS: &[&str] = &[
+//     // crates/agent-adapter/src/codex.rs: pushes on command_execution
+//     "codex-exec-json",
+//     // crates/agent-adapter/src/gemini.rs: pushes on tool_use
+//     "gemini-stream-json",
+//     // crates/agent-adapter/src/grok.rs: pushes on tool_call
+//     "grok-streaming-json",
+//     // crates/agent-adapter/src/agy_stream.rs: pushes on step_type="tool".
+//     //
+//     // Added 2026-09-01 after Grok found the gate was permanently closed against Antigravity:
+//     // the live agy path emits agy-pipe-plain-text / agy-pty-plain-text, which record nothing,
+//     // so every antigravity review was rejected however carefully it looked. Plain text has no
+//     // tool events to record, so the fix was dispatching agy with --output-format stream-json
+//     // rather than teaching the old parser to see something that was never there.
+//     "agy-stream-json",
+//     // crates/agent-adapter/src/claude_stream.rs: pushes on a content block of type "tool_use".
+//     //
+//     // Added 2026-09-02, and the reason is the same one as agy's, one seat over. `claude` is a
+//     // DEFAULT reviewer and its runner built ParsedAgentResult from Default::default(): empty
+//     // parser mode, empty tool_calls. So the claude seat was permanently closed against the
+//     // sight gate, and turning sight on for the reviewer would have rejected roughly one review
+//     // in three for a fault that is the harness's.
+//     //
+//     // `claude-plain-text` is deliberately NOT here. That mode is what the runner falls back to
+//     // when no `result` event arrived, which means the turn was not stream-json and there is no
+//     // receipt mechanism to trust.
+//     "claude-stream-json",
+// ];
+fn parser_modes_with_tool_records() -> &'static [&'static str] {
+    static MODES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    MODES.get_or_init(|| modes_with_tool_records_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `parser_modes_with_tool_records`: every parser mode of every row with `records_tool_calls`.
+fn modes_with_tool_records_from(
+    rows: &[mcp_bridge::seat_profile::SeatProfile],
+) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.records_tool_calls)
+        .flat_map(|row| row.parser_modes.iter().copied())
+        .collect()
+}
 
 /// Agents that have no tools at all, so `require_sight` can never be satisfied by them.
 ///
@@ -2263,34 +2374,52 @@ const AGENTS_WITH_NO_WRITE_CONTAINMENT: &[&str] = &[];
 /// Fail closed: a parser not listed here cannot have `required_sources` enforced, and the gate
 /// says so rather than pretending. That is the same rule as the tool-record allowlist, applied
 /// one level finer.
-const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
-    "gemini-stream-json",
-    "grok-streaming-json",
-    "agy-stream-json",
-    // Added 2026-09-01. codex-exec-json used to stamp EVERY call ToolKind::Bash, so on that
-    // backend "opened the file" and "ran a command mentioning the file" were the same record
-    // and named sources were refused rather than faked. `codex.rs` now classifies a
-    // `command_execution` as a READ when its command is a pure content reader (cat, head, nl,
-    // ...) or one of the two RANGED shapes codex actually reads with (`sed -n 'a,bp' FILE` and
-    // `nl -ba FILE | sed -n 'a,bp'`), and leaves everything else as Bash. `rg` and `grep` are
-    // searches, not reads, and are NOT on the list. The allowlist is conservative and fails
-    // closed: `ls`, `find`, `stat`, compound commands, other pipes and redirections are all
-    // still Bash and still cannot satisfy a source.
-    //
-    // 2026-09-03: the ranged shapes were added after every source-gated codex review that day
-    // was rejected "never opened". Codex reads files in 260-line windows with `sed -n`, which
-    // the reader list did not contain, and the previous version of THIS comment claimed
-    // `sed -n` was on it. See `codex_ranged_reads_cover_source` for how windows add up.
-    //
-    // This closes Grok's "Codex can be sighted and cannot be source-gated", which mattered
-    // because codex is the peer most likely to be reviewing code.
-    "codex-exec-json",
-    // Added 2026-09-02. The claude stream names the tool directly ("Read", "Grep", "Bash"), so
-    // read against search against shell is a first-class distinction rather than something
-    // inferred from a command line. Verified against a live capture: an allowed Read records
-    // ToolKind::ReadFile with the path in args_json, and a DENIED one records success: false.
-    "claude-stream-json",
-];
+// Seven Primes T-202 (REQ-063): DERIVED from the seat table, every parser mode of every seat whose row sets
+// `classifies_reads`. The per-mode history above is kept because it is the reason each mode is trusted; adding a mode now means
+// setting the field on its SeatProfile row, and the exact pin in the tests below still turns red until someone opens
+// the parser and confirms it. The comment block this replaced listed the modes inline:
+// const PARSER_MODES_THAT_CLASSIFY_READS: &[&str] = &[
+//     "gemini-stream-json",
+//     "grok-streaming-json",
+//     "agy-stream-json",
+//     // Added 2026-09-01. codex-exec-json used to stamp EVERY call ToolKind::Bash, so on that
+//     // backend "opened the file" and "ran a command mentioning the file" were the same record
+//     // and named sources were refused rather than faked. `codex.rs` now classifies a
+//     // `command_execution` as a READ when its command is a pure content reader (cat, head, nl,
+//     // ...) or one of the two RANGED shapes codex actually reads with (`sed -n 'a,bp' FILE` and
+//     // `nl -ba FILE | sed -n 'a,bp'`), and leaves everything else as Bash. `rg` and `grep` are
+//     // searches, not reads, and are NOT on the list. The allowlist is conservative and fails
+//     // closed: `ls`, `find`, `stat`, compound commands, other pipes and redirections are all
+//     // still Bash and still cannot satisfy a source.
+//     //
+//     // 2026-09-03: the ranged shapes were added after every source-gated codex review that day
+//     // was rejected "never opened". Codex reads files in 260-line windows with `sed -n`, which
+//     // the reader list did not contain, and the previous version of THIS comment claimed
+//     // `sed -n` was on it. See `codex_ranged_reads_cover_source` for how windows add up.
+//     //
+//     // This closes Grok's "Codex can be sighted and cannot be source-gated", which mattered
+//     // because codex is the peer most likely to be reviewing code.
+//     "codex-exec-json",
+//     // Added 2026-09-02. The claude stream names the tool directly ("Read", "Grep", "Bash"), so
+//     // read against search against shell is a first-class distinction rather than something
+//     // inferred from a command line. Verified against a live capture: an allowed Read records
+//     // ToolKind::ReadFile with the path in args_json, and a DENIED one records success: false.
+//     "claude-stream-json",
+// ];
+fn parser_modes_that_classify_reads() -> &'static [&'static str] {
+    static MODES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    MODES.get_or_init(|| modes_that_classify_reads_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `parser_modes_that_classify_reads`: every parser mode of every row with `classifies_reads`.
+fn modes_that_classify_reads_from(
+    rows: &[mcp_bridge::seat_profile::SeatProfile],
+) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.classifies_reads)
+        .flat_map(|row| row.parser_modes.iter().copied())
+        .collect()
+}
 
 /// Did any COMPLETED, SUCCESSFUL READ of this source happen?
 ///
@@ -3190,14 +3319,14 @@ fn enforce_reviewer_sight(
     // This is also what makes the allowlist FAIL CLOSED. Previously a parser that was not on
     // the list could still pass by recording one call, so an unvetted new parser was trusted by
     // default, which is the denylist behaviour the allowlist was meant to replace.
-    if !PARSER_MODES_WITH_TOOL_RECORDS.contains(&parser_mode) {
+    if !parser_modes_with_tool_records().contains(&parser_mode) {
         let detail = format!(
             "{agent_display} ran under parser mode `{parser_mode}`, which is not on the \
              allowlist of parsers verified to record tool calls, so this turn cannot produce \
              the receipt require_sight demands. This is the instrument's blind spot and not \
              evidence about the agent. Re-dispatch on a verified parser ({}), or confirm \
-             `{parser_mode}` records tool calls and add it to PARSER_MODES_WITH_TOOL_RECORDS.",
-            PARSER_MODES_WITH_TOOL_RECORDS.join(", ")
+             `{parser_mode}` records tool calls, then set records_tool_calls on its SeatProfile row.",
+            parser_modes_with_tool_records().join(", ")
         );
         lifecycle.push(LifecycleEvent {
             state: "REJECTED".to_string(),
@@ -3206,14 +3335,15 @@ fn enforce_reviewer_sight(
         return Err(detail);
     }
 
-    if !required_sources.is_empty() && !PARSER_MODES_THAT_CLASSIFY_READS.contains(&parser_mode) {
+    if !required_sources.is_empty() && !parser_modes_that_classify_reads().contains(&parser_mode) {
         let detail = format!(
             "{agent_display} ran under parser mode `{parser_mode}`, which does not distinguish a \
              file READ from a search or a shell command, so `required_sources` cannot be \
              enforced on it and a pass would be theatre. Drop required_sources for this agent \
              and rely on the weaker any-tool-call check, or route the review to a peer whose \
-             parser classifies reads ({})."
-        , PARSER_MODES_THAT_CLASSIFY_READS.join(", "));
+             parser classifies reads ({}).",
+            parser_modes_that_classify_reads().join(", ")
+        );
         lifecycle.push(LifecycleEvent {
             state: "REJECTED".to_string(),
             detail: detail.clone(),
@@ -3365,7 +3495,19 @@ enum SightRepair {
 }
 
 /// Seats whose CLI resumes a session, which is what makes a second turn of ONE dispatch possible.
-const SIGHT_REPAIR_AGENTS: &[&str] = &["codex", "grok"];
+// Seven Primes T-202: derived from `SeatProfile.sight_repair` (was the literal ["codex", "grok"]).
+fn sight_repair_agents() -> &'static [&'static str] {
+    static AGENTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    AGENTS.get_or_init(|| sight_repair_agents_from(mcp_bridge::seat_profile::all_seats()))
+}
+
+/// The row-taking half of `sight_repair_agents`: the keys of the rows with `sight_repair`.
+fn sight_repair_agents_from(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    rows.iter()
+        .filter(|row| row.sight_repair)
+        .map(|row| row.key)
+        .collect()
+}
 
 /// A repair turn is not started with less than this left of the review budget. A repair that
 /// the client abandons mid-turn is paid for and lost, which is worse than the rejection.
@@ -3377,8 +3519,8 @@ const SIGHT_REPAIR_MIN_BUDGET: Duration = Duration::from_secs(120);
 /// (Codex, consult: a reviewer that read nothing is not one to coax).
 fn sight_failure_is_repairable(tool_calls: &[ToolCallRecord], parser_mode: &str, required_sources: &[String]) -> bool {
     !required_sources.is_empty()
-        && PARSER_MODES_WITH_TOOL_RECORDS.contains(&parser_mode)
-        && PARSER_MODES_THAT_CLASSIFY_READS.contains(&parser_mode)
+        && parser_modes_with_tool_records().contains(&parser_mode)
+        && parser_modes_that_classify_reads().contains(&parser_mode)
         && !tool_calls.iter().any(|c| matches!(c.kind, ToolKind::WriteFile | ToolKind::EditFile))
         && !tool_calls.iter().any(|c| c.tool == agent_adapter::codex::COLLAB_TOOL)
         && tool_calls.iter().any(|c| matches!(c.kind, ToolKind::ReadFile) && c.success == Some(true))
@@ -3485,7 +3627,7 @@ async fn try_sight_repair(
     let Some(session) = first.session_id.as_deref().filter(|s| !s.trim().is_empty()) else {
         return SightRepair::NotTried;
     };
-    if !SIGHT_REPAIR_AGENTS.contains(&agent)
+    if !sight_repair_agents().contains(&agent)
         || !sight_failure_is_repairable(&first.tool_calls, &first.parser_mode, &req.required_sources)
     {
         return SightRepair::NotTried;
@@ -4261,6 +4403,11 @@ pub(crate) async fn run_named_agent_with_session_and_model(
     req_overrides: Option<&AskAgentRequest>,
 ) -> anyhow::Result<ParsedAgentResult> {
     let _ = session_id; // deepseek arm intentionally ignores resume tokens — T-014.
+    // Seven Primes T-204: every dispatch arm starts here, and this is where a seat's credentials start being read
+    // (the deepseek key file, a CLI's own auth when its process starts). Test builds record the seat, so a gate
+    // test can prove a refused call never reached credential access.
+    #[cfg(test)]
+    seven_primes_gate_tests::note_dispatch_reached(agent);
     // A review dispatch must not be able to write. Only agy consumes this today: codex exec
     // is already read-only without --full-auto, and the others have no containment knob on
     // this path. See AGENTS_WITH_NO_WRITE_CONTAINMENT.
@@ -4342,6 +4489,41 @@ pub(crate) async fn run_named_agent_with_session_and_model(
             .await
         }
         "deepseek" => run_deepseek_agent(message, req_overrides).await,
+        // Seven Primes T-205: the new seats share one runner. Read-only by construction (the builder always emits
+        // the read-only argv); `read_only` only picks the timeout.
+        "kimi" => run_new_seat(
+            "kimi",
+            message,
+            cwd,
+            session_id,
+            model_override,
+            events_tx,
+            read_only,
+        )
+        .await
+        .map(|a| a.parsed),
+        "mistral" => run_new_seat(
+            "mistral",
+            message,
+            cwd,
+            session_id,
+            model_override,
+            events_tx,
+            read_only,
+        )
+        .await
+        .map(|a| a.parsed),
+        "qwen" => run_new_seat(
+            "qwen",
+            message,
+            cwd,
+            session_id,
+            model_override,
+            events_tx,
+            read_only,
+        )
+        .await
+        .map(|a| a.parsed),
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
@@ -4554,10 +4736,41 @@ pub(crate) async fn prewarm_daemon_workers() {
         return;
     }
 
+    let seats = prewarm_seats(mcp_bridge::seat_profile::all_seats());
     let cwds = daemon_prewarm_cwds();
     for cwd in cwds {
-        prewarm_worker("gemini", &cwd).await;
-        prewarm_worker("codex", &cwd).await;
+        for seat in &seats {
+            prewarm_worker(seat, &cwd).await;
+        }
+    }
+}
+
+/// Seven Primes T-204 (REQ-090): the seats prewarm warms, in roster order: rows whose `prewarm_policy` is Always
+/// (today gemini then codex, the order the hard-coded calls used), minus any seat the gate refuses on Prewarm
+/// (always `Unattended`: nobody is at a terminal at daemon start). A refused seat is skipped and logged, never
+/// warmed and never substituted.
+fn prewarm_seats(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    use mcp_bridge::seat_gate::{Origin, Surface, seat_gate};
+    rows.iter()
+        .filter(|row| row.prewarm_policy == mcp_bridge::seat_profile::PrewarmPolicy::Always)
+        .filter(|row| match seat_gate(row.key, Surface::Prewarm, Origin::Unattended, false) {
+            Ok(()) => true,
+            Err(refusal) => {
+                tracing::info!(seat = row.key, refusal = %refusal.message, "prewarm skipped: seat gate refused");
+                false
+            }
+        })
+        .map(|row| row.key)
+        .collect()
+}
+
+/// The gate's surface for an ask-family request, as its entry point named it.
+fn ask_surface(surface: shared_types::AskSurface) -> mcp_bridge::seat_gate::Surface {
+    use mcp_bridge::seat_gate::Surface;
+    match surface {
+        shared_types::AskSurface::AskAgent => Surface::AskAgent,
+        shared_types::AskSurface::Session => Surface::Session,
+        shared_types::AskSurface::Jury => Surface::Jury,
     }
 }
 
@@ -5507,10 +5720,29 @@ pub(crate) fn attempt_schedule_for(
     // It is ONE attempt: three retries of a review that timed out are three more reviews that
     // time out, and the first failure ends up buried under the last. 2026-09-13: a codex review
     // ran 3 x 180s, failed at 543s, and the caller was told only about the third.
+    attempt_schedule_for_row(
+        mcp_bridge::seat_profile::seat_profile(&normalize_agent_name(agent)),
+        gemini_backend_selected,
+        review,
+        strict,
+    )
+}
+
+/// The row-taking half of `attempt_schedule_for`: the schedule follows `row.attempt_policy`.
+fn attempt_schedule_for_row(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    gemini_backend_selected: Option<GeminiBackend>,
+    review: bool,
+    strict: bool,
+) -> Vec<(Duration, Option<&'static str>)> {
     if review {
         return vec![(Duration::ZERO, None)];
     }
-    if agent == "gemini" {
+    // Seven Primes T-202 (REQ-050): the policy is the seat's `SeatProfile.attempt_policy`; new seats are Single. A
+    // name with no row keeps the old default, three attempts.
+    use mcp_bridge::seat_profile::AttemptPolicy;
+    let policy = row.map_or(AttemptPolicy::Retry3, |row| row.attempt_policy);
+    if policy == AttemptPolicy::GeminiFaildown {
         if matches!(gemini_backend_selected, Some(GeminiBackend::Agy)) {
             vec![(Duration::ZERO, None)]
         } else if strict {
@@ -5525,7 +5757,7 @@ pub(crate) fn attempt_schedule_for(
                 })
                 .collect()
         }
-    } else if agent == "deepseek" || agent == "grok" {
+    } else if policy == AttemptPolicy::Single {
         vec![(Duration::ZERO, None)]
     } else {
         vec![
@@ -6112,6 +6344,630 @@ async fn run_claude_cli_process_with_session(
     Ok(parsed)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Seven Primes T-205: the shared dispatch runner for the new seats (kimi, mistral, qwen).
+// BACKEND_STRUCTURE sections 5 and 6 are the contract. The seatbelt and the repo audit are T-206.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What one new-seat dispatch returns: the parsed turn plus the model the stream says answered (REQ-043).
+pub(crate) struct NewSeatAnswer {
+    pub(crate) parsed: ParsedAgentResult,
+    pub(crate) served_model: Option<String>,
+}
+
+/// Seats whose quota breaker is open, with the instant it opened (REQ-050, QuotaPolicy::TerminalTripBreaker).
+fn new_seat_breakers() -> &'static Mutex<std::collections::HashMap<String, Instant>> {
+    static OPEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    OPEN.get_or_init(Mutex::default)
+}
+
+/// How long a new seat's quota breaker stays open (`TRIUMVIRATE_SEAT_QUOTA_COOLDOWN_SECS`, default 1800).
+fn new_seat_quota_cooldown() -> Duration {
+    std::env::var("TRIUMVIRATE_SEAT_QUOTA_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(1800))
+}
+
+/// Seconds until the seat's quota breaker closes, or `None` when it is closed (an elapsed one is cleared here).
+fn new_seat_breaker_remaining(seat: &str) -> Option<u64> {
+    let mut open = new_seat_breakers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let opened = *open.get(seat)?;
+    let cooldown = new_seat_quota_cooldown();
+    let elapsed = opened.elapsed();
+    if elapsed >= cooldown {
+        open.remove(seat);
+        return None;
+    }
+    Some((cooldown - elapsed).as_secs().max(1))
+}
+
+/// Open the seat's quota breaker: one quota failure is terminal for a new seat (no retry loop).
+fn trip_new_seat_breaker(seat: &str) {
+    new_seat_breakers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(seat.to_string(), Instant::now());
+    mcp_bridge::posthog::record_breaker_event(
+        "tripped_quota",
+        seat,
+        "seat quota exhausted: one attempt, breaker open",
+        None,
+    );
+}
+
+/// The quota or suspension class of a failed new-seat run, read from the failure code and the CLI's stderr
+/// (BACKEND_STRUCTURE section 6 "quota signal" row): kimi reports the status in `last_retry_status=<n>`, mistral in
+/// the export.json error the failure code carries, qwen in its error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewSeatFailureClass {
+    Suspended,
+    Quota,
+    Other,
+}
+
+fn classify_new_seat_failure(failure: &str, stderr: &str) -> NewSeatFailureClass {
+    let text = format!("{failure}\n{stderr}");
+    let has = |code: &str| {
+        regex_lite::Regex::new(&format!(r"(^|[^0-9]){code}([^0-9]|$)"))
+            .is_ok_and(|re| re.is_match(&text))
+    };
+    if has("403") {
+        NewSeatFailureClass::Suspended
+    } else if has("429") {
+        NewSeatFailureClass::Quota
+    } else {
+        NewSeatFailureClass::Other
+    }
+}
+
+/// True when `name` matches an `env_remove` entry: an exact name, or a `PREFIX*` pattern (the containment rule).
+fn env_name_matches(name: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pattern,
+    }
+}
+
+/// The Qwen plan key from `homes/qwen/credentials.env` (0600). One `NAME=value` line; a trailing newline is optional
+/// (A-9). The name must be the plan's env var. The value is never logged or put in an error.
+fn read_qwen_plan_key(seat_home: &Path) -> Result<(String, String), String> {
+    let (env_key, _) = mcp_bridge::qwen::plan_auth(None)?;
+    let path = seat_home.join("credentials.env");
+    mcp_bridge::containment::check_credentials_file(&path)?;
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("credentials_unreadable: {}: {e}", path.display()))?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(format!(
+                "credentials_malformed: {}: expected NAME=value",
+                path.display()
+            ));
+        };
+        let name = name.trim();
+        if name != env_key {
+            return Err(format!(
+                "credentials_wrong_var: {}: holds {name}, the plan needs {env_key}",
+                path.display()
+            ));
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        if value.is_empty() {
+            return Err(format!(
+                "credentials_empty: {}: {env_key} has no value",
+                path.display()
+            ));
+        }
+        return Ok((env_key.to_string(), value.to_string()));
+    }
+    Err(format!(
+        "credentials_empty: {}: no {env_key} line",
+        path.display()
+    ))
+}
+
+/// A fresh per-call directory under the system temp dir (Mistral writes export.json here). Removed after `finish`.
+fn new_seat_output_dir(seat: &str) -> Result<PathBuf, String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // pid + counter alone collided with a directory a previous process (same recycled pid) left behind: "File exists"
+    // failed the call. Add the clock, and never reuse an existing directory: on AlreadyExists, take the next name.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut last_err = String::new();
+    for _ in 0..16 {
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "triumvirate-seat-{seat}-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = format!("{}: {e}", dir.display());
+            }
+            Err(e) => return Err(format!("seat_output_dir: {}: {e}", dir.display())),
+        }
+    }
+    Err(format!(
+        "seat_output_dir: no free name after 16 attempts ({last_err})"
+    ))
+}
+
+/// The per-seat parser behind one runner.
+enum NewSeatParser {
+    Kimi(agent_adapter::kimi::KimiStreamParser),
+    Mistral(agent_adapter::mistral::MistralStreamParser),
+    Qwen(Box<agent_adapter::qwen::QwenStreamParser>),
+}
+
+impl NewSeatParser {
+    fn for_seat(seat: &str) -> Option<Self> {
+        match seat {
+            "kimi" => Some(Self::Kimi(agent_adapter::kimi::KimiStreamParser::new())),
+            "mistral" => Some(Self::Mistral(
+                agent_adapter::mistral::MistralStreamParser::new(),
+            )),
+            "qwen" => Some(Self::Qwen(Box::new(
+                agent_adapter::qwen::QwenStreamParser::new(),
+            ))),
+            _ => None,
+        }
+    }
+
+    fn parse_line(&mut self, line: &str) -> Option<WorkingStateEvent> {
+        match self {
+            Self::Kimi(p) => p.parse_line(line),
+            Self::Mistral(p) => p.parse_line(line),
+            Self::Qwen(p) => p.parse_line(line),
+        }
+    }
+
+    fn finish(
+        self,
+        exit_code: Option<i32>,
+        output_dir: &Path,
+    ) -> Result<agent_adapter::SeatParsed, String> {
+        match self {
+            Self::Kimi(p) => p.finish(exit_code),
+            Self::Mistral(mut p) => {
+                let export = fs::read_to_string(output_dir.join("export.json")).ok();
+                // T-302: read results live only in the session journal, which is removed with the output dir.
+                p.ingest_journal(&read_mistral_journal(output_dir));
+                p.finish(exit_code, export.as_deref())
+            }
+            Self::Qwen(p) => p.finish(exit_code),
+        }
+    }
+}
+
+/// Every `<output-dir>/session/journal/*.jsonl` file, in name order, concatenated (empty when Vibe wrote none).
+fn read_mistral_journal(output_dir: &Path) -> String {
+    let dir = output_dir.join("session").join("journal");
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|f| fs::read_to_string(f).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_new_seat_invocation(
+    seat: &str,
+    req: &mcp_bridge::containment::SeatRequest<'_>,
+) -> Result<mcp_bridge::containment::SeatInvocation, String> {
+    match seat {
+        "kimi" => mcp_bridge::kimi::build_kimi_invocation(req),
+        "mistral" => mcp_bridge::mistral::build_mistral_invocation(req),
+        "qwen" => mcp_bridge::qwen::build_qwen_invocation(req),
+        other => Err(format!("not_a_new_seat: {other}")),
+    }
+}
+
+/// One read-only dispatch to a new seat (kimi, mistral, qwen). The builder always emits the read-only argv; `read_only`
+/// only picks the timeout, as the claude arm does. Exactly one attempt: a quota failure is terminal and opens the seat's
+/// breaker, a 403 writes suspended.json.
+/// How often a call queued on a seat lock reports progress (TRIUMVIRATE_SEAT_QUEUE_HEARTBEAT_SECS, default 30 s). It
+/// must stay well under every seat's stall window (780 s) so queued calls are never stall-killed.
+fn seat_queue_heartbeat() -> Duration {
+    std::env::var("TRIUMVIRATE_SEAT_QUEUE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30))
+}
+
+pub(crate) async fn run_new_seat(
+    seat: &str,
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    model: Option<&str>,
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    read_only: bool,
+) -> anyhow::Result<NewSeatAnswer> {
+    let profile = mcp_bridge::seat_profile::seat_profile(seat)
+        .ok_or_else(|| anyhow::anyhow!("not_a_new_seat: {seat}"))?;
+    let Some(parser) = NewSeatParser::for_seat(seat) else {
+        anyhow::bail!("not_a_new_seat: {seat}");
+    };
+    if let Some(secs) = new_seat_breaker_remaining(seat) {
+        anyhow::bail!(
+            "seat_quota_exhausted:{seat}: quota breaker open, {secs}s until it closes; no process spawned"
+        );
+    }
+    let th = mcp_bridge::seat_state::triumvirate_home().map_err(anyhow::Error::msg)?;
+    let seat_home = mcp_bridge::containment::seat_home(&th, seat).map_err(anyhow::Error::msg)?;
+    mcp_bridge::containment::write_seat_files(&seat_home, profile).map_err(anyhow::Error::msg)?;
+    // Resolved BEFORE the child's HOME moves to the seat home.
+    let bin = mcp_bridge::new_seat_bin(seat).map_err(anyhow::Error::msg)?;
+    // A test build never falls through to a real CLI: the binary must be named explicitly (a mock).
+    #[cfg(test)]
+    if std::env::var(mcp_bridge::new_seat_bin_env(seat)).is_err() {
+        anyhow::bail!(
+            "test build: {} must point at a mock before a {seat} dispatch",
+            mcp_bridge::new_seat_bin_env(seat)
+        );
+    }
+    let mut env_add: Vec<(String, String)> = Vec::new();
+    if seat == "qwen" {
+        env_add.push(read_qwen_plan_key(&seat_home).map_err(anyhow::Error::msg)?);
+    }
+
+    // T-207 (REQ-053): one process per seat machine-wide. The guard is bound here so it lives until this function
+    // returns on every path: after `run_new_seat_in` (spawn, wait, parse, seatbelt run and repo audit), the output-dir
+    // removal and the Qwen served-model check. A stall kill drops this future, which drops the guard and closes the
+    // fd, so the seat is released on the failure path too. The flock blocks, so it runs off the async runtime.
+    let _seat_lock = if profile.concurrency_limit == mcp_bridge::seat_profile::ConcurrencyLimit::One
+    {
+        let (lock_home, lock_seat) = (th.clone(), seat.to_string());
+        let waited = Instant::now();
+        let mut acquire = tokio::task::spawn_blocking(move || {
+            daemon_core::seat_lock::acquire_seat_lock(&lock_home, &lock_seat)
+        });
+        // A call queued behind another call on the same seat is not stalled: the ask-path stall clock reads silence
+        // on events_tx as a hang, so a long run ahead of us would get this call killed before it ever spawned. Emit a
+        // "queued" heartbeat while waiting. The connector timeout still bounds the wait. If this future is dropped,
+        // the blocking task finishes, and the guard it returns is dropped with the discarded handle.
+        let mut heartbeat = tokio::time::interval(seat_queue_heartbeat());
+        heartbeat.tick().await;
+        let joined = loop {
+            tokio::select! {
+                r = &mut acquire => break r,
+                _ = heartbeat.tick() => emit_working_event(
+                    events_tx.as_ref(),
+                    WorkingStateEvent {
+                        agent: seat.to_string(),
+                        state: WorkingState::Unknown,
+                        detail: format!("queued: waiting for the {seat} seat lock"),
+                        tool_name: None,
+                        tool_args_json: None,
+                        token_usage: None,
+                        ts_ms: Some(core_unix_time_ms()),
+                    },
+                ),
+            }
+        };
+        let guard = joined
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
+            .map_err(|e| anyhow::anyhow!("seat_lock_unavailable:{seat}: {e}"))?;
+        tracing::debug!(
+            seat,
+            waited_ms = waited.elapsed().as_millis() as u64,
+            "seat lock acquired"
+        );
+        Some(guard)
+    } else {
+        None
+    };
+
+    let output_dir = new_seat_output_dir(seat).map_err(anyhow::Error::msg)?;
+    let result = run_new_seat_in(
+        seat,
+        profile,
+        parser,
+        &bin,
+        &seat_home,
+        &output_dir,
+        env_add,
+        message,
+        cwd,
+        session_id,
+        model,
+        events_tx,
+        read_only,
+    )
+    .await;
+    let _ = fs::remove_dir_all(&output_dir);
+    let answer = result?;
+
+    // Qwen REQ-043: the model that answered must be a Qwen model.
+    if seat == "qwen"
+        && let Some(served) = answer.served_model.as_deref()
+    {
+        mcp_bridge::qwen::check_served_model(served).map_err(anyhow::Error::msg)?;
+    }
+    Ok(answer)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_new_seat_in(
+    seat: &str,
+    profile: &mcp_bridge::seat_profile::SeatProfile,
+    mut parser: NewSeatParser,
+    bin: &str,
+    seat_home: &Path,
+    output_dir: &Path,
+    mut env_add: Vec<(String, String)>,
+    message: &str,
+    cwd: &str,
+    session_id: Option<&str>,
+    model: Option<&str>,
+    events_tx: Option<mpsc::Sender<WorkingStateEvent>>,
+    read_only: bool,
+) -> anyhow::Result<NewSeatAnswer> {
+    let timeout_duration = if read_only {
+        review_timeout()
+    } else {
+        connector_timeout()
+    };
+    let cwd_path = Path::new(cwd);
+    let req = mcp_bridge::containment::SeatRequest {
+        prompt: message,
+        cwd: cwd_path,
+        seat_home,
+        output_dir,
+        model,
+        resume_session_id: session_id,
+        extra_args: &[],
+        max_turns: 12,
+        time_limit: timeout_duration,
+    };
+    // The builder's errors (prompt over 64 KiB, forbidden extra args) surface verbatim.
+    let invocation = build_new_seat_invocation(seat, &req).map_err(anyhow::Error::msg)?;
+    let base: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| !invocation.env_remove.iter().any(|p| env_name_matches(k, p)))
+        .collect();
+    let mut add = invocation.env_add.clone();
+    add.append(&mut env_add);
+    let child_env = mcp_bridge::containment::child_env(&base, profile, seat_home, &add)
+        .map_err(anyhow::Error::msg)?;
+
+    // REQ-034 marker: every new-seat dispatch is read-only, whatever the caller's flag said.
+    tracing::info!("read_only_seat: {seat} (answers only, never edits)");
+
+    // T-206 (REQ-031): the seatbelt wraps the child. It is the PRIMARY write barrier; the repo audit below is the
+    // backstop. Resolved before the first snapshot, so a missing seatbelt spawns nothing.
+    let (program, program_args) = seatbelt_wrap(seat, bin, &invocation.args, seat_home, output_dir)
+        .map_err(anyhow::Error::msg)?;
+
+    // T-206 (REQ-035): snapshot the cwd before the child exists. An audit that cannot run fails the call unspawned.
+    let audit_cwd = invocation.cwd.clone();
+    let before = snapshot_cwd_off_runtime(audit_cwd.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("read_only_audit_unavailable:{seat}: {e}"))?;
+
+    let outcome: anyhow::Result<NewSeatAnswer> = async {
+        emit_working_event(
+            events_tx.as_ref(),
+            WorkingStateEvent {
+                agent: seat.to_string(),
+                state: WorkingState::TurnStarted,
+                detail: format!("{seat} process started"),
+                tool_name: None,
+                tool_args_json: None,
+                token_usage: None,
+                ts_ms: Some(core_unix_time_ms()),
+            },
+        );
+
+        let mut command = Command::new(&program);
+        command
+            .args(&program_args)
+            .current_dir(&invocation.cwd)
+            .env_clear()
+            .envs(child_env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        configure_process_group(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn_failed:{seat}: {bin}: {e}"))?;
+        note_attempt_child(&child);
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("{seat} stdout missing"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("{seat} stderr missing"))?;
+        let stderr_task = tokio::spawn(async move {
+            let mut tail: VecDeque<String> = VecDeque::new();
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if tail.len() == 40 {
+                    tail.pop_front();
+                }
+                tail.push_back(trimmed.to_string());
+            }
+            tail.into_iter().collect::<Vec<_>>().join("\n")
+        });
+
+        let mut reader = BufReader::new(stdout).lines();
+        let read = async {
+            while let Some(line) = reader.next_line().await? {
+                if let Some(event) = parser.parse_line(&line) {
+                    emit_working_event(events_tx.as_ref(), event);
+                }
+            }
+            anyhow::Ok(())
+        };
+        let status = match timeout(timeout_duration, async {
+            read.await?;
+            Ok::<_, anyhow::Error>(child.wait().await?)
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                kill_process_group(&mut child);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                anyhow::bail!(
+                    "{seat} connector timed out after {}s",
+                    timeout_duration.as_secs()
+                );
+            }
+        };
+        let stderr_text = stderr_task.await.unwrap_or_default();
+
+        let seat_parsed = parser
+            .finish(status.code(), output_dir)
+            .map_err(anyhow::Error::msg)?;
+        let served_model = seat_parsed.served_model.clone();
+        let mut parsed = seat_parsed.result;
+        match seat_parsed.outcome {
+            agent_adapter::SeatOutcome::Success => {}
+            agent_adapter::SeatOutcome::Partial(reason) => {
+                parsed.response_text = format!("{}\n\n[partial: {reason}]", parsed.response_text);
+            }
+            agent_adapter::SeatOutcome::Failure(code) => {
+                let tail = stderr_text
+                    .lines()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let said = if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {seat} said: {tail}")
+                };
+                match classify_new_seat_failure(&code, &stderr_text) {
+                    NewSeatFailureClass::Suspended => {
+                        let reason = format!("403 from provider: {code}");
+                        if let Err(e) = mcp_bridge::seat_state::write_suspended(
+                            &mcp_bridge::seat_state::triumvirate_home()
+                                .map_err(anyhow::Error::msg)?,
+                            seat,
+                            &reason,
+                        ) {
+                            tracing::error!(seat, error = %e, "could not write suspended.json");
+                        }
+                        anyhow::bail!("seat_suspended: {seat}: {reason}{said}");
+                    }
+                    NewSeatFailureClass::Quota => {
+                        trip_new_seat_breaker(seat);
+                        anyhow::bail!("seat_quota_exhausted:{seat}: {code}{said}");
+                    }
+                    NewSeatFailureClass::Other => anyhow::bail!("{code}{said}"),
+                }
+            }
+        }
+        Ok(NewSeatAnswer {
+            parsed,
+            served_model,
+        })
+    }
+    .await;
+
+    // After the child exits, whatever its outcome: any change in the cwd replaces the seat's answer (or its error).
+    // Nothing is reverted; the violation names the paths so the operator can look.
+    let after = snapshot_cwd_off_runtime(audit_cwd)
+        .await
+        .map_err(|e| anyhow::anyhow!("read_only_audit_unavailable:{seat}: {e}"))?;
+    let changed = mcp_bridge::containment::audit_repo(&before, &after)
+        .map_err(|e| anyhow::anyhow!("read_only_audit_unavailable:{seat}: {e}"))?;
+    if !changed.is_empty() {
+        anyhow::bail!("read_only_violation:{seat}: {}", changed.join(", "));
+    }
+    outcome
+}
+
+/// `containment::snapshot_cwd` on a blocking thread: it runs git or walks up to `WALK_CAP` files.
+async fn snapshot_cwd_off_runtime(
+    cwd: PathBuf,
+) -> Result<mcp_bridge::containment::RepoSnapshot, String> {
+    tokio::task::spawn_blocking(move || mcp_bridge::containment::snapshot_cwd(&cwd))
+        .await
+        .map_err(|e| format!("snapshot task failed: {e}"))?
+}
+
+/// The program and argv that run a new seat (T-206, REQ-031). On macOS: `/usr/bin/sandbox-exec -p <profile> <bin>
+/// <args>...`, the BACKEND_STRUCTURE section 5 profile rendered for this call's seat home, output dir and temp dir. A
+/// missing sandbox-exec is `seatbelt_unavailable:<seat>`; the seat never runs unwrapped on macOS.
+#[cfg(target_os = "macos")]
+fn seatbelt_wrap(
+    seat: &str,
+    bin: &str,
+    args: &[String],
+    seat_home: &Path,
+    output_dir: &Path,
+) -> Result<(String, Vec<String>), String> {
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+    if !Path::new(SANDBOX_EXEC).is_file() {
+        return Err(format!(
+            "seatbelt_unavailable:{seat}: {SANDBOX_EXEC} not found; refusing to run the seat unwrapped"
+        ));
+    }
+    let profile = mcp_bridge::containment::render_seatbelt_profile(
+        seat_home,
+        output_dir,
+        &std::env::temp_dir(),
+    )?;
+    let mut wrapped = vec!["-p".to_string(), profile, bin.to_string()];
+    wrapped.extend(args.iter().cloned());
+    Ok((SANDBOX_EXEC.to_string(), wrapped))
+}
+
+/// Off macOS there is no seatbelt (the Linux CI job): the seat runs unwrapped and the repo audit is the only check.
+/// Production seats run on macOS, where the wrap above is mandatory.
+#[cfg(not(target_os = "macos"))]
+fn seatbelt_wrap(
+    _seat: &str,
+    bin: &str,
+    args: &[String],
+    _seat_home: &Path,
+    _output_dir: &Path,
+) -> Result<(String, Vec<String>), String> {
+    Ok((bin.to_string(), args.to_vec()))
+}
+
 async fn run_agent_process_with_session(
     agent: &str,
     bin: &str,
@@ -6153,13 +7009,22 @@ async fn run_agent_process_with_session(
                 // no-touch check cannot see a write made inside a shell command, so this
                 // is the only thing stopping a reviewer from editing what it reviews.
                 crate::agy::run_agy_cli_process_with_session(
-                    &agy_bin, &agy_args, message, cwd, session_id, events_tx, read_only,
+                    &agy_bin,
+                    &agy_args,
+                    message,
+                    cwd,
+                    session_id,
+                    events_tx,
+                    read_only,
                     crate::agy::BreakerRole::Traffic,
                 )
                 .await
             }
             GeminiBackend::GeminiCli => {
-                tracing::info!(backend = "gemini-cli", "gemini dispatch served by gemini-cli backend");
+                tracing::info!(
+                    backend = "gemini-cli",
+                    "gemini dispatch served by gemini-cli backend"
+                );
                 run_gemini_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
                     .await
             }
@@ -6189,12 +7054,25 @@ async fn run_agent_process_with_session(
             )
             .await
         }
+        // Seven Primes T-205: a new seat resolves its own binary and argv (the builder's), so `bin` and `args` are
+        // not used.
+        "kimi" => run_new_seat("kimi", message, cwd, session_id, None, events_tx, read_only)
+            .await
+            .map(|a| a.parsed),
+        "mistral" => run_new_seat(
+            "mistral", message, cwd, session_id, None, events_tx, read_only,
+        )
+        .await
+        .map(|a| a.parsed),
+        "qwen" => run_new_seat("qwen", message, cwd, session_id, None, events_tx, read_only)
+            .await
+            .map(|a| a.parsed),
         _ => anyhow::bail!("unsupported agent: {agent}"),
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// T-012 (REQ-DS-014, REQ-DS-023) tests — dispatch arm + CoT bifurcation.
+// T-012 (REQ-DS-014, REQ-DS-023) tests: dispatch arm + CoT bifurcation.
 //
 // These tests use the testable inner `run_deepseek_with_runtime` so the
 // process-static OnceLock cache stays untouched. The mock server is a
@@ -6288,9 +7166,10 @@ mod deepseek_dispatch_tests {
             message: "what is 2+2".to_string(),
             ..Default::default()
         };
-        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
-            .await
-            .expect("dispatch ok");
+        let parsed =
+            run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+                .await
+                .expect("dispatch ok");
 
         assert_eq!(parsed.response_text, "clean final answer");
         assert!(
@@ -6334,17 +7213,23 @@ mod deepseek_dispatch_tests {
             deepseek_include_reasoning: Some(true),
             ..Default::default()
         };
-        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
-            .await
-            .expect("dispatch ok");
+        let parsed =
+            run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+                .await
+                .expect("dispatch ok");
 
-        assert!(parsed.response_text.contains("the model is thinking carefully"),
-            "include_reasoning=true must surface reasoning; got: {}", parsed.response_text);
+        assert!(
+            parsed
+                .response_text
+                .contains("the model is thinking carefully"),
+            "include_reasoning=true must surface reasoning; got: {}",
+            parsed.response_text
+        );
         assert!(parsed.response_text.contains("clean final answer"));
         assert!(parsed.response_text.contains("<reasoning>"));
     }
 
-    /// cfg_with_overrides — every Effort variant collapses correctly.
+    /// cfg_with_overrides: every Effort variant collapses correctly.
     #[test]
     fn cfg_with_overrides_collapses_effort_levels() {
         use shared_types::{AskAgentRequest, DeepSeekEffort, DeepSeekThinking};
@@ -6427,7 +7312,7 @@ mod deepseek_dispatch_tests {
             "empty/whitespace deepseek_model must not blank the cfg default"
         );
 
-        // Arbitrary string passes through — the API will reject unknown
+        // Arbitrary string passes through; the API will reject unknown
         // models with 400 via the runner's HardProvider classification.
         let req = AskAgentRequest {
             agent: "deepseek".to_string(),
@@ -6472,17 +7357,19 @@ mod deepseek_dispatch_tests {
 
         let req = shared_types::AskAgentRequest {
             agent: "deepseek".to_string(),
-            message: "<triumvirate_tool name=\"ledger_session\">test</triumvirate_tool>".to_string(),
+            message: "<triumvirate_tool name=\"ledger_session\">test</triumvirate_tool>"
+                .to_string(),
             ..Default::default()
         };
         // The mock server returns canned content regardless of what we send,
         // so the actual content of the request body doesn't matter to the
-        // mock — the test is asserting that ADDING a system message to the
+        // mock: the test is asserting that ADDING a system message to the
         // messages array (and increasing prompt_chars_estimate accordingly)
         // doesn't break the dispatch flow.
-        let parsed = run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
-            .await
-            .expect("dispatch must succeed with system message prepended");
+        let parsed =
+            run_deepseek_with_runtime(&cfg, &client, &resilience, &req.message, Some(&req))
+                .await
+                .expect("dispatch must succeed with system message prepended");
         assert!(!parsed.response_text.is_empty());
 
         // The per-request log captures the FINAL state. We can't directly
@@ -6493,7 +7380,8 @@ mod deepseek_dispatch_tests {
             messages: vec![
                 ds::RequestMessage {
                     role: "system".to_string(),
-                    content: "placeholder — the real runner injects the real system prompt".to_string(),
+                    content: "placeholder: the real runner injects the real system prompt"
+                        .to_string(),
                 },
                 ds::RequestMessage {
                     role: "user".to_string(),
@@ -6516,7 +7404,6 @@ mod deepseek_dispatch_tests {
     // T-013 (REQ-DS-026): attempt_schedule + persist-before-Err.
     // ─────────────────────────────────────────────────────────────────────
 
-
     // ---- Slice D: grok dispatch. Claude proves two dispatch layers can drift, so BOTH are
     // asserted here rather than trusting that adding one arm covered it. ----
 
@@ -6534,9 +7421,11 @@ mod deepseek_dispatch_tests {
     fn both_dispatch_layers_have_a_grok_arm() {
         let src = include_str!("agent_exec.rs");
         let arms = src.matches("\"grok\" => {").count();
-        assert!(arms >= 2,
+        assert!(
+            arms >= 2,
             "expected a grok arm in BOTH run_named_agent_with_session_and_model and \
-             run_agent_process_with_session, found {arms}");
+             run_agent_process_with_session, found {arms}"
+        );
     }
 
 
@@ -6546,40 +7435,167 @@ mod deepseek_dispatch_tests {
     /// antigravity/codex/deepseek/claude. An agent read that, concluded grok was unsupported, and
     /// routed to DeepSeek instead. A stale list in a description excludes an agent exactly as
     /// effectively as the allowlist does.
+    /// Every logical line of `src` that states a hand-written list of agents, as `"<line no>: <text>"`.
+    ///
+    /// Seven Primes REQ-004: a physical-line scan was evaded by wrapping the list across lines with `\`
+    /// continuations, two names per line, each line under the threshold. So lines are joined while a string literal
+    /// is still open (an odd count of unescaped quotes), and the check runs on the joined text. Names come from the
+    /// roster, so a new seat is covered the moment it gets a row. Comments are skipped: they explain, and match arms
+    /// and fixtures legitimately name agents one at a time. What must not exist is PROSE listing several.
+    fn hand_written_agent_lists(src: &str) -> Vec<String> {
+        let mut names: Vec<String> = mcp_bridge::supported_agent_names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        names.push("antigravity".to_string());
+        // Whether a double-quoted string literal is still open at the end of `t`. Inside a string a backslash escapes
+        // the next character; outside one, the char literals `'"'` and `'\"'` are not quotes.
+        let string_open = |t: &str| {
+            let c: Vec<char> = t.chars().collect();
+            let (mut open, mut i) = (false, 0);
+            while i < c.len() {
+                match c[i] {
+                    '\\' if open => i += 1,
+                    '"' => open = !open,
+                    '\'' if !open && c.get(i + 1) == Some(&'"') && c.get(i + 2) == Some(&'\'') => {
+                        i += 2
+                    }
+                    '\'' if !open
+                        && c.get(i + 1) == Some(&'\\')
+                        && c.get(i + 2) == Some(&'"')
+                        && c.get(i + 3) == Some(&'\'') =>
+                    {
+                        i += 3
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            open
+        };
+        let mut found = Vec::new();
+        let mut logical = String::new();
+        let mut first = 0;
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim();
+            if logical.is_empty() {
+                if l.starts_with("//") {
+                    continue;
+                }
+                first = i + 1;
+            }
+            logical.push_str(l.trim_end_matches('\\'));
+            logical.push(' ');
+            if string_open(&logical) {
+                continue;
+            }
+            // Collapse every whitespace run (repeated spaces, tabs, the seam of a joined line) to one space, so a
+            // trigger phrase cannot evade the match by spacing.
+            let text = std::mem::take(&mut logical)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let prose = text.contains("supports only")
+                || text.contains("Supported:")
+                || text.contains("must be one of")
+                || text.contains("default seats:");
+            if !prose || !text.contains('"') {
+                continue;
+            }
+            let lower = text.to_lowercase();
+            let named = names.iter().filter(|n| lower.contains(n.as_str())).count();
+            if named >= 2 {
+                found.push(format!("{first}: {}", text.trim()));
+            }
+        }
+        found
+    }
+
+    /// The scan that would have caught the three stale lists a morning session tripped over.
+    ///
+    /// grok was dispatchable, but the ask_agent MCP tool DESCRIPTION still named only
+    /// antigravity/codex/deepseek/claude. An agent read that, concluded grok was unsupported, and
+    /// routed to DeepSeek instead. A stale list in a description excludes an agent exactly as
+    /// effectively as the allowlist does.
+    /// RED IF: a source states a hand-written agent list (descriptions render from data, REQ-004).
     #[test]
     fn no_hand_written_agent_lists_in_daemon_sources() {
         for (label, src) in [
             ("agent_exec.rs", include_str!("agent_exec.rs")),
             ("main.rs", include_str!("main.rs")),
+            ("aliases.rs", include_str!("../../mcp-tools/src/aliases.rs")),
+            ("jury.rs", include_str!("../../mcp-tools/src/jury.rs")),
         ] {
-            for (i, line) in src.lines().enumerate() {
-                let l = line.trim();
-                // Comments explain; match arms and test fixtures legitimately name agents one at a
-                // time. What must not exist is PROSE listing several, which is always a copy that
-                // will drift.
-                if l.starts_with("//") || !l.contains('"') {
-                    continue;
-                }
-                let prose = l.contains("supports only")
-                    || l.contains("Supported:")
-                    || l.contains("must be one of");
-                if !prose {
-                    continue;
-                }
-                let named = ["codex", "deepseek", "claude", "grok", "antigravity"]
-                    .iter()
-                    .filter(|a| l.contains(*a))
-                    .count();
-                assert!(
-                    named < 2,
-                    "{label} line {} states a hand-written agent list; build it from \
-                     mcp_bridge::supported_agent_names() so it cannot go stale: {l}",
-                    i + 1
-                );
-            }
+            let found = hand_written_agent_lists(src);
+            assert!(
+                found.is_empty(),
+                "{label} states a hand-written agent list; build it from mcp_bridge::supported_agent_names() \
+                 so it cannot go stale: {found:?}"
+            );
         }
     }
 
+    /// RED IF: the scan is per physical line again (a wrapped list passes), or fails on everything (prose fails).
+    #[test]
+    fn hand_written_list_scan_catches_wrapped_lists_and_passes_prose() {
+        // Each physical line names ONE agent; only the joined literal is a list. The old scan passed this.
+        let wrapped = concat!(
+            "    description = \"Supported: 'codex', \\\n",
+            "                   'kimi'.\"\n",
+        );
+        assert_eq!(
+            hand_written_agent_lists(wrapped).len(),
+            1,
+            "wrapped list must fail: {wrapped}"
+        );
+        // Ordinary prose that happens to name several agents is not a list.
+        let prose = "    let note = \"codex and grok disagreed about the lock, and qwen agreed with codex\";\n";
+        assert_eq!(hand_written_agent_lists(prose), Vec::<String>::new());
+        // A comment may list agents freely. (Built from two statements so no single source line here is a list.)
+        let trigger = "    // Supported: ";
+        let comment = format!("{trigger}{}", "\"codex\", \"grok\"\n");
+        assert_eq!(hand_written_agent_lists(&comment), Vec::<String>::new());
+    }
+
+    /// Spacing must not hide a trigger phrase. The phrase pieces are held apart from the agent names so no single
+    /// source line of this test is itself a list.
+    /// RED IF: the scan matches trigger phrases without collapsing whitespace runs first (repeated spaces, tabs, or a
+    /// phrase split across a `\` continuation evade it).
+    #[test]
+    fn hand_written_list_scan_collapses_whitespace_runs() {
+        let names = "'codex', 'grok'";
+        let spaces = "must  be   one of";
+        let tabs = "must\tbe\t\tone of";
+        let fixtures = [
+            format!("    d = \"agent {spaces} {names}\";\n"),
+            format!("    d = \"agent {tabs} {names}\";\n"),
+            format!("    d = \"agent must \\\n        be one of {names}\";\n"),
+            format!("    d = \"agent must\t\\\n\tbe\tone of {names}\";\n"),
+        ];
+        for fixture in &fixtures {
+            assert_eq!(
+                hand_written_agent_lists(fixture).len(),
+                1,
+                "spaced list must fail: {fixture:?}"
+            );
+        }
+    }
+
+    /// A `'"'` char literal is not the start of a string: counting it as one keeps a phantom literal open, joins every
+    /// following line into it, and the list after it is never checked.
+    /// RED IF: the quote tracking counts the double quote inside a char literal.
+    #[test]
+    fn hand_written_list_scan_ignores_quote_char_literals() {
+        let names = "'codex', 'grok'";
+        for char_lit in ["'\"'", "'\\\"'"] {
+            let fixture = format!("    let q = {char_lit};\n    let d = \"Supported: {names}\";\n");
+            assert_eq!(
+                hand_written_agent_lists(&fixture).len(),
+                1,
+                "list after a quote char literal must fail: {fixture:?}"
+            );
+        }
+    }
 
     /// The auth classifier must not fire on prose that merely mentions authentication.
     ///
@@ -6633,12 +7649,21 @@ mod deepseek_dispatch_tests {
     fn attempt_schedule_is_single_for_metered_and_context_heavy_agents() {
         use super::attempt_schedule_for;
         // Single attempt: the runner owns its retries, or a retry is genuinely expensive.
-        assert_eq!(attempt_schedule_for("deepseek", None, false, false).len(), 1,
-            "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)");
-        assert_eq!(attempt_schedule_for("grok", None, false, false).len(), 1,
-            "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)");
-        assert_eq!(attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false, false).len(), 1,
-            "agy runs its own internal retry (REQ-013)");
+        assert_eq!(
+            attempt_schedule_for("deepseek", None, false, false).len(),
+            1,
+            "deepseek MUST be single-attempt: an outer retry double-bills on 429 (REQ-DS-008)"
+        );
+        assert_eq!(
+            attempt_schedule_for("grok", None, false, false).len(),
+            1,
+            "grok MUST be single-attempt: every turn re-ships the full system prompt (REQ-GROK-013)"
+        );
+        assert_eq!(
+            attempt_schedule_for("gemini", Some(super::GeminiBackend::Agy), false, false).len(),
+            1,
+            "agy runs its own internal retry (REQ-013)"
+        );
 
         // Everything else keeps the generic ladder. This is the regression guard: adding a
         // single-attempt agent must not silently convert the default.
@@ -6646,20 +7671,35 @@ mod deepseek_dispatch_tests {
         // A sight-gated review is one attempt for every agent: a review that timed out is
         // not improved by two more, and the first failure would be buried under the last.
         for agent in ["codex", "claude", "gemini", "grok"] {
-            assert_eq!(attempt_schedule_for(agent, None, true, false).len(), 1, "{agent} review must be one attempt");
+            assert_eq!(
+                attempt_schedule_for(agent, None, true, false).len(),
+                1,
+                "{agent} review must be one attempt"
+            );
         }
         assert_eq!(attempt_schedule_for("claude", None, false, false).len(), 3);
 
         // STRICT pins the model. The gemini-cli chain answers as `gemini` on any of four
         // models, so a seat that asked for one voter could get a different one and no field
         // said so (Grok). RED IF: strict keeps the faildown chain.
-        let loose = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, false);
+        let loose = attempt_schedule_for(
+            "gemini",
+            Some(super::GeminiBackend::GeminiCli),
+            false,
+            false,
+        );
         assert_eq!(loose.len(), 4, "the chain is still there for ordinary Q&A");
-        let strict = attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, true);
+        let strict =
+            attempt_schedule_for("gemini", Some(super::GeminiBackend::GeminiCli), false, true);
         assert_eq!(strict.len(), 1, "strict is one attempt, no faildown");
-        assert_eq!(strict[0].1, loose[0].1, "and it is the PRIMARY model, not some other one");
-        assert!(attempt_schedule_for("gemini", None, false, false).len() > 1,
-            "gemini-cli uses the model faildown chain");
+        assert_eq!(
+            strict[0].1, loose[0].1,
+            "and it is the PRIMARY model, not some other one"
+        );
+        assert!(
+            attempt_schedule_for("gemini", None, false, false).len() > 1,
+            "gemini-cli uses the model faildown chain"
+        );
     }
 
     #[test]
@@ -6755,7 +7795,9 @@ mod deepseek_dispatch_tests {
     async fn deepseek_anti_bulk_rejects_oversized_payload() {
         let _g = BULK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Clear any env override so the default 16KB applies.
-        unsafe { std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES"); }
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES");
+        }
         let big = "x".repeat(20_000);
         let req = shared_types::AskAgentRequest {
             agent: "deepseek".to_string(),
@@ -6766,7 +7808,10 @@ mod deepseek_dispatch_tests {
             .await
             .expect_err("oversized deepseek payload must Err");
         let lower = err.to_lowercase();
-        assert!(lower.contains("payload too large"), "missing 'payload too large': {err}");
+        assert!(
+            lower.contains("payload too large"),
+            "missing 'payload too large': {err}"
+        );
         assert!(lower.contains("metered"), "missing 'metered': {err}");
     }
 
@@ -6795,9 +7840,9 @@ mod deepseek_dispatch_tests {
         // production call site (not the test reference) and confirm the
         // preceding ~200 chars contain the deepseek gate.
         let needle = "req.message.len() > cap";
-        let abs = production_src.find(needle).expect(
-            "expected the anti-bulk intercept `req.message.len() > cap` in agent_exec.rs"
-        );
+        let abs = production_src
+            .find(needle)
+            .expect("expected the anti-bulk intercept `req.message.len() > cap` in agent_exec.rs");
         let lookback = &production_src[abs.saturating_sub(300)..abs];
         assert!(
             lookback.contains("if agent == \"deepseek\""),
@@ -6812,7 +7857,9 @@ mod deepseek_dispatch_tests {
     #[tokio::test]
     async fn deepseek_anti_bulk_cap_is_env_configurable() {
         let _g = BULK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe { std::env::set_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES", "32768"); }
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES", "32768");
+        }
         let big = "x".repeat(20_000);
         let req = shared_types::AskAgentRequest {
             agent: "deepseek".to_string(),
@@ -6820,7 +7867,9 @@ mod deepseek_dispatch_tests {
             ..Default::default()
         };
         let err = execute_ask_agent(&req, None).await.err();
-        unsafe { std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES"); }
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_DEEPSEEK_BULK_BYTES");
+        }
         // Whatever error surfaces, it must NOT be "payload too large".
         if let Some(msg) = err {
             assert!(
@@ -6915,11 +7964,10 @@ mod deepseek_dispatch_tests {
         }
     }
 
-    /// prewarm_daemon_workers MUST NOT spawn a deepseek worker. We assert
-    /// structurally — by source-grep — that the prewarm function only calls
-    /// `prewarm_worker("gemini"...)` and `prewarm_worker("codex"...)`, not
-    /// deepseek. (A runtime test would need an HTTP daemon spun up; the
-    /// source-grep is the canary the IMPL_PLAN demands.)
+    /// prewarm_daemon_workers MUST NOT spawn a deepseek worker. Asserted on the source (the body selects its seats
+    /// through `prewarm_seats` and names none) and on the selection itself (gemini, then codex, never deepseek).
+    /// (A runtime test with mocks is `seven_primes_gate_tests::prewarm_warms_only_gate_admitted_always_seats`.)
+    /// RED IF: prewarm names seats again, or its row-driven selection admits deepseek.
     #[test]
     fn deepseek_prewarm_slot_is_a_safe_no_op() {
         let src = std::fs::read_to_string(
@@ -6933,10 +7981,7 @@ mod deepseek_dispatch_tests {
         let fn_start = src
             .find("pub(crate) async fn prewarm_daemon_workers()")
             .expect("prewarm_daemon_workers exists");
-        let body_start = src[fn_start..]
-            .find('{')
-            .expect("function body opens")
-            + fn_start;
+        let body_start = src[fn_start..].find('{').expect("function body opens") + fn_start;
         // Find the matching closing brace.
         let bytes = src.as_bytes();
         let mut depth = 0i32;
@@ -6958,17 +8003,26 @@ mod deepseek_dispatch_tests {
             }
         }
         let body = &src[body_start..=body_end];
+        // Seven Primes T-204: prewarm no longer names its seats; it warms the rows prewarm_seats selects (the
+        // prewarm_policy column, then the seat gate on Prewarm). The structural half: the body names no seat at all.
+        // The behavioral half: the selection is gemini then codex, as the literal calls were, and never deepseek.
         assert!(
-            body.contains("prewarm_worker(\"gemini\""),
-            "prewarm must still spawn gemini"
+            body.contains("prewarm_seats("),
+            "prewarm must select its seats from the rows"
         );
         assert!(
-            body.contains("prewarm_worker(\"codex\""),
-            "prewarm must still spawn codex"
+            !body.contains("\"deepseek\""),
+            "prewarm must not name a seat"
+        );
+        let seats = prewarm_seats(mcp_bridge::seat_profile::all_seats());
+        assert_eq!(
+            seats,
+            ["gemini", "codex"],
+            "prewarm must still spawn gemini, then codex"
         );
         assert!(
-            !body.contains("prewarm_worker(\"deepseek\""),
-            "prewarm MUST NOT spawn a deepseek worker (REQ-DS-020 — stateless)"
+            !seats.contains(&"deepseek"),
+            "prewarm MUST NOT spawn a deepseek worker (REQ-DS-020: stateless)"
         );
     }
 
@@ -7044,7 +8098,11 @@ mod sight_gate_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(rel);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, (1..=lines).map(|i| format!("l{i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &file,
+            (1..=lines).map(|i| format!("l{i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let root = dir.path().to_string_lossy().into_owned();
         (dir, root)
     }
@@ -7060,11 +8118,19 @@ mod sight_gate_tests {
         if let Some(l) = limit {
             args["limit"] = serde_json::json!(l);
         }
-        let total = std::fs::read_to_string(path).map(|t| t.lines().count() as u64).unwrap_or(0);
+        let total = std::fs::read_to_string(path)
+            .map(|t| t.lines().count() as u64)
+            .unwrap_or(0);
         let first = offset.unwrap_or(1).max(1);
         let last = limit.map_or(total, |l| (first + l).saturating_sub(1).min(total));
-        let returned_lines = if limit == Some(0) || first > last { Vec::new() } else { vec![(first, last)] };
-        ToolCallRecord { shown_output: None, returned_lines,
+        let returned_lines = if limit == Some(0) || first > last {
+            Vec::new()
+        } else {
+            vec![(first, last)]
+        };
+        ToolCallRecord {
+            shown_output: None,
+            returned_lines,
             id: None,
             tool: "read_file".to_string(),
             kind: ToolKind::ReadFile,
@@ -7082,7 +8148,11 @@ mod sight_gate_tests {
     fn sight_39_structured_windows_that_tile_the_file_are_a_whole_read() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("big.rs");
-        std::fs::write(&src, (1..=100).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=100).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let src = src.to_string_lossy().into_owned();
         let cwd = dir.path().to_string_lossy().into_owned();
 
@@ -7091,8 +8161,15 @@ mod sight_gate_tests {
             structured_read(&src, Some(61), Some(40)),
         ];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &calls, "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect("windows 1..60 and 61..100 cover a 100-line file");
+        enforce_reviewer_sight(
+            "Grok",
+            &calls,
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("windows 1..60 and 61..100 cover a 100-line file");
 
         // NEGATIVE CONTROL: leave a gap and the gate must still reject.
         let gapped = vec![
@@ -7100,8 +8177,15 @@ mod sight_gate_tests {
             structured_read(&src, Some(70), Some(31)),
         ];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &gapped, "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("lines 61..69 were never read");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &gapped,
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("lines 61..69 were never read");
         assert!(err.contains("read PART"), "{err}");
 
         // NEGATIVE CONTROL 2: a full-coverage window set naming a DIFFERENT file proves nothing.
@@ -7109,8 +8193,15 @@ mod sight_gate_tests {
         std::fs::write(&other, "x\n").unwrap();
         let wrong_file = vec![structured_read(&other, Some(1), Some(100))];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &wrong_file, "grok-streaming-json", &[src], &cwd, &mut lifecycle)
-            .expect_err("reading another file is not reading this one");
+        enforce_reviewer_sight(
+            "Grok",
+            &wrong_file,
+            "grok-streaming-json",
+            &[src],
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("reading another file is not reading this one");
     }
 
     /// D-032, unnumbered results. agy `view_file` delivers at most 800 lines a call (measured):
@@ -7121,7 +8212,13 @@ mod sight_gate_tests {
     fn sight_d032_unnumbered_reads_are_capped_or_earn_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("long.rs");
-        std::fs::write(&src, (1..=1000).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=1000)
+                .map(|i| format!("line {i}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
         let src = src.to_string_lossy().into_owned();
         let cwd = dir.path().to_string_lossy().into_owned();
         let view = |args: serde_json::Value, tool: &str| ToolCallRecord {
@@ -7136,22 +8233,52 @@ mod sight_gate_tests {
         };
         let whole_ask = view(serde_json::json!({ "AbsolutePath": src }), "view_file");
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Antigravity", &[whole_ask], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("view_file returns 800 lines, not 1000");
+        let err = enforce_reviewer_sight(
+            "Antigravity",
+            &[whole_ask],
+            "agy-stream-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("view_file returns 800 lines, not 1000");
         assert!(err.contains("read PART"), "{err}");
 
         let tiled = vec![
-            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 1, "EndLine": 800 }), "view_file"),
-            view(serde_json::json!({ "AbsolutePath": src, "StartLine": 801, "EndLine": 1000 }), "view_file"),
+            view(
+                serde_json::json!({ "AbsolutePath": src, "StartLine": 1, "EndLine": 800 }),
+                "view_file",
+            ),
+            view(
+                serde_json::json!({ "AbsolutePath": src, "StartLine": 801, "EndLine": 1000 }),
+                "view_file",
+            ),
         ];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Antigravity", &tiled, "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect("1..800 and 801..1000 are the whole file");
+        enforce_reviewer_sight(
+            "Antigravity",
+            &tiled,
+            "agy-stream-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("1..800 and 801..1000 are the whole file");
 
-        let unknown = view(serde_json::json!({ "path": src, "offset": 1, "limit": 1000 }), "mystery_reader");
+        let unknown = view(
+            serde_json::json!({ "path": src, "offset": 1, "limit": 1000 }),
+            "mystery_reader",
+        );
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Antigravity", &[unknown], "agy-stream-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("an unmeasured unnumbered read proves nothing");
+        enforce_reviewer_sight(
+            "Antigravity",
+            &[unknown],
+            "agy-stream-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("an unmeasured unnumbered read proves nothing");
     }
 
     /// D-032. A read that ASKED for the whole file but RECEIVED only part of it (a capped tool)
@@ -7160,31 +8287,56 @@ mod sight_gate_tests {
     fn sight_d032_a_truncated_read_is_credited_with_what_came_back() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("big.rs");
-        std::fs::write(&src, (1..=100).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=100).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let src = src.to_string_lossy().into_owned();
         let cwd = dir.path().to_string_lossy().into_owned();
 
         let mut capped = structured_read(&src, Some(1), Some(100));
         capped.returned_lines = vec![(1, 60)];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &[capped], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("asked for 1..100, received 1..60");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &[capped],
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("asked for 1..100, received 1..60");
         assert!(err.contains("read PART"), "{err}");
 
         // An elided middle: lines 1..50 and 90..100 came back. Two runs, not 1..100.
         let mut elided = structured_read(&src, Some(1), Some(100));
         elided.returned_lines = vec![(1, 50), (90, 100)];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &[elided], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect_err("51..89 never came back");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &[elided],
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("51..89 never came back");
         assert!(err.contains("read PART"), "{err}");
 
         // Twin: the tool numbered every line, so the whole file was received.
         let mut whole = structured_read(&src, Some(1), Some(100));
         whole.returned_lines = vec![(1, 100)];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &[whole], "grok-streaming-json", std::slice::from_ref(&src), &cwd, &mut lifecycle)
-            .expect("received 1..100 of a 100-line file");
+        enforce_reviewer_sight(
+            "Grok",
+            &[whole],
+            "grok-streaming-json",
+            std::slice::from_ref(&src),
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("received 1..100 of a 100-line file");
     }
 
     /// A relative source is rejected UP FRONT, naming the absolute path to pass instead.
@@ -7206,7 +8358,10 @@ mod sight_gate_tests {
             .expect_err("a relative required_source must be refused, not dispatched");
         assert!(err.contains("must be ABSOLUTE"), "{err}");
         // It must say WHICH path to use, or the caller is left guessing.
-        assert!(err.contains("/Users/someone/repo/daemon/src/lib.rs"), "{err}");
+        assert!(
+            err.contains("/Users/someone/repo/daemon/src/lib.rs"),
+            "{err}"
+        );
     }
 
     /// Defence in depth for the same bug: candidates now expand relative -> absolute too.
@@ -7662,18 +8817,28 @@ mod sight_gate_tests {
     /// RED IF: any parser mode is added to or removed from the allowlist.
     #[test]
     fn sight_06_the_allowlist_is_exactly_the_verified_parsers() {
+        // Compared as a SET: the list is derived from the seat table in roster order, and order never mattered.
+        let mut got = parser_modes_with_tool_records().to_vec();
+        got.sort_unstable();
+        let mut want = vec![
+            "codex-exec-json",
+            "gemini-stream-json",
+            "grok-streaming-json",
+            "agy-stream-json",
+            // Added 2026-09-02. Confirmed the way this test demands: `claude_stream.rs`
+            // pushes a ToolCallRecord on every content block of type "tool_use", and that
+            // is exercised against a LIVE capture, not a hand-written fixture.
+            "claude-stream-json",
+            // Seven Primes (REQ-063), added 2026-10-18: each parser pushes a ToolCallRecord with the read path, proven
+            // so far against fixtures transcribed from VENDOR SOURCE only. T-302 must re-run this against live
+            // captures (REQ-044) before any of the three is trusted for a launch review.
+            "kimi-stream-json",
+            "mistral-streaming",
+            "qwen-stream-json",
+        ];
+        want.sort_unstable();
         assert_eq!(
-            PARSER_MODES_WITH_TOOL_RECORDS,
-            &[
-                "codex-exec-json",
-                "gemini-stream-json",
-                "grok-streaming-json",
-                "agy-stream-json",
-                // Added 2026-09-02. Confirmed the way this test demands: `claude_stream.rs`
-                // pushes a ToolCallRecord on every content block of type "tool_use", and that
-                // is exercised against a LIVE capture, not a hand-written fixture.
-                "claude-stream-json",
-            ],
+            got, want,
             "the allowlist changed. Open the parser you are adding and confirm it actually \
              calls tool_calls.push on a real tool event. These are known NOT to: \
              agy-pipe-plain-text, agy-pty-plain-text, codex-app-server-jsonrpc, \
@@ -7694,15 +8859,22 @@ mod sight_gate_tests {
     /// RED IF: any parser mode is added to or removed from the read-classifying allowlist.
     #[test]
     fn sight_30_the_read_classifying_allowlist_is_pinned() {
+        let mut got = parser_modes_that_classify_reads().to_vec();
+        got.sort_unstable();
+        let mut want = vec![
+            "gemini-stream-json",
+            "grok-streaming-json",
+            "agy-stream-json",
+            "codex-exec-json",
+            "claude-stream-json",
+            // Seven Primes (REQ-063): vendor-source fixtures only until T-302's live captures (see sight_06).
+            "kimi-stream-json",
+            "mistral-streaming",
+            "qwen-stream-json",
+        ];
+        want.sort_unstable();
         assert_eq!(
-            PARSER_MODES_THAT_CLASSIFY_READS,
-            &[
-                "gemini-stream-json",
-                "grok-streaming-json",
-                "agy-stream-json",
-                "codex-exec-json",
-                "claude-stream-json",
-            ],
+            got, want,
             "the read-classifying allowlist changed. Open the parser and confirm it can tell a              file READ from a search or a shell command. If it stamps every call the same kind,              required_sources cannot be enforced on it and a pass would be theatre."
         );
     }
@@ -7712,9 +8884,9 @@ mod sight_gate_tests {
     /// RED IF: the two lists drift apart.
     #[test]
     fn sight_31_read_classifiers_are_a_subset_of_recorders() {
-        for mode in PARSER_MODES_THAT_CLASSIFY_READS {
+        for mode in parser_modes_that_classify_reads() {
             assert!(
-                PARSER_MODES_WITH_TOOL_RECORDS.contains(mode),
+                parser_modes_with_tool_records().contains(mode),
                 "{mode} classifies reads but is not on the tool-record allowlist, so the                  stronger check would run on records the weaker one does not trust"
             );
         }
@@ -9106,7 +10278,10 @@ mod claude_runner_tests {
             !argv.contains("--allowedTools"),
             "a consult must keep its tools; the allow-list is containment for reviews only"
         );
-        assert!(argv.contains("stream-json"), "observability still applies to every call");
+        assert!(
+            argv.contains("stream-json"),
+            "observability still applies to every call"
+        );
     }
 
     /// An operator who chose an output format keeps it, and the turn then FAILS CLOSED on the
@@ -9117,7 +10292,11 @@ mod claude_runner_tests {
     async fn u_cr_04_a_non_streaming_claude_cannot_claim_a_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
         let argv_log = dir.path().join("argv.txt");
-        let bin = fake_claude(dir.path(), &argv_log, "just some plain text, no events at all");
+        let bin = fake_claude(
+            dir.path(),
+            &argv_log,
+            "just some plain text, no events at all",
+        );
 
         let parsed = run_claude_cli_process_with_session(
             bin.to_str().expect("utf8"),
@@ -9142,7 +10321,7 @@ mod claude_runner_tests {
             "a turn that never streamed must not claim the trusted mode"
         );
         assert!(
-            !PARSER_MODES_WITH_TOOL_RECORDS.contains(&parsed.parser_mode.as_str()),
+            !parser_modes_with_tool_records().contains(&parsed.parser_mode.as_str()),
             "and that mode must fail closed on the sight gate"
         );
         assert!(parsed.response_text.contains("plain text"));
@@ -9174,7 +10353,10 @@ mod grok_panel_route_tests {
     }
 
     fn flag_value(argv: &[String], flag: &str) -> Option<String> {
-        argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1)).cloned()
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
     }
 
     async fn dispatch(is_peer_review: bool) -> Vec<String> {
@@ -9274,7 +10456,11 @@ mod grok_panel_route_tests {
 
         // The daemon is Deep (the helper sets it). A consult asking for Fast gets Fast.
         let fast = dispatch_with_depth(false, Some(GrokDepthOverride::Fast)).await;
-        assert_eq!(flag_value(&fast, "--effort").as_deref(), Some("low"), "argv was {fast:?}");
+        assert_eq!(
+            flag_value(&fast, "--effort").as_deref(),
+            Some("low"),
+            "argv was {fast:?}"
+        );
         assert_eq!(flag_value(&fast, "--max-turns").as_deref(), Some("12"));
 
         // And asking for Deep on a Deep daemon is Deep, which is also the "absent" control.
@@ -9304,7 +10490,11 @@ mod grok_panel_route_tests {
         // defaults are what is under test here rather than an operator value left by a sibling.
         unsafe { std::env::remove_var("TRIUMVIRATE_GROK_MAX_TURNS") };
         let panel = dispatch(true).await;
-        assert_eq!(flag_value(&panel, "--effort").as_deref(), Some("low"), "argv was {panel:?}");
+        assert_eq!(
+            flag_value(&panel, "--effort").as_deref(),
+            Some("low"),
+            "argv was {panel:?}"
+        );
         assert_eq!(flag_value(&panel, "--max-turns").as_deref(), Some("12"));
         assert!(panel.iter().any(|a| a == "--no-subagents"));
 
@@ -9328,10 +10518,16 @@ mod grok_tool_surface_tests {
     #[test]
     fn u_ts_01_the_threshold_is_exclusive() {
         assert!(!grok_tool_surface_is_bloated(0));
-        assert!(!grok_tool_surface_is_bloated(26), "the no-MCP fixture must stay quiet");
+        assert!(
+            !grok_tool_surface_is_bloated(26),
+            "the no-MCP fixture must stay quiet"
+        );
         assert!(!grok_tool_surface_is_bloated(GROK_TOOL_SURFACE_WARN_AT));
         assert!(grok_tool_surface_is_bloated(GROK_TOOL_SURFACE_WARN_AT + 1));
-        assert!(grok_tool_surface_is_bloated(420), "the full-inheritance capture must trip it");
+        assert!(
+            grok_tool_surface_is_bloated(420),
+            "the full-inheritance capture must trip it"
+        );
     }
 
     /// Driven through the real parser, from a real `available_commands` line shape, because the
@@ -9399,7 +10595,12 @@ mod mandatory_review_tests {
     /// RED IF: the fallback arm stops being Indeterminate, or Indeterminate stops blocking.
     #[test]
     fn review_01_unusable_output_blocks_rather_than_passing() {
-        for junk in ["", "I think this looks fine overall.", "Sure, seems reasonable.", "  \n "] {
+        for junk in [
+            "",
+            "I think this looks fine overall.",
+            "Sure, seems reasonable.",
+            "  \n ",
+        ] {
             let (v, _) = classify_review_verdict(junk);
             assert_eq!(v, ReviewVerdict::Indeterminate, "junk: {junk:?}");
             assert!(v.blocks(), "no usable verdict must stop the turn: {junk:?}");
@@ -9468,7 +10669,10 @@ mod mandatory_review_tests {
             ("> REJECT", ReviewVerdict::Reject),
             ("`APPROVE`", ReviewVerdict::Approve),
             ("APPROVE.", ReviewVerdict::Approve),
-            ("**REJECT**: the count is wrong", ReviewVerdict::Indeterminate),
+            (
+                "**REJECT**: the count is wrong",
+                ReviewVerdict::Indeterminate,
+            ),
         ] {
             let (v, _) = classify_review_verdict(line);
             assert_eq!(v, want, "line: {line:?}");
@@ -9483,7 +10687,10 @@ mod mandatory_review_tests {
     #[test]
     fn review_05_only_reject_and_indeterminate_block() {
         assert!(!ReviewVerdict::Approve.blocks());
-        assert!(!ReviewVerdict::Concerns.blocks(), "a considered concern does not block");
+        assert!(
+            !ReviewVerdict::Concerns.blocks(),
+            "a considered concern does not block"
+        );
         assert!(ReviewVerdict::Reject.blocks());
         assert!(
             ReviewVerdict::Indeterminate.blocks(),
@@ -9608,7 +10815,11 @@ mod mandatory_review_tests {
     ) -> PathBuf {
         let bin = dir.join(format!(
             "fake-codex-{}-{}-{}",
-            if reader.is_empty() || !echo_nonce { "blind" } else { reader },
+            if reader.is_empty() || !echo_nonce {
+                "blind"
+            } else {
+                reader
+            },
             if echo_nonce { "nonce" } else { "nononce" },
             std::process::id()
         ));
@@ -9634,7 +10845,9 @@ mod mandatory_review_tests {
             // and nothing else, so the stand-in can only quote what its own read saw. A
             // `head -1` therefore satisfies the sight gate and still fails the nonce check,
             // which is the exact attack Grok described.
-            script.push_str(&format!("  READ_OUTPUT=\"$({reader} \"$ARTIFACT\" 2>/dev/null)\"\n"));
+            script.push_str(&format!(
+                "  READ_OUTPUT=\"$({reader} \"$ARTIFACT\" 2>/dev/null)\"\n"
+            ));
             script.push_str("  RC=$?\n");
             script.push_str(&format!(
                 "  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"id\":\"c1\",\"command\":\"{reader} %s\",\"exit_code\":%d,\"aggregated_output\":\"%s\"}}}}\\n' \"$ARTIFACT\" \"$RC\" \"$(jesc \"$READ_OUTPUT\")\"\n"
@@ -9712,6 +10925,8 @@ mod mandatory_review_tests {
         // which is where the mock connector is honoured. `grok` has its own runner and would
         // not use the mock.
         //
+        // Seven Primes T-204 (A-12): next_reviewer fails closed without the gate; install the production one.
+        mcp_tools::review::install_reviewer_gate();
         // SAFETY: serialised by `review_env_lock`, cleared by `clear_review_env`.
         unsafe {
             std::env::set_var("TRIUMVIRATE_CODEX_BIN", &reviewer_bin);
@@ -9719,7 +10934,11 @@ mod mandatory_review_tests {
             std::env::set_var("TRIUMVIRATE_PEER_REVIEWERS", "codex");
             std::env::set_var("TRIUMVIRATE_REQUIRE_PEER_REVIEW", "1");
         }
-        ReviewFixture { _dir: dir, root, counts }
+        ReviewFixture {
+            _dir: dir,
+            root,
+            counts,
+        }
     }
 
     fn clear_review_env() {
@@ -9802,7 +11021,10 @@ mod mandatory_review_tests {
             err.contains("reasoning follows"),
             "the reviewer's own words must come back, or a block is unactionable; got: {err}"
         );
-        assert!(fx.counts.exists(), "the reviewer process must actually have run");
+        assert!(
+            fx.counts.exists(),
+            "the reviewer process must actually have run"
+        );
     }
 
     /// GOAL 1.5, the headline: a reviewer that approves without opening anything is REJECTED.
@@ -9922,8 +11144,7 @@ mod mandatory_review_tests {
         let nested = dir.path().join("crates").join("deep");
         std::fs::create_dir_all(&nested).expect("nested");
 
-        let root = resolve_absolute_project_root(nested.to_str().expect("utf8"))
-            .expect("resolves");
+        let root = resolve_absolute_project_root(nested.to_str().expect("utf8")).expect("resolves");
         assert_eq!(
             root,
             std::fs::canonicalize(&nested).expect("canonical"),
@@ -9962,7 +11183,8 @@ mod mandatory_review_tests {
         let (v, _) = classify_review_verdict("APPROVE\nreasoning\nREVIEW-NONCE: TV-abc");
         assert_eq!(v, ReviewVerdict::Approve, "line 1 decides the verdict");
 
-        let (buried, _) = classify_review_verdict("I would say APPROVE here.\nREVIEW-NONCE: TV-abc");
+        let (buried, _) =
+            classify_review_verdict("I would say APPROVE here.\nREVIEW-NONCE: TV-abc");
         assert_eq!(
             buried,
             ReviewVerdict::Indeterminate,
@@ -9971,7 +11193,10 @@ mod mandatory_review_tests {
 
         // And the containment check itself, which is what the dispatch applies.
         let answer = "APPROVE\n\nlots of reasoning\n\nREVIEW-NONCE: TV-deadbeef\n";
-        assert!(answer.contains("TV-deadbeef"), "position must not matter to the proof");
+        assert!(
+            answer.contains("TV-deadbeef"),
+            "position must not matter to the proof"
+        );
     }
 
     /// The nonce check itself, now that no partial read can reach it.
@@ -10040,7 +11265,9 @@ mod mandatory_review_tests {
             r#"{"file_path":"/repo/a.md","offset":9000}"#,
             r#"{"file_path":"/repo/a.md","limit":1,"offset":9000}"#,
         ] {
-            let calls = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+            let calls = vec![ToolCallRecord {
+                shown_output: None,
+                returned_lines: Vec::new(),
                 id: Some("t".into()),
                 tool: "Read".into(),
                 kind: ToolKind::ReadFile,
@@ -10074,7 +11301,9 @@ mod mandatory_review_tests {
         std::fs::write(&src, "one\ntwo\nthree\n").unwrap();
         let src = src.to_string_lossy().into_owned();
         let root = dir.path().to_string_lossy().into_owned();
-        let calls = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 3)],
+        let calls = vec![ToolCallRecord {
+            shown_output: None,
+            returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "Read".into(),
             kind: ToolKind::ReadFile,
@@ -10094,13 +11323,18 @@ mod mandatory_review_tests {
         .expect("an unbounded read of the named source must pass");
 
         // An explicit null is not a slice either: grok's own capture records "offset":null.
-        let with_nulls = vec![ToolCallRecord { shown_output: None, returned_lines: vec![(1, 3)],
+        let with_nulls = vec![ToolCallRecord {
+            shown_output: None,
+            returned_lines: vec![(1, 3)],
             id: Some("t".into()),
             tool: "read_file".into(),
             kind: ToolKind::ReadFile,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(serde_json::json!({ "target_file": src, "offset": null, "limit": null }).to_string()),
+            args_json: Some(
+                serde_json::json!({ "target_file": src, "offset": null, "limit": null })
+                    .to_string(),
+            ),
         }];
         let mut lifecycle2 = Vec::new();
         enforce_reviewer_sight(
@@ -10119,7 +11353,9 @@ mod mandatory_review_tests {
     /// RED IF: the partial branch is removed and both fall through to the same message.
     #[test]
     fn review_24_a_peek_and_a_miss_report_differently() {
-        let peek = vec![ToolCallRecord { shown_output: None, returned_lines: Vec::new(),
+        let peek = vec![ToolCallRecord {
+            shown_output: None,
+            returned_lines: Vec::new(),
             id: Some("t".into()),
             tool: "command_execution".into(),
             kind: ToolKind::ReadFile,
@@ -10129,13 +11365,23 @@ mod mandatory_review_tests {
         }];
         let mut a = Vec::new();
         let peeked = enforce_reviewer_sight(
-            "Codex", &peek, "codex-exec-json", &["/repo/a.md".to_string()], "/repo", &mut a,
+            "Codex",
+            &peek,
+            "codex-exec-json",
+            &["/repo/a.md".to_string()],
+            "/repo",
+            &mut a,
         )
         .unwrap_err();
 
         let mut b = Vec::new();
         let missed = enforce_reviewer_sight(
-            "Codex", &[], "codex-exec-json", &["/repo/a.md".to_string()], "/repo", &mut b,
+            "Codex",
+            &[],
+            "codex-exec-json",
+            &["/repo/a.md".to_string()],
+            "/repo",
+            &mut b,
         )
         .unwrap_err();
 
@@ -10182,7 +11428,10 @@ mod mandatory_review_tests {
         let _guard = review_env_lock();
         let fx = setup_review_with_reader("APPROVE", "cat");
         let out = run_review(&fx, "a claim that needs checking").await;
-        assert!(out.is_ok(), "an honest full read must still pass; got: {out:?}");
+        assert!(
+            out.is_ok(),
+            "an honest full read must still pass; got: {out:?}"
+        );
     }
 
     /// A missing nonce must never turn a REJECT into something else. The check runs after
@@ -10244,7 +11493,10 @@ mod mandatory_review_tests {
                 dispatch_owned: true,
             })
             .expect("occupy the slot");
-        assert_eq!(occupying.state, "in_progress", "the fixture must actually fill the cap");
+        assert_eq!(
+            occupying.state, "in_progress",
+            "the fixture must actually fill the cap"
+        );
 
         let out = run_review(&fx, "work that arrives while the queue is full").await;
 
@@ -10397,9 +11649,19 @@ mod codex_error_tail_tests {
         );
         let out = codex_error_tail(raw, &tail(&["Reading additional input from stdin..."]));
         assert!(out.contains("usage limit"), "got: {out}");
-        assert!(!out.contains("Skill descriptions"), "item-level notices are not the failure: {out}");
-        assert!(!out.contains("Reading additional input"), "stdin notice is noise: {out}");
-        assert_eq!(out.matches("usage limit").count(), 1, "error and turn.failed carry the same text once: {out}");
+        assert!(
+            !out.contains("Skill descriptions"),
+            "item-level notices are not the failure: {out}"
+        );
+        assert!(
+            !out.contains("Reading additional input"),
+            "stdin notice is noise: {out}"
+        );
+        assert_eq!(
+            out.matches("usage limit").count(),
+            1,
+            "error and turn.failed carry the same text once: {out}"
+        );
     }
 
     #[test]
@@ -10442,12 +11704,18 @@ mod codex_error_tail_tests {
     #[test]
     fn plain_error_line_and_stderr_still_count() {
         let out = codex_error_tail("OK\nERROR: something broke\n", &tail(&["fatal: boom"]));
-        assert!(out.contains("ERROR: something broke") && out.contains("fatal: boom"), "got: {out}");
+        assert!(
+            out.contains("ERROR: something broke") && out.contains("fatal: boom"),
+            "got: {out}"
+        );
     }
 
     #[test]
     fn nothing_useful_adds_nothing() {
-        assert_eq!(codex_error_tail("{\"type\":\"turn.started\"}\n", &tail(&[])), "");
+        assert_eq!(
+            codex_error_tail("{\"type\":\"turn.started\"}\n", &tail(&[])),
+            ""
+        );
     }
 }
 
@@ -10466,13 +11734,17 @@ mod grok_shell_read_gate_tests {
     }
 
     fn grok_shell(command: &str, kind: ToolKind) -> ToolCallRecord {
-        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
+        ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(command)),
+            returned_lines: Vec::new(),
             id: None,
             tool: "run_terminal_command".to_string(),
             kind,
             success: Some(true),
             duration_ms: None,
-            args_json: Some(serde_json::json!({ "command": command, "description": "x" }).to_string()),
+            args_json: Some(
+                serde_json::json!({ "command": command, "description": "x" }).to_string(),
+            ),
         }
     }
 
@@ -10484,7 +11756,9 @@ mod grok_shell_read_gate_tests {
     /// this file tests are ever reached. A helper that skips the step under test is not a test.
     fn codex_shell(command: &str) -> ToolCallRecord {
         let args = serde_json::json!({ "command": command });
-        ToolCallRecord { shown_output: Some(super::honest_shown_output(command)), returned_lines: Vec::new(),
+        ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(command)),
+            returned_lines: Vec::new(),
             id: None,
             tool: "command_execution".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -10508,7 +11782,14 @@ mod grok_shell_read_gate_tests {
         let tools: Vec<ToolCallRecord> = cmds.iter().map(|c| codex_shell(c)).collect();
         let sources = vec![source.to_string()];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Codex", &tools, "codex-exec-json", &sources, cwd, &mut lifecycle)
+        enforce_reviewer_sight(
+            "Codex",
+            &tools,
+            "codex-exec-json",
+            &sources,
+            cwd,
+            &mut lifecycle,
+        )
     }
 
     /// D-017, THE LIVE CASE. On the first real `ask_jury` run, codex read a 97-line brief with
@@ -10538,7 +11819,8 @@ mod grok_shell_read_gate_tests {
             // the line count will always do.
             format!("wc -l {src} && sed -n '1,99999p' {src}"),
         ] {
-            gate_codex(&[&cmd], &src, &cwd).unwrap_or_else(|e| panic!("must count as a read: {cmd}\n  gate said: {e}"));
+            gate_codex(&[&cmd], &src, &cwd)
+                .unwrap_or_else(|e| panic!("must count as a read: {cmd}\n  gate said: {e}"));
         }
     }
 
@@ -10559,7 +11841,11 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,320p' {src}\"")
         });
-        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
+        let call = ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(
+                args["command"].as_str().unwrap_or_default(),
+            )),
+            returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -10567,11 +11853,22 @@ mod grok_shell_read_gate_tests {
             duration_ms: None,
             args_json: Some(args.to_string()),
         };
-        assert_eq!(call.kind, ToolKind::ReadFile, "the classifier must see a chained read at all");
+        assert_eq!(
+            call.kind,
+            ToolKind::ReadFile,
+            "the classifier must see a chained read at all"
+        );
         let sources = vec![src.clone()];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
-            .expect("the window over the SOURCE must count, whatever the other link read");
+        enforce_reviewer_sight(
+            "Codex",
+            &[call],
+            "codex-exec-json",
+            &sources,
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect("the window over the SOURCE must count, whatever the other link read");
     }
 
     /// A rejection must explain itself. The receipt that sent me hunting printed the command
@@ -10581,7 +11878,9 @@ mod grok_shell_read_gate_tests {
     fn a_rejection_receipt_names_the_operand_and_window_each_read_bound_to() {
         let (dir, src) = source_file(400);
         let cwd = dir.path().to_string_lossy().into_owned();
-        let other = dir.path().join("other-with-a-deliberately-long-name-to-push-past-the-old-limit.md");
+        let other = dir
+            .path()
+            .join("other-with-a-deliberately-long-name-to-push-past-the-old-limit.md");
         std::fs::write(&other, "x\n".repeat(40)).expect("write other");
         let other = other.to_string_lossy().into_owned();
 
@@ -10590,7 +11889,11 @@ mod grok_shell_read_gate_tests {
         let args = serde_json::json!({
             "command": format!("/bin/zsh -lc \"sed -n '1,240p' {other} && sed -n '1,50p' {src}\"")
         });
-        let call = ToolCallRecord { shown_output: Some(super::honest_shown_output(args["command"].as_str().unwrap_or_default())), returned_lines: Vec::new(),
+        let call = ToolCallRecord {
+            shown_output: Some(super::honest_shown_output(
+                args["command"].as_str().unwrap_or_default(),
+            )),
+            returned_lines: Vec::new(),
             id: None,
             tool: "Bash".to_string(),
             kind: agent_adapter::codex::shell_read_kind(ToolKind::Bash, Some(&args)),
@@ -10600,10 +11903,20 @@ mod grok_shell_read_gate_tests {
         };
         let sources = vec![src.clone()];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Codex", &[call], "codex-exec-json", &sources, &cwd, &mut lifecycle)
-            .expect_err("50 of 400 lines is not the source");
+        let err = enforce_reviewer_sight(
+            "Codex",
+            &[call],
+            "codex-exec-json",
+            &sources,
+            &cwd,
+            &mut lifecycle,
+        )
+        .expect_err("50 of 400 lines is not the source");
 
-        assert!(err.contains("lines 1-50"), "the receipt must name the window it got: {err}");
+        assert!(
+            err.contains("lines 1-50"),
+            "the receipt must name the window it got: {err}"
+        );
         assert!(err.contains(&src), "and the operand it bound to: {err}");
         assert!(
             !err.contains("/bin/zsh"),
@@ -10619,22 +11932,47 @@ mod grok_shell_read_gate_tests {
         let (dir, src) = source_file(97);
         let cwd = dir.path().to_string_lossy().into_owned();
         for (cmd, why) in [
-            (format!("wc -l {src} && head -5 {src}"), "a peek in a chain is still only PART"),
-            (format!("sed -n '1,50p' {src} && wc -l {src}"), "half the file in a chain is still PART"),
-            (format!("cat /dev/null < {src} && wc -l {src}"), "a redirect still reads nothing"),
-            (format!("cat /etc/hostname # {src} && wc -l {src}"), "a comment still names nothing"),
+            (
+                format!("wc -l {src} && head -5 {src}"),
+                "a peek in a chain is still only PART",
+            ),
+            (
+                format!("sed -n '1,50p' {src} && wc -l {src}"),
+                "half the file in a chain is still PART",
+            ),
+            (
+                format!("cat /dev/null < {src} && wc -l {src}"),
+                "a redirect still reads nothing",
+            ),
+            (
+                format!("cat /etc/hostname # {src} && wc -l {src}"),
+                "a comment still names nothing",
+            ),
             // `;` and `||` mask a failed read: both exit zero having read nothing, so the
             // success flag the gate trusts would be a lie. They stay refused whole.
-            (format!("cat /nonexistent ; cat {src}"), "a semicolon chain is still refused"),
-            (format!("cat /nonexistent || cat {src}"), "an or-chain is still refused"),
-            (format!("echo {src} && cat /etc/hostname"), "naming the file is not reading it"),
+            (
+                format!("cat /nonexistent ; cat {src}"),
+                "a semicolon chain is still refused",
+            ),
+            (
+                format!("cat /nonexistent || cat {src}"),
+                "an or-chain is still refused",
+            ),
+            (
+                format!("echo {src} && cat /etc/hostname"),
+                "naming the file is not reading it",
+            ),
             // An UNTERMINATED quote is a parse error for the whole line, so the shell runs
             // NOTHING, including the read that precedes it. Splitting would credit a read that
             // never happened. (The mirror case, `echo 'oops && cat SRC`, needs no guard: the
             // scanner is inside the quote when it reaches the `&&`, so it never splits there.)
-            (format!("cat {src} && echo 'oops"), "an unterminated quote runs nothing"),
+            (
+                format!("cat {src} && echo 'oops"),
+                "an unterminated quote runs nothing",
+            ),
         ] {
-            let err = gate_codex(&[&cmd], &src, &cwd).expect_err(&format!("must NOT pass: {why}\n  {cmd}"));
+            let err = gate_codex(&[&cmd], &src, &cwd)
+                .expect_err(&format!("must NOT pass: {why}\n  {cmd}"));
             assert!(
                 err.contains("never successfully opened") || err.contains("only read PART"),
                 "{why}: unexpected rejection text: {err}"
@@ -10652,8 +11990,15 @@ mod grok_shell_read_gate_tests {
         let tools = vec![grok_shell(&format!("cat {src}"), ToolKind::ReadFile)];
         let sources = vec![src];
         let mut lifecycle = Vec::new();
-        enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, &root, &mut lifecycle)
-            .expect("a whole-file cat is the source");
+        enforce_reviewer_sight(
+            "Grok",
+            &tools,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut lifecycle,
+        )
+        .expect("a whole-file cat is the source");
     }
 
     /// D-032 shell half. The CLIs truncate one call's output (codex near 10k tokens, grok to the
@@ -10671,21 +12016,45 @@ mod grok_shell_read_gate_tests {
         let sources = vec![big.clone()];
 
         let cat = vec![grok_shell(&format!("cat {big}"), ToolKind::ReadFile)];
-        let err = enforce_reviewer_sight("Grok", &cat, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("60 KB through one call: the middle was truncated away");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &cat,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("60 KB through one call: the middle was truncated away");
         assert!(err.contains("PART"), "{err}");
 
-        let chained = vec![grok_shell(&format!("sed -n '1,300p' {big} && sed -n '301,600p' {big}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Grok", &chained, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("two windows in ONE call still print 60 KB into one output");
+        let chained = vec![grok_shell(
+            &format!("sed -n '1,300p' {big} && sed -n '301,600p' {big}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Grok",
+            &chained,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("two windows in ONE call still print 60 KB into one output");
 
         let tiled = vec![
             grok_shell(&format!("sed -n '1,250p' {big}"), ToolKind::ReadFile),
             grok_shell(&format!("sed -n '251,500p' {big}"), ToolKind::ReadFile),
             grok_shell(&format!("sed -n '501,600p' {big}"), ToolKind::ReadFile),
         ];
-        enforce_reviewer_sight("Grok", &tiled, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect("25 KB, 25 KB and 10 KB calls each fit and together cover the file");
+        enforce_reviewer_sight(
+            "Grok",
+            &tiled,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect("25 KB, 25 KB and 10 KB calls each fit and together cover the file");
     }
 
     /// Codex, D-032 third pass: the budget is on PRINTED bytes. 5000 two-byte lines are 10 KB of
@@ -10700,26 +12069,76 @@ mod grok_shell_read_gate_tests {
         let root = dir.path().to_string_lossy().into_owned();
         let sources = vec![src.clone()];
 
-        let numbered = vec![grok_shell(&format!("nl -ba {src} | sed -n '1,5000p'"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &numbered, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("10 KB of source, 45 KB printed: truncated");
+        let numbered = vec![grok_shell(
+            &format!("nl -ba {src} | sed -n '1,5000p'"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &numbered,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("10 KB of source, 45 KB printed: truncated");
 
-        let plain = vec![grok_shell(&format!("sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &plain, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect("the same window, undecorated, prints 10 KB");
+        let plain = vec![grok_shell(
+            &format!("sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &plain,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect("the same window, undecorated, prints 10 KB");
 
         // A segment whose output cannot be bounded poisons the call; `wc` (D-017's live habit)
         // is bounded and does not.
-        let unbounded = vec![grok_shell(&format!("find {root} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &unbounded, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("find's output cannot be sized and shares the output");
+        let unbounded = vec![grok_shell(
+            &format!("find {root} && sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &unbounded,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("find's output cannot be sized and shares the output");
         // Brace expansion: a short command, a huge output (Codex, fourth pass).
-        let braces = vec![grok_shell(&format!("echo {{1..40000}} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &braces, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect_err("echo {1..40000} prints far more than its text");
-        let with_wc = vec![grok_shell(&format!("wc -l {src} && sed -n '1,5000p' {src}"), ToolKind::ReadFile)];
-        enforce_reviewer_sight("Codex", &with_wc, "grok-streaming-json", &sources, &root, &mut Vec::new())
-            .expect("wc prints a bounded line");
+        let braces = vec![grok_shell(
+            &format!("echo {{1..40000}} && sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &braces,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect_err("echo {1..40000} prints far more than its text");
+        let with_wc = vec![grok_shell(
+            &format!("wc -l {src} && sed -n '1,5000p' {src}"),
+            ToolKind::ReadFile,
+        )];
+        enforce_reviewer_sight(
+            "Codex",
+            &with_wc,
+            "grok-streaming-json",
+            &sources,
+            &root,
+            &mut Vec::new(),
+        )
+        .expect("wc prints a bounded line");
     }
 
     /// RED IF: a peek passes as the source. `head -5` is the FIND-REVIEW-07 shape.
@@ -10728,8 +12147,15 @@ mod grok_shell_read_gate_tests {
         let tools = vec![grok_shell("head -5 /repo/a.rs", ToolKind::ReadFile)];
         let sources = vec!["/repo/a.rs".to_string()];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
-            .expect_err("a peek is not the source");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &tools,
+            "grok-streaming-json",
+            &sources,
+            "/repo",
+            &mut lifecycle,
+        )
+        .expect_err("a peek is not the source");
         assert!(err.contains("only read PART"), "got: {err}");
     }
 
@@ -10738,13 +12164,27 @@ mod grok_shell_read_gate_tests {
     /// RED IF: any of these passes as "opened".
     #[test]
     fn a_read_of_something_else_that_mentions_the_source_does_not_open_it() {
-        for cmd in ["cat /dev/null < /repo/a.rs", "cat /repo/b.rs # /repo/a.rs", "cat /dev/null"] {
+        for cmd in [
+            "cat /dev/null < /repo/a.rs",
+            "cat /repo/b.rs # /repo/a.rs",
+            "cat /dev/null",
+        ] {
             let mut rec = grok_shell(cmd, ToolKind::ReadFile);
-            rec.args_json = Some(serde_json::json!({ "command": cmd, "description": "reading /repo/a.rs" }).to_string());
+            rec.args_json = Some(
+                serde_json::json!({ "command": cmd, "description": "reading /repo/a.rs" })
+                    .to_string(),
+            );
             let sources = vec!["/repo/a.rs".to_string()];
             let mut lifecycle = Vec::new();
-            let err = enforce_reviewer_sight("Grok", &[rec], "grok-streaming-json", &sources, "/repo", &mut lifecycle)
-                .expect_err(cmd);
+            let err = enforce_reviewer_sight(
+                "Grok",
+                &[rec],
+                "grok-streaming-json",
+                &sources,
+                "/repo",
+                &mut lifecycle,
+            )
+            .expect_err(cmd);
             assert!(
                 err.contains("never successfully opened") || err.contains("only read PART"),
                 "{cmd}: {err}"
@@ -10764,7 +12204,9 @@ mod grok_shell_read_gate_tests {
             ("bash", serde_json::json!({ "command": cmd })),
             ("command_execution", serde_json::json!({ "command": cmd })),
         ] {
-            let rec = ToolCallRecord { shown_output: Some(super::honest_shown_output(&cmd)), returned_lines: Vec::new(),
+            let rec = ToolCallRecord {
+                shown_output: Some(super::honest_shown_output(&cmd)),
+                returned_lines: Vec::new(),
                 id: None,
                 tool: tool.to_string(),
                 kind: ToolKind::ReadFile,
@@ -10774,8 +12216,15 @@ mod grok_shell_read_gate_tests {
             };
             let sources = vec![src.clone()];
             let mut lifecycle = Vec::new();
-            enforce_reviewer_sight("X", &[rec], "grok-streaming-json", &sources, &root, &mut lifecycle)
-                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            enforce_reviewer_sight(
+                "X",
+                &[rec],
+                "grok-streaming-json",
+                &sources,
+                &root,
+                &mut lifecycle,
+            )
+            .unwrap_or_else(|e| panic!("{tool}: {e}"));
         }
     }
 
@@ -10786,8 +12235,15 @@ mod grok_shell_read_gate_tests {
         let tools = vec![grok_shell("wc -l /repo/a.rs", ToolKind::Bash)];
         let sources = vec!["/repo/a.rs".to_string()];
         let mut lifecycle = Vec::new();
-        let err = enforce_reviewer_sight("Grok", &tools, "grok-streaming-json", &sources, "/repo", &mut lifecycle)
-            .expect_err("wc is not a read");
+        let err = enforce_reviewer_sight(
+            "Grok",
+            &tools,
+            "grok-streaming-json",
+            &sources,
+            "/repo",
+            &mut lifecycle,
+        )
+        .expect_err("wc is not a read");
         assert!(err.contains("never successfully opened"), "got: {err}");
     }
 }
@@ -10831,7 +12287,8 @@ mod strict_agent_tests {
     }
 
     fn write_script(path: &std::path::Path, body: &str) {
-        crate::write_test_executable(path, format!("#!/bin/sh\n{body}\n")).expect("write test executable");
+        crate::write_test_executable(path, format!("#!/bin/sh\n{body}\n"))
+            .expect("write test executable");
     }
 
     /// agy always fails on quota. codex always answers, and leaves a file saying it ran.
@@ -10840,7 +12297,10 @@ mod strict_agent_tests {
         let codex_ran = dir.path().join("codex-ran");
         let agy = dir.path().join("mock-agy");
         let codex = dir.path().join("mock-codex");
-        write_script(&agy, "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2");
+        write_script(
+            &agy,
+            "echo 'Error: RESOURCE_EXHAUSTED quota exceeded' 1>&2; exit 2",
+        );
         write_script(
             &codex,
             &format!(
@@ -10878,16 +12338,23 @@ mod strict_agent_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
     async fn strict_00_default_route_never_substitutes_codex() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _agy = crate::agy::tests::ENV_LOCK.lock().await;
         let fx = setup();
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_DEGRADED_ROUTE") };
 
         execute_ask_agent(&request(&fx, None), None)
             .await
-            .expect_err("an unavailable Gemini backend is a failure by default, not codex's answer");
+            .expect_err(
+                "an unavailable Gemini backend is a failure by default, not codex's answer",
+            );
 
-        assert!(!fx.codex_ran.exists(), "codex must not be spawned under the default route");
+        assert!(
+            !fx.codex_ran.exists(),
+            "codex must not be spawned under the default route"
+        );
     }
 
     /// THE NEGATIVE CONTROL. Without `strict_agent` this fixture substitutes codex, which is
@@ -10896,7 +12363,9 @@ mod strict_agent_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
     async fn strict_01_without_strict_the_fixture_substitutes_codex() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _agy = crate::agy::tests::ENV_LOCK.lock().await;
         let fx = setup();
 
@@ -10906,7 +12375,10 @@ mod strict_agent_tests {
 
         assert_eq!(out.agent, "gemini");
         assert_eq!(out.answered_by_agent.as_deref(), Some("codex"));
-        assert!(fx.codex_ran.exists(), "codex must have been spawned for the control to mean anything");
+        assert!(
+            fx.codex_ran.exists(),
+            "codex must have been spawned for the control to mean anything"
+        );
     }
 
     /// RED IF: the `strict_agent` gate is removed from the degraded route. codex answers, the
@@ -10914,21 +12386,31 @@ mod strict_agent_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
     async fn strict_02_strict_fails_with_the_seats_own_error_and_never_spawns_codex() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _agy = crate::agy::tests::ENV_LOCK.lock().await;
         let fx = setup();
 
         let err = execute_ask_agent(&request(&fx, Some(true)), None)
             .await
-            .expect_err("an unavailable backend under strict_agent is a failure, not codex's answer");
+            .expect_err(
+                "an unavailable backend under strict_agent is a failure, not codex's answer",
+            );
 
-        assert!(err.contains("STRICT_NO_SUBSTITUTION"), "the lifecycle must say why; got: {err}");
+        assert!(
+            err.contains("STRICT_NO_SUBSTITUTION"),
+            "the lifecycle must say why; got: {err}"
+        );
         let lower = err.to_lowercase();
         assert!(
             lower.contains("quota") || lower.contains("capacity"),
             "the error must be agy's own, not a later hop's; got: {err}"
         );
-        assert!(!fx.codex_ran.exists(), "no other agent may even be spawned under strict_agent");
+        assert!(
+            !fx.codex_ran.exists(),
+            "no other agent may even be spawned under strict_agent"
+        );
     }
 }
 
@@ -10954,7 +12436,11 @@ mod sight_gate_canary_tests {
 mod stall_kill_tests {
     use super::*;
 
-    const ENV_KEYS: [&str; 3] = ["TRIUMVIRATE_HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_STALL_SECS_CODEX"];
+    const ENV_KEYS: [&str; 3] = [
+        "TRIUMVIRATE_HOME",
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_STALL_SECS_CODEX",
+    ];
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -11018,7 +12504,9 @@ mod stall_kill_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
     async fn marker_01_a_reply_of_only_a_tool_marker_is_not_done() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fx = setup(
             // The fixture's background sleep would hold stdout open; this test is not about stalls.
             r#"kill $!
@@ -11030,7 +12518,10 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
         let err = execute_ask_agent(&request(&fx), None)
             .await
             .expect_err("a reply that is only an unexecuted marker is not an answer");
-        assert!(err.contains("replied with only an unexecuted tool call (ledger_query)"), "{err}");
+        assert!(
+            err.contains("replied with only an unexecuted tool call (ledger_query)"),
+            "{err}"
+        );
     }
 
     fn pid_in(fx: &Fixture, name: &str) -> u32 {
@@ -11052,7 +12543,9 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
     async fn stall_01_a_silent_codex_is_killed_at_its_window_with_the_stalled_outcome() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fx = setup("echo '{\"type\":\"turn.started\"}'\nsleep 60", 2);
 
         let started = std::time::Instant::now();
@@ -11061,11 +12554,26 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
             .expect_err("a silent agent must fail");
         let elapsed = started.elapsed();
 
-        assert!(err.contains("stalled after 2 s without progress"), "got: {err}");
-        assert!(err.contains("STALLED"), "the lifecycle must name the stall; got: {err}");
-        assert!(!err.contains("RETRY"), "a stall is not retryable; got: {err}");
-        assert!(elapsed >= Duration::from_secs(2), "killed before its window: {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(10), "not killed near its window: {elapsed:?}");
+        assert!(
+            err.contains("stalled after 2 s without progress"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("STALLED"),
+            "the lifecycle must name the stall; got: {err}"
+        );
+        assert!(
+            !err.contains("RETRY"),
+            "a stall is not retryable; got: {err}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "killed before its window: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "not killed near its window: {elapsed:?}"
+        );
         assert_eq!(invocations(&fx), 1, "exactly one attempt");
         tokio::time::sleep(Duration::from_millis(300)).await;
         for name in ["leader.pid", "grandchild.pid"] {
@@ -11082,7 +12590,9 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
     async fn stall_02_a_slow_codex_inside_its_window_is_not_killed() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fx = setup(
             "for i in 1 2 3 4; do echo '{\"type\":\"turn.started\"}'; sleep 1; done\n\
              echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'\n\
@@ -11122,9 +12632,15 @@ mod stall_unit_tests {
     /// RED IF: a source-gated dispatch reaches the agent without the paths it must read (D-035).
     #[test]
     fn required_sources_are_named_in_the_prompt() {
-        let p = with_required_sources("review this", &["/abs/a.rs".to_string(), "/abs/b.rs".to_string()]);
+        let p = with_required_sources(
+            "review this",
+            &["/abs/a.rs".to_string(), "/abs/b.rs".to_string()],
+        );
         assert!(p.starts_with("review this"));
-        assert!(p.contains("- /abs/a.rs") && p.contains("- /abs/b.rs"), "{p}");
+        assert!(
+            p.contains("- /abs/a.rs") && p.contains("- /abs/b.rs"),
+            "{p}"
+        );
         assert_eq!(with_required_sources("plain", &[]), "plain");
     }
 
@@ -11138,12 +12654,34 @@ mod stall_unit_tests {
         let big = dir.path().join("big.rs");
         std::fs::write(&big, "x".repeat(SHELL_OUTPUT_BUDGET + 1) + "\n").expect("write");
         let (small_s, big_s) = (small.display().to_string(), big.display().to_string());
-        let p = with_required_sources("review", &[small_s.clone(), big_s.clone(), "/no/such/file.rs".to_string()]);
-        assert!(p.contains(&format!("- {small_s} (3 lines, 5 bytes)\n")), "{p}");
-        assert!(p.contains(&format!("- {big_s} (1 lines, {} bytes, over the one-command limit", SHELL_OUTPUT_BUDGET + 2)), "{p}");
-        assert!(p.contains("- /no/such/file.rs\n"), "an unreadable source is listed bare: {p}");
+        let p = with_required_sources(
+            "review",
+            &[
+                small_s.clone(),
+                big_s.clone(),
+                "/no/such/file.rs".to_string(),
+            ],
+        );
+        assert!(
+            p.contains(&format!("- {small_s} (3 lines, 5 bytes)\n")),
+            "{p}"
+        );
+        assert!(
+            p.contains(&format!(
+                "- {big_s} (1 lines, {} bytes, over the one-command limit",
+                SHELL_OUTPUT_BUDGET + 2
+            )),
+            "{p}"
+        );
+        assert!(
+            p.contains("- /no/such/file.rs\n"),
+            "an unreadable source is listed bare: {p}"
+        );
         assert!(p.ends_with(SIGHT_CONTRACT_RULE), "{p}");
-        assert!(SIGHT_CONTRACT_RULE.contains("30000") && SHELL_OUTPUT_BUDGET == 30_000, "the rule's number is the gate's");
+        assert!(
+            SIGHT_CONTRACT_RULE.contains("30000") && SHELL_OUTPUT_BUDGET == 30_000,
+            "the rule's number is the gate's"
+        );
     }
 
     /// RED IF: the detector's own STUCK events count as progress. They fire while a run is
@@ -11160,7 +12698,10 @@ mod stall_unit_tests {
     fn only_connectors_that_stream_progress_are_stall_killed() {
         assert!(!streams_live_progress("gemini", Some(GeminiBackend::Agy)));
         assert!(!streams_live_progress("deepseek", None));
-        assert!(streams_live_progress("gemini", Some(GeminiBackend::GeminiCli)));
+        assert!(streams_live_progress(
+            "gemini",
+            Some(GeminiBackend::GeminiCli)
+        ));
         assert!(streams_live_progress("codex", None));
         assert!(streams_live_progress("grok", None));
     }
@@ -11169,7 +12710,10 @@ mod stall_unit_tests {
     fn no_window_means_no_deadline() {
         let now = Instant::now();
         assert_eq!(stall_deadline(None, now), None);
-        assert_eq!(stall_deadline(Some(Duration::from_secs(5)), now), Some(now + Duration::from_secs(5)));
+        assert_eq!(
+            stall_deadline(Some(Duration::from_secs(5)), now),
+            Some(now + Duration::from_secs(5))
+        );
     }
 
     /// RED IF: an attempt that reported no child (an HTTP agent) tries to signal something.
@@ -11203,7 +12747,15 @@ mod sight_repair_tests {
             response_text: "PARTIAL REVIEW".to_string(),
             session_id: Some("thread-1".to_string()),
             tool_calls: calls,
-            token_usage: Some(agent_adapter::TokenUsage { input: Some(100), output: Some(10), cached: None, thinking_tokens: None, latency_ms: None, tool_calls: None, total: Some(110) }),
+            token_usage: Some(agent_adapter::TokenUsage {
+                input: Some(100),
+                output: Some(10),
+                cached: None,
+                thinking_tokens: None,
+                latency_ms: None,
+                tool_calls: None,
+                total: Some(110),
+            }),
             parser_mode: "codex-exec-json".to_string(),
             ..Default::default()
         }
@@ -11220,13 +12772,29 @@ mod sight_repair_tests {
     fn stub(body: &str) -> Stub {
         let dir = tempfile::tempdir().expect("tempdir");
         let src = dir.path().join("src.rs");
-        std::fs::write(&src, (1..=480).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=480).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let src = src.display().to_string();
         let bin = dir.path().join("fake-codex-repair");
         let d = dir.path().display();
-        crate::write_test_executable(&bin, format!("#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n", crate::tests::JSON_ESCAPE_SH)).expect("write test executable");
-        let restore = crate::agy::tests::set_env_scoped("TRIUMVIRATE_CODEX_BIN", Some(bin.to_str().unwrap()));
-        Stub { dir, src, _restore: restore }
+        crate::write_test_executable(
+            &bin,
+            format!(
+                "#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n",
+                crate::tests::JSON_ESCAPE_SH
+            ),
+        )
+        .expect("write test executable");
+        let restore =
+            crate::agy::tests::set_env_scoped("TRIUMVIRATE_CODEX_BIN", Some(bin.to_str().unwrap()));
+        Stub {
+            dir,
+            src,
+            _restore: restore,
+        }
     }
 
     const READ_REST: &str = r#"printf '{"type":"thread.started","thread_id":"thread-1"}\n'
@@ -11247,7 +12815,10 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     }
 
     fn snapshot(req: &AskAgentRequest, cwd: &str) -> Vec<Option<Vec<u8>>> {
-        req.required_sources.iter().map(|s| source_bytes(s, cwd)).collect()
+        req.required_sources
+            .iter()
+            .map(|s| source_bytes(s, cwd))
+            .collect()
     }
 
     /// RED IF: only PARTIAL and NEVER-OPENED with a real read are repairable stops holding.
@@ -11255,18 +12826,51 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     fn only_a_missed_spot_is_repairable() {
         let src = vec!["/r/a.rs".to_string()];
         let read = read_call("sed -n '1,10p' /r/a.rs".to_string(), true);
-        assert!(sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &src));
-        assert!(!sight_failure_is_repairable(&[], "codex-exec-json", &src), "zero tool calls");
-        assert!(!sight_failure_is_repairable(&[read_call("ls /r".to_string(), true)], "codex-exec-json", &src), "no read at all");
-        assert!(!sight_failure_is_repairable(&[read_call("sed -n '1,10p' /r/a.rs".to_string(), false)], "codex-exec-json", &src), "a failed read");
-        assert!(!sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &[]), "no named sources");
-        assert!(!sight_failure_is_repairable(std::slice::from_ref(&read), "agy-pipe-plain-text", &src), "blind parser");
+        assert!(sight_failure_is_repairable(
+            std::slice::from_ref(&read),
+            "codex-exec-json",
+            &src
+        ));
+        assert!(
+            !sight_failure_is_repairable(&[], "codex-exec-json", &src),
+            "zero tool calls"
+        );
+        assert!(
+            !sight_failure_is_repairable(
+                &[read_call("ls /r".to_string(), true)],
+                "codex-exec-json",
+                &src
+            ),
+            "no read at all"
+        );
+        assert!(
+            !sight_failure_is_repairable(
+                &[read_call("sed -n '1,10p' /r/a.rs".to_string(), false)],
+                "codex-exec-json",
+                &src
+            ),
+            "a failed read"
+        );
+        assert!(
+            !sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &[]),
+            "no named sources"
+        );
+        assert!(
+            !sight_failure_is_repairable(std::slice::from_ref(&read), "agy-pipe-plain-text", &src),
+            "blind parser"
+        );
         let mut write = read.clone();
         write.kind = ToolKind::WriteFile;
-        assert!(!sight_failure_is_repairable(&[read.clone(), write], "codex-exec-json", &src), "a write");
+        assert!(
+            !sight_failure_is_repairable(&[read.clone(), write], "codex-exec-json", &src),
+            "a write"
+        );
         let mut collab = read.clone();
         collab.tool = agent_adapter::codex::COLLAB_TOOL.to_string();
-        assert!(!sight_failure_is_repairable(&[read, collab], "codex-exec-json", &src), "a delegation");
+        assert!(
+            !sight_failure_is_repairable(&[read, collab], "codex-exec-json", &src),
+            "a delegation"
+        );
     }
 
     /// RED IF: the merged turn drops a turn's tool calls, does not sum tokens, or does not say
@@ -11280,43 +12884,97 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let m = merge_repaired_turn(&a, b);
         assert_eq!(m.tool_calls.len(), 2);
         assert_eq!(m.token_usage.as_ref().and_then(|t| t.total), Some(220));
-        assert!(m.response_text.starts_with("[sight repair:") && m.response_text.ends_with("FULL"), "{}", m.response_text);
+        assert!(
+            m.response_text.starts_with("[sight repair:") && m.response_text.ends_with("FULL"),
+            "{}",
+            m.response_text
+        );
     }
 
     /// End to end through a stand-in codex. RED IF: the repair does not resume turn 1's own
     /// thread, does not union the two turns, or passes when it should not.
     #[tokio::test]
     async fn a_partial_read_is_repaired_in_the_same_session() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = stub(READ_REST);
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        assert!(enforce_reviewer_sight("Codex", &first.tool_calls, &first.parser_mode, &req.required_sources, &cwd, &mut lc).is_err(), "turn 1 alone is partial");
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+        assert!(
+            enforce_reviewer_sight(
+                "Codex",
+                &first.tool_calls,
+                &first.parser_mode,
+                &req.required_sources,
+                &cwd,
+                &mut lc
+            )
+            .is_err(),
+            "turn 1 alone is partial"
+        );
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Passed(m) => {
-                assert!(m.response_text.ends_with("FULL REVIEW"), "{}", m.response_text);
+                assert!(
+                    m.response_text.ends_with("FULL REVIEW"),
+                    "{}",
+                    m.response_text
+                );
                 assert_eq!(m.tool_calls.len(), 2);
             }
             SightRepair::Failed(e, _) => panic!("should pass: {e}"),
             SightRepair::NotTried => panic!("should try: {lc:?}"),
         }
         let argv = std::fs::read_to_string(st.dir.path().join("argv")).unwrap();
-        assert!(argv.contains("resume") && argv.contains("thread-1"), "resumed its own thread: {argv}");
+        assert!(
+            argv.contains("resume") && argv.contains("thread-1"),
+            "resumed its own thread: {argv}"
+        );
         assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR"));
     }
 
     /// The file changes between the turns. RED IF: turn 1's window of the OLD file still counts.
     #[tokio::test]
     async fn a_source_that_changed_between_turns_counts_only_the_repair_reads() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let st = stub(&format!("printf 'line 0\\n' | cat - \"$SRC\" > \"$SRC.new\" && mv \"$SRC.new\" \"$SRC\"\n{READ_REST}"));
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(&format!(
+            "printf 'line 0\\n' | cat - \"$SRC\" > \"$SRC.new\" && mv \"$SRC.new\" \"$SRC\"\n{READ_REST}"
+        ));
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Failed(e, m) => {
                 assert!(e.contains("changed after turn 1"), "{e}");
                 assert_eq!(m.tool_calls.len(), 2, "both turns kept for the saved file");
@@ -11336,16 +12994,75 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let cwd = st.dir.path().display().to_string();
         let partial = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        let gemini = try_sight_repair("gemini", "Antigravity", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
-        let empty = try_sight_repair("codex", "Codex", &first_turn(Vec::new()), "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
-        let late = try_sight_repair("codex", "Codex", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(30), &mut lc).await;
+        let gemini = try_sight_repair(
+            "gemini",
+            "Antigravity",
+            &partial,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        let empty = try_sight_repair(
+            "codex",
+            "Codex",
+            &first_turn(Vec::new()),
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        let late = try_sight_repair(
+            "codex",
+            "Codex",
+            &partial,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(30),
+            &mut lc,
+        )
+        .await;
         let mut no_session = partial.clone();
         no_session.session_id = None;
-        let unresumable = try_sight_repair("codex", "Codex", &no_session, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
-        for (name, r) in [("gemini", gemini), ("zero tools", empty), ("budget", late), ("no session", unresumable)] {
-            assert!(matches!(r, SightRepair::NotTried), "{name} must not be repaired");
+        let unresumable = try_sight_repair(
+            "codex",
+            "Codex",
+            &no_session,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        for (name, r) in [
+            ("gemini", gemini),
+            ("zero tools", empty),
+            ("budget", late),
+            ("no session", unresumable),
+        ] {
+            assert!(
+                matches!(r, SightRepair::NotTried),
+                "{name} must not be repaired"
+            );
         }
-        assert!(!st.dir.path().join("argv").exists(), "the stand-in was launched");
+        assert!(
+            !st.dir.path().join("argv").exists(),
+            "the stand-in was launched"
+        );
         assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_SKIPPED"));
     }
 
@@ -11353,8 +13070,12 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     /// later test in this binary back to the operator's real ~/.triumvirate.
     #[test]
     fn test_home_stays_isolated() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = std::env::var_os("TRIUMVIRATE_HOME").map(PathBuf::from).expect("TRIUMVIRATE_HOME unset in a test binary");
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::var_os("TRIUMVIRATE_HOME")
+            .map(PathBuf::from)
+            .expect("TRIUMVIRATE_HOME unset in a test binary");
         let real = dirs::home_dir().map(|h| h.join(".triumvirate"));
         assert_ne!(Some(home), real, "tests are writing to the real home");
     }
@@ -11363,16 +13084,39 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     /// snapshot is taken at the repair, so turn 1's window of the old file is unioned.
     #[tokio::test]
     async fn a_change_before_the_repair_starts_is_caught() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = stub(READ_REST);
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
         let before = snapshot(&req, &cwd);
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
-        std::fs::write(&st.src, (1..=480).map(|i| format!("CHANGED {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &st.src,
+            (1..=480)
+                .map(|i| format!("CHANGED {i}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
         let mut lc = Vec::new();
-        let r = try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await;
-        assert!(matches!(r, SightRepair::Failed(ref e, _) if e.contains("changed after turn 1")), "old window covered the new file");
+        let r = try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &before,
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        assert!(
+            matches!(r, SightRepair::Failed(ref e, _) if e.contains("changed after turn 1")),
+            "old window covered the new file"
+        );
     }
 
     /// Two sources: A read whole on turn 1 and unchanged, B changed and read whole on the repair.
@@ -11385,7 +13129,8 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
 printf '{"type":"thread.started","thread_id":"thread-1"}\n'
 printf '{"type":"item.started","item":{"type":"command_execution","id":"c9","command":"cat %s"}}\n' "$SRC"
 printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"cat %s","exit_code":0,"aggregated_output":"%s"}}\n' "$SRC" "$(jesc "$(cat "$SRC")")"
-printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'"#);
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'"#,
+        );
         let a = st.dir.path().join("a.rs");
         std::fs::write(&a, "a1\na2\n").unwrap();
         let a = a.display().to_string();
@@ -11393,9 +13138,25 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REV
         req.required_sources = vec![a.clone(), st.src.clone()];
         let cwd = st.dir.path().display().to_string();
         let before = snapshot(&req, &cwd);
-        let first = first_turn(vec![read_call(format!("cat {a}"), true), read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let first = first_turn(vec![
+            read_call(format!("cat {a}"), true),
+            read_call(format!("sed -n '1,240p' {}", st.src), true),
+        ]);
         let mut lc = Vec::new();
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &before,
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Passed(_) => {}
             SightRepair::Failed(e, _) => panic!("A's unchanged turn-1 read was dropped: {e}"),
             SightRepair::NotTried => panic!("should try"),
@@ -11406,15 +13167,33 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REV
     /// RED IF: a repair turn that errors is reported as turn 1's error alone (Antigravity).
     #[tokio::test]
     async fn a_repair_that_does_not_finish_says_so() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = stub("exit 3");
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Failed(e, kept) => {
-                assert!(e.starts_with("TURN 1 ERROR") && e.contains("did not finish"), "{e}");
+                assert!(
+                    e.starts_with("TURN 1 ERROR") && e.contains("did not finish"),
+                    "{e}"
+                );
                 assert_eq!(kept.response_text, "PARTIAL REVIEW");
             }
             _ => panic!("a repair that errored must be a named failure"),
@@ -11434,8 +13213,16 @@ mod unexecuted_tool_marker_tests {
         let src = include_str!("agent_exec.rs");
         let call = ["let mut sight_err = ", "unexecuted_tool_marker("].concat();
         let old = ["let mut sight_err = ", "None;"].concat();
-        assert_eq!(src.matches(call.as_str()).count(), 2, "primary and degraded arms");
-        assert_eq!(src.matches(old.as_str()).count(), 0, "no arm starts without the check");
+        assert_eq!(
+            src.matches(call.as_str()).count(),
+            2,
+            "primary and degraded arms"
+        );
+        assert_eq!(
+            src.matches(old.as_str()).count(),
+            0,
+            "no arm starts without the check"
+        );
     }
 
     /// The live shape (Mneme handoff, request 5c988187): the whole reply was one marker.
@@ -11443,27 +13230,903 @@ mod unexecuted_tool_marker_tests {
     #[test]
     fn a_reply_of_only_markers_is_refused_and_prose_around_one_is_not() {
         let bare = r#"<triumvirate_tool name="ledger_query">{"query":"one token data providers"}</triumvirate_tool>"#;
-        let err = unexecuted_tool_marker("Codex", &format!("\n  {bare}\n")).expect("a bare marker is not an answer");
-        assert!(err.contains("Codex replied with only an unexecuted tool call (ledger_query)"), "{err}");
+        let err = unexecuted_tool_marker("Codex", &format!("\n  {bare}\n"))
+            .expect("a bare marker is not an answer");
+        assert!(
+            err.contains("Codex replied with only an unexecuted tool call (ledger_query)"),
+            "{err}"
+        );
 
         let two = format!("{bare}\n<triumvirate_tool name=\"lesson_list\"></triumvirate_tool>");
-        assert!(unexecuted_tool_marker("Codex", &two).expect("two markers").contains("(ledger_query, lesson_list)"));
+        assert!(
+            unexecuted_tool_marker("Codex", &two)
+                .expect("two markers")
+                .contains("(ledger_query, lesson_list)")
+        );
 
         let broken = r#"<triumvirate_tool>{"query":"x"}</triumvirate_tool>"#;
-        assert!(unexecuted_tool_marker("Codex", broken).expect("a malformed marker").contains("(unparsed)"));
+        assert!(
+            unexecuted_tool_marker("Codex", broken)
+                .expect("a malformed marker")
+                .contains("(unparsed)")
+        );
 
-        assert_eq!(unexecuted_tool_marker("Codex", &format!("The reply was {bare}, which nothing runs.")), None);
-        assert_eq!(unexecuted_tool_marker("Codex", &format!("{bare}\nThen I answered: two providers.")), None);
-        assert!(unexecuted_tool_marker("Codex", "<triumvirate_tool name=\"x\"> never closed").expect("unclosed").contains("(unclosed)"));
+        assert_eq!(
+            unexecuted_tool_marker(
+                "Codex",
+                &format!("The reply was {bare}, which nothing runs.")
+            ),
+            None
+        );
+        assert_eq!(
+            unexecuted_tool_marker("Codex", &format!("{bare}\nThen I answered: two providers.")),
+            None
+        );
+        assert!(
+            unexecuted_tool_marker("Codex", "<triumvirate_tool name=\"x\"> never closed")
+                .expect("unclosed")
+                .contains("(unclosed)")
+        );
         let fenced = format!("```xml\n{bare}\n```");
-        assert!(unexecuted_tool_marker("Codex", &fenced).expect("a fenced marker").contains("(ledger_query)"));
-        assert_eq!(unexecuted_tool_marker("Codex", &format!("```xml\n{bare}\n```\nThat is the call I would make.")), None);
+        assert!(
+            unexecuted_tool_marker("Codex", &fenced)
+                .expect("a fenced marker")
+                .contains("(ledger_query)")
+        );
+        assert_eq!(
+            unexecuted_tool_marker(
+                "Codex",
+                &format!("```xml\n{bare}\n```\nThat is the call I would make.")
+            ),
+            None
+        );
         assert_eq!(unexecuted_tool_marker("Codex", "a plain answer"), None);
         // A longer tag name is not a marker, and only a whole name attribute names one.
-        assert_eq!(unexecuted_tool_marker("Codex", "<triumvirate_toolbox>x</triumvirate_tool>"), None);
+        assert_eq!(
+            unexecuted_tool_marker("Codex", "<triumvirate_toolbox>x</triumvirate_tool>"),
+            None
+        );
         let surname = r#"<triumvirate_tool surname="x">{}</triumvirate_tool>"#;
-        assert!(unexecuted_tool_marker("Codex", surname).expect("still a marker").contains("(unparsed)"));
+        assert!(
+            unexecuted_tool_marker("Codex", surname)
+                .expect("still a marker")
+                .contains("(unparsed)")
+        );
         let junk = r#"<triumvirate_tool name="ledger_query"junk>{}</triumvirate_tool>"#;
-        assert!(unexecuted_tool_marker("Codex", junk).expect("still a marker").contains("(unparsed)"));
+        assert!(
+            unexecuted_tool_marker("Codex", junk)
+                .expect("still a marker")
+                .contains("(unparsed)")
+        );
+    }
+}
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization: today's per-agent dispatch policy for the five existing
+/// seats, pinned before T-202 moves these sites onto the SeatProfile table. Each assertion is the CURRENT value.
+/// RED IF: any seat's live-progress flag, parser-mode allowlist, sight-repair membership or attempt schedule changes.
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn streams_live_progress_per_seat() {
+        assert!(streams_live_progress("gemini", None));
+        assert!(streams_live_progress(
+            "gemini",
+            Some(GeminiBackend::GeminiCli)
+        ));
+        assert!(!streams_live_progress("gemini", Some(GeminiBackend::Agy)));
+        assert!(!streams_live_progress("deepseek", None));
+        for live in ["codex", "grok", "claude"] {
+            assert!(streams_live_progress(live, None), "{live}");
+        }
+    }
+
+    #[test]
+    fn parser_mode_allowlists_and_sight_repair_seats() {
+        // T-202: the lists are derived from the seat table. The five existing seats' modes are unchanged, the three
+        // new seats add one mode each, and order is roster order (it never carried meaning).
+        assert_eq!(
+            parser_modes_with_tool_records(),
+            &[
+                "agy-stream-json",
+                "gemini-stream-json",
+                "codex-exec-json",
+                "claude-stream-json",
+                "grok-streaming-json",
+                "kimi-stream-json",
+                "mistral-streaming",
+                "qwen-stream-json",
+            ]
+        );
+        assert_eq!(
+            parser_modes_that_classify_reads(),
+            parser_modes_with_tool_records()
+        );
+        assert_eq!(sight_repair_agents(), &["codex", "grok"]);
+    }
+
+    #[test]
+    fn attempt_schedule_per_seat() {
+        let single = vec![(Duration::ZERO, None)];
+        let retried = vec![
+            (Duration::from_millis(250), None),
+            (Duration::from_secs(1), None),
+            (Duration::from_secs(2), None),
+        ];
+        // A sight-gated review is one attempt for every seat.
+        for agent in ["gemini", "codex", "deepseek", "claude", "grok"] {
+            assert_eq!(
+                attempt_schedule_for(agent, None, true, false),
+                single,
+                "{agent} review"
+            );
+        }
+        assert_eq!(attempt_schedule_for("deepseek", None, false, false), single);
+        assert_eq!(attempt_schedule_for("grok", None, false, false), single);
+        assert_eq!(attempt_schedule_for("codex", None, false, false), retried);
+        assert_eq!(attempt_schedule_for("claude", None, false, false), retried);
+        // gemini: agy is single; gemini-cli strict pins the first model; non-strict walks the faildown chain.
+        assert_eq!(
+            attempt_schedule_for("gemini", Some(GeminiBackend::Agy), false, false),
+            single
+        );
+        assert_eq!(
+            attempt_schedule_for("gemini", Some(GeminiBackend::GeminiCli), false, true),
+            vec![(Duration::ZERO, Some(GEMINI_MODEL_FAILDOWN[0]))]
+        );
+        let chain = attempt_schedule_for("gemini", Some(GeminiBackend::GeminiCli), false, false);
+        assert_eq!(chain.len(), GEMINI_MODEL_FAILDOWN.len());
+        for (i, (backoff, model)) in chain.iter().enumerate() {
+            let want = if i == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(500)
+            };
+            assert_eq!(
+                (*backoff, *model),
+                (want, Some(GEMINI_MODEL_FAILDOWN[i])),
+                "gemini step {i}"
+            );
+        }
+    }
+}
+
+/// Seven Primes T-202 consumer tests for the dispatch-policy sites moved onto SeatProfile.
+/// RED IF: a new seat's attempt schedule, live-progress flag, parser-mode membership or usage label stops following
+/// its row.
+#[cfg(test)]
+mod seven_primes_consumer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The schedule a policy means, spelled out with its delays (the expectation side of the attempt tests).
+    fn expected_schedule(
+        policy: mcp_bridge::seat_profile::AttemptPolicy,
+    ) -> Vec<(Duration, Option<&'static str>)> {
+        use mcp_bridge::seat_profile::AttemptPolicy;
+        match policy {
+            AttemptPolicy::Single => vec![(Duration::ZERO, None)],
+            AttemptPolicy::Retry3 => vec![
+                (Duration::from_millis(250), None),
+                (Duration::from_secs(1), None),
+                (Duration::from_secs(2), None),
+            ],
+            // gemini-cli backend (None), not strict: the whole faildown chain.
+            AttemptPolicy::GeminiFaildown => GEMINI_MODEL_FAILDOWN
+                .iter()
+                .enumerate()
+                .map(|(i, model)| {
+                    let backoff = if i == 0 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(500)
+                    };
+                    (backoff, Some(*model))
+                })
+                .collect(),
+        }
+    }
+
+    /// The live consumers follow each new seat's row: the attempt schedule is the one `row.attempt_policy` means
+    /// (with its delays), sight repair matches `row.sight_repair`, and a cloned row with either field changed changes
+    /// the consumer's output. An unknown name gets the Retry3 schedule element by element.
+    /// RED IF: the schedule or sight-repair membership stops following the row, or the no-row default changes.
+    #[test]
+    fn new_seats_follow_their_rows() {
+        use mcp_bridge::seat_profile::AttemptPolicy;
+        for seat in ["kimi", "mistral", "qwen"] {
+            let row = mcp_bridge::seat_profile::seat_profile(seat).unwrap();
+            assert_eq!(
+                attempt_schedule_for(seat, None, false, false),
+                expected_schedule(row.attempt_policy),
+                "{seat}"
+            );
+            assert_eq!(row.attempt_policy, AttemptPolicy::Single, "{seat}: REQ-050");
+            let mut mutated = row.clone();
+            for policy in [
+                AttemptPolicy::Single,
+                AttemptPolicy::Retry3,
+                AttemptPolicy::GeminiFaildown,
+            ] {
+                mutated.attempt_policy = policy;
+                assert_eq!(
+                    attempt_schedule_for_row(Some(&mutated), None, false, false),
+                    expected_schedule(policy),
+                    "{seat} {policy:?}"
+                );
+            }
+            assert_eq!(
+                sight_repair_agents().contains(&seat),
+                row.sight_repair,
+                "{seat}"
+            );
+            let flipped: Vec<_> = mcp_bridge::seat_profile::all_seats()
+                .iter()
+                .cloned()
+                .map(|mut r| {
+                    if r.key == seat {
+                        r.sight_repair = !r.sight_repair;
+                    }
+                    r
+                })
+                .collect();
+            assert_eq!(
+                sight_repair_agents_from(&flipped).contains(&seat),
+                !row.sight_repair,
+                "{seat}: flipping the row flips membership"
+            );
+            assert_eq!(
+                streams_live_progress(seat, None),
+                row.live_progress == mcp_bridge::seat_profile::LiveProgress::Streams,
+                "{seat}"
+            );
+            for mode in row.parser_modes {
+                assert!(
+                    parser_modes_with_tool_records().contains(mode),
+                    "{seat} {mode}"
+                );
+                assert!(
+                    parser_modes_that_classify_reads().contains(mode),
+                    "{seat} {mode}"
+                );
+            }
+            assert!(
+                !sight_repair_agents().contains(&seat),
+                "{seat}: sight repair is off at launch"
+            );
+        }
+        // Aliases reach the same row.
+        assert_eq!(
+            attempt_schedule_for("vibe", None, false, false),
+            expected_schedule(
+                mcp_bridge::seat_profile::seat_profile("mistral")
+                    .unwrap()
+                    .attempt_policy
+            )
+        );
+        // A name with no row keeps the old default, three attempts at 250 ms, 1 s, 2 s.
+        assert_eq!(
+            attempt_schedule_for("not-a-seat", None, false, false),
+            vec![
+                (Duration::from_millis(250), None),
+                (Duration::from_secs(1), None),
+                (Duration::from_secs(2), None),
+            ]
+        );
+        assert!(streams_live_progress("not-a-seat", None));
+    }
+
+    /// REQ-041: missing usage is labeled `not_reported`; a REPORTED zero stays `exact`; agy stays `unmetered`.
+    #[test]
+    fn usage_source_distinguishes_missing_from_zero() {
+        let mut parsed = ParsedAgentResult {
+            parser_mode: "kimi-stream-json".into(),
+            ..Default::default()
+        };
+        assert_eq!(usage_source_for(&parsed), "not_reported");
+        parsed.token_usage = Some(agent_adapter::TokenUsage {
+            input: Some(0),
+            output: Some(0),
+            cached: None,
+            thinking_tokens: None,
+            latency_ms: None,
+            tool_calls: None,
+            total: Some(0),
+        });
+        assert_eq!(usage_source_for(&parsed), "exact");
+        parsed.parser_mode = "agy-stream-json".into();
+        assert_eq!(usage_source_for(&parsed), "unmetered");
+    }
+
+    fn row(key: &str) -> mcp_bridge::seat_profile::SeatProfile {
+        mcp_bridge::seat_profile::seat_profile(key).unwrap().clone()
+    }
+
+    /// REQ-043: Mistral (ExportConfig) and Qwen (MessageModel) record the seat's parsed served model; gemini keeps
+    /// agy's runtime report from cli_version; kimi (NotExposed) and Legacy rows record nothing; a blank name is Missing.
+    /// RED IF: SeatParsed.served_model is ignored for ExportConfig or MessageModel seats, or the agy path breaks.
+    #[test]
+    fn served_model_record_follows_the_evidence_row() {
+        let parsed = ParsedAgentResult {
+            cli_version: Some("Gemini 3.1 Pro (High)".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            served_model_record(Some(&row("gemini")), &parsed, Some("ignored")),
+            ServedModelRecord::Model("Gemini 3.1 Pro (High)")
+        );
+        assert_eq!(
+            served_model_record(Some(&row("mistral")), &parsed, Some("devstral-2")),
+            ServedModelRecord::Model("devstral-2")
+        );
+        assert_eq!(
+            served_model_record(Some(&row("qwen")), &parsed, Some("qwen3-coder-plus")),
+            ServedModelRecord::Model("qwen3-coder-plus")
+        );
+        assert_eq!(
+            served_model_record(Some(&row("qwen")), &parsed, Some("  ")),
+            ServedModelRecord::Missing
+        );
+        assert_eq!(
+            served_model_record(Some(&row("mistral")), &parsed, None),
+            ServedModelRecord::Missing
+        );
+        assert_eq!(
+            served_model_record(Some(&row("kimi")), &parsed, Some("k2")),
+            ServedModelRecord::NotExposed
+        );
+        assert_eq!(
+            served_model_record(Some(&row("codex")), &parsed, Some("gpt")),
+            ServedModelRecord::NotExposed
+        );
+        assert_eq!(
+            served_model_record(None, &parsed, Some("x")),
+            ServedModelRecord::NotExposed
+        );
+        // A mutated row moves the source: kimi switched to MessageModel records the seat's model.
+        let mut kimi = row("kimi");
+        kimi.served_model_evidence = mcp_bridge::seat_profile::ModelEvidence::MessageModel;
+        assert_eq!(
+            served_model_record(Some(&kimi), &parsed, Some("k2")),
+            ServedModelRecord::Model("k2")
+        );
+        let empty = ParsedAgentResult::default();
+        assert_eq!(
+            served_model_record(Some(&row("gemini")), &empty, None),
+            ServedModelRecord::Missing
+        );
+    }
+
+    /// The call site's step reaches CallTelemetry::set_model for an ExportConfig / MessageModel seat and for agy, and
+    /// leaves the served model unset for kimi.
+    /// RED IF: record_served_model stops calling set_model with the parsed served model.
+    #[test]
+    fn record_served_model_sets_the_telemetry_model() {
+        let span = Span::none();
+        let parsed = ParsedAgentResult {
+            cli_version: Some("Gemini 3.1 Pro (High)".into()),
+            ..Default::default()
+        };
+        let cases: [(&str, Option<&str>, Option<&str>); 4] = [
+            ("mistral", Some("devstral-2"), Some("devstral-2")),
+            ("qwen", Some("qwen3-coder-plus"), Some("qwen3-coder-plus")),
+            ("gemini", None, Some("Gemini 3.1 Pro (High)")),
+            ("kimi", Some("k2"), None),
+        ];
+        for (seat, seat_model, want) in cases {
+            let mut tel = mcp_bridge::posthog::CallTelemetry::new(seat, "trace", None);
+            record_served_model(&mut tel, &span, Some(&row(seat)), &parsed, seat_model);
+            assert_eq!(tel.served_model(), want, "{seat}");
+            tel.rejected("test: the emitted event does not matter");
+        }
+    }
+
+    /// Each dispatch-policy consumer reads the row it is handed: a cloned row with the field changed changes the
+    /// output (attempt schedule, live progress, both parser-mode lists, sight repair).
+    /// RED IF: any of these consumers is a constant or per-agent match instead of reading the row field.
+    #[test]
+    fn dispatch_consumers_follow_mutated_rows() {
+        use mcp_bridge::seat_profile::{AttemptPolicy, LiveProgress};
+        let single = vec![(Duration::ZERO, None)];
+
+        let mut kimi = row("kimi");
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false),
+            attempt_schedule_for("kimi", None, false, false)
+        );
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false),
+            single
+        );
+        kimi.attempt_policy = AttemptPolicy::Retry3;
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false).len(),
+            3
+        );
+        kimi.attempt_policy = AttemptPolicy::GeminiFaildown;
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, false, false).len(),
+            GEMINI_MODEL_FAILDOWN.len()
+        );
+        assert_eq!(
+            attempt_schedule_for_row(Some(&kimi), None, true, false),
+            single,
+            "a review stays one attempt"
+        );
+
+        let mut seat = row("kimi");
+        assert_eq!(
+            streams_live_progress_for_row(Some(&seat), None),
+            streams_live_progress("kimi", None)
+        );
+        seat.live_progress = LiveProgress::Buffered;
+        assert!(!streams_live_progress_for_row(Some(&seat), None));
+        seat.live_progress = LiveProgress::Streams;
+        assert!(streams_live_progress_for_row(Some(&seat), None));
+        seat.live_progress = LiveProgress::StreamsExceptAgy;
+        assert!(!streams_live_progress_for_row(
+            Some(&seat),
+            Some(GeminiBackend::Agy)
+        ));
+        assert!(streams_live_progress_for_row(
+            Some(&seat),
+            Some(GeminiBackend::GeminiCli)
+        ));
+
+        let mut rows = mcp_bridge::seat_profile::all_seats().to_vec();
+        assert_eq!(
+            modes_with_tool_records_from(&rows),
+            parser_modes_with_tool_records()
+        );
+        assert_eq!(
+            modes_that_classify_reads_from(&rows),
+            parser_modes_that_classify_reads()
+        );
+        assert_eq!(sight_repair_agents_from(&rows), sight_repair_agents());
+        for r in &mut rows {
+            match r.key {
+                "kimi" => {
+                    r.records_tool_calls = false;
+                    r.sight_repair = true;
+                }
+                "qwen" => r.classifies_reads = false,
+                "codex" => r.sight_repair = false,
+                _ => {}
+            }
+        }
+        let tool = modes_with_tool_records_from(&rows);
+        assert!(!tool.contains(&"kimi-stream-json"), "{tool:?}");
+        assert!(tool.contains(&"qwen-stream-json"), "{tool:?}");
+        let reads = modes_that_classify_reads_from(&rows);
+        assert!(!reads.contains(&"qwen-stream-json"), "{reads:?}");
+        assert!(reads.contains(&"kimi-stream-json"), "{reads:?}");
+        assert_eq!(sight_repair_agents_from(&rows), vec!["grok", "kimi"]);
+    }
+}
+
+/// Seven Primes T-204 (REQ-090, REQ-091, REQ-062): the seat gate at the ask-family call sites, with mock agent
+/// binaries that append their own name to a marker file. Shared helpers here are used by main.rs's entry-point tests.
+#[cfg(test)]
+// The env lock is held across awaits on purpose: these tests repoint every agent binary through process env.
+#[allow(clippy::await_holding_lock)]
+pub(crate) mod seven_primes_gate_tests {
+    use super::*;
+    use mcp_bridge::seat_gate::Surface;
+    use shared_types::{AskSurface, Origin};
+
+    static DISPATCHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Called at the top of `run_named_agent_with_session_and_model`, where a seat's credentials start being read.
+    pub(crate) fn note_dispatch_reached(agent: &str) {
+        DISPATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(agent.to_string());
+    }
+
+    /// How many times this seat has reached dispatch (credential access) in this test binary.
+    pub(crate) fn dispatch_count(seat: &str) -> usize {
+        DISPATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|s| *s == seat)
+            .count()
+    }
+
+    pub(crate) const ENV: &[&str] = &[
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_CODEX_ARGS",
+        "TRIUMVIRATE_GEMINI_BIN",
+        "TRIUMVIRATE_GEMINI_ARGS",
+        "TRIUMVIRATE_GEMINI_BACKEND",
+        "TRIUMVIRATE_AGY_BIN",
+        "TRIUMVIRATE_AGY_ARGS",
+        "TRIUMVIRATE_CLAUDE_BIN",
+        "TRIUMVIRATE_CLAUDE_ARGS",
+        "TRIUMVIRATE_GROK_BIN",
+        "TRIUMVIRATE_GROK_ARGS",
+        "TRIUMVIRATE_KIMI_BIN",
+        "TRIUMVIRATE_MISTRAL_BIN",
+        "TRIUMVIRATE_QWEN_BIN",
+        "TRIUMVIRATE_HOME",
+        "TRIUMVIRATE_ENABLE_KIMI",
+        "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+        "TRIUMVIRATE_MCP_USE_DAEMON",
+        "TRIUMVIRATE_DAEMON_PREWARM",
+        "TRIUMVIRATE_DAEMON_PREWARM_CWDS",
+    ];
+
+    /// Puts every variable in `ENV` back on drop. Hold `crate::tests::env_lock()` for its whole life.
+    pub(crate) struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        pub(crate) fn capture() -> Self {
+            Self(ENV.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                // SAFETY: under the crate env lock, which the caller holds for this guard's whole life.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mock binaries for every existing seat with a local process, an isolated TRIUMVIRATE_HOME, and kimi
+    /// unconfigured. Each mock appends its seat name to `marker` when it runs. agy gets a mock too, so a backend flip
+    /// can never launch the real agent from a test.
+    pub(crate) struct Mocks {
+        pub(crate) dir: tempfile::TempDir,
+        pub(crate) marker: PathBuf,
+        pub(crate) home: PathBuf,
+    }
+
+    impl Mocks {
+        pub(crate) fn install() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let marker = dir.path().join("marker");
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            // T-206: the dispatch cwd is its own empty dir. The new-seat repo audit fails a call whose cwd changes, and
+            // the marker and the daemon's outbox under `home` both change during every call.
+            std::fs::create_dir_all(dir.path().join("cwd")).expect("cwd");
+            let connector = |name: &str| {
+                let bin = dir.path().join(format!("mock-{name}"));
+                let script = format!(
+                    "#!/bin/sh\necho {name} >> '{m}'\nIFS= read -r _line\n\
+                     echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} answered\"}}}}'\n",
+                    m = marker.display()
+                );
+                crate::write_test_executable(&bin, script).expect("mock");
+                bin
+            };
+            let grok = dir.path().join("fake-grok");
+            crate::write_test_executable(
+                &grok,
+                format!(
+                    "#!/bin/sh\necho grok >> '{m}'\n\
+                     printf '{{\"type\":\"text\",\"data\":\"grok answered\"}}\\n'\n\
+                     printf '{{\"type\":\"end\",\"sessionId\":\"s\",\"stopReason\":\"end_turn\"}}\\n'\n",
+                    m = marker.display()
+                ),
+            )
+            .expect("grok mock");
+            let agy = dir.path().join("fake-agy");
+            crate::write_test_executable(
+                &agy,
+                format!(
+                    "#!/bin/sh\necho agy >> '{m}'\nexit 1\n",
+                    m = marker.display()
+                ),
+            )
+            .expect("agy mock");
+            let (codex, gemini, claude) =
+                (connector("codex"), connector("gemini"), connector("claude"));
+            // T-205: the new seats get mocks too, so no dispatch from this module can reach a real kimi, vibe or qwen.
+            let new_seat = |seat: &str, stdout: &str| {
+                let bin = dir.path().join(format!("fake-{seat}"));
+                crate::write_test_executable(
+                    &bin,
+                    format!(
+                        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.0.0; exit 0; fi\n\
+                         echo {seat} >> '{m}'\nprintf '%s\\n' '{stdout}'\n",
+                        m = marker.display()
+                    ),
+                )
+                .expect("new seat mock");
+                bin
+            };
+            // A real Kimi turn ends with `session.resume_hint`; without it T-208 correctly breaks a session
+            // (`missing_session_id:kimi`), so the mock emits one like the live CLI does (LIVE_SMOKE-2026-10-19).
+            let kimi = new_seat(
+                "kimi",
+                "{\"role\":\"assistant\",\"content\":\"kimi answered\"}\n\
+                 {\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_t204\"}",
+            );
+            let mistral = new_seat("mistral", "{}");
+            let qwen = new_seat("qwen", "{}");
+            // SAFETY: the caller holds the crate env lock and an EnvRestore over ENV.
+            unsafe {
+                std::env::set_var("TRIUMVIRATE_CODEX_BIN", &codex);
+                std::env::set_var("TRIUMVIRATE_GEMINI_BIN", &gemini);
+                std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
+                std::env::set_var("TRIUMVIRATE_AGY_BIN", &agy);
+                std::env::set_var("TRIUMVIRATE_CLAUDE_BIN", &claude);
+                std::env::set_var("TRIUMVIRATE_GROK_BIN", &grok);
+                std::env::set_var("TRIUMVIRATE_KIMI_BIN", &kimi);
+                std::env::set_var("TRIUMVIRATE_MISTRAL_BIN", &mistral);
+                std::env::set_var("TRIUMVIRATE_QWEN_BIN", &qwen);
+                for k in [
+                    "TRIUMVIRATE_CODEX_ARGS",
+                    "TRIUMVIRATE_GEMINI_ARGS",
+                    "TRIUMVIRATE_AGY_ARGS",
+                    "TRIUMVIRATE_CLAUDE_ARGS",
+                    "TRIUMVIRATE_GROK_ARGS",
+                    "TRIUMVIRATE_ENABLE_KIMI",
+                    "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+                    "TRIUMVIRATE_MCP_USE_DAEMON",
+                ] {
+                    std::env::remove_var(k);
+                }
+                std::env::set_var("TRIUMVIRATE_HOME", &home);
+            }
+            Self { dir, marker, home }
+        }
+
+        /// Every seat that has run, in order.
+        pub(crate) fn ran(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.marker)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        pub(crate) fn cwd(&self) -> String {
+            self.dir.path().join("cwd").display().to_string()
+        }
+
+        /// kimi enabled and verified, so the gate reaches its surface rule.
+        pub(crate) fn kimi_available(&self) {
+            // SAFETY: under the crate env lock; EnvRestore puts it back.
+            unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") };
+            mcp_bridge::seat_state::write_verified(
+                &self.home,
+                "kimi",
+                &mcp_bridge::seat_state::VerifiedRecord {
+                    cli_version: "t204-gate".into(),
+                    seat_home: "/x".into(),
+                    probed_at: "t".into(),
+                    served_model: None,
+                },
+            )
+            .expect("verified.json");
+            mcp_bridge::seat_gate::register_installed_cli_version("kimi", "t204-gate");
+        }
+    }
+
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn ask(agent: &str, cwd: &str, surface: AskSurface, origin: Origin) -> AskAgentRequest {
+        AskAgentRequest {
+            agent: agent.to_string(),
+            message: "t204".to_string(),
+            cwd: Some(cwd.to_string()),
+            origin,
+            ask_surface: surface,
+            ..Default::default()
+        }
+    }
+
+    const ASK_SURFACES: [(AskSurface, Surface); 3] = [
+        (AskSurface::AskAgent, Surface::AskAgent),
+        (AskSurface::Session, Surface::Session),
+        (AskSurface::Jury, Surface::Jury),
+    ];
+    const ORIGINS: [Origin; 2] = [Origin::Interactive, Origin::Unattended];
+
+    /// THE REFUSED HALF, at `execute_ask_agent_inner`. kimi on AskAgent, Session and Jury, both origins, in each
+    /// refused state (not configured, configured but unverified, suspended): the exact payload comes back, no mock
+    /// runs, and dispatch (where credentials are read) is never reached.
+    /// RED IF: the gate call in execute_ask_agent_inner is removed or moved after dispatch (kimi would reach dispatch
+    /// and fail `unsupported agent`), or a refused call spawns anything.
+    #[tokio::test]
+    async fn refused_seats_return_the_exact_code_and_spawn_nothing() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let dispatched_before = dispatch_count("kimi");
+        let not_configured =
+            "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon";
+        let unverified = "seat_unverified: kimi: run triumvirate doctor --live in a terminal";
+        let suspended =
+            "seat_suspended: kimi: 403 account suspended (run: triumvirate seat clear kimi)";
+        let states: [(&str, &dyn Fn()); 3] = [
+            (not_configured, &|| {}),
+            (unverified, &|| {
+                // SAFETY: under the crate env lock; EnvRestore puts it back.
+                unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") }
+            }),
+            (suspended, &|| {
+                m.kimi_available();
+                mcp_bridge::seat_state::write_suspended(&m.home, "kimi", "403 account suspended")
+                    .expect("suspended.json");
+            }),
+        ];
+        let mut checked = 0;
+        for (want, enter) in states {
+            enter();
+            for (surface, _) in ASK_SURFACES {
+                for origin in ORIGINS {
+                    let err = execute_ask_agent(&ask("kimi", &m.cwd(), surface, origin), None)
+                        .await
+                        .expect_err("refused");
+                    assert_eq!(err, want, "{surface:?} {origin:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 18);
+        assert!(
+            m.ran().is_empty(),
+            "no mock may run for a refused call: {:?}",
+            m.ran()
+        );
+        assert_eq!(
+            dispatch_count("kimi"),
+            dispatched_before,
+            "no credential access for a refused seat"
+        );
+    }
+
+    /// THE PERMITTED HALF, at `execute_ask_agent_inner`. Every existing seat with a local process on AskAgent,
+    /// Session and Jury, for both origins, spawns ITS OWN mock and returns that mock's answer, with the request's
+    /// (seat, surface, origin) seen by the gate. A permitted NEW seat (kimi, enabled and verified) passes the gate
+    /// and, since T-205, spawns ITS OWN mock and answers (A-9: the spawn-and-answer half moved to T-205), with no
+    /// other seat substituted. deepseek (an HTTP seat with no local process) is admitted by the same gate on the same
+    /// triples.
+    /// RED IF: a permitted seat stops spawning (a dispatcher that never spawns), answers as another seat, or the
+    /// request's origin or surface stops reaching the gate.
+    #[tokio::test]
+    async fn permitted_seats_spawn_their_own_mock_including_new_seats() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        m.kimi_available();
+        let _trail = mcp_tools::inter_agent::gate_trail::record();
+        // The new seat FIRST, before any existing seat has run, so a mock line here can only be a substitution.
+        assert!(m.ran().is_empty());
+        let reached = dispatch_count("kimi");
+        for (surface, gate_surface) in ASK_SURFACES {
+            for origin in ORIGINS {
+                let before = m.ran().len();
+                let resp = execute_ask_agent(&ask("kimi", &m.cwd(), surface, origin), None)
+                    .await
+                    .unwrap_or_else(|e| panic!("kimi {surface:?} {origin:?}: {e}"));
+                assert_eq!(resp.response, "kimi answered", "{surface:?} {origin:?}");
+                assert_eq!(
+                    m.ran()[before..].to_vec(),
+                    ["kimi"],
+                    "only kimi's own mock ran"
+                );
+                assert!(mcp_tools::inter_agent::gate_trail::saw(
+                    "kimi",
+                    gate_surface,
+                    origin
+                ));
+            }
+        }
+        assert_eq!(
+            dispatch_count("kimi"),
+            reached + 6,
+            "permitted: it passed the gate and reached dispatch"
+        );
+        assert_eq!(
+            m.ran(),
+            ["kimi"; 6],
+            "kimi ran six times and nothing ran in its place"
+        );
+        let mut spawned = 0;
+        for seat in ["codex", "gemini", "claude", "grok"] {
+            for (surface, gate_surface) in ASK_SURFACES {
+                for origin in ORIGINS {
+                    let before = m.ran().len();
+                    let resp = execute_ask_agent(&ask(seat, &m.cwd(), surface, origin), None)
+                        .await
+                        .unwrap_or_else(|e| panic!("{seat} {surface:?} {origin:?}: {e}"));
+                    assert_eq!(
+                        resp.response,
+                        format!("{seat} answered"),
+                        "{surface:?} {origin:?}"
+                    );
+                    assert_eq!(resp.agent, seat);
+                    // At least one run, and every run is this seat's own binary. grok can run twice: its untracked
+                    // session is reaped by a second invocation of the same CLI.
+                    let ran = m.ran()[before..].to_vec();
+                    assert!(
+                        !ran.is_empty() && ran.iter().all(|r| r == seat),
+                        "{seat} {surface:?} {origin:?}: only its own mock may run, got {ran:?}"
+                    );
+                    assert!(mcp_tools::inter_agent::gate_trail::saw(
+                        seat,
+                        gate_surface,
+                        origin
+                    ));
+                    spawned += 1;
+                }
+            }
+        }
+        assert_eq!(spawned, 24);
+        for (_, gate_surface) in ASK_SURFACES {
+            for origin in ORIGINS {
+                assert_eq!(
+                    mcp_bridge::seat_gate::seat_gate("deepseek", gate_surface, origin, false),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    /// Prewarm reads the row and the gate: today gemini then codex (the old hard-coded order); a row flipped to
+    /// Always for an existing seat joins; a new seat flipped to Always is still refused on Prewarm and skipped. The
+    /// real prewarm spawns exactly the selected seats' mocks.
+    /// RED IF: prewarm goes back to a literal list, ignores prewarm_policy, or warms a seat the gate refuses.
+    #[tokio::test]
+    async fn prewarm_warms_only_gate_admitted_always_seats() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let rows = mcp_bridge::seat_profile::all_seats();
+        assert_eq!(prewarm_seats(rows), ["gemini", "codex"]);
+        let mut mutated = rows.to_vec();
+        for r in &mut mutated {
+            if matches!(r.key, "claude" | "kimi") {
+                r.prewarm_policy = mcp_bridge::seat_profile::PrewarmPolicy::Always;
+            }
+        }
+        assert_eq!(prewarm_seats(&mutated), ["gemini", "codex", "claude"]);
+        m.kimi_available();
+        assert_eq!(
+            mcp_bridge::seat_gate::seat_gate("kimi", Surface::Prewarm, Origin::Unattended, false)
+                .unwrap_err()
+                .message,
+            "seat_surface_deferred: kimi on Prewarm ships in v1.1"
+        );
+        assert_eq!(
+            prewarm_seats(&mutated),
+            ["gemini", "codex", "claude"],
+            "kimi stays out"
+        );
+
+        let cwd = m.dir.path().join("warm");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // SAFETY: under the crate env lock; EnvRestore puts both back.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_DAEMON_PREWARM", "1");
+            std::env::set_var("TRIUMVIRATE_DAEMON_PREWARM_CWDS", &cwd);
+        }
+        prewarm_daemon_workers().await;
+        assert_eq!(
+            m.ran(),
+            ["gemini", "codex"],
+            "prewarm spawned exactly the selected seats"
+        );
+        for seat in ["gemini", "codex"] {
+            let _ = agent_worker::dismiss_worker(seat, &cwd.display().to_string(), None).await;
+        }
     }
 }

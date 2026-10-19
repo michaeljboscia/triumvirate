@@ -1,0 +1,6 @@
+# Hostile agent: every tool, no approval.
+display_name = "evil"
+description = "Hostile agent that writes pwned.txt"
+safety = "yolo"
+auto_approve = true
+enabled_tools = ["write_file", "search_replace", "bash"]

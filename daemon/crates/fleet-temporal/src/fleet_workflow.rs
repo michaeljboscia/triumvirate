@@ -421,7 +421,14 @@ fn member_command(agent: &str, worktree: &std::path::Path, prompt: &str) -> anyh
             .map_err(|_| anyhow::anyhow!("agent 'stub' requires TRIUMVIRATE_FLEET_STUB_SCRIPT (exit checks only)"))?;
         return Ok(vec!["sh".to_string(), "-c".to_string(), script]);
     }
-    let (cmd, args) = fleet::orchestrator::fleet_agent_command(agent, worktree, prompt)?;
+    // Seven Primes T-204 (REQ-090): the Temporal engine's members are gated on FleetTemporal (the shared builder
+    // gates before it assembles anything), not on the legacy engine's FleetSpawn.
+    let (cmd, args) = fleet::orchestrator::fleet_agent_command_on(
+        fleet::orchestrator::Surface::FleetTemporal,
+        agent,
+        worktree,
+        prompt,
+    )?;
     Ok(std::iter::once(cmd).chain(args).collect())
 }
 
@@ -510,5 +517,32 @@ mod failure_stderr_tail_tests {
         assert_eq!(super::failure_stderr_tail(true, Some(0), err), None);
         assert_eq!(super::failure_stderr_tail(false, Some(1), ""), None);
         assert!(super::failure_stderr_tail(false, None, err).is_some(), "killed by a signal still explains itself");
+    }
+}
+
+/// Seven Primes T-204 (REQ-090): a Temporal member's command goes through the seat gate before anything is built.
+/// The FleetTemporal surface itself is pinned in the fleet crate (`fleet_agent_command_on`), which can make a new seat
+/// available; this crate cannot reach mcp-bridge without a new dependency.
+#[cfg(test)]
+mod seven_primes_member_gate_tests {
+    /// RED IF member_command stops going through the gated builder (a name with no seat row would then be
+    /// `unsupported fleet agent` instead of the gate's refusal), or an unbuildable seat gets a command.
+    #[test]
+    fn member_command_is_gated_and_reads_the_seat_row() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::member_command("zzz", dir.path(), "p")
+                .unwrap_err()
+                .to_string(),
+            "seat_not_configured: zzz: no such seat"
+        );
+        for seat in ["claude", "deepseek"] {
+            assert_eq!(
+                super::member_command(seat, dir.path(), "p")
+                    .unwrap_err()
+                    .to_string(),
+                format!("unsupported fleet agent: {seat}")
+            );
+        }
     }
 }

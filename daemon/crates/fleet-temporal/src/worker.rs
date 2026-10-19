@@ -179,17 +179,34 @@ pub async fn launch(input: &RunWorkerInput) -> Result<(Option<tokio::process::Ch
 /// `TRIUMVIRATE_FLEET_STALL_SECS_<AGENT>` sets one; that override also changes a default, and
 /// `0` turns the rule off for that agent.
 pub fn stall_window(agent: &str) -> Option<Duration> {
-    let key = format!("TRIUMVIRATE_FLEET_STALL_SECS_{}", agent.to_ascii_uppercase());
-    let secs = match std::env::var(&key).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+    let key = format!(
+        "TRIUMVIRATE_FLEET_STALL_SECS_{}",
+        agent.to_ascii_uppercase()
+    );
+    // Seven Primes T-202: the default is the seat's `SeatProfile.fleet_stall_window` (A-7: read through `fleet`).
+    let secs = match std::env::var(&key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
         Some(v) => v,
-        None => match agent {
-            "codex" => 240,
-            "gemini" => 300,
-            "grok" => 780,
-            _ => return None,
-        },
+        None => {
+            return fleet_window_for_row(fleet::seat_profile::seat_profile(
+                &shared_types::normalize_agent_name(agent),
+            ));
+        }
     };
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// The row-taking half of `stall_window` (no env override): the row's `fleet_stall_window`, none for Disabled, no
+/// row, or 0 s.
+fn fleet_window_for_row(row: Option<&fleet::seat_profile::SeatProfile>) -> Option<Duration> {
+    match row.map(|row| row.fleet_stall_window) {
+        Some(fleet::seat_profile::StallWindow::Secs(secs)) if secs > 0 => {
+            Some(Duration::from_secs(secs))
+        }
+        _ => None,
+    }
 }
 
 /// Bytes the member has written so far, stdout and stderr together.
@@ -335,5 +352,49 @@ mod stall_window_tests {
         assert_eq!(stall_window("stallwindowprobe"), None);
         unsafe { std::env::remove_var(key) };
         assert_eq!(stall_window("stallwindowprobe"), None);
+    }
+
+    /// Seven Primes T-202 consumer test: the fleet window is the row's `fleet_stall_window`; the new seats are not on
+    /// the fleet at launch and get none.
+    /// RED IF: the fleet window stops being read from SeatProfile.
+    #[test]
+    fn seven_primes_fleet_windows_come_from_the_seat_row() {
+        for seat in ["kimi", "mistral", "qwen"] {
+            assert_eq!(stall_window(seat), None, "{seat}");
+        }
+        for row in fleet::seat_profile::all_seats() {
+            let want = match row.fleet_stall_window {
+                fleet::seat_profile::StallWindow::Secs(s) => Some(Duration::from_secs(s)),
+                fleet::seat_profile::StallWindow::Disabled => None,
+            };
+            assert_eq!(stall_window(row.key), want, "{}", row.key);
+        }
+    }
+
+    /// The fleet consumer reads `fleet_stall_window` from the row it is handed: a cloned kimi row (Disabled at launch)
+    /// set to 781 s gives 781 s, 0 s gives none, and changing only the ask-path `stall_window` changes nothing here.
+    /// RED IF: the fleet window is a constant, a per-agent match, or read from the ask-path field.
+    #[test]
+    fn fleet_window_follows_a_mutated_row() {
+        use fleet::seat_profile::{StallWindow, seat_profile};
+        let mut row = seat_profile("kimi").unwrap().clone();
+        assert_eq!(
+            super::fleet_window_for_row(Some(&row)),
+            stall_window("kimi")
+        );
+        assert_eq!(super::fleet_window_for_row(Some(&row)), None);
+        row.fleet_stall_window = StallWindow::Secs(781);
+        assert_eq!(
+            super::fleet_window_for_row(Some(&row)),
+            Some(Duration::from_secs(781))
+        );
+        row.stall_window = StallWindow::Secs(5);
+        assert_eq!(
+            super::fleet_window_for_row(Some(&row)),
+            Some(Duration::from_secs(781))
+        );
+        row.fleet_stall_window = StallWindow::Secs(0);
+        assert_eq!(super::fleet_window_for_row(Some(&row)), None);
+        assert_eq!(super::fleet_window_for_row(None), None);
     }
 }

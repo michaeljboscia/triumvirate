@@ -77,6 +77,76 @@ jobs:
       # so this is offline; the codex oracle tests among them use the CLI installed above.
       - name: Daemon binary and integration tests
         run: cargo test -p triumvirate --tests
+      # Seven Primes T-104: seat containment (env scrub, seat files, repo audit). Its seatbelt cases are
+      # cfg(target_os = "macos") and compile out here; the macOS job below runs them.
+      - name: Seat containment tests
+        run: cargo test -p mcp-bridge --test containment
+
+  # Seven Primes T-104 (REQ-035): the macOS seatbelt is the new seats' write barrier, and seatbelt only exists on
+  # macOS, so these tests would never run on the Linux jobs. Required for a green PR, which puts the real
+  # sandbox-exec cases in the authoritative verdict. T-206 adds the runner's integration tests to this job.
+  macos-containment:
+    name: macOS containment
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: daemon
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The Temporal SDK's build script needs protoc on every platform it builds on.
+      - name: Install system deps (macOS)
+        run: brew install protobuf
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: daemon
+      - name: Seat containment tests (real sandbox-exec)
+        run: cargo test -p mcp-bridge --test containment
+      # Seven Primes T-206: the new-seat runner under the real seatbelt (mock CLIs only, never a vendor binary).
+      - name: New-seat runner integration tests (real sandbox-exec)
+        run: cargo test -p triumvirate --test integration_seven_primes
+
+  # Seven Primes T-000 (REQ-010): the security floor the local validator enforces per task, re-run on the PR head.
+  # Only for the feature PR; T-301 adds the live-evidence step and widens the trigger. gitleaks comes from its release
+  # tarball checked against the release's own sha256, semgrep is pinned, and fetch-depth 0 gives origin/main..HEAD.
+  seven-primes-floor:
+    name: Seven Primes floor
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Detect Seven Primes seat changes
+        id: seven-primes-scope
+        shell: bash
+        run: |
+          run_floor=false
+          if [[ "${{ github.head_ref }}" == "feat/seven-primes" ]]; then
+            run_floor=true
+          elif git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^daemon/crates/(mcp-bridge/src/(kimi|mistral|qwen|containment|seat_[^/]+)\.rs|agent-adapter/src/(kimi|mistral|qwen)\.rs)$'; then
+            run_floor=true
+          fi
+          echo "run_floor=$run_floor" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
+      - name: Install gitleaks 8.30.1 (pinned sha256)
+        run: |
+          curl -sSfL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks && sudo mv gitleaks /usr/local/bin/ && gitleaks version
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install semgrep 1.157.0
+        run: pip install semgrep==1.157.0 && semgrep --version
+      - name: Security floor
+        if: steps.seven-primes-scope.outputs.run_floor == 'true'
+        run: bash scripts/validate-seven-primes-task.sh --floor-only
+      - name: Live evidence gate
+        if: steps.seven-primes-scope.outputs.run_floor == 'true'
+        run: bash scripts/check-live-evidence.sh
 
   build:
     name: Build Release

@@ -1,0 +1,5 @@
+[workspace]
+members = ["fx", "fy", "fz"]
+resolver = "2"
+
+[workspace.dependencies]

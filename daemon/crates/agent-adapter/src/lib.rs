@@ -11,6 +11,12 @@ pub mod grok;
 pub mod stuck;
 pub mod types;
 
+// Seven Primes new seats (T-003 scaffold; T-101..T-103 implement). Kept in their own group so the legacy module order
+// above is untouched.
+pub mod kimi;
+pub mod mistral;
+pub mod qwen;
+
 pub use claude_stream::{ClaudeStreamParser, PARSER_MODE_STREAM as CLAUDE_PARSER_MODE_STREAM};
 pub use codex::CodexExecParser;
 pub use agy_stream::{AgyStreamParser, PARSER_MODE_STREAM as AGY_PARSER_MODE_STREAM};
@@ -27,6 +33,33 @@ pub use types::{
     WorkingStateEvent, should_display,
 };
 
+/// How a new seat's dispatch ended (Seven Primes REQ-052). The exit-code tables per seat are in BACKEND_STRUCTURE section 6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeatOutcome {
+    Success,
+    /// Usable output that stopped early (Mistral exit 3, Qwen 53/55), with the reason.
+    Partial(String),
+    /// A failure code first, for example `empty_or_unrecognized_stream:kimi` or `missing_export:mistral`.
+    Failure(String),
+}
+
+/// Usage as the seat reports it (REQ-041). `NotReported` persists as `not_reported`, never as zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageReport {
+    Exact(TokenUsage),
+    NotReported,
+}
+
+/// A new seat's parsed dispatch.
+#[derive(Debug, Clone)]
+pub struct SeatParsed {
+    pub result: ParsedAgentResult,
+    pub outcome: SeatOutcome,
+    pub usage: UsageReport,
+    /// The model that actually answered, when the stream says (REQ-043).
+    pub served_model: Option<String>,
+}
+
 pub fn format_working_state(event: &WorkingStateEvent) -> String {
     match event.state {
         WorkingState::ToolCallStarted | WorkingState::ToolCallCompleted => {
@@ -38,7 +71,17 @@ pub fn format_working_state(event: &WorkingStateEvent) -> String {
             // left every grok tool line in the watch CLI showing the tool name instead of the
             // file. The grok parser was fixed for its own FileRead event; this generic
             // formatter was not, so the same bug survived on the other surface.
-            let path = extract_param(&event.tool_args_json, &["target_file", "file_path", "path"]);
+            // Seven Primes REQ-063: Mistral's effects carry `filePath` and Qwen's tool inputs may carry `absolute_path`.
+            let path = extract_param(
+                &event.tool_args_json,
+                &[
+                    "target_file",
+                    "file_path",
+                    "path",
+                    "filePath",
+                    "absolute_path",
+                ],
+            );
             let cmd = extract_param(&event.tool_args_json, &["command"]);
             let pattern = extract_param(&event.tool_args_json, &["pattern", "query"]);
             if let Some(p) = path {
@@ -208,5 +251,35 @@ mod format_working_state_tests {
             line.contains(&expected),
             "the formatter must resolve {expected} from the live capture's rawInput; got: {line}"
         );
+    }
+}
+
+/// Seven Primes T-202 (REQ-063): the watch formatter shows the read path for the new seats' argument keys.
+/// RED IF: `filePath` or `absolute_path` stop being recognised, so a Mistral or Qwen read shows only the tool name.
+#[cfg(test)]
+mod seven_primes_format_tests {
+    use super::*;
+
+    fn read_event(agent: &str, args: &str) -> WorkingStateEvent {
+        WorkingStateEvent {
+            agent: agent.into(),
+            state: WorkingState::ToolCallStarted,
+            detail: "read_file".into(),
+            tool_name: Some("read_file".into()),
+            tool_args_json: Some(args.into()),
+            token_usage: None,
+            ts_ms: None,
+        }
+    }
+
+    #[test]
+    fn new_seat_read_keys_show_the_path() {
+        for (agent, args) in [
+            ("mistral", r#"{"filePath":"src/main.rs"}"#),
+            ("qwen", r#"{"absolute_path":"src/main.rs"}"#),
+        ] {
+            let line = format_working_state(&read_event(agent, args));
+            assert!(line.contains("(src/main.rs)"), "{agent}: {line}");
+        }
     }
 }

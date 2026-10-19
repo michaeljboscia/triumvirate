@@ -105,10 +105,51 @@ impl AgentLauncher for DaemonAgentLauncher {
     }
 }
 
+/// Which fleet engine is asking (Seven Primes T-204, REQ-090): the legacy launcher spawns on `FleetSpawn`, the
+/// Temporal engine's members on `FleetTemporal`. Re-exported so fleet-temporal can name it without depending on
+/// mcp-bridge (a new dependency would change Cargo.lock).
+pub use mcp_bridge::seat_gate::Surface;
+
 /// The program and argv a fleet member's agent is spawned with. One builder for both engines:
 /// the legacy launcher below, and the Temporal engine's run_worker (through `fleet-shim`), so a
-/// worker runs the same CLI the same way whichever engine launched it.
+/// worker runs the same CLI the same way whichever engine launched it. This is the legacy engine's entry
+/// (`FleetSpawn`); the Temporal engine calls `fleet_agent_command_on(Surface::FleetTemporal, ..)`.
 pub fn fleet_agent_command(agent: &str, worktree_path: &Path, task_prompt: &str) -> anyhow::Result<(String, Vec<String>)> {
+    fleet_agent_command_on(Surface::FleetSpawn, agent, worktree_path, task_prompt)
+}
+
+/// `fleet_agent_command` for a named fleet surface. Seven Primes T-204 (REQ-090, REQ-066): before any argv is
+/// assembled (the codex arm runs git), the seat gate on `surface` (always `Unattended`: a fleet member has no
+/// person at a terminal, and the class is internal, never a caller field), then the seat row's `fleet_buildable`.
+/// A refusal is the gate's exact payload; a permitted seat whose row is not fleet-buildable is
+/// `unsupported fleet agent: <seat>`, as before.
+pub fn fleet_agent_command_on(
+    surface: Surface,
+    agent: &str,
+    worktree_path: &Path,
+    task_prompt: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    use mcp_bridge::seat_gate::{Origin, seat_gate};
+    seat_gate(agent, surface, Origin::Unattended, false).map_err(|r| anyhow::anyhow!(r.message))?;
+    fleet_agent_command_for_row(
+        mcp_bridge::seat_profile::seat_profile(agent),
+        agent,
+        worktree_path,
+        task_prompt,
+    )
+}
+
+/// The row half of `fleet_agent_command_on`, taking the row so a test can hand it a mutated one. Each built arm's
+/// argv is exactly what the per-agent match built before T-204; the row decides WHETHER an arm may be used.
+fn fleet_agent_command_for_row(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    agent: &str,
+    worktree_path: &Path,
+    task_prompt: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    if !row.is_some_and(|r| r.fleet_buildable) {
+        anyhow::bail!("unsupported fleet agent: {agent}");
+    }
     let (cmd, args): (String, Vec<String>) = match agent {
         // The SAME binary the consult path runs (TRIUMVIRATE_CODEX_BIN, else PATH). A bare
         // "codex" here let the launchd daemon's PATH pick /opt/homebrew/bin/codex 0.133.0 while
@@ -2638,8 +2679,9 @@ mod tests {
         }
     }
 
-    /// Serialises the two tests below: both set the route env and feed the global breaker.
-    static ROUTE_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    /// Serialises the two tests below: both set the route env and feed the global breaker. Also held by the T-204
+    /// fleet gate tests, which set TRIUMVIRATE_GEMINI_BACKEND that these tests remove.
+    pub(super) static ROUTE_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn launched_for_failing_gemini(route: Option<&str>) -> Vec<String> {
         let _lock = ROUTE_ENV_LOCK.lock().await;
@@ -2818,6 +2860,16 @@ mod tests {
     /// the fix it "proved" merged rejected code (Codex and Grok, both seats). Go through
     /// `submit_review` so the test cannot drift from the writer again.
     fn record_verdict(project_root: &Path, fleet_id: &str, task_id: &str, verdict: &str) {
+        // Seven Primes T-204 (A-12): next_reviewer fails closed without a gate; install the production one explicitly.
+        peer_review::set_reviewer_gate(Box::new(|seat| {
+            mcp_bridge::seat_gate::seat_gate(
+                seat,
+                mcp_bridge::seat_gate::Surface::PeerReviewRotation,
+                mcp_bridge::seat_gate::Origin::Unattended,
+                false,
+            )
+            .is_ok()
+        }));
         let engine = peer_review::PeerReviewEngine::new(project_root.to_path_buf()).expect("engine");
         let record = engine
             .request_review(peer_review::ReviewRequest {
@@ -3867,5 +3919,288 @@ mod tests {
             .await
             .expect_err("must refuse");
         assert!(err.to_string().contains("refusing to reuse"), "{err}");
+    }
+}
+
+/// Seven Primes T-001 (REQ-010, REQ-011) characterization: the set of agents `fleet_agent_command` has an arm for.
+/// codex, gemini and grok are built: in a real git repo each returns Ok with a program and an argv that carries the
+/// task prompt; every other existing seat is refused by the `_` arm.
+/// RED IF: a seat gains or loses a fleet arm before T-204 moves this onto the SeatProfile table, or a built arm
+/// stops assembling a command (an arm stubbed to return any error fails here).
+#[cfg(test)]
+mod seven_primes_characterization_tests {
+    use super::fleet_agent_command;
+
+    #[test]
+    fn fleet_agent_command_arm_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for refused in ["deepseek", "claude"] {
+            let err = fleet_agent_command(refused, dir.path(), "t")
+                .expect_err(refused)
+                .to_string();
+            assert_eq!(err, format!("unsupported fleet agent: {refused}"));
+        }
+        // A real LINKED worktree (what fleet spawns into), so the codex arm's git write dirs resolve and no built arm
+        // can fail for scratch-path reasons.
+        let main = dir.path().join("main");
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&main).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .expect("git must be on PATH")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "fleet/f1/t1",
+            wt.to_str().unwrap(),
+        ]);
+        for built in ["codex", "gemini", "grok"] {
+            let (cmd, args) = fleet_agent_command(built, &wt, "SEVEN-PRIMES-PROMPT")
+                .unwrap_or_else(|e| panic!("{built}: {e}"));
+            assert!(!cmd.is_empty(), "{built}: empty program");
+            assert!(
+                args.iter().any(|a| a.contains("SEVEN-PRIMES-PROMPT")),
+                "{built}: prompt missing from argv {args:?}"
+            );
+        }
+    }
+}
+
+/// Seven Primes T-204 (REQ-090, REQ-066): the fleet builder gates every seat on its engine's surface and reads
+/// `fleet_buildable` from the seat row; permitted, buildable seats produce a command that runs the seat's own mock.
+#[cfg(test)]
+mod seven_primes_fleet_gate_tests {
+    use super::{
+        Surface, fleet_agent_command, fleet_agent_command_for_row, fleet_agent_command_on,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// The env these tests repoint (agent binaries, the gemini backend, kimi's enable flag and home) is also written
+    /// by the route tests (they REMOVE TRIUMVIRATE_GEMINI_BACKEND), so both hold the same lock. Without it a route
+    /// test flipped the backend to agy mid-test and the gemini command became a real agy launch.
+    fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        super::tests::ROUTE_ENV_LOCK.blocking_lock()
+    }
+
+    const ENV: &[&str] = &[
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_GEMINI_BIN",
+        "TRIUMVIRATE_GEMINI_BACKEND",
+        "TRIUMVIRATE_GROK_BIN",
+        "TRIUMVIRATE_CLAUDE_BIN",
+        "TRIUMVIRATE_ENABLE_KIMI",
+        "TRIUMVIRATE_HOME",
+    ];
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                // SAFETY: under env_lock(), which the test holds for this guard's whole life.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A linked worktree (what fleet spawns into), so the codex arm's git write dirs resolve.
+    fn linked_worktree(dir: &Path) -> PathBuf {
+        let main = dir.join("main");
+        let wt = dir.join("wt");
+        std::fs::create_dir(&main).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .expect("git must be on PATH")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "fleet/f1/t1",
+            wt.to_str().unwrap(),
+        ]);
+        wt
+    }
+
+    /// Mock agent binaries that append their own name to `marker`, one per existing seat with a binary override.
+    fn install_mocks(
+        dir: &Path,
+        marker: &Path,
+    ) -> std::collections::BTreeMap<&'static str, PathBuf> {
+        let mut bins = std::collections::BTreeMap::new();
+        for (var, name) in [
+            ("TRIUMVIRATE_CODEX_BIN", "codex"),
+            ("TRIUMVIRATE_GEMINI_BIN", "gemini"),
+            ("TRIUMVIRATE_GROK_BIN", "grok"),
+            ("TRIUMVIRATE_CLAUDE_BIN", "claude"),
+        ] {
+            let bin = dir.join(format!("mock-fleet-{name}"));
+            std::fs::write(
+                &bin,
+                format!("#!/bin/sh\necho {name} >> '{}'\n", marker.display()),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("755")
+                    .arg(&bin)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            // SAFETY: under env_lock(); restored by the caller's EnvRestore.
+            unsafe { std::env::set_var(var, &bin) };
+            bins.insert(name, bin);
+        }
+        // SAFETY: as above. The gemini-cli backend runs the pinned binary directly (agy is a different program).
+        unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli") };
+        bins
+    }
+
+    /// The row decides: flipping `fleet_buildable` on a cloned row flips whether the builder produces a command.
+    /// RED IF: fleet buildability is a literal per-agent list again instead of the seat row.
+    #[test]
+    fn fleet_buildability_follows_the_seat_row() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = linked_worktree(dir.path());
+        for seat in ["codex", "gemini", "grok"] {
+            let row = mcp_bridge::seat_profile::seat_profile(seat).unwrap();
+            assert!(
+                fleet_agent_command_for_row(Some(row), seat, &wt, "p").is_ok(),
+                "{seat}"
+            );
+            let mut off = row.clone();
+            off.fleet_buildable = false;
+            assert_eq!(
+                fleet_agent_command_for_row(Some(&off), seat, &wt, "p")
+                    .unwrap_err()
+                    .to_string(),
+                format!("unsupported fleet agent: {seat}"),
+                "{seat}: a row that is not fleet_buildable must refuse"
+            );
+        }
+        assert!(fleet_agent_command_for_row(None, "codex", &wt, "p").is_err());
+    }
+
+    /// The whole matrix on both fleet surfaces. Refused seats return the gate's exact payload (kimi unconfigured,
+    /// then enabled and verified, where it is deferred ON THAT SURFACE); permitted but unbuildable existing seats
+    /// (claude, deepseek) are `unsupported fleet agent: <seat>`; and neither ever runs a mock. Every buildable seat
+    /// (codex, gemini, grok) produces a command that, when run, runs ITS OWN mock and no other.
+    /// RED IF: the builder stops gating, gates on the wrong surface, ignores the row, or routes a seat to another
+    /// seat's binary.
+    #[test]
+    fn every_fleet_surface_gates_and_spawns_only_the_seat_asked_for() {
+        let _g = env_lock();
+        let _restore = EnvRestore(ENV.iter().map(|k| (*k, std::env::var_os(k))).collect());
+        let dir = tempfile::tempdir().unwrap();
+        let wt = linked_worktree(dir.path());
+        let marker = dir.path().join("marker");
+        let bins = install_mocks(dir.path(), &marker);
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: under env_lock(); restored by _restore.
+        unsafe {
+            std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI");
+            std::env::set_var("TRIUMVIRATE_HOME", &home);
+        }
+        let run = |cmd: &str, args: &[String]| {
+            std::process::Command::new(cmd)
+                .args(args)
+                .current_dir(&wt)
+                .status()
+                .unwrap_or_else(|e| panic!("{cmd}: {e}"))
+        };
+        for surface in [Surface::FleetSpawn, Surface::FleetTemporal] {
+            for (seat, want) in [
+                ("kimi", "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon".to_string()),
+                ("zzz", "seat_not_configured: zzz: no such seat".to_string()),
+                ("claude", "unsupported fleet agent: claude".to_string()),
+                ("deepseek", "unsupported fleet agent: deepseek".to_string()),
+            ] {
+                let err = fleet_agent_command_on(surface, seat, &wt, "p").unwrap_err().to_string();
+                assert_eq!(err, want, "{seat} on {surface:?}");
+            }
+            assert!(
+                !marker.exists(),
+                "{surface:?}: a refused or unbuildable seat ran a mock"
+            );
+            for seat in ["codex", "gemini", "grok"] {
+                let (cmd, args) = fleet_agent_command_on(surface, seat, &wt, "T204-PROMPT")
+                    .unwrap_or_else(|e| panic!("{seat} on {surface:?}: {e}"));
+                assert!(
+                    args.iter().any(|a| a.contains("T204-PROMPT")),
+                    "{seat}: {args:?}"
+                );
+                // Never run anything but the mock: a command naming any other program fails here, unexecuted.
+                assert_eq!(
+                    Path::new(&cmd),
+                    bins[seat].as_path(),
+                    "{seat} on {surface:?}: {cmd} {args:?}"
+                );
+                let _ = std::fs::remove_file(&marker);
+                run(&cmd, &args);
+                assert_eq!(
+                    std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+                    seat,
+                    "{seat} on {surface:?} must run its own mock, and only it"
+                );
+            }
+            let _ = std::fs::remove_file(&marker);
+        }
+        // kimi enabled and verified: the gate's surface rule names the engine's own surface.
+        // SAFETY: under env_lock(); restored by _restore.
+        unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") };
+        mcp_bridge::seat_state::write_verified(
+            &home,
+            "kimi",
+            &mcp_bridge::seat_state::VerifiedRecord {
+                cli_version: "t204-fleet".into(),
+                seat_home: "/x".into(),
+                probed_at: "t".into(),
+                served_model: None,
+            },
+        )
+        .unwrap();
+        mcp_bridge::seat_gate::register_installed_cli_version("kimi", "t204-fleet");
+        assert_eq!(
+            fleet_agent_command("kimi", &wt, "p")
+                .unwrap_err()
+                .to_string(),
+            "seat_surface_deferred: kimi on FleetSpawn ships in v1.1"
+        );
+        assert_eq!(
+            fleet_agent_command_on(Surface::FleetTemporal, "kimi", &wt, "p")
+                .unwrap_err()
+                .to_string(),
+            "seat_surface_deferred: kimi on FleetTemporal ships in v1.1"
+        );
+        assert!(!marker.exists());
     }
 }

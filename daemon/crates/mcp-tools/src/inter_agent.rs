@@ -1,14 +1,15 @@
 use crate::{ProgressEmitter, display_agent_name, next_heartbeat_offset};
 use agent_worker::{WorkerAcquireMode, acquire_worker, dismiss_worker};
 use daemon_core::{
-    daemon_bind_addr as core_daemon_bind_addr,
+    PublishResult, TurnOutcome, acquire_session_lock, daemon_bind_addr as core_daemon_bind_addr,
     persist_json_file_if_enabled as core_persist_json_file_if_enabled,
+    reload_session_if_enabled as core_reload_session_if_enabled, session_busy_wait,
+    triumvirate_home_dir,
 };
 use daemon_http::{
-    DaemonRequestError, DaemonRequestFailure, daemon_ask_timeout_secs,
-    fetch_daemon_ask_agent, fetch_daemon_session_ask, fetch_daemon_session_dismiss,
-    fetch_daemon_session_list, fetch_daemon_session_spawn, fetch_daemon_status,
-    fetch_daemon_status_snapshot,
+    DaemonRequestError, DaemonRequestFailure, daemon_ask_timeout_secs, fetch_daemon_ask_agent,
+    fetch_daemon_session_ask, fetch_daemon_session_dismiss, fetch_daemon_session_list,
+    fetch_daemon_session_spawn, fetch_daemon_status, fetch_daemon_status_snapshot,
 };
 use fallback_outbox::{count_pending_fallbacks, list_pending_fallback_paths};
 use mcp_bridge::{caller_driver_identity, is_supported_agent_name, normalize_agent_name};
@@ -18,26 +19,25 @@ use rmcp::{
 };
 use shared_types::{
     AskAgentRequest, AskAgentResponse, AskSessionRequest, DaemonHealthResponse,
-    DismissSessionRequest, SessionInfo, SessionListResponse, SessionState, SpawnSessionRequest,
-    StatusResponse,
+    DismissSessionRequest, SessionInfo, SessionListResponse, SessionPhase, SessionState,
+    SpawnSessionRequest, StatusResponse,
 };
-use std::{
-    collections::HashMap,
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::{
     sync::Mutex,
     time::{Duration, Instant, sleep},
 };
-
 pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 pub type ExecuteAskAgentFn = for<'a> fn(
     &'a AskAgentRequest,
     Option<ProgressEmitter>,
 ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>>;
+
+fn is_new_seat(agent: &str) -> bool {
+    mcp_bridge::seat_profile::seat_profile(agent).is_some_and(|profile| {
+        profile.resume_strategy != mcp_bridge::seat_profile::ResumeStrategy::Legacy
+    })
+}
 
 /// Describes an `ask_agent` failure without asserting a cause we have not checked.
 ///
@@ -46,6 +46,81 @@ pub type ExecuteAskAgentFn = for<'a> fn(
 /// continuously for four days: the real cause was the 180s client ceiling on a dispatch
 /// that needed 424s. An unverified remediation is worse than none, because it reads like a
 /// diagnosis and closes the investigation.
+/// The seat gate at an ask-family call site (Seven Primes T-204, REQ-090, REQ-091): `ask_agent`, a session spawn or
+/// turn, a jury seat, a blind validator. Decided before anything is spawned; a refusal comes back as the Refusal's
+/// exact payload, which the caller returns as its tool or HTTP error text. `tty` is false: none of these surfaces runs
+/// on the operator's terminal. The surface is the caller's, never inferred here.
+pub fn gate_seat(
+    seat: &str,
+    surface: mcp_bridge::seat_gate::Surface,
+    origin: shared_types::Origin,
+) -> Result<(), String> {
+    gate_trail::note(seat, surface, origin);
+    mcp_bridge::seat_gate::seat_gate(seat, surface, origin, false).map_err(|r| r.message)
+}
+
+/// Which (seat, surface, origin) triples reached `gate_seat`, so a test can prove a request's `origin` arrived at
+/// the gate (under A-2 no answer depends on origin, so the answer alone cannot show it). Recorded only while at
+/// least one `Recording` is alive; otherwise `note` is one atomic load.
+#[doc(hidden)]
+pub mod gate_trail {
+    use mcp_bridge::seat_gate::Surface;
+    use shared_types::Origin;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static CALLS: Mutex<Vec<(String, Surface, Origin)>> = Mutex::new(Vec::new());
+
+    /// While this lives, gate calls are recorded. Tests that run in parallel share one trail, so assert on a
+    /// triple your own test produced, not on the trail's length.
+    pub struct Recording(());
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Start recording. The first recorder clears what an earlier one left, so callers that serialise on their own
+    /// lock see only their own calls.
+    pub fn record() -> Recording {
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) == 0 {
+            CALLS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        Recording(())
+    }
+
+    /// Every triple recorded since recording started, in call order.
+    pub fn calls() -> Vec<(String, Surface, Origin)> {
+        CALLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn note(seat: &str, surface: Surface, origin: Origin) {
+        if ACTIVE.load(Ordering::SeqCst) > 0 {
+            CALLS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((seat.to_string(), surface, origin));
+        }
+    }
+
+    /// True if this exact triple has reached the gate while recording.
+    pub fn saw(seat: &str, surface: Surface, origin: Origin) -> bool {
+        CALLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(s, su, o)| s == seat && *su == surface && *o == origin)
+    }
+}
+
 pub(crate) fn describe_ask_agent_failure(err: &anyhow::Error) -> String {
     let detail = format!("ask_agent failed: {err:#}");
     match err.downcast_ref::<DaemonRequestError>().map(|e| e.failure) {
@@ -132,6 +207,8 @@ pub async fn spawn_session(
             crate::aliases::daemon_target_agents().join(", ")
         ));
     }
+    // Seven Primes T-204 (REQ-090): a seat the gate refuses on Session never gets a session or a worker.
+    gate_seat(&agent, mcp_bridge::seat_gate::Surface::Session, req.origin)?;
     let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
     // Per NAMED session, so two sessions for one agent in one directory do not resume each
     // other. Keyed on (agent, cwd) alone this leaked a passphrase between sessions.
@@ -155,6 +232,13 @@ pub async fn spawn_session(
             root_session_id: None,
             pantheon_session_id: None,
             cli_session_id: None,
+            phase: if is_new_seat(&agent) {
+                SessionPhase::Pending
+            } else {
+                SessionPhase::Ready
+            },
+            broken_reason: None,
+            generation: 0,
         },
     );
     core_persist_json_file_if_enabled(sessions_file, &*sessions)
@@ -182,6 +266,21 @@ pub async fn ask_session(
         return fetch_daemon_session_ask(req)
             .await
             .map_err(|e| format!("ask_session via daemon failed: {e}"));
+    }
+
+    let session_agent = {
+        let mut sessions = sessions.lock().await;
+        if !sessions.contains_key(&req.name) {
+            core_reload_session_if_enabled(sessions_file, &req.name, &mut sessions)
+                .map_err(|e| format!("failed to reload sessions: {e}"))?;
+        }
+        sessions
+            .get(&req.name)
+            .map(|state| normalize_agent_name(&state.agent))
+            .ok_or_else(|| format!("session '{}' not found", req.name))?
+    };
+    if is_new_seat(&session_agent) {
+        return ask_new_seat_session(sessions, sessions_file, req, execute_ask_agent).await;
     }
 
     let (agent, cwd, had_history, prior_cli_session) = {
@@ -222,6 +321,9 @@ pub async fn ask_session(
             // Same story as the sight fields: without this a named grok session could never
             // run Deep, so a session review could be gated on sources it had no turns to read.
             grok_depth: req.grok_depth,
+            // Seven Primes T-204 (REQ-090): this turn is gated on the Session surface with the caller's origin.
+            origin: req.origin,
+            ask_surface: shared_types::AskSurface::Session,
             ..Default::default()
         },
         None,
@@ -257,6 +359,115 @@ pub async fn ask_session(
         .map_err(|e| format!("failed to persist sessions: {e}"))?;
 
     Ok(response)
+}
+
+async fn ask_new_seat_session(
+    sessions: &Sessions,
+    sessions_file: Option<&PathBuf>,
+    req: &AskSessionRequest,
+    execute_ask_agent: ExecuteAskAgentFn,
+) -> Result<String, String> {
+    let home = sessions_file
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .map(Ok)
+        .unwrap_or_else(triumvirate_home_dir)
+        .map_err(|e| format!("session_lock: {e}"))?;
+    let _session_guard = acquire_session_lock(&home, &req.name, session_busy_wait())
+        .await
+        .map_err(|e| {
+            if e == "session_busy" {
+                format!("session_busy: {}", req.name)
+            } else {
+                e
+            }
+        })?;
+
+    let (agent, cwd, generation, prior_cli_session) = {
+        let mut all = sessions.lock().await;
+        core_reload_session_if_enabled(sessions_file, &req.name, &mut all)
+            .map_err(|e| format!("failed to reload sessions: {e}"))?;
+        let state = all
+            .get(&req.name)
+            .ok_or_else(|| format!("session '{}' not found", req.name))?;
+        if matches!(state.phase, SessionPhase::Broken) {
+            return Err(format!(
+                "session_broken: {}; dismiss_session and spawn a new one",
+                state.broken_reason.as_deref().unwrap_or("unknown")
+            ));
+        }
+        (
+            normalize_agent_name(&state.agent),
+            state.cwd.clone(),
+            state.generation,
+            if matches!(state.phase, SessionPhase::Ready) {
+                state.cli_session_id.clone()
+            } else {
+                None
+            },
+        )
+    };
+
+    let turn = execute_ask_agent(
+        &AskAgentRequest {
+            agent: agent.clone(),
+            message: req.message.clone(),
+            cwd,
+            repo: None,
+            branch: None,
+            reuse_session: Some(true),
+            session_key: Some(req.name.clone()),
+            prior_cli_session_id: prior_cli_session,
+            required_sources: req.required_sources.clone(),
+            require_sight: req.require_sight,
+            grok_depth: req.grok_depth,
+            origin: req.origin,
+            ask_surface: shared_types::AskSurface::Session,
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+
+    let mut all = sessions.lock().await;
+    let state = all
+        .get_mut(&req.name)
+        .ok_or_else(|| format!("session '{}' not found", req.name))?;
+    let publish = match &turn {
+        Ok(response) => daemon_core::publish_turn(
+            state,
+            generation,
+            &agent,
+            TurnOutcome::Success {
+                cli_session_id: response.cli_session_id.as_deref(),
+            },
+        ),
+        Err(error) => {
+            daemon_core::publish_turn(state, generation, &agent, TurnOutcome::Failure(error))
+        }
+    };
+    if matches!(publish, PublishResult::Conflict) {
+        tracing::warn!(
+            name = %req.name,
+            start_generation = generation,
+            stored_generation = state.generation,
+            "session_generation_conflict"
+        );
+    }
+    let result = match turn {
+        Ok(response) => {
+            let mut answer = response.response;
+            if let PublishResult::NotResumable(reason) = publish {
+                answer.push_str(&format!("\n(session not resumable: {reason})"));
+            }
+            state.history.push(format!("user: {}", req.message));
+            state.history.push(format!("assistant: {answer}"));
+            Ok(answer)
+        }
+        Err(error) => Err(format!("ask_session failed: {error}")),
+    };
+    core_persist_json_file_if_enabled(sessions_file, &*all)
+        .map_err(|e| format!("failed to persist sessions: {e}"))?;
+    result
 }
 
 pub async fn dismiss_session(
@@ -308,6 +519,53 @@ pub async fn list_sessions(
     Json(SessionListResponse { sessions: out })
 }
 
+/// Seven Primes T-203 (REQ-080, REQ-091): every seat that needs `doctor --live` verification, with its state read NOW
+/// (configured from its env flag, verified/suspended from `$TRIUMVIRATE_HOME/seats/<seat>/`), and `reason` set to the
+/// exact refusal the gate would give an ask.
+pub fn seats_status() -> std::collections::BTreeMap<String, shared_types::SeatStatus> {
+    use mcp_bridge::seat_profile::{Configured, VerifyPolicy, all_seats};
+    let home = mcp_bridge::seat_state::triumvirate_home().ok();
+    all_seats()
+        .iter()
+        .filter(|row| row.verify_policy == VerifyPolicy::DoctorLive)
+        .map(|row| {
+            let configured = match row.configured {
+                Configured::Always => true,
+                Configured::EnvFlag(var) => std::env::var(var).is_ok_and(|v| v == "1"),
+            };
+            let version = mcp_bridge::seat_gate::installed_cli_version(row.key);
+            let state = home
+                .as_deref()
+                .and_then(|h| {
+                    mcp_bridge::seat_state::availability(h, row.key, configured, version.as_deref())
+                        .ok()
+                })
+                .unwrap_or(mcp_bridge::seat_state::SeatAvailability {
+                    configured,
+                    verified: false,
+                    suspended: None,
+                });
+            let reason = mcp_bridge::seat_gate::seat_gate_with(
+                row.key,
+                mcp_bridge::seat_gate::Surface::AskAgent,
+                shared_types::Origin::Interactive,
+                true,
+                &state,
+            )
+            .err()
+            .map(|refusal| refusal.message);
+            let status = shared_types::SeatStatus {
+                configured: state.configured,
+                verified: state.verified,
+                suspended: state.suspended.is_some(),
+                available: state.available(),
+                reason,
+            };
+            (row.key.to_string(), status)
+        })
+        .collect()
+}
+
 pub async fn get_status(
     sessions: &Sessions,
     mcp_daemon_proxy_enabled: bool,
@@ -334,6 +592,7 @@ pub async fn get_status(
             pending_fallbacks: snapshot.pending_fallbacks.unwrap_or(0),
             fallback_tickets: snapshot.fallback_tickets.unwrap_or_default(),
             daemon_bind_addr: snapshot.daemon_bind_addr.unwrap_or(local_bind_addr),
+            seats: snapshot.seats.unwrap_or_else(seats_status),
         });
     }
     let pending_fallbacks = count_pending_fallbacks().unwrap_or(0);
@@ -353,6 +612,7 @@ pub async fn get_status(
             .map(|p| p.display().to_string())
             .collect(),
         daemon_bind_addr: local_bind_addr,
+        seats: seats_status(),
     })
 }
 
@@ -366,6 +626,81 @@ pub async fn daemon_health() -> Result<Json<DaemonHealthResponse>, String> {
 #[cfg(test)]
 mod ask_agent_failure_message_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE_NEW_SEAT_TURNS: AtomicUsize = AtomicUsize::new(0);
+    static MAX_ACTIVE_NEW_SEAT_TURNS: AtomicUsize = AtomicUsize::new(0);
+    static NEW_SEAT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static NEW_SEAT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    fn overlapping_probe_executor<'a>(
+        req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            NEW_SEAT_CALLS.fetch_add(1, Ordering::SeqCst);
+            let active = ACTIVE_NEW_SEAT_TURNS.fetch_add(1, Ordering::SeqCst) + 1;
+            MAX_ACTIVE_NEW_SEAT_TURNS.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ACTIVE_NEW_SEAT_TURNS.fetch_sub(1, Ordering::SeqCst);
+            let mut response = AskAgentResponse::direct(
+                "request".to_string(),
+                req.agent.clone(),
+                "answer".to_string(),
+                Vec::new(),
+            );
+            response.cli_session_id = Some("vendor-id".to_string());
+            Ok(response)
+        })
+    }
+
+    fn no_id_executor<'a>(
+        req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            NEW_SEAT_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(AskAgentResponse::direct(
+                "request".to_string(),
+                req.agent.clone(),
+                "answer".to_string(),
+                Vec::new(),
+            ))
+        })
+    }
+
+    fn slow_executor<'a>(
+        req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            NEW_SEAT_CALLS.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let mut response = AskAgentResponse::direct(
+                "request".to_string(),
+                req.agent.clone(),
+                "answer".to_string(),
+                Vec::new(),
+            );
+            response.cli_session_id = Some("vendor-id".to_string());
+            Ok(response)
+        })
+    }
+
+    fn pending_session(agent: &str) -> SessionState {
+        SessionState {
+            agent: agent.to_string(),
+            cwd: None,
+            history: Vec::new(),
+            cli_session_id: None,
+            phase: SessionPhase::Pending,
+            broken_reason: None,
+            generation: 0,
+            parent_session_id: None,
+            root_session_id: None,
+            pantheon_session_id: None,
+        }
+    }
 
     fn daemon_error(failure: DaemonRequestFailure) -> anyhow::Error {
         anyhow::Error::new(DaemonRequestError {
@@ -385,7 +720,219 @@ mod ask_agent_failure_message_tests {
             "the daemon was never down; this line is what sent the operator hunting a corpse: {message}"
         );
         assert!(message.contains("may still be finishing"), "{message}");
-        assert!(message.contains("TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS"), "{message}");
+        assert!(
+            message.contains("TRIUMVIRATE_DAEMON_ASK_TIMEOUT_SECS"),
+            "{message}"
+        );
+    }
+
+    /// RED IF: two in-process asks for one new-seat session overlap child lifetimes.
+    #[tokio::test]
+    async fn new_seat_session_asks_are_serialized() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        ACTIVE_NEW_SEAT_TURNS.store(0, Ordering::SeqCst);
+        MAX_ACTIVE_NEW_SEAT_TURNS.store(0, Ordering::SeqCst);
+        NEW_SEAT_CALLS.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+            "same".to_string(),
+            pending_session("kimi"),
+        )])));
+        core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+        let req = AskSessionRequest {
+            name: "same".to_string(),
+            message: "turn".to_string(),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(
+            ask_session(
+                &sessions,
+                Some(&file),
+                &req,
+                false,
+                overlapping_probe_executor
+            ),
+            ask_session(
+                &sessions,
+                Some(&file),
+                &req,
+                false,
+                overlapping_probe_executor
+            )
+        );
+        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+        assert_eq!(MAX_ACTIVE_NEW_SEAT_TURNS.load(Ordering::SeqCst), 1);
+        assert_eq!(NEW_SEAT_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    /// RED IF: an in-process contender waits past its configured lock limit or invokes its executor.
+    #[tokio::test]
+    async fn in_process_lock_timeout_returns_session_busy_without_second_spawn() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        NEW_SEAT_CALLS.store(0, Ordering::SeqCst);
+        let prior = std::env::var_os("TRIUMVIRATE_SESSION_BUSY_SECS");
+        unsafe { std::env::set_var("TRIUMVIRATE_SESSION_BUSY_SECS", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+            "busy".to_string(),
+            pending_session("kimi"),
+        )])));
+        core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+        let req = AskSessionRequest {
+            name: "busy".to_string(),
+            message: "turn".to_string(),
+            ..Default::default()
+        };
+        let first = ask_session(&sessions, Some(&file), &req, false, slow_executor);
+        let second = async {
+            while NEW_SEAT_CALLS.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            ask_session(&sessions, Some(&file), &req, false, slow_executor).await
+        };
+        let (first, second) = tokio::join!(first, second);
+        match prior {
+            Some(value) => unsafe { std::env::set_var("TRIUMVIRATE_SESSION_BUSY_SECS", value) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_SESSION_BUSY_SECS") },
+        }
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(second.unwrap_err(), "session_busy: busy");
+        assert_eq!(NEW_SEAT_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    /// RED IF: a first successful turn without an id stays usable or spawns again.
+    #[tokio::test]
+    async fn each_new_seat_missing_first_id_breaks_session_and_blocks_next_spawn() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        for seat in ["kimi", "mistral", "qwen"] {
+            NEW_SEAT_CALLS.store(0, Ordering::SeqCst);
+            let dir = tempfile::tempdir().unwrap();
+            let file = daemon_core::sessions_file_path(dir.path());
+            let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+                "missing".to_string(),
+                pending_session(seat),
+            )])));
+            core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+            let req = AskSessionRequest {
+                name: "missing".to_string(),
+                message: "turn".to_string(),
+                ..Default::default()
+            };
+            let answer = ask_session(&sessions, Some(&file), &req, false, no_id_executor)
+                .await
+                .unwrap();
+            assert!(answer.contains(&format!("session not resumable: missing_session_id:{seat}")));
+            let error = ask_session(&sessions, Some(&file), &req, false, no_id_executor)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "session_broken: missing_session_id:{seat}; dismiss_session and spawn a new one"
+                )
+            );
+            assert_eq!(NEW_SEAT_CALLS.load(Ordering::SeqCst), 1, "{seat}");
+        }
+    }
+
+    /// RED IF: in-process spawn does not create and persist a Pending new-seat record before any ask.
+    #[tokio::test]
+    async fn in_process_spawn_persists_pending_before_first_ask() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("empty-cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let prior_home = std::env::var_os("TRIUMVIRATE_HOME");
+        let prior_enable = std::env::var_os("TRIUMVIRATE_ENABLE_KIMI");
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_HOME", dir.path());
+            std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1");
+        }
+        mcp_bridge::seat_state::write_verified(
+            dir.path(),
+            "kimi",
+            &mcp_bridge::seat_state::VerifiedRecord {
+                cli_version: "2.2.0".to_string(),
+                seat_home: dir.path().join("homes/kimi").display().to_string(),
+                probed_at: "2026-10-19T00:00:00Z".to_string(),
+                served_model: None,
+            },
+        )
+        .unwrap();
+        mcp_bridge::seat_gate::register_installed_cli_version("kimi", "2.2.0");
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let result = spawn_session(
+            &sessions,
+            Some(&file),
+            &SpawnSessionRequest {
+                agent: "kimi".to_string(),
+                name: "pending".to_string(),
+                cwd: Some(cwd.display().to_string()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        match prior_home {
+            Some(value) => unsafe { std::env::set_var("TRIUMVIRATE_HOME", value) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_HOME") },
+        }
+        match prior_enable {
+            Some(value) => unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", value) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI") },
+        }
+        result.unwrap();
+        let state = sessions.lock().await.get("pending").cloned().unwrap();
+        assert_eq!(state.phase, SessionPhase::Pending);
+        assert_eq!(state.generation, 0);
+        let disk: HashMap<String, SessionState> = daemon_core::load_json_file(&file).unwrap();
+        assert_eq!(disk["pending"].phase, SessionPhase::Pending);
+    }
+
+    /// RED IF: a Codex session enters the new-seat state machine or creates a session lock file.
+    #[tokio::test]
+    async fn codex_session_keeps_legacy_path_without_phase_or_lock_change() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+            "legacy".to_string(),
+            SessionState {
+                agent: "codex".to_string(),
+                cwd: Some(dir.path().join("empty-cwd").display().to_string()),
+                history: Vec::new(),
+                cli_session_id: None,
+                phase: SessionPhase::Ready,
+                broken_reason: None,
+                generation: 0,
+                parent_session_id: None,
+                root_session_id: None,
+                pantheon_session_id: None,
+            },
+        )])));
+        std::fs::create_dir(dir.path().join("empty-cwd")).unwrap();
+        core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+        let answer = ask_session(
+            &sessions,
+            Some(&file),
+            &AskSessionRequest {
+                name: "legacy".to_string(),
+                message: "turn".to_string(),
+                ..Default::default()
+            },
+            false,
+            no_id_executor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "answer");
+        let state = sessions.lock().await.get("legacy").cloned().unwrap();
+        assert_eq!(state.phase, SessionPhase::Ready);
+        assert_eq!(state.generation, 0);
+        assert!(!dir.path().join("locks").exists());
     }
 
     #[test]
@@ -502,6 +1049,9 @@ mod session_sight_tests {
                 cwd: Some("/repo".to_string()),
                 history: Vec::new(),
                 cli_session_id: None,
+                phase: SessionPhase::Ready,
+                broken_reason: None,
+                generation: 0,
                 parent_session_id: None,
                 root_session_id: None,
                 pantheon_session_id: None,
@@ -514,6 +1064,7 @@ mod session_sight_tests {
             required_sources: vec!["/repo/a.rs".to_string()],
             require_sight: Some(true),
             grok_depth: Some(shared_types::GrokDepthOverride::Deep),
+            ..Default::default()
         };
         ask_session(&sessions, None, &req, false, capturing_executor)
             .await
@@ -534,5 +1085,141 @@ mod session_sight_tests {
         // The session identity must still be carried, or this fix would trade one leak for
         // another: session_key is what stops two named sessions resuming each other.
         assert_eq!(got.session_key.as_deref(), Some("reviewer"));
+    }
+
+    /// Seven Primes T-204: a session turn reaches dispatch on the Session surface with the turn's own origin, for
+    /// both origins. RED IF: ask_session drops `origin` or stops naming the Session surface.
+    fn origin_capturing_executor<'a>(
+        req: &'a AskAgentRequest,
+        _p: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        ORIGIN_SEEN
+            .lock()
+            .unwrap()
+            .push((req.origin, req.ask_surface));
+        Box::pin(async move {
+            Ok(AskAgentResponse::direct(
+                "req-1".to_string(),
+                req.agent.clone(),
+                "ok".to_string(),
+                Vec::new(),
+            ))
+        })
+    }
+    static ORIGIN_SEEN: std::sync::Mutex<Vec<(shared_types::Origin, shared_types::AskSurface)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[tokio::test]
+    async fn ask_session_forwards_origin_and_the_session_surface() {
+        for origin in [
+            shared_types::Origin::Interactive,
+            shared_types::Origin::Unattended,
+        ] {
+            let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+            sessions.lock().await.insert(
+                "s".to_string(),
+                SessionState {
+                    agent: "codex".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    history: Vec::new(),
+                    cli_session_id: None,
+                    phase: SessionPhase::Ready,
+                    broken_reason: None,
+                    generation: 0,
+                    parent_session_id: None,
+                    root_session_id: None,
+                    pantheon_session_id: None,
+                },
+            );
+            let req = AskSessionRequest {
+                name: "s".to_string(),
+                message: "m".to_string(),
+                origin,
+                ..Default::default()
+            };
+            ask_session(&sessions, None, &req, false, origin_capturing_executor)
+                .await
+                .expect("dispatch");
+        }
+        assert_eq!(
+            *ORIGIN_SEEN.lock().unwrap(),
+            [
+                (
+                    shared_types::Origin::Interactive,
+                    shared_types::AskSurface::Session
+                ),
+                (
+                    shared_types::Origin::Unattended,
+                    shared_types::AskSurface::Session
+                ),
+            ]
+        );
+    }
+
+    /// Seven Primes T-204 (REQ-090): spawn_session gates the seat on Session with the request's origin BEFORE any
+    /// session or worker exists. An unconfigured kimi is refused with the gate's exact payload and leaves no session;
+    /// an existing seat spawns for either origin; and the trail shows the unattended origin reached the gate.
+    /// RED IF: spawn_session stops calling the gate, gates after creating the session, or drops `origin`.
+    #[tokio::test]
+    async fn spawn_session_gates_before_creating_anything() {
+        let _rec = gate_trail::record();
+        let prior = {
+            let _env = crate::PROCESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prior = std::env::var_os("TRIUMVIRATE_ENABLE_KIMI");
+            // SAFETY: under PROCESS_ENV_LOCK; restored at the end of this test.
+            unsafe { std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI") };
+            prior
+        };
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let spawn = |agent: &str, name: &str, origin| SpawnSessionRequest {
+            agent: agent.to_string(),
+            name: name.to_string(),
+            cwd: Some("/tmp/t204-spawn".to_string()),
+            origin,
+        };
+        let err = spawn_session(
+            &sessions,
+            None,
+            &spawn("kimi", "k", shared_types::Origin::Unattended),
+            false,
+        )
+        .await
+        .expect_err("an unconfigured seat is refused");
+        assert_eq!(
+            err,
+            "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+        );
+        assert!(
+            sessions.lock().await.is_empty(),
+            "a refused spawn leaves no session"
+        );
+        assert!(gate_trail::saw(
+            "kimi",
+            mcp_bridge::seat_gate::Surface::Session,
+            shared_types::Origin::Unattended
+        ));
+        for (name, origin) in [
+            ("c1", shared_types::Origin::Interactive),
+            ("c2", shared_types::Origin::Unattended),
+        ] {
+            spawn_session(&sessions, None, &spawn("codex", name, origin), false)
+                .await
+                .expect("an existing seat spawns");
+            assert!(gate_trail::saw(
+                "codex",
+                mcp_bridge::seat_gate::Surface::Session,
+                origin
+            ));
+        }
+        assert_eq!(sessions.lock().await.len(), 2);
+        if let Some(v) = prior {
+            let _env = crate::PROCESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: under PROCESS_ENV_LOCK.
+            unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", v) };
+        }
     }
 }

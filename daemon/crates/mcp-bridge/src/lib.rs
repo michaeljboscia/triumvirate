@@ -30,6 +30,15 @@ pub mod deepseek_resilience;
 // T-005 (REQ-DS-007): reqwest::Client builder honouring rolling read_timeout.
 pub mod deepseek;
 
+/// The seat table (Seven Primes FEAT-001, REQ-011): one typed row per seat. Consumers move onto it in T-202/T-204.
+pub mod seat_profile;
+// Seven Primes new modules (T-003 scaffold; Wave 1 implements each in its own file).
+pub mod containment;
+pub mod kimi;
+pub mod mistral;
+pub mod qwen;
+pub mod seat_gate;
+pub mod seat_state;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
@@ -69,24 +78,17 @@ pub fn is_supported_agent(req: &AskAgentRequest) -> bool {
 pub fn display_agent_name(agent: &str) -> String {
     // Normalize first so the alias inputs (antigravity/agy) render the product
     // label instead of falling through to the generic capitaliser ("Agy").
-    match normalize_agent_name(agent).as_str() {
-        "codex" => "Codex".to_string(),
-        // The internal execution key is still `gemini`, but the operator-facing
-        // product name is Antigravity — never render "Gemini" to a human.
-        "gemini" => "Antigravity".to_string(),
-        // T-001: explicit arm — the generic first-letter capitaliser below would produce
-        // "Deepseek" (wrong); the canonical brand spelling is "DeepSeek".
-        "deepseek" => "DeepSeek".to_string(),
-        // REQ-GROK-002: explicit arm so alias inputs (grok-build/xai/supergrok) render "Grok".
-        // SuperGrok is a billing plan, never an operator-facing agent name.
-        "grok" => "Grok".to_string(),
-        other => {
-            let mut chars = other.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => "Agent".to_string(),
-            }
-        }
+    let canonical = normalize_agent_name(agent);
+    // Seven Primes REQ-003: a seat's display name is data on its SeatProfile row ("Kimi", "Mistral", "Qwen").
+    // Every seat has a row (gemini renders "Antigravity", deepseek "DeepSeek"), so only a name with no row reaches
+    // the generic capitaliser below.
+    if let Some(row) = seat_profile::seat_profile(&canonical) {
+        return row.display_name.to_string();
+    }
+    let mut chars = canonical.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Agent".to_string(),
     }
 }
 
@@ -103,8 +105,12 @@ pub fn normalize_agent_name(agent: &str) -> String {
 /// MUST validate against it. Before this existed the four surfaces had drifted into three
 /// different answers, none matching the allowlist: `claude` was dispatchable while advertised
 /// nowhere. A literal list in a second place is how that happened, so do not add one.
+///
+/// Seven Primes REQ-001: rendered from the SeatProfile table, so a seat with a row is on the roster and a roster
+/// entry without a row cannot exist (the T-004 census pins both directions).
 pub fn supported_agent_names() -> &'static [&'static str] {
-    &["gemini", "codex", "deepseek", "claude", "grok"]
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| seat_profile::all_seats().iter().map(|s| s.key).collect())
 }
 
 #[instrument(skip_all)]
@@ -371,6 +377,46 @@ pub fn agy_command() -> (String, Vec<String>) {
     resolve_connector_command("TRIUMVIRATE_AGY_BIN", "TRIUMVIRATE_AGY_ARGS", "agy")
 }
 
+/// The CLI program a new seat's builder emits (Seven Primes T-205), or `None` for any other seat.
+pub fn new_seat_program(seat: &str) -> Option<&'static str> {
+    match seat {
+        "kimi" => Some(kimi::KIMI_PROGRAM),
+        "mistral" => Some(mistral::MISTRAL_PROGRAM),
+        "qwen" => Some("qwen"),
+        _ => None,
+    }
+}
+
+/// The env var that overrides a new seat's binary: `TRIUMVIRATE_<SEAT>_BIN`.
+pub fn new_seat_bin_env(seat: &str) -> String {
+    format!(
+        "TRIUMVIRATE_{}_BIN",
+        seat.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// Resolve a new seat's binary BEFORE the child's HOME is relocated to the seat home (BACKEND_STRUCTURE section 5):
+/// `TRIUMVIRATE_<SEAT>_BIN` wins, else the builder's program on this process's PATH (as an absolute path), else the
+/// known install directory under this process's HOME. No extra args: a new seat's argv is the builder's alone.
+pub fn new_seat_bin(seat: &str) -> Result<String, String> {
+    let program = new_seat_program(seat).ok_or_else(|| format!("not_a_new_seat: {seat}"))?;
+    if let Some(explicit) = std::env::var(new_seat_bin_env(seat))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return Ok(explicit);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(program);
+            if candidate.is_absolute() && is_executable(&candidate) {
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(resolve_on_path_or_fallback(program))
+}
+
 /// Shadow-compare mode (Slice 6, opt-in via `TRIUMVIRATE_GEMINI_SHADOW`). When on,
 /// every `gemini` request ALSO dispatches the other Gemini backend for comparison;
 /// the primary still answers. Off by default — it doubles usage of the shared Google
@@ -569,6 +615,32 @@ mod tests {
         unsafe { std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "anything-else") };
         assert_eq!(super::gemini_backend(), super::GeminiBackend::Agy);
         unsafe { std::env::remove_var("TRIUMVIRATE_GEMINI_BACKEND") };
+    }
+
+    /// Seven Primes T-205. RED IF: the per-seat override stops winning, a non-new seat resolves to a binary, or the
+    /// override name drifts from `TRIUMVIRATE_<SEAT>_BIN`.
+    #[test]
+    fn new_seat_bin_override_wins_and_only_new_seats_resolve() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        assert_eq!(super::new_seat_bin_env("kimi"), "TRIUMVIRATE_KIMI_BIN");
+        let saved = std::env::var_os("TRIUMVIRATE_KIMI_BIN");
+        // SAFETY: under this module's env lock.
+        unsafe { std::env::set_var("TRIUMVIRATE_KIMI_BIN", "/tmp/mock-kimi") };
+        let got = super::new_seat_bin("kimi");
+        // SAFETY: under this module's env lock.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("TRIUMVIRATE_KIMI_BIN", v),
+                None => std::env::remove_var("TRIUMVIRATE_KIMI_BIN"),
+            }
+        }
+        assert_eq!(got.as_deref(), Ok("/tmp/mock-kimi"));
+        assert_eq!(super::new_seat_program("mistral"), Some("vibe"));
+        assert!(
+            super::new_seat_bin("codex")
+                .unwrap_err()
+                .starts_with("not_a_new_seat")
+        );
     }
 
     #[test]

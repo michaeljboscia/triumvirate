@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+for s in kimi mistral qwen; do if [[ "${DOCTOR_FAIL_SEAT:-}" == "$s" ]]; then echo "  $s.binary: FAIL (fixture)"; else echo "  $s.binary: PASS (fixture)"; echo "  $s.version: PASS (fixture)"; fi; done

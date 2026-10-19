@@ -2,6 +2,12 @@
 //!
 //! This crate is the extraction target for daemon-only orchestration logic.
 
+use serde::{Serialize, de::DeserializeOwned};
+use shared_types::{FleetBuild, MemoryEntry, SessionPhase, SessionState};
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -9,28 +15,28 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use serde::{Serialize, de::DeserializeOwned};
-use shared_types::{FleetBuild, MemoryEntry, SessionState};
 use tokio::sync::Mutex;
 use tracing::instrument;
 use uuid::Uuid;
 
-pub mod version;
 pub mod metrics;
 pub mod observability;
-pub mod sequencer;
+pub mod pantheon_session;
 pub mod pid;
 pub mod replay;
-pub mod pantheon_session;
-pub use version::{NAME, VERSION};
-pub use sequencer::EventSequencer;
-pub use pid::PidFile;
-pub use replay::{EventReplayBuffer, ReplayResult, DEFAULT_CAPACITY as REPLAY_BUFFER_DEFAULT_CAPACITY};
-pub use pantheon_session::{
-    PANTHEON_SESSION, PantheonSessionContext, current_parent_session_id,
-    current_pantheon_session, current_root_session_id,
-};
+pub mod sequencer;
 
+pub mod version;
+pub use pantheon_session::{
+    PANTHEON_SESSION, PantheonSessionContext, current_pantheon_session, current_parent_session_id,
+    current_root_session_id,
+};
+pub use pid::PidFile;
+pub use replay::{
+    DEFAULT_CAPACITY as REPLAY_BUFFER_DEFAULT_CAPACITY, EventReplayBuffer, ReplayResult,
+};
+pub use sequencer::EventSequencer;
+pub use version::{NAME, VERSION};
 #[instrument(skip_all)]
 pub fn dead_drop_dir(root: &Path) -> PathBuf {
     root.join("dead-drop")
@@ -251,6 +257,156 @@ pub fn sessions_file_path(root: &Path) -> PathBuf {
     root.join("sessions.json")
 }
 
+#[derive(Debug)]
+pub struct SessionLockGuard {
+    _file: File,
+}
+
+fn session_lock_path(triumvirate_home: &Path, name: &str) -> PathBuf {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    triumvirate_home
+        .join("locks")
+        .join(format!("session-{hash:016x}"))
+}
+
+fn open_session_lock_file(path: &Path) -> Result<File, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("session_lock: {} has no parent", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("session_lock: cannot create {}: {e}", parent.display()))?;
+    let meta = fs::symlink_metadata(parent)
+        .map_err(|e| format!("session_lock: cannot stat {}: {e}", parent.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("session_lock: {} is a symlink", parent.display()));
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("session_lock: cannot open {}: {e}", path.display()))
+}
+
+pub fn session_busy_wait() -> Duration {
+    std::env::var("TRIUMVIRATE_SESSION_BUSY_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(600))
+}
+
+#[allow(clippy::useless_conversion)]
+pub async fn acquire_session_lock(
+    triumvirate_home: &Path,
+    name: &str,
+    wait: Duration,
+) -> Result<SessionLockGuard, String> {
+    let path = session_lock_path(triumvirate_home, name);
+    let file = open_session_lock_file(&path)?;
+    let started = tokio::time::Instant::now();
+    loop {
+        // SAFETY: the fd belongs to `file`, which remains alive in the returned guard.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(SessionLockGuard { _file: file });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) && err.raw_os_error() != Some(libc::EAGAIN)
+        {
+            return Err(format!(
+                "session_lock: flock {} failed: {err}",
+                path.display()
+            ));
+        }
+        if started.elapsed() >= wait {
+            return Err("session_busy".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome<'a> {
+    Success { cli_session_id: Option<&'a str> },
+    Failure(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishResult {
+    Applied,
+    NotResumable(String),
+    Conflict,
+}
+
+/// Classifies vendor-rejected session ids. T-302 captures the live strings and replaces these patterns.
+fn vendor_rejected_session(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("session")
+        && [
+            "not found",
+            "does not exist",
+            "no such",
+            "invalid",
+            "expired",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
+pub fn publish_turn(
+    state: &mut SessionState,
+    start_generation: u64,
+    seat: &str,
+    outcome: TurnOutcome<'_>,
+) -> PublishResult {
+    if state.generation != start_generation {
+        return PublishResult::Conflict;
+    }
+    let result = match outcome {
+        TurnOutcome::Success {
+            cli_session_id: Some(id),
+        } => {
+            state.cli_session_id = Some(id.to_string());
+            state.phase = SessionPhase::Ready;
+            state.broken_reason = None;
+            PublishResult::Applied
+        }
+        TurnOutcome::Success {
+            cli_session_id: None,
+        } if matches!(state.phase, SessionPhase::Pending) => {
+            let reason = format!("missing_session_id:{seat}");
+            state.phase = SessionPhase::Broken;
+            state.broken_reason = Some(reason.clone());
+            PublishResult::NotResumable(reason)
+        }
+        TurnOutcome::Success {
+            cli_session_id: None,
+        } => PublishResult::Applied,
+        TurnOutcome::Failure(error) if matches!(state.phase, SessionPhase::Pending) => {
+            state.phase = SessionPhase::Broken;
+            state.broken_reason = Some(error.lines().next().unwrap_or(error).to_string());
+            PublishResult::Applied
+        }
+        TurnOutcome::Failure(error)
+            if matches!(state.phase, SessionPhase::Ready) && vendor_rejected_session(error) =>
+        {
+            state.phase = SessionPhase::Broken;
+            state.broken_reason = Some(error.lines().next().unwrap_or(error).to_string());
+            PublishResult::Applied
+        }
+        TurnOutcome::Failure(_) => PublishResult::Applied,
+    };
+    state.generation += 1;
+    result
+}
+
 #[instrument(skip_all)]
 pub fn load_json_file<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     if !path.exists() {
@@ -298,6 +454,29 @@ pub fn persist_json_file_if_enabled<T: Serialize>(
         return Ok(());
     };
     persist_json_file(path, value)
+}
+
+/// Refresh one named session from the cross-process sessions file while its session lock is held.
+pub fn reload_session_if_enabled(
+    maybe_path: Option<&PathBuf>,
+    name: &str,
+    sessions: &mut HashMap<String, SessionState>,
+) -> anyhow::Result<()> {
+    let Some(path) = maybe_path else {
+        // Persistence-disabled bridges are process-local. Their in-memory record is authoritative,
+        // while the cross-process lock still prevents overlapping child processes.
+        return Ok(());
+    };
+    let disk: HashMap<String, SessionState> = load_json_file_if_exists(path)?;
+    if let Some(mut fresh) = disk.get(name).cloned() {
+        if fresh.history.is_empty()
+            && let Some(current) = sessions.get(name)
+        {
+            fresh.history = current.history.clone();
+        }
+        sessions.insert(name.to_string(), fresh);
+    }
+    Ok(())
 }
 
 #[instrument(skip_all)]
@@ -779,10 +958,10 @@ mod replay_fill_tests {
 
 #[cfg(test)]
 mod tests {
+    use shared_types::{MemoryEntry, SessionPhase, SessionState};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use shared_types::MemoryEntry;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn dead_drop_count_roundtrip() -> anyhow::Result<()> {
@@ -902,6 +1081,139 @@ mod tests {
         Ok(())
     }
 
+    fn session(phase: SessionPhase, generation: u64, id: Option<&str>) -> SessionState {
+        SessionState {
+            agent: "kimi".to_string(),
+            cwd: None,
+            history: Vec::new(),
+            cli_session_id: id.map(str::to_string),
+            phase,
+            broken_reason: None,
+            generation,
+            parent_session_id: None,
+            root_session_id: None,
+            pantheon_session_id: None,
+        }
+    }
+
+    /// RED IF: a stale turn can overwrite a newer session id or advance its generation.
+    #[test]
+    fn publish_turn_rejects_stale_generation() {
+        let mut state = session(SessionPhase::Ready, 5, Some("newer"));
+        let result = super::publish_turn(
+            &mut state,
+            4,
+            "kimi",
+            super::TurnOutcome::Success {
+                cli_session_id: Some("stale"),
+            },
+        );
+        assert_eq!(result, super::PublishResult::Conflict);
+        assert_eq!(state.generation, 5);
+        assert_eq!(state.cli_session_id.as_deref(), Some("newer"));
+        assert_eq!(state.phase, SessionPhase::Ready);
+    }
+
+    /// RED IF: an applied turn does not publish its id and advance exactly one generation.
+    #[test]
+    fn publish_turn_applies_matching_generation() {
+        let mut state = session(SessionPhase::Pending, 5, None);
+        let result = super::publish_turn(
+            &mut state,
+            5,
+            "kimi",
+            super::TurnOutcome::Success {
+                cli_session_id: Some("first"),
+            },
+        );
+        assert_eq!(result, super::PublishResult::Applied);
+        assert_eq!(state.generation, 6);
+        assert_eq!(state.cli_session_id.as_deref(), Some("first"));
+        assert_eq!(state.phase, SessionPhase::Ready);
+    }
+
+    /// RED IF: a Ready session loses its resumable id when a successful turn reports no id.
+    #[test]
+    fn ready_success_without_id_keeps_stored_id() {
+        let mut state = session(SessionPhase::Ready, 1, Some("stored"));
+        super::publish_turn(
+            &mut state,
+            1,
+            "qwen",
+            super::TurnOutcome::Success {
+                cli_session_id: None,
+            },
+        );
+        assert_eq!(state.cli_session_id.as_deref(), Some("stored"));
+        assert_eq!(state.phase, SessionPhase::Ready);
+        assert_eq!(state.generation, 2);
+    }
+
+    /// RED IF: an ordinary transient failure incorrectly poisons a Ready session.
+    #[test]
+    fn ready_non_vendor_failure_stays_ready() {
+        let mut state = session(SessionPhase::Ready, 8, Some("stored"));
+        super::publish_turn(
+            &mut state,
+            8,
+            "mistral",
+            super::TurnOutcome::Failure("rate limited"),
+        );
+        assert_eq!(state.phase, SessionPhase::Ready);
+        assert_eq!(state.broken_reason, None);
+        assert_eq!(state.generation, 9);
+    }
+
+    /// RED IF: any captured vendor rejection is missed, or a transient rate limit is classified as rejection.
+    #[test]
+    fn vendor_rejected_session_matches_every_contract_pattern_only() {
+        for error in [
+            "Session not found",
+            "SESSION does not exist",
+            "no such session",
+            "invalid session token",
+            "session expired",
+        ] {
+            assert!(super::vendor_rejected_session(error), "{error}");
+        }
+        assert!(!super::vendor_rejected_session("rate limited"));
+        assert!(!super::vendor_rejected_session("invalid request"));
+    }
+
+    /// RED IF: a Ready session remains usable after the vendor rejects its stored session id.
+    #[test]
+    fn ready_vendor_rejection_becomes_broken_and_keeps_id_for_diagnosis() {
+        let mut state = session(SessionPhase::Ready, 3, Some("stored"));
+        let result = super::publish_turn(
+            &mut state,
+            3,
+            "kimi",
+            super::TurnOutcome::Failure("Session not found\nmore detail"),
+        );
+        assert_eq!(result, super::PublishResult::Applied);
+        assert_eq!(state.phase, SessionPhase::Broken);
+        assert_eq!(state.broken_reason.as_deref(), Some("Session not found"));
+        assert_eq!(state.cli_session_id.as_deref(), Some("stored"));
+        assert_eq!(state.generation, 4);
+    }
+
+    /// RED IF: two callers can hold the same named session lock at once or timeout is not reported.
+    #[tokio::test]
+    async fn session_lock_is_exclusive_and_times_out() {
+        let home = tempfile::tempdir().unwrap();
+        let first = super::acquire_session_lock(home.path(), "any/name", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let error = super::acquire_session_lock(home.path(), "any/name", Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "session_busy");
+        drop(first);
+        super::acquire_session_lock(home.path(), "any/name", Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn resolve_context_prefers_explicit_values() {
         let (cwd, repo, branch) = super::resolve_context(
@@ -974,3 +1286,7 @@ mod persist_json_atomic_tests {
         assert!(stray.is_empty(), "temp files left behind: {stray:?}");
     }
 }
+
+// Seven Primes per-seat lock (T-003 scaffold; T-105 implements). At the end of the file, in its own group, so the
+// legacy module and re-export order above is untouched.
+pub mod seat_lock;

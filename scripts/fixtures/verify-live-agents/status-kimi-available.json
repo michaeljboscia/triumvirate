@@ -1,0 +1,25 @@
+{
+ "seats": {
+  "kimi": {
+   "configured": true,
+   "verified": true,
+   "suspended": false,
+   "available": true,
+   "reason": null
+  },
+  "mistral": {
+   "configured": false,
+   "verified": false,
+   "suspended": false,
+   "available": false,
+   "reason": "seat_not_configured"
+  },
+  "qwen": {
+   "configured": false,
+   "verified": false,
+   "suspended": false,
+   "available": false,
+   "reason": "seat_not_configured"
+  }
+ }
+}

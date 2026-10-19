@@ -10,6 +10,10 @@ pub mod shim;
 pub mod index;
 pub mod git_ops;
 
+/// Seven Primes (amendment A-7): fleet-temporal reads per-seat facts (the fleet stall window) through this re-export,
+/// because it depends on `fleet` and not on `mcp-bridge`, and a new dependency would change Cargo.lock.
+pub use mcp_bridge::seat_profile;
+
 /// The time a ledger event happened. Events used to carry a hardcoded "2030-01-01T00:00:00Z",
 /// a fabricated value in every fleet's history. The ledger dedupes on (session_id, event_type,
 /// sequence), never on the timestamp, so a retried write stays a duplicate it can catch.

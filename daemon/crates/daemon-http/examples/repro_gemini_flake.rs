@@ -49,6 +49,8 @@ async fn main() -> anyhow::Result<()> {
         agent: agent.clone(),
         name: session_name.clone(),
         cwd: cwd.clone(),
+        // A person runs this repro by hand.
+        origin: shared_types::Origin::Interactive,
     };
     eprintln!("[spawn] requesting fresh session...");
     match daemon_http::fetch_daemon_session_spawn(&spawn_req).await {
@@ -70,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         let ask_req = AskSessionRequest {
             name: session_name.clone(),
             message: prompt,
+            origin: shared_types::Origin::Interactive,
             required_sources: Vec::new(),
             require_sight: None,
             grok_depth: None,

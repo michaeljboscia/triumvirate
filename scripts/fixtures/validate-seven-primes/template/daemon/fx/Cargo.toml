@@ -1,0 +1,12 @@
+[package]
+name = "fx"
+version = "0.1.0"
+edition = "2024"
+description = "validator fixture crate"
+
+[dependencies]
+fy = { path = "../fy" }
+
+[dev-dependencies]
+
+[build-dependencies]
