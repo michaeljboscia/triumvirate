@@ -188,6 +188,7 @@ fn req_021_req_031_kimi_agent_file_is_exact_and_read_only() {
         concat!(
             "---\n",
             "name: triumvirate-readonly\n",
+            "description: Read-only reviewer that answers questions and never writes files.\n",
             "tools: [Read, Grep, Glob]\n",
             "disallowedTools: [Agent, AgentSwarm]\n",
             "subagents: []\n",
@@ -219,6 +220,7 @@ fn req_031_kimi_agent_file_is_rewritten_from_daemon_truth() {
         concat!(
             "---\n",
             "name: triumvirate-readonly\n",
+            "description: Read-only reviewer that answers questions and never writes files.\n",
             "tools: [Read, Grep, Glob]\n",
             "disallowedTools: [Agent, AgentSwarm]\n",
             "subagents: []\n",

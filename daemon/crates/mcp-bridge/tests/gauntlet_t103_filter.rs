@@ -102,7 +102,7 @@ fn test_should_cap_prompt_at_64_kib() {
 // TECH_STACK: the default pinned model is qwen3-coder-plus and starts with qwen.
 #[test]
 fn test_should_default_to_qwen3_coder_plus() {
-    assert_eq!(DEFAULT_QWEN_MODEL, "qwen3-coder-plus");
+    assert_eq!(DEFAULT_QWEN_MODEL, "qwen3.7-plus");
     assert!(DEFAULT_QWEN_MODEL.starts_with("qwen"));
 }
 
@@ -112,12 +112,12 @@ fn test_should_list_exact_exclude_tools() {
     assert_eq!(EXCLUDED_TOOLS, &EXPECTED_EXCLUDED[..]);
 }
 
-// BACKEND_STRUCTURE section 6: forbidden extra args are exactly the Qwen column.
+// BACKEND_STRUCTURE section 6: forbidden extra args are exactly the Qwen column, plus `--auth-type` (A-13: the builder owns it).
 #[test]
 fn test_should_list_exact_forbidden_extra_args() {
     let expected = [
         "--continue", "--yolo", "-y", "--approval-mode", "--resume", "--output-format", "-o", "-p", "--prompt", "-m",
-        "--model", "--safe-mode", "--exclude-tools", "--allowed-tools",
+        "--model", "--safe-mode", "--auth-type", "--exclude-tools", "--allowed-tools",
     ];
     assert_eq!(FORBIDDEN_EXTRA_ARGS, &expected[..]);
 }

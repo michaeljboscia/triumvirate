@@ -91,7 +91,9 @@ pub fn seat_home(triumvirate_home: &Path, seat: &str) -> Result<PathBuf, String>
 }
 
 /// Kimi's read-only agent file (BACKEND_STRUCTURE section 5): tools limited to read and search, no subagents.
-const KIMI_RO_AGENT: &str = "---\nname: triumvirate-readonly\ntools: [Read, Grep, Glob]\ndisallowedTools: [Agent, AgentSwarm]\nsubagents: []\n---\nRead-only reviewer: never write files.\n";
+/// A-13: Kimi Code 2.2.0 rejects an agent file without `description` (live: "Missing required frontmatter field
+/// \"description\"").
+const KIMI_RO_AGENT: &str = "---\nname: triumvirate-readonly\ndescription: Read-only reviewer that answers questions and never writes files.\ntools: [Read, Grep, Glob]\ndisallowedTools: [Agent, AgentSwarm]\nsubagents: []\n---\nRead-only reviewer: never write files.\n";
 
 /// Write the daemon-owned files into a seat home: Kimi ro-agent.md (0444), Qwen settings.json, Mistral config.toml.
 ///

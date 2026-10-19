@@ -6,10 +6,12 @@ use crate::containment::{SeatInvocation, SeatRequest};
 /// The prompt limit (REQ-024): larger prompts are refused before spawning, never truncated.
 pub const MAX_PROMPT_BYTES: usize = 65536;
 
-/// The pinned Qwen model when the seat config names none (TECH_STACK.md: prefer `qwen3-coder-plus`). The plan also
+/// The pinned Qwen model when the seat config names none. TECH_STACK.md: prefer `qwen3-coder-plus`, else `qwen3.7-plus`;
+/// A-13: the QwenCloud Token Plan /models list (live, 2026-10-18) has no `qwen3-coder-plus` (404 "Model not exist"),
+/// so the fallback is pinned. The plan also
 /// serves GLM, Kimi and MiniMax models (research/03 "Auth and plan"), so an unpinned call could be answered by
 /// another lab.
-pub const DEFAULT_QWEN_MODEL: &str = "qwen3-coder-plus";
+pub const DEFAULT_QWEN_MODEL: &str = "qwen3.7-plus";
 
 /// REQ-023 read-only denylist, the second layer behind `--approval-mode plan` (research/03 "Round 1 research
 /// additions", packages/core/src/tools/tool-names.ts).
@@ -45,6 +47,7 @@ pub const FORBIDDEN_EXTRA_ARGS: &[&str] = &[
     "-m",
     "--model",
     "--safe-mode",
+    "--auth-type",
     "--exclude-tools",
     "--allowed-tools",
 ];
@@ -80,6 +83,10 @@ pub fn build_qwen_invocation(req: &SeatRequest<'_>) -> Result<SeatInvocation, St
         "stream-json",
         // research/03 "Isolation": skips the reviewed repo's `.qwen/settings.json` and `.env`.
         "--safe-mode",
+        // A-13 (live, qwen 0.25.2): without an auth type the CLI exits 1 "No auth type is selected"; `openai` selects
+        // the settings.json modelProviders.openai entry the daemon writes.
+        "--auth-type",
+        "openai",
         "-m",
         model,
         "--max-session-turns",

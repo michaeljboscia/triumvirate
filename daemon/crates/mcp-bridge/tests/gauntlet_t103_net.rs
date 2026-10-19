@@ -62,7 +62,7 @@ fn has_token(args: &[String], token: &str) -> bool {
 // REQ-023: the pinned constants carry the spec values.
 #[test]
 fn t103_req023_constants_carry_spec_values() {
-    assert_eq!(DEFAULT_QWEN_MODEL, "qwen3-coder-plus");
+    assert_eq!(DEFAULT_QWEN_MODEL, "qwen3.7-plus");
     assert_eq!(MAX_PROMPT_BYTES, 65536);
     assert_eq!(UNATTENDED_RETRY_ENV, "QWEN_CODE_UNATTENDED_RETRY");
     assert_eq!(EXCLUDED_TOOLS.len(), 15);
@@ -92,7 +92,7 @@ fn t103_req023_stream_json_output_and_prompt_after_p() {
 #[test]
 fn t103_req023_unrequested_model_pins_default() {
     let inv = ok("hi");
-    assert_eq!(value_after(&inv.args, "-m"), Some("qwen3-coder-plus"));
+    assert_eq!(value_after(&inv.args, "-m"), Some("qwen3.7-plus"));
 }
 
 // REQ-023: a requested model is passed as -m.
