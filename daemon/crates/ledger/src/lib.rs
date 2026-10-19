@@ -280,11 +280,32 @@ impl LedgerStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, path::PathBuf};
+    use std::{
+        collections::HashSet,
+        fs,
+        os::unix::{fs::PermissionsExt, fs::symlink},
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use shared_types::{ManualRecord, RawEvent};
 
     use super::LedgerStore;
+
+    fn git(args: &[&str]) {
+        let output = Command::new("git").args(args).output().expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(path: &Path) {
+        git(&["init", path.to_str().expect("UTF-8 repo path")]);
+    }
 
     #[test]
     fn open_rejects_relative_paths() {
@@ -810,29 +831,317 @@ mod tests {
         assert_eq!(status.status, "degraded");
     }
 
+    /// RED IF: test a sees a .gitignore write or more than one local exclude entry.
     #[test]
-    fn open_adds_triumvirate_gitignore_entry_once() {
+    fn test_a_open_writes_local_exclude_once() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let project_root = temp.path().join("project");
-        fs::create_dir_all(&project_root).expect("create project root");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
 
-        let status = std::process::Command::new("git")
-            .arg("init")
-            .arg(&project_root)
-            .status()
-            .expect("run git init");
-        assert!(status.success(), "git init failed");
+        LedgerStore::open(repo.clone()).expect("first open");
+        LedgerStore::open(repo.clone()).expect("second open");
 
-        LedgerStore::open(project_root.clone()).expect("first open");
-        LedgerStore::open(project_root.clone()).expect("second open");
-
-        let gitignore = fs::read_to_string(project_root.join(".gitignore"))
-            .expect("read .gitignore");
-        let occurrences = gitignore
+        let exclude = fs::read_to_string(repo.join(".git/info/exclude")).expect("read exclude");
+        let occurrences = exclude
             .lines()
             .filter(|line| line.trim() == ".triumvirate/")
             .count();
         assert_eq!(occurrences, 1);
+        assert!(!repo.join(".gitignore").exists());
+    }
+
+    /// RED IF: test b changes any byte in an existing tracked .gitignore.
+    #[test]
+    fn test_b_open_preserves_existing_gitignore_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let gitignore = repo.join(".gitignore");
+        fs::write(&gitignore, b"target/\n").expect("write gitignore");
+
+        LedgerStore::open(repo).expect("open ledger");
+
+        assert_eq!(fs::read(gitignore).expect("read gitignore"), b"target/\n");
+    }
+
+    /// RED IF: test c misses an ancestor repo or leaves the nested ledger directory untracked.
+    #[test]
+    fn test_c_subdirectory_root_uses_ancestor_exclude() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let project_root = repo.join("crates/x");
+        fs::create_dir_all(&project_root).expect("create nested project");
+
+        LedgerStore::open(project_root).expect("open ledger");
+
+        let exclude = fs::read(repo.join(".git/info/exclude")).expect("read exclude");
+        assert!(
+            exclude
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == b".triumvirate/")
+        );
+        let output = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().expect("UTF-8 repo path"),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ])
+            .output()
+            .expect("git status");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "status was {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// RED IF: test d writes inside the linked worktree instead of the main common Git directory.
+    #[test]
+    fn test_d_linked_worktree_uses_main_repo_exclude() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktree = temp.path().join("worktree");
+        init_repo(&repo);
+        fs::write(repo.join("README.md"), b"fixture\n").expect("write fixture");
+        let repo_text = repo.to_str().expect("UTF-8 repo path");
+        git(&["-C", repo_text, "config", "user.name", "Ledger Test"]);
+        git(&[
+            "-C",
+            repo_text,
+            "config",
+            "user.email",
+            "ledger@example.invalid",
+        ]);
+        git(&["-C", repo_text, "add", "README.md"]);
+        git(&["-C", repo_text, "commit", "-m", "fixture"]);
+        git(&[
+            "-C",
+            repo_text,
+            "worktree",
+            "add",
+            "-b",
+            "linked-test",
+            worktree.to_str().expect("UTF-8 worktree path"),
+        ]);
+
+        LedgerStore::open(worktree.clone()).expect("open linked worktree ledger");
+
+        let exclude = fs::read(repo.join(".git/info/exclude")).expect("read main exclude");
+        assert!(
+            exclude
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == b".triumvirate/")
+        );
+        let output = Command::new("git")
+            .args([
+                "-C",
+                worktree.to_str().expect("UTF-8 worktree path"),
+                "status",
+                "--porcelain",
+            ])
+            .output()
+            .expect("git status");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "status was {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!worktree.join(".gitignore").exists());
+    }
+
+    /// RED IF: test e creates Git ignore metadata when no repository exists.
+    #[test]
+    fn test_e_plain_directory_creates_no_git_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir(&project_root).expect("create project");
+
+        LedgerStore::open(project_root.clone()).expect("open ledger outside repo");
+
+        assert!(!project_root.join(".gitignore").exists());
+        assert!(!project_root.join("info/exclude").exists());
+        assert!(!project_root.join(".git/info/exclude").exists());
+    }
+
+    /// RED IF: test f rewrites prior bytes or joins the new rule to the final existing line.
+    #[test]
+    fn test_f_exclude_without_newline_appends_own_line() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let exclude = repo.join(".git/info/exclude");
+        fs::write(&exclude, b"target/").expect("write exclude");
+
+        LedgerStore::open(repo).expect("open ledger");
+
+        assert_eq!(
+            fs::read(exclude).expect("read exclude"),
+            b"target/\n.triumvirate/\n"
+        );
+    }
+
+    /// RED IF: test m fails to create a missing `.git/info` directory and its exclude file.
+    #[test]
+    fn test_m_missing_info_dir_is_created() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        fs::remove_dir_all(repo.join(".git/info")).expect("remove info dir");
+
+        LedgerStore::open(repo.clone()).expect("open ledger");
+
+        assert_eq!(
+            fs::read(repo.join(".git/info/exclude")).expect("read exclude"),
+            b".triumvirate/\n"
+        );
+    }
+
+    /// RED IF: test n fails to create a missing exclude file inside an existing `.git/info`.
+    #[test]
+    fn test_n_missing_exclude_file_is_created() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        fs::remove_file(repo.join(".git/info/exclude")).expect("remove exclude");
+
+        LedgerStore::open(repo.clone()).expect("open ledger");
+
+        assert_eq!(
+            fs::read(repo.join(".git/info/exclude")).expect("read exclude"),
+            b".triumvirate/\n"
+        );
+    }
+
+    /// RED IF: test h makes LedgerStore::open fail when the local exclude cannot be written.
+    #[test]
+    fn test_h_read_only_info_is_nonfatal() {
+        struct PermissionGuard {
+            path: PathBuf,
+            mode: u32,
+        }
+
+        impl Drop for PermissionGuard {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let info = repo.join(".git/info");
+        let exclude = info.join("exclude");
+        fs::remove_file(exclude).expect("remove default exclude");
+        let original_mode = fs::metadata(&info)
+            .expect("info metadata")
+            .permissions()
+            .mode();
+        let _guard = PermissionGuard {
+            path: info.clone(),
+            mode: original_mode,
+        };
+        fs::set_permissions(&info, fs::Permissions::from_mode(0o555)).expect("make info read-only");
+        let project_root = repo.join("crates/x");
+        fs::create_dir_all(&project_root).expect("create nested project");
+
+        let store = LedgerStore::open(project_root).expect("exclude failure must be nonfatal");
+
+        store.health().expect("store remains working");
+    }
+
+    /// RED IF: test i follows an exclude symlink and changes a file outside the repository.
+    #[test]
+    fn test_i_exclude_symlink_is_not_followed() {
+        let repo_temp = tempfile::tempdir().expect("repo tempdir");
+        let target_temp = tempfile::tempdir().expect("target tempdir");
+        let repo = repo_temp.path().join("repo");
+        init_repo(&repo);
+        let target = target_temp.path().join("outside");
+        fs::write(&target, b"outside bytes\n").expect("write outside target");
+        let exclude = repo.join(".git/info/exclude");
+        fs::remove_file(&exclude).expect("remove default exclude");
+        symlink(&target, &exclude).expect("create exclude symlink");
+
+        LedgerStore::open(repo).expect("symlink refusal must be nonfatal");
+
+        assert_eq!(fs::read(&target).expect("read target"), b"outside bytes\n");
+        assert!(
+            fs::symlink_metadata(exclude)
+                .expect("symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// RED IF: test j rejects or rewrites non UTF-8 bytes already present in the exclude file.
+    #[test]
+    fn test_j_non_utf8_exclude_bytes_are_preserved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let exclude = repo.join(".git/info/exclude");
+        fs::write(&exclude, b"\xff\xfe junk\n").expect("write non UTF-8 exclude");
+
+        LedgerStore::open(repo).expect("open ledger");
+
+        assert_eq!(
+            fs::read(exclude).expect("read exclude"),
+            b"\xff\xfe junk\n.triumvirate/\n"
+        );
+    }
+
+    /// RED IF: test k treats malformed or missing gitdir targets as repositories to modify.
+    #[test]
+    fn test_k_invalid_gitdir_files_are_nonfatal() {
+        for (name, git_file) in [
+            ("garbage", "garbage\n"),
+            ("missing", "gitdir: missing-git-dir\n"),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project_root = temp.path().join(name);
+            fs::create_dir(&project_root).expect("create project");
+            fs::write(project_root.join(".git"), git_file).expect("write git file");
+
+            LedgerStore::open(project_root.clone()).expect("invalid gitdir must be nonfatal");
+
+            assert!(project_root.join(".triumvirate/ledger.db").is_file());
+            assert!(!project_root.join("info").exists());
+            assert!(!project_root.join(".gitignore").exists());
+            assert!(!project_root.join("missing-git-dir").exists());
+        }
+    }
+
+    /// RED IF: test l allows concurrent opens to append duplicate local exclude rules.
+    #[test]
+    fn test_l_concurrent_opens_append_one_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let barrier = Arc::new(Barrier::new(8));
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                let barrier = Arc::clone(&barrier);
+                let repo = repo.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    LedgerStore::open(repo).expect("concurrent open");
+                });
+            }
+        });
+
+        let exclude = fs::read_to_string(repo.join(".git/info/exclude")).expect("read exclude");
+        assert_eq!(
+            exclude
+                .lines()
+                .filter(|line| line.trim() == ".triumvirate/")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::{
 use rusqlite::Connection;
 
 use crate::LedgerStore;
-use crate::init::ensure_triumvirate_gitignore;
+use crate::init::ensure_triumvirate_excluded;
 
 static INGEST_WRITES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
@@ -172,7 +172,7 @@ pub(crate) fn open(project_root: PathBuf) -> anyhow::Result<LedgerStore> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(CREATE_SCHEMA_SQL)?;
     migrate_reviews_dispatch_owned(&conn)?;
-    ensure_triumvirate_gitignore(&project_root)?;
+    ensure_triumvirate_excluded(&project_root);
 
     Ok(LedgerStore {
         project_root,
