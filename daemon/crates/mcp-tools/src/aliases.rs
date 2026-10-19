@@ -52,6 +52,9 @@ pub struct AskDaemonParams {
     pub daemon_id: String,
     pub question: String,
     pub timeout_ms: Option<u64>,
+    /// Who is behind this turn (Seven Primes T-204, REQ-090). Default `interactive`, so a legacy caller is unchanged.
+    #[serde(default)]
+    pub origin: shared_types::Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -129,6 +132,8 @@ pub struct AskSessionRequestLike {
     pub name: String,
     pub message: String,
     pub timeout_ms: Option<u64>,
+    /// Carried to the session turn's seat gate (T-204). `send_message` has no such field and maps Interactive.
+    pub origin: shared_types::Origin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +254,7 @@ pub fn map_ask_daemon_params(p: AskDaemonParams) -> Result<AskSessionRequestLike
         name: validate_daemon_id(p.daemon_id)?,
         message: p.question,
         timeout_ms: p.timeout_ms,
+        origin: p.origin,
     })
 }
 
@@ -289,6 +295,8 @@ pub fn map_send_message_params(
         name: p.target,
         message: p.question,
         timeout_ms: p.timeout_ms,
+        // The legacy send_message schema has no origin field.
+        origin: shared_types::Origin::Interactive,
     })
 }
 
@@ -420,6 +428,7 @@ mod tests {
             daemon_id: "gd_session_abc".into(),
             question: "hi".into(),
             timeout_ms: None,
+            origin: Default::default(),
         };
         let out = map_ask_daemon_params(p).unwrap();
         assert_eq!(out.name, "gd_session_abc");
@@ -432,11 +441,32 @@ mod tests {
             daemon_id: "cd_session_xyz".into(),
             question: "hello".into(),
             timeout_ms: Some(50),
+            origin: Default::default(),
         };
         let out = map_ask_daemon_params(p).unwrap();
         assert_eq!(out.name, "cd_session_xyz");
         assert_eq!(out.message, "hello");
         assert_eq!(out.timeout_ms, Some(50));
+    }
+
+    /// Seven Primes T-204: ask_daemon carries `origin` to the session turn, defaulting to interactive when absent.
+    /// RED IF: map_ask_daemon_params drops the field, or a legacy body without it stops parsing.
+    #[test]
+    fn u_al_t204_ask_daemon_carries_origin() {
+        let legacy: AskDaemonParams =
+            serde_json::from_value(serde_json::json!({"daemon_id": "s", "question": "q"})).unwrap();
+        assert_eq!(
+            map_ask_daemon_params(legacy).unwrap().origin,
+            shared_types::Origin::Interactive
+        );
+        let unattended: AskDaemonParams = serde_json::from_value(
+            serde_json::json!({"daemon_id": "s", "question": "q", "origin": "unattended"}),
+        )
+        .unwrap();
+        assert_eq!(
+            map_ask_daemon_params(unattended).unwrap().origin,
+            shared_types::Origin::Unattended
+        );
     }
 
     #[test]
@@ -445,6 +475,7 @@ mod tests {
             daemon_id: "".into(),
             question: "hello".into(),
             timeout_ms: None,
+            origin: Default::default(),
         };
         let err = map_ask_daemon_params(p).unwrap_err();
         assert!(matches!(err, AliasMappingError::InvalidDaemonId(id) if id.is_empty()));
@@ -456,6 +487,7 @@ mod tests {
             daemon_id: "daemon-peritia".into(),
             question: "hello".into(),
             timeout_ms: None,
+            origin: Default::default(),
         };
         let out = map_ask_daemon_params(p).unwrap();
         assert_eq!(out.name, "daemon-peritia");
@@ -663,6 +695,7 @@ mod tests {
             daemon_id: "gd_ok".into(),
             question: "q".into(),
             timeout_ms: None,
+            origin: Default::default(),
         }));
         assert_dismiss_type(map_dismiss_daemon_params(DismissDaemonParams {
             daemon_id: "cd_ok".into(),

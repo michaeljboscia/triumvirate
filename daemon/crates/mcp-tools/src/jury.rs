@@ -454,6 +454,10 @@ pub fn seat_request(req: &AskJuryRequest, agent: &str) -> AskAgentRequest {
         strict_agent: Some(true),
         // Without this the daemon runs the seats one at a time: they share a `cwd`.
         own_lane: Some(true),
+        // Seven Primes T-204 (REQ-090): every seat inherits the jury's origin and is gated on the Jury surface, which
+        // crosses the wire with the seat's request to the daemon's `/ask`.
+        origin: req.origin,
+        ask_surface: shared_types::AskSurface::Jury,
         ..Default::default()
     }
 }
@@ -848,6 +852,39 @@ mod tests {
             |_| {},
         )
         .await
+    }
+
+    /// Seven Primes T-204: every seat request carries the jury's origin and names the Jury surface, for both origins,
+    /// through the real dispatch loop (the runner sees exactly what the daemon would be sent).
+    /// RED IF: seat_request drops `origin` (a seat would be gated as interactive) or stops naming the Jury surface.
+    #[tokio::test]
+    async fn every_seat_inherits_the_jury_origin_and_the_jury_surface() {
+        for origin in [
+            shared_types::Origin::Interactive,
+            shared_types::Origin::Unattended,
+        ] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            let req = AskJuryRequest {
+                origin,
+                ..jury(&["codex", "kimi", "grok"])
+            };
+            run(&req, move |r| {
+                log.lock()
+                    .unwrap()
+                    .push((r.agent.clone(), r.origin, r.ask_surface));
+                Ok(reply(&r.agent, "APPROVE"))
+            })
+            .await
+            .expect("jury runs");
+            let mut seen = seen.lock().unwrap().clone();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            let want: Vec<_> = ["codex", "grok", "kimi"]
+                .iter()
+                .map(|a| (a.to_string(), origin, shared_types::AskSurface::Jury))
+                .collect();
+            assert_eq!(seen, want, "{origin:?}");
+        }
     }
 
     /// BRIEF ACCEPTANCE 1. One seat's backend is forced unavailable.

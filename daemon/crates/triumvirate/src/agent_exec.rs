@@ -804,6 +804,21 @@ async fn execute_ask_agent_inner(
     // $ai_input: the actual prompt for this call, so PostHog's LLM trace view shows what we sent.
     tel.set_input(&req.message);
 
+    // Seven Primes T-204 (REQ-090, REQ-091): the seat gate, FIRST among the pre-dispatch checks and before any
+    // worker, process or credential is touched. The surface is the one the entry point named on the request
+    // (ask_agent and HTTP /ask: AskAgent; a session turn: Session; a jury seat: Jury), never inferred here. A
+    // refusal returns the gate's exact payload. A new seat the gate permits continues to dispatch, which has no arm
+    // for it until T-205 and fails loudly with `unsupported agent: <seat>` (amendment A-9), never another seat.
+    if let Err(refusal) =
+        mcp_tools::inter_agent::gate_seat(&agent, ask_surface(req.ask_surface), req.origin)
+    {
+        span.record("agent.outcome", "rejected_seat_gate");
+        span.record("agent.tokens", 0_u64);
+        span.record("agent.duration_ms", started.elapsed().as_millis() as u64);
+        tel.rejected(&refusal);
+        return Err(refusal);
+    }
+
     // A capability mismatch should cost nothing to discover. DeepSeek has no filesystem tools
     // at all and its parser (`deepseek-sse`) hardcodes an empty `tool_calls`, so a review
     // dispatched to it can never satisfy require_sight. Rejecting on the way OUT would spend a
@@ -4388,6 +4403,11 @@ pub(crate) async fn run_named_agent_with_session_and_model(
     req_overrides: Option<&AskAgentRequest>,
 ) -> anyhow::Result<ParsedAgentResult> {
     let _ = session_id; // deepseek arm intentionally ignores resume tokens — T-014.
+    // Seven Primes T-204: every dispatch arm starts here, and this is where a seat's credentials start being read
+    // (the deepseek key file, a CLI's own auth when its process starts). Test builds record the seat, so a gate
+    // test can prove a refused call never reached credential access.
+    #[cfg(test)]
+    seven_primes_gate_tests::note_dispatch_reached(agent);
     // A review dispatch must not be able to write. Only agy consumes this today: codex exec
     // is already read-only without --full-auto, and the others have no containment knob on
     // this path. See AGENTS_WITH_NO_WRITE_CONTAINMENT.
@@ -4681,10 +4701,41 @@ pub(crate) async fn prewarm_daemon_workers() {
         return;
     }
 
+    let seats = prewarm_seats(mcp_bridge::seat_profile::all_seats());
     let cwds = daemon_prewarm_cwds();
     for cwd in cwds {
-        prewarm_worker("gemini", &cwd).await;
-        prewarm_worker("codex", &cwd).await;
+        for seat in &seats {
+            prewarm_worker(seat, &cwd).await;
+        }
+    }
+}
+
+/// Seven Primes T-204 (REQ-090): the seats prewarm warms, in roster order: rows whose `prewarm_policy` is Always
+/// (today gemini then codex, the order the hard-coded calls used), minus any seat the gate refuses on Prewarm
+/// (always `Unattended`: nobody is at a terminal at daemon start). A refused seat is skipped and logged, never
+/// warmed and never substituted.
+fn prewarm_seats(rows: &[mcp_bridge::seat_profile::SeatProfile]) -> Vec<&'static str> {
+    use mcp_bridge::seat_gate::{Origin, Surface, seat_gate};
+    rows.iter()
+        .filter(|row| row.prewarm_policy == mcp_bridge::seat_profile::PrewarmPolicy::Always)
+        .filter(|row| match seat_gate(row.key, Surface::Prewarm, Origin::Unattended, false) {
+            Ok(()) => true,
+            Err(refusal) => {
+                tracing::info!(seat = row.key, refusal = %refusal.message, "prewarm skipped: seat gate refused");
+                false
+            }
+        })
+        .map(|row| row.key)
+        .collect()
+}
+
+/// The gate's surface for an ask-family request, as its entry point named it.
+fn ask_surface(surface: shared_types::AskSurface) -> mcp_bridge::seat_gate::Surface {
+    use mcp_bridge::seat_gate::Surface;
+    match surface {
+        shared_types::AskSurface::AskAgent => Surface::AskAgent,
+        shared_types::AskSurface::Session => Surface::Session,
+        shared_types::AskSurface::Jury => Surface::Jury,
     }
 }
 
@@ -7188,11 +7239,10 @@ mod deepseek_dispatch_tests {
         }
     }
 
-    /// prewarm_daemon_workers MUST NOT spawn a deepseek worker. We assert
-    /// structurally — by source-grep — that the prewarm function only calls
-    /// `prewarm_worker("gemini"...)` and `prewarm_worker("codex"...)`, not
-    /// deepseek. (A runtime test would need an HTTP daemon spun up; the
-    /// source-grep is the canary the IMPL_PLAN demands.)
+    /// prewarm_daemon_workers MUST NOT spawn a deepseek worker. Asserted on the source (the body selects its seats
+    /// through `prewarm_seats` and names none) and on the selection itself (gemini, then codex, never deepseek).
+    /// (A runtime test with mocks is `seven_primes_gate_tests::prewarm_warms_only_gate_admitted_always_seats`.)
+    /// RED IF: prewarm names seats again, or its row-driven selection admits deepseek.
     #[test]
     fn deepseek_prewarm_slot_is_a_safe_no_op() {
         let src = std::fs::read_to_string(
@@ -7231,17 +7281,26 @@ mod deepseek_dispatch_tests {
             }
         }
         let body = &src[body_start..=body_end];
+        // Seven Primes T-204: prewarm no longer names its seats; it warms the rows prewarm_seats selects (the
+        // prewarm_policy column, then the seat gate on Prewarm). The structural half: the body names no seat at all.
+        // The behavioral half: the selection is gemini then codex, as the literal calls were, and never deepseek.
         assert!(
-            body.contains("prewarm_worker(\"gemini\""),
-            "prewarm must still spawn gemini"
+            body.contains("prewarm_seats("),
+            "prewarm must select its seats from the rows"
         );
         assert!(
-            body.contains("prewarm_worker(\"codex\""),
-            "prewarm must still spawn codex"
+            !body.contains("\"deepseek\""),
+            "prewarm must not name a seat"
+        );
+        let seats = prewarm_seats(mcp_bridge::seat_profile::all_seats());
+        assert_eq!(
+            seats,
+            ["gemini", "codex"],
+            "prewarm must still spawn gemini, then codex"
         );
         assert!(
-            !body.contains("prewarm_worker(\"deepseek\""),
-            "prewarm MUST NOT spawn a deepseek worker (REQ-DS-020 — stateless)"
+            !seats.contains(&"deepseek"),
+            "prewarm MUST NOT spawn a deepseek worker (REQ-DS-020: stateless)"
         );
     }
 
@@ -10002,6 +10061,8 @@ mod mandatory_review_tests {
         // which is where the mock connector is honoured. `grok` has its own runner and would
         // not use the mock.
         //
+        // Seven Primes T-204 (A-12): next_reviewer fails closed without the gate; install the production one.
+        mcp_tools::review::install_reviewer_gate();
         // SAFETY: serialised by `review_env_lock`, cleared by `clear_review_env`.
         unsafe {
             std::env::set_var("TRIUMVIRATE_CODEX_BIN", &reviewer_bin);
@@ -12160,5 +12221,394 @@ mod seven_primes_consumer_tests {
         assert!(!reads.contains(&"qwen-stream-json"), "{reads:?}");
         assert!(reads.contains(&"kimi-stream-json"), "{reads:?}");
         assert_eq!(sight_repair_agents_from(&rows), vec!["grok", "kimi"]);
+    }
+}
+
+/// Seven Primes T-204 (REQ-090, REQ-091, REQ-062): the seat gate at the ask-family call sites, with mock agent
+/// binaries that append their own name to a marker file. Shared helpers here are used by main.rs's entry-point tests.
+#[cfg(test)]
+// The env lock is held across awaits on purpose: these tests repoint every agent binary through process env.
+#[allow(clippy::await_holding_lock)]
+pub(crate) mod seven_primes_gate_tests {
+    use super::*;
+    use mcp_bridge::seat_gate::Surface;
+    use shared_types::{AskSurface, Origin};
+
+    static DISPATCHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Called at the top of `run_named_agent_with_session_and_model`, where a seat's credentials start being read.
+    pub(crate) fn note_dispatch_reached(agent: &str) {
+        DISPATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(agent.to_string());
+    }
+
+    /// How many times this seat has reached dispatch (credential access) in this test binary.
+    pub(crate) fn dispatch_count(seat: &str) -> usize {
+        DISPATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|s| *s == seat)
+            .count()
+    }
+
+    pub(crate) const ENV: &[&str] = &[
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_CODEX_ARGS",
+        "TRIUMVIRATE_GEMINI_BIN",
+        "TRIUMVIRATE_GEMINI_ARGS",
+        "TRIUMVIRATE_GEMINI_BACKEND",
+        "TRIUMVIRATE_AGY_BIN",
+        "TRIUMVIRATE_AGY_ARGS",
+        "TRIUMVIRATE_CLAUDE_BIN",
+        "TRIUMVIRATE_CLAUDE_ARGS",
+        "TRIUMVIRATE_GROK_BIN",
+        "TRIUMVIRATE_GROK_ARGS",
+        "TRIUMVIRATE_HOME",
+        "TRIUMVIRATE_ENABLE_KIMI",
+        "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+        "TRIUMVIRATE_MCP_USE_DAEMON",
+        "TRIUMVIRATE_DAEMON_PREWARM",
+        "TRIUMVIRATE_DAEMON_PREWARM_CWDS",
+    ];
+
+    /// Puts every variable in `ENV` back on drop. Hold `crate::tests::env_lock()` for its whole life.
+    pub(crate) struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        pub(crate) fn capture() -> Self {
+            Self(ENV.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                // SAFETY: under the crate env lock, which the caller holds for this guard's whole life.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mock binaries for every existing seat with a local process, an isolated TRIUMVIRATE_HOME, and kimi
+    /// unconfigured. Each mock appends its seat name to `marker` when it runs. agy gets a mock too, so a backend flip
+    /// can never launch the real agent from a test.
+    pub(crate) struct Mocks {
+        pub(crate) dir: tempfile::TempDir,
+        pub(crate) marker: PathBuf,
+        pub(crate) home: PathBuf,
+    }
+
+    impl Mocks {
+        pub(crate) fn install() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let marker = dir.path().join("marker");
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let connector = |name: &str| {
+                let bin = dir.path().join(format!("mock-{name}"));
+                let script = format!(
+                    "#!/bin/sh\necho {name} >> '{m}'\nIFS= read -r _line\n\
+                     echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"text\":\"{name} answered\"}}}}'\n",
+                    m = marker.display()
+                );
+                crate::write_test_executable(&bin, script).expect("mock");
+                bin
+            };
+            let grok = dir.path().join("fake-grok");
+            crate::write_test_executable(
+                &grok,
+                format!(
+                    "#!/bin/sh\necho grok >> '{m}'\n\
+                     printf '{{\"type\":\"text\",\"data\":\"grok answered\"}}\\n'\n\
+                     printf '{{\"type\":\"end\",\"sessionId\":\"s\",\"stopReason\":\"end_turn\"}}\\n'\n",
+                    m = marker.display()
+                ),
+            )
+            .expect("grok mock");
+            let agy = dir.path().join("fake-agy");
+            crate::write_test_executable(
+                &agy,
+                format!(
+                    "#!/bin/sh\necho agy >> '{m}'\nexit 1\n",
+                    m = marker.display()
+                ),
+            )
+            .expect("agy mock");
+            let (codex, gemini, claude) =
+                (connector("codex"), connector("gemini"), connector("claude"));
+            // SAFETY: the caller holds the crate env lock and an EnvRestore over ENV.
+            unsafe {
+                std::env::set_var("TRIUMVIRATE_CODEX_BIN", &codex);
+                std::env::set_var("TRIUMVIRATE_GEMINI_BIN", &gemini);
+                std::env::set_var("TRIUMVIRATE_GEMINI_BACKEND", "gemini-cli");
+                std::env::set_var("TRIUMVIRATE_AGY_BIN", &agy);
+                std::env::set_var("TRIUMVIRATE_CLAUDE_BIN", &claude);
+                std::env::set_var("TRIUMVIRATE_GROK_BIN", &grok);
+                for k in [
+                    "TRIUMVIRATE_CODEX_ARGS",
+                    "TRIUMVIRATE_GEMINI_ARGS",
+                    "TRIUMVIRATE_AGY_ARGS",
+                    "TRIUMVIRATE_CLAUDE_ARGS",
+                    "TRIUMVIRATE_GROK_ARGS",
+                    "TRIUMVIRATE_ENABLE_KIMI",
+                    "TRIUMVIRATE_REQUIRE_PEER_REVIEW",
+                    "TRIUMVIRATE_MCP_USE_DAEMON",
+                ] {
+                    std::env::remove_var(k);
+                }
+                std::env::set_var("TRIUMVIRATE_HOME", &home);
+            }
+            Self { dir, marker, home }
+        }
+
+        /// Every seat that has run, in order.
+        pub(crate) fn ran(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.marker)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        pub(crate) fn cwd(&self) -> String {
+            self.dir.path().display().to_string()
+        }
+
+        /// kimi enabled and verified, so the gate reaches its surface rule.
+        pub(crate) fn kimi_available(&self) {
+            // SAFETY: under the crate env lock; EnvRestore puts it back.
+            unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") };
+            mcp_bridge::seat_state::write_verified(
+                &self.home,
+                "kimi",
+                &mcp_bridge::seat_state::VerifiedRecord {
+                    cli_version: "t204-gate".into(),
+                    seat_home: "/x".into(),
+                    probed_at: "t".into(),
+                    served_model: None,
+                },
+            )
+            .expect("verified.json");
+            mcp_bridge::seat_gate::register_installed_cli_version("kimi", "t204-gate");
+        }
+    }
+
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn ask(agent: &str, cwd: &str, surface: AskSurface, origin: Origin) -> AskAgentRequest {
+        AskAgentRequest {
+            agent: agent.to_string(),
+            message: "t204".to_string(),
+            cwd: Some(cwd.to_string()),
+            origin,
+            ask_surface: surface,
+            ..Default::default()
+        }
+    }
+
+    const ASK_SURFACES: [(AskSurface, Surface); 3] = [
+        (AskSurface::AskAgent, Surface::AskAgent),
+        (AskSurface::Session, Surface::Session),
+        (AskSurface::Jury, Surface::Jury),
+    ];
+    const ORIGINS: [Origin; 2] = [Origin::Interactive, Origin::Unattended];
+
+    /// THE REFUSED HALF, at `execute_ask_agent_inner`. kimi on AskAgent, Session and Jury, both origins, in each
+    /// refused state (not configured, configured but unverified, suspended): the exact payload comes back, no mock
+    /// runs, and dispatch (where credentials are read) is never reached.
+    /// RED IF: the gate call in execute_ask_agent_inner is removed or moved after dispatch (kimi would reach dispatch
+    /// and fail `unsupported agent`), or a refused call spawns anything.
+    #[tokio::test]
+    async fn refused_seats_return_the_exact_code_and_spawn_nothing() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let dispatched_before = dispatch_count("kimi");
+        let not_configured =
+            "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon";
+        let unverified = "seat_unverified: kimi: run triumvirate doctor --live in a terminal";
+        let suspended =
+            "seat_suspended: kimi: 403 account suspended (run: triumvirate seat clear kimi)";
+        let states: [(&str, &dyn Fn()); 3] = [
+            (not_configured, &|| {}),
+            (unverified, &|| {
+                // SAFETY: under the crate env lock; EnvRestore puts it back.
+                unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1") }
+            }),
+            (suspended, &|| {
+                m.kimi_available();
+                mcp_bridge::seat_state::write_suspended(&m.home, "kimi", "403 account suspended")
+                    .expect("suspended.json");
+            }),
+        ];
+        let mut checked = 0;
+        for (want, enter) in states {
+            enter();
+            for (surface, _) in ASK_SURFACES {
+                for origin in ORIGINS {
+                    let err = execute_ask_agent(&ask("kimi", &m.cwd(), surface, origin), None)
+                        .await
+                        .expect_err("refused");
+                    assert_eq!(err, want, "{surface:?} {origin:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 18);
+        assert!(
+            m.ran().is_empty(),
+            "no mock may run for a refused call: {:?}",
+            m.ran()
+        );
+        assert_eq!(
+            dispatch_count("kimi"),
+            dispatched_before,
+            "no credential access for a refused seat"
+        );
+    }
+
+    /// THE PERMITTED HALF, at `execute_ask_agent_inner`. Every existing seat with a local process on AskAgent,
+    /// Session and Jury, for both origins, spawns ITS OWN mock and returns that mock's answer, with the request's
+    /// (seat, surface, origin) seen by the gate. A permitted NEW seat (kimi, enabled and verified) passes the gate
+    /// and then fails `unsupported agent: kimi` with no mock run and no other seat substituted (A-9). deepseek (an
+    /// HTTP seat with no local process) is admitted by the same gate on the same triples.
+    /// RED IF: a permitted seat stops spawning (a dispatcher that never spawns), answers as another seat, or the
+    /// request's origin or surface stops reaching the gate.
+    #[tokio::test]
+    async fn permitted_seats_spawn_their_own_mock_and_new_seats_fail_unsupported() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        m.kimi_available();
+        let _trail = mcp_tools::inter_agent::gate_trail::record();
+        // The new seat FIRST, before any existing seat has run, so a mock line here can only be a substitution.
+        assert!(m.ran().is_empty());
+        let reached = dispatch_count("kimi");
+        for (surface, gate_surface) in ASK_SURFACES {
+            for origin in ORIGINS {
+                let err = execute_ask_agent(&ask("kimi", &m.cwd(), surface, origin), None)
+                    .await
+                    .expect_err("no kimi arm until T-205");
+                assert!(
+                    err.contains("unsupported agent: kimi"),
+                    "{surface:?} {origin:?}: {err}"
+                );
+                assert!(mcp_tools::inter_agent::gate_trail::saw(
+                    "kimi",
+                    gate_surface,
+                    origin
+                ));
+            }
+        }
+        assert_eq!(
+            dispatch_count("kimi"),
+            reached + 6,
+            "permitted: it passed the gate and reached dispatch"
+        );
+        assert!(
+            m.ran().is_empty(),
+            "and nothing ran in its place: {:?}",
+            m.ran()
+        );
+        let mut spawned = 0;
+        for seat in ["codex", "gemini", "claude", "grok"] {
+            for (surface, gate_surface) in ASK_SURFACES {
+                for origin in ORIGINS {
+                    let before = m.ran().len();
+                    let resp = execute_ask_agent(&ask(seat, &m.cwd(), surface, origin), None)
+                        .await
+                        .unwrap_or_else(|e| panic!("{seat} {surface:?} {origin:?}: {e}"));
+                    assert_eq!(
+                        resp.response,
+                        format!("{seat} answered"),
+                        "{surface:?} {origin:?}"
+                    );
+                    assert_eq!(resp.agent, seat);
+                    // At least one run, and every run is this seat's own binary. grok can run twice: its untracked
+                    // session is reaped by a second invocation of the same CLI.
+                    let ran = m.ran()[before..].to_vec();
+                    assert!(
+                        !ran.is_empty() && ran.iter().all(|r| r == seat),
+                        "{seat} {surface:?} {origin:?}: only its own mock may run, got {ran:?}"
+                    );
+                    assert!(mcp_tools::inter_agent::gate_trail::saw(
+                        seat,
+                        gate_surface,
+                        origin
+                    ));
+                    spawned += 1;
+                }
+            }
+        }
+        assert_eq!(spawned, 24);
+        for (_, gate_surface) in ASK_SURFACES {
+            for origin in ORIGINS {
+                assert_eq!(
+                    mcp_bridge::seat_gate::seat_gate("deepseek", gate_surface, origin, false),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    /// Prewarm reads the row and the gate: today gemini then codex (the old hard-coded order); a row flipped to
+    /// Always for an existing seat joins; a new seat flipped to Always is still refused on Prewarm and skipped. The
+    /// real prewarm spawns exactly the selected seats' mocks.
+    /// RED IF: prewarm goes back to a literal list, ignores prewarm_policy, or warms a seat the gate refuses.
+    #[tokio::test]
+    async fn prewarm_warms_only_gate_admitted_always_seats() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let rows = mcp_bridge::seat_profile::all_seats();
+        assert_eq!(prewarm_seats(rows), ["gemini", "codex"]);
+        let mut mutated = rows.to_vec();
+        for r in &mut mutated {
+            if matches!(r.key, "claude" | "kimi") {
+                r.prewarm_policy = mcp_bridge::seat_profile::PrewarmPolicy::Always;
+            }
+        }
+        assert_eq!(prewarm_seats(&mutated), ["gemini", "codex", "claude"]);
+        m.kimi_available();
+        assert_eq!(
+            mcp_bridge::seat_gate::seat_gate("kimi", Surface::Prewarm, Origin::Unattended, false)
+                .unwrap_err()
+                .message,
+            "seat_surface_deferred: kimi on Prewarm ships in v1.1"
+        );
+        assert_eq!(
+            prewarm_seats(&mutated),
+            ["gemini", "codex", "claude"],
+            "kimi stays out"
+        );
+
+        let cwd = m.dir.path().join("warm");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // SAFETY: under the crate env lock; EnvRestore puts both back.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_DAEMON_PREWARM", "1");
+            std::env::set_var("TRIUMVIRATE_DAEMON_PREWARM_CWDS", &cwd);
+        }
+        prewarm_daemon_workers().await;
+        assert_eq!(
+            m.ran(),
+            ["gemini", "codex"],
+            "prewarm spawned exactly the selected seats"
+        );
+        for seat in ["gemini", "codex"] {
+            let _ = agent_worker::dismiss_worker(seat, &cwd.display().to_string(), None).await;
+        }
     }
 }

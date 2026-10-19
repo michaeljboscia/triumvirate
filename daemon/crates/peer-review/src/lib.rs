@@ -67,6 +67,37 @@ pub fn default_reviewers() -> Vec<String> {
     }
 }
 
+/// The seat gate's answer for the peer-review rotation, as a predicate on a canonical seat key.
+type ReviewerGate = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Process-wide, installed once by the binary before any mode starts (Seven Primes T-204, amendment A-12).
+static REVIEWER_GATE: std::sync::OnceLock<ReviewerGate> = std::sync::OnceLock::new();
+
+/// Install the seat gate the reviewer rotation filters through (Seven Primes T-204, REQ-090, amendment A-12).
+///
+/// peer-review cannot call `mcp_bridge::seat_gate` itself: that is a new path dependency, which changes Cargo.lock,
+/// which the security floor forbids. So the gate is injected. `triumvirate`'s `main()` installs
+/// `seat_gate(seat, PeerReviewRotation, Unattended, false).is_ok()` before any mode starts; PeerReviewRotation is an
+/// internal class and never comes from a caller field. The first install wins and later calls are ignored (logged),
+/// so nothing can swap the gate out after startup. Until one is installed `next_reviewer` picks nobody.
+pub fn set_reviewer_gate(gate: Box<dyn Fn(&str) -> bool + Send + Sync>) {
+    if REVIEWER_GATE.set(gate).is_err() {
+        // No tracing dependency here (adding one would change Cargo.lock), so a second install goes to stderr.
+        eprintln!(
+            "peer-review: set_reviewer_gate: a reviewer gate is already installed; the first one stays"
+        );
+    }
+}
+
+/// The gate this crate's tests install: the A-2 launch answer for PeerReviewRotation (existing seats admitted, the
+/// three new seats deferred). Every test that reaches `next_reviewer` calls this explicitly.
+#[cfg(test)]
+pub(crate) fn install_test_reviewer_gate() {
+    set_reviewer_gate(Box::new(|seat| {
+        !matches!(seat, "kimi" | "mistral" | "qwen")
+    }));
+}
+
 /// Serialises every test that touches `TRIUMVIRATE_PEER_REVIEWERS`.
 ///
 /// It lives at crate scope because the tests that MUTATE that variable and the tests that READ
@@ -382,6 +413,21 @@ impl PeerReviewEngine {
     }
 
     fn next_reviewer(&self, author_agent: &str) -> anyhow::Result<String> {
+        self.next_reviewer_through(author_agent, REVIEWER_GATE.get().map(|g| g.as_ref()))
+    }
+
+    /// `next_reviewer` with the gate passed in, so the fail-closed branch is testable in a binary whose other tests
+    /// have installed the process-wide gate.
+    fn next_reviewer_through(
+        &self,
+        author_agent: &str,
+        gate: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    ) -> anyhow::Result<String> {
+        // Fail CLOSED (A-12): with no gate there is no way to know which seats may sit in the unattended rotation, and
+        // picking one anyway is exactly the dispatch the gate exists to refuse.
+        let Some(gate) = gate else {
+            anyhow::bail!("reviewer_gate_not_installed");
+        };
         // Exclude the author by CANONICAL identity, not by spelling (D-030).
         let author_canonical = shared_types::normalize_agent_name(author_agent);
         let candidates = self
@@ -392,6 +438,23 @@ impl PeerReviewEngine {
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             anyhow::bail!("no non-author reviewers available");
+        }
+        // Seven Primes T-204 (REQ-090): only seats the gate admits on PeerReviewRotation. A refused seat is skipped
+        // rather than failing the review, because the panel is a rotation and the next name is a legitimate answer.
+        let refused: Vec<String> = candidates
+            .iter()
+            .filter(|name| !gate(&shared_types::normalize_agent_name(name)))
+            .cloned()
+            .collect();
+        let candidates = candidates
+            .into_iter()
+            .filter(|name| !refused.contains(name))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            anyhow::bail!(
+                "no non-author reviewer is allowed in the peer-review rotation; refused by the seat gate: {}",
+                refused.join(", ")
+            );
         }
         let mut idx = self
             .round_robin
@@ -448,6 +511,7 @@ mod tests {
 
     #[test]
     fn review_assignment_queue_and_timeout_behave_as_expected() {
+        crate::install_test_reviewer_gate();
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root = temp.path().join("project");
         fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
@@ -524,6 +588,7 @@ mod tests {
 
     #[test]
     fn submit_review_promotes_oldest_pending_when_slot_frees() {
+        crate::install_test_reviewer_gate();
         let temp = tempfile::tempdir().expect("tempdir");
         let project_root = temp.path().join("project");
         fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
@@ -614,6 +679,7 @@ mod tests {
     /// An author must never review its own output, including grok.
     #[test]
     fn u_pr_grok_cannot_review_itself() {
+        crate::install_test_reviewer_gate();
         let tmp = std::env::temp_dir().join("tv-peer-review-grok-self");
         std::fs::create_dir_all(&tmp).unwrap();
         let engine = PeerReviewEngine::new(tmp).unwrap();
@@ -705,6 +771,7 @@ mod submit_authority_tests {
     }
 
     fn seeded_with_owner(author: &str, dispatch_owned: bool) -> (PeerReviewEngine, String, String) {
+        crate::install_test_reviewer_gate();
         let temp = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
         let project_root = temp.path().join("project");
         fs::create_dir_all(project_root.join(".triumvirate").join("spool")).expect("spool");
@@ -732,6 +799,7 @@ mod submit_authority_tests {
     /// RED IF: either comparison goes back to raw string equality.
     #[test]
     fn d030_an_alias_of_the_author_is_never_chosen_as_its_reviewer() {
+        crate::install_test_reviewer_gate();
         let temp = tempfile::tempdir().expect("tempdir");
         let _ = ledger::LedgerStore::open(temp.path().to_path_buf()).expect("ledger");
         let engine = PeerReviewEngine::new(temp.path().to_path_buf()).expect("engine");
@@ -1126,5 +1194,75 @@ mod verdict_normalisation_tests {
             let after = engine.get_review(&review_id).expect("get").expect("present");
             assert_eq!(after.verdict.as_deref(), Some(v));
         }
+    }
+}
+
+/// Seven Primes T-204 (REQ-090, amendment A-12): the reviewer rotation filters through the injected seat gate and
+/// fails closed without one.
+#[cfg(test)]
+mod reviewer_gate_tests {
+    use super::*;
+
+    fn engine(reviewers: &[&str]) -> PeerReviewEngine {
+        PeerReviewEngine {
+            db_path: PathBuf::from("/nonexistent/ledger.db"),
+            reviewers: reviewers.iter().map(|s| s.to_string()).collect(),
+            round_robin: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// RED IF: next_reviewer picks anyone when no gate is installed, or the error stops naming the cause.
+    #[test]
+    fn no_gate_fails_closed() {
+        let err = engine(&["codex", "gemini"])
+            .next_reviewer_through("claude", None)
+            .expect_err("no gate, no reviewer");
+        assert_eq!(err.to_string(), "reviewer_gate_not_installed");
+    }
+
+    /// Through the INSTALLED gate (the production path, `next_reviewer`): over many rotations a deferred seat is never
+    /// picked, every admitted non-author seat is, and a panel of only refused seats is an error naming them.
+    /// RED IF: the gate call in next_reviewer is removed or ignored (kimi and qwen get picked).
+    #[test]
+    fn the_installed_gate_filters_the_rotation() {
+        install_test_reviewer_gate();
+        let e = engine(&["kimi", "codex", "qwen", "gemini", "claude"]);
+        let picked: std::collections::BTreeSet<String> = (0..20)
+            .map(|_| e.next_reviewer("claude").expect("a reviewer"))
+            .collect();
+        assert_eq!(
+            picked.into_iter().collect::<Vec<_>>(),
+            ["codex", "gemini"],
+            "only gate-admitted, non-author seats"
+        );
+        let err = engine(&["kimi", "mistral", "codex"])
+            .next_reviewer("codex")
+            .expect_err("every non-author seat is refused");
+        assert!(
+            err.to_string()
+                .contains("refused by the seat gate: kimi, mistral"),
+            "{err}"
+        );
+    }
+
+    /// The gate is asked with the CANONICAL key, and its answer is what decides: a gate that refuses gemini removes
+    /// it even when the roster spells it `antigravity`.
+    /// RED IF: the filter stops consulting the gate it is handed, or passes the raw alias.
+    #[test]
+    fn the_gate_decides_and_sees_canonical_keys() {
+        let seen = Mutex::new(Vec::new());
+        let gate = |seat: &str| {
+            seen.lock().unwrap().push(seat.to_string());
+            seat != "gemini"
+        };
+        let e = engine(&["antigravity", "codex"]);
+        for _ in 0..4 {
+            assert_eq!(
+                e.next_reviewer_through("claude", Some(&gate)).unwrap(),
+                "codex"
+            );
+        }
+        assert!(seen.lock().unwrap().iter().any(|s| s == "gemini"));
+        assert!(!seen.lock().unwrap().iter().any(|s| s == "antigravity"));
     }
 }

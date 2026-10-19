@@ -608,6 +608,14 @@ fn build_dispatch_produced(
     parts.join("\n\n")
 }
 
+/// Who a worktree dispatch's content trace is about: the repo, and the agent whose process was actually spawned
+/// (Seven Primes T-204). Travels into every watcher as one value, so no watcher can report a different agent.
+#[derive(Debug, Clone)]
+struct DispatchSubject {
+    repo: String,
+    agent: String,
+}
+
 /// Build + emit a worktree dispatch's told/produced content trace, gated on `won`. Shared by every
 /// terminal site (the 4 racing watchers + the main path) so each is a one-liner. The `won` gate is
 /// what makes the race safe: only the watcher that WON the terminal transition emits, so the losers
@@ -620,7 +628,7 @@ async fn emit_worktree_content(
     worktree_path: &std::path::Path,
     told: &str,
     trace_id: &str,
-    repo: &str,
+    subject: &DispatchSubject,
     commit_sha: Option<&str>,
     files: &[String],
     error_or_diagnosis: Option<&str>,
@@ -652,8 +660,9 @@ async fn emit_worktree_content(
     );
     mcp_bridge::posthog::record_dispatch_generation(
         trace_id,
+        &subject.agent,
         "dispatch_codex_worktree",
-        Some(repo),
+        Some(&subject.repo),
         told,
         &produced,
         outcome != "completed",
@@ -697,23 +706,11 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
 
     // Agent-aware. Defaults to codex, so an ABE dispatch that worked before is unchanged.
     let worker_agent = abe_worker_agent();
-    // The `_` arm is FIND-ABE-01's shape one layer out, as Grok noted in round 4: it resolves
-    // ANY unknown name to the codex binary. It is not reachable today, because
-    // `build_worker_argv` matches the agent first and errors on anything outside
-    // ABE_BUILDABLE_AGENTS, so no unknown name gets this far. Left as codex rather than made to
-    // panic because codex IS the correct answer for the one name that legitimately arrives here,
-    // and every other name is already refused upstream. If a new arm is ever added to the
-    // builder without one here, that agent silently gets the codex binary: `abe_09` fails in
-    // that case, which is why it now asserts the spawned binary rather than the absence of an
-    // error.
-    let resolve_command = |a: &str| -> (String, Vec<String>) {
-        match a {
-            "grok" => mcp_bridge::grok_command(),
-            "claude" => mcp_bridge::claude_command(),
-            // Codex keeps its injected resolver, which existing tests rely on.
-            _ => (callbacks.codex_command)(),
-        }
-    };
+    // Seven Primes T-204 (REQ-066, REQ-090): the seat gate on AbeDispatch and the seat row's `abe_buildable`, before
+    // anything is spawned (including the `git rev-parse` below). An unknown, refused or unbuildable agent is an error
+    // naming it; it is never turned into codex.
+    check_abe_worker(&worker_agent)?;
+    let resolve_command = |a: &str| resolve_abe_command(a, &callbacks.codex_command);
     let (cmd, args) = build_worker_argv(&worker_agent, &resolve_command, &req.prompt, &cwd)?;
     let start_sha = std::process::Command::new("git")
         .arg("-C")
@@ -800,6 +797,8 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
     let trace_id_for_monitor = dispatch_trace_id;
     let log_dir_for_monitor = log_dir;
     let repo_for_monitor = cwd.clone();
+    // The agent whose process was just spawned, for the content trace (T-204: it reported "codex" for every worker).
+    let agent_for_monitor = worker_agent.clone();
     // Supervisor clones: reach the tracker if the monitor dies before any transition.
     let tracker_for_sup = tracker.clone();
     let task_id_for_sup = task_id.clone();
@@ -843,8 +842,14 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                         stdout.as_deref(),
                     );
                     mcp_bridge::posthog::record_dispatch_generation(
-                        &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
-                        &told_for_monitor, &produced, true, dur_ms(),
+                        &trace_id_for_monitor,
+                        &agent_for_monitor,
+                        "dispatch_codex",
+                        Some(&repo_for_monitor),
+                        &told_for_monitor,
+                        &produced,
+                        true,
+                        dur_ms(),
                     );
                 }
                 return;
@@ -858,12 +863,24 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 if won {
                     let stdout = read_stdout_log(&log_dir_for_monitor);
                     let produced = build_dispatch_produced(
-                        "timeout", None, &[], None, None, None,
-                        Some("worker exceeded its timeout and was terminated"), stdout.as_deref(),
+                        "timeout",
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        Some("worker exceeded its timeout and was terminated"),
+                        stdout.as_deref(),
                     );
                     mcp_bridge::posthog::record_dispatch_generation(
-                        &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
-                        &told_for_monitor, &produced, true, dur_ms(),
+                        &trace_id_for_monitor,
+                        &agent_for_monitor,
+                        "dispatch_codex",
+                        Some(&repo_for_monitor),
+                        &told_for_monitor,
+                        &produced,
+                        true,
+                        dur_ms(),
                     );
                 }
                 return;
@@ -890,8 +907,14 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                         stdout.as_deref(),
                     );
                     mcp_bridge::posthog::record_dispatch_generation(
-                        &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
-                        &told_for_monitor, &produced, true, dur_ms(),
+                        &trace_id_for_monitor,
+                        &agent_for_monitor,
+                        "dispatch_codex",
+                        Some(&repo_for_monitor),
+                        &told_for_monitor,
+                        &produced,
+                        true,
+                        dur_ms(),
                     );
                 }
                 return;
@@ -916,8 +939,14 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                 .await;
             if won {
                 mcp_bridge::posthog::record_dispatch_generation(
-                    &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
-                    &told_for_monitor, &produced, false, dur_ms(),
+                    &trace_id_for_monitor,
+                    &agent_for_monitor,
+                    "dispatch_codex",
+                    Some(&repo_for_monitor),
+                    &told_for_monitor,
+                    &produced,
+                    false,
+                    dur_ms(),
                 );
             }
         } else {
@@ -936,8 +965,14 @@ pub async fn dispatch_codex<T: AbeTaskTracker>(
                     stdout.as_deref(),
                 );
                 mcp_bridge::posthog::record_dispatch_generation(
-                    &trace_id_for_monitor, "dispatch_codex", Some(&repo_for_monitor),
-                    &told_for_monitor, &produced, true, dur_ms(),
+                    &trace_id_for_monitor,
+                    &agent_for_monitor,
+                    "dispatch_codex",
+                    Some(&repo_for_monitor),
+                    &told_for_monitor,
+                    &produced,
+                    true,
+                    dur_ms(),
                 );
             }
         }
@@ -1027,6 +1062,9 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
             return Err("failed to resolve project_root".to_string());
         }
     };
+    // Seven Primes T-204 (REQ-066, REQ-090): gate and seat row BEFORE the worktree is created (setup runs git).
+    let worker_agent = abe_worker_agent();
+    check_abe_worker(&worker_agent)?;
     // Dispatch clock starts here, before setup + spawn, so the terminal duration covers the
     // whole dispatch (Codex: worktree setup/spawn happen before register).
     let dispatch_started_at = Instant::now();
@@ -1068,9 +1106,8 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
 
     let prompt =
         "Read .triumvirate/BRIEFING.md and implement the task contract. Commit when complete.".to_string();
-    // Agent-aware. The codex branch below is byte-for-byte what this site built before, so an
-    // existing worktree dispatch produces the same process.
-    let worker_agent = abe_worker_agent();
+    // Agent-aware (`worker_agent`, gated above). The codex branch below is byte-for-byte what this site built
+    // before, so an existing worktree dispatch produces the same process.
 
     // The main repo's .git, so a worktree worker can run git operations that need the parent.
     // Computed here and passed in, because every agent needs it and only the argv syntax differs.
@@ -1089,11 +1126,7 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
 
     let (cmd, args) = build_worktree_worker_argv(
         &worker_agent,
-        &|a: &str| match a {
-            "grok" => mcp_bridge::grok_command(),
-            "claude" => mcp_bridge::claude_command(),
-            _ => (callbacks.codex_command)(),
-        },
+        &|a: &str| resolve_abe_command(a, &callbacks.codex_command),
         &prompt,
         &setup.worktree_path.display().to_string(),
         &extra_dirs,
@@ -1150,7 +1183,10 @@ pub async fn dispatch_codex_worktree<T: AbeTaskTracker>(
         .filter(|s| !s.trim().is_empty())
         .or_else(|| parent_session_id.clone().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| task_id.clone());
-    let wt_repo = project_root.display().to_string();
+    let wt_repo = DispatchSubject {
+        repo: project_root.display().to_string(),
+        agent: worker_agent.clone(),
+    };
 
     tracker
         .register(
@@ -1794,6 +1830,7 @@ pub fn build_worker_argv(
     prompt: &str,
     cwd: &str,
 ) -> Result<(String, Vec<String>), String> {
+    check_abe_worker(agent)?;
     match mcp_bridge::normalize_agent_name(agent).as_str() {
         "grok" => {
             let (bin, extra) = command_for("grok");
@@ -1912,6 +1949,7 @@ pub fn build_worktree_worker_argv(
     extra_dirs: &[String],
     sandbox_permissions: Option<&[String]>,
 ) -> Result<(String, Vec<String>), String> {
+    check_abe_worker(agent)?;
     match mcp_bridge::normalize_agent_name(agent).as_str() {
         "grok" => {
             // `workspace` rather than the consult default of `read-only`: a worktree worker
@@ -2002,6 +2040,11 @@ pub(crate) fn abe_env_lock() -> &'static std::sync::Mutex<()> {
 ///
 /// ABE hardcoded codex at both dispatch sites, so gemini, claude and grok were all equally
 /// excluded. This makes the choice explicit and overridable without changing the default.
+///
+/// Seven Primes T-204: an agent ABE cannot build is returned AS REQUESTED (canonicalized), no longer swapped for
+/// codex. Both dispatch sites run `check_abe_worker` on it, which refuses it loudly by name before anything spawns.
+/// The old fallback spawned codex for a request that named something else, which is the silent substitution
+/// FIND-ABE-01 removed from the builder.
 pub fn abe_worker_agent() -> String {
     let raw = std::env::var("TRIUMVIRATE_ABE_AGENT").unwrap_or_else(|_| "codex".to_string());
     let canonical = mcp_bridge::normalize_agent_name(&raw);
@@ -2017,15 +2060,53 @@ pub fn abe_worker_agent() -> String {
     //
     // claude was in that list when this comment was written and has had an arm since fe46483.
     // Grok caught the stale sentence in round 4.
-    if ABE_BUILDABLE_AGENTS.contains(&canonical.as_str()) {
-        canonical
-    } else {
+    if !ABE_BUILDABLE_AGENTS.contains(&canonical.as_str()) {
         tracing::warn!(
             requested = %raw,
             buildable = ?ABE_BUILDABLE_AGENTS,
-            "TRIUMVIRATE_ABE_AGENT is not an agent ABE can build a worker for; using codex"
+            "TRIUMVIRATE_ABE_AGENT is not an agent ABE can build a worker for; dispatches will be refused"
         );
-        "codex".to_string()
+    }
+    canonical
+}
+
+/// The command for an ABE worker's agent. Codex keeps its injected resolver (existing tests rely on it). There is
+/// no fallback arm: a name without its own command resolves to itself, never to the codex binary. Unreachable in
+/// practice, because `check_abe_worker` refuses every agent without a builder arm first.
+fn resolve_abe_command(
+    agent: &str,
+    codex_command: &Arc<dyn Fn() -> (String, Vec<String>) + Send + Sync>,
+) -> (String, Vec<String>) {
+    match agent {
+        "codex" => codex_command(),
+        "grok" => mcp_bridge::grok_command(),
+        "claude" => mcp_bridge::claude_command(),
+        other => (other.to_string(), Vec::new()),
+    }
+}
+
+/// Seven Primes T-204 (REQ-066, REQ-090): may ABE spawn a worker for this agent? The seat gate on `AbeDispatch`
+/// (always `Unattended`: an ABE worker is never a person at a terminal; the class is internal, never a caller field),
+/// then the seat row's `abe_buildable`. Called before anything is spawned. A refusal is the gate's exact payload.
+pub fn check_abe_worker(agent: &str) -> Result<(), String> {
+    use mcp_bridge::seat_gate::{Origin, Surface, seat_gate};
+    let seat = mcp_bridge::normalize_agent_name(agent);
+    seat_gate(&seat, Surface::AbeDispatch, Origin::Unattended, false).map_err(|r| r.message)?;
+    abe_buildable_for_row(mcp_bridge::seat_profile::seat_profile(&seat), &seat)
+}
+
+/// The row half of `check_abe_worker`, taking the row so a test can hand it a mutated one.
+fn abe_buildable_for_row(
+    row: Option<&mcp_bridge::seat_profile::SeatProfile>,
+    seat: &str,
+) -> Result<(), String> {
+    match row {
+        Some(row) if row.abe_buildable => Ok(()),
+        _ => Err(format!(
+            "ABE cannot dispatch a `{seat}` worker: its seat row is not abe_buildable (only \
+             {ABE_BUILDABLE_AGENTS:?} are). Refusing rather than substituting codex, which would report a \
+             `{seat}` worker that is a codex process."
+        )),
     }
 }
 
@@ -2109,7 +2190,8 @@ mod abe_agent_tests {
         assert_eq!(args[i + 1], "workspace", "an ABE worker must be able to write its worktree");
     }
 
-    /// Aliases resolve, and an unknown agent falls back to codex rather than failing a dispatch.
+    /// Aliases resolve, and an unknown agent is kept AS REQUESTED (T-204) so the dispatch refuses it by name instead
+    /// of quietly running codex.
     #[test]
     fn u_abe_04_agent_selection_normalizes_and_defaults_safely() {
         let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -2123,7 +2205,11 @@ mod abe_agent_tests {
 
         // SAFETY: as above.
         unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "not-an-agent") };
-        assert_eq!(abe_worker_agent(), "codex", "a bad value must not break dispatch");
+        assert_eq!(
+            abe_worker_agent(),
+            "not-an-agent",
+            "T-204: a bad value is refused at dispatch by name, never silently turned into codex"
+        );
 
         // SAFETY: as above.
         unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
@@ -2450,9 +2536,9 @@ mod abe_label_honesty_tests {
         }
     }
 
-    /// Selection warns and falls back at the point an operator can see it, rather than producing
-    /// a worker whose label and process disagree.
-    /// RED IF: abe_worker_agent goes back to validating against the daemon-wide agent list.
+    /// Selection warns at the point an operator can see it and keeps the requested agent, so the dispatch refuses
+    /// it by name (T-204: it used to fall back to codex, a silent substitution one layer above the builder).
+    /// RED IF: abe_worker_agent substitutes codex for an unbuildable agent, or the dispatch check lets it through.
     #[test]
     fn abe_10_selection_falls_back_for_an_unbuildable_agent() {
         let _g = env_guard();
@@ -2463,10 +2549,11 @@ mod abe_label_honesty_tests {
         let selected = abe_worker_agent();
         unsafe { std::env::remove_var("TRIUMVIRATE_ABE_AGENT") };
         assert_eq!(
-            selected, "codex",
-            "deepseek is dispatchable by the daemon but not buildable by ABE; selecting it would \
-             record a deepseek worker and spawn a codex process"
+            selected, "deepseek",
+            "deepseek is dispatchable by the daemon but not buildable by ABE; it is kept as requested"
         );
+        let err = super::check_abe_worker(&selected).expect_err("and refused at dispatch, by name");
+        assert!(err.contains("cannot dispatch a `deepseek` worker"), "{err}");
 
         // claude IS buildable now, so it must select as itself rather than falling back.
         unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", "claude") };
@@ -2591,5 +2678,457 @@ mod abe_binary_oracle_tests {
         let (cmd, args) =
             build_worktree_worker_argv("codex", &resolver, "noop task", "/tmp", &dirs, None).expect("codex argv");
         parses_on_installed_binary(&cmd, &args).unwrap();
+    }
+}
+
+/// Seven Primes T-204 (REQ-066, REQ-090): ABE reads the seat gate and the SeatProfile row, refuses by name, spawns
+/// nothing it refuses, and reports the agent it actually spawned.
+#[cfg(test)]
+// The env lock is held across awaits on purpose: these tests repoint agent binaries and PostHog through process env.
+#[allow(clippy::await_holding_lock)]
+mod seven_primes_abe_gate_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        super::abe_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Restores every captured variable on drop, including on panic. Held under `env_guard`.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                // SAFETY: under env_guard for the guard's whole life.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    const ENV: &[&str] = &[
+        "TRIUMVIRATE_ABE_AGENT",
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_CODEX_ARGS",
+        "TRIUMVIRATE_CLAUDE_BIN",
+        "TRIUMVIRATE_CLAUDE_ARGS",
+        "TRIUMVIRATE_GROK_BIN",
+        "TRIUMVIRATE_GROK_ARGS",
+        "TRIUMVIRATE_ENABLE_KIMI",
+        "TRIUMVIRATE_HOME",
+        "POSTHOG_HOST",
+        "POSTHOG_API_KEY",
+    ];
+
+    /// A mock agent binary: appends its own name to `marker` when executed, then exits 0.
+    fn mock_bin(dir: &Path, name: &str, marker: &Path) -> PathBuf {
+        let bin = dir.join(format!("mock-abe-{name}"));
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho {name} >> '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let st = std::process::Command::new("/bin/chmod")
+            .arg("755")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        bin
+    }
+
+    /// kimi enabled and verified in a fresh TRIUMVIRATE_HOME, so the gate reaches its surface rule.
+    fn kimi_available(home: &Path) {
+        // SAFETY: callers hold env_guard and an EnvRestore over both variables.
+        unsafe {
+            std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", "1");
+            std::env::set_var("TRIUMVIRATE_HOME", home);
+        }
+        mcp_bridge::seat_state::write_verified(
+            home,
+            "kimi",
+            &mcp_bridge::seat_state::VerifiedRecord {
+                cli_version: "t204-abe".into(),
+                seat_home: "/x".into(),
+                probed_at: "t".into(),
+                served_model: None,
+            },
+        )
+        .unwrap();
+        mcp_bridge::seat_gate::register_installed_cli_version("kimi", "t204-abe");
+    }
+
+    #[derive(Clone, Default)]
+    struct StubTracker;
+
+    impl AbeTaskTracker for StubTracker {
+        fn register(
+            &self,
+            _: String,
+            _: u32,
+            _: Arc<Mutex<Child>>,
+            _: Option<PathBuf>,
+            _: Option<String>,
+            _: Option<String>,
+            _: String,
+            _: Option<&'static str>,
+            _: Option<String>,
+            _: Instant,
+        ) -> BoxFuture<()> {
+            Box::pin(async {})
+        }
+        fn mark_completed(
+            &self,
+            _: String,
+            _: String,
+            _: Vec<String>,
+            _: String,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> BoxFuture<bool> {
+            Box::pin(async { true })
+        }
+        fn mark_failed(&self, _: String, _: Option<i32>, _: String) -> BoxFuture<bool> {
+            Box::pin(async { true })
+        }
+        fn mark_timeout(&self, _: String) -> BoxFuture<bool> {
+            Box::pin(async { true })
+        }
+        fn mark_stuck(&self, _: String, _: String) -> BoxFuture<bool> {
+            Box::pin(async { true })
+        }
+        fn register_setup_failed(&self, _: String, _: String, _: String) -> BoxFuture<()> {
+            Box::pin(async {})
+        }
+        fn get_status(&self, _: String) -> BoxFuture<Option<GetTaskStatusResponse>> {
+            Box::pin(async { None })
+        }
+        fn get_output(&self, _: String) -> BoxFuture<Option<GetTaskOutputResponse>> {
+            Box::pin(async { None })
+        }
+        fn cancel(&self, _: String) -> BoxFuture<Option<AbeCancelTaskResponse>> {
+            Box::pin(async { None })
+        }
+    }
+
+    /// Real spawn of whatever argv dispatch built; counts every spawn and setup attempt.
+    fn callbacks(spawns: Arc<AtomicUsize>, setups: Arc<AtomicUsize>) -> AbeCallbacks {
+        AbeCallbacks {
+            metrics: Arc::new(DaemonMetrics::new().unwrap()),
+            codex_command: Arc::new(mcp_bridge::codex_command),
+            setup_worktree: Arc::new(move |_| {
+                setups.fetch_add(1, Ordering::SeqCst);
+                Err("setup must not be reached in these tests".to_string())
+            }),
+            spawn_background: Arc::new(move |spec: SpawnSpec| {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    let child = tokio::process::Command::new(&spec.cmd)
+                        .args(&spec.args)
+                        .current_dir(&spec.cwd)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|e| e.to_string())?;
+                    Ok(Arc::new(Mutex::new(child)))
+                })
+            }),
+            enforce_timeout: Arc::new(|_, _, _| Box::pin(async { Ok(false) })),
+            resolve_commit_outputs: Arc::new(|_, _| (String::new(), Vec::new())),
+            validate_commit: Arc::new(|_, _, _| PostExitValidation {
+                passed: true,
+                violations: Vec::new(),
+            }),
+            rollback_worktree: Arc::new(|_, _| Ok(())),
+            completion_env: Arc::new(HashMap::new),
+        }
+    }
+
+    fn contract(task_id: &str) -> ContractFields {
+        ContractFields {
+            task_id: task_id.to_string(),
+            req_ids: vec!["REQ-1".to_string()],
+            wave: 1,
+            file_policy: shared_types::FilePolicy::DefaultDeny,
+            allowed_files: vec!["a.rs".to_string()],
+            forbidden_files: Vec::new(),
+            allowed_commands: vec![vec!["cargo".to_string()]],
+            forbidden_commands: Vec::new(),
+            commit_format: "feat: x".to_string(),
+            test_command: "true".to_string(),
+            task_timeout_sec: 60,
+            done_when: "d".to_string(),
+            reality_test: "r".to_string(),
+            sandbox_permissions: None,
+        }
+    }
+
+    /// The row half reads `abe_buildable` from the row it is handed: flipping it on a cloned row flips the answer.
+    /// RED IF: ABE's buildability is a literal list or ignores the row.
+    #[test]
+    fn abe_buildability_follows_the_seat_row() {
+        use mcp_bridge::seat_profile::seat_profile;
+        for seat in ["codex", "claude", "grok", "gemini", "deepseek", "kimi"] {
+            let row = seat_profile(seat).unwrap();
+            assert_eq!(
+                abe_buildable_for_row(Some(row), seat).is_ok(),
+                row.abe_buildable,
+                "{seat}"
+            );
+            let mut flipped = row.clone();
+            flipped.abe_buildable = !row.abe_buildable;
+            assert_eq!(
+                abe_buildable_for_row(Some(&flipped), seat).is_ok(),
+                !row.abe_buildable,
+                "{seat}: flipping the row flips the answer"
+            );
+        }
+        assert!(abe_buildable_for_row(None, "zzz").is_err());
+    }
+
+    /// Every refused or ineligible worker agent, on both dispatch paths: the exact refusal (gate payload, or a loud
+    /// error naming the seat), and NOTHING spawned: no spawn callback, no worktree setup, no marker from any mock.
+    /// RED IF: dispatch_codex or dispatch_codex_worktree spawns (or sets up a worktree for) an agent the gate refuses
+    /// or the row cannot build, or an unknown agent is turned into codex.
+    #[tokio::test]
+    async fn refused_and_unbuildable_workers_spawn_nothing() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture(ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: under env_guard; restored by _restore.
+        unsafe {
+            for (var, name) in [
+                ("TRIUMVIRATE_CODEX_BIN", "codex"),
+                ("TRIUMVIRATE_CLAUDE_BIN", "claude"),
+                ("TRIUMVIRATE_GROK_BIN", "grok"),
+            ] {
+                std::env::set_var(var, mock_bin(dir.path(), name, &marker));
+            }
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI");
+            std::env::set_var("TRIUMVIRATE_HOME", &home);
+        }
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "not-an-agent",
+                "seat_not_configured: not-an-agent: no such seat".to_string(),
+            ),
+            (
+                "kimi",
+                "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+                    .to_string(),
+            ),
+            (
+                "gemini",
+                "ABE cannot dispatch a `gemini` worker".to_string(),
+            ),
+            (
+                "deepseek",
+                "ABE cannot dispatch a `deepseek` worker".to_string(),
+            ),
+        ];
+        let run = |agent: &str| {
+            let agent = agent.to_string();
+            let cwd = dir.path().display().to_string();
+            async move {
+                // SAFETY: under env_guard.
+                unsafe { std::env::set_var("TRIUMVIRATE_ABE_AGENT", &agent) };
+                let spawns = Arc::new(AtomicUsize::new(0));
+                let setups = Arc::new(AtomicUsize::new(0));
+                let plain = dispatch_codex(
+                    StubTracker,
+                    DispatchCodexRequest {
+                        prompt: "p".to_string(),
+                        cwd: Some(cwd.clone()),
+                        timeout_sec: Some(5),
+                        sandbox: None,
+                    },
+                    callbacks(spawns.clone(), setups.clone()),
+                )
+                .await
+                .map(|r| r.task_id);
+                let worktree = dispatch_codex_worktree(
+                    StubTracker,
+                    DispatchCodexWorktreeRequest {
+                        project_root: Some(cwd.clone()),
+                        sha: "0".repeat(40),
+                        briefing_content: "b".to_string(),
+                        contract_fields: contract("T-1"),
+                        keep_failed_worktree: None,
+                    },
+                    callbacks(spawns.clone(), setups.clone()),
+                )
+                .await
+                .map(|r| r.task_id);
+                (
+                    plain,
+                    worktree,
+                    spawns.load(Ordering::SeqCst),
+                    setups.load(Ordering::SeqCst),
+                )
+            }
+        };
+        for (agent, want) in &cases {
+            let (plain, worktree, spawns, setups) = run(agent).await;
+            for (path, got) in [
+                ("dispatch_codex", plain),
+                ("dispatch_codex_worktree", worktree),
+            ] {
+                let err = got.expect_err(&format!("{agent} on {path} must be refused"));
+                assert!(err.starts_with(want.as_str()), "{agent} {path}: {err}");
+            }
+            assert_eq!(
+                (spawns, setups),
+                (0, 0),
+                "{agent}: nothing may be spawned or set up"
+            );
+        }
+        // kimi enabled AND verified: the gate's own surface rule, deferred on AbeDispatch (A-2).
+        kimi_available(&home);
+        let (plain, worktree, spawns, setups) = run("kimi").await;
+        for got in [plain, worktree] {
+            assert_eq!(
+                got.expect_err("deferred"),
+                "seat_surface_deferred: kimi on AbeDispatch ships in v1.1"
+            );
+        }
+        assert_eq!((spawns, setups), (0, 0));
+        assert!(!marker.exists(), "no mock agent ever ran");
+    }
+
+    /// One HTTP request's JSON body, answered 200. A minimal PostHog capture endpoint.
+    async fn serve_one(stream: &mut tokio::net::TcpStream) -> Option<serde_json::Value> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let len = text[..end]
+                    .lines()
+                    .find_map(|l| {
+                        let l = l.to_ascii_lowercase();
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + len {
+                    let body = buf[end + 4..end + 4 + len].to_vec();
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return serde_json::from_slice(&body).ok();
+                }
+            }
+        }
+    }
+
+    /// Every ABE-buildable seat, dispatched for real: its mock spawns (the marker names it), and the dispatch
+    /// $ai_generation PostHog receives for that task reports THAT agent, not codex.
+    /// RED IF: record_dispatch_generation reports anything but the spawned agent, or a buildable seat stops spawning.
+    #[tokio::test]
+    async fn dispatch_telemetry_reports_the_spawned_agent() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture(ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Some(body) = serve_one(&mut stream).await {
+                        let _ = tx.send(body);
+                    }
+                });
+            }
+        });
+        // SAFETY: under env_guard; restored by _restore.
+        unsafe {
+            std::env::set_var("POSTHOG_HOST", format!("http://{addr}"));
+            std::env::set_var("POSTHOG_API_KEY", "t204");
+            std::env::remove_var("TRIUMVIRATE_CODEX_ARGS");
+            std::env::remove_var("TRIUMVIRATE_CLAUDE_ARGS");
+            std::env::remove_var("TRIUMVIRATE_GROK_ARGS");
+        }
+        for agent in ["codex", "claude", "grok"] {
+            let marker = dir.path().join(format!("marker-{agent}"));
+            // SAFETY: under env_guard.
+            unsafe {
+                for (var, name) in [
+                    ("TRIUMVIRATE_CODEX_BIN", "codex"),
+                    ("TRIUMVIRATE_CLAUDE_BIN", "claude"),
+                    ("TRIUMVIRATE_GROK_BIN", "grok"),
+                ] {
+                    std::env::set_var(
+                        var,
+                        mock_bin(dir.path(), &format!("{name}-for-{agent}"), &marker),
+                    );
+                }
+                std::env::set_var("TRIUMVIRATE_ABE_AGENT", agent);
+            }
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let task_id = dispatch_codex(
+                StubTracker,
+                DispatchCodexRequest {
+                    prompt: "p".to_string(),
+                    cwd: Some(dir.path().display().to_string()),
+                    timeout_sec: Some(10),
+                    sandbox: None,
+                },
+                callbacks(spawns.clone(), Arc::new(AtomicUsize::new(0))),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{agent}: {e}"))
+            .task_id;
+            let event = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    let body = rx.recv().await.expect("listener alive");
+                    let props = &body["properties"];
+                    if body["event"] == "$ai_generation"
+                        && props["$ai_trace_id"] == task_id.as_str()
+                    {
+                        return props.clone();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{agent}: no dispatch generation reached PostHog"));
+            let spawned = std::fs::read_to_string(&marker).unwrap_or_default();
+            assert_eq!(
+                spawned.trim(),
+                format!("{agent}-for-{agent}"),
+                "the {agent} mock ran, alone"
+            );
+            assert_eq!(spawns.load(Ordering::SeqCst), 1);
+            assert_eq!(event["tv_agent"], agent, "{event}");
+            assert_eq!(event["tv_backend"], "dispatch_codex", "{event}");
+        }
+        server.abort();
     }
 }

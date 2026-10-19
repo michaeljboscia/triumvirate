@@ -38,6 +38,27 @@ pub enum Origin {
     Unattended,
 }
 
+/// Which ask-family surface an `AskAgentRequest` came in on (Seven Primes T-204, REQ-090): plain `ask_agent`, a turn
+/// of a named session, or a jury seat. Set by the ENTRY POINT that builds the request, never inferred from other
+/// fields. It crosses the wire because a jury seat reaches the daemon over HTTP `/ask` like any other ask. Only these
+/// three values exist: the unattended surfaces (peer-review rotation, fleet, ABE, prewarm) are internal classes that
+/// no request can name, and at launch these three have the same answer for every seat (amendment A-2), so a caller
+/// that mislabels one cannot widen what it may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AskSurface {
+    #[default]
+    AskAgent,
+    Session,
+    Jury,
+}
+
+impl AskSurface {
+    fn is_ask_agent(&self) -> bool {
+        *self == AskSurface::AskAgent
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AskAgentRequest {
     pub agent: String,
@@ -45,6 +66,17 @@ pub struct AskAgentRequest {
     pub cwd: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
+
+    /// Who is behind this call (Seven Primes T-204, REQ-090): `interactive` (the default, so an old caller that sends
+    /// nothing is unchanged) or `unattended`. Read by the seat gate before anything is spawned.
+    #[serde(default)]
+    pub origin: Origin,
+
+    /// The ask-family surface this request arrived on. See `AskSurface`. Absent means plain `ask_agent`. Not in the
+    /// tool schema: the session and jury entry points set it, a caller has no reason to.
+    #[serde(default, skip_serializing_if = "AskSurface::is_ask_agent")]
+    #[schemars(skip)]
+    pub ask_surface: AskSurface,
 
     /// Resume the cached worker session for (agent, cwd) instead of starting a
     /// fresh one. Opt-in, and `None`/`false` for every one-shot caller.
@@ -206,6 +238,9 @@ pub struct AskJuryRequest {
     /// The same message goes to every seat, verbatim.
     pub message: String,
     pub cwd: Option<String>,
+    /// Who is behind this call (T-204, REQ-090). Every seat inherits it. Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
     /// Which agents sit. Default: the jury default set (`mcp_tools::jury::DEFAULT_SEATS`, rendered into the ask_jury
     /// tool description). At least two, and no agent twice:
     /// `gemini` and `antigravity` are ONE seat, and asking both is one agent voting twice.
@@ -569,11 +604,14 @@ impl AskAgentResponse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SpawnSessionRequest {
     pub agent: String,
     pub name: String,
     pub cwd: Option<String>,
+    /// Who is behind this call (T-204, REQ-090). Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -588,10 +626,14 @@ pub struct SessionListResponse {
     pub sessions: Vec<SessionInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AskSessionRequest {
     pub name: String,
     pub message: String,
+
+    /// Who is behind this turn (T-204, REQ-090). Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
 
     /// The primary sources this turn must actually open, by path.
     ///
@@ -938,6 +980,9 @@ pub struct BlindValidateRequest {
     /// Candidate validators in preference order. Omit for the default panel.
     #[serde(default)]
     pub roster: Vec<String>,
+    /// Who is behind this call (T-204, REQ-090). Every candidate validator is gated with it. Default `interactive`.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1368,6 +1413,62 @@ mod origin_tests {
             Origin::Interactive
         );
         assert!(serde_json::from_str::<Origin>("\"robot\"").is_err());
+    }
+
+    /// Seven Primes T-204: every request type that reaches the seat gate carries `origin`; an old caller that sends
+    /// no field is Interactive, and `unattended` on the wire is read, not dropped.
+    /// RED IF: any of the five requests loses the field, defaults it to anything but Interactive, or ignores it.
+    #[test]
+    fn every_gated_request_carries_origin_with_an_interactive_default() {
+        use super::{
+            AskAgentRequest, AskJuryRequest, AskSessionRequest, AskSurface, BlindValidateRequest,
+            SpawnSessionRequest,
+        };
+        fn both<T: serde::de::DeserializeOwned>(
+            base: serde_json::Value,
+            origin: impl Fn(&T) -> Origin,
+        ) {
+            let old: T = serde_json::from_value(base.clone()).expect("old shape");
+            assert_eq!(origin(&old), Origin::Interactive, "{base}");
+            let mut new = base;
+            new["origin"] = serde_json::json!("unattended");
+            let new: T = serde_json::from_value(new).expect("new shape");
+            assert_eq!(origin(&new), Origin::Unattended);
+        }
+        both::<AskAgentRequest>(
+            serde_json::json!({"agent": "codex", "message": "m", "cwd": null, "repo": null, "branch": null}),
+            |r| r.origin,
+        );
+        both::<AskSessionRequest>(serde_json::json!({"name": "s", "message": "m"}), |r| {
+            r.origin
+        });
+        both::<SpawnSessionRequest>(
+            serde_json::json!({"agent": "codex", "name": "s", "cwd": null}),
+            |r| r.origin,
+        );
+        both::<AskJuryRequest>(serde_json::json!({"message": "m", "cwd": null}), |r| {
+            r.origin
+        });
+        both::<BlindValidateRequest>(
+            serde_json::json!({"project_root": "/r", "impl_worktree": "/w", "contract": "c",
+                               "base_ref": "HEAD", "worker_agent": "codex"}),
+            |r| r.origin,
+        );
+        // The ask surface: absent is AskAgent and is not written back, so the wire shape of a plain ask is unchanged.
+        let plain = AskAgentRequest::default();
+        assert_eq!(plain.ask_surface, AskSurface::AskAgent);
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("ask_surface")
+        );
+        let jury = AskAgentRequest {
+            ask_surface: AskSurface::Jury,
+            ..Default::default()
+        };
+        let back: AskAgentRequest =
+            serde_json::from_str(&serde_json::to_string(&jury).unwrap()).unwrap();
+        assert_eq!(back.ask_surface, AskSurface::Jury);
     }
 }
 

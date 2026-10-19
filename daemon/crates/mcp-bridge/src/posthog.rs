@@ -1320,8 +1320,13 @@ pub fn record_ai_generation(g: &AiGeneration<'_>) {
 /// dispatch_codex_worktree) rides in `$ai_backend`/tv_backend to distinguish this from an ask_agent
 /// generation. `trace_id` should be the Pantheon root/parent session id when present so the trace
 /// nests under the parent agent, falling back to the task id.
+///
+/// Seven Primes T-204: `agent` is the agent whose process was actually spawned. This reported "codex" for every
+/// worker, so a claude or grok ABE worker showed up in LLM analytics as a codex generation.
+#[allow(clippy::too_many_arguments)]
 pub fn record_dispatch_generation(
     trace_id: &str,
+    agent: &str,
     surface: &'static str,
     repo: Option<&str>,
     told: &str,
@@ -1333,7 +1338,7 @@ pub fn record_dispatch_generation(
     // whether the caller passed a name or a full path.
     let repo_basename = repo.map(repo_name);
     record_ai_generation(&AiGeneration {
-        agent: "codex",
+        agent,
         model: None,
         outcome: if is_error { "failure" } else { "success" },
         trace_id,

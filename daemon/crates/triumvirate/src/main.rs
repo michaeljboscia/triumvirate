@@ -837,6 +837,8 @@ impl McpBridge {
             agent: mapped.agent,
             name,
             cwd: mapped.cwd,
+            // The legacy spawn_daemon schema has no origin field.
+            origin: shared_types::Origin::Interactive,
         }))
         .await
     }
@@ -851,6 +853,8 @@ impl McpBridge {
         self.ask_session(Parameters(AskSessionRequest {
             name: mapped.name,
             message: mapped.message,
+            // Seven Primes T-204: ask_daemon carries `origin` (default interactive) to the session turn's seat gate.
+            origin: mapped.origin,
             // Legacy alias schemas carry no sight fields, so a turn through them is ungated.
             // Callers that want a gated session review use ask_session directly.
             required_sources: Vec::new(),
@@ -895,6 +899,8 @@ impl McpBridge {
         let ask_req = AskSessionRequest {
             name: mapped.name.clone(),
             message: mapped.message,
+            // The legacy send_message schema has no origin; the mapping says Interactive.
+            origin: mapped.origin,
             // Same as ask_daemon: the legacy schema has no place to put these.
             required_sources: Vec::new(),
             require_sight: None,
@@ -907,6 +913,7 @@ impl McpBridge {
                     agent: mapped.name.clone(),
                     name: mapped.name,
                     cwd: None,
+                    origin: ask_req.origin,
                 }))
                 .await?;
                 self.ask_session(Parameters(ask_req)).await
@@ -1864,6 +1871,11 @@ fn maybe_install_mcp_stdout_tap() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing()?;
+    // Seven Primes T-204 (REQ-090, amendment A-12): peer-review's rotation filters through the seat gate, injected
+    // because peer-review may not depend on mcp-bridge. Installed before ANY mode starts (daemon, MCP bridge and
+    // fleet shim are this one binary), as `|seat| seat_gate(seat, PeerReviewRotation, Unattended, false).is_ok()`.
+    // Without it next_reviewer picks nobody (fails closed).
+    mcp_tools::review::install_reviewer_gate();
 
     match Cli::parse().command {
         CliCommand::Mcp => {
@@ -2560,6 +2572,176 @@ async fn status(
     })))
 }
 
+// The two named-session HTTP routes, at module scope (they were nested in run_daemon) so the Seven Primes T-204
+// origin tests can mount the real handlers. Moved, not changed, apart from the T-204 lines inside them.
+async fn session_spawn_route(
+    State(state): State<DaemonRuntimeState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<SpawnSessionRequest>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let agent = normalize_agent_name(&req.agent);
+    if !is_supported_agent_name(&agent) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(serde_json::json!({
+                "error": format!(
+                    "spawn_session supports only: {}",
+                    mcp_aliases::daemon_target_agents().join(", ")
+                )
+            })),
+        ));
+    }
+    // Seven Primes T-204 (REQ-090): the HTTP twin of mcp-tools' spawn_session gates the seat on Session with the
+    // request's origin before any session or worker exists. The refusal is the error text, verbatim.
+    if let Err(refusal) = mcp_tools::inter_agent::gate_seat(
+        &agent,
+        mcp_bridge::seat_gate::Surface::Session,
+        req.origin,
+    ) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            AxumJson(serde_json::json!({ "error": refusal })),
+        ));
+    }
+    let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
+    // Respawn starts a NEW conversation: clear any prior CLI session for this name first.
+    agent_worker::reset_worker_session(&agent, &cwd, Some(req.name.as_str())).await;
+    let worker = acquire_worker(&agent, &cwd, Some(req.name.as_str())).await;
+    let mut sessions = state.sessions.lock().await;
+    sessions.insert(
+        req.name.clone(),
+        SessionState {
+            agent: agent.clone(),
+            cwd: Some(cwd),
+            history: Vec::new(),
+            // FEAT-011 (REQ-010, REQ-033): Pantheon lineage fields,
+            // populated later during MCP dispatch in T-004.
+            parent_session_id: None,
+            root_session_id: None,
+            pantheon_session_id: None,
+            cli_session_id: None,
+        },
+    );
+    core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    Ok(AxumJson(serde_json::json!({
+        "status": "ok",
+        "message": format!("session '{}' {} for {}", req.name, if worker.mode == WorkerAcquireMode::Spawned { "spawned" } else { "reused" }, agent)
+    })))
+}
+
+async fn session_ask_route(
+    State(state): State<DaemonRuntimeState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AskSessionRequest>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    if !is_bearer_authorized(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        &state.token,
+    ) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            AxumJson(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    let (agent, cwd, prior_cli_session) = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&req.name).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                AxumJson(
+                    serde_json::json!({ "error": format!("session '{}' not found", req.name) }),
+                ),
+            )
+        })?;
+        (
+            session.agent.clone(),
+            session.cwd.clone(),
+            session.cli_session_id.clone(),
+        )
+    };
+    let response = execute_ask_agent(
+        &AskAgentRequest {
+            agent,
+            message: req.message.clone(),
+            cwd,
+            repo: None,
+            branch: None,
+            // This is the HTTP twin of mcp-tools' ask_session: a NAMED session, so it must
+            // resume. Without this it silently loses multi-turn memory while the MCP path
+            // keeps it, and the two surfaces would disagree about what a session is.
+            reuse_session: Some(true),
+            // Without this the worker key is (agent, cwd) and two named sessions in one
+            // directory resume each other. Demonstrated live before the fix.
+            session_key: Some(req.name.clone()),
+            // Prefer the id the SESSION owns. The worker registry is the legacy fallback and
+            // is only consulted when this is None, which is how pre-migration sessions keep
+            // working.
+            prior_cli_session_id: prior_cli_session.clone(),
+            // THE PATH PRODUCTION ACTUALLY TAKES. `use_daemon_for_mcp_from_env()` defaults
+            // TRUE, so the MCP ask_session proxies to THIS route. The in-process twin in
+            // mcp-tools forwards these fields; this one dropped them, so every session
+            // review in production was silently ungated while the test covering the other
+            // surface stayed green. Grok found that the fix had landed on the unused path.
+            required_sources: req.required_sources.clone(),
+            require_sight: req.require_sight,
+            // Forwarded on BOTH surfaces on purpose. The sight fields were once fixed on
+            // the in-process path only and production (this route) kept dropping them.
+            grok_depth: req.grok_depth,
+            // Seven Primes T-204 (REQ-090): this turn is gated on the Session surface with the caller's origin,
+            // the same as the in-process ask_session.
+            origin: req.origin,
+            ask_surface: shared_types::AskSurface::Session,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            AxumJson(serde_json::json!({ "error": e })),
+        )
+    })?;
+    let cli_session_id = response.cli_session_id.clone();
+    let response = response.response;
+
+    let mut sessions = state.sessions.lock().await;
+    if let Some(session) = sessions.get_mut(&req.name) {
+        session.history.push(format!("user: {}", req.message));
+        session.history.push(format!("assistant: {response}"));
+        // The session OWNS its CLI id. Persisting it here, beside the history it belongs to,
+        // is what makes the two consistent: previously the history lived in this map while
+        // the id lived in a worker keyed on (agent, cwd), and nothing kept them in step.
+        if cli_session_id.is_some() {
+            session.cli_session_id = cli_session_id;
+        }
+    }
+    core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(AxumJson(
+        serde_json::json!({ "status": "ok", "response": response }),
+    ))
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
 
     async fn metrics_middleware(
@@ -2783,124 +2965,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         );
         let outcome = if summary.blocked.is_empty() && summary.errors.is_empty() { "ok" } else { "failed" };
         mcp_bridge::posthog::record_maintenance("fleet_recovery", outcome, summary.recovered.len() as u64);
-    }
-
-    async fn session_spawn_route(
-        State(state): State<DaemonRuntimeState>,
-        headers: HeaderMap,
-        AxumJson(req): AxumJson<SpawnSessionRequest>,
-    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
-            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
-        }
-        let agent = normalize_agent_name(&req.agent);
-        if !is_supported_agent_name(&agent) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                AxumJson(serde_json::json!({
-                    "error": format!(
-                        "spawn_session supports only: {}",
-                        mcp_aliases::daemon_target_agents().join(", ")
-                    )
-                })),
-            ));
-        }
-        let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
-        // Respawn starts a NEW conversation: clear any prior CLI session for this name first.
-        agent_worker::reset_worker_session(&agent, &cwd, Some(req.name.as_str())).await;
-        let worker = acquire_worker(&agent, &cwd, Some(req.name.as_str())).await;
-        let mut sessions = state.sessions.lock().await;
-        sessions.insert(
-            req.name.clone(),
-            SessionState {
-                agent: agent.clone(),
-                cwd: Some(cwd),
-                history: Vec::new(),
-                // FEAT-011 (REQ-010, REQ-033): Pantheon lineage fields,
-                // populated later during MCP dispatch in T-004.
-                parent_session_id: None,
-                root_session_id: None,
-                pantheon_session_id: None,
-            cli_session_id: None,
-            },
-        );
-        core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(serde_json::json!({ "error": e.to_string() })))
-        })?;
-        Ok(AxumJson(serde_json::json!({
-            "status": "ok",
-            "message": format!("session '{}' {} for {}", req.name, if worker.mode == WorkerAcquireMode::Spawned { "spawned" } else { "reused" }, agent)
-        })))
-    }
-
-    async fn session_ask_route(
-        State(state): State<DaemonRuntimeState>,
-        headers: HeaderMap,
-        AxumJson(req): AxumJson<AskSessionRequest>,
-    ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
-        if !is_bearer_authorized(headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()), &state.token) {
-            return Err((StatusCode::UNAUTHORIZED, AxumJson(serde_json::json!({ "error": "unauthorized" }))));
-        }
-        let (agent, cwd, prior_cli_session) = {
-            let sessions = state.sessions.lock().await;
-            let session = sessions.get(&req.name).ok_or_else(|| {
-                (StatusCode::NOT_FOUND, AxumJson(serde_json::json!({ "error": format!("session '{}' not found", req.name) })))
-            })?;
-            (session.agent.clone(), session.cwd.clone(), session.cli_session_id.clone())
-        };
-        let response = execute_ask_agent(
-            &AskAgentRequest {
-                agent,
-                message: req.message.clone(),
-                cwd,
-                repo: None,
-                branch: None,
-                // This is the HTTP twin of mcp-tools' ask_session: a NAMED session, so it must
-                // resume. Without this it silently loses multi-turn memory while the MCP path
-                // keeps it — the two surfaces would disagree about what a session is.
-                reuse_session: Some(true),
-                // Without this the worker key is (agent, cwd) and two named sessions in one
-                // directory resume each other. Demonstrated live before the fix.
-                session_key: Some(req.name.clone()),
-                // Prefer the id the SESSION owns. The worker registry is the legacy fallback and
-                // is only consulted when this is None, which is how pre-migration sessions keep
-                // working.
-                prior_cli_session_id: prior_cli_session.clone(),
-                // THE PATH PRODUCTION ACTUALLY TAKES. `use_daemon_for_mcp_from_env()` defaults
-                // TRUE, so the MCP ask_session proxies to THIS route. The in-process twin in
-                // mcp-tools forwards these fields; this one dropped them, so every session
-                // review in production was silently ungated while the test covering the other
-                // surface stayed green. Grok found that the fix had landed on the unused path.
-                required_sources: req.required_sources.clone(),
-                require_sight: req.require_sight,
-                // Forwarded on BOTH surfaces on purpose. The sight fields were once fixed on
-                // the in-process path only and production (this route) kept dropping them.
-                grok_depth: req.grok_depth,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, AxumJson(serde_json::json!({ "error": e }))))?;
-        let cli_session_id = response.cli_session_id.clone();
-        let response = response.response;
-
-        let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(&req.name) {
-            session.history.push(format!("user: {}", req.message));
-            session.history.push(format!("assistant: {response}"));
-            // The session OWNS its CLI id. Persisting it here, beside the history it belongs to,
-            // is what makes the two consistent: previously the history lived in this map while
-            // the id lived in a worker keyed on (agent, cwd), and nothing kept them in step.
-            if cli_session_id.is_some() {
-                session.cli_session_id = cli_session_id;
-            }
-        }
-        core_persist_json_file_if_enabled(state.sessions_file.as_ref(), &*sessions).map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(serde_json::json!({ "error": e.to_string() })))
-        })?;
-
-        Ok(AxumJson(serde_json::json!({ "status": "ok", "response": response })))
     }
 
     async fn session_dismiss_route(
@@ -5206,6 +5270,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
     #[tokio::test]
     async fn ask_agent_requires_peer_review_when_env_enabled() -> anyhow::Result<()> {
+        // Seven Primes T-204 (A-12): the reviewer rotation fails closed without the gate main() installs.
+        mcp_tools::review::install_reviewer_gate();
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_GEMINI_ARGS", "TRIUMVIRATE_GEMINI_BACKEND", "TRIUMVIRATE_GEMINI_BIN", "TRIUMVIRATE_PEER_REVIEWERS", "TRIUMVIRATE_REQUIRE_PEER_REVIEW"]);
         let script_path = write_mock_gemini_script()?;
@@ -7443,6 +7509,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
 
     #[tokio::test]
     async fn review_tools_round_trip() -> anyhow::Result<()> {
+        // Seven Primes T-204 (A-12): the reviewer rotation fails closed without the gate main() installs.
+        mcp_tools::review::install_reviewer_gate();
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_cwd = std::env::current_dir()?;
         let now = SystemTime::now()
@@ -7508,6 +7576,8 @@ echo '{{\"type\":\"result\",\"stats\":{{\"input_tokens\":10,\"output_tokens\":5,
     /// whether a pending row can exist at all.
     #[tokio::test]
     async fn u_review_submit_cannot_approve_a_pending_row() -> anyhow::Result<()> {
+        // Seven Primes T-204 (A-12): the reviewer rotation fails closed without the gate main() installs.
+        mcp_tools::review::install_reviewer_gate();
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env_restore = EnvRestore::capture(&["TRIUMVIRATE_REVIEW_MAX_INFLIGHT"]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -9222,5 +9292,419 @@ mod seven_primes_status_tests {
             std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI");
             std::env::remove_var("TRIUMVIRATE_HOME");
         }
+    }
+}
+
+/// Seven Primes T-204 (REQ-090): `origin` reaches the seat gate through every entry point. Under amendment A-2 no
+/// gate answer depends on origin, so each test proves arrival twice: the gate trail records the exact
+/// (seat, surface, origin) the entry point produced, and the call's outcome is the one that triple implies (a
+/// permitted kimi passes the gate and then fails `unsupported agent: kimi` until T-205; a refused one returns the
+/// gate's exact payload).
+#[cfg(test)]
+// The env lock is held across awaits on purpose: these tests repoint every agent binary through process env.
+#[allow(clippy::await_holding_lock)]
+mod seven_primes_origin_tests {
+    use super::*;
+    use crate::agent_exec::seven_primes_gate_tests::{EnvRestore, Mocks, env_guard};
+    use mcp_bridge::seat_gate::Surface;
+    use mcp_tools::inter_agent::gate_trail;
+    use rmcp::{ClientHandler, model::CallToolRequestParams, model::ClientInfo};
+    use shared_types::Origin;
+
+    const KIMI_NOT_CONFIGURED: &str =
+        "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon";
+
+    #[derive(Clone)]
+    struct Client;
+    impl ClientHandler for Client {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::default()
+        }
+    }
+
+    /// One MCP tool call against an in-process bridge (local execution: TRIUMVIRATE_MCP_USE_DAEMON is unset by
+    /// `Mocks::install`). Returns (is_error, text).
+    async fn call(tool: &'static str, args: serde_json::Value) -> (bool, String) {
+        let (server_transport, client_transport) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = Client.serve(client_transport).await.expect("client");
+        let out = client
+            .call_tool(
+                CallToolRequestParams::new(tool)
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await;
+        let _ = client.cancel().await;
+        let _ = server.await;
+        match out {
+            Ok(r) => (
+                r.is_error.unwrap_or(false),
+                r.content
+                    .first()
+                    .and_then(|c| c.raw.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default(),
+            ),
+            Err(e) => (true, e.to_string()),
+        }
+    }
+
+    fn last_call() -> (String, Surface, Origin) {
+        gate_trail::calls()
+            .last()
+            .cloned()
+            .expect("the gate was called")
+    }
+
+    fn kimi(surface: Surface, origin: Origin) -> (String, Surface, Origin) {
+        ("kimi".to_string(), surface, origin)
+    }
+
+    /// MCP ask_agent. RED IF: the request's origin stops reaching the AskAgent gate, or a refusal is not verbatim.
+    #[tokio::test]
+    async fn origin_through_mcp_ask_agent() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let _trail = gate_trail::record();
+        let args = serde_json::json!({"agent": "kimi", "message": "m", "cwd": m.cwd(), "origin": "unattended"});
+        assert_eq!(
+            call("ask_agent", args.clone()).await,
+            (true, KIMI_NOT_CONFIGURED.to_string())
+        );
+        assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
+        m.kimi_available();
+        let (is_error, text) = call("ask_agent", args).await;
+        assert!(
+            is_error && text.contains("unsupported agent: kimi"),
+            "{text}"
+        );
+        assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
+        assert!(m.ran().is_empty(), "{:?}", m.ran());
+    }
+
+    async fn http_state() -> (
+        DaemonRuntimeState,
+        daemon_http::DaemonHttpState,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let metrics = Arc::new(daemon_core::metrics::DaemonMetrics::new().unwrap());
+        let ws_events = tokio::sync::broadcast::channel::<String>(16).0;
+        let state = DaemonState::new(
+            "t204-token".to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "127.0.0.1:0".to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            abe::task_tracker::TaskTracker::with_observability(
+                metrics.clone(),
+                Some(ws_events.clone()),
+            ),
+            Arc::new(Mutex::new(VecDeque::new())),
+            metrics,
+            ws_events,
+        );
+        let http_state = daemon_http::DaemonHttpState {
+            token: state.token.clone(),
+            queues: state.queues.clone(),
+            ledger_project_lru: state.ledger_project_lru.clone(),
+            metrics: state.metrics.clone(),
+            ws_events: state.ws_events.clone(),
+            token_db: daemon_http::open_token_db(&tmp.path().join("tokens.db")).expect("token db"),
+            ask_agent_executor: Arc::new(|req| execute_ask_agent_boxed(req, None)),
+        };
+        (state, http_state, tmp)
+    }
+
+    /// The daemon's HTTP routes, the real handlers: /ask-agent, /session/spawn, /session/ask.
+    async fn serve_http() -> (
+        String,
+        DaemonRuntimeState,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
+        let (state, http_state, tmp) = http_state().await;
+        let app = axum::Router::new()
+            .route(
+                "/ask-agent",
+                axum::routing::post_service(daemon_http::ask_agent_route.with_state(http_state)),
+            )
+            .route("/session/spawn", axum::routing::post(session_spawn_route))
+            .route("/session/ask", axum::routing::post(session_ask_route))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), state, server, tmp)
+    }
+
+    async fn post(url: String, body: serde_json::Value) -> (u16, serde_json::Value) {
+        let resp = reqwest::Client::new()
+            .post(url)
+            .bearer_auth("t204-token")
+            .json(&body)
+            .send()
+            .await
+            .expect("http");
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// HTTP /ask (the route production's MCP bridge proxies to). RED IF: origin is dropped on the HTTP hop.
+    #[tokio::test]
+    async fn origin_through_http_ask() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let _trail = gate_trail::record();
+        let (base, _state, server, _tmp) = serve_http().await;
+        let body = serde_json::json!({"agent": "kimi", "message": "m", "cwd": m.cwd(), "origin": "unattended"});
+        let (status, out) = post(format!("{base}/ask-agent"), body.clone()).await;
+        assert_eq!(
+            (status, out["error"].as_str()),
+            (502, Some(KIMI_NOT_CONFIGURED))
+        );
+        assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
+        m.kimi_available();
+        let (status, out) = post(format!("{base}/ask-agent"), body).await;
+        assert_eq!(status, 502);
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported agent: kimi"),
+            "{out}"
+        );
+        assert_eq!(last_call(), kimi(Surface::AskAgent, Origin::Unattended));
+        assert!(m.ran().is_empty());
+        server.abort();
+    }
+
+    /// MCP spawn_session, ask_session and ask_daemon, each with its own origin. RED IF: any of the three drops it.
+    #[tokio::test]
+    async fn origin_through_mcp_spawn_session_ask_session_and_ask_daemon() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let _trail = gate_trail::record();
+        let spawn = serde_json::json!({"agent": "kimi", "name": "k204", "cwd": m.cwd(), "origin": "unattended"});
+        assert_eq!(
+            call("spawn_session", spawn.clone()).await,
+            (true, KIMI_NOT_CONFIGURED.to_string())
+        );
+        assert_eq!(last_call(), kimi(Surface::Session, Origin::Unattended));
+        m.kimi_available();
+        // One bridge for the session's whole life: sessions live in the bridge.
+        let (server_transport, client_transport) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            McpBridge::new_ephemeral()
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = Client.serve(client_transport).await.expect("client");
+        let tool = |name: &'static str, args: serde_json::Value| {
+            CallToolRequestParams::new(name)
+                .with_arguments(args.as_object().cloned().unwrap_or_default())
+        };
+        let text = |r: rmcp::model::CallToolResult| {
+            (
+                r.is_error.unwrap_or(false),
+                r.content
+                    .first()
+                    .and_then(|c| c.raw.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default(),
+            )
+        };
+        let spawn_interactive =
+            serde_json::json!({"agent": "kimi", "name": "k204", "cwd": m.cwd()});
+        let (is_error, out) = text(
+            client
+                .call_tool(tool("spawn_session", spawn_interactive))
+                .await
+                .unwrap(),
+        );
+        assert!(!is_error, "a permitted seat gets its session: {out}");
+        assert_eq!(
+            last_call(),
+            kimi(Surface::Session, Origin::Interactive),
+            "an absent origin is interactive"
+        );
+        let (is_error, out) = text(
+            client
+                .call_tool(tool(
+                    "ask_session",
+                    serde_json::json!({"name": "k204", "message": "m", "origin": "unattended"}),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(is_error && out.contains("unsupported agent: kimi"), "{out}");
+        assert_eq!(
+            last_call(),
+            kimi(Surface::Session, Origin::Unattended),
+            "ask_session carried its origin"
+        );
+        let (is_error, out) = text(
+            client
+                .call_tool(tool(
+                    "ask_session",
+                    serde_json::json!({"name": "k204", "message": "m"}),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(is_error && out.contains("unsupported agent: kimi"), "{out}");
+        assert_eq!(last_call(), kimi(Surface::Session, Origin::Interactive));
+        let (is_error, out) = text(
+            client
+                .call_tool(tool(
+                    "ask_daemon",
+                    serde_json::json!({"daemon_id": "k204", "question": "q", "origin": "unattended"}),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(is_error && out.contains("unsupported agent: kimi"), "{out}");
+        assert_eq!(
+            last_call(),
+            kimi(Surface::Session, Origin::Unattended),
+            "ask_daemon carried its origin"
+        );
+        let _ = client.cancel().await;
+        let _ = server.await;
+        assert!(m.ran().is_empty(), "{:?}", m.ran());
+    }
+
+    /// HTTP /session/spawn and /session/ask. RED IF: either route drops origin, or a refused spawn creates a session.
+    #[tokio::test]
+    async fn origin_through_http_session_spawn_and_ask() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let _trail = gate_trail::record();
+        let (base, state, server, _tmp) = serve_http().await;
+        let spawn = serde_json::json!({"agent": "kimi", "name": "k204h", "cwd": m.cwd(), "origin": "unattended"});
+        let (status, out) = post(format!("{base}/session/spawn"), spawn.clone()).await;
+        assert_eq!(
+            (status, out["error"].as_str()),
+            (403, Some(KIMI_NOT_CONFIGURED))
+        );
+        assert!(
+            state.sessions.lock().await.is_empty(),
+            "a refused spawn leaves no session"
+        );
+        assert_eq!(last_call(), kimi(Surface::Session, Origin::Unattended));
+        m.kimi_available();
+        let (status, out) = post(format!("{base}/session/spawn"), spawn).await;
+        assert_eq!(status, 200, "{out}");
+        assert_eq!(last_call(), kimi(Surface::Session, Origin::Unattended));
+        let (status, out) = post(
+            format!("{base}/session/ask"),
+            serde_json::json!({"name": "k204h", "message": "m", "origin": "unattended"}),
+        )
+        .await;
+        assert_eq!(status, 502);
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported agent: kimi"),
+            "{out}"
+        );
+        assert_eq!(last_call(), kimi(Surface::Session, Origin::Unattended));
+        assert!(m.ran().is_empty());
+        server.abort();
+    }
+
+    /// MCP ask_jury: every seat inherits the jury's origin on the Jury surface. The existing seat answers with its own
+    /// mock; the permitted new seat is unavailable with `unsupported agent: kimi`, never answered by another seat.
+    /// RED IF: a seat loses the jury's origin or surface, or kimi's seat is filled by anyone.
+    #[tokio::test]
+    async fn origin_through_mcp_ask_jury() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        m.kimi_available();
+        let _trail = gate_trail::record();
+        let (is_error, text) = call(
+            "ask_jury",
+            serde_json::json!({"message": "m", "seats": ["codex", "kimi"], "cwd": m.cwd(), "origin": "unattended"}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        let out: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(out["seats"]["codex"]["response"], "codex answered", "{out}");
+        assert_ne!(out["seats"]["kimi"]["status"], "answered", "{out}");
+        assert!(out["seats"]["kimi"]["answered_by_agent"].is_null(), "{out}");
+        assert!(
+            out["seats"]["kimi"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported agent: kimi"),
+            "{out}"
+        );
+        let calls = gate_trail::calls();
+        for seat in ["codex", "kimi"] {
+            assert!(
+                calls.contains(&(seat.to_string(), Surface::Jury, Origin::Unattended)),
+                "{seat}: {calls:?}"
+            );
+        }
+        assert_eq!(m.ran(), ["codex"]);
+    }
+
+    /// blind_validate: the candidate is gated on BlindValidate with the request's origin, FIRST: the exact
+    /// seat_cannot_write_here payload comes back although the worktree does not exist (the gate ran before the
+    /// worktree check), and nothing ran.
+    /// RED IF: blind_validate drops origin, stops gating per candidate, or gates after anything else.
+    #[tokio::test]
+    async fn origin_through_blind_validate() {
+        let _g = env_guard();
+        let _restore = EnvRestore::capture();
+        let m = Mocks::install();
+        let _trail = gate_trail::record();
+        let req = |origin| BlindValidateRequest {
+            project_root: "/nonexistent-t204".to_string(),
+            impl_worktree: "/nonexistent-t204/wt".to_string(),
+            contract: "c".to_string(),
+            base_ref: "HEAD".to_string(),
+            worker_agent: "codex".to_string(),
+            package_dir: None,
+            roster: vec!["kimi".to_string()],
+            origin,
+        };
+        assert_eq!(
+            blind_validate::tool_impl(req(Origin::Unattended))
+                .await
+                .unwrap_err(),
+            KIMI_NOT_CONFIGURED
+        );
+        assert_eq!(
+            last_call(),
+            kimi(Surface::BlindValidate, Origin::Unattended)
+        );
+        m.kimi_available();
+        for origin in [Origin::Interactive, Origin::Unattended] {
+            assert_eq!(
+                blind_validate::tool_impl(req(origin)).await.unwrap_err(),
+                "seat_cannot_write_here: kimi: blind validators must write test files and kimi is read-only"
+            );
+            assert_eq!(last_call(), kimi(Surface::BlindValidate, origin));
+        }
+        assert!(m.ran().is_empty());
     }
 }

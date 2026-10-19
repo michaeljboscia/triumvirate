@@ -46,6 +46,81 @@ pub type ExecuteAskAgentFn = for<'a> fn(
 /// continuously for four days: the real cause was the 180s client ceiling on a dispatch
 /// that needed 424s. An unverified remediation is worse than none, because it reads like a
 /// diagnosis and closes the investigation.
+/// The seat gate at an ask-family call site (Seven Primes T-204, REQ-090, REQ-091): `ask_agent`, a session spawn or
+/// turn, a jury seat, a blind validator. Decided before anything is spawned; a refusal comes back as the Refusal's
+/// exact payload, which the caller returns as its tool or HTTP error text. `tty` is false: none of these surfaces runs
+/// on the operator's terminal. The surface is the caller's, never inferred here.
+pub fn gate_seat(
+    seat: &str,
+    surface: mcp_bridge::seat_gate::Surface,
+    origin: shared_types::Origin,
+) -> Result<(), String> {
+    gate_trail::note(seat, surface, origin);
+    mcp_bridge::seat_gate::seat_gate(seat, surface, origin, false).map_err(|r| r.message)
+}
+
+/// Which (seat, surface, origin) triples reached `gate_seat`, so a test can prove a request's `origin` arrived at
+/// the gate (under A-2 no answer depends on origin, so the answer alone cannot show it). Recorded only while at
+/// least one `Recording` is alive; otherwise `note` is one atomic load.
+#[doc(hidden)]
+pub mod gate_trail {
+    use mcp_bridge::seat_gate::Surface;
+    use shared_types::Origin;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static CALLS: Mutex<Vec<(String, Surface, Origin)>> = Mutex::new(Vec::new());
+
+    /// While this lives, gate calls are recorded. Tests that run in parallel share one trail, so assert on a
+    /// triple your own test produced, not on the trail's length.
+    pub struct Recording(());
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Start recording. The first recorder clears what an earlier one left, so callers that serialise on their own
+    /// lock see only their own calls.
+    pub fn record() -> Recording {
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) == 0 {
+            CALLS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        Recording(())
+    }
+
+    /// Every triple recorded since recording started, in call order.
+    pub fn calls() -> Vec<(String, Surface, Origin)> {
+        CALLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn note(seat: &str, surface: Surface, origin: Origin) {
+        if ACTIVE.load(Ordering::SeqCst) > 0 {
+            CALLS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((seat.to_string(), surface, origin));
+        }
+    }
+
+    /// True if this exact triple has reached the gate while recording.
+    pub fn saw(seat: &str, surface: Surface, origin: Origin) -> bool {
+        CALLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(s, su, o)| s == seat && *su == surface && *o == origin)
+    }
+}
+
 pub(crate) fn describe_ask_agent_failure(err: &anyhow::Error) -> String {
     let detail = format!("ask_agent failed: {err:#}");
     match err.downcast_ref::<DaemonRequestError>().map(|e| e.failure) {
@@ -132,6 +207,8 @@ pub async fn spawn_session(
             crate::aliases::daemon_target_agents().join(", ")
         ));
     }
+    // Seven Primes T-204 (REQ-090): a seat the gate refuses on Session never gets a session or a worker.
+    gate_seat(&agent, mcp_bridge::seat_gate::Surface::Session, req.origin)?;
     let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
     // Per NAMED session, so two sessions for one agent in one directory do not resume each
     // other. Keyed on (agent, cwd) alone this leaked a passphrase between sessions.
@@ -222,6 +299,9 @@ pub async fn ask_session(
             // Same story as the sight fields: without this a named grok session could never
             // run Deep, so a session review could be gated on sources it had no turns to read.
             grok_depth: req.grok_depth,
+            // Seven Primes T-204 (REQ-090): this turn is gated on the Session surface with the caller's origin.
+            origin: req.origin,
+            ask_surface: shared_types::AskSurface::Session,
             ..Default::default()
         },
         None,
@@ -563,6 +643,7 @@ mod session_sight_tests {
             required_sources: vec!["/repo/a.rs".to_string()],
             require_sight: Some(true),
             grok_depth: Some(shared_types::GrokDepthOverride::Deep),
+            ..Default::default()
         };
         ask_session(&sessions, None, &req, false, capturing_executor)
             .await
@@ -583,5 +664,138 @@ mod session_sight_tests {
         // The session identity must still be carried, or this fix would trade one leak for
         // another: session_key is what stops two named sessions resuming each other.
         assert_eq!(got.session_key.as_deref(), Some("reviewer"));
+    }
+
+    /// Seven Primes T-204: a session turn reaches dispatch on the Session surface with the turn's own origin, for
+    /// both origins. RED IF: ask_session drops `origin` or stops naming the Session surface.
+    fn origin_capturing_executor<'a>(
+        req: &'a AskAgentRequest,
+        _p: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        ORIGIN_SEEN
+            .lock()
+            .unwrap()
+            .push((req.origin, req.ask_surface));
+        Box::pin(async move {
+            Ok(AskAgentResponse::direct(
+                "req-1".to_string(),
+                req.agent.clone(),
+                "ok".to_string(),
+                Vec::new(),
+            ))
+        })
+    }
+    static ORIGIN_SEEN: std::sync::Mutex<Vec<(shared_types::Origin, shared_types::AskSurface)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[tokio::test]
+    async fn ask_session_forwards_origin_and_the_session_surface() {
+        for origin in [
+            shared_types::Origin::Interactive,
+            shared_types::Origin::Unattended,
+        ] {
+            let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+            sessions.lock().await.insert(
+                "s".to_string(),
+                SessionState {
+                    agent: "codex".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    history: Vec::new(),
+                    cli_session_id: None,
+                    parent_session_id: None,
+                    root_session_id: None,
+                    pantheon_session_id: None,
+                },
+            );
+            let req = AskSessionRequest {
+                name: "s".to_string(),
+                message: "m".to_string(),
+                origin,
+                ..Default::default()
+            };
+            ask_session(&sessions, None, &req, false, origin_capturing_executor)
+                .await
+                .expect("dispatch");
+        }
+        assert_eq!(
+            *ORIGIN_SEEN.lock().unwrap(),
+            [
+                (
+                    shared_types::Origin::Interactive,
+                    shared_types::AskSurface::Session
+                ),
+                (
+                    shared_types::Origin::Unattended,
+                    shared_types::AskSurface::Session
+                ),
+            ]
+        );
+    }
+
+    /// Seven Primes T-204 (REQ-090): spawn_session gates the seat on Session with the request's origin BEFORE any
+    /// session or worker exists. An unconfigured kimi is refused with the gate's exact payload and leaves no session;
+    /// an existing seat spawns for either origin; and the trail shows the unattended origin reached the gate.
+    /// RED IF: spawn_session stops calling the gate, gates after creating the session, or drops `origin`.
+    #[tokio::test]
+    async fn spawn_session_gates_before_creating_anything() {
+        let _rec = gate_trail::record();
+        let prior = {
+            let _env = crate::PROCESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prior = std::env::var_os("TRIUMVIRATE_ENABLE_KIMI");
+            // SAFETY: under PROCESS_ENV_LOCK; restored at the end of this test.
+            unsafe { std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI") };
+            prior
+        };
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let spawn = |agent: &str, name: &str, origin| SpawnSessionRequest {
+            agent: agent.to_string(),
+            name: name.to_string(),
+            cwd: Some("/tmp/t204-spawn".to_string()),
+            origin,
+        };
+        let err = spawn_session(
+            &sessions,
+            None,
+            &spawn("kimi", "k", shared_types::Origin::Unattended),
+            false,
+        )
+        .await
+        .expect_err("an unconfigured seat is refused");
+        assert_eq!(
+            err,
+            "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+        );
+        assert!(
+            sessions.lock().await.is_empty(),
+            "a refused spawn leaves no session"
+        );
+        assert!(gate_trail::saw(
+            "kimi",
+            mcp_bridge::seat_gate::Surface::Session,
+            shared_types::Origin::Unattended
+        ));
+        for (name, origin) in [
+            ("c1", shared_types::Origin::Interactive),
+            ("c2", shared_types::Origin::Unattended),
+        ] {
+            spawn_session(&sessions, None, &spawn("codex", name, origin), false)
+                .await
+                .expect("an existing seat spawns");
+            assert!(gate_trail::saw(
+                "codex",
+                mcp_bridge::seat_gate::Surface::Session,
+                origin
+            ));
+        }
+        assert_eq!(sessions.lock().await.len(), 2);
+        if let Some(v) = prior {
+            let _env = crate::PROCESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: under PROCESS_ENV_LOCK.
+            unsafe { std::env::set_var("TRIUMVIRATE_ENABLE_KIMI", v) };
+        }
     }
 }
