@@ -689,3 +689,208 @@ fn test_should_not_leak_state_between_parser_instances() {
     let second = finish(&[message_line("m2", "assistant", "SECOND-RUN")], 0, Some(&standard_export("finished")));
     assert!(!second.result.response_text.contains("FIRST-RUN"));
 }
+
+// ---------- round 2: survivor feedback (tool kinds, exit table, status, usage guard) ----------
+
+fn effect_line(tool: &str, kind: &str, status: &str) -> String {
+    let mut v = envelope("ex1", "sess-stream-ignored", "effect");
+    v["title"] = json!(tool);
+    v["detail"] = json!({"toolName": tool, "kind": kind, "input": {"filePath": "/p/q.rs"}});
+    v["state"] = json!({"status": status, "output": {}, "display": {"success": true}});
+    v.to_string()
+}
+
+fn kind_label(k: &ToolKind) -> &'static str {
+    match k {
+        ToolKind::ReadFile => "ReadFile",
+        ToolKind::WriteFile => "WriteFile",
+        ToolKind::EditFile => "EditFile",
+        ToolKind::Bash => "Bash",
+        ToolKind::Grep => "Grep",
+        ToolKind::Glob => "Glob",
+        ToolKind::RequestUserInput => "RequestUserInput",
+        ToolKind::Unknown => "Unknown",
+    }
+}
+
+fn kind_of(tool: &str, kind: &str) -> &'static str {
+    let sut = finish(&[effect_line(tool, kind, "completed")], 0, Some(&standard_export("finished")));
+    assert_eq!(sut.result.tool_calls.len(), 1, "{tool}/{kind}: one record expected");
+    kind_label(&sut.result.tool_calls[0].kind)
+}
+
+#[test]
+fn test_should_classify_tool_kind_by_vendor_tool_name() {
+    // research/02 built-in tool modules: name decides the ToolKind
+    let table = [
+        ("read_file", "ReadFile"),
+        ("grep", "Grep"),
+        ("write_file", "WriteFile"),
+        ("edit", "EditFile"),
+        ("bash", "Bash"),
+        ("git_bash", "Bash"),
+        ("experimental_bash", "Bash"),
+        ("windows_shell", "Bash"),
+        ("ask_user_question", "RequestUserInput"),
+    ];
+    for (tool, want) in table {
+        // neutral detail.kind so the name alone decides
+        assert_eq!(kind_of(tool, "other"), want, "tool {tool}");
+    }
+}
+
+#[test]
+fn test_should_classify_tool_kind_from_detail_kind_when_name_is_unknown() {
+    // research/02: detail.kind "file_read" / "shell" are the fallbacks
+    assert_eq!(kind_of("mystery_tool", "file_read"), "ReadFile");
+    assert_eq!(kind_of("mystery_tool", "shell"), "Bash");
+}
+
+#[test]
+fn test_should_classify_unknown_tool_with_unknown_kind_as_unknown() {
+    // edge: nothing recognised => Unknown
+    assert_eq!(kind_of("mystery_tool", "mystery_kind"), "Unknown");
+}
+
+#[test]
+fn test_should_not_classify_non_read_tools_as_readfile() {
+    // property: write/edit/shell/grep records are never ReadFile (they must not earn sight credit)
+    for tool in ["write_file", "edit", "bash", "grep", "ask_user_question"] {
+        assert_ne!(kind_of(tool, "other"), "ReadFile", "tool {tool}");
+    }
+}
+
+fn success_of(status: &str) -> Option<bool> {
+    let sut = finish(&[effect_line("read_file", "file_read", status)], 0, Some(&standard_export("finished")));
+    sut.result.tool_calls[0].success
+}
+
+#[test]
+fn test_should_map_effect_status_to_tool_success() {
+    // spec: state.status completed => success true; failed/error/rejected => success false
+    assert_eq!(success_of("completed"), Some(true));
+    for s in ["failed", "error", "rejected"] {
+        assert_eq!(success_of(s), Some(false), "status {s}");
+    }
+}
+
+fn outcome_kind(o: &SeatOutcome) -> &'static str {
+    match o {
+        SeatOutcome::Success => "success",
+        SeatOutcome::Partial(_) => "partial",
+        SeatOutcome::Failure(_) => "failure",
+    }
+}
+
+#[test]
+fn test_should_follow_exit_table_row_by_row_when_export_names_no_outcome() {
+    // BACKEND_STRUCTURE section 6 / research/02: 0 finished, 1 usage/config, 2 infra, 3 partial, 4 aborted
+    let export = json!({"schema_version": 1, "session_id": "s-1", "vibe_version": "2.26.1"}).to_string();
+    let table = [(0, "success"), (1, "failure"), (2, "failure"), (3, "partial"), (4, "failure")];
+    for (code, want) in table {
+        let sut = finish(&[message_line("m1", "assistant", "x")], code, Some(&export));
+        assert_eq!(outcome_kind(&sut.outcome), want, "exit {code}");
+    }
+}
+
+#[test]
+fn test_should_treat_empty_outcome_string_as_no_outcome() {
+    // finished/empty rule: "" is not a recognised outcome, the exit table decides
+    let table = [(0, "success"), (1, "failure"), (2, "failure"), (3, "partial")];
+    for (code, want) in table {
+        let export = export_json("", "s-1", 1, 1, 0, 2, 0.0);
+        let sut = finish(&[message_line("m1", "assistant", "x")], code, Some(&export));
+        assert_eq!(outcome_kind(&sut.outcome), want, "exit {code} with empty outcome");
+    }
+}
+
+#[test]
+fn test_should_treat_null_outcome_as_no_outcome() {
+    // finished/empty rule: null outcome falls back to the exit table
+    let export = json!({"schema_version": 1, "outcome": null, "session_id": "s-1"}).to_string();
+    let a = finish(&[message_line("m1", "assistant", "x")], 0, Some(&export));
+    assert_eq!(outcome_kind(&a.outcome), "success");
+    let b = finish(&[message_line("m1", "assistant", "x")], 2, Some(&export));
+    assert_eq!(outcome_kind(&b.outcome), "failure");
+}
+
+#[test]
+fn test_should_succeed_for_finished_outcome_with_exit_zero_and_keep_answer() {
+    // finished arm: Success keeps the answer
+    let sut = finish(&[message_line("m1", "assistant", "done")], 0, Some(&standard_export("finished")));
+    assert_eq!(outcome_kind(&sut.outcome), "success");
+    assert!(sut.result.response_text.contains("done"));
+}
+
+#[test]
+fn test_should_give_non_empty_failure_message_for_each_failing_row() {
+    // REQ-052: a Failure always says why
+    let export = json!({"schema_version": 1, "session_id": "s-1"}).to_string();
+    for code in [1, 2, 4] {
+        let sut = finish(&[], code, Some(&export));
+        match sut.outcome {
+            SeatOutcome::Failure(m) => assert!(!m.trim().is_empty(), "exit {code}: empty failure message"),
+            other => panic!("exit {code}: expected Failure, was {}", outcome_label(&other)),
+        }
+    }
+}
+
+#[test]
+fn test_should_give_non_empty_partial_reason_when_exit_three_without_outcome() {
+    // REQ-052: Partial always carries a reason, even when the export names none
+    let export = json!({"schema_version": 1, "session_id": "s-1"}).to_string();
+    let sut = finish(&[message_line("m1", "assistant", "x")], 3, Some(&export));
+    match sut.outcome {
+        SeatOutcome::Partial(r) => assert!(!r.trim().is_empty()),
+        other => panic!("expected Partial, was {}", outcome_label(&other)),
+    }
+}
+
+fn usage_export(usage: Value) -> String {
+    json!({"schema_version": 1, "outcome": "finished", "session_id": "s-1", "vibe_version": "2.26.1", "usage": usage})
+        .to_string()
+}
+
+#[test]
+fn test_should_report_exact_usage_when_only_input_count_is_present() {
+    // REQ-041: any one count present => Exact
+    let sut = finish(&[], 0, Some(&usage_export(json!({"input_tokens": 9}))));
+    match sut.usage {
+        UsageReport::Exact(u) => assert_eq!(u.input, Some(9)),
+        UsageReport::NotReported => panic!("one count present must be Exact"),
+    }
+}
+
+#[test]
+fn test_should_report_exact_usage_when_only_output_count_is_present() {
+    // REQ-041: any one count present => Exact
+    let sut = finish(&[], 0, Some(&usage_export(json!({"output_tokens": 4}))));
+    match sut.usage {
+        UsageReport::Exact(u) => assert_eq!(u.output, Some(4)),
+        UsageReport::NotReported => panic!("one count present must be Exact"),
+    }
+}
+
+#[test]
+fn test_should_report_exact_usage_when_only_total_count_is_present() {
+    // REQ-041: any one count present => Exact
+    let sut = finish(&[], 0, Some(&usage_export(json!({"total_tokens": 13}))));
+    match sut.usage {
+        UsageReport::Exact(u) => assert_eq!(u.total, Some(13)),
+        UsageReport::NotReported => panic!("one count present must be Exact"),
+    }
+}
+
+#[test]
+fn test_should_report_not_reported_when_usage_object_has_no_counts() {
+    // REQ-041: empty usage object => NotReported, never zeros
+    let sut = finish(&[], 0, Some(&usage_export(json!({}))));
+    assert!(matches!(sut.usage, UsageReport::NotReported));
+}
+
+#[test]
+fn test_should_report_not_reported_when_usage_is_null() {
+    // REQ-041: null usage => NotReported
+    let sut = finish(&[], 0, Some(&usage_export(Value::Null)));
+    assert!(matches!(sut.usage, UsageReport::NotReported));
+}
