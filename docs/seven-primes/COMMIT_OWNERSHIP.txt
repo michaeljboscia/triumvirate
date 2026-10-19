@@ -1,0 +1,6 @@
+4973234b T-303 check-live-evidence git-failure message (finding from the Mistral seat's T-303 review)
+9659164a T-302 live evidence records served_model null
+8ff3fde3 P6.3 coverage-runtime env tolerance in the child-env tests
+b65015c9 T-302 doctor resolves seat CLIs like the runner (found by the --launch run)
+581eeece T-302 stray-key scan skips documentation placeholders (found by the --launch run)
+71c718ef deps merge of the approved dependency security bump (Mike: "Bump deps first")

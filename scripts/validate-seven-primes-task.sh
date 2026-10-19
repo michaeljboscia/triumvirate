@@ -99,10 +99,15 @@ task_commits() {
 
 # Commits in the range whose subject names NO task (amendment A-10). Ownership is by subject prefix, so a commit that
 # names no task would belong to no task and escape every task's file scope and Rust scope; any such commit is a FAIL.
+# A-15: a subject may also name a goatrodeo phase (P6.3), and a commit already made without an id (launch-night fixes,
+# the approved dependency-bump merge) is owned through docs/seven-primes/COMMIT_OWNERSHIP.txt: one line per commit,
+# "<sha7> <T-xxx|Pn.n|deps> <reason>". History is never rewritten to fix a subject: other sessions pin these shas.
 unowned_commits() {
-    local sha subject
+    local sha subject map="$REPO/docs/seven-primes/COMMIT_OWNERSHIP.txt"
     while IFS=$'\t' read -r sha subject; do
-        if ! [[ "$subject" =~ ^([a-z]+(\([^\)]*\))?!?:\ )?T-[0-9]{3}([^0-9]|$) ]]; then printf '%s %s\n' "${sha:0:7}" "$subject"; fi
+        if [[ "$subject" =~ ^([a-z]+(\([^\)]*\))?!?:\ )?(T-[0-9]{3}|P[0-9]+(\.[0-9]+)?)([^0-9]|$) ]]; then continue; fi
+        if [[ -f "$map" ]] && grep -Eq "^${sha:0:7} (T-[0-9]{3}|P[0-9]+(\.[0-9]+)?|deps) .+" "$map"; then continue; fi
+        printf '%s %s\n' "${sha:0:7}" "$subject"
     done < <(git -C "$REPO" log --format=$'%H\t%s' "$BASE..HEAD")
 }
 
