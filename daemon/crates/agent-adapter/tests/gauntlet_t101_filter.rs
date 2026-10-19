@@ -318,9 +318,18 @@ fn should_record_multiple_tool_calls_from_one_assistant_message() {
 
 #[test]
 fn should_leave_tool_success_unknown() {
-    // research/01 #4241: tool result lines carry no outcome, ToolCallRecord.success stays None
+    // research/01 #4241: tool result lines carry no outcome. A-14 / T-302 (live capture): a result that numbers its
+    // lines IS the evidence the read succeeded, so only an unnumbered result (an error message) stays unknown.
     let parsed = run(&fixture_lines(), Some(0)).unwrap();
+    assert_eq!(parsed.result.tool_calls[0].success, Some(true));
+    let lines = s(&[
+        r#"{"role":"assistant","content":"","tool_calls":[{"id":"e1","function":{"name":"Read","arguments":"{\"path\":\"/m/missing.rs\"}"}}]}"#,
+        r#"{"role":"tool","tool_call_id":"e1","content":"Error: file not found"}"#,
+        r#"{"role":"assistant","content":"done"}"#,
+    ]);
+    let parsed = run(&lines, Some(0)).unwrap();
     assert_eq!(parsed.result.tool_calls[0].success, None);
+    assert!(parsed.result.tool_calls[0].returned_lines.is_empty());
 }
 
 #[test]
