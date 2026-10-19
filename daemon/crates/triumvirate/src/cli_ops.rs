@@ -439,6 +439,8 @@ pub(crate) fn build_status_report(
             "pending_fallbacks": snapshot.pending_fallbacks.unwrap_or(0),
             "fallback_tickets": snapshot.fallback_tickets.unwrap_or_default(),
             "daemon_bind_addr": snapshot.daemon_bind_addr.unwrap_or_else(|| daemon_bind_addr.clone()),
+            // Seven Primes REQ-080: the daemon's seats map as /status reported it (null from an older daemon).
+            "seats": snapshot.seats,
         });
 
         return serde_json::json!({
@@ -526,12 +528,15 @@ fn check(name: &'static str, ok: bool, detail: impl Into<String>) -> SeatCheck {
     }
 }
 
-/// `<bin> --version`, first `x.y.z` in its output. None when it does not run or prints no version.
+/// `<bin> --version`, first `x.y.z` in its output. None when it does not run, exits nonzero, or prints no version.
 pub(crate) fn installed_version(bin: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new(bin)
         .arg("--version")
         .output()
         .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -576,37 +581,83 @@ pub(crate) fn vibe_cli_check(env: &[(String, String)]) -> SeatCheck {
     )
 }
 
-/// Files under the seat home holding a key-shaped string that is not the seat's own expected credential file.
+/// Findings under the seat home: files holding a key-shaped string that are not the seat's own expected credential
+/// file, plus every entry the scan could not read (a scanner that skips what it cannot read fails open).
+/// Symlinks are never followed (`DirEntry::file_type` does not traverse them), so the walk cannot leave the canonical
+/// seat home or loop; files are streamed line by line, so no size makes a file unscannable. A missing seat home has
+/// nothing to scan (the `seat_home` check reports it). Sockets and FIFOs hold no data at rest and opening a FIFO would
+/// block, so only directories and regular files are walked.
 fn stray_key_files(seat_home: &std::path::Path, expected: &[&str]) -> Vec<String> {
+    use std::io::BufRead;
     let Ok(patterns) = regex_lite::Regex::new(
         r"(?m)(sk-[A-Za-z0-9_-]{16,}|^\s*[A-Z0-9_]*(API_KEY|TOKEN)\s*=\s*\S+)",
     ) else {
         return vec!["key regex failed to compile".to_string()];
     };
+    let root = match fs::canonicalize(seat_home) {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => return vec![format!("{} (unreadable: {e})", seat_home.display())],
+    };
+    let rel = |path: &std::path::Path| {
+        path.strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    };
     let mut found = Vec::new();
-    let mut stack = vec![seat_home.to_path_buf()];
+    let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                found.push(format!("{} (unreadable: {e})", rel(&dir)));
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    found.push(format!("{} (unreadable entry: {e})", rel(&dir)));
+                    continue;
+                }
+            };
             let path = entry.path();
-            if path.is_dir() {
+            let name = rel(&path);
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(e) => {
+                    found.push(format!("{name} (unreadable: {e})"));
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
-            let rel = path
-                .strip_prefix(seat_home)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            if expected.contains(&rel.as_str())
-                || entry.metadata().map_or(true, |m| m.len() > 1_000_000)
-            {
+            if !file_type.is_file() || expected.contains(&name.as_str()) {
                 continue;
             }
-            if fs::read_to_string(&path).is_ok_and(|text| patterns.is_match(&text)) {
-                found.push(rel);
+            let file = match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) => {
+                    found.push(format!("{name} (unreadable: {e})"));
+                    continue;
+                }
+            };
+            for line in std::io::BufReader::new(file).split(b'\n') {
+                match line {
+                    Ok(line) if patterns.is_match(&String::from_utf8_lossy(&line)) => {
+                        found.push(name.clone());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        found.push(format!("{name} (unreadable: {e})"));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -732,7 +783,12 @@ pub(crate) fn seat_static_checks(seat: &str, ctx: &SeatDoctorCtx) -> Vec<SeatChe
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
             .and_then(|v| {
-                v["modelProviders"]["openai"][0]["baseUrl"]
+                // The daemon's entry is the one whose id is the pinned model, not necessarily the first (T-104
+                // merges into settings.json written at login).
+                v["modelProviders"]["openai"]
+                    .as_array()?
+                    .iter()
+                    .find(|e| e["id"].as_str() == Some(mcp_bridge::qwen::DEFAULT_QWEN_MODEL))?["baseUrl"]
                     .as_str()
                     .map(str::to_string)
             });
@@ -752,7 +808,10 @@ pub(crate) fn seat_static_checks(seat: &str, ctx: &SeatDoctorCtx) -> Vec<SeatChe
         if stray.is_empty() {
             "no extra key-shaped strings".to_string()
         } else {
-            format!("key-shaped string in {}", stray.join(", "))
+            format!(
+                "key-shaped string or unscannable entry: {}",
+                stray.join(", ")
+            )
         },
     ));
     checks
@@ -800,8 +859,13 @@ pub(crate) fn register_installed_seat_versions() {
 
 /// `triumvirate seat clear <seat>`: the only way a suspension is lifted (REQ-091).
 pub(crate) fn run_seat_clear(seat: &str) -> anyhow::Result<()> {
-    let home = core_triumvirate_home_dir()?;
-    mcp_bridge::seat_state::clear(&home, seat).map_err(anyhow::Error::msg)?;
+    run_seat_clear_in(&core_triumvirate_home_dir()?, seat)
+}
+
+/// `run_seat_clear` against an explicit Triumvirate home, so a test drives the command path without touching the
+/// process-global home (the `seat_gate_in` pattern).
+pub(crate) fn run_seat_clear_in(home: &std::path::Path, seat: &str) -> anyhow::Result<()> {
+    mcp_bridge::seat_state::clear(home, seat).map_err(anyhow::Error::msg)?;
     write_line_stdout(&format!(
         "{seat}: suspension cleared (suspended.json removed if present)"
     ))
@@ -1101,16 +1165,133 @@ mod seven_primes_doctor_tests {
         assert_eq!(rows, clis);
     }
 
-    /// `seat clear` lifts a suspension through the same state file the gate reads.
-    /// RED IF: clearing leaves suspended.json, or the version regex stops reading a CLI's version.
+    /// `seat clear` lifts a suspension through the same state file the gate reads, via the command's own code path.
+    /// RED IF: `run_seat_clear` (through `run_seat_clear_in`) leaves suspended.json, or the version regex stops reading
+    /// a CLI's version.
     #[test]
     fn seat_clear_removes_the_suspension_and_versions_parse() {
         let dir = tempfile::tempdir().unwrap();
         mcp_bridge::seat_state::write_suspended(dir.path(), "qwen", "403").unwrap();
         assert!(dir.path().join("seats/qwen/suspended.json").exists());
-        mcp_bridge::seat_state::clear(dir.path(), "qwen").unwrap();
+        run_seat_clear_in(dir.path(), "qwen").unwrap();
         assert!(!dir.path().join("seats/qwen/suspended.json").exists());
         let bin = fake_bin(dir.path(), "kimi", "2.2.0");
         assert_eq!(installed_version(&bin).as_deref(), Some("2.2.0"));
+    }
+
+    /// A CLI that prints the pinned version but exits nonzero is broken, not installed at that version.
+    /// RED IF: `installed_version` reads a version from a `--version` run that failed.
+    #[test]
+    fn a_nonzero_version_exit_reports_no_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("kimi");
+        crate::write_test_executable(&bin, "#!/bin/sh\necho \"kimi 2.2.0\"\nexit 3\n").unwrap();
+        assert_eq!(installed_version(&bin), None);
+    }
+
+    /// The stray scan never follows a symlink: a link inside the seat home to a directory outside it (which holds a
+    /// key-shaped file) must not be walked, and a link back to the home must not loop.
+    /// RED IF: the scanner follows a directory symlink out of the seat home or into a cycle.
+    #[test]
+    fn stray_scan_does_not_follow_symlinks() {
+        let f = good();
+        let outside = f._dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("leak.txt"),
+            format!("OPENAI_API_KEY={}\n", fake_secret("sk-proj-")),
+        )
+        .unwrap();
+        let kimi = f.home.join("homes/kimi");
+        std::os::unix::fs::symlink(&outside, kimi.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&kimi, kimi.join("loop")).unwrap();
+        assert_eq!(stray_key_files(&kimi, &[]), Vec::<String>::new());
+        assert!(failing("kimi", &ctx(&f, vec![], sandbox())).is_empty());
+    }
+
+    /// An entry the scan cannot read is a finding, not a skip: a scanner that skips what it cannot read fails open.
+    /// RED IF: an unreadable file or directory under the seat home lets `stray_keys` PASS.
+    #[test]
+    fn stray_scan_fails_on_an_unreadable_entry() {
+        let f = good();
+        let kimi = f.home.join("homes/kimi");
+        let file = kimi.join("locked.txt");
+        fs::write(&file, "nothing").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        let sub = kimi.join("lockeddir");
+        fs::create_dir_all(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        let found = stray_key_files(&kimi, &[]);
+        let failed = failing("kimi", &ctx(&f, vec![], sandbox()));
+        // Restore so the tempdir can be removed (r-x is enough to list, and so remove, the empty directory).
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|e| e.contains("unreadable")), "{found:?}");
+        assert!(
+            found[0].starts_with("locked.txt") && found[1].starts_with("lockeddir"),
+            "{found:?}"
+        );
+        assert_eq!(failed, ["stray_keys"]);
+    }
+
+    /// The Qwen baseUrl check reads the daemon's entry by model id: other openai entries written at login may come
+    /// first (T-104 merges rather than replaces).
+    /// RED IF: the check reads `openai[0]` instead of the entry whose id is the pinned model.
+    #[test]
+    fn qwen_base_url_is_read_from_the_daemon_entry_not_the_first() {
+        let f = good();
+        let settings = f.home.join("homes/qwen/settings.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        doc["modelProviders"]["openai"]
+            .as_array_mut()
+            .unwrap()
+            .insert(
+                0,
+                serde_json::json!({"id": "login-model", "baseUrl": "https://example.invalid"}),
+            );
+        fs::write(&settings, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        assert!(failing("qwen", &ctx(&f, vec![], sandbox())).is_empty());
+    }
+
+    /// `triumvirate status` shows the daemon's seats map.
+    /// RED IF: the CLI status report drops `seats` from a reachable daemon's snapshot.
+    #[test]
+    fn status_report_includes_the_daemon_seats() {
+        let seat = shared_types::SeatStatus {
+            configured: false,
+            verified: false,
+            suspended: false,
+            available: false,
+            reason: Some("seat_not_configured: kimi".to_string()),
+        };
+        let report = build_status_report(
+            "127.0.0.1:1".to_string(),
+            Some(DaemonHealthResponse {
+                status: "ok".to_string(),
+                version: None,
+                service: None,
+                mode: None,
+                daemon: None,
+                auth: None,
+                daemon_bind_addr: None,
+            }),
+            Some(DaemonStatusSnapshot {
+                seats: Some([("kimi".to_string(), seat)].into_iter().collect()),
+                daemon_mode: None,
+                supported_agents: None,
+                pending_fallbacks: None,
+                fallback_tickets: None,
+                daemon_bind_addr: None,
+            }),
+            0,
+            vec![],
+        );
+        assert_eq!(
+            report["snapshot"]["seats"]["kimi"]["reason"],
+            "seat_not_configured: kimi"
+        );
+        assert_eq!(report["snapshot"]["seats"]["kimi"]["configured"], false);
     }
 }
