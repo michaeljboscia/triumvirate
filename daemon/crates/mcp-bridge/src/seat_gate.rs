@@ -193,7 +193,7 @@ fn seat_gate_in(
     };
     let configured = match profile.configured {
         Configured::Always => true,
-        Configured::EnvFlag(var) => std::env::var(var).is_ok_and(|v| v.trim() == "1"),
+        Configured::EnvFlag(var) => std::env::var(var).is_ok_and(|v| v == "1"),
     };
     let version = installed_versions()
         .lock()

@@ -3,7 +3,8 @@
 
 use mcp_bridge::seat_gate::{Refusal, RefusalCode, seat_gate_with};
 use mcp_bridge::seat_state::SeatAvailability;
-use mcp_bridge::Surface;
+// Orchestrator compile fix (GAUNTLET triage): Surface is re-exported by seat_gate, not the crate root.
+use mcp_bridge::seat_gate::Surface;
 use shared_types::Origin;
 
 #[derive(Clone, Copy)]
