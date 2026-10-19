@@ -111,12 +111,23 @@ jobs:
   # tarball checked against the release's own sha256, semgrep is pinned, and fetch-depth 0 gives origin/main..HEAD.
   seven-primes-floor:
     name: Seven Primes floor
-    if: github.event_name == 'pull_request' && github.head_ref == 'feat/seven-primes'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Detect Seven Primes seat changes
+        id: seven-primes-scope
+        shell: bash
+        run: |
+          run_floor=false
+          if [[ "${{ github.head_ref }}" == "feat/seven-primes" ]]; then
+            run_floor=true
+          elif git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^daemon/crates/(mcp-bridge/src/(kimi|mistral|qwen|containment|seat_[^/]+)\.rs|agent-adapter/src/(kimi|mistral|qwen)\.rs)$'; then
+            run_floor=true
+          fi
+          echo "run_floor=$run_floor" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -131,7 +142,11 @@ jobs:
       - name: Install semgrep 1.157.0
         run: pip install semgrep==1.157.0 && semgrep --version
       - name: Security floor
+        if: steps.seven-primes-scope.outputs.run_floor == 'true'
         run: bash scripts/validate-seven-primes-task.sh --floor-only
+      - name: Live evidence gate
+        if: steps.seven-primes-scope.outputs.run_floor == 'true'
+        run: bash scripts/check-live-evidence.sh
 
   build:
     name: Build Release

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+url="${*: -1}"
+[[ "$url" == *':1/'* ]] && exit 7
+if [[ "$url" == */status ]]; then cat "$STUB_STATUS_FILE"; exit 0; fi
+body=''
+while [[ $# -gt 0 ]]; do [[ "$1" == -d ]] && { shift; body="$1"; }; shift || true; done
+python3 -I -c 'import json,sys
+d=json.load(open(sys.argv[1])); seat=json.loads(sys.argv[2]).get("agent",""); row=d.get("seats",{}).get(seat,{}); code=d.get("_refusal_codes",{}).get(seat) or ("seat_not_configured" if not row.get("configured") else "seat_suspended" if row.get("suspended") else "seat_unverified" if not row.get("available") else ""); print(json.dumps({"error":f"{code}: {seat}: fixture"} if code else {"response":"OK"}))' "$STUB_STATUS_FILE" "$body"
