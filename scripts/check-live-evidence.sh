@@ -5,7 +5,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FILE="${1:-$ROOT/docs/seven-primes/live-evidence.json}"
 [[ -f "$FILE" ]] || { echo "RESULT: FAIL missing live evidence: $FILE"; exit 1; }
-TREE="$(git -C "$ROOT" ls-tree -r HEAD -- daemon scripts .github | git hash-object --stdin)"
+# A git failure must say so, not surface as a "code_tree mismatch" (finding by the Mistral seat's T-303 review).
+TREE="$(git -C "$ROOT" ls-tree -r HEAD -- daemon scripts .github | git hash-object --stdin)" \
+    || { echo "RESULT: FAIL cannot compute code_tree (git failed in $ROOT)"; exit 1; }
 python3 -I - "$FILE" "$TREE" <<'PY'
 import json,re,sys
 try: v=json.load(open(sys.argv[1],encoding="utf-8"))
