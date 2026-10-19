@@ -6992,13 +6992,22 @@ async fn run_agent_process_with_session(
                 // no-touch check cannot see a write made inside a shell command, so this
                 // is the only thing stopping a reviewer from editing what it reviews.
                 crate::agy::run_agy_cli_process_with_session(
-                    &agy_bin, &agy_args, message, cwd, session_id, events_tx, read_only,
+                    &agy_bin,
+                    &agy_args,
+                    message,
+                    cwd,
+                    session_id,
+                    events_tx,
+                    read_only,
                     crate::agy::BreakerRole::Traffic,
                 )
                 .await
             }
             GeminiBackend::GeminiCli => {
-                tracing::info!(backend = "gemini-cli", "gemini dispatch served by gemini-cli backend");
+                tracing::info!(
+                    backend = "gemini-cli",
+                    "gemini dispatch served by gemini-cli backend"
+                );
                 run_gemini_cli_process_with_session(bin, args, message, cwd, session_id, events_tx)
                     .await
             }
@@ -11893,7 +11902,10 @@ mod strict_agent_tests {
             .await
             .expect_err("an unavailable Gemini backend is a failure by default, not codex's answer");
 
-        assert!(!fx.codex_ran.exists(), "codex must not be spawned under the default route");
+        assert!(
+            !fx.codex_ran.exists(),
+            "codex must not be spawned under the default route"
+        );
     }
 
     /// THE NEGATIVE CONTROL. Without `strict_agent` this fixture substitutes codex, which is
@@ -11902,7 +11914,9 @@ mod strict_agent_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
     async fn strict_01_without_strict_the_fixture_substitutes_codex() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _agy = crate::agy::tests::ENV_LOCK.lock().await;
         let fx = setup();
 
@@ -11912,7 +11926,10 @@ mod strict_agent_tests {
 
         assert_eq!(out.agent, "gemini");
         assert_eq!(out.answered_by_agent.as_deref(), Some("codex"));
-        assert!(fx.codex_ran.exists(), "codex must have been spawned for the control to mean anything");
+        assert!(
+            fx.codex_ran.exists(),
+            "codex must have been spawned for the control to mean anything"
+        );
     }
 
     /// RED IF: the `strict_agent` gate is removed from the degraded route. codex answers, the
@@ -11920,21 +11937,31 @@ mod strict_agent_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run with scripts/verify-live-agents.sh strict"]
     async fn strict_02_strict_fails_with_the_seats_own_error_and_never_spawns_codex() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _agy = crate::agy::tests::ENV_LOCK.lock().await;
         let fx = setup();
 
         let err = execute_ask_agent(&request(&fx, Some(true)), None)
             .await
-            .expect_err("an unavailable backend under strict_agent is a failure, not codex's answer");
+            .expect_err(
+                "an unavailable backend under strict_agent is a failure, not codex's answer",
+            );
 
-        assert!(err.contains("STRICT_NO_SUBSTITUTION"), "the lifecycle must say why; got: {err}");
+        assert!(
+            err.contains("STRICT_NO_SUBSTITUTION"),
+            "the lifecycle must say why; got: {err}"
+        );
         let lower = err.to_lowercase();
         assert!(
             lower.contains("quota") || lower.contains("capacity"),
             "the error must be agy's own, not a later hop's; got: {err}"
         );
-        assert!(!fx.codex_ran.exists(), "no other agent may even be spawned under strict_agent");
+        assert!(
+            !fx.codex_ran.exists(),
+            "no other agent may even be spawned under strict_agent"
+        );
     }
 }
 
@@ -11960,7 +11987,11 @@ mod sight_gate_canary_tests {
 mod stall_kill_tests {
     use super::*;
 
-    const ENV_KEYS: [&str; 3] = ["TRIUMVIRATE_HOME", "TRIUMVIRATE_CODEX_BIN", "TRIUMVIRATE_STALL_SECS_CODEX"];
+    const ENV_KEYS: [&str; 3] = [
+        "TRIUMVIRATE_HOME",
+        "TRIUMVIRATE_CODEX_BIN",
+        "TRIUMVIRATE_STALL_SECS_CODEX",
+    ];
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -12024,7 +12055,9 @@ mod stall_kill_tests {
     #[tokio::test]
     #[ignore = "mutates process-global dispatch env; run stall_kill_tests with --ignored"]
     async fn marker_01_a_reply_of_only_a_tool_marker_is_not_done() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fx = setup(
             // The fixture's background sleep would hold stdout open; this test is not about stalls.
             r#"kill $!
@@ -12036,7 +12069,10 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
         let err = execute_ask_agent(&request(&fx), None)
             .await
             .expect_err("a reply that is only an unexecuted marker is not an answer");
-        assert!(err.contains("replied with only an unexecuted tool call (ledger_query)"), "{err}");
+        assert!(
+            err.contains("replied with only an unexecuted tool call (ledger_query)"),
+            "{err}"
+        );
     }
 
     fn pid_in(fx: &Fixture, name: &str) -> u32 {
@@ -12067,11 +12103,26 @@ printf '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}\n
             .expect_err("a silent agent must fail");
         let elapsed = started.elapsed();
 
-        assert!(err.contains("stalled after 2 s without progress"), "got: {err}");
-        assert!(err.contains("STALLED"), "the lifecycle must name the stall; got: {err}");
-        assert!(!err.contains("RETRY"), "a stall is not retryable; got: {err}");
-        assert!(elapsed >= Duration::from_secs(2), "killed before its window: {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(10), "not killed near its window: {elapsed:?}");
+        assert!(
+            err.contains("stalled after 2 s without progress"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("STALLED"),
+            "the lifecycle must name the stall; got: {err}"
+        );
+        assert!(
+            !err.contains("RETRY"),
+            "a stall is not retryable; got: {err}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "killed before its window: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "not killed near its window: {elapsed:?}"
+        );
         assert_eq!(invocations(&fx), 1, "exactly one attempt");
         tokio::time::sleep(Duration::from_millis(300)).await;
         for name in ["leader.pid", "grandchild.pid"] {
@@ -12128,9 +12179,15 @@ mod stall_unit_tests {
     /// RED IF: a source-gated dispatch reaches the agent without the paths it must read (D-035).
     #[test]
     fn required_sources_are_named_in_the_prompt() {
-        let p = with_required_sources("review this", &["/abs/a.rs".to_string(), "/abs/b.rs".to_string()]);
+        let p = with_required_sources(
+            "review this",
+            &["/abs/a.rs".to_string(), "/abs/b.rs".to_string()],
+        );
         assert!(p.starts_with("review this"));
-        assert!(p.contains("- /abs/a.rs") && p.contains("- /abs/b.rs"), "{p}");
+        assert!(
+            p.contains("- /abs/a.rs") && p.contains("- /abs/b.rs"),
+            "{p}"
+        );
         assert_eq!(with_required_sources("plain", &[]), "plain");
     }
 
@@ -12144,12 +12201,34 @@ mod stall_unit_tests {
         let big = dir.path().join("big.rs");
         std::fs::write(&big, "x".repeat(SHELL_OUTPUT_BUDGET + 1) + "\n").expect("write");
         let (small_s, big_s) = (small.display().to_string(), big.display().to_string());
-        let p = with_required_sources("review", &[small_s.clone(), big_s.clone(), "/no/such/file.rs".to_string()]);
-        assert!(p.contains(&format!("- {small_s} (3 lines, 5 bytes)\n")), "{p}");
-        assert!(p.contains(&format!("- {big_s} (1 lines, {} bytes, over the one-command limit", SHELL_OUTPUT_BUDGET + 2)), "{p}");
-        assert!(p.contains("- /no/such/file.rs\n"), "an unreadable source is listed bare: {p}");
+        let p = with_required_sources(
+            "review",
+            &[
+                small_s.clone(),
+                big_s.clone(),
+                "/no/such/file.rs".to_string(),
+            ],
+        );
+        assert!(
+            p.contains(&format!("- {small_s} (3 lines, 5 bytes)\n")),
+            "{p}"
+        );
+        assert!(
+            p.contains(&format!(
+                "- {big_s} (1 lines, {} bytes, over the one-command limit",
+                SHELL_OUTPUT_BUDGET + 2
+            )),
+            "{p}"
+        );
+        assert!(
+            p.contains("- /no/such/file.rs\n"),
+            "an unreadable source is listed bare: {p}"
+        );
         assert!(p.ends_with(SIGHT_CONTRACT_RULE), "{p}");
-        assert!(SIGHT_CONTRACT_RULE.contains("30000") && SHELL_OUTPUT_BUDGET == 30_000, "the rule's number is the gate's");
+        assert!(
+            SIGHT_CONTRACT_RULE.contains("30000") && SHELL_OUTPUT_BUDGET == 30_000,
+            "the rule's number is the gate's"
+        );
     }
 
     /// RED IF: the detector's own STUCK events count as progress. They fire while a run is
@@ -12166,7 +12245,10 @@ mod stall_unit_tests {
     fn only_connectors_that_stream_progress_are_stall_killed() {
         assert!(!streams_live_progress("gemini", Some(GeminiBackend::Agy)));
         assert!(!streams_live_progress("deepseek", None));
-        assert!(streams_live_progress("gemini", Some(GeminiBackend::GeminiCli)));
+        assert!(streams_live_progress(
+            "gemini",
+            Some(GeminiBackend::GeminiCli)
+        ));
         assert!(streams_live_progress("codex", None));
         assert!(streams_live_progress("grok", None));
     }
@@ -12175,7 +12257,10 @@ mod stall_unit_tests {
     fn no_window_means_no_deadline() {
         let now = Instant::now();
         assert_eq!(stall_deadline(None, now), None);
-        assert_eq!(stall_deadline(Some(Duration::from_secs(5)), now), Some(now + Duration::from_secs(5)));
+        assert_eq!(
+            stall_deadline(Some(Duration::from_secs(5)), now),
+            Some(now + Duration::from_secs(5))
+        );
     }
 
     /// RED IF: an attempt that reported no child (an HTTP agent) tries to signal something.
@@ -12209,7 +12294,15 @@ mod sight_repair_tests {
             response_text: "PARTIAL REVIEW".to_string(),
             session_id: Some("thread-1".to_string()),
             tool_calls: calls,
-            token_usage: Some(agent_adapter::TokenUsage { input: Some(100), output: Some(10), cached: None, thinking_tokens: None, latency_ms: None, tool_calls: None, total: Some(110) }),
+            token_usage: Some(agent_adapter::TokenUsage {
+                input: Some(100),
+                output: Some(10),
+                cached: None,
+                thinking_tokens: None,
+                latency_ms: None,
+                tool_calls: None,
+                total: Some(110),
+            }),
             parser_mode: "codex-exec-json".to_string(),
             ..Default::default()
         }
@@ -12226,13 +12319,29 @@ mod sight_repair_tests {
     fn stub(body: &str) -> Stub {
         let dir = tempfile::tempdir().expect("tempdir");
         let src = dir.path().join("src.rs");
-        std::fs::write(&src, (1..=480).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &src,
+            (1..=480).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let src = src.display().to_string();
         let bin = dir.path().join("fake-codex-repair");
         let d = dir.path().display();
-        crate::write_test_executable(&bin, format!("#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n", crate::tests::JSON_ESCAPE_SH)).expect("write test executable");
-        let restore = crate::agy::tests::set_env_scoped("TRIUMVIRATE_CODEX_BIN", Some(bin.to_str().unwrap()));
-        Stub { dir, src, _restore: restore }
+        crate::write_test_executable(
+            &bin,
+            format!(
+                "#!/bin/sh\n{}\necho \"$@\" >> '{d}/argv'\nSRC='{src}'\n{body}\n",
+                crate::tests::JSON_ESCAPE_SH
+            ),
+        )
+        .expect("write test executable");
+        let restore =
+            crate::agy::tests::set_env_scoped("TRIUMVIRATE_CODEX_BIN", Some(bin.to_str().unwrap()));
+        Stub {
+            dir,
+            src,
+            _restore: restore,
+        }
     }
 
     const READ_REST: &str = r#"printf '{"type":"thread.started","thread_id":"thread-1"}\n'
@@ -12253,7 +12362,10 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     }
 
     fn snapshot(req: &AskAgentRequest, cwd: &str) -> Vec<Option<Vec<u8>>> {
-        req.required_sources.iter().map(|s| source_bytes(s, cwd)).collect()
+        req.required_sources
+            .iter()
+            .map(|s| source_bytes(s, cwd))
+            .collect()
     }
 
     /// RED IF: only PARTIAL and NEVER-OPENED with a real read are repairable stops holding.
@@ -12261,18 +12373,51 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     fn only_a_missed_spot_is_repairable() {
         let src = vec!["/r/a.rs".to_string()];
         let read = read_call("sed -n '1,10p' /r/a.rs".to_string(), true);
-        assert!(sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &src));
-        assert!(!sight_failure_is_repairable(&[], "codex-exec-json", &src), "zero tool calls");
-        assert!(!sight_failure_is_repairable(&[read_call("ls /r".to_string(), true)], "codex-exec-json", &src), "no read at all");
-        assert!(!sight_failure_is_repairable(&[read_call("sed -n '1,10p' /r/a.rs".to_string(), false)], "codex-exec-json", &src), "a failed read");
-        assert!(!sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &[]), "no named sources");
-        assert!(!sight_failure_is_repairable(std::slice::from_ref(&read), "agy-pipe-plain-text", &src), "blind parser");
+        assert!(sight_failure_is_repairable(
+            std::slice::from_ref(&read),
+            "codex-exec-json",
+            &src
+        ));
+        assert!(
+            !sight_failure_is_repairable(&[], "codex-exec-json", &src),
+            "zero tool calls"
+        );
+        assert!(
+            !sight_failure_is_repairable(
+                &[read_call("ls /r".to_string(), true)],
+                "codex-exec-json",
+                &src
+            ),
+            "no read at all"
+        );
+        assert!(
+            !sight_failure_is_repairable(
+                &[read_call("sed -n '1,10p' /r/a.rs".to_string(), false)],
+                "codex-exec-json",
+                &src
+            ),
+            "a failed read"
+        );
+        assert!(
+            !sight_failure_is_repairable(std::slice::from_ref(&read), "codex-exec-json", &[]),
+            "no named sources"
+        );
+        assert!(
+            !sight_failure_is_repairable(std::slice::from_ref(&read), "agy-pipe-plain-text", &src),
+            "blind parser"
+        );
         let mut write = read.clone();
         write.kind = ToolKind::WriteFile;
-        assert!(!sight_failure_is_repairable(&[read.clone(), write], "codex-exec-json", &src), "a write");
+        assert!(
+            !sight_failure_is_repairable(&[read.clone(), write], "codex-exec-json", &src),
+            "a write"
+        );
         let mut collab = read.clone();
         collab.tool = agent_adapter::codex::COLLAB_TOOL.to_string();
-        assert!(!sight_failure_is_repairable(&[read, collab], "codex-exec-json", &src), "a delegation");
+        assert!(
+            !sight_failure_is_repairable(&[read, collab], "codex-exec-json", &src),
+            "a delegation"
+        );
     }
 
     /// RED IF: the merged turn drops a turn's tool calls, does not sum tokens, or does not say
@@ -12286,43 +12431,97 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let m = merge_repaired_turn(&a, b);
         assert_eq!(m.tool_calls.len(), 2);
         assert_eq!(m.token_usage.as_ref().and_then(|t| t.total), Some(220));
-        assert!(m.response_text.starts_with("[sight repair:") && m.response_text.ends_with("FULL"), "{}", m.response_text);
+        assert!(
+            m.response_text.starts_with("[sight repair:") && m.response_text.ends_with("FULL"),
+            "{}",
+            m.response_text
+        );
     }
 
     /// End to end through a stand-in codex. RED IF: the repair does not resume turn 1's own
     /// thread, does not union the two turns, or passes when it should not.
     #[tokio::test]
     async fn a_partial_read_is_repaired_in_the_same_session() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = stub(READ_REST);
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        assert!(enforce_reviewer_sight("Codex", &first.tool_calls, &first.parser_mode, &req.required_sources, &cwd, &mut lc).is_err(), "turn 1 alone is partial");
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+        assert!(
+            enforce_reviewer_sight(
+                "Codex",
+                &first.tool_calls,
+                &first.parser_mode,
+                &req.required_sources,
+                &cwd,
+                &mut lc
+            )
+            .is_err(),
+            "turn 1 alone is partial"
+        );
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Passed(m) => {
-                assert!(m.response_text.ends_with("FULL REVIEW"), "{}", m.response_text);
+                assert!(
+                    m.response_text.ends_with("FULL REVIEW"),
+                    "{}",
+                    m.response_text
+                );
                 assert_eq!(m.tool_calls.len(), 2);
             }
             SightRepair::Failed(e, _) => panic!("should pass: {e}"),
             SightRepair::NotTried => panic!("should try: {lc:?}"),
         }
         let argv = std::fs::read_to_string(st.dir.path().join("argv")).unwrap();
-        assert!(argv.contains("resume") && argv.contains("thread-1"), "resumed its own thread: {argv}");
+        assert!(
+            argv.contains("resume") && argv.contains("thread-1"),
+            "resumed its own thread: {argv}"
+        );
         assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR"));
     }
 
     /// The file changes between the turns. RED IF: turn 1's window of the OLD file still counts.
     #[tokio::test]
     async fn a_source_that_changed_between_turns_counts_only_the_repair_reads() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let st = stub(&format!("printf 'line 0\\n' | cat - \"$SRC\" > \"$SRC.new\" && mv \"$SRC.new\" \"$SRC\"\n{READ_REST}"));
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = stub(&format!(
+            "printf 'line 0\\n' | cat - \"$SRC\" > \"$SRC.new\" && mv \"$SRC.new\" \"$SRC\"\n{READ_REST}"
+        ));
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Failed(e, m) => {
                 assert!(e.contains("changed after turn 1"), "{e}");
                 assert_eq!(m.tool_calls.len(), 2, "both turns kept for the saved file");
@@ -12342,16 +12541,75 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
         let cwd = st.dir.path().display().to_string();
         let partial = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        let gemini = try_sight_repair("gemini", "Antigravity", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
-        let empty = try_sight_repair("codex", "Codex", &first_turn(Vec::new()), "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
-        let late = try_sight_repair("codex", "Codex", &partial, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(30), &mut lc).await;
+        let gemini = try_sight_repair(
+            "gemini",
+            "Antigravity",
+            &partial,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        let empty = try_sight_repair(
+            "codex",
+            "Codex",
+            &first_turn(Vec::new()),
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        let late = try_sight_repair(
+            "codex",
+            "Codex",
+            &partial,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(30),
+            &mut lc,
+        )
+        .await;
         let mut no_session = partial.clone();
         no_session.session_id = None;
-        let unresumable = try_sight_repair("codex", "Codex", &no_session, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await;
-        for (name, r) in [("gemini", gemini), ("zero tools", empty), ("budget", late), ("no session", unresumable)] {
-            assert!(matches!(r, SightRepair::NotTried), "{name} must not be repaired");
+        let unresumable = try_sight_repair(
+            "codex",
+            "Codex",
+            &no_session,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        for (name, r) in [
+            ("gemini", gemini),
+            ("zero tools", empty),
+            ("budget", late),
+            ("no session", unresumable),
+        ] {
+            assert!(
+                matches!(r, SightRepair::NotTried),
+                "{name} must not be repaired"
+            );
         }
-        assert!(!st.dir.path().join("argv").exists(), "the stand-in was launched");
+        assert!(
+            !st.dir.path().join("argv").exists(),
+            "the stand-in was launched"
+        );
         assert!(lc.iter().any(|e| e.state == "SIGHT_REPAIR_SKIPPED"));
     }
 
@@ -12359,8 +12617,12 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     /// later test in this binary back to the operator's real ~/.triumvirate.
     #[test]
     fn test_home_stays_isolated() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = std::env::var_os("TRIUMVIRATE_HOME").map(PathBuf::from).expect("TRIUMVIRATE_HOME unset in a test binary");
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::var_os("TRIUMVIRATE_HOME")
+            .map(PathBuf::from)
+            .expect("TRIUMVIRATE_HOME unset in a test binary");
         let real = dirs::home_dir().map(|h| h.join(".triumvirate"));
         assert_ne!(Some(home), real, "tests are writing to the real home");
     }
@@ -12369,16 +12631,39 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
     /// snapshot is taken at the repair, so turn 1's window of the old file is unioned.
     #[tokio::test]
     async fn a_change_before_the_repair_starts_is_caught() {
-        let _guard = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = stub(READ_REST);
         let req = request(&st);
         let cwd = st.dir.path().display().to_string();
         let before = snapshot(&req, &cwd);
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
-        std::fs::write(&st.src, (1..=480).map(|i| format!("CHANGED {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &st.src,
+            (1..=480)
+                .map(|i| format!("CHANGED {i}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
         let mut lc = Vec::new();
-        let r = try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await;
-        assert!(matches!(r, SightRepair::Failed(ref e, _) if e.contains("changed after turn 1")), "old window covered the new file");
+        let r = try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &before,
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await;
+        assert!(
+            matches!(r, SightRepair::Failed(ref e, _) if e.contains("changed after turn 1")),
+            "old window covered the new file"
+        );
     }
 
     /// Two sources: A read whole on turn 1 and unchanged, B changed and read whole on the repair.
@@ -12391,7 +12676,8 @@ printf '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":5}}\
 printf '{"type":"thread.started","thread_id":"thread-1"}\n'
 printf '{"type":"item.started","item":{"type":"command_execution","id":"c9","command":"cat %s"}}\n' "$SRC"
 printf '{"type":"item.completed","item":{"type":"command_execution","id":"c9","command":"cat %s","exit_code":0,"aggregated_output":"%s"}}\n' "$SRC" "$(jesc "$(cat "$SRC")")"
-printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'"#);
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REVIEW"}}\n'"#,
+        );
         let a = st.dir.path().join("a.rs");
         std::fs::write(&a, "a1\na2\n").unwrap();
         let a = a.display().to_string();
@@ -12399,9 +12685,25 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REV
         req.required_sources = vec![a.clone(), st.src.clone()];
         let cwd = st.dir.path().display().to_string();
         let before = snapshot(&req, &cwd);
-        let first = first_turn(vec![read_call(format!("cat {a}"), true), read_call(format!("sed -n '1,240p' {}", st.src), true)]);
+        let first = first_turn(vec![
+            read_call(format!("cat {a}"), true),
+            read_call(format!("sed -n '1,240p' {}", st.src), true),
+        ]);
         let mut lc = Vec::new();
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &before, None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &before,
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Passed(_) => {}
             SightRepair::Failed(e, _) => panic!("A's unchanged turn-1 read was dropped: {e}"),
             SightRepair::NotTried => panic!("should try"),
@@ -12418,9 +12720,25 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"FULL REV
         let cwd = st.dir.path().display().to_string();
         let first = first_turn(vec![read_call(format!("sed -n '1,240p' {}", st.src), true)]);
         let mut lc = Vec::new();
-        match try_sight_repair("codex", "Codex", &first, "TURN 1 ERROR", &req, &cwd, &snapshot(&req, &cwd), None, Duration::from_secs(600), &mut lc).await {
+        match try_sight_repair(
+            "codex",
+            "Codex",
+            &first,
+            "TURN 1 ERROR",
+            &req,
+            &cwd,
+            &snapshot(&req, &cwd),
+            None,
+            Duration::from_secs(600),
+            &mut lc,
+        )
+        .await
+        {
             SightRepair::Failed(e, kept) => {
-                assert!(e.starts_with("TURN 1 ERROR") && e.contains("did not finish"), "{e}");
+                assert!(
+                    e.starts_with("TURN 1 ERROR") && e.contains("did not finish"),
+                    "{e}"
+                );
                 assert_eq!(kept.response_text, "PARTIAL REVIEW");
             }
             _ => panic!("a repair that errored must be a named failure"),
@@ -12440,8 +12758,16 @@ mod unexecuted_tool_marker_tests {
         let src = include_str!("agent_exec.rs");
         let call = ["let mut sight_err = ", "unexecuted_tool_marker("].concat();
         let old = ["let mut sight_err = ", "None;"].concat();
-        assert_eq!(src.matches(call.as_str()).count(), 2, "primary and degraded arms");
-        assert_eq!(src.matches(old.as_str()).count(), 0, "no arm starts without the check");
+        assert_eq!(
+            src.matches(call.as_str()).count(),
+            2,
+            "primary and degraded arms"
+        );
+        assert_eq!(
+            src.matches(old.as_str()).count(),
+            0,
+            "no arm starts without the check"
+        );
     }
 
     /// The live shape (Mneme handoff, request 5c988187): the whole reply was one marker.
@@ -12449,28 +12775,74 @@ mod unexecuted_tool_marker_tests {
     #[test]
     fn a_reply_of_only_markers_is_refused_and_prose_around_one_is_not() {
         let bare = r#"<triumvirate_tool name="ledger_query">{"query":"one token data providers"}</triumvirate_tool>"#;
-        let err = unexecuted_tool_marker("Codex", &format!("\n  {bare}\n")).expect("a bare marker is not an answer");
-        assert!(err.contains("Codex replied with only an unexecuted tool call (ledger_query)"), "{err}");
+        let err = unexecuted_tool_marker("Codex", &format!("\n  {bare}\n"))
+            .expect("a bare marker is not an answer");
+        assert!(
+            err.contains("Codex replied with only an unexecuted tool call (ledger_query)"),
+            "{err}"
+        );
 
         let two = format!("{bare}\n<triumvirate_tool name=\"lesson_list\"></triumvirate_tool>");
-        assert!(unexecuted_tool_marker("Codex", &two).expect("two markers").contains("(ledger_query, lesson_list)"));
+        assert!(
+            unexecuted_tool_marker("Codex", &two)
+                .expect("two markers")
+                .contains("(ledger_query, lesson_list)")
+        );
 
         let broken = r#"<triumvirate_tool>{"query":"x"}</triumvirate_tool>"#;
-        assert!(unexecuted_tool_marker("Codex", broken).expect("a malformed marker").contains("(unparsed)"));
+        assert!(
+            unexecuted_tool_marker("Codex", broken)
+                .expect("a malformed marker")
+                .contains("(unparsed)")
+        );
 
-        assert_eq!(unexecuted_tool_marker("Codex", &format!("The reply was {bare}, which nothing runs.")), None);
-        assert_eq!(unexecuted_tool_marker("Codex", &format!("{bare}\nThen I answered: two providers.")), None);
-        assert!(unexecuted_tool_marker("Codex", "<triumvirate_tool name=\"x\"> never closed").expect("unclosed").contains("(unclosed)"));
+        assert_eq!(
+            unexecuted_tool_marker(
+                "Codex",
+                &format!("The reply was {bare}, which nothing runs.")
+            ),
+            None
+        );
+        assert_eq!(
+            unexecuted_tool_marker("Codex", &format!("{bare}\nThen I answered: two providers.")),
+            None
+        );
+        assert!(
+            unexecuted_tool_marker("Codex", "<triumvirate_tool name=\"x\"> never closed")
+                .expect("unclosed")
+                .contains("(unclosed)")
+        );
         let fenced = format!("```xml\n{bare}\n```");
-        assert!(unexecuted_tool_marker("Codex", &fenced).expect("a fenced marker").contains("(ledger_query)"));
-        assert_eq!(unexecuted_tool_marker("Codex", &format!("```xml\n{bare}\n```\nThat is the call I would make.")), None);
+        assert!(
+            unexecuted_tool_marker("Codex", &fenced)
+                .expect("a fenced marker")
+                .contains("(ledger_query)")
+        );
+        assert_eq!(
+            unexecuted_tool_marker(
+                "Codex",
+                &format!("```xml\n{bare}\n```\nThat is the call I would make.")
+            ),
+            None
+        );
         assert_eq!(unexecuted_tool_marker("Codex", "a plain answer"), None);
         // A longer tag name is not a marker, and only a whole name attribute names one.
-        assert_eq!(unexecuted_tool_marker("Codex", "<triumvirate_toolbox>x</triumvirate_tool>"), None);
+        assert_eq!(
+            unexecuted_tool_marker("Codex", "<triumvirate_toolbox>x</triumvirate_tool>"),
+            None
+        );
         let surname = r#"<triumvirate_tool surname="x">{}</triumvirate_tool>"#;
-        assert!(unexecuted_tool_marker("Codex", surname).expect("still a marker").contains("(unparsed)"));
+        assert!(
+            unexecuted_tool_marker("Codex", surname)
+                .expect("still a marker")
+                .contains("(unparsed)")
+        );
         let junk = r#"<triumvirate_tool name="ledger_query"junk>{}</triumvirate_tool>"#;
-        assert!(unexecuted_tool_marker("Codex", junk).expect("still a marker").contains("(unparsed)"));
+        assert!(
+            unexecuted_tool_marker("Codex", junk)
+                .expect("still a marker")
+                .contains("(unparsed)")
+        );
     }
 }
 

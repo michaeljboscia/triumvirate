@@ -78,7 +78,10 @@ fn roster_entries_are_lowercase_and_trimmed() {
 #[test]
 fn every_roster_entry_is_supported() {
     for n in supported_agent_names() {
-        assert!(is_supported_agent_name(n), "{n} on roster but not supported");
+        assert!(
+            is_supported_agent_name(n),
+            "{n} on roster but not supported"
+        );
     }
 }
 
@@ -110,7 +113,11 @@ fn bridge_normalizes_every_new_alias() {
 #[test]
 fn shared_types_normalizes_every_new_alias() {
     for (alias, canon) in NEW_ALIASES {
-        assert_eq!(shared_types::normalize_agent_name(alias), *canon, "alias {alias}");
+        assert_eq!(
+            shared_types::normalize_agent_name(alias),
+            *canon,
+            "alias {alias}"
+        );
     }
 }
 
@@ -146,7 +153,11 @@ fn both_normalizers_agree() {
 fn existing_aliases_still_normalize() {
     for (alias, canon) in EXISTING_ALIASES {
         assert_eq!(normalize_agent_name(alias), *canon, "alias {alias}");
-        assert_eq!(shared_types::normalize_agent_name(alias), *canon, "alias {alias}");
+        assert_eq!(
+            shared_types::normalize_agent_name(alias),
+            *canon,
+            "alias {alias}"
+        );
     }
 }
 
@@ -174,7 +185,10 @@ fn non_aliases_pass_through_lowercased() {
     assert_eq!(normalize_agent_name("CODEX"), "codex");
     assert_eq!(normalize_agent_name("some-unknown"), "some-unknown");
     assert_eq!(shared_types::normalize_agent_name("CODEX"), "codex");
-    assert_eq!(shared_types::normalize_agent_name("Some-Unknown"), "some-unknown");
+    assert_eq!(
+        shared_types::normalize_agent_name("Some-Unknown"),
+        "some-unknown"
+    );
 }
 
 // REQ-002 test clause: AGENT_ALIASES holds every new alias with the exact target.
@@ -193,7 +207,10 @@ fn alias_table_contains_every_new_pair() {
 fn no_alias_collides_with_a_canonical_key() {
     for (alias, _) in shared_types::AGENT_ALIASES {
         assert!(!EIGHT.contains(alias), "alias {alias} is a canonical key");
-        assert!(!supported_agent_names().contains(alias), "alias {alias} is on the roster");
+        assert!(
+            !supported_agent_names().contains(alias),
+            "alias {alias} is on the roster"
+        );
     }
 }
 
@@ -210,7 +227,10 @@ fn no_alias_collides_with_another_alias() {
 #[test]
 fn alias_targets_are_roster_seats_and_table_is_exact() {
     for (alias, target) in shared_types::AGENT_ALIASES {
-        assert!(supported_agent_names().contains(target), "{alias} -> {target} not on roster");
+        assert!(
+            supported_agent_names().contains(target),
+            "{alias} -> {target} not on roster"
+        );
     }
     assert_eq!(shared_types::AGENT_ALIASES.len(), 14);
 }

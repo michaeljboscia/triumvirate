@@ -155,13 +155,15 @@ fn matching_cli_version_makes_configured_seat_available() {
     let home = TestHome::new("matching-version");
     write_verified(home.path(), "kimi", &record("2.2.0")).expect("write verified record");
 
-    let state =
-        availability(home.path(), "kimi", true, Some("2.2.0")).expect("read availability");
+    let state = availability(home.path(), "kimi", true, Some("2.2.0")).expect("read availability");
 
     assert!(state.configured, "configured input must be preserved");
     assert!(state.verified, "matching CLI version must verify the seat");
     assert_eq!(state.suspended, None);
-    assert!(state.available(), "matching verified seat must be available");
+    assert!(
+        state.available(),
+        "matching verified seat must be available"
+    );
     assert!(
         state.first_blocker().is_none(),
         "available seat must have no blocker"
@@ -176,7 +178,10 @@ fn changed_or_unknown_cli_version_invalidates_verification() {
 
     let changed =
         availability(home.path(), "kimi", true, Some("2.2.1")).expect("read changed version");
-    assert!(!changed.verified, "different installed version must invalidate");
+    assert!(
+        !changed.verified,
+        "different installed version must invalidate"
+    );
     assert!(!changed.available());
     assert_unverified(changed.first_blocker());
 
@@ -219,8 +224,7 @@ fn suspension_is_observed_per_call_and_outranks_missing_verification() {
     assert_eq!(before.suspended, None);
     assert_unverified(before.first_blocker());
 
-    write_suspended(home.path(), "qwen", "provider account suspended")
-        .expect("write suspension");
+    write_suspended(home.path(), "qwen", "provider account suspended").expect("write suspension");
 
     let after = availability(home.path(), "qwen", true, Some("0.25.2"))
         .expect("read suspended availability");
@@ -237,10 +241,8 @@ fn suspension_is_observed_per_call_and_outranks_missing_verification() {
 #[test]
 fn failed_spawned_probe_deletes_verification_but_preserves_suspension() {
     let home = TestHome::new("failed-probe");
-    write_verified(home.path(), "mistral", &record("2.26.1"))
-        .expect("write verified record");
-    write_suspended(home.path(), "mistral", "subscription disabled")
-        .expect("write suspension");
+    write_verified(home.path(), "mistral", &record("2.26.1")).expect("write verified record");
+    write_suspended(home.path(), "mistral", "subscription disabled").expect("write suspension");
 
     delete_verified(home.path(), "mistral").expect("delete verified record");
 
@@ -278,8 +280,7 @@ fn clear_removes_only_suspension_and_restores_verified_availability() {
         "clear must remove suspended.json"
     );
 
-    let state =
-        availability(home.path(), "kimi", true, Some("2.2.0")).expect("read cleared state");
+    let state = availability(home.path(), "kimi", true, Some("2.2.0")).expect("read cleared state");
     assert!(state.configured);
     assert!(state.verified);
     assert_eq!(state.suspended, None);
@@ -375,10 +376,7 @@ fn seat_keys_cannot_escape_the_seats_directory() {
         availability(home.path(), invalid, true, Some("2.2.0")),
         "availability",
     );
-    assert_invalid_seat(
-        delete_verified(home.path(), invalid),
-        "delete_verified",
-    );
+    assert_invalid_seat(delete_verified(home.path(), invalid), "delete_verified");
     assert_invalid_seat(clear(home.path(), invalid), "clear");
 
     assert!(

@@ -125,11 +125,16 @@ impl KimiStreamParser {
         // T-302 (live, kimi 2.2.0, fixture kimi-2.2.0-live-read-20261019.jsonl): a `Read` result numbers its lines
         // (`1\talpha ...`), so the lines it SHOWED are recoverable. The result carries no outcome (#4241); numbered
         // lines are the evidence the read succeeded, and an unnumbered result (an error message) earns no credit.
-        let content = value.get("content").and_then(Value::as_str).unwrap_or_default();
+        let content = value
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let runs = crate::types::numbered_line_runs(content);
-        if let Some(call) = id
-            .and_then(|id| self.tool_calls.iter_mut().find(|c| c.id.as_deref() == Some(id)))
-            && !runs.is_empty()
+        if let Some(call) = id.and_then(|id| {
+            self.tool_calls
+                .iter_mut()
+                .find(|c| c.id.as_deref() == Some(id))
+        }) && !runs.is_empty()
         {
             call.returned_lines = runs;
             call.success = Some(true);

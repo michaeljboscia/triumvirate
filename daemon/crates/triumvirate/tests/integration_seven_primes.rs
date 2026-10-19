@@ -2030,7 +2030,9 @@ async fn t208_5_vendor_rejected_ready_session_becomes_broken() {
     let persisted: Value =
         serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap()).unwrap();
     assert_eq!(persisted["rejected"]["phase"], "broken");
-    let reason = persisted["rejected"]["broken_reason"].as_str().unwrap_or_default();
+    let reason = persisted["rejected"]["broken_reason"]
+        .as_str()
+        .unwrap_or_default();
     assert!(reason.contains("Session not found"), "{reason}");
     let blocked = http_ask(&rig, token.trim(), "rejected", "blocked").await;
     assert_eq!(blocked.0, reqwest::StatusCode::CONFLICT);

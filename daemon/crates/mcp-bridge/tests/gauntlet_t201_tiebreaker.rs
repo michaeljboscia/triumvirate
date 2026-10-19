@@ -49,7 +49,10 @@ fn roster_has_no_duplicate_keys() {
 // REQ-001 and REQ-061: every roster key is accepted as a supported daemon target.
 fn every_roster_key_is_supported() {
     for &agent in supported_agent_names() {
-        assert!(is_supported_agent_name(agent), "unsupported roster key: {agent}");
+        assert!(
+            is_supported_agent_name(agent),
+            "unsupported roster key: {agent}"
+        );
     }
 }
 
@@ -57,7 +60,10 @@ fn every_roster_key_is_supported() {
 // REQ-001: names outside the exact canonical roster are rejected as roster keys.
 fn names_outside_the_roster_are_not_supported_keys() {
     for agent in ["", "unknown", "not-a-seat"] {
-        assert!(!is_supported_agent_name(agent), "unexpected roster key: {agent}");
+        assert!(
+            !is_supported_agent_name(agent),
+            "unexpected roster key: {agent}"
+        );
     }
 }
 
@@ -74,8 +80,14 @@ fn aliases_are_collision_free_and_target_canonical_seats() {
     assert_eq!(alias_names.len(), AGENT_ALIASES.len());
 
     for &(alias, canonical) in AGENT_ALIASES {
-        assert!(EXPECTED_ROSTER.contains(&canonical), "noncanonical target for {alias}");
-        assert!(!EXPECTED_ROSTER.contains(&alias), "alias collides with roster: {alias}");
+        assert!(
+            EXPECTED_ROSTER.contains(&canonical),
+            "noncanonical target for {alias}"
+        );
+        assert!(
+            !EXPECTED_ROSTER.contains(&alias),
+            "alias collides with roster: {alias}"
+        );
     }
 }
 
@@ -110,7 +122,10 @@ fn bridge_and_shared_normalizers_cannot_disagree() {
         .chain(AGENT_ALIASES.iter().map(|(alias, _)| *alias))
         .chain(["UNLISTED", "MixedCaseUnknown"])
     {
-        assert_eq!(normalize_agent_name(input), normalize_shared_agent_name(input));
+        assert_eq!(
+            normalize_agent_name(input),
+            normalize_shared_agent_name(input)
+        );
     }
 }
 

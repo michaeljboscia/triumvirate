@@ -11,14 +11,15 @@
 // SPEC_AMBIGUITY: the seat-key directory guard, the atomic-write helper and the triumvirate_home rule are described in doc
 // comments without listed signatures, and triumvirate_home and is_configured read process environment. Not tested here.
 
-use mcp_bridge::seat_gate::{seat_gate_with, Origin, Refusal};
+use mcp_bridge::seat_gate::{Origin, Refusal, seat_gate_with};
 use mcp_bridge::seat_profile::{
-    all_seats, seat_profile, AttemptPolicy, Configured, ConcurrencyLimit, Containment, PrewarmPolicy, Provider,
-    QuotaPolicy, StallWindow, SuspensionPolicy, Surface, VerifyPolicy, NEW_SEAT_LAUNCH_SURFACES,
+    AttemptPolicy, ConcurrencyLimit, Configured, Containment, NEW_SEAT_LAUNCH_SURFACES,
+    PrewarmPolicy, Provider, QuotaPolicy, StallWindow, Surface, SuspensionPolicy, VerifyPolicy,
+    all_seats, seat_profile,
 };
 use mcp_bridge::seat_state::{
-    availability, clear as clear_suspended, delete_verified, write_suspended, write_verified, Blocker, SeatAvailability,
-    VerifiedRecord,
+    Blocker, SeatAvailability, VerifiedRecord, availability, clear as clear_suspended,
+    delete_verified, write_suspended, write_verified,
 };
 
 // ---------- helpers ----------
@@ -66,34 +67,56 @@ fn exp(code: &str, message: String) -> Option<(String, String)> {
 }
 
 fn av(configured: bool, verified: bool, suspended: Option<&str>) -> SeatAvailability {
-    SeatAvailability { configured, verified, suspended: suspended.map(|s| s.to_string()) }
+    SeatAvailability {
+        configured,
+        verified,
+        suspended: suspended.map(|s| s.to_string()),
+    }
 }
 
 /// The spec's decision for a NEW seat (kimi, mistral, qwen) in a given state, per SPEC_v2 REQ-090/091 and A-2.
 /// Origin and tty never change the answer at launch.
-fn expected_new_seat(seat: &str, surface: &Surface, st: &SeatAvailability) -> Option<(String, String)> {
+fn expected_new_seat(
+    seat: &str,
+    surface: &Surface,
+    st: &SeatAvailability,
+) -> Option<(String, String)> {
     if !st.configured {
         return exp(
             "seat_not_configured",
-            format!("seat_not_configured: {seat}: set TRIUMVIRATE_ENABLE_{}=1 and restart the daemon", seat.to_uppercase()),
+            format!(
+                "seat_not_configured: {seat}: set TRIUMVIRATE_ENABLE_{}=1 and restart the daemon",
+                seat.to_uppercase()
+            ),
         );
     }
     if let Some(reason) = &st.suspended {
-        return exp("seat_suspended", format!("seat_suspended: {seat}: {reason} (run: triumvirate seat clear {seat})"));
+        return exp(
+            "seat_suspended",
+            format!("seat_suspended: {seat}: {reason} (run: triumvirate seat clear {seat})"),
+        );
     }
     let is_probe = matches!(surface, Surface::DoctorLiveProbe);
     if !st.verified && !is_probe {
-        return exp("seat_unverified", format!("seat_unverified: {seat}: run triumvirate doctor --live in a terminal"));
+        return exp(
+            "seat_unverified",
+            format!("seat_unverified: {seat}: run triumvirate doctor --live in a terminal"),
+        );
     }
     match surface {
         Surface::AskAgent | Surface::Session | Surface::Jury | Surface::DoctorLiveProbe => None,
         Surface::BlindValidate => exp(
             "seat_cannot_write_here",
-            format!("seat_cannot_write_here: {seat}: blind validators must write test files and {seat} is read-only"),
+            format!(
+                "seat_cannot_write_here: {seat}: blind validators must write test files and {seat} is read-only"
+            ),
         ),
         other => exp(
             "seat_surface_deferred",
-            format!("seat_surface_deferred: {seat} on {} ships in v1.1", surface_name(other)),
+            format!(
+                "seat_surface_deferred: {seat} on {} ships in v1.1",
+                surface_name(other)
+            ),
         ),
     }
 }
@@ -122,10 +145,10 @@ fn rec(cli: &str) -> VerifiedRecord {
 // REQ-090, REQ-091, A-2: every (new seat, surface, origin, tty, state) cell resolves to exactly one code and exact payload.
 fn new_seats_full_matrix_exact_payloads() {
     let states = [
-        av(false, true, None),                              // not configured
-        av(true, true, Some("account access terminated")),  // suspended
-        av(true, false, None),                              // configured, unverified
-        av(true, true, None),                               // available
+        av(false, true, None),                             // not configured
+        av(true, true, Some("account access terminated")), // suspended
+        av(true, false, None),                             // configured, unverified
+        av(true, true, None),                              // available
     ];
     let mut cells = 0usize;
     let mut refused = 0usize;
@@ -139,9 +162,10 @@ fn new_seats_full_matrix_exact_payloads() {
                         let expected = expected_new_seat(seat, &surface, st);
                         let got = describe(seat_gate_with(seat, surface, origin, tty, st));
                         if let Some((code, _)) = &got
-                            && code == "seat_surface_refused" {
-                                refused += 1;
-                            }
+                            && code == "seat_surface_refused"
+                        {
+                            refused += 1;
+                        }
                         assert_eq!(got, expected, "seat {seat} surface {name} tty {tty}");
                         cells += 1;
                     }
@@ -182,8 +206,23 @@ fn launch_surfaces_allowed_for_any_origin_and_tty() {
 // A-2 examples: (qwen, AskAgent, Unattended) is allowed; (kimi, DoctorLiveProbe, tty=false) is allowed.
 fn a2_worked_examples_allowed() {
     let st = av(true, true, None);
-    assert!(describe(seat_gate_with("qwen", Surface::AskAgent, Origin::Unattended, false, &st)).is_none());
-    let probe = describe(seat_gate_with("kimi", Surface::DoctorLiveProbe, Origin::Interactive, false, &st));
+    assert!(
+        describe(seat_gate_with(
+            "qwen",
+            Surface::AskAgent,
+            Origin::Unattended,
+            false,
+            &st
+        ))
+        .is_none()
+    );
+    let probe = describe(seat_gate_with(
+        "kimi",
+        Surface::DoctorLiveProbe,
+        Origin::Interactive,
+        false,
+        &st,
+    ));
     assert!(probe.is_none());
 }
 
@@ -192,12 +231,30 @@ fn a2_worked_examples_allowed() {
 fn prewarm_is_deferred_with_exact_payload() {
     let st = av(true, true, None);
     assert_eq!(
-        describe(seat_gate_with("qwen", Surface::Prewarm, Origin::Unattended, false, &st)),
-        exp("seat_surface_deferred", "seat_surface_deferred: qwen on Prewarm ships in v1.1".to_string())
+        describe(seat_gate_with(
+            "qwen",
+            Surface::Prewarm,
+            Origin::Unattended,
+            false,
+            &st
+        )),
+        exp(
+            "seat_surface_deferred",
+            "seat_surface_deferred: qwen on Prewarm ships in v1.1".to_string()
+        )
     );
     assert_eq!(
-        describe(seat_gate_with("mistral", Surface::Prewarm, Origin::Unattended, false, &st)),
-        exp("seat_surface_deferred", "seat_surface_deferred: mistral on Prewarm ships in v1.1".to_string())
+        describe(seat_gate_with(
+            "mistral",
+            Surface::Prewarm,
+            Origin::Unattended,
+            false,
+            &st
+        )),
+        exp(
+            "seat_surface_deferred",
+            "seat_surface_deferred: mistral on Prewarm ships in v1.1".to_string()
+        )
     );
 }
 
@@ -219,8 +276,18 @@ fn blind_validate_is_cannot_write_here_not_refused() {
 fn not_configured_outranks_suspended_and_unverified() {
     let st = av(false, false, Some("account access terminated"));
     assert_eq!(
-        describe(seat_gate_with("kimi", Surface::AskAgent, Origin::Interactive, true, &st)),
-        exp("seat_not_configured", "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon".to_string())
+        describe(seat_gate_with(
+            "kimi",
+            Surface::AskAgent,
+            Origin::Interactive,
+            true,
+            &st
+        )),
+        exp(
+            "seat_not_configured",
+            "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+                .to_string()
+        )
     );
 }
 
@@ -250,8 +317,17 @@ fn suspended_outranks_unverified_and_surface_rule() {
 fn unverified_outranks_surface_rule() {
     let st = av(true, false, None);
     assert_eq!(
-        describe(seat_gate_with("kimi", Surface::BlindValidate, Origin::Interactive, true, &st)),
-        exp("seat_unverified", "seat_unverified: kimi: run triumvirate doctor --live in a terminal".to_string())
+        describe(seat_gate_with(
+            "kimi",
+            Surface::BlindValidate,
+            Origin::Interactive,
+            true,
+            &st
+        )),
+        exp(
+            "seat_unverified",
+            "seat_unverified: kimi: run triumvirate doctor --live in a terminal".to_string()
+        )
     );
 }
 
@@ -259,8 +335,26 @@ fn unverified_outranks_surface_rule() {
 // REQ-091: the live probe is how a seat gets verified, so DoctorLiveProbe skips the unverified check, with or without a TTY.
 fn doctor_probe_skips_unverified_check() {
     let st = av(true, false, None);
-    assert!(describe(seat_gate_with("qwen", Surface::DoctorLiveProbe, Origin::Interactive, true, &st)).is_none());
-    assert!(describe(seat_gate_with("qwen", Surface::DoctorLiveProbe, Origin::Interactive, false, &st)).is_none());
+    assert!(
+        describe(seat_gate_with(
+            "qwen",
+            Surface::DoctorLiveProbe,
+            Origin::Interactive,
+            true,
+            &st
+        ))
+        .is_none()
+    );
+    assert!(
+        describe(seat_gate_with(
+            "qwen",
+            Surface::DoctorLiveProbe,
+            Origin::Interactive,
+            false,
+            &st
+        ))
+        .is_none()
+    );
 }
 
 #[test]
@@ -312,7 +406,10 @@ fn surface_all_lists_ten_surfaces_in_order() {
 // A-2: every new seat's surfaces_allowed is exactly Mistral's launch set; the shared constant matches.
 fn new_seat_rows_allow_exactly_the_launch_surfaces() {
     let want_const: Vec<&str> = NEW_SEAT_LAUNCH_SURFACES.iter().map(surface_name).collect();
-    assert_eq!(want_const, vec!["AskAgent", "Session", "Jury", "DoctorLiveProbe"]);
+    assert_eq!(
+        want_const,
+        vec!["AskAgent", "Session", "Jury", "DoctorLiveProbe"]
+    );
     for key in ["kimi", "mistral", "qwen"] {
         let p = seat_profile(key).expect("row exists");
         let mut got: Vec<&str> = p.surfaces_allowed.iter().map(surface_name).collect();
@@ -341,15 +438,42 @@ fn new_seats_are_env_gated_with_their_own_flag() {
 fn new_seat_launch_policy_fields() {
     for key in ["kimi", "mistral", "qwen"] {
         let p = seat_profile(key).expect("row exists");
-        assert!(matches!(p.verify_policy, VerifyPolicy::DoctorLive), "{key} verify");
-        assert!(matches!(p.suspension_policy, SuspensionPolicy::Classified), "{key} suspension");
-        assert!(matches!(p.concurrency_limit, ConcurrencyLimit::One), "{key} concurrency");
-        assert!(matches!(p.attempt_policy, AttemptPolicy::Single), "{key} attempts");
-        assert!(matches!(p.quota_policy, QuotaPolicy::TerminalTripBreaker), "{key} quota");
-        assert!(matches!(p.read_only_containment, Containment::SeatbeltPlusAudit), "{key} containment");
-        assert!(matches!(p.prewarm_policy, PrewarmPolicy::Never), "{key} prewarm");
-        assert!(matches!(p.stall_window, StallWindow::Secs(780)), "{key} stall window");
-        assert!(!p.can_write_test_file, "{key} cannot write test files (D-10)");
+        assert!(
+            matches!(p.verify_policy, VerifyPolicy::DoctorLive),
+            "{key} verify"
+        );
+        assert!(
+            matches!(p.suspension_policy, SuspensionPolicy::Classified),
+            "{key} suspension"
+        );
+        assert!(
+            matches!(p.concurrency_limit, ConcurrencyLimit::One),
+            "{key} concurrency"
+        );
+        assert!(
+            matches!(p.attempt_policy, AttemptPolicy::Single),
+            "{key} attempts"
+        );
+        assert!(
+            matches!(p.quota_policy, QuotaPolicy::TerminalTripBreaker),
+            "{key} quota"
+        );
+        assert!(
+            matches!(p.read_only_containment, Containment::SeatbeltPlusAudit),
+            "{key} containment"
+        );
+        assert!(
+            matches!(p.prewarm_policy, PrewarmPolicy::Never),
+            "{key} prewarm"
+        );
+        assert!(
+            matches!(p.stall_window, StallWindow::Secs(780)),
+            "{key} stall window"
+        );
+        assert!(
+            !p.can_write_test_file,
+            "{key} cannot write test files (D-10)"
+        );
         assert!(!p.fleet_buildable, "{key} no fleet role");
         assert!(!p.abe_buildable, "{key} no ABE role");
     }
@@ -358,13 +482,25 @@ fn new_seat_launch_policy_fields() {
 #[test]
 // A-7: provider fields are OpenRouter slugs (moonshotai, mistralai, qwen; grok is x-ai, not xai).
 fn provider_slugs_are_openrouter_slugs() {
-    assert!(matches!(seat_profile("kimi").expect("row").provider, Provider::Moonshot));
+    assert!(matches!(
+        seat_profile("kimi").expect("row").provider,
+        Provider::Moonshot
+    ));
     assert_eq!(Provider::Moonshot.as_str(), "moonshotai");
-    assert!(matches!(seat_profile("mistral").expect("row").provider, Provider::Mistral));
+    assert!(matches!(
+        seat_profile("mistral").expect("row").provider,
+        Provider::Mistral
+    ));
     assert_eq!(Provider::Mistral.as_str(), "mistralai");
-    assert!(matches!(seat_profile("qwen").expect("row").provider, Provider::Alibaba));
+    assert!(matches!(
+        seat_profile("qwen").expect("row").provider,
+        Provider::Alibaba
+    ));
     assert_eq!(Provider::Alibaba.as_str(), "qwen");
-    assert!(matches!(seat_profile("grok").expect("row").provider, Provider::XAi));
+    assert!(matches!(
+        seat_profile("grok").expect("row").provider,
+        Provider::XAi
+    ));
     assert_eq!(Provider::XAi.as_str(), "x-ai");
 }
 
@@ -414,7 +550,11 @@ fn cli_version_change_or_unknown_version_flips_verified() {
 fn delete_verified_makes_seat_unverified() {
     let h = tempfile::tempdir().expect("tempdir");
     write_verified(h.path(), "qwen", &rec("0.25.0")).expect("write");
-    assert!(availability(h.path(), "qwen", true, Some("0.25.0")).expect("read").available());
+    assert!(
+        availability(h.path(), "qwen", true, Some("0.25.0"))
+            .expect("read")
+            .available()
+    );
     delete_verified(h.path(), "qwen").expect("delete");
     let after = availability(h.path(), "qwen", true, Some("0.25.0")).expect("read");
     assert_eq!(blocker_desc(&after), "unverified");
@@ -448,7 +588,10 @@ fn suspended_blocks_until_clear() {
     write_suspended(h.path(), "kimi", "provider terminated access").expect("write suspended");
     let blocked = availability(h.path(), "kimi", true, Some("2.2.0")).expect("read");
     assert!(!blocked.available());
-    assert_eq!(blocker_desc(&blocked), "suspended:provider terminated access");
+    assert_eq!(
+        blocker_desc(&blocked),
+        "suspended:provider terminated access"
+    );
 
     clear_suspended(h.path(), "kimi").expect("clear");
     let cleared = availability(h.path(), "kimi", true, Some("2.2.0")).expect("read");
@@ -477,6 +620,9 @@ fn unreadable_suspended_still_blocks() {
     let dir = h.path().join("seats").join("kimi");
     std::fs::write(dir.join("suspended.json"), b"\x00\xff garbage").expect("write garbage");
     let a = availability(h.path(), "kimi", true, Some("2.2.0")).expect("read");
-    assert!(a.suspended.is_some(), "unreadable suspended.json must read as suspended");
+    assert!(
+        a.suspended.is_some(),
+        "unreadable suspended.json must read as suspended"
+    );
     assert!(!a.available());
 }

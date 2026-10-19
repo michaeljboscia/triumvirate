@@ -96,9 +96,20 @@ const SESSION_B: &str = "11112222-3333-4444-5555-666677778888";
 fn variant_b() -> String {
     join(&[
         start(SESSION_B, "qwen3.7-plus"),
-        assistant_tool(SESSION_B, "qwen3.7-plus", "call_b", "read_file", r#"{"file_path":"/repo/Cargo.toml"}"#),
+        assistant_tool(
+            SESSION_B,
+            "qwen3.7-plus",
+            "call_b",
+            "read_file",
+            r#"{"file_path":"/repo/Cargo.toml"}"#,
+        ),
         tool_result(SESSION_B, "call_b", "[package]", false),
-        assistant_text(SESSION_B, "qwen3.7-plus", "Cargo.toml declares one package.", r#","usage":{"input_tokens":70,"output_tokens":9}"#),
+        assistant_text(
+            SESSION_B,
+            "qwen3.7-plus",
+            "Cargo.toml declares one package.",
+            r#","usage":{"input_tokens":70,"output_tokens":9}"#,
+        ),
         result_line(
             SESSION_B,
             "Cargo.toml declares one package.",
@@ -221,8 +232,19 @@ fn test_should_surface_non_qwen_served_model_verbatim() {
     let s = "aaaa0000-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "glm-5"),
-        assistant_text(s, "glm-5", "hi", r#","usage":{"input_tokens":1,"output_tokens":1}"#),
-        result_line(s, "hi", false, "success", r#","usage":{"input_tokens":1,"output_tokens":1}"#),
+        assistant_text(
+            s,
+            "glm-5",
+            "hi",
+            r#","usage":{"input_tokens":1,"output_tokens":1}"#,
+        ),
+        result_line(
+            s,
+            "hi",
+            false,
+            "success",
+            r#","usage":{"input_tokens":1,"output_tokens":1}"#,
+        ),
     ]);
     let sut = parse_ok(&stream, Some(0));
     assert_eq!(sut.served_model.as_deref(), Some("glm-5"));
@@ -261,9 +283,21 @@ fn test_should_record_each_read_with_its_own_path() {
     let s = "dddd0000-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "c1", "read_file", r#"{"file_path":"/repo/a.rs"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "c1",
+            "read_file",
+            r#"{"file_path":"/repo/a.rs"}"#,
+        ),
         tool_result(s, "c1", "a", false),
-        assistant_tool(s, "qwen3-coder-plus", "c2", "read_file", r#"{"file_path":"/repo/b.rs"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "c2",
+            "read_file",
+            r#"{"file_path":"/repo/b.rs"}"#,
+        ),
         tool_result(s, "c2", "b", false),
         assistant_text(s, "qwen3-coder-plus", "done", ""),
         result_line(s, "done", false, "success", ""),
@@ -282,14 +316,30 @@ fn test_should_not_classify_shell_or_write_tools_as_reads() {
     let s = "eeee0000-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "c1", "run_shell_command", r#"{"command":"cat /repo/a.rs"}"#),
-        assistant_tool(s, "qwen3-coder-plus", "c2", "write_file", r#"{"file_path":"/repo/a.rs","content":"x"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "c1",
+            "run_shell_command",
+            r#"{"command":"cat /repo/a.rs"}"#,
+        ),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "c2",
+            "write_file",
+            r#"{"file_path":"/repo/a.rs","content":"x"}"#,
+        ),
         result_line(s, "x", false, "success", ""),
     ]);
     let sut = parse_ok(&stream, Some(0));
     assert_eq!(sut.result.tool_calls.len(), 2);
     for call in &sut.result.tool_calls {
-        assert!(!matches!(call.kind, ToolKind::ReadFile), "{} classified as a read", call.tool);
+        assert!(
+            !matches!(call.kind, ToolKind::ReadFile),
+            "{} classified as a read",
+            call.tool
+        );
     }
 }
 
@@ -299,7 +349,13 @@ fn test_should_not_mark_errored_read_as_success() {
     let s = "ffff0000-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "c1", "read_file", r#"{"file_path":"/repo/missing.rs"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "c1",
+            "read_file",
+            r#"{"file_path":"/repo/missing.rs"}"#,
+        ),
         tool_result(s, "c1", "ENOENT", true),
         result_line(s, "none", false, "success", ""),
     ]);
@@ -317,7 +373,13 @@ fn test_should_keep_reported_zero_usage_as_exact_zero() {
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
         assistant_text(s, "qwen3-coder-plus", "ok", ""),
-        result_line(s, "ok", false, "success", r#","usage":{"input_tokens":0,"output_tokens":0}"#),
+        result_line(
+            s,
+            "ok",
+            false,
+            "success",
+            r#","usage":{"input_tokens":0,"output_tokens":0}"#,
+        ),
     ]);
     let sut = parse_ok(&stream, Some(0));
     match sut.usage {
@@ -361,8 +423,18 @@ fn test_should_fall_back_to_last_assistant_usage() {
     let s = "0000dddd-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_text(s, "qwen3-coder-plus", "one", r#","usage":{"input_tokens":5,"output_tokens":1}"#),
-        assistant_text(s, "qwen3-coder-plus", "two", r#","usage":{"input_tokens":7,"output_tokens":3}"#),
+        assistant_text(
+            s,
+            "qwen3-coder-plus",
+            "one",
+            r#","usage":{"input_tokens":5,"output_tokens":1}"#,
+        ),
+        assistant_text(
+            s,
+            "qwen3-coder-plus",
+            "two",
+            r#","usage":{"input_tokens":7,"output_tokens":3}"#,
+        ),
         result_line(s, "two", false, "success", ""),
     ]);
     let sut = parse_ok(&stream, Some(0));
@@ -379,12 +451,19 @@ fn test_should_fall_back_to_last_assistant_usage() {
 #[test]
 fn test_should_keep_result_token_usage_consistent_with_usage_report() {
     let reported = parse_ok(FIXTURE, Some(0));
-    let tu = reported.result.token_usage.expect("token_usage set when usage is Exact");
+    let tu = reported
+        .result
+        .token_usage
+        .expect("token_usage set when usage is Exact");
     assert_eq!(tu.input, Some(2600));
     assert_eq!(tu.output, Some(52));
 
     let s = "0000eeee-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "ok", ""), result_line(s, "ok", false, "success", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_text(s, "qwen3-coder-plus", "ok", ""),
+        result_line(s, "ok", false, "success", ""),
+    ]);
     let missing = parse_ok(&stream, Some(0));
     assert!(missing.result.token_usage.is_none());
 }
@@ -455,9 +534,19 @@ fn test_should_return_no_event_for_blank_and_malformed_lines() {
 // REQ-044: JSON that is not an object never panics and never counts as a recognized stream.
 #[test]
 fn test_should_not_recognize_non_object_json_lines() {
-    for junk in ["null", "[]", "123", "\"text\"", r#"{"type":5}"#, r#"{"no_type":true}"#] {
+    for junk in [
+        "null",
+        "[]",
+        "123",
+        "\"text\"",
+        r#"{"type":5}"#,
+        r#"{"no_type":true}"#,
+    ] {
         let failure = failure_code(parse(junk, Some(0)));
-        assert!(failure.starts_with("empty_or_unrecognized_stream:qwen"), "{junk} -> {failure}");
+        assert!(
+            failure.starts_with("empty_or_unrecognized_stream:qwen"),
+            "{junk} -> {failure}"
+        );
     }
 }
 
@@ -467,15 +556,24 @@ fn test_should_not_recognize_non_object_json_lines() {
 #[test]
 fn test_should_fail_empty_stream_with_exit_zero() {
     let code = failure_code(parse("", Some(0)));
-    assert!(code.starts_with("empty_or_unrecognized_stream:qwen"), "got {code}");
+    assert!(
+        code.starts_with("empty_or_unrecognized_stream:qwen"),
+        "got {code}"
+    );
 }
 
 // REQ-052: a stream of only unknown event types with exit 0 is the same failure.
 #[test]
 fn test_should_fail_unrecognized_only_stream_with_exit_zero() {
-    let stream = join(&[r#"{"type":"mystery"}"#.to_string(), r#"{"type":"other","x":1}"#.to_string()]);
+    let stream = join(&[
+        r#"{"type":"mystery"}"#.to_string(),
+        r#"{"type":"other","x":1}"#.to_string(),
+    ]);
     let code = failure_code(parse(&stream, Some(0)));
-    assert!(code.starts_with("empty_or_unrecognized_stream:qwen"), "got {code}");
+    assert!(
+        code.starts_with("empty_or_unrecognized_stream:qwen"),
+        "got {code}"
+    );
 }
 
 // REQ-052: exit 0 with an is_error result is a failure.
@@ -494,7 +592,10 @@ fn test_should_fail_exit_zero_with_error_result() {
 #[test]
 fn test_should_fail_exit_zero_when_is_error_true_despite_success_subtype() {
     let s = "2222bbbb-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), result_line(s, "x", true, "success", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        result_line(s, "x", true, "success", ""),
+    ]);
     assert!(is_failure(parse(&stream, Some(0))));
 }
 
@@ -502,7 +603,10 @@ fn test_should_fail_exit_zero_when_is_error_true_despite_success_subtype() {
 #[test]
 fn test_should_not_succeed_on_exit_zero_without_result_line() {
     let s = "2222cccc-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "cut off", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_text(s, "qwen3-coder-plus", "cut off", ""),
+    ]);
     assert!(is_failure(parse(&stream, Some(0))));
 }
 
@@ -510,7 +614,10 @@ fn test_should_not_succeed_on_exit_zero_without_result_line() {
 #[test]
 fn test_should_report_partial_for_exit_53() {
     let s = "3333aaaa-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "got this far", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_text(s, "qwen3-coder-plus", "got this far", ""),
+    ]);
     let sut = parse_ok(&stream, Some(53));
     assert!(matches!(sut.outcome, SeatOutcome::Partial(_)));
     assert!(sut.result.response_text.contains("got this far"));
@@ -521,7 +628,10 @@ fn test_should_report_partial_for_exit_53() {
 #[test]
 fn test_should_report_partial_for_exit_55() {
     let s = "3333bbbb-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "budget hit", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_text(s, "qwen3-coder-plus", "budget hit", ""),
+    ]);
     let sut = parse_ok(&stream, Some(55));
     assert!(matches!(sut.outcome, SeatOutcome::Partial(_)));
     assert!(sut.result.response_text.contains("budget hit"));
@@ -531,7 +641,10 @@ fn test_should_report_partial_for_exit_55() {
 #[test]
 fn test_should_give_partial_a_nonempty_reason() {
     let s = "3333cccc-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "x", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_text(s, "qwen3-coder-plus", "x", ""),
+    ]);
     for code in [53, 55] {
         match parse_ok(&stream, Some(code)).outcome {
             SeatOutcome::Partial(reason) => assert!(!reason.trim().is_empty(), "exit {code}"),
@@ -544,7 +657,10 @@ fn test_should_give_partial_a_nonempty_reason() {
 #[test]
 fn test_should_distinguish_partial_reasons_for_53_and_55() {
     let s = "3333dddd-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "x", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_text(s, "qwen3-coder-plus", "x", ""),
+    ]);
     let a = match parse_ok(&stream, Some(53)).outcome {
         SeatOutcome::Partial(r) => r,
         _ => panic!("53 not partial"),
@@ -566,7 +682,10 @@ fn test_should_fail_exit_130() {
 #[test]
 fn test_should_fail_other_nonzero_exits() {
     for code in [1, 2, 3, 52, 54, 56, 127, 137, 255] {
-        assert!(is_failure(parse(FIXTURE, Some(code))), "exit {code} should fail");
+        assert!(
+            is_failure(parse(FIXTURE, Some(code))),
+            "exit {code} should fail"
+        );
     }
 }
 
@@ -587,7 +706,10 @@ fn test_should_fail_empty_stream_with_nonzero_exit() {
 fn test_should_never_return_success_for_nonzero_exit() {
     for code in [1, 53, 55, 130] {
         if let Ok(p) = parse(FIXTURE, Some(code)) {
-            assert!(!matches!(p.outcome, SeatOutcome::Success), "exit {code} returned Success");
+            assert!(
+                !matches!(p.outcome, SeatOutcome::Success),
+                "exit {code} returned Success"
+            );
         }
     }
 }
@@ -602,7 +724,13 @@ fn kind_for(tool: &str) -> ToolKind {
     let s = "9999aaaa-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "k1", tool, r#"{"file_path":"/repo/a.rs","command":"ls","pattern":"x"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "k1",
+            tool,
+            r#"{"file_path":"/repo/a.rs","command":"ls","pattern":"x"}"#,
+        ),
         result_line(s, "ok", false, "success", ""),
     ]);
     let sut = parse_ok(&stream, Some(0));
@@ -651,7 +779,14 @@ fn test_should_classify_glob_as_glob() {
 #[test]
 fn test_should_classify_read_file_as_read_only_for_read_file() {
     assert!(matches!(kind_for("read_file"), ToolKind::ReadFile));
-    for other in ["write_file", "edit", "run_shell_command", "exec", "grep_search", "glob"] {
+    for other in [
+        "write_file",
+        "edit",
+        "run_shell_command",
+        "exec",
+        "grep_search",
+        "glob",
+    ] {
         assert!(!matches!(kind_for(other), ToolKind::ReadFile), "{other}");
     }
 }
@@ -660,8 +795,20 @@ fn two_reads(first_err: bool, second_err: bool) -> String {
     let s = "9999bbbb-0000-4000-8000-000000000000";
     join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "p1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
-        assistant_tool(s, "qwen3-coder-plus", "p2", "read_file", r#"{"file_path":"/repo/two.rs"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "p1",
+            "read_file",
+            r#"{"file_path":"/repo/one.rs"}"#,
+        ),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "p2",
+            "read_file",
+            r#"{"file_path":"/repo/two.rs"}"#,
+        ),
         tool_result(s, "p1", "one", first_err),
         tool_result(s, "p2", "two", second_err),
         result_line(s, "done", false, "success", ""),
@@ -701,8 +848,20 @@ fn test_should_pair_out_of_order_tool_results_by_id() {
     let s = "9999cccc-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "q1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
-        assistant_tool(s, "qwen3-coder-plus", "q2", "read_file", r#"{"file_path":"/repo/two.rs"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "q1",
+            "read_file",
+            r#"{"file_path":"/repo/one.rs"}"#,
+        ),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "q2",
+            "read_file",
+            r#"{"file_path":"/repo/two.rs"}"#,
+        ),
         tool_result(s, "q2", "two", true),
         tool_result(s, "q1", "one", false),
         result_line(s, "done", false, "success", ""),
@@ -718,7 +877,13 @@ fn test_should_ignore_tool_result_with_unmatched_id() {
     let s = "9999dddd-0000-4000-8000-000000000000";
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "r1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "r1",
+            "read_file",
+            r#"{"file_path":"/repo/one.rs"}"#,
+        ),
         tool_result(s, "no_such_id", "x", true),
         tool_result(s, "no_such_id", "x", false),
         result_line(s, "done", false, "success", ""),
@@ -733,7 +898,11 @@ fn test_should_ignore_tool_result_with_unmatched_id() {
 #[test]
 fn test_should_not_create_record_for_unmatched_tool_result() {
     let s = "9999eeee-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), tool_result(s, "ghost", "x", false), result_line(s, "d", false, "success", "")]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        tool_result(s, "ghost", "x", false),
+        result_line(s, "d", false, "success", ""),
+    ]);
     let sut = parse_ok(&stream, Some(0));
     assert!(sut.result.tool_calls.is_empty());
 }
@@ -744,19 +913,38 @@ fn test_should_emit_tool_call_completed_for_tool_result_line() {
     let s = "9999ffff-0000-4000-8000-000000000000";
     let mut sut = QwenStreamParser::new();
     let _ = sut.parse_line(&start(s, "qwen3-coder-plus"));
-    let _ = sut.parse_line(&assistant_tool(s, "qwen3-coder-plus", "e1", "read_file", r#"{"file_path":"/repo/one.rs"}"#));
-    let ev = sut.parse_line(&tool_result(s, "e1", "one", false)).expect("tool_result emits an event");
-    assert!(matches!(ev.state, WorkingState::ToolCallCompleted), "got a different state");
+    let _ = sut.parse_line(&assistant_tool(
+        s,
+        "qwen3-coder-plus",
+        "e1",
+        "read_file",
+        r#"{"file_path":"/repo/one.rs"}"#,
+    ));
+    let ev = sut
+        .parse_line(&tool_result(s, "e1", "one", false))
+        .expect("tool_result emits an event");
+    assert!(
+        matches!(ev.state, WorkingState::ToolCallCompleted),
+        "got a different state"
+    );
 }
 
 // Stream shape: a user line without tool_result blocks changes no call.
 #[test]
 fn test_should_leave_calls_alone_for_plain_user_line() {
     let s = "9999abab-0000-4000-8000-000000000000";
-    let plain = format!(r#"{{"type":"user","session_id":"{s}","message":{{"role":"user","content":[{{"type":"text","text":"hello"}}]}}}}"#);
+    let plain = format!(
+        r#"{{"type":"user","session_id":"{s}","message":{{"role":"user","content":[{{"type":"text","text":"hello"}}]}}}}"#
+    );
     let stream = join(&[
         start(s, "qwen3-coder-plus"),
-        assistant_tool(s, "qwen3-coder-plus", "u1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
+        assistant_tool(
+            s,
+            "qwen3-coder-plus",
+            "u1",
+            "read_file",
+            r#"{"file_path":"/repo/one.rs"}"#,
+        ),
         plain,
         result_line(s, "d", false, "success", ""),
     ]);
@@ -767,7 +955,11 @@ fn test_should_leave_calls_alone_for_plain_user_line() {
 
 fn only_usage(usage: &str) -> UsageReport {
     let s = "9999acac-0000-4000-8000-000000000000";
-    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "ok", ""), result_line(s, "ok", false, "success", usage)]);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_text(s, "qwen3-coder-plus", "ok", ""),
+        result_line(s, "ok", false, "success", usage),
+    ]);
     parse_ok(&stream, Some(0)).usage
 }
 
@@ -815,7 +1007,12 @@ fn test_should_parse_valid_line_after_blank_line() {
     let _ = sut.parse_line(&start(s, "qwen3-coder-plus"));
     assert!(sut.parse_line("").is_none());
     assert!(sut.parse_line("\t  ").is_none());
-    let _ = sut.parse_line(&assistant_text(s, "qwen3-coder-plus", "after the blank", ""));
+    let _ = sut.parse_line(&assistant_text(
+        s,
+        "qwen3-coder-plus",
+        "after the blank",
+        "",
+    ));
     let _ = sut.parse_line("");
     let _ = sut.parse_line(&result_line(s, "after the blank", false, "success", ""));
     let parsed = sut.finish(Some(0)).expect("finishes");
@@ -828,5 +1025,8 @@ fn test_should_parse_valid_line_after_blank_line() {
 #[test]
 fn test_should_treat_only_blank_lines_as_empty_stream() {
     let code = failure_code(parse("\n\n   \n\t\n", Some(0)));
-    assert!(code.starts_with("empty_or_unrecognized_stream:qwen"), "got {code}");
+    assert!(
+        code.starts_with("empty_or_unrecognized_stream:qwen"),
+        "got {code}"
+    );
 }

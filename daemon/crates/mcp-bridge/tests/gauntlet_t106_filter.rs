@@ -44,7 +44,11 @@ fn test_should_available_equal_configured_and_verified_and_not_suspended_for_all
                     suspended: if s { Some("r".to_string()) } else { None },
                 };
                 assert_eq!(sut.available(), c && v && !s, "c={c} v={v} s={s}");
-                assert_eq!(sut.first_blocker().is_none(), sut.available(), "c={c} v={v} s={s}");
+                assert_eq!(
+                    sut.first_blocker().is_none(),
+                    sut.available(),
+                    "c={c} v={v} s={s}"
+                );
             }
         }
     }
@@ -63,11 +67,20 @@ fn test_should_first_blocker_follow_precedence_for_all_combinations() {
                 };
                 let got = sut.first_blocker();
                 if !c {
-                    assert!(matches!(got, Some(Blocker::NotConfigured)), "c={c} v={v} s={s}");
+                    assert!(
+                        matches!(got, Some(Blocker::NotConfigured)),
+                        "c={c} v={v} s={s}"
+                    );
                 } else if s {
-                    assert!(matches!(got, Some(Blocker::Suspended(ref r)) if r == "why"), "c={c} v={v} s={s}");
+                    assert!(
+                        matches!(got, Some(Blocker::Suspended(ref r)) if r == "why"),
+                        "c={c} v={v} s={s}"
+                    );
                 } else if !v {
-                    assert!(matches!(got, Some(Blocker::Unverified)), "c={c} v={v} s={s}");
+                    assert!(
+                        matches!(got, Some(Blocker::Unverified)),
+                        "c={c} v={v} s={s}"
+                    );
                 } else {
                     assert!(got.is_none(), "c={c} v={v} s={s}");
                 }
@@ -82,15 +95,30 @@ fn test_should_reflect_every_state_change_on_the_next_read_without_caching() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     for i in 0..25 {
-        assert!(!avail(home, "kimi", Some("2.2.0")).verified, "iteration {i} before write");
+        assert!(
+            !avail(home, "kimi", Some("2.2.0")).verified,
+            "iteration {i} before write"
+        );
         write_verified(home, "kimi", &rec("2.2.0")).unwrap();
-        assert!(avail(home, "kimi", Some("2.2.0")).verified, "iteration {i} after write");
+        assert!(
+            avail(home, "kimi", Some("2.2.0")).verified,
+            "iteration {i} after write"
+        );
         delete_verified(home, "kimi").unwrap();
-        assert!(!avail(home, "kimi", Some("2.2.0")).verified, "iteration {i} after delete");
+        assert!(
+            !avail(home, "kimi", Some("2.2.0")).verified,
+            "iteration {i} after delete"
+        );
         write_suspended(home, "kimi", "r").unwrap();
-        assert!(avail(home, "kimi", Some("2.2.0")).suspended.is_some(), "iteration {i} suspended");
+        assert!(
+            avail(home, "kimi", Some("2.2.0")).suspended.is_some(),
+            "iteration {i} suspended"
+        );
         clear(home, "kimi").unwrap();
-        assert!(avail(home, "kimi", Some("2.2.0")).suspended.is_none(), "iteration {i} cleared");
+        assert!(
+            avail(home, "kimi", Some("2.2.0")).suspended.is_none(),
+            "iteration {i} cleared"
+        );
     }
 }
 
@@ -106,7 +134,10 @@ fn test_should_never_expose_half_written_verified_record_to_concurrent_reader() 
             let mut reads = 0u32;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 let a = availability(home, "kimi", true, Some("2.2.0")).expect("read must be Ok");
-                assert!(a.verified, "torn or missing verified.json observed on read {reads}");
+                assert!(
+                    a.verified,
+                    "torn or missing verified.json observed on read {reads}"
+                );
                 reads += 1;
             }
             reads
@@ -140,7 +171,8 @@ fn test_should_write_verified_json_with_the_four_documented_fields() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     write_verified(home, "kimi", &rec("2.2.0")).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(vpath(home, "kimi")).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(vpath(home, "kimi")).unwrap()).unwrap();
     assert_eq!(v["cli_version"], "2.2.0");
     assert_eq!(v["seat_home"], "/tmp/gauntlet-seat-home");
     assert_eq!(v["probed_at"], "2026-10-18T12:00:00Z");
@@ -155,7 +187,8 @@ fn test_should_write_null_served_model_when_none() {
     let mut r = rec("2.2.0");
     r.served_model = None;
     write_verified(home, "qwen", &r).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(vpath(home, "qwen")).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(vpath(home, "qwen")).unwrap()).unwrap();
     assert!(v["served_model"].is_null());
     assert_eq!(v["cli_version"], "2.2.0");
 }
@@ -166,10 +199,14 @@ fn test_should_write_suspended_json_with_reason_and_rfc3339_at() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     write_suspended(home, "kimi", "account suspended by provider").unwrap();
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(spath(home, "kimi")).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(spath(home, "kimi")).unwrap()).unwrap();
     assert_eq!(v["reason"], "account suspended by provider");
     let at = v["at"].as_str().expect("at must be a string");
-    assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok(), "at not RFC3339: {at}");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+        "at not RFC3339: {at}"
+    );
 }
 
 // Reality test: writing verified.json makes the next availability read true; version change makes it false.
@@ -269,7 +306,10 @@ fn test_should_remove_suspended_json_only_via_clear() {
     write_verified(home, "kimi", &rec("2.2.0")).unwrap();
     delete_verified(home, "kimi").unwrap();
     write_verified(home, "kimi", &rec("2.2.0")).unwrap();
-    assert!(avail(home, "kimi", Some("2.2.0")).suspended.is_some(), "writing/deleting verified must not clear suspension");
+    assert!(
+        avail(home, "kimi", Some("2.2.0")).suspended.is_some(),
+        "writing/deleting verified must not clear suspension"
+    );
     clear(home, "kimi").unwrap();
     assert!(!spath(home, "kimi").exists());
     assert!(avail(home, "kimi", Some("2.2.0")).suspended.is_none());
@@ -319,7 +359,13 @@ fn test_should_pass_configured_flag_through_to_result() {
 #[test]
 fn test_should_read_missing_state_as_unverified_and_unsuspended() {
     let dir = tempfile::tempdir().unwrap();
-    let a = availability(&dir.path().join("does-not-exist"), "kimi", true, Some("2.2.0")).unwrap();
+    let a = availability(
+        &dir.path().join("does-not-exist"),
+        "kimi",
+        true,
+        Some("2.2.0"),
+    )
+    .unwrap();
     assert!(a.configured);
     assert!(!a.verified);
     assert!(a.suspended.is_none());
@@ -351,7 +397,10 @@ fn test_should_leave_only_the_final_file_after_atomic_writes() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["suspended.json".to_string(), "verified.json".to_string()]);
+    assert_eq!(
+        names,
+        vec!["suspended.json".to_string(), "verified.json".to_string()]
+    );
 }
 
 // Reasons with quotes, newlines and unicode survive the JSON round trip exactly.
@@ -361,7 +410,10 @@ fn test_should_round_trip_awkward_suspension_reason_exactly() {
     let home = dir.path();
     let reason = "quota \"hard\" stop\nline two \\ backslash \u{1F512} \u{00E9}";
     write_suspended(home, "kimi", reason).unwrap();
-    assert_eq!(avail(home, "kimi", Some("2.2.0")).suspended.as_deref(), Some(reason));
+    assert_eq!(
+        avail(home, "kimi", Some("2.2.0")).suspended.as_deref(),
+        Some(reason)
+    );
 }
 
 // ---------- (3) boundaries and edges ----------
@@ -392,8 +444,22 @@ fn test_should_invalidate_verified_on_any_version_string_difference() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     write_verified(home, "kimi", &rec("2.2.0")).unwrap();
-    for other in ["2.2.1", "2.2", "2.2.0 ", " 2.2.0", "2.2.00", "2.2.0-beta", "v2.2.0", "3.2.0", "2.2.0\n", ""] {
-        assert!(!avail(home, "kimi", Some(other)).verified, "version {other:?} must not match 2.2.0");
+    for other in [
+        "2.2.1",
+        "2.2",
+        "2.2.0 ",
+        " 2.2.0",
+        "2.2.00",
+        "2.2.0-beta",
+        "v2.2.0",
+        "3.2.0",
+        "2.2.0\n",
+        "",
+    ] {
+        assert!(
+            !avail(home, "kimi", Some(other)).verified,
+            "version {other:?} must not match 2.2.0"
+        );
     }
     assert!(avail(home, "kimi", Some("2.2.0")).verified);
 }
@@ -424,7 +490,15 @@ fn test_should_fail_closed_on_corrupt_verified_json() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     std::fs::create_dir_all(home.join("seats").join("kimi")).unwrap();
-    for body in ["", "not json", "{", "[]", "null", "{\"cli_version\":2}", "{\"seat_home\":\"/x\"}"] {
+    for body in [
+        "",
+        "not json",
+        "{",
+        "[]",
+        "null",
+        "{\"cli_version\":2}",
+        "{\"seat_home\":\"/x\"}",
+    ] {
         std::fs::write(vpath(home, "kimi"), body).unwrap();
         let a = avail(home, "kimi", Some("2.2.0"));
         assert!(!a.verified, "body {body:?} must not verify");
@@ -451,7 +525,10 @@ fn test_should_fail_closed_on_corrupt_suspended_json() {
     for body in ["", "garbage", "{", "[]", "{\"at\":\"x\"}"] {
         std::fs::write(spath(home, "kimi"), body).unwrap();
         let a = avail(home, "kimi", Some("2.2.0"));
-        assert!(a.suspended.is_some(), "body {body:?} must still count as suspended");
+        assert!(
+            a.suspended.is_some(),
+            "body {body:?} must still count as suspended"
+        );
         assert!(!a.available());
         assert!(matches!(a.first_blocker(), Some(Blocker::Suspended(_))));
     }
@@ -476,8 +553,14 @@ fn test_should_reject_path_escaping_seat_keys_on_write() {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     for bad in ["../evil", "a/b", "..", "", "/abs"] {
-        assert!(write_verified(&home, bad, &rec("1")).is_err(), "write_verified accepted {bad:?}");
-        assert!(write_suspended(&home, bad, "r").is_err(), "write_suspended accepted {bad:?}");
+        assert!(
+            write_verified(&home, bad, &rec("1")).is_err(),
+            "write_verified accepted {bad:?}"
+        );
+        assert!(
+            write_suspended(&home, bad, "r").is_err(),
+            "write_suspended accepted {bad:?}"
+        );
     }
     assert!(!dir.path().join("evil").exists());
     assert!(!home.join("evil").exists());
@@ -513,7 +596,10 @@ fn test_should_round_trip_large_suspension_reason() {
     let home = dir.path();
     let reason = "r".repeat(200_000);
     write_suspended(home, "kimi", &reason).unwrap();
-    assert_eq!(avail(home, "kimi", Some("2.2.0")).suspended.as_deref(), Some(reason.as_str()));
+    assert_eq!(
+        avail(home, "kimi", Some("2.2.0")).suspended.as_deref(),
+        Some(reason.as_str())
+    );
 }
 
 // An empty reason still counts as suspended (existence of the file, not its text).
@@ -535,10 +621,20 @@ fn test_should_enable_seat_only_when_env_is_exactly_one() {
     let var = "TRIUMVIRATE_ENABLE_GAUNTLETT106CFG";
     // SAFETY: unique variable name touched by this one test only.
     unsafe { std::env::remove_var(var) };
-    assert_eq!(is_configured("gauntlett106cfg"), Ok(false), "unset must be off");
-    for off in ["0", "true", "yes", "on", "", " 1", "1 ", "11", "TRUE", "enabled", "-1"] {
+    assert_eq!(
+        is_configured("gauntlett106cfg"),
+        Ok(false),
+        "unset must be off"
+    );
+    for off in [
+        "0", "true", "yes", "on", "", " 1", "1 ", "11", "TRUE", "enabled", "-1",
+    ] {
         unsafe { std::env::set_var(var, off) };
-        assert_eq!(is_configured("gauntlett106cfg"), Ok(false), "value {off:?} must not enable");
+        assert_eq!(
+            is_configured("gauntlett106cfg"),
+            Ok(false),
+            "value {off:?} must not enable"
+        );
     }
     unsafe { std::env::set_var(var, "1") };
     assert_eq!(is_configured("gauntlett106cfg"), Ok(true));
@@ -566,6 +662,9 @@ fn test_should_resolve_triumvirate_home_from_env_or_default_dot_triumvirate() {
     let got = triumvirate_home().expect("home must resolve");
     match std::env::var("TRIUMVIRATE_HOME") {
         Ok(v) if !v.is_empty() => assert_eq!(got, std::path::PathBuf::from(v)),
-        _ => assert!(got.ends_with(".triumvirate"), "default must end with .triumvirate, got {got:?}"),
+        _ => assert!(
+            got.ends_with(".triumvirate"),
+            "default must end with .triumvirate, got {got:?}"
+        ),
     }
 }

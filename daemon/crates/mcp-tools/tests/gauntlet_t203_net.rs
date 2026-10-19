@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use mcp_bridge::seat_gate::register_installed_cli_version;
 use mcp_tools::inter_agent::seats_status;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const ENV_KEYS: [&str; 4] = [
     "TRIUMVIRATE_HOME",
@@ -50,7 +50,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let saved: Vec<(&'static str, Option<OsString>)> = ENV_KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+    let saved: Vec<(&'static str, Option<OsString>)> =
+        ENV_KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
     let home = tempfile::tempdir().expect("tempdir");
     // SAFETY: serialized by LOCK; restored by EnvRestore on drop.
     unsafe {
@@ -59,7 +60,11 @@ fn fixture() -> Fixture {
         }
         std::env::set_var("TRIUMVIRATE_HOME", home.path());
     }
-    Fixture { _restore: EnvRestore(saved), _lock: lock, home }
+    Fixture {
+        _restore: EnvRestore(saved),
+        _lock: lock,
+        home,
+    }
 }
 
 fn enable(seat: &str) {
@@ -84,13 +89,16 @@ fn write_verified(home: &Path, seat: &str, cli_version: &str) {
 
 fn write_suspended(home: &Path, seat: &str, reason: &str) {
     let body = format!(r#"{{"reason":"{reason}","at":"2026-10-18T12:00:00Z"}}"#);
-    std::fs::write(seat_dir(home, seat).join("suspended.json"), body).expect("write suspended.json");
+    std::fs::write(seat_dir(home, seat).join("suspended.json"), body)
+        .expect("write suspended.json");
 }
 
 /// The `seats` map as /status serves it, for one seat.
 fn status_of(seat: &str) -> Value {
     let all = serde_json::to_value(seats_status()).expect("seats map serializes");
-    all.get(seat).cloned().unwrap_or_else(|| panic!("seats map has no entry for {seat}"))
+    all.get(seat)
+        .cloned()
+        .unwrap_or_else(|| panic!("seats map has no entry for {seat}"))
 }
 
 /// REQ-080: the seats map covers exactly the three launch seats, and each entry carries exactly the five keys.
@@ -98,13 +106,34 @@ fn status_of(seat: &str) -> Value {
 fn seats_map_lists_the_launch_seats_with_five_keys_each() {
     let _f = fixture();
     let all = serde_json::to_value(seats_status()).expect("seats map serializes");
-    let keys: Vec<String> = all.as_object().expect("seats is an object").keys().cloned().collect();
-    assert_eq!(keys, vec!["kimi".to_string(), "mistral".to_string(), "qwen".to_string()]);
+    let keys: Vec<String> = all
+        .as_object()
+        .expect("seats is an object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "kimi".to_string(),
+            "mistral".to_string(),
+            "qwen".to_string()
+        ]
+    );
     for seat in ["kimi", "mistral", "qwen"] {
         let entry = status_of(seat);
-        let mut entry_keys: Vec<String> = entry.as_object().expect("entry is an object").keys().cloned().collect();
+        let mut entry_keys: Vec<String> = entry
+            .as_object()
+            .expect("entry is an object")
+            .keys()
+            .cloned()
+            .collect();
         entry_keys.sort();
-        assert_eq!(entry_keys, vec!["available", "configured", "reason", "suspended", "verified"], "{seat}");
+        assert_eq!(
+            entry_keys,
+            vec!["available", "configured", "reason", "suspended", "verified"],
+            "{seat}"
+        );
     }
 }
 
@@ -133,7 +162,10 @@ fn enabled_seat_without_verification_reports_unverified() {
     assert_eq!(s["configured"], json!(true));
     assert_eq!(s["verified"], json!(false));
     assert_eq!(s["available"], json!(false));
-    assert_eq!(s["reason"], json!("seat_unverified: kimi: run triumvirate doctor --live in a terminal"));
+    assert_eq!(
+        s["reason"],
+        json!("seat_unverified: kimi: run triumvirate doctor --live in a terminal")
+    );
 }
 
 /// REQ-091 precedence 2: a suspended seat reports suspended, and that beats the unverified reason.
@@ -148,7 +180,10 @@ fn suspended_seat_reports_suspension_reason() {
     assert_eq!(s["verified"], json!(false));
     assert_eq!(s["suspended"], json!(true));
     assert_eq!(s["available"], json!(false));
-    assert_eq!(s["reason"], json!("seat_suspended: mistral: quota exhausted (run: triumvirate seat clear mistral)"));
+    assert_eq!(
+        s["reason"],
+        json!("seat_suspended: mistral: quota exhausted (run: triumvirate seat clear mistral)")
+    );
 }
 
 /// REQ-091: configured, verified at the installed version and not suspended means available, with reason null.
@@ -176,7 +211,10 @@ fn verified_record_for_old_cli_version_does_not_count() {
     let s = status_of("qwen");
     assert_eq!(s["verified"], json!(false));
     assert_eq!(s["available"], json!(false));
-    assert_eq!(s["reason"], json!("seat_unverified: qwen: run triumvirate doctor --live in a terminal"));
+    assert_eq!(
+        s["reason"],
+        json!("seat_unverified: qwen: run triumvirate doctor --live in a terminal")
+    );
 }
 
 /// REQ-091: state is read now, not cached at start, so a new verified record shows without a restart.

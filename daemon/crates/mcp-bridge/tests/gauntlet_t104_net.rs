@@ -19,8 +19,8 @@ use std::path::Path;
 use std::process::Command;
 
 use mcp_bridge::containment::{
-    audit_repo, check_credentials_file, render_seatbelt_profile, scan_stray_keys, seat_home, snapshot_repo,
-    SEAT_CREDENTIAL_SCRUB,
+    SEAT_CREDENTIAL_SCRUB, audit_repo, check_credentials_file, render_seatbelt_profile,
+    scan_stray_keys, seat_home, snapshot_repo,
 };
 
 /// Run git with a fixed identity so commits work on any machine.
@@ -107,15 +107,26 @@ fn seatbelt_profile_denies_then_allows_listed_paths() {
         "(allow file-write* (subpath \"{}\"))",
         seat.canonicalize().unwrap().display()
     );
-    let seat_allow = p.find(&seat_allow_text).expect("seat home allow line present, canonicalized");
-    assert!(deny < seat_allow, "deny must come before the seat home allow");
+    let seat_allow = p
+        .find(&seat_allow_text)
+        .expect("seat home allow line present, canonicalized");
+    assert!(
+        deny < seat_allow,
+        "deny must come before the seat home allow"
+    );
     assert!(p.contains(&format!(
         "(allow file-write* (subpath \"{}\"))",
         out.canonicalize().unwrap().display()
     )));
     assert!(p.contains("(allow file-write* (subpath \"/private/var/folders\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/private/tmp\"))"));
-    for dev in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/dtracehelper", "/dev/tty"] {
+    for dev in [
+        "/dev/null",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/dtracehelper",
+        "/dev/tty",
+    ] {
         assert!(p.contains(dev), "profile must allow {dev}");
     }
 }
@@ -137,12 +148,27 @@ fn audit_reports_new_tracked_and_untracked_mutations_and_reverts_nothing() {
 
     let mut changed = audit_repo(&before, &after).expect("audit returns the changed paths");
     changed.sort();
-    assert_eq!(changed, vec!["new_untracked.txt".to_string(), "other.txt".to_string()]);
+    assert_eq!(
+        changed,
+        vec!["new_untracked.txt".to_string(), "other.txt".to_string()]
+    );
 
-    assert_eq!(fs::read_to_string(repo.join("tracked.txt")).unwrap(), "pre-existing tracked edit\n");
-    assert_eq!(fs::read_to_string(repo.join("pre_untracked.txt")).unwrap(), "pre-existing untracked\n");
-    assert_eq!(fs::read_to_string(repo.join("other.txt")).unwrap(), "seat wrote this\n");
-    assert_eq!(fs::read_to_string(repo.join("new_untracked.txt")).unwrap(), "seat wrote this too\n");
+    assert_eq!(
+        fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+        "pre-existing tracked edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("pre_untracked.txt")).unwrap(),
+        "pre-existing untracked\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("other.txt")).unwrap(),
+        "seat wrote this\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("new_untracked.txt")).unwrap(),
+        "seat wrote this too\n"
+    );
 }
 
 // REQ-035 acceptance (2): a pre-existing edit that is changed again counts as CHANGED.
@@ -154,7 +180,10 @@ fn audit_reports_further_change_to_a_pre_existing_edit() {
     let before = snapshot_repo(repo).expect("snapshot before");
     fs::write(repo.join("tracked.txt"), "edited again by the run\n").unwrap();
     let after = snapshot_repo(repo).expect("snapshot after");
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["tracked.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["tracked.txt".to_string()]
+    );
 }
 
 // REQ-035 (audit spec): a path in before that is gone from after changed too (the run restored a pre-existing edit).
@@ -167,7 +196,10 @@ fn audit_reports_a_pre_existing_edit_the_run_restored() {
     git(repo, &["checkout", "--", "tracked.txt"]);
     let after = snapshot_repo(repo).expect("snapshot after");
     assert!(!after.entries.contains_key("tracked.txt"));
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["tracked.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["tracked.txt".to_string()]
+    );
 }
 
 // REQ-035 (audit spec): no change between snapshots means an empty result.
@@ -204,7 +236,10 @@ fn staged_new_file_is_reported() {
     git(repo, &["add", "staged_new.txt"]);
     let after = snapshot_repo(repo).expect("snapshot after");
     assert!(after.entries.contains_key("staged_new.txt"));
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["staged_new.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["staged_new.txt".to_string()]
+    );
 }
 
 // REQ-035 acceptance (3): writes outside the repo (seat home, output dir, temp) do not trip the audit.
@@ -237,7 +272,10 @@ fn credentials_file_passes_only_at_mode_0600() {
     assert!(check_credentials_file(&p).is_err(), "0644 must fail");
 
     fs::set_permissions(&p, fs::Permissions::from_mode(0o400)).unwrap();
-    assert!(check_credentials_file(&p).is_err(), "0400 must fail: the spec says exactly 0600");
+    assert!(
+        check_credentials_file(&p).is_err(),
+        "0400 must fail: the spec says exactly 0600"
+    );
 }
 
 // REQ-033: a missing credentials.env fails the check.
@@ -299,7 +337,10 @@ fn seatbelt_blocks_repo_write_and_allows_seat_home_write() {
     let profile = render_seatbelt_profile(&seat, &out, &tmp).expect("render");
 
     let repo_write = run_under_profile(&profile, &format!("echo x > '{}/f'", repo.display()));
-    assert!(!repo_write.status.success(), "repo write must fail under the seatbelt");
+    assert!(
+        !repo_write.status.success(),
+        "repo write must fail under the seatbelt"
+    );
     assert!(!repo.join("f").exists());
 
     let seat_write = run_under_profile(&profile, &format!("echo x > '{}/f'", seat.display()));
@@ -324,7 +365,10 @@ fn seatbelt_allows_output_dir_and_temp_writes() {
     }
     let profile = render_seatbelt_profile(&seat, &out, &tmp).expect("render");
 
-    let out_write = run_under_profile(&profile, &format!("echo x > '{}/export.json'", out.display()));
+    let out_write = run_under_profile(
+        &profile,
+        &format!("echo x > '{}/export.json'", out.display()),
+    );
     assert!(out_write.status.success(), "output dir write must succeed");
     let tmp_write = run_under_profile(&profile, &format!("echo x > '{}/scratch'", tmp.display()));
     assert!(tmp_write.status.success(), "temp write must succeed");

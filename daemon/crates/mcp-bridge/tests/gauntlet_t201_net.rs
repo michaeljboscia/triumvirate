@@ -10,7 +10,9 @@
 // lives in triumvirate/src/main.rs and mcp-tools, outside the mcp_bridge and shared_types public API named by the scope. Not tested here.
 // SPEC_AMBIGUITY: the spec does not say how surrounding whitespace is handled by normalize_agent_name. Not tested.
 
-use mcp_bridge::{display_agent_name, is_supported_agent_name, normalize_agent_name, supported_agent_names};
+use mcp_bridge::{
+    display_agent_name, is_supported_agent_name, normalize_agent_name, supported_agent_names,
+};
 use shared_types::AGENT_ALIASES;
 
 // REQ-001: the canonical key kimi is on the roster.
@@ -54,7 +56,10 @@ fn is_supported_true_for_new_canonical_keys() {
 #[test]
 fn is_supported_true_for_every_roster_entry() {
     for name in supported_agent_names() {
-        assert!(is_supported_agent_name(name), "roster entry {name} not supported");
+        assert!(
+            is_supported_agent_name(name),
+            "roster entry {name} not supported"
+        );
     }
 }
 
@@ -174,7 +179,9 @@ fn seven_primes_aliases_present_with_exact_targets() {
     ];
     for (alias, target) in expected {
         assert!(
-            AGENT_ALIASES.iter().any(|(a, c)| *a == alias && *c == target),
+            AGENT_ALIASES
+                .iter()
+                .any(|(a, c)| *a == alias && *c == target),
             "missing alias row {alias} -> {target}"
         );
     }
@@ -217,7 +224,11 @@ fn canonical_new_keys_normalize_to_themselves() {
 fn normalization_is_idempotent_on_every_alias() {
     for (alias, _) in AGENT_ALIASES {
         let once = normalize_agent_name(alias);
-        assert_eq!(normalize_agent_name(&once), once, "not idempotent for {alias}");
+        assert_eq!(
+            normalize_agent_name(&once),
+            once,
+            "not idempotent for {alias}"
+        );
     }
 }
 
@@ -239,7 +250,10 @@ fn uppercase_canonical_key_is_lowercased() {
 fn every_alias_normalizes_to_a_supported_agent() {
     for (alias, _) in AGENT_ALIASES {
         let canonical = normalize_agent_name(alias);
-        assert!(is_supported_agent_name(&canonical), "alias {alias} -> {canonical} not supported");
+        assert!(
+            is_supported_agent_name(&canonical),
+            "alias {alias} -> {canonical} not supported"
+        );
     }
 }
 

@@ -20,7 +20,7 @@ use mcp_bridge::containment::*;
 use mcp_bridge::seat_profile::seat_profile;
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -86,8 +86,21 @@ fn test_should_accept_each_new_seat_key() {
 #[test]
 fn test_should_reject_seat_keys_that_escape_homes() {
     // seat_home doc: a seat key must not address anything outside homes/
-    for bad in ["", ".", "..", "../x", "a/b", "/abs", "kimi/..", "../../etc", "a/../b"] {
-        assert!(seat_home(Path::new("/base/tri"), bad).is_err(), "accepted {bad:?}");
+    for bad in [
+        "",
+        ".",
+        "..",
+        "../x",
+        "a/b",
+        "/abs",
+        "kimi/..",
+        "../../etc",
+        "a/../b",
+    ] {
+        assert!(
+            seat_home(Path::new("/base/tri"), bad).is_err(),
+            "accepted {bad:?}"
+        );
     }
 }
 
@@ -101,7 +114,10 @@ fn test_should_write_kimi_ro_agent_file_with_0444_and_contract_text() {
     write_seat_files(&home, seat_profile("kimi").unwrap()).unwrap();
     let f = home.join("ro-agent.md");
     let text = fs::read_to_string(&f).unwrap();
-    assert!(text.starts_with("---"), "frontmatter must open the file: {text}");
+    assert!(
+        text.starts_with("---"),
+        "frontmatter must open the file: {text}"
+    );
     for needle in [
         "name: triumvirate-readonly",
         "tools: [Read, Grep, Glob]",
@@ -168,10 +184,21 @@ fn test_should_write_qwen_settings_json_with_plan_provider_and_no_cross_session(
     let v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join("settings.json")).unwrap()).unwrap();
     let entry = &v["modelProviders"]["openai"][0];
-    assert!(entry["id"].as_str().is_some_and(|s| !s.is_empty()), "id: {entry}");
-    assert!(entry["baseUrl"].as_str().is_some_and(|s| s.starts_with("https://")), "baseUrl: {entry}");
+    assert!(
+        entry["id"].as_str().is_some_and(|s| !s.is_empty()),
+        "id: {entry}"
+    );
+    assert!(
+        entry["baseUrl"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("https://")),
+        "baseUrl: {entry}"
+    );
     assert_eq!(entry["envKey"], "QWENCLOUD_TOKEN_PLAN_API_KEY");
-    assert_eq!(v["agents"]["crossSessionMessaging"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["agents"]["crossSessionMessaging"],
+        serde_json::Value::Bool(false)
+    );
 }
 
 #[test]
@@ -189,7 +216,10 @@ fn test_should_merge_qwen_settings_and_keep_login_keys() {
     let v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join("settings.json")).unwrap()).unwrap();
     assert_eq!(v["loginMarker"], "kept");
-    assert_eq!(v["agents"]["crossSessionMessaging"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["agents"]["crossSessionMessaging"],
+        serde_json::Value::Bool(false)
+    );
     assert!(v["modelProviders"]["openai"][0]["id"].is_string());
 }
 
@@ -345,7 +375,11 @@ fn test_should_leave_no_non_empty_hook_plugin_or_skill_dirs_in_seat_home() {
         for name in ["skills", "hooks", "plugins"] {
             let d = home.join(name);
             if d.exists() {
-                assert_eq!(fs::read_dir(&d).unwrap().count(), 0, "{seat}/{name} not empty");
+                assert_eq!(
+                    fs::read_dir(&d).unwrap().count(),
+                    0,
+                    "{seat}/{name} not empty"
+                );
             }
         }
     }
@@ -392,20 +426,39 @@ fn test_should_scrub_credentials_and_add_vibe_cli_for_mistral() {
 #[test]
 fn test_should_set_home_and_vendor_home_var_for_each_seat() {
     // REQ-030: vendor home var AND HOME == seat home, real home absent
-    for (seat, var) in [("kimi", "KIMI_CODE_HOME"), ("mistral", "VIBE_HOME"), ("qwen", "QWEN_HOME")] {
+    for (seat, var) in [
+        ("kimi", "KIMI_CODE_HOME"),
+        ("mistral", "VIBE_HOME"),
+        ("qwen", "QWEN_HOME"),
+    ] {
         let base = vec![kv("HOME", "/real/home"), kv("PATH", "/usr/bin")];
-        let sut = child_env(&base, seat_profile(seat).unwrap(), Path::new("/seat/home"), &[]).unwrap();
+        let sut = child_env(
+            &base,
+            seat_profile(seat).unwrap(),
+            Path::new("/seat/home"),
+            &[],
+        )
+        .unwrap();
         assert_eq!(get(&sut, "HOME"), Some("/seat/home"), "{seat}");
         assert_eq!(get(&sut, var), Some("/seat/home"), "{seat}");
         assert_eq!(count(&sut, "HOME"), 1, "{seat}");
-        assert!(sut.iter().all(|(_, v)| v != "/real/home"), "{seat} leaks the real home");
+        assert!(
+            sut.iter().all(|(_, v)| v != "/real/home"),
+            "{seat} leaks the real home"
+        );
     }
 }
 
 #[test]
 fn test_should_set_home_even_when_base_has_no_home() {
     // REQ-030: HOME is set regardless of the inherited env
-    let sut = child_env(&[], seat_profile("kimi").unwrap(), Path::new("/seat/home"), &[]).unwrap();
+    let sut = child_env(
+        &[],
+        seat_profile("kimi").unwrap(),
+        Path::new("/seat/home"),
+        &[],
+    )
+    .unwrap();
     assert_eq!(get(&sut, "HOME"), Some("/seat/home"));
     assert_eq!(get(&sut, "KIMI_CODE_HOME"), Some("/seat/home"));
 }
@@ -443,7 +496,10 @@ fn test_should_let_env_add_win_over_scrub_for_the_plan_key() {
     // REQ-033: scrub runs before env_add; the plan key is the only credential var left, once
     let inherited = format!("{}{}", "sk-", "inherited");
     let plan = format!("{}{}", "sk-sp-", "plan");
-    let base = vec![kv("QWENCLOUD_TOKEN_PLAN_API_KEY", &inherited), kv("DASHSCOPE_API_KEY", &inherited)];
+    let base = vec![
+        kv("QWENCLOUD_TOKEN_PLAN_API_KEY", &inherited),
+        kv("DASHSCOPE_API_KEY", &inherited),
+    ];
     let sut = child_env(
         &base,
         seat_profile("qwen").unwrap(),
@@ -452,7 +508,10 @@ fn test_should_let_env_add_win_over_scrub_for_the_plan_key() {
     )
     .unwrap();
     assert_eq!(count(&sut, "QWENCLOUD_TOKEN_PLAN_API_KEY"), 1);
-    assert_eq!(get(&sut, "QWENCLOUD_TOKEN_PLAN_API_KEY"), Some(plan.as_str()));
+    assert_eq!(
+        get(&sut, "QWENCLOUD_TOKEN_PLAN_API_KEY"),
+        Some(plan.as_str())
+    );
     assert_eq!(get(&sut, "DASHSCOPE_API_KEY"), None);
 }
 
@@ -476,7 +535,13 @@ fn test_should_not_mutate_the_base_env() {
     // child_env takes a slice and returns a new env
     let base = vec![kv("HOME", "/real/home"), kv("OPENAI_API_KEY", "k")];
     let before = base.clone();
-    let _ = child_env(&base, seat_profile("mistral").unwrap(), Path::new("/s"), &[]).unwrap();
+    let _ = child_env(
+        &base,
+        seat_profile("mistral").unwrap(),
+        Path::new("/s"),
+        &[],
+    )
+    .unwrap();
     assert_eq!(base, before);
 }
 
@@ -490,12 +555,20 @@ fn canon(p: &Path) -> String {
 fn test_should_render_the_section5_seatbelt_profile_with_canonical_paths() {
     // REQ-035 / BACKEND_STRUCTURE s5: template lines with canonicalized existing paths
     let tmp = tempfile::tempdir().unwrap();
-    let (h, o, t) = (tmp.path().join("h"), tmp.path().join("o"), tmp.path().join("t"));
+    let (h, o, t) = (
+        tmp.path().join("h"),
+        tmp.path().join("o"),
+        tmp.path().join("t"),
+    );
     for d in [&h, &o, &t] {
         fs::create_dir_all(d).unwrap();
     }
     let sut = render_seatbelt_profile(&h, &o, &t).unwrap();
-    let lines: Vec<&str> = sut.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = sut
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     let expected = vec![
         "(version 1)".to_string(),
         "(allow default)".to_string(),
@@ -570,14 +643,30 @@ mod sandbox {
             fs::create_dir_all(d).unwrap();
         }
         let profile = render_seatbelt_profile(&home, &out, &tmpd).unwrap();
-        let denied = run_under(&profile, &format!("echo x > '{}/f'", repo.display()), root.path());
+        let denied = run_under(
+            &profile,
+            &format!("echo x > '{}/f'", repo.display()),
+            root.path(),
+        );
         assert!(!denied, "repo write must fail");
         assert!(!repo.join("f").exists());
-        assert!(run_under(&profile, &format!("echo x > '{}/f'", home.display()), root.path()));
+        assert!(run_under(
+            &profile,
+            &format!("echo x > '{}/f'", home.display()),
+            root.path()
+        ));
         assert!(home.join("f").exists());
-        assert!(run_under(&profile, &format!("echo x > '{}/f'", out.display()), root.path()));
+        assert!(run_under(
+            &profile,
+            &format!("echo x > '{}/f'", out.display()),
+            root.path()
+        ));
         assert!(out.join("f").exists());
-        assert!(run_under(&profile, &format!("echo x > '{}/f'", tmpd.display()), root.path()));
+        assert!(run_under(
+            &profile,
+            &format!("echo x > '{}/f'", tmpd.display()),
+            root.path()
+        ));
         assert!(run_under(&profile, "echo x > /dev/null", root.path()));
     }
 
@@ -585,12 +674,20 @@ mod sandbox {
     fn test_should_deny_write_to_a_sibling_of_the_seat_home() {
         // REQ-035: only the seat home subtree is allowed, not its parent
         let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let (home, out, tmpd) = (root.path().join("home"), root.path().join("out"), root.path().join("tmp"));
+        let (home, out, tmpd) = (
+            root.path().join("home"),
+            root.path().join("out"),
+            root.path().join("tmp"),
+        );
         for d in [&home, &out, &tmpd] {
             fs::create_dir_all(d).unwrap();
         }
         let profile = render_seatbelt_profile(&home, &out, &tmpd).unwrap();
-        assert!(!run_under(&profile, &format!("echo x > '{}/sibling'", root.path().display()), root.path()));
+        assert!(!run_under(
+            &profile,
+            &format!("echo x > '{}/sibling'", root.path().display()),
+            root.path()
+        ));
     }
 }
 
@@ -600,11 +697,22 @@ fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn init_repo() -> tempfile::TempDir {
@@ -654,10 +762,22 @@ fn test_should_report_both_new_paths_and_leave_all_four_untouched() {
     let sut = audit_repo(&before, &after).unwrap();
     assert_eq!(sorted(sut), vec!["b.txt".to_string(), "u2.txt".to_string()]);
     // nothing reverted
-    assert_eq!(fs::read_to_string(repo.path().join("a.txt")).unwrap(), "edited before\n");
-    assert_eq!(fs::read_to_string(repo.path().join("u1.txt")).unwrap(), "untracked before\n");
-    assert_eq!(fs::read_to_string(repo.path().join("b.txt")).unwrap(), "edited during\n");
-    assert_eq!(fs::read_to_string(repo.path().join("u2.txt")).unwrap(), "untracked during\n");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "edited before\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("u1.txt")).unwrap(),
+        "untracked before\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("b.txt")).unwrap(),
+        "edited during\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("u2.txt")).unwrap(),
+        "untracked during\n"
+    );
 }
 
 #[test]
@@ -676,7 +796,10 @@ fn test_should_report_a_pre_dirty_path_whose_content_changed_again() {
     let before = snapshot_repo(repo.path()).unwrap();
     fs::write(repo.path().join("a.txt"), "edited again\n").unwrap();
     let after = snapshot_repo(repo.path()).unwrap();
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["a.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["a.txt".to_string()]
+    );
 }
 
 #[test]
@@ -686,7 +809,10 @@ fn test_should_report_an_untracked_file_whose_content_changed() {
     let before = snapshot_repo(repo.path()).unwrap();
     fs::write(repo.path().join("u1.txt"), "rewritten\n").unwrap();
     let after = snapshot_repo(repo.path()).unwrap();
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["u1.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["u1.txt".to_string()]
+    );
 }
 
 #[test]
@@ -696,7 +822,10 @@ fn test_should_report_a_pre_existing_edit_that_was_restored() {
     let before = snapshot_repo(repo.path()).unwrap();
     git(repo.path(), &["checkout", "--", "a.txt"]);
     let after = snapshot_repo(repo.path()).unwrap();
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["a.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["a.txt".to_string()]
+    );
 }
 
 #[test]
@@ -706,7 +835,10 @@ fn test_should_report_a_deleted_pre_existing_untracked_file() {
     let before = snapshot_repo(repo.path()).unwrap();
     fs::remove_file(repo.path().join("u1.txt")).unwrap();
     let after = snapshot_repo(repo.path()).unwrap();
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["u1.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["u1.txt".to_string()]
+    );
 }
 
 #[test]
@@ -716,7 +848,10 @@ fn test_should_report_a_deleted_tracked_file() {
     let before = snapshot_repo(repo.path()).unwrap();
     fs::remove_file(repo.path().join("c.txt")).unwrap();
     let after = snapshot_repo(repo.path()).unwrap();
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["c.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["c.txt".to_string()]
+    );
 }
 
 #[test]
@@ -744,7 +879,10 @@ fn test_should_handle_paths_with_spaces_and_unicode() {
     let after = snapshot_repo(repo.path()).unwrap();
     assert_eq!(
         sorted(audit_repo(&before, &after).unwrap()),
-        sorted(vec!["with space.txt".to_string(), "caf\u{e9}.txt".to_string()])
+        sorted(vec![
+            "with space.txt".to_string(),
+            "caf\u{e9}.txt".to_string()
+        ])
     );
 }
 
@@ -756,7 +894,10 @@ fn test_should_report_a_newly_staged_file() {
     fs::write(repo.path().join("staged.txt"), "s").unwrap();
     git(repo.path(), &["add", "staged.txt"]);
     let after = snapshot_repo(repo.path()).unwrap();
-    assert_eq!(audit_repo(&before, &after).unwrap(), vec!["staged.txt".to_string()]);
+    assert_eq!(
+        audit_repo(&before, &after).unwrap(),
+        vec!["staged.txt".to_string()]
+    );
 }
 
 #[test]
@@ -798,13 +939,19 @@ fn test_should_audit_synthetic_snapshots_new_changed_gone_and_same() {
     let before = snap(&[("same", "h1"), ("changed", "h1"), ("gone", "h1")]);
     let after = snap(&[("same", "h1"), ("changed", "h2"), ("new", "h9")]);
     let sut = audit_repo(&before, &after).unwrap();
-    assert_eq!(sorted(sut), vec!["changed".to_string(), "gone".to_string(), "new".to_string()]);
+    assert_eq!(
+        sorted(sut),
+        vec!["changed".to_string(), "gone".to_string(), "new".to_string()]
+    );
 }
 
 #[test]
 fn test_should_audit_two_empty_snapshots_as_clean() {
     // audit_repo doc: a non-empty result fails the call; empty means pass
-    assert_eq!(audit_repo(&snap(&[]), &snap(&[])).unwrap(), Vec::<String>::new());
+    assert_eq!(
+        audit_repo(&snap(&[]), &snap(&[])).unwrap(),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -879,13 +1026,20 @@ fn test_should_name_metered_keys_present_in_the_env() {
     assert!(names.contains(&"MISTRAL_API_KEY".to_string()), "{names:?}");
     assert!(names.contains(&"OPENAI_API_KEY".to_string()), "{names:?}");
     assert!(!names.contains(&"PATH".to_string()), "{names:?}");
-    assert!(sut.iter().all(|n| !n.contains(&secret)), "a key value leaked into the result");
+    assert!(
+        sut.iter().all(|n| !n.contains(&secret)),
+        "a key value leaked into the result"
+    );
 }
 
 #[test]
 fn test_should_return_empty_for_an_env_without_metered_keys() {
     // scan_stray_keys doc: clean env yields nothing
-    let env = vec![kv("PATH", "/usr/bin"), kv("HOME", "/seat/home"), kv("VIBE_CLI", "python")];
+    let env = vec![
+        kv("PATH", "/usr/bin"),
+        kv("HOME", "/seat/home"),
+        kv("VIBE_CLI", "python"),
+    ];
     assert_eq!(scan_stray_keys(&env).unwrap(), Vec::<String>::new());
 }
 

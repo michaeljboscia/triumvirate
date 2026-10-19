@@ -22,8 +22,10 @@ const MSG_BETA: &str = r#"{"id":"m2","sessionId":"sess-2","turnId":"t2","generat
 const REASONING: &str = r#"{"id":"r1","sessionId":"sess-1","turnId":"t1","generationStatus":"completed","type":"reasoning","content":[{"type":"text","text":"THINK-SECRET"}]}"#;
 const READ_EFFECT: &str = r#"{"id":"e1","sessionId":"sess-1","turnId":"t1","generationStatus":"completed","type":"effect","title":"Read file","detail":{"toolName":"read_file","kind":"read","input":{"filePath":"/repo/src/lib.rs"}},"state":{"status":"completed","output":"ok","display":"ok"}}"#;
 
-const EXPORT_OK_XYZ: &str = r#"{"schema_version":1,"session_id":"sess-xyz","vibe_version":"2.26.1","cost_usd":0.0125}"#;
-const EXPORT_BETA: &str = r#"{"schema_version":1,"session_id":"sess-other","vibe_version":"2.26.1","cost_usd":0.5}"#;
+const EXPORT_OK_XYZ: &str =
+    r#"{"schema_version":1,"session_id":"sess-xyz","vibe_version":"2.26.1","cost_usd":0.0125}"#;
+const EXPORT_BETA: &str =
+    r#"{"schema_version":1,"session_id":"sess-other","vibe_version":"2.26.1","cost_usd":0.5}"#;
 const EXPORT_INFRA: &str = r#"{"schema_version":1,"session_id":"sess-xyz","vibe_version":"2.26.1","cost_usd":0.0,"outcome":"infrastructure_failure"}"#;
 
 fn run(lines: &[&str], exit: Option<i32>, export: Option<&str>) -> SeatParsed {
@@ -50,7 +52,10 @@ fn answer_text_from_assistant_message_only() {
     let parsed = run(&[REASONING, MSG_ALPHA], Some(0), Some(EXPORT_OK_XYZ));
     let dbg = debug_result(&parsed);
     assert!(dbg.contains("ANSWER-ALPHA"), "answer missing: {dbg}");
-    assert!(!dbg.contains("THINK-SECRET"), "reasoning leaked into answer: {dbg}");
+    assert!(
+        !dbg.contains("THINK-SECRET"),
+        "reasoning leaked into answer: {dbg}"
+    );
 }
 
 // REQ-022 / REQ-063: a read_file effect keeps its filePath value as the read path.
@@ -77,15 +82,24 @@ fn second_fixture_variant_yields_its_own_values() {
     let dbg = debug_result(&parsed);
     assert!(dbg.contains("ANSWER-BETA"), "beta answer missing: {dbg}");
     assert!(dbg.contains("sess-other"), "beta session missing: {dbg}");
-    assert!(!dbg.contains("ANSWER-ALPHA"), "alpha leaked into beta: {dbg}");
-    assert!(!dbg.contains("sess-xyz"), "alpha session leaked into beta: {dbg}");
+    assert!(
+        !dbg.contains("ANSWER-ALPHA"),
+        "alpha leaked into beta: {dbg}"
+    );
+    assert!(
+        !dbg.contains("sess-xyz"),
+        "alpha session leaked into beta: {dbg}"
+    );
 }
 
 // REQ-052: exit 0 with no recognised export outcome is success (exit-code table decides).
 #[test]
 fn exit_zero_without_outcome_is_success() {
     let parsed = run(&[MSG_ALPHA], Some(0), Some(EXPORT_OK_XYZ));
-    assert!(matches!(parsed.outcome, SeatOutcome::Success), "expected Success");
+    assert!(
+        matches!(parsed.outcome, SeatOutcome::Success),
+        "expected Success"
+    );
 }
 
 // REQ-052: exit 0 with export outcome infrastructure_failure is a failure, never a success.
@@ -104,7 +118,10 @@ fn export_outcome_beats_exit_code() {
     let parsed = run(&[MSG_ALPHA], Some(3), Some(EXPORT_INFRA));
     match parsed.outcome {
         SeatOutcome::Failure(_) => {}
-        other => panic!("expected Failure (outcome wins over exit 3), got {}", describe(&other)),
+        other => panic!(
+            "expected Failure (outcome wins over exit 3), got {}",
+            describe(&other)
+        ),
     }
 }
 
@@ -113,7 +130,9 @@ fn export_outcome_beats_exit_code() {
 fn exit_three_is_partial_with_reason() {
     let parsed = run(&[MSG_ALPHA], Some(3), Some(EXPORT_OK_XYZ));
     match parsed.outcome {
-        SeatOutcome::Partial(reason) => assert!(!reason.is_empty(), "partial reason must be non-empty"),
+        SeatOutcome::Partial(reason) => {
+            assert!(!reason.is_empty(), "partial reason must be non-empty")
+        }
         other => panic!("expected Partial, got {}", describe(&other)),
     }
 }
@@ -122,14 +141,20 @@ fn exit_three_is_partial_with_reason() {
 #[test]
 fn exit_one_is_failure() {
     let parsed = run(&[], Some(1), Some(EXPORT_OK_XYZ));
-    assert!(matches!(parsed.outcome, SeatOutcome::Failure(_)), "expected Failure for exit 1");
+    assert!(
+        matches!(parsed.outcome, SeatOutcome::Failure(_)),
+        "expected Failure for exit 1"
+    );
 }
 
 // REQ-052: exit 2 (infrastructure failure) is a failure.
 #[test]
 fn exit_two_is_failure() {
     let parsed = run(&[], Some(2), Some(EXPORT_INFRA));
-    assert!(matches!(parsed.outcome, SeatOutcome::Failure(_)), "expected Failure for exit 2");
+    assert!(
+        matches!(parsed.outcome, SeatOutcome::Failure(_)),
+        "expected Failure for exit 2"
+    );
 }
 
 // REQ-042 / REQ-052: a stream with no export.json is failure missing_export:mistral, never an empty success.
@@ -139,7 +164,10 @@ fn missing_export_is_failure_with_exact_code() {
     let parsed = run(&[MSG_ALPHA], Some(0), None);
     match parsed.outcome {
         SeatOutcome::Failure(code) => assert_eq!(code, "missing_export:mistral"),
-        other => panic!("expected Failure(missing_export:mistral), got {}", describe(&other)),
+        other => panic!(
+            "expected Failure(missing_export:mistral), got {}",
+            describe(&other)
+        ),
     }
 }
 
@@ -147,14 +175,20 @@ fn missing_export_is_failure_with_exact_code() {
 #[test]
 fn missing_export_is_never_success() {
     let parsed = run(&[MSG_ALPHA], Some(0), None);
-    assert!(!matches!(parsed.outcome, SeatOutcome::Success), "missing export must not be Success");
+    assert!(
+        !matches!(parsed.outcome, SeatOutcome::Success),
+        "missing export must not be Success"
+    );
 }
 
 // REQ-041: an export with no usage object persists as NotReported, never as zero counts.
 #[test]
 fn usage_absent_from_export_is_not_reported() {
     let parsed = run(&[MSG_ALPHA], Some(0), Some(EXPORT_OK_XYZ));
-    assert!(matches!(parsed.usage, UsageReport::NotReported), "expected NotReported");
+    assert!(
+        matches!(parsed.usage, UsageReport::NotReported),
+        "expected NotReported"
+    );
 }
 
 // REQ-044 mutation cases: partial line, malformed JSON, unknown entry type and key casing never leak content into
@@ -170,8 +204,14 @@ fn malformed_and_unknown_lines_do_not_leak_or_panic() {
     ];
     let parsed = run(&lines, Some(0), Some(EXPORT_OK_XYZ));
     let dbg = debug_result(&parsed);
-    assert!(dbg.contains("ANSWER-ALPHA"), "valid message lost after bad lines: {dbg}");
-    assert!(!dbg.contains("UNKNOWN-LEAK"), "unknown entry type leaked: {dbg}");
+    assert!(
+        dbg.contains("ANSWER-ALPHA"),
+        "valid message lost after bad lines: {dbg}"
+    );
+    assert!(
+        !dbg.contains("UNKNOWN-LEAK"),
+        "unknown entry type leaked: {dbg}"
+    );
     assert!(!dbg.contains("CASE-LEAK"), "wrong-cased keys leaked: {dbg}");
 }
 

@@ -40,7 +40,11 @@ fn all_surfaces() -> Vec<Surface> {
 }
 
 fn healthy() -> SeatAvailability {
-    SeatAvailability { configured: true, verified: true, suspended: None }
+    SeatAvailability {
+        configured: true,
+        verified: true,
+        suspended: None,
+    }
 }
 
 fn is_launch_surface(s: Surface) -> bool {
@@ -116,10 +120,26 @@ fn test_should_never_produce_seat_surface_refused_for_any_triple_or_state() {
     // A-2: zero (seat, surface, origin, tty) triples map to seat_surface_refused.
     let states = [
         healthy(),
-        SeatAvailability { configured: false, verified: false, suspended: None },
-        SeatAvailability { configured: true, verified: false, suspended: None },
-        SeatAvailability { configured: true, verified: true, suspended: Some("r".into()) },
-        SeatAvailability { configured: true, verified: false, suspended: Some("r".into()) },
+        SeatAvailability {
+            configured: false,
+            verified: false,
+            suspended: None,
+        },
+        SeatAvailability {
+            configured: true,
+            verified: false,
+            suspended: None,
+        },
+        SeatAvailability {
+            configured: true,
+            verified: true,
+            suspended: Some("r".into()),
+        },
+        SeatAvailability {
+            configured: true,
+            verified: false,
+            suspended: Some("r".into()),
+        },
     ];
     for seat in NEW_SEATS {
         for s in all_surfaces() {
@@ -142,9 +162,21 @@ fn test_should_prefix_every_message_with_its_code_and_colon() {
     // BACKEND_STRUCTURE section 3: the code starts every payload string.
     let states = [
         healthy(),
-        SeatAvailability { configured: false, verified: false, suspended: None },
-        SeatAvailability { configured: true, verified: false, suspended: None },
-        SeatAvailability { configured: true, verified: true, suspended: Some("boom".into()) },
+        SeatAvailability {
+            configured: false,
+            verified: false,
+            suspended: None,
+        },
+        SeatAvailability {
+            configured: true,
+            verified: false,
+            suspended: None,
+        },
+        SeatAvailability {
+            configured: true,
+            verified: true,
+            suspended: Some("boom".into()),
+        },
     ];
     for seat in NEW_SEATS {
         for s in all_surfaces() {
@@ -161,8 +193,20 @@ fn test_should_prefix_every_message_with_its_code_and_colon() {
 #[test]
 fn test_should_be_deterministic_for_repeated_calls() {
     // done_when: every combination resolves to exactly one code with the exact payload (pure decision).
-    let a = refuse("qwen", Surface::Prewarm, Origin::Unattended, false, &healthy());
-    let b = refuse("qwen", Surface::Prewarm, Origin::Unattended, false, &healthy());
+    let a = refuse(
+        "qwen",
+        Surface::Prewarm,
+        Origin::Unattended,
+        false,
+        &healthy(),
+    );
+    let b = refuse(
+        "qwen",
+        Surface::Prewarm,
+        Origin::Unattended,
+        false,
+        &healthy(),
+    );
     assert_eq!(a.code.as_str(), b.code.as_str());
     assert_eq!(a.message, b.message);
 }
@@ -191,37 +235,76 @@ fn test_should_not_depend_on_origin_or_tty_for_new_seats() {
 #[test]
 fn test_should_allow_qwen_ask_agent_when_unattended() {
     // A-2 task impact: (qwen, AskAgent, Unattended) == allowed.
-    assert!(seat_gate_with("qwen", Surface::AskAgent, Origin::Unattended, false, &healthy()).is_ok());
+    assert!(
+        seat_gate_with(
+            "qwen",
+            Surface::AskAgent,
+            Origin::Unattended,
+            false,
+            &healthy()
+        )
+        .is_ok()
+    );
 }
 
 #[test]
 fn test_should_allow_kimi_doctor_live_probe_without_tty() {
     // A-2: (kimi, DoctorLiveProbe, tty=false) == allowed.
     assert!(
-        seat_gate_with("kimi", Surface::DoctorLiveProbe, Origin::Interactive, false, &healthy())
-            .is_ok()
+        seat_gate_with(
+            "kimi",
+            Surface::DoctorLiveProbe,
+            Origin::Interactive,
+            false,
+            &healthy()
+        )
+        .is_ok()
     );
 }
 
 #[test]
 fn test_should_defer_qwen_prewarm_with_exact_payload() {
     // A-2: (qwen, Prewarm) == seat_surface_deferred payload.
-    let r = refuse("qwen", Surface::Prewarm, Origin::Unattended, true, &healthy());
+    let r = refuse(
+        "qwen",
+        Surface::Prewarm,
+        Origin::Unattended,
+        true,
+        &healthy(),
+    );
     assert_eq!(r.code.as_str(), "seat_surface_deferred");
-    assert_eq!(r.message, "seat_surface_deferred: qwen on Prewarm ships in v1.1");
+    assert_eq!(
+        r.message,
+        "seat_surface_deferred: qwen on Prewarm ships in v1.1"
+    );
 }
 
 #[test]
 fn test_should_defer_mistral_prewarm_with_exact_payload() {
     // reality_test: (mistral, Prewarm) == seat_surface_deferred payload.
-    let r = refuse("mistral", Surface::Prewarm, Origin::Interactive, true, &healthy());
-    assert_eq!(r.message, "seat_surface_deferred: mistral on Prewarm ships in v1.1");
+    let r = refuse(
+        "mistral",
+        Surface::Prewarm,
+        Origin::Interactive,
+        true,
+        &healthy(),
+    );
+    assert_eq!(
+        r.message,
+        "seat_surface_deferred: mistral on Prewarm ships in v1.1"
+    );
 }
 
 #[test]
 fn test_should_refuse_qwen_blind_validate_as_cannot_write_not_surface_refused() {
     // A-2: (qwen, BlindValidate, Unattended) is cannot-write, replacing the old surface_refused string.
-    let r = refuse("qwen", Surface::BlindValidate, Origin::Unattended, true, &healthy());
+    let r = refuse(
+        "qwen",
+        Surface::BlindValidate,
+        Origin::Unattended,
+        true,
+        &healthy(),
+    );
     assert_eq!(r.code.as_str(), "seat_cannot_write_here");
     assert_eq!(
         r.message,
@@ -275,7 +358,9 @@ fn test_should_allow_every_surface_for_existing_seats() {
 fn test_should_include_codex_and_grok_among_existing_seats() {
     // Guard so the existing-seat loop above is not vacuous.
     let keys: Vec<&str> = all_seats().iter().map(|p| p.key).collect();
-    for k in ["codex", "gemini", "grok", "claude", "kimi", "mistral", "qwen"] {
+    for k in [
+        "codex", "gemini", "grok", "claude", "kimi", "mistral", "qwen",
+    ] {
         assert!(keys.contains(&k), "missing seat row {k}");
     }
 }
@@ -285,7 +370,11 @@ fn test_should_include_codex_and_grok_among_existing_seats() {
 #[test]
 fn test_should_report_not_configured_with_exact_payload() {
     // REQ-091 payload: seat_not_configured.
-    let st = SeatAvailability { configured: false, verified: false, suspended: None };
+    let st = SeatAvailability {
+        configured: false,
+        verified: false,
+        suspended: None,
+    };
     expect_refusal(
         "kimi",
         Surface::AskAgent,
@@ -298,7 +387,11 @@ fn test_should_report_not_configured_with_exact_payload() {
 #[test]
 fn test_should_uppercase_seat_in_enable_variable() {
     // REQ-091 payload: TRIUMVIRATE_ENABLE_<SEAT> is upper case.
-    let st = SeatAvailability { configured: false, verified: true, suspended: None };
+    let st = SeatAvailability {
+        configured: false,
+        verified: true,
+        suspended: None,
+    };
     let r = refuse("mistral", Surface::Session, Origin::Interactive, true, &st);
     assert_eq!(
         r.message,
@@ -341,7 +434,11 @@ fn test_should_embed_unicode_suspension_reason_verbatim() {
 #[test]
 fn test_should_report_unverified_with_exact_payload() {
     // REQ-091 payload: seat_unverified.
-    let st = SeatAvailability { configured: true, verified: false, suspended: None };
+    let st = SeatAvailability {
+        configured: true,
+        verified: false,
+        suspended: None,
+    };
     expect_refusal(
         "mistral",
         Surface::AskAgent,
@@ -354,7 +451,11 @@ fn test_should_report_unverified_with_exact_payload() {
 #[test]
 fn test_should_rank_not_configured_above_suspended_and_unverified() {
     // REQ-091 precedence: not configured first.
-    let st = SeatAvailability { configured: false, verified: false, suspended: Some("x".into()) };
+    let st = SeatAvailability {
+        configured: false,
+        verified: false,
+        suspended: Some("x".into()),
+    };
     let r = refuse("kimi", Surface::AskAgent, Origin::Interactive, true, &st);
     assert_eq!(r.code.as_str(), "seat_not_configured");
 }
@@ -362,7 +463,11 @@ fn test_should_rank_not_configured_above_suspended_and_unverified() {
 #[test]
 fn test_should_rank_suspended_above_unverified() {
     // REQ-091 precedence: suspended outranks unverified.
-    let st = SeatAvailability { configured: true, verified: false, suspended: Some("x".into()) };
+    let st = SeatAvailability {
+        configured: true,
+        verified: false,
+        suspended: Some("x".into()),
+    };
     let r = refuse("qwen", Surface::AskAgent, Origin::Interactive, true, &st);
     assert_eq!(r.code.as_str(), "seat_suspended");
 }
@@ -370,8 +475,16 @@ fn test_should_rank_suspended_above_unverified() {
 #[test]
 fn test_should_rank_unverified_above_deferred_and_cannot_write() {
     // REQ-091 precedence: unverified outranks the surface rule.
-    let st = SeatAvailability { configured: true, verified: false, suspended: None };
-    for s in [Surface::Prewarm, Surface::BlindValidate, Surface::FleetSpawn] {
+    let st = SeatAvailability {
+        configured: true,
+        verified: false,
+        suspended: None,
+    };
+    for s in [
+        Surface::Prewarm,
+        Surface::BlindValidate,
+        Surface::FleetSpawn,
+    ] {
         let r = refuse("kimi", s, Origin::Interactive, true, &st);
         assert_eq!(r.code.as_str(), "seat_unverified", "{}", surface_name(s));
     }
@@ -380,7 +493,11 @@ fn test_should_rank_unverified_above_deferred_and_cannot_write() {
 #[test]
 fn test_should_rank_not_configured_above_surface_rule() {
     // REQ-091 precedence: not configured outranks deferred.
-    let st = SeatAvailability { configured: false, verified: true, suspended: None };
+    let st = SeatAvailability {
+        configured: false,
+        verified: true,
+        suspended: None,
+    };
     let r = refuse("qwen", Surface::Prewarm, Origin::Interactive, true, &st);
     assert_eq!(r.code.as_str(), "seat_not_configured");
 }
@@ -388,15 +505,29 @@ fn test_should_rank_not_configured_above_surface_rule() {
 #[test]
 fn test_should_rank_suspended_above_surface_rule() {
     // REQ-091 precedence: suspended outranks cannot-write.
-    let st = SeatAvailability { configured: true, verified: true, suspended: Some("x".into()) };
-    let r = refuse("mistral", Surface::BlindValidate, Origin::Interactive, true, &st);
+    let st = SeatAvailability {
+        configured: true,
+        verified: true,
+        suspended: Some("x".into()),
+    };
+    let r = refuse(
+        "mistral",
+        Surface::BlindValidate,
+        Origin::Interactive,
+        true,
+        &st,
+    );
     assert_eq!(r.code.as_str(), "seat_suspended");
 }
 
 #[test]
 fn test_should_skip_unverified_check_for_doctor_live_probe() {
     // REQ-091: unverified is not checked for DoctorLiveProbe (how a seat gets verified).
-    let st = SeatAvailability { configured: true, verified: false, suspended: None };
+    let st = SeatAvailability {
+        configured: true,
+        verified: false,
+        suspended: None,
+    };
     for seat in NEW_SEATS {
         for o in ORIGINS {
             for tty in [true, false] {
@@ -412,18 +543,42 @@ fn test_should_skip_unverified_check_for_doctor_live_probe() {
 #[test]
 fn test_should_still_check_suspended_and_configured_for_doctor_live_probe() {
     // REQ-091: only the unverified level is skipped for the probe.
-    let suspended = SeatAvailability { configured: true, verified: false, suspended: Some("s".into()) };
-    let r = refuse("kimi", Surface::DoctorLiveProbe, Origin::Interactive, true, &suspended);
+    let suspended = SeatAvailability {
+        configured: true,
+        verified: false,
+        suspended: Some("s".into()),
+    };
+    let r = refuse(
+        "kimi",
+        Surface::DoctorLiveProbe,
+        Origin::Interactive,
+        true,
+        &suspended,
+    );
     assert_eq!(r.code.as_str(), "seat_suspended");
-    let off = SeatAvailability { configured: false, verified: false, suspended: None };
-    let r = refuse("kimi", Surface::DoctorLiveProbe, Origin::Interactive, true, &off);
+    let off = SeatAvailability {
+        configured: false,
+        verified: false,
+        suspended: None,
+    };
+    let r = refuse(
+        "kimi",
+        Surface::DoctorLiveProbe,
+        Origin::Interactive,
+        true,
+        &off,
+    );
     assert_eq!(r.code.as_str(), "seat_not_configured");
 }
 
 #[test]
 fn test_should_apply_unverified_check_to_non_probe_surfaces_only() {
     // REQ-091: every other launch surface is blocked by unverified.
-    let st = SeatAvailability { configured: true, verified: false, suspended: None };
+    let st = SeatAvailability {
+        configured: true,
+        verified: false,
+        suspended: None,
+    };
     for s in [Surface::AskAgent, Surface::Session, Surface::Jury] {
         let r = refuse("qwen", s, Origin::Interactive, true, &st);
         assert_eq!(r.code.as_str(), "seat_unverified");
@@ -435,12 +590,24 @@ fn test_should_apply_unverified_check_to_non_probe_surfaces_only() {
 #[test]
 fn test_should_expose_exact_code_strings() {
     // BACKEND_STRUCTURE section 3: the six code strings.
-    assert_eq!(RefusalCode::SeatNotConfigured.as_str(), "seat_not_configured");
+    assert_eq!(
+        RefusalCode::SeatNotConfigured.as_str(),
+        "seat_not_configured"
+    );
     assert_eq!(RefusalCode::SeatSuspended.as_str(), "seat_suspended");
     assert_eq!(RefusalCode::SeatUnverified.as_str(), "seat_unverified");
-    assert_eq!(RefusalCode::SeatSurfaceRefused.as_str(), "seat_surface_refused");
-    assert_eq!(RefusalCode::SeatSurfaceDeferred.as_str(), "seat_surface_deferred");
-    assert_eq!(RefusalCode::SeatCannotWriteHere.as_str(), "seat_cannot_write_here");
+    assert_eq!(
+        RefusalCode::SeatSurfaceRefused.as_str(),
+        "seat_surface_refused"
+    );
+    assert_eq!(
+        RefusalCode::SeatSurfaceDeferred.as_str(),
+        "seat_surface_deferred"
+    );
+    assert_eq!(
+        RefusalCode::SeatCannotWriteHere.as_str(),
+        "seat_cannot_write_here"
+    );
 }
 
 #[test]
@@ -474,7 +641,10 @@ fn test_should_return_none_for_unregistered_cli_version() {
 fn test_should_round_trip_registered_cli_version() {
     // register/installed_cli_version doc: read back what was registered.
     register_installed_cli_version("t107_filter_seat_a", "2.2.0");
-    assert_eq!(installed_cli_version("t107_filter_seat_a"), Some("2.2.0".to_string()));
+    assert_eq!(
+        installed_cli_version("t107_filter_seat_a"),
+        Some("2.2.0".to_string())
+    );
 }
 
 #[test]
@@ -482,7 +652,10 @@ fn test_should_overwrite_cli_version_after_upgrade() {
     // register doc: re-registered after a CLI upgrade is detected.
     register_installed_cli_version("t107_filter_seat_b", "1.0.0");
     register_installed_cli_version("t107_filter_seat_b", "1.1.0");
-    assert_eq!(installed_cli_version("t107_filter_seat_b"), Some("1.1.0".to_string()));
+    assert_eq!(
+        installed_cli_version("t107_filter_seat_b"),
+        Some("1.1.0".to_string())
+    );
 }
 
 #[test]
@@ -490,7 +663,13 @@ fn test_should_keep_cli_versions_isolated_per_seat() {
     // registry is keyed by seat.
     register_installed_cli_version("t107_filter_seat_c", "3.0.0");
     register_installed_cli_version("t107_filter_seat_d", "4.0.0");
-    assert_eq!(installed_cli_version("t107_filter_seat_c"), Some("3.0.0".to_string()));
-    assert_eq!(installed_cli_version("t107_filter_seat_d"), Some("4.0.0".to_string()));
+    assert_eq!(
+        installed_cli_version("t107_filter_seat_c"),
+        Some("3.0.0".to_string())
+    );
+    assert_eq!(
+        installed_cli_version("t107_filter_seat_d"),
+        Some("4.0.0".to_string())
+    );
     assert_eq!(installed_cli_version("t107_filter_seat_e_unset"), None);
 }

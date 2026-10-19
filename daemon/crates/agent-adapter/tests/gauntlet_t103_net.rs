@@ -12,7 +12,7 @@
 //!   from REQ-044 and REQ-040, not stated as an exact result).
 //! SPEC_AMBIGUITY: the "missing id" mutation cannot be observed through the listed API, so it is not tested.
 
-use agent_adapter::qwen::{QwenStreamParser, PARSER_MODE};
+use agent_adapter::qwen::{PARSER_MODE, QwenStreamParser};
 use agent_adapter::{SeatOutcome, SeatParsed, UsageReport};
 
 const SESSION_START: &str = r#"{"type":"system","subtype":"session_start","session_id":"7f3c9a2e-5b1d-4e8a-9c40-2d6f1e8b7a01","model":"qwen3-coder-plus"}"#;
@@ -104,7 +104,8 @@ fn t103_req041_reported_zero_stays_exact() {
 // REQ-041: a result with no usage object persists as NotReported.
 #[test]
 fn t103_req041_missing_usage_is_not_reported() {
-    let no_usage = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"result":"done"}"#;
+    let no_usage =
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"result":"done"}"#;
     let parsed = run(&[SESSION_START, no_usage], Some(0)).expect("parses");
     assert!(matches!(parsed.usage, UsageReport::NotReported));
 }
@@ -136,7 +137,10 @@ fn t103_req052_exit_55_is_partial() {
 fn t103_req052_exit_zero_with_error_result_is_failure() {
     let r = run(&[SESSION_START, RESULT_ERR], Some(0));
     assert!(!is_success(&r), "error result must not be Success");
-    assert!(failure_code(&r).is_some(), "error result must carry a failure");
+    assert!(
+        failure_code(&r).is_some(),
+        "error result must carry a failure"
+    );
 }
 
 // REQ-052: exit 0 with a stream that never reaches a result is not a success.
@@ -175,15 +179,25 @@ fn t103_empty_stream_exit_zero_exact_failure_code() {
 fn t103_req044_blank_partial_malformed_lines_skipped() {
     let mut p = QwenStreamParser::new();
     assert!(p.parse_line("").is_none(), "blank line yielded an event");
-    assert!(p.parse_line("{\"type\":\"assistant\",\"message\":{").is_none(), "partial line yielded an event");
-    assert!(p.parse_line("not json at all").is_none(), "malformed line yielded an event");
+    assert!(
+        p.parse_line("{\"type\":\"assistant\",\"message\":{")
+            .is_none(),
+        "partial line yielded an event"
+    );
+    assert!(
+        p.parse_line("not json at all").is_none(),
+        "malformed line yielded an event"
+    );
 }
 
 // REQ-044: an unknown event type is ignored and yields no event.
 #[test]
 fn t103_req044_unknown_event_type_ignored() {
     let mut p = QwenStreamParser::new();
-    assert!(p.parse_line(r#"{"type":"telemetry_ping","value":1}"#).is_none());
+    assert!(
+        p.parse_line(r#"{"type":"telemetry_ping","value":1}"#)
+            .is_none()
+    );
 }
 
 // REQ-044 (key casing): uppercase keys are not recognized, so a stream of only those lines is unrecognized.

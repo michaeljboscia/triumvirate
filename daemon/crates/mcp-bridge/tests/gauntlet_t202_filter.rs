@@ -117,14 +117,19 @@ fn test_should_name_grok_env_var() {
 #[test]
 fn test_should_name_new_seat_env_vars() {
     assert_eq!(stall_window_env_var("kimi"), "TRIUMVIRATE_STALL_SECS_KIMI");
-    assert_eq!(stall_window_env_var("mistral"), "TRIUMVIRATE_STALL_SECS_MISTRAL");
+    assert_eq!(
+        stall_window_env_var("mistral"),
+        "TRIUMVIRATE_STALL_SECS_MISTRAL"
+    );
     assert_eq!(stall_window_env_var("qwen"), "TRIUMVIRATE_STALL_SECS_QWEN");
 }
 
 // Property: every seat's env var is distinct and shares the prefix.
 #[test]
 fn test_should_give_distinct_env_var_per_seat() {
-    let seats = ["codex", "gemini", "grok", "claude", "deepseek", "kimi", "mistral", "qwen"];
+    let seats = [
+        "codex", "gemini", "grok", "claude", "deepseek", "kimi", "mistral", "qwen",
+    ];
     let vars: Vec<String> = seats.iter().map(|s| stall_window_env_var(s)).collect();
     for v in &vars {
         assert!(v.starts_with("TRIUMVIRATE_STALL_SECS_"), "bad prefix: {v}");
@@ -203,7 +208,9 @@ fn test_should_apply_override_to_new_seat() {
 #[test]
 fn test_should_not_leak_override_across_agents() {
     let var = stall_window_env_var("mistral");
-    let (mine, other) = with_env(&var, Some("11"), || (stall_window("mistral"), stall_window("codex")));
+    let (mine, other) = with_env(&var, Some("11"), || {
+        (stall_window("mistral"), stall_window("codex"))
+    });
     assert_eq!(mine, Some(Duration::from_secs(11)));
     assert_eq!(other, Some(Duration::from_secs(240)));
 }
@@ -247,7 +254,9 @@ fn test_should_differ_by_secs() {
 // Property: default window is deterministic across calls.
 #[test]
 fn test_should_be_pure_for_default_window() {
-    for s in ["codex", "gemini", "grok", "claude", "deepseek", "kimi", "mistral", "qwen"] {
+    for s in [
+        "codex", "gemini", "grok", "claude", "deepseek", "kimi", "mistral", "qwen",
+    ] {
         assert_eq!(default_stall_window_secs(s), default_stall_window_secs(s));
     }
 }

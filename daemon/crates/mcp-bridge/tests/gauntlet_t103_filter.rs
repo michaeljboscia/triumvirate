@@ -19,8 +19,8 @@ use std::time::Duration;
 use agent_adapter::qwen::QwenStreamParser;
 use mcp_bridge::containment::{SeatInvocation, SeatRequest};
 use mcp_bridge::qwen::{
-    DEFAULT_QWEN_MODEL, EXCLUDED_TOOLS, FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES, UNATTENDED_RETRY_ENV,
-    build_qwen_invocation, check_served_model, plan_auth,
+    DEFAULT_QWEN_MODEL, EXCLUDED_TOOLS, FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES,
+    UNATTENDED_RETRY_ENV, build_qwen_invocation, check_served_model, plan_auth,
 };
 
 const EXPECTED_EXCLUDED: [&str; 15] = [
@@ -79,7 +79,16 @@ fn build_with(
 }
 
 fn build(d: &Dirs, prompt: &str) -> SeatInvocation {
-    build_with(d, prompt, Some("qwen3-coder-plus"), None, &[], 12, Duration::from_secs(600)).expect("builds")
+    build_with(
+        d,
+        prompt,
+        Some("qwen3-coder-plus"),
+        None,
+        &[],
+        12,
+        Duration::from_secs(600),
+    )
+    .expect("builds")
 }
 
 fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -116,8 +125,21 @@ fn test_should_list_exact_exclude_tools() {
 #[test]
 fn test_should_list_exact_forbidden_extra_args() {
     let expected = [
-        "--continue", "--yolo", "-y", "--approval-mode", "--resume", "--output-format", "-o", "-p", "--prompt", "-m",
-        "--model", "--safe-mode", "--auth-type", "--exclude-tools", "--allowed-tools",
+        "--continue",
+        "--yolo",
+        "-y",
+        "--approval-mode",
+        "--resume",
+        "--output-format",
+        "-o",
+        "-p",
+        "--prompt",
+        "-m",
+        "--model",
+        "--safe-mode",
+        "--auth-type",
+        "--exclude-tools",
+        "--allowed-tools",
     ];
     assert_eq!(FORBIDDEN_EXTRA_ARGS, &expected[..]);
 }
@@ -142,7 +164,10 @@ fn test_should_run_the_qwen_program() {
 fn test_should_pass_prompt_after_dash_p() {
     let d = dirs();
     let sut = build(&d, "Review src/main.rs please");
-    assert_eq!(value_after(&sut.args, "-p"), Some("Review src/main.rs please"));
+    assert_eq!(
+        value_after(&sut.args, "-p"),
+        Some("Review src/main.rs please")
+    );
 }
 
 // REQ-023: a prompt that looks like a flag is still just the value of -p.
@@ -157,7 +182,10 @@ fn test_should_keep_flag_shaped_prompt_as_value_of_dash_p() {
 #[test]
 fn test_should_request_stream_json_output() {
     let d = dirs();
-    assert_eq!(value_after(&build(&d, "x").args, "--output-format"), Some("stream-json"));
+    assert_eq!(
+        value_after(&build(&d, "x").args, "--output-format"),
+        Some("stream-json")
+    );
 }
 
 // REQ-023: --safe-mode is on every call.
@@ -165,7 +193,16 @@ fn test_should_request_stream_json_output() {
 fn test_should_always_pass_safe_mode() {
     let d = dirs();
     for resume in [None, Some("7f3c9a2e-5b1d-4e8a-9c40-2d6f1e8b7a01")] {
-        let sut = build_with(&d, "x", Some("qwen3-coder-plus"), resume, &[], 5, Duration::from_secs(60)).unwrap();
+        let sut = build_with(
+            &d,
+            "x",
+            Some("qwen3-coder-plus"),
+            resume,
+            &[],
+            5,
+            Duration::from_secs(60),
+        )
+        .unwrap();
         assert_eq!(count(&sut.args, "--safe-mode"), 1);
     }
 }
@@ -188,14 +225,26 @@ fn test_should_pass_full_exclude_tools_list() {
     let sut = build(&d, "x");
     let expected = EXPECTED_EXCLUDED.join(",");
     assert_eq!(count(&sut.args, "--exclude-tools"), 1);
-    assert_eq!(value_after(&sut.args, "--exclude-tools"), Some(expected.as_str()));
+    assert_eq!(
+        value_after(&sut.args, "--exclude-tools"),
+        Some(expected.as_str())
+    );
 }
 
 // REQ-023: -m is the pinned model given by the request.
 #[test]
 fn test_should_pin_requested_qwen_model() {
     let d = dirs();
-    let sut = build_with(&d, "x", Some("qwen3.7-plus"), None, &[], 5, Duration::from_secs(60)).unwrap();
+    let sut = build_with(
+        &d,
+        "x",
+        Some("qwen3.7-plus"),
+        None,
+        &[],
+        5,
+        Duration::from_secs(60),
+    )
+    .unwrap();
     assert_eq!(value_after(&sut.args, "-m"), Some("qwen3.7-plus"));
 }
 
@@ -241,9 +290,21 @@ fn test_should_omit_resume_for_fresh_session() {
 #[test]
 fn test_should_pass_resume_with_session_id() {
     let d = dirs();
-    let sut = build_with(&d, "x", None, Some("7f3c9a2e-5b1d-4e8a-9c40-2d6f1e8b7a01"), &[], 5, Duration::from_secs(60)).unwrap();
+    let sut = build_with(
+        &d,
+        "x",
+        None,
+        Some("7f3c9a2e-5b1d-4e8a-9c40-2d6f1e8b7a01"),
+        &[],
+        5,
+        Duration::from_secs(60),
+    )
+    .unwrap();
     assert_eq!(count(&sut.args, "--resume"), 1);
-    assert_eq!(value_after(&sut.args, "--resume"), Some("7f3c9a2e-5b1d-4e8a-9c40-2d6f1e8b7a01"));
+    assert_eq!(
+        value_after(&sut.args, "--resume"),
+        Some("7f3c9a2e-5b1d-4e8a-9c40-2d6f1e8b7a01")
+    );
 }
 
 // REQ-023: the builder never emits --continue, --yolo, -y or a writer approval mode, for any request shape.
@@ -252,11 +313,35 @@ fn test_should_never_emit_writer_or_continue_flags() {
     let d = dirs();
     for resume in [None, Some("id-1")] {
         for model in [None, Some("qwen3-coder-plus")] {
-            let sut = build_with(&d, "review", model, resume, &[], 9, Duration::from_secs(120)).unwrap();
-            for banned in ["--continue", "-c", "--yolo", "-y", "--allowed-tools", "--auto-approve"] {
-                assert_eq!(count(&sut.args, banned), 0, "{banned} present with resume={resume:?}");
+            let sut = build_with(
+                &d,
+                "review",
+                model,
+                resume,
+                &[],
+                9,
+                Duration::from_secs(120),
+            )
+            .unwrap();
+            for banned in [
+                "--continue",
+                "-c",
+                "--yolo",
+                "-y",
+                "--allowed-tools",
+                "--auto-approve",
+            ] {
+                assert_eq!(
+                    count(&sut.args, banned),
+                    0,
+                    "{banned} present with resume={resume:?}"
+                );
             }
-            assert!(!sut.args.iter().any(|a| a == "yolo" || a == "auto-edit" || a == "default"));
+            assert!(
+                !sut.args
+                    .iter()
+                    .any(|a| a == "yolo" || a == "auto-edit" || a == "default")
+            );
         }
     }
 }
@@ -265,7 +350,10 @@ fn test_should_never_emit_writer_or_continue_flags() {
 #[test]
 fn test_should_not_exclude_read_tools() {
     for read_tool in ["read_file", "grep_search", "glob", "list_directory"] {
-        assert!(!EXCLUDED_TOOLS.contains(&read_tool), "{read_tool} must stay usable");
+        assert!(
+            !EXCLUDED_TOOLS.contains(&read_tool),
+            "{read_tool} must stay usable"
+        );
     }
 }
 
@@ -294,7 +382,12 @@ fn test_should_change_only_prompt_value_for_different_prompt() {
     let a = build(&d, "alpha");
     let b = build(&d, "bravo");
     assert_eq!(a.args.len(), b.args.len());
-    let diff: Vec<_> = a.args.iter().zip(b.args.iter()).filter(|(x, y)| x != y).collect();
+    let diff: Vec<_> = a
+        .args
+        .iter()
+        .zip(b.args.iter())
+        .filter(|(x, y)| x != y)
+        .collect();
     assert_eq!(diff.len(), 1);
     assert_eq!(diff[0].0, "alpha");
     assert_eq!(diff[0].1, "bravo");
@@ -307,7 +400,11 @@ fn test_should_change_only_prompt_value_for_different_prompt() {
 fn test_should_never_add_unattended_retry_env() {
     let d = dirs();
     let sut = build(&d, "x");
-    assert!(!sut.env_add.iter().any(|(k, _)| k == "QWEN_CODE_UNATTENDED_RETRY"));
+    assert!(
+        !sut.env_add
+            .iter()
+            .any(|(k, _)| k == "QWEN_CODE_UNATTENDED_RETRY")
+    );
 }
 
 // research/03: env_remove strips the unattended retry var from the inherited env.
@@ -317,7 +414,9 @@ fn test_should_strip_unattended_retry_env_from_inherited_env() {
     for resume in [None, Some("id")] {
         let sut = build_with(&d, "x", None, resume, &[], 5, Duration::from_secs(60)).unwrap();
         assert!(
-            sut.env_remove.iter().any(|k| k == "QWEN_CODE_UNATTENDED_RETRY"),
+            sut.env_remove
+                .iter()
+                .any(|k| k == "QWEN_CODE_UNATTENDED_RETRY"),
             "env_remove was {:?}",
             sut.env_remove
         );
@@ -339,7 +438,8 @@ fn test_should_not_mention_unattended_retry_in_args() {
 fn test_should_refuse_65_kib_prompt() {
     let d = dirs();
     let prompt = "a".repeat(65 * 1024);
-    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).expect_err("must refuse");
+    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60))
+        .expect_err("must refuse");
     assert!(err.starts_with("prompt_too_large_for_qwen"), "got {err}");
 }
 
@@ -348,8 +448,12 @@ fn test_should_refuse_65_kib_prompt() {
 fn test_should_accept_exactly_64_kib_without_truncation() {
     let d = dirs();
     let prompt = "b".repeat(MAX_PROMPT_BYTES);
-    let sut = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).expect("boundary accepted");
-    assert_eq!(value_after(&sut.args, "-p").map(|p| p.len()), Some(MAX_PROMPT_BYTES));
+    let sut = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60))
+        .expect("boundary accepted");
+    assert_eq!(
+        value_after(&sut.args, "-p").map(|p| p.len()),
+        Some(MAX_PROMPT_BYTES)
+    );
 }
 
 // REQ-024: one byte over the limit is refused.
@@ -357,7 +461,8 @@ fn test_should_accept_exactly_64_kib_without_truncation() {
 fn test_should_refuse_one_byte_over_the_limit() {
     let d = dirs();
     let prompt = "c".repeat(MAX_PROMPT_BYTES + 1);
-    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).expect_err("must refuse");
+    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60))
+        .expect_err("must refuse");
     assert!(err.starts_with("prompt_too_large_for_qwen"), "got {err}");
 }
 
@@ -368,7 +473,8 @@ fn test_should_count_bytes_not_chars_for_prompt_limit() {
     let prompt = "\u{e9}".repeat(MAX_PROMPT_BYTES / 2 + 1);
     assert!(prompt.chars().count() <= MAX_PROMPT_BYTES);
     assert!(prompt.len() > MAX_PROMPT_BYTES);
-    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60)).expect_err("must refuse");
+    let err = build_with(&d, &prompt, None, None, &[], 5, Duration::from_secs(60))
+        .expect_err("must refuse");
     assert!(err.starts_with("prompt_too_large_for_qwen"), "got {err}");
 }
 
@@ -415,7 +521,10 @@ fn test_should_reject_forbidden_arg_with_value() {
     ];
     for case in cases {
         let extra: Vec<String> = case.iter().map(|s| s.to_string()).collect();
-        assert!(build_with(&d, "x", None, None, &extra, 5, Duration::from_secs(60)).is_err(), "{case:?}");
+        assert!(
+            build_with(&d, "x", None, None, &extra, 5, Duration::from_secs(60)).is_err(),
+            "{case:?}"
+        );
     }
 }
 
@@ -434,13 +543,19 @@ const QWENCLOUD_ENDPOINT: &str = "https://token-plan.maas.qwencloudapi.com/compa
 // TECH_STACK: the default plan is qwencloud.
 #[test]
 fn test_should_default_plan_to_qwencloud() {
-    assert_eq!(plan_auth(None), Ok(("QWENCLOUD_TOKEN_PLAN_API_KEY", QWENCLOUD_ENDPOINT)));
+    assert_eq!(
+        plan_auth(None),
+        Ok(("QWENCLOUD_TOKEN_PLAN_API_KEY", QWENCLOUD_ENDPOINT))
+    );
 }
 
 // TECH_STACK: an explicit qwencloud plan equals the default.
 #[test]
 fn test_should_map_explicit_qwencloud_plan() {
-    assert_eq!(plan_auth(Some("qwencloud")), Ok(("QWENCLOUD_TOKEN_PLAN_API_KEY", QWENCLOUD_ENDPOINT)));
+    assert_eq!(
+        plan_auth(Some("qwencloud")),
+        Ok(("QWENCLOUD_TOKEN_PLAN_API_KEY", QWENCLOUD_ENDPOINT))
+    );
     assert_eq!(plan_auth(Some("qwencloud")), plan_auth(None));
 }
 
@@ -467,7 +582,12 @@ fn test_should_not_leak_modelstudio_env_or_endpoint() {
 // REQ-043: Qwen models pass.
 #[test]
 fn test_should_accept_qwen_models() {
-    for m in ["qwen3-coder-plus", "qwen3.7-plus", "qwen", "qwen3-coder-plus-2026"] {
+    for m in [
+        "qwen3-coder-plus",
+        "qwen3.7-plus",
+        "qwen",
+        "qwen3-coder-plus-2026",
+    ] {
         assert_eq!(check_served_model(m), Ok(()), "{m}");
     }
 }
@@ -475,21 +595,39 @@ fn test_should_accept_qwen_models() {
 // REQ-043: glm-5 fails with the exact code and the model name.
 #[test]
 fn test_should_reject_glm_5_with_exact_message() {
-    assert_eq!(check_served_model("glm-5"), Err("qwen_seat_served_non_qwen_model: glm-5".to_string()));
+    assert_eq!(
+        check_served_model("glm-5"),
+        Err("qwen_seat_served_non_qwen_model: glm-5".to_string())
+    );
 }
 
 // REQ-043: the other third-party lab models on the plan fail with the model in the message.
 #[test]
 fn test_should_reject_other_lab_models() {
-    for m in ["kimi-k2.5", "MiniMax-M2.5", "gpt-5", "deepseek-v4", "claude-opus"] {
-        assert_eq!(check_served_model(m), Err(format!("qwen_seat_served_non_qwen_model: {m}")), "{m}");
+    for m in [
+        "kimi-k2.5",
+        "MiniMax-M2.5",
+        "gpt-5",
+        "deepseek-v4",
+        "claude-opus",
+    ] {
+        assert_eq!(
+            check_served_model(m),
+            Err(format!("qwen_seat_served_non_qwen_model: {m}")),
+            "{m}"
+        );
     }
 }
 
 // REQ-043: the check is a prefix check, not a contains check.
 #[test]
 fn test_should_require_qwen_prefix_not_substring() {
-    for m in ["not-qwen3", "xqwen3-coder-plus", "glm-qwen", " qwen3-coder-plus"] {
+    for m in [
+        "not-qwen3",
+        "xqwen3-coder-plus",
+        "glm-qwen",
+        " qwen3-coder-plus",
+    ] {
         assert!(check_served_model(m).is_err(), "{m} must fail");
     }
 }
@@ -509,17 +647,26 @@ fn test_should_fail_check_for_glm_5_stream_and_pass_for_qwen_stream() {
         r#"{"type":"assistant","session_id":"s1","message":{"role":"assistant","model":"glm-5","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
         r#"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"result":"hi","usage":{"input_tokens":1,"output_tokens":1}}"#,
     ];
-    let qwen: Vec<String> = glm.iter().map(|l| l.replace("glm-5", "qwen3-coder-plus")).collect();
+    let qwen: Vec<String> = glm
+        .iter()
+        .map(|l| l.replace("glm-5", "qwen3-coder-plus"))
+        .collect();
 
     let served = |lines: &[&str]| {
         let mut p = QwenStreamParser::new();
         for l in lines {
             let _ = p.parse_line(l);
         }
-        p.finish(Some(0)).expect("finishes").served_model.expect("served model present")
+        p.finish(Some(0))
+            .expect("finishes")
+            .served_model
+            .expect("served model present")
     };
     let glm_model = served(&glm);
-    assert_eq!(check_served_model(&glm_model), Err("qwen_seat_served_non_qwen_model: glm-5".to_string()));
+    assert_eq!(
+        check_served_model(&glm_model),
+        Err("qwen_seat_served_non_qwen_model: glm-5".to_string())
+    );
 
     let qwen_refs: Vec<&str> = qwen.iter().map(|s| s.as_str()).collect();
     let qwen_model = served(&qwen_refs);

@@ -82,8 +82,7 @@ fn dropping_a_guard_allows_reacquisition_without_rewriting_the_file() {
     let home = TempDir::new().expect("create isolated TRIUMVIRATE_HOME");
     let lock_path = home.path().join("locks").join("qwen");
 
-    let first_guard =
-        acquire_seat_lock(home.path(), "qwen").expect("acquire first qwen seat lock");
+    let first_guard = acquire_seat_lock(home.path(), "qwen").expect("acquire first qwen seat lock");
     drop(first_guard);
 
     let second_guard =

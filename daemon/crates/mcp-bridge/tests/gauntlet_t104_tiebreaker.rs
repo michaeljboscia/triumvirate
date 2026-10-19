@@ -50,18 +50,12 @@ fn req_030_seat_home_is_exactly_under_homes() {
     // REQ-030: a seat home is $TRIUMVIRATE_HOME/homes/<seat>.
     let root = Path::new("/tmp/triumvirate-contract-root");
 
-    assert_eq!(
-        seat_home(root, "kimi"),
-        Ok(root.join("homes").join("kimi"))
-    );
+    assert_eq!(seat_home(root, "kimi"), Ok(root.join("homes").join("kimi")));
     assert_eq!(
         seat_home(root, "mistral"),
         Ok(root.join("homes").join("mistral"))
     );
-    assert_eq!(
-        seat_home(root, "qwen"),
-        Ok(root.join("homes").join("qwen"))
-    );
+    assert_eq!(seat_home(root, "qwen"), Ok(root.join("homes").join("qwen")));
 }
 
 #[test]
@@ -115,7 +109,10 @@ fn req_030_req_033_child_env_scrubs_then_adds_and_relocates_home() {
         ("VIBE_HOME".to_owned(), "/real/vibe".to_owned()),
         ("MISTRAL_API_KEY".to_owned(), "inherited".to_owned()),
         ("OPENAI_API_KEY".to_owned(), "inherited".to_owned()),
-        ("OPENAI_BASE_URL".to_owned(), "https://wrong.invalid".to_owned()),
+        (
+            "OPENAI_BASE_URL".to_owned(),
+            "https://wrong.invalid".to_owned(),
+        ),
         ("DASHSCOPE_API_KEY".to_owned(), "inherited".to_owned()),
         ("BAILIAN_TOKEN".to_owned(), "inherited".to_owned()),
         ("QWENCLOUD_PLAN_KEY".to_owned(), "inherited".to_owned()),
@@ -134,10 +131,7 @@ fn req_030_req_033_child_env_scrubs_then_adds_and_relocates_home() {
     let expected = BTreeMap::from([
         ("HOME".to_owned(), home.display().to_string()),
         ("KEEP".to_owned(), "yes".to_owned()),
-        (
-            "MISTRAL_API_KEY".to_owned(),
-            "seat-owned".to_owned(),
-        ),
+        ("MISTRAL_API_KEY".to_owned(), "seat-owned".to_owned()),
         ("VIBE_CLI".to_owned(), "python".to_owned()),
         ("VIBE_HOME".to_owned(), home.display().to_string()),
     ]);
@@ -244,10 +238,9 @@ fn req_031_qwen_settings_are_merged_and_containment_keys_are_set() {
 
     write_seat_files(&home, profile("qwen")).expect("Qwen seat files must be written");
 
-    let document: serde_json::Value = serde_json::from_slice(
-        &fs::read(home.join("settings.json")).expect("read settings.json"),
-    )
-    .expect("settings.json must remain valid JSON");
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("settings.json")).expect("read settings.json"))
+            .expect("settings.json must remain valid JSON");
 
     assert_eq!(document["login"]["refreshToken"], "preserve-me");
     assert_eq!(document["agents"]["operatorChoice"], true);
@@ -263,11 +256,7 @@ fn req_031_qwen_settings_are_merged_and_containment_keys_are_set() {
         .expect("the pinned provider must be an object");
     assert_eq!(
         provider.keys().cloned().collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "baseUrl".to_owned(),
-            "envKey".to_owned(),
-            "id".to_owned(),
-        ])
+        BTreeSet::from(["baseUrl".to_owned(), "envKey".to_owned(), "id".to_owned(),])
     );
 
     for key in ["id", "baseUrl", "envKey"] {
@@ -401,11 +390,8 @@ fn req_035_real_git_audit_finds_only_run_deltas_and_reverts_nothing() {
 
     let before = snapshot_repo(repo).expect("snapshot before run");
 
-    fs::write(
-        repo.join("tracked.txt"),
-        "preexisting edit plus run edit\n",
-    )
-    .expect("write new tracked edit");
+    fs::write(repo.join("tracked.txt"), "preexisting edit plus run edit\n")
+        .expect("write new tracked edit");
     fs::write(repo.join("new-untracked.txt"), "new\n").expect("write new untracked file");
 
     let after = snapshot_repo(repo).expect("snapshot after run");
@@ -441,12 +427,10 @@ fn req_033_credentials_file_requires_mode_0600() {
     let credentials = temp.path().join("credentials.env");
     fs::write(&credentials, "PLAN_KEY=value\n").expect("write credentials file");
 
-    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600))
-        .expect("set mode 0600");
+    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).expect("set mode 0600");
     assert_eq!(check_credentials_file(&credentials), Ok(()));
 
-    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o644))
-        .expect("set mode 0644");
+    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o644)).expect("set mode 0644");
     assert!(check_credentials_file(&credentials).is_err());
 }
 

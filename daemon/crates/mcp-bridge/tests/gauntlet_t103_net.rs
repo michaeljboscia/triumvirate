@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use mcp_bridge::containment::{SeatInvocation, SeatRequest};
 use mcp_bridge::qwen::{
-    build_qwen_invocation, check_served_model, plan_auth, DEFAULT_QWEN_MODEL, EXCLUDED_TOOLS,
-    FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES, UNATTENDED_RETRY_ENV,
+    DEFAULT_QWEN_MODEL, EXCLUDED_TOOLS, FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES,
+    UNATTENDED_RETRY_ENV, build_qwen_invocation, check_served_model, plan_auth,
 };
 
 fn build(
@@ -84,7 +84,10 @@ fn t103_req023_read_only_flags_on_every_call() {
 #[test]
 fn t103_req023_stream_json_output_and_prompt_after_p() {
     let inv = ok("summarize main.rs");
-    assert_eq!(value_after(&inv.args, "--output-format"), Some("stream-json"));
+    assert_eq!(
+        value_after(&inv.args, "--output-format"),
+        Some("stream-json")
+    );
     assert_eq!(value_after(&inv.args, "-p"), Some("summarize main.rs"));
 }
 
@@ -197,7 +200,10 @@ fn t103_req024_limit_counts_bytes_not_chars() {
 
     let over = format!("{at_limit}x");
     let err = build(&over, None, None, &[], 5, 120).expect_err("refused");
-    assert!(err.starts_with("prompt_too_large_for_qwen"), "wrong code: {err}");
+    assert!(
+        err.starts_with("prompt_too_large_for_qwen"),
+        "wrong code: {err}"
+    );
 }
 
 // REQ-023 (scope): every forbidden extra arg is rejected by the builder.
@@ -217,7 +223,11 @@ fn t103_d07_default_plan_is_qwencloud() {
     let named = plan_auth(Some("qwencloud")).expect("qwencloud resolves");
     assert_eq!(default, named);
     assert_eq!(default.0, "QWENCLOUD_TOKEN_PLAN_API_KEY");
-    assert!(default.1.starts_with("https://"), "endpoint not https: {}", default.1);
+    assert!(
+        default.1.starts_with("https://"),
+        "endpoint not https: {}",
+        default.1
+    );
 }
 
 // TECH_STACK / contract change: modelstudio is refused, never mapped to an env var.

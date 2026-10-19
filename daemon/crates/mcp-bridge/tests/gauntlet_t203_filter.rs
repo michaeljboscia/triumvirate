@@ -14,7 +14,10 @@ fn test_should_return_none_for_seat_never_registered() {
 #[test]
 fn test_should_return_registered_version_exactly() {
     register_installed_cli_version("t203-filter-a", "2.2.0");
-    assert_eq!(installed_cli_version("t203-filter-a"), Some("2.2.0".to_string()));
+    assert_eq!(
+        installed_cli_version("t203-filter-a"),
+        Some("2.2.0".to_string())
+    );
 }
 
 // seat_gate docs: re-registering after a CLI upgrade replaces the earlier value.
@@ -22,7 +25,10 @@ fn test_should_return_registered_version_exactly() {
 fn test_should_replace_version_when_registered_again() {
     register_installed_cli_version("t203-filter-b", "0.25.1");
     register_installed_cli_version("t203-filter-b", "0.25.2");
-    assert_eq!(installed_cli_version("t203-filter-b"), Some("0.25.2".to_string()));
+    assert_eq!(
+        installed_cli_version("t203-filter-b"),
+        Some("0.25.2".to_string())
+    );
 }
 
 // Registry is per seat: one seat's version never leaks to another.
@@ -30,8 +36,14 @@ fn test_should_replace_version_when_registered_again() {
 fn test_should_keep_versions_independent_per_seat() {
     register_installed_cli_version("t203-filter-c1", "1.0.0");
     register_installed_cli_version("t203-filter-c2", "2.0.0");
-    assert_eq!(installed_cli_version("t203-filter-c1"), Some("1.0.0".to_string()));
-    assert_eq!(installed_cli_version("t203-filter-c2"), Some("2.0.0".to_string()));
+    assert_eq!(
+        installed_cli_version("t203-filter-c1"),
+        Some("1.0.0".to_string())
+    );
+    assert_eq!(
+        installed_cli_version("t203-filter-c2"),
+        Some("2.0.0".to_string())
+    );
     assert_eq!(installed_cli_version("t203-filter-c3"), None);
 }
 
@@ -39,7 +51,10 @@ fn test_should_keep_versions_independent_per_seat() {
 #[test]
 fn test_should_store_version_text_verbatim() {
     register_installed_cli_version("t203-filter-d", "v2.26.1-rc.1+build5");
-    assert_eq!(installed_cli_version("t203-filter-d"), Some("v2.26.1-rc.1+build5".to_string()));
+    assert_eq!(
+        installed_cli_version("t203-filter-d"),
+        Some("v2.26.1-rc.1+build5".to_string())
+    );
 }
 
 // Seat names are case sensitive keys.
@@ -63,6 +78,9 @@ fn test_should_keep_all_versions_under_concurrent_registration() {
         h.join().unwrap();
     }
     for i in 0..16 {
-        assert_eq!(installed_cli_version(&format!("t203-filter-par-{i}")), Some(format!("9.0.{i}")));
+        assert_eq!(
+            installed_cli_version(&format!("t203-filter-par-{i}")),
+            Some(format!("9.0.{i}"))
+        );
     }
 }

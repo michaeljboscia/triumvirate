@@ -13,7 +13,11 @@ use std::path::PathBuf;
 fn fixture_lines() -> Vec<String> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/kimi-2.2.0-provisional-20261018.jsonl");
-    std::fs::read_to_string(p).unwrap().lines().map(String::from).collect()
+    std::fs::read_to_string(p)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect()
 }
 
 fn run(lines: &[String], exit: Option<i32>) -> Result<SeatParsed, String> {
@@ -29,7 +33,10 @@ fn s(v: &[&str]) -> Vec<String> {
 }
 
 fn args_of(p: &SeatParsed, i: usize) -> String {
-    p.result.tool_calls[i].args_json.clone().expect("args_json present")
+    p.result.tool_calls[i]
+        .args_json
+        .clone()
+        .expect("args_json present")
 }
 
 /// A stream: read of `path`, tool result, final `answer`, optional resume hint with `sid`.
@@ -97,7 +104,11 @@ fn should_record_exactly_one_read_tool_call_for_fixture() {
 #[test]
 fn should_yield_different_values_for_second_variant() {
     // reality_test: variant with other path, answer, session id defeats constant-returning parsers
-    let lines = stream("/other/lib/zeta.py", "zeta is a python module.", Some("sess-variant-0002"));
+    let lines = stream(
+        "/other/lib/zeta.py",
+        "zeta is a python module.",
+        Some("sess-variant-0002"),
+    );
     let parsed = run(&lines, Some(0)).unwrap();
     let r = &parsed.result;
     assert_eq!(r.response_text, "zeta is a python module.");
@@ -157,8 +168,14 @@ fn should_skip_partial_trailing_line_and_keep_rest() {
     lines.push(r#"{"role":"assistant","content":"cut off mid"#.to_string());
     let parsed = run(&lines, Some(0)).unwrap();
     assert!(matches!(parsed.outcome, SeatOutcome::Success));
-    assert_eq!(parsed.result.response_text, "main.rs defines an empty main function.");
-    assert_eq!(parsed.result.session_id.as_deref(), Some("sess-kimi-fixture-0001"));
+    assert_eq!(
+        parsed.result.response_text,
+        "main.rs defines an empty main function."
+    );
+    assert_eq!(
+        parsed.result.session_id.as_deref(),
+        Some("sess-kimi-fixture-0001")
+    );
 }
 
 #[test]
@@ -170,29 +187,50 @@ fn should_skip_malformed_json_line_in_the_middle() {
     lines.insert(4, "}{".to_string());
     let parsed = run(&lines, Some(0)).unwrap();
     assert!(matches!(parsed.outcome, SeatOutcome::Success));
-    assert_eq!(parsed.result.response_text, "main.rs defines an empty main function.");
+    assert_eq!(
+        parsed.result.response_text,
+        "main.rs defines an empty main function."
+    );
     assert_eq!(parsed.result.tool_calls.len(), 1);
-    assert_eq!(parsed.result.session_id.as_deref(), Some("sess-kimi-fixture-0001"));
+    assert_eq!(
+        parsed.result.session_id.as_deref(),
+        Some("sess-kimi-fixture-0001")
+    );
 }
 
 #[test]
 fn should_ignore_unknown_meta_type() {
     // REQ-044: unknown meta type ignored
     let mut lines = fixture_lines();
-    lines.insert(1, r#"{"role":"meta","type":"future.unknown","payload":{"a":1}}"#.to_string());
+    lines.insert(
+        1,
+        r#"{"role":"meta","type":"future.unknown","payload":{"a":1}}"#.to_string(),
+    );
     let parsed = run(&lines, Some(0)).unwrap();
     assert!(matches!(parsed.outcome, SeatOutcome::Success));
-    assert_eq!(parsed.result.response_text, "main.rs defines an empty main function.");
-    assert_eq!(parsed.result.session_id.as_deref(), Some("sess-kimi-fixture-0001"));
+    assert_eq!(
+        parsed.result.response_text,
+        "main.rs defines an empty main function."
+    );
+    assert_eq!(
+        parsed.result.session_id.as_deref(),
+        Some("sess-kimi-fixture-0001")
+    );
 }
 
 #[test]
 fn should_ignore_unknown_role() {
     // spec: unknown roles are ignored
     let mut lines = fixture_lines();
-    lines.insert(1, r#"{"role":"developer","content":"sneaky role text"}"#.to_string());
+    lines.insert(
+        1,
+        r#"{"role":"developer","content":"sneaky role text"}"#.to_string(),
+    );
     let parsed = run(&lines, Some(0)).unwrap();
-    assert_eq!(parsed.result.response_text, "main.rs defines an empty main function.");
+    assert_eq!(
+        parsed.result.response_text,
+        "main.rs defines an empty main function."
+    );
 }
 
 #[test]
@@ -205,7 +243,11 @@ fn should_fail_empty_stream_with_exit_zero() {
 #[test]
 fn should_fail_non_kimi_garbage_with_exit_zero() {
     // spec: zero recognized lines means empty or not kimi's
-    let parsed = run(&s(&["hello world", "{\"type\":\"result\",\"is_error\":false}"]), Some(0)).unwrap();
+    let parsed = run(
+        &s(&["hello world", "{\"type\":\"result\",\"is_error\":false}"]),
+        Some(0),
+    )
+    .unwrap();
     assert_eq!(failure_of(&parsed), "empty_or_unrecognized_stream:kimi");
 }
 
@@ -247,28 +289,49 @@ fn should_map_missing_exit_code_to_no_exit_code_failure() {
 fn should_append_last_retry_status_to_nonzero_exit() {
     // finish doc: " last_retry_status=<n>" appended when a retry was seen
     let mut lines = fixture_lines();
-    lines.insert(1, r#"{"role":"meta","type":"turn.step.retrying","status_code":429,"attempt":1}"#.to_string());
+    lines.insert(
+        1,
+        r#"{"role":"meta","type":"turn.step.retrying","status_code":429,"attempt":1}"#.to_string(),
+    );
     let parsed = run(&lines, Some(1)).unwrap();
-    assert_eq!(failure_of(&parsed), "nonzero_exit:kimi:1 last_retry_status=429");
+    assert_eq!(
+        failure_of(&parsed),
+        "nonzero_exit:kimi:1 last_retry_status=429"
+    );
 }
 
 #[test]
 fn should_append_last_retry_status_to_no_exit_code() {
     // finish doc: both failure codes get the suffix
     let mut lines = fixture_lines();
-    lines.insert(1, r#"{"role":"meta","type":"turn.step.retrying","status_code":403}"#.to_string());
+    lines.insert(
+        1,
+        r#"{"role":"meta","type":"turn.step.retrying","status_code":403}"#.to_string(),
+    );
     let parsed = run(&lines, None).unwrap();
-    assert_eq!(failure_of(&parsed), "no_exit_code:kimi last_retry_status=403");
+    assert_eq!(
+        failure_of(&parsed),
+        "no_exit_code:kimi last_retry_status=403"
+    );
 }
 
 #[test]
 fn should_use_most_recent_retry_status() {
     // struct doc: last_retry_status is the MOST RECENT turn.step.retrying
     let mut lines = fixture_lines();
-    lines.insert(1, r#"{"role":"meta","type":"turn.step.retrying","status_code":500}"#.to_string());
-    lines.insert(2, r#"{"role":"meta","type":"turn.step.retrying","status_code":429}"#.to_string());
+    lines.insert(
+        1,
+        r#"{"role":"meta","type":"turn.step.retrying","status_code":500}"#.to_string(),
+    );
+    lines.insert(
+        2,
+        r#"{"role":"meta","type":"turn.step.retrying","status_code":429}"#.to_string(),
+    );
     let parsed = run(&lines, Some(2)).unwrap();
-    assert_eq!(failure_of(&parsed), "nonzero_exit:kimi:2 last_retry_status=429");
+    assert_eq!(
+        failure_of(&parsed),
+        "nonzero_exit:kimi:2 last_retry_status=429"
+    );
 }
 
 #[test]
@@ -282,7 +345,10 @@ fn should_not_append_retry_suffix_when_none_seen() {
 fn should_succeed_when_retry_seen_but_turn_completed() {
     // a retried step that later completes with exit 0 is still Success
     let mut lines = fixture_lines();
-    lines.insert(1, r#"{"role":"meta","type":"turn.step.retrying","status_code":429}"#.to_string());
+    lines.insert(
+        1,
+        r#"{"role":"meta","type":"turn.step.retrying","status_code":429}"#.to_string(),
+    );
     let parsed = run(&lines, Some(0)).unwrap();
     assert!(matches!(parsed.outcome, SeatOutcome::Success));
 }
@@ -335,11 +401,20 @@ fn should_leave_tool_success_unknown() {
 #[test]
 fn should_tolerate_crlf_terminated_lines() {
     // NDJSON robustness: trailing \r does not break a line
-    let lines: Vec<String> = fixture_lines().into_iter().map(|l| format!("{l}\r")).collect();
+    let lines: Vec<String> = fixture_lines()
+        .into_iter()
+        .map(|l| format!("{l}\r"))
+        .collect();
     let parsed = run(&lines, Some(0)).unwrap();
     assert!(matches!(parsed.outcome, SeatOutcome::Success));
-    assert_eq!(parsed.result.session_id.as_deref(), Some("sess-kimi-fixture-0001"));
-    assert_eq!(parsed.result.response_text, "main.rs defines an empty main function.");
+    assert_eq!(
+        parsed.result.session_id.as_deref(),
+        Some("sess-kimi-fixture-0001")
+    );
+    assert_eq!(
+        parsed.result.response_text,
+        "main.rs defines an empty main function."
+    );
 }
 
 #[test]
@@ -353,7 +428,11 @@ fn should_not_leak_state_between_parser_instances() {
 #[test]
 fn should_preserve_unicode_answer_text() {
     // text passes through untouched
-    let parsed = run(&stream("/u/x.rs", "caf\\u00e9 done", Some("sess-u")), Some(0)).unwrap();
+    let parsed = run(
+        &stream("/u/x.rs", "caf\\u00e9 done", Some("sess-u")),
+        Some(0),
+    )
+    .unwrap();
     assert_eq!(parsed.result.response_text, "caf\u{e9} done");
 }
 
@@ -423,7 +502,10 @@ fn should_map_ask_user_question_to_request_user_input_kind() {
 #[test]
 fn should_map_unlisted_tool_to_unknown_kind() {
     // a name outside the mapped set must not be classed as a read or write
-    assert_eq!(kind_of("FetchURL"), ("FetchURL".to_string(), ToolKind::Unknown));
+    assert_eq!(
+        kind_of("FetchURL"),
+        ("FetchURL".to_string(), ToolKind::Unknown)
+    );
 }
 
 #[test]
@@ -435,7 +517,10 @@ fn should_keep_distinct_kinds_across_one_message_in_order() {
     ]);
     let r = run(&lines, Some(0)).unwrap().result;
     let kinds: Vec<ToolKind> = r.tool_calls.iter().map(|c| c.kind.clone()).collect();
-    assert_eq!(kinds, vec![ToolKind::Grep, ToolKind::WriteFile, ToolKind::ReadFile]);
+    assert_eq!(
+        kinds,
+        vec![ToolKind::Grep, ToolKind::WriteFile, ToolKind::ReadFile]
+    );
 }
 
 #[test]
@@ -446,14 +531,19 @@ fn should_record_five_tool_calls_across_messages() {
         lines.push(format!(
             r#"{{"role":"assistant","content":"","tool_calls":[{{"id":"c{i}","function":{{"name":"Read","arguments":"{{\"path\":\"/f/{i}.rs\"}}"}}}}]}}"#
         ));
-        lines.push(format!(r#"{{"role":"tool","tool_call_id":"c{i}","content":"body {i}"}}"#));
+        lines.push(format!(
+            r#"{{"role":"tool","tool_call_id":"c{i}","content":"body {i}"}}"#
+        ));
     }
     lines.push(r#"{"role":"assistant","content":"all read"}"#.to_string());
     let parsed = run(&lines, Some(0)).unwrap();
     assert!(matches!(parsed.outcome, SeatOutcome::Success));
     assert_eq!(parsed.result.tool_calls.len(), 5);
     for i in 0..5 {
-        assert_eq!(parsed.result.tool_calls[i].id.as_deref(), Some(format!("c{i}").as_str()));
+        assert_eq!(
+            parsed.result.tool_calls[i].id.as_deref(),
+            Some(format!("c{i}").as_str())
+        );
         assert!(args_of(&parsed, i).contains(&format!("/f/{i}.rs")));
     }
 }
@@ -478,9 +568,14 @@ fn should_emit_tool_call_completed_for_each_of_several_results() {
     );
     for id in ["a", "b", "c"] {
         let ev = p
-            .parse_line(&format!(r#"{{"role":"tool","tool_call_id":"{id}","content":"r"}}"#))
+            .parse_line(&format!(
+                r#"{{"role":"tool","tool_call_id":"{id}","content":"r"}}"#
+            ))
             .expect("completed event");
-        assert!(matches!(ev.state, WorkingState::ToolCallCompleted), "result {id}");
+        assert!(
+            matches!(ev.state, WorkingState::ToolCallCompleted),
+            "result {id}"
+        );
     }
 }
 
@@ -491,10 +586,14 @@ fn should_pair_tool_result_with_its_call_by_id() {
     let _ = p.parse_line(
         r#"{"role":"assistant","content":"","tool_calls":[{"id":"a","function":{"name":"Read","arguments":"{}"}},{"id":"b","function":{"name":"Grep","arguments":"{}"}},{"id":"c","function":{"name":"Glob","arguments":"{}"}}]}"#,
     );
-    let ev = p.parse_line(r#"{"role":"tool","tool_call_id":"b","content":"r"}"#).expect("event");
+    let ev = p
+        .parse_line(r#"{"role":"tool","tool_call_id":"b","content":"r"}"#)
+        .expect("event");
     assert!(matches!(ev.state, WorkingState::ToolCallCompleted));
     assert_eq!(ev.tool_name.as_deref(), Some("Grep"));
-    let ev = p.parse_line(r#"{"role":"tool","tool_call_id":"a","content":"r"}"#).expect("event");
+    let ev = p
+        .parse_line(r#"{"role":"tool","tool_call_id":"a","content":"r"}"#)
+        .expect("event");
     assert_eq!(ev.tool_name.as_deref(), Some("Read"));
 }
 
@@ -529,7 +628,9 @@ fn should_emit_event_for_each_of_several_retries() {
     // retry lines are surfaced each time (counts past one)
     let mut p = KimiStreamParser::new();
     for n in [429, 429, 500] {
-        let ev = p.parse_line(&format!(r#"{{"role":"meta","type":"turn.step.retrying","status_code":{n}}}"#));
+        let ev = p.parse_line(&format!(
+            r#"{{"role":"meta","type":"turn.step.retrying","status_code":{n}}}"#
+        ));
         assert!(ev.is_some(), "retry {n}");
     }
 }
@@ -539,11 +640,17 @@ fn should_report_last_retry_after_many_retries_and_many_lines() {
     // last_retry_status survives a long stream with several retries; the most recent in stream order wins
     let mut lines = fixture_lines();
     for n in [500, 502, 429, 503, 429] {
-        lines.insert(2, format!(r#"{{"role":"meta","type":"turn.step.retrying","status_code":{n}}}"#));
+        lines.insert(
+            2,
+            format!(r#"{{"role":"meta","type":"turn.step.retrying","status_code":{n}}}"#),
+        );
     }
     // inserting at index 2 each time reverses order, so the last in stream order is the first inserted: 500
     let parsed = run(&lines, Some(7)).unwrap();
-    assert_eq!(failure_of(&parsed), "nonzero_exit:kimi:7 last_retry_status=500");
+    assert_eq!(
+        failure_of(&parsed),
+        "nonzero_exit:kimi:7 last_retry_status=500"
+    );
 }
 
 #[test]
@@ -554,7 +661,10 @@ fn should_fail_unrecognized_stream_made_only_of_unknown_lines() {
         r#"{"role":"meta","type":"future.b"}"#,
         r#"{"role":"observer","content":"hi"}"#,
     ]);
-    assert_eq!(failure_of(&run(&lines, Some(0)).unwrap()), "empty_or_unrecognized_stream:kimi");
+    assert_eq!(
+        failure_of(&run(&lines, Some(0)).unwrap()),
+        "empty_or_unrecognized_stream:kimi"
+    );
 }
 
 #[test]

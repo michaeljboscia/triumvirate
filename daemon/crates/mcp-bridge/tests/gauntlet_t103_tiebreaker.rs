@@ -152,10 +152,7 @@ fn req_024_prompt_limit_accepts_exact_boundary() {
     let prompt = "x".repeat(MAX_PROMPT_BYTES);
     let invocation = build_qwen_invocation(&request(&prompt, None, None, &[])).unwrap();
 
-    assert_eq!(
-        value_after(&invocation.args, "-p").len(),
-        MAX_PROMPT_BYTES
-    );
+    assert_eq!(value_after(&invocation.args, "-p").len(), MAX_PROMPT_BYTES);
 }
 
 #[test]

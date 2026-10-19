@@ -16,7 +16,12 @@ enum SurfaceOutcome {
 
 fn surface_case(index: usize) -> (Surface, &'static str, SurfaceOutcome, bool) {
     match index {
-        0 => (Surface::AskAgent, "AskAgent", SurfaceOutcome::Allowed, false),
+        0 => (
+            Surface::AskAgent,
+            "AskAgent",
+            SurfaceOutcome::Allowed,
+            false,
+        ),
         1 => (Surface::Session, "Session", SurfaceOutcome::Allowed, false),
         2 => (Surface::Jury, "Jury", SurfaceOutcome::Allowed, false),
         3 => (
@@ -55,12 +60,7 @@ fn surface_case(index: usize) -> (Surface, &'static str, SurfaceOutcome, bool) {
             SurfaceOutcome::Deferred,
             false,
         ),
-        9 => (
-            Surface::Prewarm,
-            "Prewarm",
-            SurfaceOutcome::Deferred,
-            false,
-        ),
+        9 => (Surface::Prewarm, "Prewarm", SurfaceOutcome::Deferred, false),
         _ => panic!("surface case index out of range: {index}"),
     }
 }
@@ -160,9 +160,7 @@ fn expected_gate_result(
     if !verified && !doctor_live_probe {
         return Err((
             "seat_unverified",
-            format!(
-                "seat_unverified: {seat}: run triumvirate doctor --live in a terminal"
-            ),
+            format!("seat_unverified: {seat}: run triumvirate doctor --live in a terminal"),
         ));
     }
 
@@ -325,8 +323,7 @@ fn suspension_outranks_unverified_and_doctor_probe_exception() {
     for seat in ["kimi", "mistral", "qwen"] {
         for surface_index in 0..10 {
             let (surface, surface_name, _, _) = surface_case(surface_index);
-            let result =
-                seat_gate_with(seat, surface, Origin::Interactive, true, &suspended);
+            let result = seat_gate_with(seat, surface, Origin::Interactive, true, &suspended);
             assert_refusal(
                 result,
                 "seat_suspended",
@@ -351,8 +348,7 @@ fn not_configured_has_highest_precedence() {
     for seat in ["kimi", "mistral", "qwen"] {
         for surface_index in 0..10 {
             let (surface, surface_name, _, _) = surface_case(surface_index);
-            let result =
-                seat_gate_with(seat, surface, Origin::Unattended, false, &blocked);
+            let result = seat_gate_with(seat, surface, Origin::Unattended, false, &blocked);
             assert_refusal(
                 result,
                 "seat_not_configured",

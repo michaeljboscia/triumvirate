@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use mcp_bridge::containment::{SeatInvocation, SeatRequest};
 use mcp_bridge::mistral::{
-    ENABLED_TOOLS, FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES, MISTRAL_PROGRAM, build_mistral_invocation,
+    ENABLED_TOOLS, FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES, MISTRAL_PROGRAM,
+    build_mistral_invocation,
 };
 
 struct Fx {
@@ -102,7 +103,9 @@ fn req022_env_add_sets_vibe_cli_python_always() {
     let fresh = fx.build("hello", &[], None, None).expect("fresh");
     assert_eq!(env_value(&fresh, "VIBE_CLI"), vec!["python".to_string()]);
 
-    let resumed = fx.build("hello", &[], Some("mistral-x"), Some("sess-abc")).expect("resume");
+    let resumed = fx
+        .build("hello", &[], Some("mistral-x"), Some("sess-abc"))
+        .expect("resume");
     assert_eq!(env_value(&resumed, "VIBE_CLI"), vec!["python".to_string()]);
 }
 
@@ -114,7 +117,11 @@ fn req022_three_enabled_tools_in_order() {
     let inv = fx.build("hello", &[], None, None).expect("build");
     assert_eq!(
         all_values_after(&inv.args, "--enabled-tools"),
-        vec!["read_file".to_string(), "grep".to_string(), "todo".to_string()]
+        vec![
+            "read_file".to_string(),
+            "grep".to_string(),
+            "todo".to_string()
+        ]
     );
 }
 
@@ -132,11 +139,17 @@ fn req022_core_argv_values_exact() {
     let fx = Fx::new();
     let inv = fx.build("hello", &[], None, None).expect("build");
     assert_eq!(value_after(&inv.args, "-p"), Some("hello".to_string()));
-    assert_eq!(value_after(&inv.args, "--output"), Some("streaming".to_string()));
+    assert_eq!(
+        value_after(&inv.args, "--output"),
+        Some("streaming".to_string())
+    );
     assert_eq!(value_after(&inv.args, "--workdir"), Some(fx.cwd_str()));
     assert_eq!(value_after(&inv.args, "--output-dir"), Some(fx.out_str()));
     assert_eq!(value_after(&inv.args, "--max-turns"), Some("7".to_string()));
-    assert_eq!(value_after(&inv.args, "--time-limit"), Some("600".to_string()));
+    assert_eq!(
+        value_after(&inv.args, "--time-limit"),
+        Some("600".to_string())
+    );
 }
 
 // REQ-022: the invocation cwd is the repo the seat reads.
@@ -151,8 +164,17 @@ fn req022_invocation_cwd_is_repo() {
 #[test]
 fn req022_no_writer_or_unsafe_flags_built() {
     let fx = Fx::new();
-    let inv = fx.build("hello", &[], Some("mistral-x"), Some("sess-abc")).expect("build");
-    for banned in ["--trust", "--worktree", "--continue", "--auto-approve", "--yolo", "-c"] {
+    let inv = fx
+        .build("hello", &[], Some("mistral-x"), Some("sess-abc"))
+        .expect("build");
+    for banned in [
+        "--trust",
+        "--worktree",
+        "--continue",
+        "--auto-approve",
+        "--yolo",
+        "-c",
+    ] {
         assert!(
             !inv.args.iter().any(|a| a == banned),
             "argv must not contain {banned}: {:?}",
@@ -173,17 +195,32 @@ fn req022_fresh_session_has_no_resume_flag() {
 #[test]
 fn req022_resume_passes_session_id() {
     let fx = Fx::new();
-    let inv = fx.build("hello", &[], None, Some("sess-abc")).expect("build");
-    assert_eq!(value_after(&inv.args, "--resume"), Some("sess-abc".to_string()));
+    let inv = fx
+        .build("hello", &[], None, Some("sess-abc"))
+        .expect("build");
+    assert_eq!(
+        value_after(&inv.args, "--resume"),
+        Some("sess-abc".to_string())
+    );
 }
 
 // REQ-022: the model is not on the argv (the seat home config selects it).
 #[test]
 fn req022_model_never_on_argv() {
     let fx = Fx::new();
-    let inv = fx.build("hello", &[], Some("mistral-large-2"), None).expect("build");
-    assert!(!inv.args.iter().any(|a| a.contains("mistral-large-2")), "{:?}", inv.args);
-    assert!(!inv.args.iter().any(|a| a == "-m" || a == "--model"), "{:?}", inv.args);
+    let inv = fx
+        .build("hello", &[], Some("mistral-large-2"), None)
+        .expect("build");
+    assert!(
+        !inv.args.iter().any(|a| a.contains("mistral-large-2")),
+        "{:?}",
+        inv.args
+    );
+    assert!(
+        !inv.args.iter().any(|a| a == "-m" || a == "--model"),
+        "{:?}",
+        inv.args
+    );
 }
 
 // REQ-024: the constant is the 64 KiB limit.
@@ -197,7 +234,9 @@ fn req024_limit_constant_is_64_kib() {
 fn req024_prompt_at_exact_limit_accepted() {
     let fx = Fx::new();
     let prompt = "a".repeat(65536);
-    let inv = fx.build(&prompt, &[], None, None).expect("65536 bytes must be accepted");
+    let inv = fx
+        .build(&prompt, &[], None, None)
+        .expect("65536 bytes must be accepted");
     assert_eq!(value_after(&inv.args, "-p").map(|p| p.len()), Some(65536));
 }
 
@@ -206,7 +245,9 @@ fn req024_prompt_at_exact_limit_accepted() {
 fn req024_one_byte_over_rejected_with_code() {
     let fx = Fx::new();
     let prompt = "a".repeat(65537);
-    let err = fx.build(&prompt, &[], None, None).expect_err("65537 bytes must be rejected");
+    let err = fx
+        .build(&prompt, &[], None, None)
+        .expect_err("65537 bytes must be rejected");
     assert!(
         err.starts_with("prompt_too_large_for_mistral"),
         "error must start with prompt_too_large_for_mistral, got: {err}"
@@ -218,8 +259,13 @@ fn req024_one_byte_over_rejected_with_code() {
 fn req024_65_kib_prompt_rejected() {
     let fx = Fx::new();
     let prompt = "b".repeat(65 * 1024);
-    let err = fx.build(&prompt, &[], None, None).expect_err("65 KiB must be rejected");
-    assert!(err.starts_with("prompt_too_large_for_mistral"), "got: {err}");
+    let err = fx
+        .build(&prompt, &[], None, None)
+        .expect_err("65 KiB must be rejected");
+    assert!(
+        err.starts_with("prompt_too_large_for_mistral"),
+        "got: {err}"
+    );
 }
 
 // REQ-024: the limit is measured in bytes, not characters. 32769 two-byte characters are 65538 bytes.
@@ -228,8 +274,13 @@ fn req024_limit_counts_bytes_not_chars() {
     let fx = Fx::new();
     let prompt = "\u{e9}".repeat(32769);
     assert_eq!(prompt.len(), 65538);
-    let err = fx.build(&prompt, &[], None, None).expect_err("65538 bytes must be rejected");
-    assert!(err.starts_with("prompt_too_large_for_mistral"), "got: {err}");
+    let err = fx
+        .build(&prompt, &[], None, None)
+        .expect_err("65538 bytes must be rejected");
+    assert!(
+        err.starts_with("prompt_too_large_for_mistral"),
+        "got: {err}"
+    );
 }
 
 // REQ-020: the forbidden extra-arg list has the 16 entries the spec names and includes the writer flags.
@@ -254,7 +305,10 @@ fn req020_forbidden_list_contents() {
         "--prompt",
         "--prompt-file",
     ] {
-        assert!(FORBIDDEN_EXTRA_ARGS.contains(&must), "missing forbidden entry {must}");
+        assert!(
+            FORBIDDEN_EXTRA_ARGS.contains(&must),
+            "missing forbidden entry {must}"
+        );
     }
 }
 
@@ -264,9 +318,15 @@ fn req020_every_forbidden_long_flag_refused_bare_and_with_value() {
     let fx = Fx::new();
     for flag in FORBIDDEN_EXTRA_ARGS.iter().filter(|f| f.starts_with("--")) {
         let bare = vec![flag.to_string()];
-        assert!(fx.build("hi", &bare, None, None).is_err(), "bare {flag} must be refused");
+        assert!(
+            fx.build("hi", &bare, None, None).is_err(),
+            "bare {flag} must be refused"
+        );
         let eq = vec![format!("{flag}=x")];
-        assert!(fx.build("hi", &eq, None, None).is_err(), "{flag}=x must be refused");
+        assert!(
+            fx.build("hi", &eq, None, None).is_err(),
+            "{flag}=x must be refused"
+        );
     }
 }
 
@@ -274,11 +334,20 @@ fn req020_every_forbidden_long_flag_refused_bare_and_with_value() {
 #[test]
 fn req020_short_forbidden_flags_refused_with_attached_value() {
     let fx = Fx::new();
-    for flag in FORBIDDEN_EXTRA_ARGS.iter().filter(|f| f.len() == 2 && f.starts_with('-') && !f.starts_with("--")) {
+    for flag in FORBIDDEN_EXTRA_ARGS
+        .iter()
+        .filter(|f| f.len() == 2 && f.starts_with('-') && !f.starts_with("--"))
+    {
         let attached = vec![format!("{flag}foo")];
-        assert!(fx.build("hi", &attached, None, None).is_err(), "{flag}foo must be refused");
+        assert!(
+            fx.build("hi", &attached, None, None).is_err(),
+            "{flag}foo must be refused"
+        );
         let bare = vec![flag.to_string()];
-        assert!(fx.build("hi", &bare, None, None).is_err(), "bare {flag} must be refused");
+        assert!(
+            fx.build("hi", &bare, None, None).is_err(),
+            "bare {flag} must be refused"
+        );
     }
 }
 
@@ -286,8 +355,17 @@ fn req020_short_forbidden_flags_refused_with_attached_value() {
 #[test]
 fn req020_writer_flag_extra_args_refused() {
     let fx = Fx::new();
-    for flag in ["--trust", "--worktree", "--continue", "--auto-approve", "--yolo"] {
+    for flag in [
+        "--trust",
+        "--worktree",
+        "--continue",
+        "--auto-approve",
+        "--yolo",
+    ] {
         let extra = vec![flag.to_string()];
-        assert!(fx.build("hi", &extra, None, None).is_err(), "{flag} must be refused");
+        assert!(
+            fx.build("hi", &extra, None, None).is_err(),
+            "{flag} must be refused"
+        );
     }
 }

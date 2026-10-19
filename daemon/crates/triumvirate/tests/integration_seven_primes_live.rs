@@ -31,9 +31,11 @@ fn base() -> String {
 }
 
 fn token() -> String {
-    let home = std::env::var("TRIUMVIRATE_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").expect("HOME")).join(".triumvirate")
-    });
+    let home = std::env::var("TRIUMVIRATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".triumvirate")
+        });
     std::fs::read_to_string(home.join("daemon.token"))
         .expect("daemon.token readable")
         .trim()
@@ -41,33 +43,59 @@ fn token() -> String {
 }
 
 fn unique(label: &str) -> String {
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("{label}-{}-{n}", std::process::id())
 }
 
 /// A fresh git repo under CARGO_TARGET_TMPDIR (never a seatbelt-writable temp root).
 fn repo(label: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("seven-primes-live").join(unique(label));
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("seven-primes-live")
+        .join(unique(label));
     std::fs::create_dir_all(&dir).unwrap();
     let dir = std::fs::canonicalize(&dir).unwrap();
     let s = dir.to_string_lossy();
     assert!(
-        !s.starts_with("/private/tmp") && !s.starts_with("/private/var/folders") && !s.starts_with("/tmp"),
+        !s.starts_with("/private/tmp")
+            && !s.starts_with("/private/var/folders")
+            && !s.starts_with("/tmp"),
         "live repos must not sit under a seatbelt-writable temp root: {s}"
     );
     std::fs::write(dir.join("README.md"), "live fixture repo\n").unwrap();
     for args in [
         vec!["init", "-q"],
         vec!["add", "."],
-        vec!["-c", "user.email=live@example.invalid", "-c", "user.name=live", "commit", "-qm", "base"],
+        vec![
+            "-c",
+            "user.email=live@example.invalid",
+            "-c",
+            "user.name=live",
+            "commit",
+            "-qm",
+            "base",
+        ],
     ] {
-        assert!(Command::new("git").arg("-C").arg(&dir).args(&args).status().unwrap().success());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
     dir
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder().timeout(Duration::from_secs(900)).build().unwrap()
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .unwrap()
 }
 
 async fn post(path: &str, body: Value) -> (u16, Value) {
@@ -80,7 +108,10 @@ async fn post(path: &str, body: Value) -> (u16, Value) {
         .expect("daemon reachable");
     let status = r.status().as_u16();
     let text = r.text().await.unwrap_or_default();
-    (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(Value::String(text)),
+    )
 }
 
 fn answer(v: &Value) -> String {
@@ -123,9 +154,15 @@ async fn canary_write_leaves_no_file(seat: &str) {
         }),
     )
     .await;
-    assert!(!dir.join("canary.txt").exists(), "{seat} wrote the canary: {out}");
+    assert!(
+        !dir.join("canary.txt").exists(),
+        "{seat} wrote the canary: {out}"
+    );
     let text = out.to_string();
-    assert!(!text.contains("read_only_violation"), "{seat}: a mutation landed: {out}");
+    assert!(
+        !text.contains("read_only_violation"),
+        "{seat}: a mutation landed: {out}"
+    );
     let _ = status;
 }
 
@@ -146,7 +183,10 @@ async fn second_turn_resumes(seat: &str) {
     )
     .await;
     assert_eq!(status, 200, "{seat}: {out}");
-    assert!(!answer(&out).contains("session not resumable"), "{seat}: {out}");
+    assert!(
+        !answer(&out).contains("session not resumable"),
+        "{seat}: {out}"
+    );
     let (status, out) = post(
         "/session/ask",
         serde_json::json!({"name": name, "message": "What codeword did I ask you to remember? Reply with only the codeword."}),
@@ -203,7 +243,11 @@ async fn kimi_live_failed_first_turn_leaves_no_resumable_id() {
     )
     .await;
     assert_ne!(status, 200, "an over-limit first turn must fail: {out}");
-    let (status, out) = post("/session/ask", serde_json::json!({"name": name, "message": "hi"})).await;
+    let (status, out) = post(
+        "/session/ask",
+        serde_json::json!({"name": name, "message": "hi"}),
+    )
+    .await;
     assert_eq!(status, 409, "{out}");
     assert!(out.to_string().contains("session_broken"), "{out}");
     let _ = post("/session/dismiss", serde_json::json!({"name": name})).await;
@@ -241,7 +285,8 @@ async fn mistral_live_runs_the_python_cli() {
     if !live("mistral") {
         return;
     }
-    let bin = std::env::var("TRIUMVIRATE_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_triumvirate").to_string());
+    let bin = std::env::var("TRIUMVIRATE_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_triumvirate").to_string());
     let mut doctor = Command::new(bin);
     doctor.arg("doctor").env("TRIUMVIRATE_ENABLE_MISTRAL", "1");
     let out = doctor.output().expect("triumvirate doctor runs");

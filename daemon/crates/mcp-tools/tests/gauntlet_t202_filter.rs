@@ -27,7 +27,10 @@ fn sorted_targets() -> Vec<&'static str> {
 // REQ-004/061: targets are exactly the three existing CLI peers plus the three session-capable new seats.
 #[test]
 fn test_should_list_exactly_six_daemon_targets() {
-    assert_eq!(sorted_targets(), vec!["codex", "gemini", "grok", "kimi", "mistral", "qwen"]);
+    assert_eq!(
+        sorted_targets(),
+        vec!["codex", "gemini", "grok", "kimi", "mistral", "qwen"]
+    );
 }
 
 // Property: no duplicate targets.
@@ -80,13 +83,19 @@ fn test_should_reject_claude_with_invalid_target() {
 // Doc comment: deepseek is rejected with InvalidTarget.
 #[test]
 fn test_should_reject_deepseek_with_invalid_target() {
-    assert!(matches!(spawn("deepseek"), Err(AliasMappingError::InvalidTarget(_))));
+    assert!(matches!(
+        spawn("deepseek"),
+        Err(AliasMappingError::InvalidTarget(_))
+    ));
 }
 
 // Edge: unknown target is rejected.
 #[test]
 fn test_should_reject_unknown_target() {
-    assert!(matches!(spawn("not-a-real-seat"), Err(AliasMappingError::InvalidTarget(_))));
+    assert!(matches!(
+        spawn("not-a-real-seat"),
+        Err(AliasMappingError::InvalidTarget(_))
+    ));
 }
 
 // Edge: empty target is rejected.

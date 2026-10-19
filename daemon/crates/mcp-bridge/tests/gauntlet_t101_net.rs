@@ -79,8 +79,22 @@ fn forbidden_list_is_exact() {
     let mut got: Vec<&str> = KIMI_FORBIDDEN_EXTRA_ARGS.to_vec();
     got.sort();
     let mut want = vec![
-        "--continue", "-c", "--yolo", "-y", "--auto", "--plan", "--session", "-S", "-r",
-        "--resume", "--output-format", "-p", "--prompt", "--agent", "--agent-file", "-m",
+        "--continue",
+        "-c",
+        "--yolo",
+        "-y",
+        "--auto",
+        "--plan",
+        "--session",
+        "-S",
+        "-r",
+        "--resume",
+        "--output-format",
+        "-p",
+        "--prompt",
+        "--agent",
+        "--agent-file",
+        "-m",
         "--model",
     ];
     want.sort();
@@ -92,14 +106,21 @@ fn forbidden_list_is_exact() {
 fn creation_argv_is_exact() {
     let f = fixture();
     let extra: Vec<String> = vec![];
-    let inv = build_kimi_invocation(&request(&f, "hello", &extra, None, None))
-        .expect("creation builds");
+    let inv =
+        build_kimi_invocation(&request(&f, "hello", &extra, None, None)).expect("creation builds");
     let agent = ro_agent_path(&f);
     assert_eq!(inv.program, "kimi");
     assert_eq!(inv.cwd, f.repo);
     assert_eq!(
         inv.args,
-        args(&["-p", "hello", "--output-format", "stream-json", "--agent-file", agent.as_str()])
+        args(&[
+            "-p",
+            "hello",
+            "--output-format",
+            "stream-json",
+            "--agent-file",
+            agent.as_str()
+        ])
     );
 }
 
@@ -136,7 +157,14 @@ fn resume_argv_is_exact_and_has_no_agent_file() {
         .expect("resume builds");
     assert_eq!(
         inv.args,
-        args(&["-p", "hi", "--output-format", "stream-json", "--session", "sess-abc"])
+        args(&[
+            "-p",
+            "hi",
+            "--output-format",
+            "stream-json",
+            "--session",
+            "sess-abc"
+        ])
     );
     assert!(!inv.args.iter().any(|a| a == "--agent-file"));
 }
@@ -148,7 +176,10 @@ fn every_forbidden_extra_is_rejected_on_creation() {
     for flag in KIMI_FORBIDDEN_EXTRA_ARGS {
         let extra = args(&[flag]);
         let res = build_kimi_invocation(&request(&f, "hi", &extra, None, None));
-        assert!(res.is_err(), "forbidden extra {flag} was accepted on creation");
+        assert!(
+            res.is_err(),
+            "forbidden extra {flag} was accepted on creation"
+        );
     }
 }
 
@@ -159,7 +190,10 @@ fn every_forbidden_extra_is_rejected_on_resume() {
     for flag in KIMI_FORBIDDEN_EXTRA_ARGS {
         let extra = args(&[flag]);
         let res = build_kimi_invocation(&request(&f, "hi", &extra, Some("sess-abc"), None));
-        assert!(res.is_err(), "forbidden extra {flag} was accepted on resume");
+        assert!(
+            res.is_err(),
+            "forbidden extra {flag} was accepted on resume"
+        );
     }
 }
 
@@ -167,7 +201,13 @@ fn every_forbidden_extra_is_rejected_on_resume() {
 #[test]
 fn forbidden_flag_in_equals_form_is_rejected() {
     let f = fixture();
-    for raw in ["--continue=1", "--agent-file=/etc/x.md", "--model=gpt", "--session=abc", "--output-format=text"] {
+    for raw in [
+        "--continue=1",
+        "--agent-file=/etc/x.md",
+        "--model=gpt",
+        "--session=abc",
+        "--output-format=text",
+    ] {
         let extra = args(&[raw]);
         let res = build_kimi_invocation(&request(&f, "hi", &extra, None, None));
         assert!(res.is_err(), "equals-form {raw} was accepted");

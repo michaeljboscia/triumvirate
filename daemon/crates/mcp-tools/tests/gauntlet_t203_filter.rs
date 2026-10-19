@@ -49,7 +49,11 @@ impl Env {
             unsafe { std::env::remove_var(flag_name(s)) };
         }
         unsafe { std::env::set_var("TRIUMVIRATE_HOME", dir.path()) };
-        Env { _lock: lock, dir, saved }
+        Env {
+            _lock: lock,
+            dir,
+            saved,
+        }
     }
     fn enable(&self, seat: &str) {
         unsafe { std::env::set_var(flag_name(seat), "1") };
@@ -90,11 +94,16 @@ impl Drop for Env {
 }
 
 fn status(seat: &str) -> SeatStatus {
-    seats_status().remove(seat).unwrap_or_else(|| panic!("seat {seat} missing from seats_status"))
+    seats_status()
+        .remove(seat)
+        .unwrap_or_else(|| panic!("seat {seat} missing from seats_status"))
 }
 
 fn not_configured(seat: &str) -> String {
-    format!("seat_not_configured: {seat}: set TRIUMVIRATE_ENABLE_{}=1 and restart the daemon", seat.to_uppercase())
+    format!(
+        "seat_not_configured: {seat}: set TRIUMVIRATE_ENABLE_{}=1 and restart the daemon",
+        seat.to_uppercase()
+    )
 }
 fn unverified(seat: &str) -> String {
     format!("seat_unverified: {seat}: run triumvirate doctor --live in a terminal")
@@ -139,7 +148,10 @@ fn test_should_not_configure_other_seats_when_one_flag_is_set() {
     assert!(status("kimi").configured);
     assert!(!status("qwen").configured);
     assert!(!status("mistral").configured);
-    assert_eq!(status("qwen").reason.as_deref(), Some(not_configured("qwen").as_str()));
+    assert_eq!(
+        status("qwen").reason.as_deref(),
+        Some(not_configured("qwen").as_str())
+    );
 }
 
 // REQ-091: state is read now, so removing the flag unconfigures the seat again.
@@ -206,7 +218,10 @@ fn test_should_report_suspended_with_exact_reason_text() {
     assert!(s.configured);
     assert!(s.suspended);
     assert!(!s.available);
-    assert_eq!(s.reason.as_deref(), Some(suspended("mistral", "quota exhausted").as_str()));
+    assert_eq!(
+        s.reason.as_deref(),
+        Some(suspended("mistral", "quota exhausted").as_str())
+    );
 }
 
 // REQ-091 precedence: suspended beats unverified.
@@ -219,7 +234,10 @@ fn test_should_prefer_suspended_over_unverified_in_reason() {
     assert!(s.suspended);
     assert!(!s.verified);
     assert!(!s.available);
-    assert_eq!(s.reason.as_deref(), Some(suspended("kimi", "billing hold").as_str()));
+    assert_eq!(
+        s.reason.as_deref(),
+        Some(suspended("kimi", "billing hold").as_str())
+    );
 }
 
 // REQ-091 precedence: not configured beats suspended.
@@ -283,7 +301,11 @@ fn test_should_not_verify_when_verified_file_is_garbage() {
     let env = Env::new();
     env.enable("kimi");
     register_installed_cli_version("kimi", "2.2.0");
-    std::fs::write(env.seat_dir("kimi").join("verified.json"), "not json at all").unwrap();
+    std::fs::write(
+        env.seat_dir("kimi").join("verified.json"),
+        "not json at all",
+    )
+    .unwrap();
     let s = status("kimi");
     assert!(!s.verified);
     assert!(!s.available);
@@ -337,7 +359,9 @@ fn test_should_have_reason_iff_not_available() {
         if s.available {
             assert_eq!(s.reason, None, "{seat}");
         } else {
-            let r = s.reason.unwrap_or_else(|| panic!("{seat} unavailable without reason"));
+            let r = s
+                .reason
+                .unwrap_or_else(|| panic!("{seat} unavailable without reason"));
             assert!(r.starts_with("seat_"), "{seat}: {r}");
         }
     }
@@ -352,10 +376,16 @@ fn test_should_serialize_seats_map_with_documented_keys_and_round_trip() {
     env.write_verified("mistral", "2.26.1");
     let map = seats_status();
     let v = serde_json::to_value(&map).unwrap();
-    let kimi = v.get("kimi").and_then(|x| x.as_object()).expect("kimi object");
+    let kimi = v
+        .get("kimi")
+        .and_then(|x| x.as_object())
+        .expect("kimi object");
     let mut keys: Vec<&str> = kimi.keys().map(|k| k.as_str()).collect();
     keys.sort();
-    assert_eq!(keys, ["available", "configured", "reason", "suspended", "verified"]);
+    assert_eq!(
+        keys,
+        ["available", "configured", "reason", "suspended", "verified"]
+    );
     assert_eq!(kimi["configured"], serde_json::json!(false));
     assert_eq!(kimi["reason"], serde_json::json!(not_configured("kimi")));
     assert_eq!(v["mistral"]["available"], serde_json::json!(true));

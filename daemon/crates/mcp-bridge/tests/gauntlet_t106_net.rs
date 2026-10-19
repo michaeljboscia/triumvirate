@@ -110,7 +110,10 @@ fn suspended_outranks_unverified_and_carries_reason() {
     assert_eq!(a.suspended.as_deref(), Some("403 account suspended"));
     assert!(!a.available());
     assert_eq!(kind(&a), "suspended");
-    assert_eq!(suspended_reason_from_blocker(&a).as_deref(), Some("403 account suspended"));
+    assert_eq!(
+        suspended_reason_from_blocker(&a).as_deref(),
+        Some("403 account suspended")
+    );
 }
 
 // REQ-091 precedence: not configured outranks suspended and unverified.
@@ -138,7 +141,10 @@ fn suspension_survives_failed_probe_deleting_verified() {
     let a = seat_state::availability(home, "kimi", true, Some(INSTALLED)).unwrap();
     assert!(!a.verified);
     assert_eq!(kind(&a), "suspended");
-    assert_eq!(suspended_reason_from_blocker(&a).as_deref(), Some("billing failure"));
+    assert_eq!(
+        suspended_reason_from_blocker(&a).as_deref(),
+        Some("billing failure")
+    );
 }
 
 // REQ-050 and REQ-091 (4): only clear() removes suspended.json; a fresh verified record does not.
@@ -188,7 +194,10 @@ fn verified_json_has_the_named_fields_on_disk() {
     let bytes = fs::read(seat_dir(home, "kimi").join("verified.json")).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["cli_version"], "2.2.0");
-    assert_eq!(v["seat_home"], "/Users/michaelboscia/.triumvirate/homes/kimi");
+    assert_eq!(
+        v["seat_home"],
+        "/Users/michaelboscia/.triumvirate/homes/kimi"
+    );
     assert_eq!(v["probed_at"], "2026-10-18T12:00:00Z");
     assert!(v["served_model"].is_null());
 }
@@ -216,7 +225,10 @@ fn suspended_json_has_reason_and_rfc3339_at() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["reason"], "403 account suspended");
     let at = v["at"].as_str().expect("at must be a string");
-    assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok(), "at is not RFC3339: {at}");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+        "at is not RFC3339: {at}"
+    );
 }
 
 // REQ-091 fail closed: an unreadable verified.json is "not verified", not an error that makes the seat available.
@@ -240,7 +252,11 @@ fn unreadable_suspended_json_is_still_suspended() {
     let home = tmp.path();
     seat_state::write_verified(home, "kimi", &record(INSTALLED, None)).unwrap();
     fs::create_dir_all(seat_dir(home, "kimi")).unwrap();
-    fs::write(seat_dir(home, "kimi").join("suspended.json"), b"\xff\xfe garbage").unwrap();
+    fs::write(
+        seat_dir(home, "kimi").join("suspended.json"),
+        b"\xff\xfe garbage",
+    )
+    .unwrap();
 
     let a = seat_state::availability(home, "kimi", true, Some(INSTALLED)).unwrap();
     assert!(a.suspended.is_some());
@@ -279,11 +295,15 @@ fn concurrent_reader_never_sees_half_written_record() {
             }
         });
         for _ in 0..2000 {
-            let bytes = fs::read(&path).expect("verified.json must always exist after the first write");
-            let v: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("torn read: verified.json was not complete JSON");
+            let bytes =
+                fs::read(&path).expect("verified.json must always exist after the first write");
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .expect("torn read: verified.json was not complete JSON");
             let cli = v["cli_version"].as_str().expect("cli_version missing");
-            assert!(cli == "2.2.0" || cli == "2.3.0", "unexpected cli_version: {cli}");
+            assert!(
+                cli == "2.2.0" || cli == "2.3.0",
+                "unexpected cli_version: {cli}"
+            );
         }
     });
 }
@@ -317,7 +337,10 @@ fn seat_key_cannot_escape_seats_directory() {
     let _ = seat_state::write_suspended(&home, "../escape", "x");
     let _ = seat_state::write_verified(&home, "../escape", &record(INSTALLED, None));
 
-    assert!(!tmp.path().join("escape").exists(), "write escaped the home directory");
+    assert!(
+        !tmp.path().join("escape").exists(),
+        "write escaped the home directory"
+    );
     assert!(!home.join("escape").exists(), "write escaped seats/");
 }
 

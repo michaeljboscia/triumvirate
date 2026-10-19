@@ -5,7 +5,7 @@
 // SPEC_AMBIGUITY: the spec does not constrain the seat name (empty, path separators, ".."); no test covers it.
 // SPEC_AMBIGUITY: the spec does not say what happens when $TRIUMVIRATE_HOME does not exist; no test covers it.
 
-use daemon_core::seat_lock::{acquire_seat_lock, SeatLockGuard};
+use daemon_core::seat_lock::{SeatLockGuard, acquire_seat_lock};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -145,7 +145,10 @@ fn test_should_block_second_acquirer_until_first_guard_drops() {
     log.lock().unwrap().push("first_released");
     drop(first);
     t.join().unwrap();
-    assert_eq!(*log.lock().unwrap(), vec!["first_released", "second_acquired"]);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["first_released", "second_acquired"]
+    );
 }
 
 // REQ-053: the second acquirer blocks rather than failing (it does not return while the seat is held).
@@ -160,9 +163,15 @@ fn test_should_not_return_while_seat_is_held_by_another_guard() {
         let r = acquire_seat_lock(&hp2, "kimi");
         tx.send(r.is_ok()).unwrap();
     });
-    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "second call returned while seat was held");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "second call returned while seat was held"
+    );
     drop(first);
-    assert!(rx.recv_timeout(Duration::from_secs(10)).expect("second call completes after release"));
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("second call completes after release")
+    );
     t.join().unwrap();
 }
 
@@ -216,10 +225,14 @@ fn test_should_release_lock_when_holding_child_process_is_killed() {
         tx.send(()).unwrap();
         drop(g);
     });
-    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "acquired while child still held the lock");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "acquired while child still held the lock"
+    );
     child.kill().expect("kill child");
     child.wait().expect("reap child");
-    rx.recv_timeout(Duration::from_secs(10)).expect("lock released by process death");
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("lock released by process death");
     t.join().unwrap();
 }
 
@@ -239,9 +252,15 @@ fn test_should_exclude_other_process_while_guard_held_then_admit_it() {
 fn test_should_leave_lock_file_empty_after_acquire() {
     let home = home_with_locks();
     let g = acquire_seat_lock(home.path(), "kimi").expect("acquire");
-    assert_eq!(fs::metadata(lock_path(home.path(), "kimi")).unwrap().len(), 0);
+    assert_eq!(
+        fs::metadata(lock_path(home.path(), "kimi")).unwrap().len(),
+        0
+    );
     drop(g);
-    assert_eq!(fs::metadata(lock_path(home.path(), "kimi")).unwrap().len(), 0);
+    assert_eq!(
+        fs::metadata(lock_path(home.path(), "kimi")).unwrap().len(),
+        0
+    );
 }
 
 // Spec doc: open with create and no truncate; pre-existing content is preserved.
@@ -314,7 +333,10 @@ fn test_should_refuse_symlinked_locks_directory() {
     std::os::unix::fs::symlink(outside.path(), home.path().join("locks")).unwrap();
     let r = acquire_seat_lock(home.path(), "kimi");
     assert!(r.is_err(), "symlinked locks dir must be refused");
-    assert!(!outside.path().join("kimi").exists(), "no lock file may be created through the link");
+    assert!(
+        !outside.path().join("kimi").exists(),
+        "no lock file may be created through the link"
+    );
 }
 
 // REQ-053 error path: a refused acquire returns a non-empty String message (Result<_, String>).
@@ -368,8 +390,15 @@ fn assert_invalid_seat(seat: &str) {
         Ok(_) => panic!("seat {seat:?} must be rejected"),
         Err(e) => e,
     };
-    assert!(err.starts_with("invalid_seat_name:"), "seat {seat:?} gave error {err:?}");
-    assert_eq!(tree_listing(home.path()), before, "seat {seat:?} must create nothing under home");
+    assert!(
+        err.starts_with("invalid_seat_name:"),
+        "seat {seat:?} gave error {err:?}"
+    );
+    assert_eq!(
+        tree_listing(home.path()),
+        before,
+        "seat {seat:?} must create nothing under home"
+    );
 }
 
 // Spec sharpening: empty seat is invalid.
@@ -438,7 +467,9 @@ fn test_should_reject_non_ascii_seat_names() {
 // Spec sharpening: other punctuation and NUL are invalid.
 #[test]
 fn test_should_reject_other_punctuation_and_nul() {
-    for s in ["a:b", "a*b", "a\\b", "a$b", "a@b", "a+b", "a=b", "a;b", "ki\0mi", "kimi~"] {
+    for s in [
+        "a:b", "a*b", "a\\b", "a$b", "a@b", "a+b", "a=b", "a;b", "ki\0mi", "kimi~",
+    ] {
         assert_invalid_seat(s);
     }
 }
@@ -475,7 +506,24 @@ fn test_should_not_create_file_outside_locks_for_traversal_name() {
 // Spec sharpening: lowercase letters, digits and '-' are valid.
 #[test]
 fn test_should_accept_lowercase_digits_and_hyphen_seat_names() {
-    for s in ["kimi", "mistral", "qwen", "a", "z", "0", "9", "seat-1", "a-b-c", "-", "--", "-a", "a-", "0123456789", "abcdefghijklmnopqrstuvwxyz", "k2-0"] {
+    for s in [
+        "kimi",
+        "mistral",
+        "qwen",
+        "a",
+        "z",
+        "0",
+        "9",
+        "seat-1",
+        "a-b-c",
+        "-",
+        "--",
+        "-a",
+        "a-",
+        "0123456789",
+        "abcdefghijklmnopqrstuvwxyz",
+        "k2-0",
+    ] {
         let home = home_with_locks();
         let g = match acquire_seat_lock(home.path(), s) {
             Ok(g) => g,
@@ -491,7 +539,10 @@ fn test_should_accept_lowercase_digits_and_hyphen_seat_names() {
 fn test_should_enforce_range_boundaries_of_allowed_characters() {
     for s in ["a", "z", "0", "9", "-"] {
         let home = home_with_locks();
-        assert!(acquire_seat_lock(home.path(), s).is_ok(), "{s:?} must be accepted");
+        assert!(
+            acquire_seat_lock(home.path(), s).is_ok(),
+            "{s:?} must be accepted"
+        );
     }
     for s in ["`", "{", "/", ":", "@", "[", "A", "Z", ",", "."] {
         assert_invalid_seat(s);
@@ -510,9 +561,15 @@ fn test_should_block_second_thread_after_successful_acquire_until_drop() {
         let g = acquire_seat_lock(&hp2, "seat-7");
         tx.send(g.is_ok()).unwrap();
     });
-    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "second acquirer got through a held lock");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "second acquirer got through a held lock"
+    );
     drop(first);
-    assert!(rx.recv_timeout(Duration::from_secs(10)).expect("second acquirer proceeds after drop"));
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("second acquirer proceeds after drop")
+    );
     t.join().unwrap();
 }
 
@@ -545,11 +602,18 @@ fn test_should_wait_for_foreign_holder_then_really_hold_lock() {
         release_rx.recv().unwrap();
         drop(g);
     });
-    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "acquire returned while a foreign process held the lock");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "acquire returned while a foreign process held the lock"
+    );
     child.kill().unwrap();
     child.wait().unwrap();
-    rx.recv_timeout(Duration::from_secs(10)).expect("acquire completes after foreign release");
-    assert!(probe_is_held(&path), "guard returned Ok but does not hold the flock");
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("acquire completes after foreign release");
+    assert!(
+        probe_is_held(&path),
+        "guard returned Ok but does not hold the flock"
+    );
     release_tx.send(()).unwrap();
     t.join().unwrap();
     assert!(!probe_is_held(&path));

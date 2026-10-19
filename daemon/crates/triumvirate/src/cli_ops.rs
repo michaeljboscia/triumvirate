@@ -690,9 +690,21 @@ fn line_has_real_key(patterns: &regex_lite::Regex, line: &str) -> bool {
             .trim()
             .trim_matches(|c| c == '"' || c == '\'')
             .to_ascii_lowercase();
-        ["your", "<", "${", "$", "xxx", "example", "changeme", "...", "***", "placeholder", "replace"]
-            .iter()
-            .any(|p| v.starts_with(p))
+        [
+            "your",
+            "<",
+            "${",
+            "$",
+            "xxx",
+            "example",
+            "changeme",
+            "...",
+            "***",
+            "placeholder",
+            "replace",
+        ]
+        .iter()
+        .any(|p| v.starts_with(p))
     }
     patterns.find_iter(line).any(|m| {
         let text = m.as_str();
@@ -1462,8 +1474,15 @@ mod seven_primes_doctor_tests {
         )
         .unwrap();
         assert_eq!(stray_key_files(&kimi, &[]), Vec::<String>::new());
-        fs::write(docs.join("real.md"), format!("MISTRAL_API_KEY={}\n", fake_secret("m"))).unwrap();
-        assert_eq!(stray_key_files(&kimi, &[]), vec!["logs/plugins/skills/real.md".to_string()]);
+        fs::write(
+            docs.join("real.md"),
+            format!("MISTRAL_API_KEY={}\n", fake_secret("m")),
+        )
+        .unwrap();
+        assert_eq!(
+            stray_key_files(&kimi, &[]),
+            vec!["logs/plugins/skills/real.md".to_string()]
+        );
     }
 
     /// An entry the scan cannot read is a finding, not a skip: a scanner that skips what it cannot read fails open.

@@ -14,7 +14,8 @@
 
 use mcp_bridge::containment::SeatRequest;
 use mcp_bridge::mistral::{
-    ENABLED_TOOLS, FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES, MISTRAL_PROGRAM, build_mistral_invocation,
+    ENABLED_TOOLS, FORBIDDEN_EXTRA_ARGS, MAX_PROMPT_BYTES, MISTRAL_PROGRAM,
+    build_mistral_invocation,
 };
 use std::path::Path;
 use std::time::Duration;
@@ -48,11 +49,29 @@ struct Dirs {
 }
 
 fn dirs() -> Dirs {
-    Dirs { cwd: tempfile::tempdir().unwrap(), home: tempfile::tempdir().unwrap(), out: tempfile::tempdir().unwrap() }
+    Dirs {
+        cwd: tempfile::tempdir().unwrap(),
+        home: tempfile::tempdir().unwrap(),
+        out: tempfile::tempdir().unwrap(),
+    }
 }
 
-fn build(d: &Dirs, prompt: &str, model: Option<&str>, resume: Option<&str>, extra: &[String]) -> Result<mcp_bridge::containment::SeatInvocation, String> {
-    build_mistral_invocation(&req(prompt, d.cwd.path(), d.home.path(), d.out.path(), model, resume, extra))
+fn build(
+    d: &Dirs,
+    prompt: &str,
+    model: Option<&str>,
+    resume: Option<&str>,
+    extra: &[String],
+) -> Result<mcp_bridge::containment::SeatInvocation, String> {
+    build_mistral_invocation(&req(
+        prompt,
+        d.cwd.path(),
+        d.home.path(),
+        d.out.path(),
+        model,
+        resume,
+        extra,
+    ))
 }
 
 fn ok(d: &Dirs) -> mcp_bridge::containment::SeatInvocation {
@@ -60,7 +79,10 @@ fn ok(d: &Dirs) -> mcp_bridge::containment::SeatInvocation {
 }
 
 fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
 }
 
 fn count(args: &[String], flag: &str) -> usize {
@@ -91,8 +113,22 @@ fn test_should_allowlist_exactly_read_file_grep_todo() {
 fn test_should_list_all_sixteen_forbidden_extra_args() {
     // BACKEND_STRUCTURE section 6, Mistral column
     let want = [
-        "--continue", "-c", "--trust", "--worktree", "--auto-approve", "--yolo", "--agent", "--enabled-tools",
-        "--disabled-tools", "--output", "--output-dir", "--workdir", "--resume", "-p", "--prompt", "--prompt-file",
+        "--continue",
+        "-c",
+        "--trust",
+        "--worktree",
+        "--auto-approve",
+        "--yolo",
+        "--agent",
+        "--enabled-tools",
+        "--disabled-tools",
+        "--output",
+        "--output-dir",
+        "--workdir",
+        "--resume",
+        "-p",
+        "--prompt",
+        "--prompt-file",
     ];
     assert_eq!(FORBIDDEN_EXTRA_ARGS.len(), 16);
     for f in want {
@@ -114,7 +150,12 @@ fn test_should_set_vibe_cli_python_in_env_add() {
     // REQ-022: VIBE_CLI=python always
     let d = dirs();
     let inv = ok(&d);
-    let vals: Vec<&str> = inv.env_add.iter().filter(|(k, _)| k == "VIBE_CLI").map(|(_, v)| v.as_str()).collect();
+    let vals: Vec<&str> = inv
+        .env_add
+        .iter()
+        .filter(|(k, _)| k == "VIBE_CLI")
+        .map(|(_, v)| v.as_str())
+        .collect();
     assert_eq!(vals, vec!["python"]);
 }
 
@@ -148,8 +189,14 @@ fn test_should_pass_workdir_and_per_call_output_dir() {
     // REQ-022: --workdir <cwd> and --output-dir <per-call dir>
     let d = dirs();
     let inv = ok(&d);
-    assert_eq!(value_after(&inv.args, "--workdir"), Some(d.cwd.path().to_str().unwrap()));
-    assert_eq!(value_after(&inv.args, "--output-dir"), Some(d.out.path().to_str().unwrap()));
+    assert_eq!(
+        value_after(&inv.args, "--workdir"),
+        Some(d.cwd.path().to_str().unwrap())
+    );
+    assert_eq!(
+        value_after(&inv.args, "--output-dir"),
+        Some(d.out.path().to_str().unwrap())
+    );
 }
 
 #[test]
@@ -172,7 +219,15 @@ fn test_should_pass_max_turns_and_time_limit_in_seconds() {
 fn test_should_follow_changed_limits() {
     // property: limits come from the request, not constants
     let d = dirs();
-    let mut r = req("p", d.cwd.path(), d.home.path(), d.out.path(), None, None, &[]);
+    let mut r = req(
+        "p",
+        d.cwd.path(),
+        d.home.path(),
+        d.out.path(),
+        None,
+        None,
+        &[],
+    );
     r.max_turns = 3;
     r.time_limit = Duration::from_secs(45);
     let inv = build_mistral_invocation(&r).unwrap();
@@ -210,7 +265,17 @@ fn test_should_emit_no_writer_or_unsafe_flags() {
     // REQ-022 / scope_out: never --trust, --worktree, --continue, --auto-approve, --yolo
     let d = dirs();
     let inv = ok(&d);
-    for bad in ["--trust", "--worktree", "--continue", "-c", "--auto-approve", "--yolo", "--disabled-tools", "--prompt-file", "--prompt"] {
+    for bad in [
+        "--trust",
+        "--worktree",
+        "--continue",
+        "-c",
+        "--auto-approve",
+        "--yolo",
+        "--disabled-tools",
+        "--prompt-file",
+        "--prompt",
+    ] {
         assert_eq!(count(&inv.args, bad), 0, "argv contains {bad}");
     }
 }
@@ -220,7 +285,11 @@ fn test_should_not_put_any_model_on_argv() {
     // spec: the model is not on the argv; the seat config selects it
     let d = dirs();
     let inv = build(&d, "p", Some("mistral-large-secret-model"), None, &[]).unwrap();
-    assert!(!inv.args.iter().any(|a| a.contains("mistral-large-secret-model")));
+    assert!(
+        !inv.args
+            .iter()
+            .any(|a| a.contains("mistral-large-secret-model"))
+    );
     assert_eq!(count(&inv.args, "-m"), 0);
     assert_eq!(count(&inv.args, "--model"), 0);
 }
@@ -248,7 +317,13 @@ fn test_should_keep_read_only_flags_when_resuming() {
     let inv = build(&d, "p", None, Some("sid-1"), &[]).unwrap();
     assert_eq!(count(&inv.args, "--enabled-tools"), 3);
     assert_eq!(value_after(&inv.args, "--agent"), Some("plan"));
-    assert_eq!(inv.env_add.iter().filter(|(k, v)| k == "VIBE_CLI" && v == "python").count(), 1);
+    assert_eq!(
+        inv.env_add
+            .iter()
+            .filter(|(k, v)| k == "VIBE_CLI" && v == "python")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -281,7 +356,10 @@ fn test_should_accept_prompt_of_exactly_max_bytes() {
     let d = dirs();
     let p = "a".repeat(MAX_PROMPT_BYTES);
     let inv = build(&d, &p, None, None, &[]).expect("exactly 64 KiB is allowed");
-    assert_eq!(value_after(&inv.args, "-p").map(|s| s.len()), Some(MAX_PROMPT_BYTES));
+    assert_eq!(
+        value_after(&inv.args, "-p").map(|s| s.len()),
+        Some(MAX_PROMPT_BYTES)
+    );
 }
 
 #[test]
@@ -290,7 +368,10 @@ fn test_should_reject_prompt_one_byte_over_max() {
     let d = dirs();
     let p = "a".repeat(MAX_PROMPT_BYTES + 1);
     let err = build(&d, &p, None, None, &[]).expect_err("must be rejected");
-    assert!(err.starts_with("prompt_too_large_for_mistral"), "was {err:?}");
+    assert!(
+        err.starts_with("prompt_too_large_for_mistral"),
+        "was {err:?}"
+    );
 }
 
 #[test]
@@ -299,7 +380,10 @@ fn test_should_reject_65_kib_prompt() {
     let d = dirs();
     let p = "x".repeat(65 * 1024);
     let err = build(&d, &p, None, None, &[]).expect_err("must be rejected");
-    assert!(err.starts_with("prompt_too_large_for_mistral"), "was {err:?}");
+    assert!(
+        err.starts_with("prompt_too_large_for_mistral"),
+        "was {err:?}"
+    );
 }
 
 #[test]
@@ -311,7 +395,10 @@ fn test_should_measure_prompt_size_in_bytes_not_chars() {
     assert!(build(&d, &at, None, None, &[]).is_ok());
     let over = "\u{e9}".repeat(32769);
     let err = build(&d, &over, None, None, &[]).expect_err("must be rejected");
-    assert!(err.starts_with("prompt_too_large_for_mistral"), "was {err:?}");
+    assert!(
+        err.starts_with("prompt_too_large_for_mistral"),
+        "was {err:?}"
+    );
 }
 
 #[test]
@@ -331,7 +418,9 @@ fn test_should_reject_every_forbidden_extra_arg_alone() {
     let d = dirs();
     for f in FORBIDDEN_EXTRA_ARGS {
         let extra = vec![f.to_string()];
-        let err = build(&d, "p", None, None, &extra).err().unwrap_or_else(|| panic!("{f} was accepted"));
+        let err = build(&d, "p", None, None, &extra)
+            .err()
+            .unwrap_or_else(|| panic!("{f} was accepted"));
         assert!(!err.is_empty(), "{f}: empty error");
     }
 }
@@ -342,7 +431,10 @@ fn test_should_reject_every_forbidden_extra_arg_in_flag_equals_value_form() {
     let d = dirs();
     for f in FORBIDDEN_EXTRA_ARGS.iter().filter(|f| f.starts_with("--")) {
         let extra = vec![format!("{f}=whatever")];
-        assert!(build(&d, "p", None, None, &extra).is_err(), "{f}=whatever was accepted");
+        assert!(
+            build(&d, "p", None, None, &extra).is_err(),
+            "{f}=whatever was accepted"
+        );
     }
 }
 
@@ -352,7 +444,10 @@ fn test_should_reject_short_flag_with_value_attached() {
     let d = dirs();
     for s in ["-pfoo", "-cfoo", "-p=foo"] {
         let extra = vec![s.to_string()];
-        assert!(build(&d, "p", None, None, &extra).is_err(), "{s} was accepted");
+        assert!(
+            build(&d, "p", None, None, &extra).is_err(),
+            "{s} was accepted"
+        );
     }
 }
 
@@ -360,9 +455,17 @@ fn test_should_reject_short_flag_with_value_attached() {
 fn test_should_reject_forbidden_flag_with_separate_value() {
     // spec: forbidden flag followed by its value operand
     let d = dirs();
-    for pair in [["--resume", "abc"], ["--agent", "auto-approve"], ["--workdir", "/tmp"], ["--output-dir", "/tmp/x"]] {
+    for pair in [
+        ["--resume", "abc"],
+        ["--agent", "auto-approve"],
+        ["--workdir", "/tmp"],
+        ["--output-dir", "/tmp/x"],
+    ] {
         let extra: Vec<String> = pair.iter().map(|s| s.to_string()).collect();
-        assert!(build(&d, "p", None, None, &extra).is_err(), "{pair:?} was accepted");
+        assert!(
+            build(&d, "p", None, None, &extra).is_err(),
+            "{pair:?} was accepted"
+        );
     }
 }
 
@@ -370,7 +473,10 @@ fn test_should_reject_forbidden_flag_with_separate_value() {
 fn test_should_reject_when_forbidden_arg_follows_allowed_ones() {
     // edge: position in the list does not matter
     let d = dirs();
-    let extra: Vec<String> = ["--max-price", "0.5", "--trust"].iter().map(|s| s.to_string()).collect();
+    let extra: Vec<String> = ["--max-price", "0.5", "--trust"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert!(build(&d, "p", None, None, &extra).is_err());
 }
 
@@ -378,7 +484,10 @@ fn test_should_reject_when_forbidden_arg_follows_allowed_ones() {
 fn test_should_reject_forbidden_flag_that_follows_an_allowed_flag_directly() {
     // edge: ["--max-price", "--trust"] still contains --trust
     let d = dirs();
-    let extra: Vec<String> = ["--max-price", "--trust"].iter().map(|s| s.to_string()).collect();
+    let extra: Vec<String> = ["--max-price", "--trust"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert!(build(&d, "p", None, None, &extra).is_err());
 }
 
@@ -386,7 +495,13 @@ fn test_should_reject_forbidden_flag_that_follows_an_allowed_flag_directly() {
 fn test_should_reject_writer_flags_even_with_other_extras() {
     // scope_out: writer flags never reach argv
     let d = dirs();
-    for w in ["--auto-approve", "--yolo", "--trust", "--worktree", "--continue"] {
+    for w in [
+        "--auto-approve",
+        "--yolo",
+        "--trust",
+        "--worktree",
+        "--continue",
+    ] {
         let extra = vec!["--max-price".to_string(), "1".to_string(), w.to_string()];
         assert!(build(&d, "p", None, None, &extra).is_err(), "{w} accepted");
     }
@@ -396,7 +511,10 @@ fn test_should_reject_writer_flags_even_with_other_extras() {
 fn test_should_pass_through_allowed_extra_args() {
     // edge: a non-forbidden extra arg is accepted and reaches argv with its value
     let d = dirs();
-    let extra: Vec<String> = ["--max-price", "0.5"].iter().map(|s| s.to_string()).collect();
+    let extra: Vec<String> = ["--max-price", "0.5"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let inv = build(&d, "p", None, None, &extra).expect("--max-price is not forbidden");
     assert_eq!(value_after(&inv.args, "--max-price"), Some("0.5"));
     assert_eq!(count(&inv.args, "--enabled-tools"), 3);
@@ -424,7 +542,15 @@ fn test_should_still_emit_exactly_one_of_each_controlled_flag_with_extras() {
     let d = dirs();
     let extra: Vec<String> = ["--max-price", "2"].iter().map(|s| s.to_string()).collect();
     let inv = build(&d, "p", None, None, &extra).unwrap();
-    for f in ["-p", "--output", "--workdir", "--output-dir", "--max-turns", "--time-limit", "--agent"] {
+    for f in [
+        "-p",
+        "--output",
+        "--workdir",
+        "--output-dir",
+        "--max-turns",
+        "--time-limit",
+        "--agent",
+    ] {
         assert_eq!(count(&inv.args, f), 1, "{f}");
     }
 }

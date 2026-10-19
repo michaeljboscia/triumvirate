@@ -45,8 +45,14 @@ fn new_seats_are_daemon_targets() {
 #[test]
 fn claude_and_deepseek_are_not_daemon_targets() {
     let targets = daemon_target_agents();
-    assert!(!targets.contains(&"claude"), "claude must not be a daemon target");
-    assert!(!targets.contains(&"deepseek"), "deepseek must not be a daemon target");
+    assert!(
+        !targets.contains(&"claude"),
+        "claude must not be a daemon target"
+    );
+    assert!(
+        !targets.contains(&"deepseek"),
+        "deepseek must not be a daemon target"
+    );
 }
 
 // REQ-004: the existing spawnable peers gemini, codex and grok remain daemon targets.

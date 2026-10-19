@@ -261,7 +261,10 @@ impl QwenStreamParser {
                 // raw text, unnumbered, so the lines it SHOWED come from the call's 0-based `offset` plus the result's
                 // line count, or from a truncation notice's "Showing lines A-B" when Qwen cut the file.
                 if !failed && rec.tool == "read_file" {
-                    let text = block.get("content").and_then(Value::as_str).unwrap_or_default();
+                    let text = block
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     rec.returned_lines = qwen_returned_lines(rec.args_json.as_deref(), text);
                 }
                 let ev = event(
@@ -316,7 +319,9 @@ impl QwenStreamParser {
 fn qwen_returned_lines(args_json: Option<&str>, text: &str) -> Vec<(u64, u64)> {
     if let Some(i) = text.find("Showing lines ") {
         let rest = &text[i + "Showing lines ".len()..];
-        let mut parts = rest.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty());
+        let mut parts = rest
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty());
         if let (Some(a), Some(b)) = (parts.next(), parts.next())
             && let (Ok(a), Ok(b)) = (a.parse::<u64>(), b.parse::<u64>())
             && a >= 1
@@ -536,7 +541,9 @@ mod tests {
             }
             p.finish(Some(0)).expect("live stream parses")
         };
-        let t1 = parse(include_str!("../tests/fixtures/qwen-0.25.2-live-turn1-20261019.jsonl"));
+        let t1 = parse(include_str!(
+            "../tests/fixtures/qwen-0.25.2-live-turn1-20261019.jsonl"
+        ));
         let t2 = parse(include_str!(
             "../tests/fixtures/qwen-0.25.2-live-turn2-resume-20261019.jsonl"
         ));
@@ -566,9 +573,15 @@ mod tests {
             .expect("a read_file call");
         assert_eq!(call.returned_lines, vec![(1, 3)]);
         assert_eq!(call.success, Some(true));
-        assert_eq!(qwen_returned_lines(Some(r#"{"offset":10}"#), "a\nb\n"), vec![(11, 12)]);
         assert_eq!(
-            qwen_returned_lines(None, "IMPORTANT: truncated. Status: Showing lines 1-2000 of 9000 total lines.\nx"),
+            qwen_returned_lines(Some(r#"{"offset":10}"#), "a\nb\n"),
+            vec![(11, 12)]
+        );
+        assert_eq!(
+            qwen_returned_lines(
+                None,
+                "IMPORTANT: truncated. Status: Showing lines 1-2000 of 9000 total lines.\nx"
+            ),
             vec![(1, 2000)]
         );
         assert!(qwen_returned_lines(None, "").is_empty());

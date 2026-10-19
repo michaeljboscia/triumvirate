@@ -12,13 +12,13 @@
 //!   target is untouched", the strongest form the spec supports.
 //! SPEC_AMBIGUITY: the spec does not state the module path. Tests assume `daemon_core::seat_lock` is publicly reachable.
 
-use daemon_core::seat_lock::{acquire_seat_lock, SeatLockGuard};
+use daemon_core::seat_lock::{SeatLockGuard, acquire_seat_lock};
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -50,7 +50,11 @@ fn lock_file_is_created_at_home_locks_seat() {
     let home = home_with_locks();
     let _guard: SeatLockGuard = acquire_seat_lock(home.path(), "kimi").expect("acquire kimi");
     let lock_file: PathBuf = home.path().join("locks").join("kimi");
-    assert!(lock_file.is_file(), "expected lock file at {}", lock_file.display());
+    assert!(
+        lock_file.is_file(),
+        "expected lock file at {}",
+        lock_file.display()
+    );
 }
 
 // FEAT-010 / pid.rs pattern: the lock is the fd, never the contents. The file stays zero bytes while held and after release.
@@ -60,9 +64,19 @@ fn lock_file_is_never_written() {
     let lock_file = home.path().join("locks").join("qwen");
     {
         let _guard = acquire_seat_lock(home.path(), "qwen").expect("acquire qwen");
-        assert_eq!(std::fs::metadata(&lock_file).expect("stat while held").len(), 0);
+        assert_eq!(
+            std::fs::metadata(&lock_file)
+                .expect("stat while held")
+                .len(),
+            0
+        );
     }
-    assert_eq!(std::fs::metadata(&lock_file).expect("stat after release").len(), 0);
+    assert_eq!(
+        std::fs::metadata(&lock_file)
+            .expect("stat after release")
+            .len(),
+        0
+    );
 }
 
 // REQ-053: one lock per seat, so different seats never block each other.
@@ -80,7 +94,9 @@ fn different_seats_do_not_block_each_other() {
         };
         let _ = tx.send(outcome);
     });
-    let outcome = rx.recv_timeout(HANG_GUARD).expect("different seats must not block");
+    let outcome = rx
+        .recv_timeout(HANG_GUARD)
+        .expect("different seats must not block");
     assert_eq!(outcome, Ok(()));
     worker.join().expect("worker join");
 }
@@ -107,9 +123,13 @@ fn second_acquire_blocks_until_first_guard_drops() {
     log.lock().expect("log lock").push("first-released");
     drop(first);
 
-    rx.recv_timeout(HANG_GUARD).expect("waiter must acquire after the first guard drops");
+    rx.recv_timeout(HANG_GUARD)
+        .expect("waiter must acquire after the first guard drops");
     waiter.join().expect("waiter join");
-    assert_eq!(*log.lock().expect("log lock"), vec!["first-released", "second-acquired"]);
+    assert_eq!(
+        *log.lock().expect("log lock"),
+        vec!["first-released", "second-acquired"]
+    );
 }
 
 // REQ-053 / concurrency_limit = 1: eight contending threads never hold the seat at the same time.
@@ -123,8 +143,12 @@ fn concurrency_limit_is_one_under_contention() {
 
     let handles: Vec<_> = (0..8)
         .map(|_| {
-            let (p, active, max_seen, completed) =
-                (path.clone(), Arc::clone(&active), Arc::clone(&max_seen), Arc::clone(&completed));
+            let (p, active, max_seen, completed) = (
+                path.clone(),
+                Arc::clone(&active),
+                Arc::clone(&max_seen),
+                Arc::clone(&completed),
+            );
             thread::spawn(move || {
                 let guard = acquire_seat_lock(&p, "deepseek").expect("contended acquire");
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -138,8 +162,16 @@ fn concurrency_limit_is_one_under_contention() {
     for h in handles {
         h.join().expect("contender join");
     }
-    assert_eq!(max_seen.load(Ordering::SeqCst), 1, "more than one holder at once");
-    assert_eq!(completed.load(Ordering::SeqCst), 8, "every contender must acquire and release");
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "more than one holder at once"
+    );
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        8,
+        "every contender must acquire and release"
+    );
 }
 
 // REQ-053 / FEAT-010 release on drop: the same thread can take the seat again after its guard drops.
@@ -154,7 +186,8 @@ fn guard_drop_releases_seat_for_reacquire() {
         let _second = acquire_seat_lock(&path, "grok").expect("reacquire after drop");
         let _ = tx.send(());
     });
-    rx.recv_timeout(HANG_GUARD).expect("reacquire after drop must not block");
+    rx.recv_timeout(HANG_GUARD)
+        .expect("reacquire after drop must not block");
     worker.join().expect("worker join");
 }
 
@@ -170,7 +203,8 @@ fn same_seat_in_different_homes_does_not_block() {
         let _gb = acquire_seat_lock(&b, "kimi").expect("home b acquire");
         let _ = tx.send(());
     });
-    rx.recv_timeout(HANG_GUARD).expect("separate homes must not block each other");
+    rx.recv_timeout(HANG_GUARD)
+        .expect("separate homes must not block each other");
     worker.join().expect("worker join");
 }
 
@@ -178,7 +212,8 @@ fn same_seat_in_different_homes_does_not_block() {
 // The holder is this test binary re-run with --exact on the child test below. It only runs when the env vars are set.
 #[test]
 fn gauntlet_t105_child_holder() {
-    let (Ok(home), Ok(seat)) = (std::env::var(CHILD_HOME_ENV), std::env::var(CHILD_SEAT_ENV)) else {
+    let (Ok(home), Ok(seat)) = (std::env::var(CHILD_HOME_ENV), std::env::var(CHILD_SEAT_ENV))
+    else {
         return;
     };
     let _guard = acquire_seat_lock(Path::new(&home), &seat).expect("child acquire");
@@ -195,7 +230,12 @@ fn killed_holder_process_releases_seat() {
 
     let exe = std::env::current_exe().expect("current test exe");
     let child = Command::new(exe)
-        .args(["--exact", "gauntlet_t105_child_holder", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "gauntlet_t105_child_holder",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD_HOME_ENV, &path)
         .env(CHILD_SEAT_ENV, "kimi")
         .stdout(Stdio::piped())
@@ -232,7 +272,8 @@ fn killed_holder_process_releases_seat() {
     // Kill the holder. The kernel must release the flock, so the waiter gets the seat.
     child.0.kill().expect("kill holder");
     child.0.wait().expect("reap holder");
-    rx.recv_timeout(HANG_GUARD).expect("seat must be released when the holder is killed");
+    rx.recv_timeout(HANG_GUARD)
+        .expect("seat must be released when the holder is killed");
     waiter.join().expect("waiter join");
 }
 
@@ -245,9 +286,13 @@ fn symlinked_seat_file_is_refused_and_outside_target_untouched() {
     std::fs::write(&target, "outside-original").expect("write outside target");
     symlink(&target, home.path().join("locks").join("kimi")).expect("plant symlink");
 
-    let err = acquire_seat_lock(home.path(), "kimi").expect_err("symlinked seat file must be refused");
+    let err =
+        acquire_seat_lock(home.path(), "kimi").expect_err("symlinked seat file must be refused");
     assert!(!err.is_empty(), "refusal must carry a message");
-    assert_eq!(std::fs::read_to_string(&target).expect("read outside target"), "outside-original");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read outside target"),
+        "outside-original"
+    );
 }
 
 // REQ-053 / spec: a locks directory that is itself a link must not send the lock outside $TRIUMVIRATE_HOME/locks.
@@ -257,8 +302,14 @@ fn symlinked_locks_directory_is_refused_and_outside_dir_untouched() {
     let outside = tempfile::tempdir().expect("outside tempdir");
     symlink(outside.path(), home.path().join("locks")).expect("plant locks symlink");
 
-    let err = acquire_seat_lock(home.path(), "kimi").expect_err("symlinked locks dir must be refused");
+    let err =
+        acquire_seat_lock(home.path(), "kimi").expect_err("symlinked locks dir must be refused");
     assert!(!err.is_empty(), "refusal must carry a message");
-    let entries = std::fs::read_dir(outside.path()).expect("read outside dir").count();
-    assert_eq!(entries, 0, "no lock file may be created outside the locks directory");
+    let entries = std::fs::read_dir(outside.path())
+        .expect("read outside dir")
+        .count();
+    assert_eq!(
+        entries, 0,
+        "no lock file may be created outside the locks directory"
+    );
 }

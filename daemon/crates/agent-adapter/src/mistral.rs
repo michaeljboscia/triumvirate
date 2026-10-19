@@ -199,7 +199,9 @@ impl MistralStreamParser {
         fn walk(v: &Value, out: &mut Vec<Value>) {
             match v {
                 Value::Object(m) => {
-                    if m.get("role").and_then(Value::as_str) == Some("tool") && m.contains_key("tool_call_id") {
+                    if m.get("role").and_then(Value::as_str) == Some("tool")
+                        && m.contains_key("tool_call_id")
+                    {
                         out.push(v.clone());
                         return;
                     }
@@ -212,11 +214,17 @@ impl MistralStreamParser {
             }
         }
         for line in journal_jsonl.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
             let mut found = Vec::new();
             walk(&v, &mut found);
             for m in found {
-                let id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or_default().to_string();
+                let id = m
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 if id.is_empty() || seen.contains(&id) {
                     continue;
                 }
@@ -242,8 +250,14 @@ impl MistralStreamParser {
             }
         }
         let mut results = reads.into_iter();
-        for rec in self.tool_calls.iter_mut().filter(|r| r.kind == ToolKind::ReadFile) {
-            let Some((ok, lines)) = results.next() else { break };
+        for rec in self
+            .tool_calls
+            .iter_mut()
+            .filter(|r| r.kind == ToolKind::ReadFile)
+        {
+            let Some((ok, lines)) = results.next() else {
+                break;
+            };
             rec.success = Some(ok);
             rec.returned_lines = lines;
         }
@@ -584,7 +598,9 @@ mod tests {
     #[test]
     fn live_journal_read_result_records_the_lines_it_showed() {
         let mut p = MistralStreamParser::new();
-        for line in include_str!("../tests/fixtures/mistral-2.26.1-live-read-20261019.jsonl").lines() {
+        for line in
+            include_str!("../tests/fixtures/mistral-2.26.1-live-read-20261019.jsonl").lines()
+        {
             p.parse_line(line);
         }
         p.ingest_journal(include_str!(
@@ -598,5 +614,4 @@ mod tests {
         assert_eq!(read.returned_lines, vec![(1, 3)]);
         assert_eq!(read.success, Some(true));
     }
-
 }

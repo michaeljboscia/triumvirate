@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use mcp_bridge::seat_gate::{
-    installed_cli_version, register_installed_cli_version, seat_gate, Origin, Refusal, RefusalCode, Surface,
+    Origin, Refusal, RefusalCode, Surface, installed_cli_version, register_installed_cli_version,
+    seat_gate,
 };
 
 const ENV_KEYS: [&str; 4] = [
@@ -24,10 +25,17 @@ const ENV_KEYS: [&str; 4] = [
 ];
 
 /// Launch seats and the installed CLI pins (A-9): kimi 2.2.0, vibe 2.26.1, qwen 0.25.2.
-const LAUNCH_SEATS: [(&str, &str); 3] = [("kimi", "2.2.0"), ("mistral", "2.26.1"), ("qwen", "0.25.2")];
+const LAUNCH_SEATS: [(&str, &str); 3] =
+    [("kimi", "2.2.0"), ("mistral", "2.26.1"), ("qwen", "0.25.2")];
 
 const ALLOWED_SURFACES: [&str; 4] = ["AskAgent", "Session", "Jury", "DoctorLiveProbe"];
-const DEFERRED_SURFACES: [&str; 5] = ["PeerReviewRotation", "FleetSpawn", "FleetTemporal", "AbeDispatch", "Prewarm"];
+const DEFERRED_SURFACES: [&str; 5] = [
+    "PeerReviewRotation",
+    "FleetSpawn",
+    "FleetTemporal",
+    "AbeDispatch",
+    "Prewarm",
+];
 const ALL_SURFACES: [&str; 10] = [
     "AskAgent",
     "Session",
@@ -68,7 +76,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let saved: Vec<(&'static str, Option<OsString>)> = ENV_KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+    let saved: Vec<(&'static str, Option<OsString>)> =
+        ENV_KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
     let home = tempfile::tempdir().expect("tempdir");
     // SAFETY: serialized by LOCK; restored by EnvRestore on drop.
     unsafe {
@@ -77,7 +86,11 @@ fn fixture() -> Fixture {
         }
         std::env::set_var("TRIUMVIRATE_HOME", home.path());
     }
-    Fixture { _restore: EnvRestore(saved), _lock: lock, home }
+    Fixture {
+        _restore: EnvRestore(saved),
+        _lock: lock,
+        home,
+    }
 }
 
 fn enable(seat: &str) {
@@ -102,7 +115,8 @@ fn write_verified(home: &Path, seat: &str, cli_version: &str) {
 
 fn write_suspended(home: &Path, seat: &str, reason: &str) {
     let body = format!(r#"{{"reason":"{reason}","at":"2026-10-18T12:00:00Z"}}"#);
-    std::fs::write(seat_dir(home, seat).join("suspended.json"), body).expect("write suspended.json");
+    std::fs::write(seat_dir(home, seat).join("suspended.json"), body)
+        .expect("write suspended.json");
 }
 
 /// Configured, registered at `version`, and verified against that version.
@@ -157,12 +171,24 @@ fn expect_refused(res: Result<(), Refusal>, ctx: &str) -> (&'static str, String)
 /// REQ-091: each refusal code renders its exact snake_case string, which starts every payload.
 #[test]
 fn refusal_codes_render_exact_strings() {
-    assert_eq!(RefusalCode::SeatNotConfigured.as_str(), "seat_not_configured");
+    assert_eq!(
+        RefusalCode::SeatNotConfigured.as_str(),
+        "seat_not_configured"
+    );
     assert_eq!(RefusalCode::SeatSuspended.as_str(), "seat_suspended");
     assert_eq!(RefusalCode::SeatUnverified.as_str(), "seat_unverified");
-    assert_eq!(RefusalCode::SeatSurfaceRefused.as_str(), "seat_surface_refused");
-    assert_eq!(RefusalCode::SeatSurfaceDeferred.as_str(), "seat_surface_deferred");
-    assert_eq!(RefusalCode::SeatCannotWriteHere.as_str(), "seat_cannot_write_here");
+    assert_eq!(
+        RefusalCode::SeatSurfaceRefused.as_str(),
+        "seat_surface_refused"
+    );
+    assert_eq!(
+        RefusalCode::SeatSurfaceDeferred.as_str(),
+        "seat_surface_deferred"
+    );
+    assert_eq!(
+        RefusalCode::SeatCannotWriteHere.as_str(),
+        "seat_cannot_write_here"
+    );
 }
 
 // ---------- REQ-091: installed version registry (fails closed) ----------
@@ -191,18 +217,30 @@ fn registered_version_reads_back_and_overwrites() {
 #[test]
 fn not_configured_refuses_with_exact_payload() {
     let _f = fixture();
-    let (code, msg) = expect_refused(seat_gate("kimi", Surface::AskAgent, Origin::Interactive, false), "kimi ask");
+    let (code, msg) = expect_refused(
+        seat_gate("kimi", Surface::AskAgent, Origin::Interactive, false),
+        "kimi ask",
+    );
     assert_eq!(code, "seat_not_configured");
-    assert_eq!(msg, "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon");
+    assert_eq!(
+        msg,
+        "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
+    );
 }
 
 /// REQ-091 precedence 1 over the surface rule: unconfigured qwen on a deferred surface is still not_configured.
 #[test]
 fn not_configured_beats_deferred_surface() {
     let _f = fixture();
-    let (code, msg) = expect_refused(seat_gate("qwen", Surface::Prewarm, Origin::Unattended, false), "qwen prewarm");
+    let (code, msg) = expect_refused(
+        seat_gate("qwen", Surface::Prewarm, Origin::Unattended, false),
+        "qwen prewarm",
+    );
     assert_eq!(code, "seat_not_configured");
-    assert_eq!(msg, "seat_not_configured: qwen: set TRIUMVIRATE_ENABLE_QWEN=1 and restart the daemon");
+    assert_eq!(
+        msg,
+        "seat_not_configured: qwen: set TRIUMVIRATE_ENABLE_QWEN=1 and restart the daemon"
+    );
 }
 
 /// REQ-091 precedence 3 and A-2: configured but unverified refuses ask, while DoctorLiveProbe (how a seat gets
@@ -212,11 +250,23 @@ fn unverified_refuses_ask_but_live_probe_is_allowed() {
     let f = fixture();
     enable("kimi");
     register_installed_cli_version("kimi", "2.2.0");
-    let (code, msg) = expect_refused(seat_gate("kimi", Surface::AskAgent, Origin::Interactive, true), "kimi ask");
+    let (code, msg) = expect_refused(
+        seat_gate("kimi", Surface::AskAgent, Origin::Interactive, true),
+        "kimi ask",
+    );
     assert_eq!(code, "seat_unverified");
-    assert_eq!(msg, "seat_unverified: kimi: run triumvirate doctor --live in a terminal");
-    expect_ok(seat_gate("kimi", Surface::DoctorLiveProbe, Origin::Interactive, true), "probe with tty");
-    expect_ok(seat_gate("kimi", Surface::DoctorLiveProbe, Origin::Unattended, false), "probe without tty (A-2)");
+    assert_eq!(
+        msg,
+        "seat_unverified: kimi: run triumvirate doctor --live in a terminal"
+    );
+    expect_ok(
+        seat_gate("kimi", Surface::DoctorLiveProbe, Origin::Interactive, true),
+        "probe with tty",
+    );
+    expect_ok(
+        seat_gate("kimi", Surface::DoctorLiveProbe, Origin::Unattended, false),
+        "probe without tty (A-2)",
+    );
     assert!(!f.home.path().join("seats/kimi/verified.json").exists());
 }
 
@@ -227,10 +277,19 @@ fn suspended_beats_unverified_and_applies_to_probe() {
     enable("kimi");
     register_installed_cli_version("kimi", "2.2.0");
     write_suspended(f.home.path(), "kimi", "quota exhausted");
-    let (code, msg) = expect_refused(seat_gate("kimi", Surface::AskAgent, Origin::Interactive, false), "kimi ask");
+    let (code, msg) = expect_refused(
+        seat_gate("kimi", Surface::AskAgent, Origin::Interactive, false),
+        "kimi ask",
+    );
     assert_eq!(code, "seat_suspended");
-    assert_eq!(msg, "seat_suspended: kimi: quota exhausted (run: triumvirate seat clear kimi)");
-    let (probe_code, _) = expect_refused(seat_gate("kimi", Surface::DoctorLiveProbe, Origin::Interactive, true), "probe");
+    assert_eq!(
+        msg,
+        "seat_suspended: kimi: quota exhausted (run: triumvirate seat clear kimi)"
+    );
+    let (probe_code, _) = expect_refused(
+        seat_gate("kimi", Surface::DoctorLiveProbe, Origin::Interactive, true),
+        "probe",
+    );
     assert_eq!(probe_code, "seat_suspended");
 }
 
@@ -239,11 +298,20 @@ fn suspended_beats_unverified_and_applies_to_probe() {
 fn cli_version_change_flips_verified_to_unverified() {
     let f = fixture();
     make_available(&f, "mistral", "2.26.1");
-    expect_ok(seat_gate("mistral", Surface::AskAgent, Origin::Unattended, false), "mistral ask before upgrade");
+    expect_ok(
+        seat_gate("mistral", Surface::AskAgent, Origin::Unattended, false),
+        "mistral ask before upgrade",
+    );
     register_installed_cli_version("mistral", "2.27.0");
-    let (code, msg) = expect_refused(seat_gate("mistral", Surface::AskAgent, Origin::Unattended, false), "after upgrade");
+    let (code, msg) = expect_refused(
+        seat_gate("mistral", Surface::AskAgent, Origin::Unattended, false),
+        "after upgrade",
+    );
     assert_eq!(code, "seat_unverified");
-    assert_eq!(msg, "seat_unverified: mistral: run triumvirate doctor --live in a terminal");
+    assert_eq!(
+        msg,
+        "seat_unverified: mistral: run triumvirate doctor --live in a terminal"
+    );
     register_installed_cli_version("mistral", "2.26.1");
 }
 
@@ -253,9 +321,15 @@ fn passing_probe_takes_effect_without_restart() {
     let f = fixture();
     enable("qwen");
     register_installed_cli_version("qwen", "0.25.2");
-    expect_refused(seat_gate("qwen", Surface::Session, Origin::Interactive, false), "before probe");
+    expect_refused(
+        seat_gate("qwen", Surface::Session, Origin::Interactive, false),
+        "before probe",
+    );
     write_verified(f.home.path(), "qwen", "0.25.2");
-    expect_ok(seat_gate("qwen", Surface::Session, Origin::Interactive, false), "after probe");
+    expect_ok(
+        seat_gate("qwen", Surface::Session, Origin::Interactive, false),
+        "after probe",
+    );
 }
 
 // ---------- REQ-090 / A-2: surface table ----------
@@ -281,14 +355,25 @@ fn surface_table_matches_amendment_a2_for_every_launch_seat() {
                         assert_eq!(code, "seat_cannot_write_here", "{ctx}");
                         assert_eq!(
                             msg,
-                            format!("seat_cannot_write_here: {seat}: blind validators must write test files and {seat} is read-only"),
+                            format!(
+                                "seat_cannot_write_here: {seat}: blind validators must write test files and {seat} is read-only"
+                            ),
                             "{ctx}"
                         );
                     } else {
-                        assert!(DEFERRED_SURFACES.contains(&surface_name), "{ctx}: unclassified surface");
+                        assert!(
+                            DEFERRED_SURFACES.contains(&surface_name),
+                            "{ctx}: unclassified surface"
+                        );
                         let (code, msg) = expect_refused(res, &ctx);
                         assert_eq!(code, "seat_surface_deferred", "{ctx}");
-                        assert_eq!(msg, format!("seat_surface_deferred: {seat} on {surface_name} ships in v1.1"), "{ctx}");
+                        assert_eq!(
+                            msg,
+                            format!(
+                                "seat_surface_deferred: {seat} on {surface_name} ships in v1.1"
+                            ),
+                            "{ctx}"
+                        );
                     }
                     checked += 1;
                 }
@@ -303,7 +388,13 @@ fn surface_table_matches_amendment_a2_for_every_launch_seat() {
 fn unattended_ask_on_verified_seat_is_allowed() {
     let f = fixture();
     make_available(&f, "kimi", "2.2.0");
-    expect_ok(seat_gate("kimi", Surface::AskAgent, Origin::Unattended, false), "kimi unattended ask");
-    expect_ok(seat_gate("kimi", Surface::Jury, Origin::Unattended, false), "kimi unattended jury");
+    expect_ok(
+        seat_gate("kimi", Surface::AskAgent, Origin::Unattended, false),
+        "kimi unattended ask",
+    );
+    expect_ok(
+        seat_gate("kimi", Surface::Jury, Origin::Unattended, false),
+        "kimi unattended jury",
+    );
     assert!(f.home.path().join("seats/kimi/verified.json").exists());
 }

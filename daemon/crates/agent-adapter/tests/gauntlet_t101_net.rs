@@ -13,7 +13,8 @@ fn parse(lines: &[&str], exit: Option<i32>) -> SeatParsed {
     for line in lines {
         let _ = p.parse_line(line);
     }
-    p.finish(exit).expect("kimi finish returns Ok; outcomes live in SeatParsed")
+    p.finish(exit)
+        .expect("kimi finish returns Ok; outcomes live in SeatParsed")
 }
 
 fn outcome(p: &SeatParsed) -> String {
@@ -73,7 +74,10 @@ fn usage_is_not_reported_and_model_unknown() {
         (vec![], None),
     ] {
         let p = parse(&lines, exit);
-        assert!(matches!(p.usage, UsageReport::NotReported), "usage was not NotReported");
+        assert!(
+            matches!(p.usage, UsageReport::NotReported),
+            "usage was not NotReported"
+        );
         assert_eq!(p.served_model, None);
     }
 }
@@ -82,14 +86,20 @@ fn usage_is_not_reported_and_model_unknown() {
 #[test]
 fn retry_status_is_appended_to_nonzero_failure() {
     let p = parse(&[RETRY_429, TEXT], Some(1));
-    assert_eq!(outcome(&p), "Failure(nonzero_exit:kimi:1 last_retry_status=429)");
+    assert_eq!(
+        outcome(&p),
+        "Failure(nonzero_exit:kimi:1 last_retry_status=429)"
+    );
 }
 
 // REQ-052: the suffix carries the most recent retry's status, not the first.
 #[test]
 fn retry_suffix_uses_most_recent_status() {
     let p = parse(&[RETRY_429, RETRY_503], Some(1));
-    assert_eq!(outcome(&p), "Failure(nonzero_exit:kimi:1 last_retry_status=503)");
+    assert_eq!(
+        outcome(&p),
+        "Failure(nonzero_exit:kimi:1 last_retry_status=503)"
+    );
 }
 
 // REQ-052: a retry seen with an empty exit-0 stream appends the suffix to the empty-stream code.
@@ -142,7 +152,10 @@ fn malformed_line_returns_no_event() {
 // REQ-044: an unknown meta type is ignored, so a stream with only that line is the empty failure.
 #[test]
 fn unknown_meta_type_is_ignored() {
-    let p = parse(&[r#"{"role":"meta","type":"future.kind.v9","x":1}"#], Some(0));
+    let p = parse(
+        &[r#"{"role":"meta","type":"future.kind.v9","x":1}"#],
+        Some(0),
+    );
     assert_eq!(outcome(&p), "Failure(empty_or_unrecognized_stream:kimi)");
 }
 
@@ -177,7 +190,9 @@ fn tool_result_alone_is_empty_failure() {
 #[test]
 fn tool_call_with_empty_content_is_empty_failure() {
     let p = parse(
-        &[r#"{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"Read","arguments":"{\"path\":\"/x/y.txt\"}"}}]}"#],
+        &[
+            r#"{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"Read","arguments":"{\"path\":\"/x/y.txt\"}"}}]}"#,
+        ],
         Some(0),
     );
     assert_eq!(outcome(&p), "Failure(empty_or_unrecognized_stream:kimi)");
