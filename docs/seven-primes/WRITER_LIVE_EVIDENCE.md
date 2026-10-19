@@ -12,3 +12,12 @@
 
 ABE and fleet dispatch reach seat-run through the daemon binary (`current_exe`), so they use exactly this path once the
 W-1 binary is installed.
+
+## Through the daemon (fleet_spawn, engine temporal; W-1 installed at 076e0c4c)
+- fleet-1792395338491279000 (kimi + qwen, same file): kimi's member committed and merged; qwen's merge conflicted on the
+  shared file (expected: same path, different content) and the queue paused correctly.
+- fleet-1792395442683836000: both members wrote their files but committed nothing: LIVE BUG, `git add -A -- .
+  :!.triumvirate` fails once `.triumvirate/` is gitignored (the daemon writes that rule). Fixed in 076e0c4c with a
+  regression test that fails on the old line.
+- fleet-1792396094423501000 (after the fix): state `done`; `fleet(kimi)` b166479 (kimi.txt "Kimi") and `fleet(qwen)`
+  0f7557e (qwen.txt "Qwen") committed in their worktrees and both merged to the repo's main (70c37ef, 4ba2e04); tree clean.
