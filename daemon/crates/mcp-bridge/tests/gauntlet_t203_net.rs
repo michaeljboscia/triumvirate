@@ -28,14 +28,17 @@ const ENV_KEYS: [&str; 4] = [
 const LAUNCH_SEATS: [(&str, &str); 3] =
     [("kimi", "2.2.0"), ("mistral", "2.26.1"), ("qwen", "0.25.2")];
 
-const ALLOWED_SURFACES: [&str; 4] = ["AskAgent", "Session", "Jury", "DoctorLiveProbe"];
-const DEFERRED_SURFACES: [&str; 5] = [
-    "PeerReviewRotation",
+// W-1 (A-16): the writer surfaces AbeDispatch, FleetSpawn and FleetTemporal are allowed through `seat-run`.
+const ALLOWED_SURFACES: [&str; 7] = [
+    "AskAgent",
+    "Session",
+    "Jury",
+    "DoctorLiveProbe",
     "FleetSpawn",
     "FleetTemporal",
     "AbeDispatch",
-    "Prewarm",
 ];
+const DEFERRED_SURFACES: [&str; 2] = ["PeerReviewRotation", "Prewarm"];
 const ALL_SURFACES: [&str; 10] = [
     "AskAgent",
     "Session",

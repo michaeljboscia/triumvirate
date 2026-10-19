@@ -147,6 +147,10 @@ enum CliCommand {
     Doctor(DoctorArgs),
     /// Seven Primes seat controls (REQ-091).
     Seat(SeatArgs),
+    /// Internal (W-1): run one new seat (kimi, mistral, qwen) as a WRITER in a git worktree and commit its work.
+    /// Launched by ABE and fleet. Not for hand use.
+    #[command(hide = true)]
+    SeatRun(SeatRunCliArgs),
     /// Bridge stdio MCP to daemon HTTP endpoint.
     Proxy,
     /// Watch live agent streaming events.
@@ -174,6 +178,24 @@ struct SeatArgs {
 enum SeatCommand {
     /// Lift a seat's suspension: removes $TRIUMVIRATE_HOME/seats/<seat>/suspended.json.
     Clear { seat: String },
+}
+
+#[derive(Debug, clap::Args)]
+struct SeatRunCliArgs {
+    #[arg(long)]
+    seat: String,
+    /// abe, fleet or fleet-temporal.
+    #[arg(long)]
+    surface: String,
+    #[arg(long)]
+    worktree: PathBuf,
+    /// Read, then deleted before the seat runs.
+    #[arg(long)]
+    prompt_file: PathBuf,
+    #[arg(long)]
+    commit_message: String,
+    #[arg(long)]
+    timeout_secs: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1889,6 +1911,18 @@ async fn main() -> anyhow::Result<()> {
         }
         CliCommand::Doctor(args) => {
             run_doctor(args.live).await?;
+        }
+        CliCommand::SeatRun(a) => {
+            let code = agent_exec::run_seat_run(agent_exec::SeatRunArgs {
+                seat: a.seat,
+                surface: a.surface,
+                worktree: a.worktree,
+                prompt_file: a.prompt_file,
+                commit_message: a.commit_message,
+                timeout_secs: a.timeout_secs,
+            })
+            .await;
+            std::process::exit(code);
         }
         CliCommand::Seat(args) => match args.command {
             SeatCommand::Clear { seat } => {

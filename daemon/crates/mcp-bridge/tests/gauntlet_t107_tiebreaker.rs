@@ -45,19 +45,22 @@ fn surface_case(index: usize) -> (Surface, &'static str, SurfaceOutcome, bool) {
         6 => (
             Surface::FleetSpawn,
             "FleetSpawn",
-            SurfaceOutcome::Deferred,
+            // W-1 (A-16): a writer surface through `triumvirate seat-run`.
+            SurfaceOutcome::Allowed,
             false,
         ),
         7 => (
             Surface::FleetTemporal,
             "FleetTemporal",
-            SurfaceOutcome::Deferred,
+            // W-1 (A-16): a writer surface through `triumvirate seat-run`.
+            SurfaceOutcome::Allowed,
             false,
         ),
         8 => (
             Surface::AbeDispatch,
             "AbeDispatch",
-            SurfaceOutcome::Deferred,
+            // W-1 (A-16): a writer surface through `triumvirate seat-run`.
+            SurfaceOutcome::Allowed,
             false,
         ),
         9 => (Surface::Prewarm, "Prewarm", SurfaceOutcome::Deferred, false),

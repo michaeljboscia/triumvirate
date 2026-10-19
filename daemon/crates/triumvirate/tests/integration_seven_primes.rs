@@ -448,6 +448,7 @@ exit "$(cat "$D/exit")"
             extra_args: &[],
             max_turns: 12,
             time_limit: Duration::from_secs(CONNECTOR_TIMEOUT_SECS),
+            mode: mcp_bridge::containment::SeatMode::ReadOnly,
         };
         match seat {
             "kimi" => mcp_bridge::kimi::build_kimi_invocation(&req),

@@ -6746,6 +6746,7 @@ async fn run_new_seat_in(
         extra_args: &[],
         max_turns: 12,
         time_limit: timeout_duration,
+        mode: mcp_bridge::containment::SeatMode::ReadOnly,
     };
     // The builder's errors (prompt over 64 KiB, forbidden extra args) surface verbatim.
     let invocation = build_new_seat_invocation(seat, &req).map_err(anyhow::Error::msg)?;
@@ -6964,6 +6965,583 @@ fn seatbelt_wrap(
     args: &[String],
     _seat_home: &Path,
     _output_dir: &Path,
+) -> Result<(String, Vec<String>), String> {
+    Ok((bin.to_string(), args.to_vec()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Seven Primes W-1: `triumvirate seat-run`, the writer runner for the new seats (kimi, mistral, qwen). ABE and fleet
+// spawn this binary in a worktree; it applies the same containment as `run_new_seat` with the WRITER argv and the
+// writer seatbelt, audits the parent repo and the git metadata, and commits on the seat's behalf (no new seat runs a
+// shell, so none can commit).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Exit code: the seat ran and changed nothing in the worktree.
+pub(crate) const SEAT_RUN_EXIT_NO_CHANGES: i32 = 3;
+/// Exit code: `--timeout-secs` expired; the vendor's process group was killed, nothing committed.
+pub(crate) const SEAT_RUN_EXIT_TIMEOUT: i32 = 124;
+/// Exit code: SIGTERM or SIGINT; the vendor's process group was killed, nothing committed.
+pub(crate) const SEAT_RUN_EXIT_SIGNALLED: i32 = 143;
+/// The writer's turn budget where the CLI has one (Mistral `--max-turns`, Qwen `--max-session-turns`). Read-only
+/// calls keep 12; a writer edits several files, and `--timeout-secs` is the real bound.
+const SEAT_RUN_WRITER_MAX_TURNS: u32 = 50;
+
+/// The parsed `triumvirate seat-run` flags.
+#[derive(Debug, Clone)]
+pub(crate) struct SeatRunArgs {
+    pub(crate) seat: String,
+    pub(crate) surface: String,
+    pub(crate) worktree: PathBuf,
+    pub(crate) prompt_file: PathBuf,
+    pub(crate) commit_message: String,
+    pub(crate) timeout_secs: u64,
+}
+
+/// `--surface` to the gate's surface: `abe` (ABE), `fleet` (legacy fleet) or `fleet-temporal` (Temporal fleet).
+pub(crate) fn seat_run_surface(name: &str) -> Result<mcp_bridge::seat_gate::Surface, String> {
+    use mcp_bridge::seat_gate::Surface;
+    match name {
+        "abe" => Ok(Surface::AbeDispatch),
+        "fleet" => Ok(Surface::FleetSpawn),
+        "fleet-temporal" => Ok(Surface::FleetTemporal),
+        other => Err(format!(
+            "seat_run_bad_surface: {other:?} (one of abe, fleet, fleet-temporal)"
+        )),
+    }
+}
+
+enum SeatRunDone {
+    Committed(String),
+    NoChanges,
+}
+
+struct SeatRunFail {
+    exit: i32,
+    message: String,
+}
+
+fn seat_run_fail(message: impl Into<String>) -> SeatRunFail {
+    SeatRunFail {
+        exit: 1,
+        message: message.into(),
+    }
+}
+
+/// Run one writer turn and return the process exit code. The final status is ONE line on stderr, never stdout
+/// (stdout carries the vendor child's stream): `seat-run: committed <sha>`, `seat-run: no_changes ...` or
+/// `seat-run: <error code>: <detail>`.
+pub(crate) async fn run_seat_run(args: SeatRunArgs) -> i32 {
+    let seat = normalize_agent_name(&args.seat);
+    tracing::info!(seat = %seat, "seat-run started");
+    let (code, line) = match seat_run_inner(&seat, &args).await {
+        Ok(SeatRunDone::Committed(sha)) => (0, format!("committed {sha}")),
+        Ok(SeatRunDone::NoChanges) => (
+            SEAT_RUN_EXIT_NO_CHANGES,
+            format!("no_changes seat_made_no_changes:{seat}"),
+        ),
+        Err(f) => (f.exit, f.message),
+    };
+    tracing::info!(seat = %seat, exit = code, "seat-run finished");
+    eprintln!("seat-run: {line}");
+    code
+}
+
+async fn seat_run_inner(seat: &str, a: &SeatRunArgs) -> Result<SeatRunDone, SeatRunFail> {
+    // The prompt file is read and DELETED first, before the gate and long before the vendor runs, so it can never be
+    // read by the seat from its cwd or swept into the commit.
+    let prompt = fs::read_to_string(&a.prompt_file).map_err(|e| {
+        seat_run_fail(format!(
+            "seat_run_prompt_unreadable:{seat}: {}: {e}",
+            a.prompt_file.display()
+        ))
+    })?;
+    fs::remove_file(&a.prompt_file).map_err(|e| {
+        seat_run_fail(format!(
+            "seat_run_prompt_unreadable:{seat}: cannot remove {}: {e}",
+            a.prompt_file.display()
+        ))
+    })?;
+    let surface = seat_run_surface(&a.surface).map_err(seat_run_fail)?;
+    let profile = mcp_bridge::seat_profile::seat_profile(seat)
+        .filter(|_| NewSeatParser::for_seat(seat).is_some())
+        .ok_or_else(|| seat_run_fail(format!("not_a_new_seat: {seat}")))?;
+    let parser = NewSeatParser::for_seat(seat)
+        .ok_or_else(|| seat_run_fail(format!("not_a_new_seat: {seat}")))?;
+
+    // The gate compares verified.json with the installed CLI version, which the daemon registers at start; this is
+    // a fresh process, so register this seat's here (the binary resolved exactly as the run below resolves it).
+    if let Some(version) = mcp_bridge::new_seat_bin(seat)
+        .ok()
+        .and_then(|bin| crate::cli_ops::installed_version(Path::new(&bin)))
+    {
+        mcp_bridge::seat_gate::register_installed_cli_version(seat, &version);
+    }
+    mcp_bridge::seat_gate::seat_gate(
+        seat,
+        surface,
+        mcp_bridge::seat_gate::Origin::Unattended,
+        false,
+    )
+    .map_err(|r| seat_run_fail(r.message))?;
+
+    let worktree = fs::canonicalize(&a.worktree).map_err(|e| {
+        seat_run_fail(format!(
+            "seat_requires_worktree:{seat}: {}: {e}",
+            a.worktree.display()
+        ))
+    })?;
+    let dirs = mcp_bridge::containment::worktree_git_dirs(&worktree).map_err(|e| {
+        if e.starts_with("seat_") {
+            seat_run_fail(e)
+        } else {
+            seat_run_fail(format!("seat_run_git_unavailable:{seat}: {e}"))
+        }
+    })?;
+
+    let th = mcp_bridge::seat_state::triumvirate_home().map_err(seat_run_fail)?;
+    let seat_home = mcp_bridge::containment::seat_home(&th, seat).map_err(seat_run_fail)?;
+    mcp_bridge::containment::write_seat_files(&seat_home, profile).map_err(seat_run_fail)?;
+    // Resolved BEFORE the child's HOME moves to the seat home.
+    let bin = mcp_bridge::new_seat_bin(seat).map_err(seat_run_fail)?;
+    let mut env_add: Vec<(String, String)> = Vec::new();
+    if seat == "qwen" {
+        env_add.push(read_qwen_plan_key(&seat_home).map_err(seat_run_fail)?);
+    }
+
+    // T-207: one process per seat machine-wide, held until this function returns.
+    let _seat_lock = if profile.concurrency_limit == mcp_bridge::seat_profile::ConcurrencyLimit::One
+    {
+        let (lock_home, lock_seat) = (th.clone(), seat.to_string());
+        let guard = tokio::task::spawn_blocking(move || {
+            daemon_core::seat_lock::acquire_seat_lock(&lock_home, &lock_seat)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
+        .map_err(|e| seat_run_fail(format!("seat_lock_unavailable:{seat}: {e}")))?;
+        Some(guard)
+    } else {
+        None
+    };
+
+    let output_dir = new_seat_output_dir(seat).map_err(seat_run_fail)?;
+    let result = seat_run_in(
+        seat,
+        profile,
+        parser,
+        &bin,
+        &seat_home,
+        &output_dir,
+        env_add,
+        &prompt,
+        &worktree,
+        &dirs,
+        a,
+    )
+    .await;
+    let _ = fs::remove_dir_all(&output_dir);
+    result
+}
+
+/// SIGKILL a process group by its leader's pid (the vendor child is its own group leader).
+#[cfg(unix)]
+fn kill_seat_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // SAFETY: kill with a negative pid signals that process group; no memory is touched.
+        unsafe {
+            let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_seat_group(_pid: Option<u32>) {}
+
+/// Write one line of the vendor child's output through to this process's stream at once (never buffered).
+fn pass_through(line: &str, to_stderr: bool) {
+    use std::io::Write;
+    if to_stderr {
+        let mut e = std::io::stderr().lock();
+        let _ = writeln!(e, "{line}");
+        let _ = e.flush();
+    } else {
+        let mut o = std::io::stdout().lock();
+        let _ = writeln!(o, "{line}");
+        let _ = o.flush();
+    }
+}
+
+/// The before/after state the writer must not touch: the parent repo's working tree (`snapshot_cwd` of the main
+/// worktree) and the git metadata (`snapshot_git_metadata`).
+async fn seat_run_snapshot(
+    worktree: &Path,
+    dirs: &mcp_bridge::containment::WorktreeGitDirs,
+) -> Result<
+    (
+        mcp_bridge::containment::RepoSnapshot,
+        mcp_bridge::containment::RepoSnapshot,
+    ),
+    String,
+> {
+    let parent = snapshot_cwd_off_runtime(dirs.main_worktree.clone()).await?;
+    let (wt, d) = (worktree.to_path_buf(), dirs.clone());
+    let meta = tokio::task::spawn_blocking(move || {
+        mcp_bridge::containment::snapshot_git_metadata(&wt, &d)
+    })
+    .await
+    .map_err(|e| format!("snapshot task failed: {e}"))??;
+    Ok((parent, meta))
+}
+
+async fn git_in_worktree(worktree: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seat_run_in(
+    seat: &str,
+    profile: &mcp_bridge::seat_profile::SeatProfile,
+    mut parser: NewSeatParser,
+    bin: &str,
+    seat_home: &Path,
+    output_dir: &Path,
+    mut env_add: Vec<(String, String)>,
+    prompt: &str,
+    worktree: &Path,
+    dirs: &mcp_bridge::containment::WorktreeGitDirs,
+    a: &SeatRunArgs,
+) -> Result<SeatRunDone, SeatRunFail> {
+    let time_limit = Duration::from_secs(a.timeout_secs.max(1));
+    let req = mcp_bridge::containment::SeatRequest {
+        prompt,
+        cwd: worktree,
+        seat_home,
+        output_dir,
+        model: None,
+        resume_session_id: None,
+        extra_args: &[],
+        max_turns: SEAT_RUN_WRITER_MAX_TURNS,
+        // The vendor's own time limit where it has one (Mistral `--time-limit`, Qwen `--max-wall-time`).
+        time_limit,
+        mode: mcp_bridge::containment::SeatMode::Writer,
+    };
+    let invocation = build_new_seat_invocation(seat, &req).map_err(seat_run_fail)?;
+    // The credential scrub and seat env apply to the vendor CHILD only; this process keeps its own env.
+    let base: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| !invocation.env_remove.iter().any(|p| env_name_matches(k, p)))
+        .collect();
+    let mut add = invocation.env_add.clone();
+    add.append(&mut env_add);
+    let child_env = mcp_bridge::containment::child_env(&base, profile, seat_home, &add)
+        .map_err(seat_run_fail)?;
+    let (program, program_args) =
+        writer_seatbelt_wrap(seat, bin, &invocation.args, seat_home, output_dir, worktree)
+            .map_err(seat_run_fail)?;
+
+    let (parent_before, meta_before) = seat_run_snapshot(worktree, dirs)
+        .await
+        .map_err(|e| seat_run_fail(format!("writer_audit_unavailable:{seat}: {e}")))?;
+
+    // Installed before the spawn, so a SIGTERM from here on reaches the handler and kills the vendor's group.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| seat_run_fail(format!("seat_run_signal_unavailable:{seat}: {e}")))?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|e| seat_run_fail(format!("seat_run_signal_unavailable:{seat}: {e}")))?;
+
+    let mut command = Command::new(&program);
+    command
+        .args(&program_args)
+        .current_dir(worktree)
+        .env_clear()
+        .envs(child_env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    configure_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| seat_run_fail(format!("spawn_failed:{seat}: {bin}: {e}")))?;
+    let pid = child.id();
+    tracing::info!(seat = %seat, "seat-run vendor started");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| seat_run_fail(format!("spawn_failed:{seat}: stdout missing")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| seat_run_fail(format!("spawn_failed:{seat}: stderr missing")))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut tail: VecDeque<String> = VecDeque::new();
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            pass_through(&line, true);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if tail.len() == 40 {
+                tail.pop_front();
+            }
+            tail.push_back(trimmed.to_string());
+        }
+        tail.into_iter().collect::<Vec<_>>().join("\n")
+    });
+
+    enum Ended {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        TimedOut,
+        Signalled(&'static str),
+    }
+    let ended = {
+        let mut reader = BufReader::new(stdout).lines();
+        let parser = &mut parser;
+        let child = &mut child;
+        let run = async move {
+            while let Some(line) = reader.next_line().await? {
+                pass_through(&line, false);
+                parser.parse_line(&line);
+            }
+            child.wait().await
+        };
+        tokio::select! {
+            r = run => Ended::Exited(r),
+            _ = sleep(time_limit) => Ended::TimedOut,
+            _ = term.recv() => Ended::Signalled("SIGTERM"),
+            _ = int.recv() => Ended::Signalled("SIGINT"),
+        }
+    };
+    // Whatever happened, nothing in the vendor's group may outlive the run (or keep writing after the audit).
+    kill_seat_group(pid);
+    let status = match ended {
+        Ended::Exited(r) => r,
+        Ended::TimedOut | Ended::Signalled(_) => {
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return Err(match ended {
+                Ended::TimedOut => SeatRunFail {
+                    exit: SEAT_RUN_EXIT_TIMEOUT,
+                    message: format!(
+                        "seat_timed_out:{seat}: no commit after {}s; the vendor's process group was killed",
+                        time_limit.as_secs()
+                    ),
+                },
+                Ended::Signalled(sig) => SeatRunFail {
+                    exit: SEAT_RUN_EXIT_SIGNALLED,
+                    message: format!(
+                        "seat_run_signalled:{seat}: {sig}; the vendor's process group was killed, nothing committed"
+                    ),
+                },
+                Ended::Exited(_) => unreachable!("handled above"),
+            });
+        }
+    }
+    .map_err(|e| seat_run_fail(format!("seat_run_wait_failed:{seat}: {e}")))?;
+    let stderr_text = match timeout(Duration::from_secs(5), stderr_task).await {
+        Ok(Ok(text)) => text,
+        _ => String::new(),
+    };
+
+    // The escape audit runs whatever the seat's outcome: a change outside the worktree fails the run, unreverted.
+    let (parent_after, meta_after) = seat_run_snapshot(worktree, dirs)
+        .await
+        .map_err(|e| seat_run_fail(format!("writer_audit_unavailable:{seat}: {e}")))?;
+    let mut escaped: Vec<String> =
+        mcp_bridge::containment::audit_repo(&parent_before, &parent_after)
+            .map_err(|e| seat_run_fail(format!("writer_audit_unavailable:{seat}: {e}")))?
+            .into_iter()
+            .map(|p| format!("parent:{p}"))
+            .collect();
+    escaped.extend(
+        mcp_bridge::containment::audit_repo(&meta_before, &meta_after)
+            .map_err(|e| seat_run_fail(format!("writer_audit_unavailable:{seat}: {e}")))?,
+    );
+    if !escaped.is_empty() {
+        return Err(seat_run_fail(format!(
+            "writer_escaped_worktree:{seat}: {}",
+            escaped.join(", ")
+        )));
+    }
+
+    let parsed = parser
+        .finish(status.code(), output_dir)
+        .map_err(seat_run_fail)?;
+    match parsed.outcome {
+        agent_adapter::SeatOutcome::Success => {}
+        agent_adapter::SeatOutcome::Partial(reason) => {
+            tracing::warn!(seat = %seat, reason = %reason, "seat-run: partial turn; committing what it wrote");
+        }
+        agent_adapter::SeatOutcome::Failure(code) => {
+            let tail = stderr_text.lines().last().unwrap_or_default();
+            let said = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("; {seat} said: {tail}")
+            };
+            return Err(seat_run_fail(
+                match classify_new_seat_failure(&code, &stderr_text) {
+                    NewSeatFailureClass::Suspended => {
+                        let reason = format!("403 from provider: {code}");
+                        if let Ok(home) = mcp_bridge::seat_state::triumvirate_home()
+                            && let Err(e) =
+                                mcp_bridge::seat_state::write_suspended(&home, seat, &reason)
+                        {
+                            tracing::error!(seat = %seat, error = %e, "could not write suspended.json");
+                        }
+                        format!("seat_suspended: {seat}: {reason}{said}")
+                    }
+                    NewSeatFailureClass::Quota => {
+                        format!("seat_quota_exhausted:{seat}: {code}{said}")
+                    }
+                    NewSeatFailureClass::Other => format!("{code}{said}"),
+                },
+            ));
+        }
+    }
+    if seat == "qwen"
+        && let Some(served) = parsed.served_model.as_deref()
+    {
+        mcp_bridge::qwen::check_served_model(served).map_err(seat_run_fail)?;
+    }
+
+    // Commit on the seat's behalf, outside the sandbox, with the repo's own author config. `.triumvirate/` (the
+    // daemon's prompt file, logs and target dir) is never part of the work.
+    let git_fail = |e: String| seat_run_fail(format!("seat_run_commit_failed:{seat}: {e}"));
+    let changes = git_in_worktree(
+        worktree,
+        &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":!.triumvirate",
+        ],
+    )
+    .await
+    .map_err(git_fail)?;
+    if changes.trim_matches('\0').trim().is_empty() {
+        return Ok(SeatRunDone::NoChanges);
+    }
+    // A symlink the seat left pointing outside the worktree is an escape too: the seatbelt resolves a write through
+    // it and denies it, but committing the link would hand the parent's path to whoever checks the branch out.
+    let outside = symlinks_leaving_worktree(worktree, &changes);
+    if !outside.is_empty() {
+        return Err(seat_run_fail(format!(
+            "writer_escaped_worktree:{seat}: {}",
+            outside.join(", ")
+        )));
+    }
+    git_in_worktree(worktree, &["add", "-A", "--", ".", ":!.triumvirate"])
+        .await
+        .map_err(git_fail)?;
+    git_in_worktree(worktree, &["commit", "-q", "-m", &a.commit_message])
+        .await
+        .map_err(git_fail)?;
+    let sha = git_in_worktree(worktree, &["rev-parse", "HEAD"])
+        .await
+        .map_err(git_fail)?;
+    Ok(SeatRunDone::Committed(sha.trim().to_string()))
+}
+
+/// Changed paths (from `git status --porcelain -z`) that are symlinks whose target, resolved lexically against the
+/// link's directory, lies outside `worktree`. Each is named `symlink:<path>`.
+fn symlinks_leaving_worktree(worktree: &Path, porcelain_z: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fields = porcelain_z.split('\0').filter(|f| !f.is_empty());
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        let (xy, rel) = (&field[..2], &field[3..]);
+        if xy.starts_with('R') || xy.starts_with('C') {
+            fields.next();
+        }
+        let path = worktree.join(rel);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(target) = fs::read_link(&path) else {
+            out.push(format!("symlink:{rel}"));
+            continue;
+        };
+        let joined = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or(worktree).join(target)
+        };
+        let mut resolved = PathBuf::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => resolved.push(other),
+            }
+        }
+        if !resolved.starts_with(worktree) {
+            out.push(format!("symlink:{rel}"));
+        }
+    }
+    out
+}
+
+/// `seatbelt_wrap` for a writer (W-1): the writer profile, which adds the worktree and nothing else.
+#[cfg(target_os = "macos")]
+fn writer_seatbelt_wrap(
+    seat: &str,
+    bin: &str,
+    args: &[String],
+    seat_home: &Path,
+    output_dir: &Path,
+    worktree: &Path,
+) -> Result<(String, Vec<String>), String> {
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+    if !Path::new(SANDBOX_EXEC).is_file() {
+        return Err(format!(
+            "seatbelt_unavailable:{seat}: {SANDBOX_EXEC} not found; refusing to run the seat unwrapped"
+        ));
+    }
+    let profile = mcp_bridge::containment::render_writer_seatbelt_profile(
+        seat_home,
+        output_dir,
+        &std::env::temp_dir(),
+        worktree,
+    )?;
+    let mut wrapped = vec!["-p".to_string(), profile, bin.to_string()];
+    wrapped.extend(args.iter().cloned());
+    Ok((SANDBOX_EXEC.to_string(), wrapped))
+}
+
+/// Off macOS there is no seatbelt (the Linux CI job): the audit is the only check, as for read-only seats.
+#[cfg(not(target_os = "macos"))]
+fn writer_seatbelt_wrap(
+    _seat: &str,
+    bin: &str,
+    args: &[String],
+    _seat_home: &Path,
+    _output_dir: &Path,
+    _worktree: &Path,
 ) -> Result<(String, Vec<String>), String> {
     Ok((bin.to_string(), args.to_vec()))
 }

@@ -774,6 +774,7 @@ pub(crate) fn seat_static_checks(seat: &str, ctx: &SeatDoctorCtx) -> Vec<SeatChe
         extra_args: &[],
         max_turns: 1,
         time_limit: std::time::Duration::from_secs(60),
+        mode: mcp_bridge::containment::SeatMode::ReadOnly,
     };
     let built = match seat {
         "kimi" => mcp_bridge::kimi::build_kimi_invocation(&req),

@@ -20,6 +20,7 @@ fn request<'a>(prompt: &'a str, extra_args: &'a [String]) -> SeatRequest<'a> {
         extra_args,
         max_turns: 12,
         time_limit: Duration::from_secs(600),
+        mode: mcp_bridge::containment::SeatMode::ReadOnly,
     }
 }
 

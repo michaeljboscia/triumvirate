@@ -50,6 +50,7 @@ impl Fx {
             extra_args: extra,
             max_turns: 7,
             time_limit: Duration::from_secs(600),
+            mode: mcp_bridge::containment::SeatMode::ReadOnly,
         };
         build_mistral_invocation(&req)
     }

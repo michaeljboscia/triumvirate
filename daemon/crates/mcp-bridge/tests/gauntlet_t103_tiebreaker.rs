@@ -27,6 +27,7 @@ fn request<'a>(
         extra_args,
         max_turns: 7,
         time_limit: Duration::from_secs(91),
+        mode: mcp_bridge::containment::SeatMode::ReadOnly,
     }
 }
 

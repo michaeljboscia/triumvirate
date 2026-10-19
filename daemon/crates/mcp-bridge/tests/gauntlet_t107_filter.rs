@@ -50,7 +50,14 @@ fn healthy() -> SeatAvailability {
 fn is_launch_surface(s: Surface) -> bool {
     matches!(
         s,
-        Surface::AskAgent | Surface::Session | Surface::Jury | Surface::DoctorLiveProbe
+        Surface::AskAgent
+            | Surface::Session
+            | Surface::Jury
+            | Surface::DoctorLiveProbe
+            // W-1 (A-16): the writer surfaces, through `triumvirate seat-run`.
+            | Surface::AbeDispatch
+            | Surface::FleetSpawn
+            | Surface::FleetTemporal
     )
 }
 
@@ -314,12 +321,9 @@ fn test_should_refuse_qwen_blind_validate_as_cannot_write_not_surface_refused() 
 
 #[test]
 fn test_should_defer_each_non_launch_surface_for_kimi() {
-    // A-2 table rows PeerReviewRotation, FleetSpawn, FleetTemporal, AbeDispatch, Prewarm.
+    // A-2 table rows PeerReviewRotation and Prewarm (W-1, A-16, opened FleetSpawn, FleetTemporal and AbeDispatch).
     for (s, name) in [
         (Surface::PeerReviewRotation, "PeerReviewRotation"),
-        (Surface::FleetSpawn, "FleetSpawn"),
-        (Surface::FleetTemporal, "FleetTemporal"),
-        (Surface::AbeDispatch, "AbeDispatch"),
         (Surface::Prewarm, "Prewarm"),
     ] {
         expect_refusal(

@@ -74,6 +74,7 @@ fn build_with(
         extra_args: extra,
         max_turns,
         time_limit: limit,
+        mode: mcp_bridge::containment::SeatMode::ReadOnly,
     };
     build_qwen_invocation(&req)
 }

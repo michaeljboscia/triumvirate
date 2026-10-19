@@ -8,7 +8,7 @@
 //!
 //! The decision is table-driven: a surface is allowed when it is in the seat's `SeatProfile.surfaces_allowed`.
 //! Outside it, BlindValidate on a seat that cannot write a test file is `seat_cannot_write_here`, and anything else is
-//! `seat_surface_deferred` (writer surfaces, peer-review rotation and prewarm ship in v1.1, F-4). Existing seats
+//! `seat_surface_deferred` (peer-review rotation and prewarm ship in v1.1, F-4; the writer surfaces opened in W-1). Existing seats
 //! (configured always, no verification) are allowed everywhere, which is today's behavior.
 
 use std::collections::HashMap;
@@ -227,7 +227,8 @@ mod tests {
 
     /// The A-2 launch answer for a new seat, written straight from the spec (REQ-091 precedence, then the surface
     /// rule) and independent of decide(): not configured, then suspended, then unverified (never for DoctorLiveProbe),
-    /// then AskAgent/Session/Jury/DoctorLiveProbe allowed, BlindValidate read-only, everything else deferred.
+    /// then AskAgent/Session/Jury/DoctorLiveProbe and (W-1, A-16) AbeDispatch/FleetSpawn/FleetTemporal allowed,
+    /// BlindValidate read-only, everything else (PeerReviewRotation, Prewarm) deferred.
     fn expected(
         k: &str,
         surface: Surface,
@@ -252,9 +253,13 @@ mod tests {
             ));
         }
         match surface {
-            Surface::AskAgent | Surface::Session | Surface::Jury | Surface::DoctorLiveProbe => {
-                Ok(())
-            }
+            Surface::AskAgent
+            | Surface::Session
+            | Surface::Jury
+            | Surface::DoctorLiveProbe
+            | Surface::AbeDispatch
+            | Surface::FleetSpawn
+            | Surface::FleetTemporal => Ok(()),
             Surface::BlindValidate => Err(format!(
                 "seat_cannot_write_here: {k}: blind validators must write test files and {k} is read-only"
             )),

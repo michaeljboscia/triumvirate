@@ -104,7 +104,14 @@ fn expected_new_seat(
         );
     }
     match surface {
-        Surface::AskAgent | Surface::Session | Surface::Jury | Surface::DoctorLiveProbe => None,
+        Surface::AskAgent
+        | Surface::Session
+        | Surface::Jury
+        | Surface::DoctorLiveProbe
+        // W-1 (A-16): the writer surfaces, through `triumvirate seat-run`.
+        | Surface::AbeDispatch
+        | Surface::FleetSpawn
+        | Surface::FleetTemporal => None,
         Surface::BlindValidate => exp(
             "seat_cannot_write_here",
             format!(
@@ -408,7 +415,15 @@ fn new_seat_rows_allow_exactly_the_launch_surfaces() {
     let want_const: Vec<&str> = NEW_SEAT_LAUNCH_SURFACES.iter().map(surface_name).collect();
     assert_eq!(
         want_const,
-        vec!["AskAgent", "Session", "Jury", "DoctorLiveProbe"]
+        vec![
+            "AskAgent",
+            "Session",
+            "Jury",
+            "DoctorLiveProbe",
+            "AbeDispatch",
+            "FleetSpawn",
+            "FleetTemporal"
+        ]
     );
     for key in ["kimi", "mistral", "qwen"] {
         let p = seat_profile(key).expect("row exists");
@@ -474,8 +489,9 @@ fn new_seat_launch_policy_fields() {
             !p.can_write_test_file,
             "{key} cannot write test files (D-10)"
         );
-        assert!(!p.fleet_buildable, "{key} no fleet role");
-        assert!(!p.abe_buildable, "{key} no ABE role");
+        // W-1 (A-16): fleet and ABE writers through seat-run.
+        assert!(p.fleet_buildable, "{key} fleet writer role");
+        assert!(p.abe_buildable, "{key} ABE writer role");
     }
 }
 

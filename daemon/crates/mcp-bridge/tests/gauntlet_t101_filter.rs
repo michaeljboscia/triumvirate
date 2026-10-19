@@ -34,6 +34,7 @@ fn req<'a>(
         extra_args: extra,
         max_turns: 10,
         time_limit: Duration::from_secs(60),
+        mode: mcp_bridge::containment::SeatMode::ReadOnly,
     }
 }
 

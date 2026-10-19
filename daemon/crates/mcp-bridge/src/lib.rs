@@ -39,6 +39,8 @@ pub mod mistral;
 pub mod qwen;
 pub mod seat_gate;
 pub mod seat_state;
+// Seven Primes W-1: the `triumvirate seat-run` command line ABE and fleet spawn for a writer seat.
+pub mod seat_run;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeInfo {
