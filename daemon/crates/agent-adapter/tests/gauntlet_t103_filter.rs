@@ -591,3 +591,242 @@ fn test_should_never_return_success_for_nonzero_exit() {
         }
     }
 }
+
+// ================================================================ round 2: survivor feedback
+// Contract sources: research/03-qwen-code-contract.md (tool names, stream shapes), BACKEND_STRUCTURE section 6,
+// and the ToolKind enum in the T-103 SPEC addendum.
+
+use agent_adapter::WorkingState;
+
+fn kind_for(tool: &str) -> ToolKind {
+    let s = "9999aaaa-0000-4000-8000-000000000000";
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_tool(s, "qwen3-coder-plus", "k1", tool, r#"{"file_path":"/repo/a.rs","command":"ls","pattern":"x"}"#),
+        result_line(s, "ok", false, "success", ""),
+    ]);
+    let sut = parse_ok(&stream, Some(0));
+    assert_eq!(sut.result.tool_calls.len(), 1, "tool {tool}");
+    assert_eq!(sut.result.tool_calls[0].tool, tool);
+    sut.result.tool_calls.into_iter().next().unwrap().kind
+}
+
+// research/03 tool-names.ts: write_file is WriteFile.
+#[test]
+fn test_should_classify_write_file_as_write() {
+    assert!(matches!(kind_for("write_file"), ToolKind::WriteFile));
+}
+
+// research/03 tool-names.ts: edit is EditFile.
+#[test]
+fn test_should_classify_edit_as_edit() {
+    assert!(matches!(kind_for("edit"), ToolKind::EditFile));
+}
+
+// research/03 tool-names.ts: run_shell_command is Bash.
+#[test]
+fn test_should_classify_run_shell_command_as_bash() {
+    assert!(matches!(kind_for("run_shell_command"), ToolKind::Bash));
+}
+
+// research/03 tool-names.ts: exec is Bash.
+#[test]
+fn test_should_classify_exec_as_bash() {
+    assert!(matches!(kind_for("exec"), ToolKind::Bash));
+}
+
+// research/03 tool-names.ts: grep_search is Grep.
+#[test]
+fn test_should_classify_grep_search_as_grep() {
+    assert!(matches!(kind_for("grep_search"), ToolKind::Grep));
+}
+
+// research/03 tool-names.ts: glob is Glob.
+#[test]
+fn test_should_classify_glob_as_glob() {
+    assert!(matches!(kind_for("glob"), ToolKind::Glob));
+}
+
+// research/03 tool-names.ts: read_file is ReadFile (and only it among these).
+#[test]
+fn test_should_classify_read_file_as_read_only_for_read_file() {
+    assert!(matches!(kind_for("read_file"), ToolKind::ReadFile));
+    for other in ["write_file", "edit", "run_shell_command", "exec", "grep_search", "glob"] {
+        assert!(!matches!(kind_for(other), ToolKind::ReadFile), "{other}");
+    }
+}
+
+fn two_reads(first_err: bool, second_err: bool) -> String {
+    let s = "9999bbbb-0000-4000-8000-000000000000";
+    join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_tool(s, "qwen3-coder-plus", "p1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
+        assistant_tool(s, "qwen3-coder-plus", "p2", "read_file", r#"{"file_path":"/repo/two.rs"}"#),
+        tool_result(s, "p1", "one", first_err),
+        tool_result(s, "p2", "two", second_err),
+        result_line(s, "done", false, "success", ""),
+    ])
+}
+
+// Stream shape (research/03): a tool_result with is_error false marks the matching call successful.
+#[test]
+fn test_should_mark_matching_call_successful_for_clean_tool_result() {
+    let sut = parse_ok(&two_reads(false, false), Some(0));
+    assert_eq!(sut.result.tool_calls[0].success, Some(true));
+    assert_eq!(sut.result.tool_calls[1].success, Some(true));
+}
+
+// Stream shape: is_error true marks the matching call failed (Some(false)).
+#[test]
+fn test_should_mark_matching_call_failed_for_error_tool_result() {
+    let sut = parse_ok(&two_reads(true, true), Some(0));
+    assert_eq!(sut.result.tool_calls[0].success, Some(false));
+    assert_eq!(sut.result.tool_calls[1].success, Some(false));
+}
+
+// Stream shape: pairing is by tool_use_id; an error on one call leaves the other untouched.
+#[test]
+fn test_should_pair_tool_result_by_id_and_leave_other_calls_alone() {
+    let sut = parse_ok(&two_reads(true, false), Some(0));
+    assert_eq!(sut.result.tool_calls[0].success, Some(false));
+    assert_eq!(sut.result.tool_calls[1].success, Some(true));
+    let sut = parse_ok(&two_reads(false, true), Some(0));
+    assert_eq!(sut.result.tool_calls[0].success, Some(true));
+    assert_eq!(sut.result.tool_calls[1].success, Some(false));
+}
+
+// Stream shape: results arriving in reverse order still pair by id, not by position.
+#[test]
+fn test_should_pair_out_of_order_tool_results_by_id() {
+    let s = "9999cccc-0000-4000-8000-000000000000";
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_tool(s, "qwen3-coder-plus", "q1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
+        assistant_tool(s, "qwen3-coder-plus", "q2", "read_file", r#"{"file_path":"/repo/two.rs"}"#),
+        tool_result(s, "q2", "two", true),
+        tool_result(s, "q1", "one", false),
+        result_line(s, "done", false, "success", ""),
+    ]);
+    let sut = parse_ok(&stream, Some(0));
+    assert_eq!(sut.result.tool_calls[0].success, Some(true));
+    assert_eq!(sut.result.tool_calls[1].success, Some(false));
+}
+
+// Stream shape: a tool_result whose id matches no tool_use changes nothing.
+#[test]
+fn test_should_ignore_tool_result_with_unmatched_id() {
+    let s = "9999dddd-0000-4000-8000-000000000000";
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_tool(s, "qwen3-coder-plus", "r1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
+        tool_result(s, "no_such_id", "x", true),
+        tool_result(s, "no_such_id", "x", false),
+        result_line(s, "done", false, "success", ""),
+    ]);
+    let sut = parse_ok(&stream, Some(0));
+    assert_eq!(sut.result.tool_calls.len(), 1);
+    assert_ne!(sut.result.tool_calls[0].success, Some(true));
+    assert_ne!(sut.result.tool_calls[0].success, Some(false));
+}
+
+// Stream shape: an unmatched tool_result does not create a record.
+#[test]
+fn test_should_not_create_record_for_unmatched_tool_result() {
+    let s = "9999eeee-0000-4000-8000-000000000000";
+    let stream = join(&[start(s, "qwen3-coder-plus"), tool_result(s, "ghost", "x", false), result_line(s, "d", false, "success", "")]);
+    let sut = parse_ok(&stream, Some(0));
+    assert!(sut.result.tool_calls.is_empty());
+}
+
+// Stream shape: a tool_result line yields a ToolCallCompleted working-state event.
+#[test]
+fn test_should_emit_tool_call_completed_for_tool_result_line() {
+    let s = "9999ffff-0000-4000-8000-000000000000";
+    let mut sut = QwenStreamParser::new();
+    let _ = sut.parse_line(&start(s, "qwen3-coder-plus"));
+    let _ = sut.parse_line(&assistant_tool(s, "qwen3-coder-plus", "e1", "read_file", r#"{"file_path":"/repo/one.rs"}"#));
+    let ev = sut.parse_line(&tool_result(s, "e1", "one", false)).expect("tool_result emits an event");
+    assert!(matches!(ev.state, WorkingState::ToolCallCompleted), "got a different state");
+}
+
+// Stream shape: a user line without tool_result blocks changes no call.
+#[test]
+fn test_should_leave_calls_alone_for_plain_user_line() {
+    let s = "9999abab-0000-4000-8000-000000000000";
+    let plain = format!(r#"{{"type":"user","session_id":"{s}","message":{{"role":"user","content":[{{"type":"text","text":"hello"}}]}}}}"#);
+    let stream = join(&[
+        start(s, "qwen3-coder-plus"),
+        assistant_tool(s, "qwen3-coder-plus", "u1", "read_file", r#"{"file_path":"/repo/one.rs"}"#),
+        plain,
+        result_line(s, "d", false, "success", ""),
+    ]);
+    let sut = parse_ok(&stream, Some(0));
+    assert_eq!(sut.result.tool_calls.len(), 1);
+    assert_ne!(sut.result.tool_calls[0].success, Some(true));
+}
+
+fn only_usage(usage: &str) -> UsageReport {
+    let s = "9999acac-0000-4000-8000-000000000000";
+    let stream = join(&[start(s, "qwen3-coder-plus"), assistant_text(s, "qwen3-coder-plus", "ok", ""), result_line(s, "ok", false, "success", usage)]);
+    parse_ok(&stream, Some(0)).usage
+}
+
+// REQ-041: usage with only input_tokens is Exact with output absent (not NotReported, not zero).
+#[test]
+fn test_should_report_usage_with_only_input_count() {
+    match only_usage(r#","usage":{"input_tokens":42}"#) {
+        UsageReport::Exact(u) => {
+            assert_eq!(u.input, Some(42));
+            assert_eq!(u.output, None);
+        }
+        UsageReport::NotReported => panic!("a present input count is a report"),
+    }
+}
+
+// REQ-041: usage with only output_tokens is Exact with input absent.
+#[test]
+fn test_should_report_usage_with_only_output_count() {
+    match only_usage(r#","usage":{"output_tokens":17}"#) {
+        UsageReport::Exact(u) => {
+            assert_eq!(u.output, Some(17));
+            assert_eq!(u.input, None);
+        }
+        UsageReport::NotReported => panic!("a present output count is a report"),
+    }
+}
+
+// REQ-041: a single reported zero count stays Exact with that zero.
+#[test]
+fn test_should_keep_single_reported_zero_count_exact() {
+    match only_usage(r#","usage":{"output_tokens":0}"#) {
+        UsageReport::Exact(u) => {
+            assert_eq!(u.output, Some(0));
+            assert_eq!(u.input, None);
+        }
+        UsageReport::NotReported => panic!("a reported zero is a report"),
+    }
+}
+
+// REQ-044: a blank line between valid lines is skipped and the next valid line still parses.
+#[test]
+fn test_should_parse_valid_line_after_blank_line() {
+    let s = "9999adad-0000-4000-8000-000000000000";
+    let mut sut = QwenStreamParser::new();
+    let _ = sut.parse_line(&start(s, "qwen3-coder-plus"));
+    assert!(sut.parse_line("").is_none());
+    assert!(sut.parse_line("\t  ").is_none());
+    let _ = sut.parse_line(&assistant_text(s, "qwen3-coder-plus", "after the blank", ""));
+    let _ = sut.parse_line("");
+    let _ = sut.parse_line(&result_line(s, "after the blank", false, "success", ""));
+    let parsed = sut.finish(Some(0)).expect("finishes");
+    assert_eq!(parsed.result.response_text, "after the blank");
+    assert_eq!(parsed.result.session_id.as_deref(), Some(s));
+    assert!(matches!(parsed.outcome, SeatOutcome::Success));
+}
+
+// REQ-044: a stream of only blank lines is an empty stream.
+#[test]
+fn test_should_treat_only_blank_lines_as_empty_stream() {
+    let code = failure_code(parse("\n\n   \n\t\n", Some(0)));
+    assert!(code.starts_with("empty_or_unrecognized_stream:qwen"), "got {code}");
+}
