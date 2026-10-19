@@ -144,17 +144,20 @@ impl MistralStreamParser {
         );
         let args_json = detail.and_then(|d| d.get("input")).map(Value::to_string);
         let state = v.get("state");
-        let success = state
+        // Fail closed: an explicit failed/error/rejected status wins over display.success, so a failed read can never
+        // earn sight credit (GAUNTLET T-102 filter: status "failed" with display.success true was recorded a success).
+        let status = state.and_then(|s| s.get("status")).and_then(Value::as_str);
+        let display_success = state
             .and_then(|s| s.get("display"))
             .and_then(|d| d.get("success"))
-            .and_then(Value::as_bool)
-            .or_else(
-                || match state.and_then(|s| s.get("status")).and_then(Value::as_str) {
-                    Some("completed") => Some(true),
-                    Some("failed") | Some("error") | Some("rejected") => Some(false),
-                    _ => None,
-                },
-            );
+            .and_then(Value::as_bool);
+        let success = match status {
+            Some("failed") | Some("error") | Some("rejected") => Some(false),
+            _ => display_success.or(match status {
+                Some("completed") => Some(true),
+                _ => None,
+            }),
+        };
         let id = v.get("id").and_then(Value::as_str).map(str::to_string);
         let record = ToolCallRecord {
             id: id.clone(),
