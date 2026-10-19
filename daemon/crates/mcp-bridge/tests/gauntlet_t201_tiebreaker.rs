@@ -49,7 +49,7 @@ fn roster_has_no_duplicate_keys() {
 // REQ-001 and REQ-061: every roster key is accepted as a supported daemon target.
 fn every_roster_key_is_supported() {
     for &agent in supported_agent_names() {
-        assert_eq!(is_supported_agent_name(agent), true, "unsupported roster key: {agent}");
+        assert!(is_supported_agent_name(agent), "unsupported roster key: {agent}");
     }
 }
 
@@ -57,7 +57,7 @@ fn every_roster_key_is_supported() {
 // REQ-001: names outside the exact canonical roster are rejected as roster keys.
 fn names_outside_the_roster_are_not_supported_keys() {
     for agent in ["", "unknown", "not-a-seat"] {
-        assert_eq!(is_supported_agent_name(agent), false, "unexpected roster key: {agent}");
+        assert!(!is_supported_agent_name(agent), "unexpected roster key: {agent}");
     }
 }
 
@@ -75,7 +75,7 @@ fn aliases_are_collision_free_and_target_canonical_seats() {
 
     for &(alias, canonical) in AGENT_ALIASES {
         assert!(EXPECTED_ROSTER.contains(&canonical), "noncanonical target for {alias}");
-        assert_eq!(EXPECTED_ROSTER.contains(&alias), false, "alias collides with roster: {alias}");
+        assert!(!EXPECTED_ROSTER.contains(&alias), "alias collides with roster: {alias}");
     }
 }
 
