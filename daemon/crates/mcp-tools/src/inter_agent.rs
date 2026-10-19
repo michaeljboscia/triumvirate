@@ -280,7 +280,14 @@ pub async fn ask_session(
             .ok_or_else(|| format!("session '{}' not found", req.name))?
     };
     if is_new_seat(&session_agent) {
-        return ask_new_seat_session(sessions, sessions_file, req, execute_ask_agent).await;
+        return ask_new_seat_session(
+            sessions,
+            sessions_file,
+            req,
+            execute_ask_agent,
+            &session_agent,
+        )
+        .await;
     }
 
     let (agent, cwd, had_history, prior_cli_session) = {
@@ -366,6 +373,8 @@ async fn ask_new_seat_session(
     sessions_file: Option<&PathBuf>,
     req: &AskSessionRequest,
     execute_ask_agent: ExecuteAskAgentFn,
+    // P-1 telemetry only: the session's seat as the caller read it, for the busy refusal (before the lock).
+    session_agent: &str,
 ) -> Result<String, String> {
     let home = sessions_file
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
@@ -376,6 +385,11 @@ async fn ask_new_seat_session(
         .await
         .map_err(|e| {
             if e == "session_busy" {
+                mcp_bridge::posthog::record_seat_session(
+                    session_agent,
+                    "busy",
+                    Some("session_busy"),
+                );
                 format!("session_busy: {}", req.name)
             } else {
                 e
@@ -390,6 +404,11 @@ async fn ask_new_seat_session(
             .get(&req.name)
             .ok_or_else(|| format!("session '{}' not found", req.name))?;
         if matches!(state.phase, SessionPhase::Broken) {
+            mcp_bridge::posthog::record_seat_session(
+                &state.agent,
+                "broken_refused",
+                Some("session_broken"),
+            );
             return Err(format!(
                 "session_broken: {}; dismiss_session and spawn a new one",
                 state.broken_reason.as_deref().unwrap_or("unknown")
@@ -432,6 +451,7 @@ async fn ask_new_seat_session(
     let state = all
         .get_mut(&req.name)
         .ok_or_else(|| format!("session '{}' not found", req.name))?;
+    let was_ready = matches!(state.phase, SessionPhase::Ready);
     let publish = match &turn {
         Ok(response) => daemon_core::publish_turn(
             state,
@@ -453,6 +473,20 @@ async fn ask_new_seat_session(
             "session_generation_conflict"
         );
     }
+    mcp_bridge::posthog::record_seat_session_publish(
+        &agent,
+        match &publish {
+            PublishResult::Conflict => mcp_bridge::posthog::SessionPublish::Conflict,
+            PublishResult::NotResumable(reason) => {
+                mcp_bridge::posthog::SessionPublish::NotResumable(reason)
+            }
+            PublishResult::Applied => mcp_bridge::posthog::SessionPublish::Applied {
+                was_ready,
+                now_broken: matches!(state.phase, SessionPhase::Broken),
+                turn_error: turn.as_ref().err().map(String::as_str),
+            },
+        },
+    );
     let result = match turn {
         Ok(response) => {
             let mut answer = response.response;
@@ -933,6 +967,256 @@ mod ask_agent_failure_message_tests {
         assert_eq!(state.phase, SessionPhase::Ready);
         assert_eq!(state.generation, 0);
         assert!(!dir.path().join("locks").exists());
+    }
+
+    // Seven Primes P-1: tv_seat_session at the in-process (MCP) session call sites. The recorder is thread-local and
+    // these tests run on a current-thread runtime, so every event of the call is recorded on the test's own thread.
+
+    /// The Sessions map a conflict executor bumps during its turn.
+    static CONFLICT_SESSIONS: std::sync::Mutex<Option<Sessions>> = std::sync::Mutex::new(None);
+
+    /// A turn during which the stored generation moves (as a second writer would), then a success with an id.
+    fn conflict_executor<'a>(
+        req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let sessions = CONFLICT_SESSIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .expect("conflict sessions installed");
+            if let Some(state) = sessions.lock().await.get_mut("conflict") {
+                state.generation += 1;
+            }
+            let mut response = AskAgentResponse::direct(
+                "request".to_string(),
+                req.agent.clone(),
+                "answer".to_string(),
+                Vec::new(),
+            );
+            response.cli_session_id = Some("vendor-id".to_string());
+            Ok(response)
+        })
+    }
+
+    /// A failed turn whose error leads with a code-shaped sentinel and carries the uppercase one.
+    fn sentinel_failure_executor<'a>(
+        _req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move { Err("customer_secret_zqx: boom ZQX-LEAK-7731".to_string()) })
+    }
+
+    /// A failed turn the vendor reports as a rejected session id.
+    fn rejected_id_executor<'a>(
+        _req: &'a AskAgentRequest,
+        _emitter: Option<ProgressEmitter>,
+    ) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+        Box::pin(async move { Err("session not found: vendor-id".to_string()) })
+    }
+
+    fn session_event(
+        agent: &str,
+        display: &str,
+        event: &str,
+        reason: Option<&str>,
+    ) -> (String, serde_json::Value) {
+        (
+            "tv_seat_session".to_string(),
+            serde_json::json!({
+                "tv_agent": agent,
+                "tv_agent_display": display,
+                "tv_session_event": event,
+                "tv_reason_code": reason,
+            }),
+        )
+    }
+
+    async fn one_session(
+        name: &str,
+        state: SessionState,
+    ) -> (tempfile::TempDir, PathBuf, Sessions) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = daemon_core::sessions_file_path(dir.path());
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(name.to_string(), state)])));
+        core_persist_json_file_if_enabled(Some(&file), &*sessions.lock().await).unwrap();
+        (dir, file, sessions)
+    }
+
+    fn turn(name: &str) -> AskSessionRequest {
+        AskSessionRequest {
+            name: name.to_string(),
+            message: "turn ZQX-LEAK-7731".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// ready (a first turn that publishes an id), broken (missing_session_id), then broken_refused on the next ask.
+    /// RED IF: any of the three is silent, mislabeled, or carries a reason outside the documented code.
+    #[tokio::test]
+    async fn p1_session_ready_broken_and_broken_refused() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        let (_d, file, sessions) = one_session("ok", pending_session("kimi")).await;
+        let rec = mcp_bridge::posthog::start_recording();
+        ask_session(
+            &sessions,
+            Some(&file),
+            &turn("ok"),
+            false,
+            overlapping_probe_executor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rec.events(), [session_event("kimi", "Kimi", "ready", None)]);
+        drop(rec);
+
+        let (_d, file, sessions) = one_session("missing", pending_session("qwen")).await;
+        let rec = mcp_bridge::posthog::start_recording();
+        ask_session(
+            &sessions,
+            Some(&file),
+            &turn("missing"),
+            false,
+            no_id_executor,
+        )
+        .await
+        .unwrap();
+        ask_session(
+            &sessions,
+            Some(&file),
+            &turn("missing"),
+            false,
+            no_id_executor,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            rec.events(),
+            [
+                session_event("qwen", "Qwen", "broken", Some("missing_session_id")),
+                session_event("qwen", "Qwen", "broken_refused", Some("session_broken")),
+            ]
+        );
+    }
+
+    /// broken from a failed first turn (the error's leading token, here a sentinel, is reported `other`) and from a
+    /// Ready session whose id the vendor rejected (vendor_rejected_session). No sentinel reaches a property.
+    /// RED IF: the failure's own text reaches tv_reason_code, or a vendor rejection is reported as anything else.
+    #[tokio::test]
+    async fn p1_session_broken_by_failure_and_by_vendor_rejection() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        let (_d, file, sessions) = one_session("fail", pending_session("mistral")).await;
+        let rec = mcp_bridge::posthog::start_recording();
+        ask_session(
+            &sessions,
+            Some(&file),
+            &turn("fail"),
+            false,
+            sentinel_failure_executor,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            rec.events(),
+            [session_event("mistral", "Mistral", "broken", Some("other"))]
+        );
+        let text = format!("{:?}", rec.events());
+        assert!(
+            !text.contains("ZQX-LEAK-7731") && !text.contains("customer_secret_zqx"),
+            "{text}"
+        );
+        drop(rec);
+
+        let mut ready = pending_session("kimi");
+        ready.phase = SessionPhase::Ready;
+        ready.cli_session_id = Some("vendor-id".to_string());
+        let (_d, file, sessions) = one_session("rejected", ready).await;
+        let rec = mcp_bridge::posthog::start_recording();
+        ask_session(
+            &sessions,
+            Some(&file),
+            &turn("rejected"),
+            false,
+            rejected_id_executor,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            rec.events(),
+            [session_event(
+                "kimi",
+                "Kimi",
+                "broken",
+                Some("vendor_rejected_session")
+            )]
+        );
+    }
+
+    /// busy: a second ask that cannot take the session lock within TRIUMVIRATE_SESSION_BUSY_SECS.
+    /// RED IF: a busy refusal is silent or reports another event.
+    #[tokio::test]
+    async fn p1_session_busy() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        NEW_SEAT_CALLS.store(0, Ordering::SeqCst);
+        let prior = std::env::var_os("TRIUMVIRATE_SESSION_BUSY_SECS");
+        // SAFETY: serialised by NEW_SEAT_TEST_LOCK, the lock every env-mutating test in this module holds.
+        unsafe { std::env::set_var("TRIUMVIRATE_SESSION_BUSY_SECS", "1") };
+        let (_d, file, sessions) = one_session("busy", pending_session("kimi")).await;
+        let rec = mcp_bridge::posthog::start_recording();
+        let req = turn("busy");
+        let first = ask_session(&sessions, Some(&file), &req, false, slow_executor);
+        let second = async {
+            while NEW_SEAT_CALLS.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            ask_session(&sessions, Some(&file), &req, false, slow_executor).await
+        };
+        let (first, second) = tokio::join!(first, second);
+        match prior {
+            // SAFETY: as above.
+            Some(value) => unsafe { std::env::set_var("TRIUMVIRATE_SESSION_BUSY_SECS", value) },
+            None => unsafe { std::env::remove_var("TRIUMVIRATE_SESSION_BUSY_SECS") },
+        }
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(second.unwrap_err(), "session_busy: busy");
+        assert_eq!(
+            rec.events(),
+            [
+                session_event("kimi", "Kimi", "busy", Some("session_busy")),
+                session_event("kimi", "Kimi", "ready", None),
+            ]
+        );
+    }
+
+    /// generation_conflict: the stored generation moved during the turn, so publish_turn applied nothing.
+    /// RED IF: the conflict path is silent or reported as ready.
+    #[tokio::test]
+    async fn p1_session_generation_conflict() {
+        let _test_guard = NEW_SEAT_TEST_LOCK.lock().await;
+        let (_d, file, sessions) = one_session("conflict", pending_session("kimi")).await;
+        *CONFLICT_SESSIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sessions.clone());
+        let rec = mcp_bridge::posthog::start_recording();
+        ask_session(
+            &sessions,
+            Some(&file),
+            &turn("conflict"),
+            false,
+            conflict_executor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rec.events(),
+            [session_event(
+                "kimi",
+                "Kimi",
+                "generation_conflict",
+                Some("session_generation_conflict")
+            )]
+        );
     }
 
     #[test]

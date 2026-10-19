@@ -169,9 +169,24 @@ pub fn seat_gate(seat: &str, surface: Surface, origin: Origin, tty: bool) -> Res
     )
 }
 
+/// `seat_gate`'s decision plus its telemetry (P-1): every refusal on every surface emits `tv_seat_gate_refused`.
+fn seat_gate_in(
+    home: Result<std::path::PathBuf, String>,
+    seat: &str,
+    surface: Surface,
+    origin: Origin,
+    tty: bool,
+) -> Result<(), Refusal> {
+    let decision = seat_gate_decide_in(home, seat, surface, origin, tty);
+    if let Err(refusal) = &decision {
+        crate::posthog::record_seat_gate_refused(seat, refusal.code, surface, origin);
+    }
+    decision
+}
+
 /// `seat_gate` with the state directory already resolved. Tests pass a tempdir here instead of rewriting the
 /// process-global `TRIUMVIRATE_HOME`, which other modules' tests also rewrite under their own locks.
-fn seat_gate_in(
+fn seat_gate_decide_in(
     home: Result<std::path::PathBuf, String>,
     seat: &str,
     surface: Surface,
@@ -464,5 +479,76 @@ mod tests {
                 "seat_not_configured: kimi: set TRIUMVIRATE_ENABLE_KIMI=1 and restart the daemon"
             )
         );
+    }
+
+    /// P-1: one refusal on each of the ten surfaces, for both origins, through the gate's body (seat_gate is one line
+    /// over seat_gate_in): each emits exactly one tv_seat_gate_refused with that surface and origin. kimi is not
+    /// configured, so every surface refuses. A permitted call emits nothing.
+    /// RED IF: a surface or origin is mislabeled, a refusal is silent, or an admitted call emits a refusal event.
+    #[test]
+    fn every_refusal_emits_one_gate_event_with_its_surface_and_origin() {
+        let _lock = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvRestore::capture(&["TRIUMVIRATE_ENABLE_KIMI"]);
+        // SAFETY: serialised by env_lock(); _restore puts the value back.
+        unsafe { std::env::remove_var("TRIUMVIRATE_ENABLE_KIMI") };
+        let home = tempfile::tempdir().unwrap();
+        let names = [
+            (Surface::AskAgent, "ask_agent"),
+            (Surface::Session, "session"),
+            (Surface::Jury, "jury"),
+            (Surface::BlindValidate, "blind_validate"),
+            (Surface::DoctorLiveProbe, "doctor_live_probe"),
+            (Surface::PeerReviewRotation, "peer_review_rotation"),
+            (Surface::FleetSpawn, "fleet_spawn"),
+            (Surface::FleetTemporal, "fleet_temporal"),
+            (Surface::AbeDispatch, "abe_dispatch"),
+            (Surface::Prewarm, "prewarm"),
+        ];
+        assert_eq!(names.len(), Surface::ALL.len());
+        for (surface, surface_name) in names {
+            for (origin, origin_name) in [
+                (Origin::Interactive, "interactive"),
+                (Origin::Unattended, "unattended"),
+            ] {
+                let rec = crate::posthog::start_recording();
+                let err = seat_gate_in(
+                    Ok(home.path().to_path_buf()),
+                    "kimi",
+                    surface,
+                    origin,
+                    false,
+                )
+                .unwrap_err();
+                assert_eq!(err.code, RefusalCode::SeatNotConfigured);
+                assert_eq!(
+                    rec.events(),
+                    [(
+                        "tv_seat_gate_refused".to_string(),
+                        serde_json::json!({
+                            "tv_agent": "kimi",
+                            "tv_agent_display": "Kimi",
+                            "tv_refusal_code": "seat_not_configured",
+                            "tv_surface": surface_name,
+                            "tv_origin": origin_name,
+                        })
+                    )],
+                    "{surface:?} {origin:?}"
+                );
+            }
+        }
+        let rec = crate::posthog::start_recording();
+        assert_eq!(
+            seat_gate_in(
+                Ok(home.path().to_path_buf()),
+                "codex",
+                Surface::AskAgent,
+                Origin::Interactive,
+                false
+            ),
+            Ok(())
+        );
+        assert!(rec.events().is_empty(), "{:?}", rec.events());
     }
 }

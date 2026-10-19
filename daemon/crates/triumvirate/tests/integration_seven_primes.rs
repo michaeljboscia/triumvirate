@@ -26,6 +26,8 @@ use mcp_bridge::containment::{SeatInvocation, SeatRequest};
 use serde_json::Value;
 use shared_types::{AskAgentRequest, AskAgentResponse, AskSessionRequest, SessionState};
 
+mod capture_server;
+
 const SEATS: [&str; 3] = ["kimi", "mistral", "qwen"];
 const METERED: [&str; 5] = [
     "MISTRAL_API_KEY",
@@ -2170,4 +2172,240 @@ async fn seat_clear_command_removes_suspended_json() {
     assert!(out.contains("qwen: suspension cleared"), "{out}");
     assert!(!qwen.exists(), "seat clear removes suspended.json");
     assert!(kimi.exists(), "another seat's suspension is untouched");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Seven Primes P-1: the tv_seat_* events reach a local capture server from the real daemon and `doctor --live`.
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The real binary, pointed at a local capture server (POSTHOG_HOST, a fake POSTHOG_API_KEY) with a run tag and the
+/// lock-event threshold lowered to 200 ms: `doctor --live` (three probe passes), then through the daemon a refused
+/// call (gate), a Qwen served-model mismatch (served by the lowercase sentinel), a Mistral quota (http_429), a Qwen
+/// 403 in stderr text (suspension_text), a read_only_violation in a repo whose path carries the sentinel, two
+/// concurrent kimi calls (lock wait), and a session whose first turn breaks it, then a refused second turn. Every
+/// expected event arrives with exactly its documented keys and values, and no tv_seat_* event carries a sentinel
+/// (which is in every prompt, the repo path, and each mock's error output).
+/// RED IF: any event is missing, gains or loses a property, carries a value outside its vocabulary, lacks the run
+/// tag, or carries a sentinel.
+#[tokio::test]
+async fn p1_posthog_events_reach_a_local_capture_server() {
+    use capture_server::{CaptureServer, SENTINELS, TEST_INGEST_VALUE, assert_keys};
+    const TAG: &str = "p1-int";
+    let [upper, lower] = SENTINELS;
+    let _g = ENV_LOCK.lock().await;
+    let capture = CaptureServer::start();
+    let mut rig = Rig::new();
+    rig.extra_env.extend([
+        ("POSTHOG_HOST".to_string(), capture.url.clone()),
+        ("POSTHOG_API_KEY".to_string(), TEST_INGEST_VALUE.to_string()),
+        ("TRIUMVIRATE_TELEMETRY_RUN_TAG".to_string(), TAG.to_string()),
+        (
+            "TRIUMVIRATE_SEAT_LOCK_EVENT_MS".to_string(),
+            "200".to_string(),
+        ),
+    ]);
+    let tagged = |p: &Value| p["tv_run_tag"] == TAG;
+
+    // doctor --live: one pass per seat at the pinned version.
+    let log = rig.root.join("doctor.log");
+    let status = rig
+        .command(&["doctor", "--live"], &log)
+        .status()
+        .expect("doctor");
+    assert!(
+        status.success(),
+        "{}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let probes = capture.wait_for("tv_seat_doctor_probe", 3, tagged);
+    for seat in SEATS {
+        let p = probes.iter().find(|p| p["tv_agent"] == seat).expect(seat);
+        assert_keys("tv_seat_doctor_probe", p, Some(TAG));
+        assert_eq!(
+            (&p["tv_outcome"], &p["tv_code"], &p["tv_cli_version"]),
+            (
+                &serde_json::json!("pass"),
+                &Value::Null,
+                &serde_json::json!(version(seat))
+            ),
+            "{p}"
+        );
+        // The fixture's qwen3-coder-plus is not on the plan list.
+        let served = if seat == "qwen" {
+            serde_json::json!("other")
+        } else {
+            Value::Null
+        };
+        assert_eq!(p["tv_served_model"], served, "{p}");
+    }
+
+    rig.start_daemon().await;
+    let prompt = format!("review {upper} {lower}");
+
+    // Gate: kimi unverified.
+    fs::remove_file(rig.th.join("seats/kimi/verified.json")).unwrap();
+    let err = rig.ask("kimi", &prompt).await.expect_err("unverified");
+    assert!(err.starts_with("seat_unverified: kimi"), "{err}");
+    rig.write_verified("kimi");
+    let p = &capture.wait_for("tv_seat_gate_refused", 1, tagged)[0];
+    assert_keys("tv_seat_gate_refused", p, Some(TAG));
+    assert_eq!(
+        (
+            &p["tv_agent"],
+            &p["tv_refusal_code"],
+            &p["tv_surface"],
+            &p["tv_origin"]
+        ),
+        (
+            &serde_json::json!("kimi"),
+            &serde_json::json!("seat_unverified"),
+            &serde_json::json!("ask_agent"),
+            &serde_json::json!("interactive")
+        )
+    );
+
+    // Served model: Qwen answered by the lowercase sentinel.
+    rig.set_fixture(
+        "qwen",
+        &QWEN_STREAM.replace("qwen3-coder-plus", lower),
+        0,
+        "",
+        None,
+    );
+    let err = rig.ask("qwen", &prompt).await.expect_err("non-qwen model");
+    assert!(err.contains("qwen_seat_served_non_qwen_model"), "{err}");
+    let p = &capture.wait_for("tv_seat_served_model_mismatch", 1, tagged)[0];
+    assert_keys("tv_seat_served_model_mismatch", p, Some(TAG));
+    assert_eq!(
+        (&p["tv_agent"], &p["tv_served_model"]),
+        (&serde_json::json!("qwen"), &serde_json::json!("other"))
+    );
+
+    // Quota: Mistral's export error carries the 429 (structured).
+    let quota_export = format!(
+        r#"{{"schema_version":1,"outcome":"infrastructure_failure","error":{{"message":"429 Too Many Requests {upper}"}},"session_id":"s"}}"#
+    );
+    rig.set_fixture(
+        "mistral",
+        "",
+        2,
+        &format!("{lower}: quota\n"),
+        Some(&quota_export),
+    );
+    let err = rig.ask("mistral", &prompt).await.expect_err("quota");
+    assert!(err.contains("seat_quota_exhausted:mistral"), "{err}");
+    let p = &capture.wait_for("tv_seat_quota", 1, tagged)[0];
+    assert_keys("tv_seat_quota", p, Some(TAG));
+    assert_eq!(
+        (&p["tv_agent"], &p["tv_quota_signal"]),
+        (
+            &serde_json::json!("mistral"),
+            &serde_json::json!("http_429")
+        )
+    );
+
+    // Suspension: a 403 only in Qwen's stderr text.
+    rig.set_fixture(
+        "qwen",
+        "",
+        1,
+        &format!("Error: 403 Forbidden {upper} {lower}\n"),
+        None,
+    );
+    let err = rig.ask("qwen", &prompt).await.expect_err("suspended");
+    assert!(err.contains("seat_suspended: qwen"), "{err}");
+    let p = &capture.wait_for("tv_seat_suspended", 1, tagged)[0];
+    assert_keys("tv_seat_suspended", p, Some(TAG));
+    assert_eq!(
+        (&p["tv_agent"], &p["tv_suspend_signal"]),
+        (
+            &serde_json::json!("qwen"),
+            &serde_json::json!("suspension_text")
+        )
+    );
+
+    // Containment: a write past the seatbelt in a repo whose path carries the sentinel.
+    let repo = rig.root.join(format!("bypass-{upper}"));
+    git_repo(&repo, &[("README.md", "hello\n")]);
+    rig.set_action("kimi", WRITE_PWNED);
+    let err = rig
+        .ask_in("kimi", &prompt, &repo)
+        .await
+        .expect_err("violation");
+    assert!(err.contains("read_only_violation:kimi: pwned.txt"), "{err}");
+    let p = &capture.wait_for("tv_seat_containment", 1, tagged)[0];
+    assert_keys("tv_seat_containment", p, Some(TAG));
+    assert_eq!(
+        (
+            &p["tv_agent"],
+            &p["tv_containment_code"],
+            &p["tv_paths_count"]
+        ),
+        (
+            &serde_json::json!("kimi"),
+            &serde_json::json!("read_only_violation"),
+            &serde_json::json!(1)
+        )
+    );
+
+    // Lock wait: two concurrent kimi calls on a mock that sleeps 1 s; the second waits past 200 ms.
+    rig.set_action("kimi", &timed_action("sleep 1"));
+    let (a, b) = (fresh_cwd(&rig, "p1-a"), fresh_cwd(&rig, "p1-b"));
+    let started = Instant::now();
+    let (ra, rb) = tokio::join!(
+        rig.ask_in("kimi", &prompt, &a),
+        rig.ask_in("kimi", &prompt, &b)
+    );
+    let took = started.elapsed().as_millis() as u64;
+    ra.unwrap();
+    rb.unwrap();
+    let p = &capture.wait_for("tv_seat_lock_wait", 1, tagged)[0];
+    assert_keys("tv_seat_lock_wait", p, Some(TAG));
+    let waited = p["tv_waited_ms"].as_u64().unwrap();
+    assert!(
+        (200..=took).contains(&waited),
+        "waited {waited} took {took}"
+    );
+    assert_eq!(
+        (&p["tv_agent"], &p["tv_outcome"]),
+        (&serde_json::json!("kimi"), &serde_json::json!("acquired"))
+    );
+
+    // Session: a first turn with no vendor id breaks it; the next ask is refused.
+    rig.set_action("kimi", "");
+    let stdout = KIMI_STREAM
+        .lines()
+        .filter(|line| !line.contains("session.resume_hint"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    rig.set_fixture("kimi", &stdout, 0, "", None);
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    http_spawn(&rig, token.trim(), "kimi", "p1-session", &rig.cwd).await;
+    let (status, _) = http_ask(&rig, token.trim(), "p1-session", &prompt).await;
+    assert!(status.is_success());
+    let (status, _) = http_ask(&rig, token.trim(), "p1-session", &prompt).await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    let sessions = capture.wait_for("tv_seat_session", 2, tagged);
+    for p in &sessions {
+        assert_keys("tv_seat_session", p, Some(TAG));
+    }
+    let shape: Vec<(Value, Value)> = sessions
+        .iter()
+        .map(|p| (p["tv_session_event"].clone(), p["tv_reason_code"].clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (
+                serde_json::json!("broken"),
+                serde_json::json!("missing_session_id")
+            ),
+            (
+                serde_json::json!("broken_refused"),
+                serde_json::json!("session_broken")
+            ),
+        ]
+    );
+
+    capture.assert_clean();
 }

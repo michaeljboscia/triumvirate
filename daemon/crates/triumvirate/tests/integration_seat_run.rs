@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod capture_server;
+
 const SEATS: [&str; 3] = ["kimi", "mistral", "qwen"];
 
 const KIMI_STREAM: &str =
@@ -617,4 +619,104 @@ fn real_seatbelt_denies_a_symlink_write_and_the_link_is_not_committed() {
     assert!(w.mock_file("kimi", "write_err").contains("not permitted"));
     assert_parent_untouched(&w);
     assert_eq!(w.head(), before);
+}
+
+/// Seven Primes P-1: seat-run's tv_seat_writer_run (and its containment event) reach a local capture server from the
+/// real binary: committed (a file named with the sentinel), no_changes, escaped (a parent write), timeout and killed.
+/// Each exit's event arrives with exactly its documented keys, the run tag, and an outcome matching the exit code; no
+/// tv_seat_* event carries a sentinel (which is in the prompt, the commit message and a committed path).
+/// RED IF: a seat-run exit is not delivered before the process exits, gains or loses a property, reports the wrong
+/// outcome, surface or file count, or carries a sentinel.
+#[test]
+fn p1_writer_run_events_reach_a_local_capture_server() {
+    use capture_server::{CaptureServer, SENTINELS, TEST_INGEST_VALUE, assert_keys};
+    const TAG: &str = "p1-writer";
+    let [upper, _] = SENTINELS;
+    let capture = CaptureServer::start();
+    let w = World::new(None);
+    let run = |prompt: &str, timeout_secs: u64| {
+        let mut cmd = w.command("kimi", prompt, timeout_secs);
+        cmd.env("POSTHOG_HOST", &capture.url)
+            .env("POSTHOG_API_KEY", TEST_INGEST_VALUE)
+            .env("TRIUMVIRATE_TELEMETRY_RUN_TAG", TAG);
+        cmd
+    };
+    let prompt = format!("write {upper}");
+    let mut want: Vec<(&str, u64)> = Vec::new();
+
+    w.set_action("kimi", &format!("echo a > {upper}.txt\necho b > b.txt\n"));
+    assert_eq!(run(&prompt, 60).output().unwrap().status.code(), Some(0));
+    want.push(("committed", 2));
+
+    w.set_action("kimi", "");
+    assert_eq!(run(&prompt, 60).output().unwrap().status.code(), Some(3));
+    want.push(("no_changes", 0));
+
+    w.set_action(
+        "kimi",
+        "echo x > \"$W1_PARENT/escape.txt\"\necho ok > out.txt\n",
+    );
+    let mut cmd = run(&prompt, 60);
+    cmd.env("W1_PARENT", &w.parent);
+    assert_eq!(cmd.output().unwrap().status.code(), Some(1));
+    want.push(("escaped", 0));
+    fs::remove_file(w.parent.join("escape.txt")).unwrap();
+    fs::remove_file(w.wt.join("out.txt")).unwrap();
+
+    w.set_action("kimi", "sleep 30\n");
+    assert_eq!(run(&prompt, 1).output().unwrap().status.code(), Some(124));
+    want.push(("timeout", 0));
+
+    let _ = fs::remove_file(w.mock_dir("kimi").join("pid"));
+    let child = run(&prompt, 60).spawn().expect("spawn");
+    let pid_file = w.mock_dir("kimi").join("pid");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pid_file.exists() {
+        assert!(Instant::now() < deadline, "the mock never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(143));
+    want.push(("killed", 0));
+
+    let runs = capture.wait_for("tv_seat_writer_run", want.len(), |p| p["tv_run_tag"] == TAG);
+    assert_eq!(runs.len(), want.len(), "{runs:?}");
+    for (p, (outcome, files)) in runs.iter().zip(&want) {
+        assert_keys("tv_seat_writer_run", p, Some(TAG));
+        assert_eq!(
+            (
+                &p["tv_agent"],
+                &p["tv_surface"],
+                &p["tv_outcome"],
+                &p["tv_files_changed"]
+            ),
+            (
+                &serde_json::json!("kimi"),
+                &serde_json::json!("fleet_spawn"),
+                &serde_json::json!(outcome),
+                &serde_json::json!(files)
+            ),
+            "{p}"
+        );
+        assert!(p["tv_duration_ms"].is_u64(), "{p}");
+    }
+    let escapes = capture.wait_for("tv_seat_containment", 1, |p| p["tv_run_tag"] == TAG);
+    assert_keys("tv_seat_containment", &escapes[0], Some(TAG));
+    assert_eq!(
+        (
+            &escapes[0]["tv_containment_code"],
+            &escapes[0]["tv_paths_count"]
+        ),
+        (
+            &serde_json::json!("writer_escaped_worktree"),
+            &serde_json::json!(1)
+        )
+    );
+    capture.assert_clean();
 }
