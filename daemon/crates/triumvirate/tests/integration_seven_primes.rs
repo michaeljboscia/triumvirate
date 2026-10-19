@@ -11,16 +11,20 @@
 //! read) in the dispatch cwd.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
+    future::Future,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use mcp_bridge::containment::{SeatInvocation, SeatRequest};
 use serde_json::Value;
+use shared_types::{AskAgentRequest, AskAgentResponse, AskSessionRequest, SessionState};
 
 const SEATS: [&str; 3] = ["kimi", "mistral", "qwen"];
 const METERED: [&str; 5] = [
@@ -178,8 +182,10 @@ impl Rig {
 D='{d}'
 if [ "$1" = --version ]; then echo {v}; exit 0; fi
 echo spawn >> "$D/count"
+n=$(wc -l < "$D/count" | tr -d ' ')
 : > "$D/argv"
-for a in "$@"; do printf '%s\n' "$a" >> "$D/argv"; done
+: > "$D/argv.$n"
+for a in "$@"; do printf '%s\n' "$a" >> "$D/argv"; printf '%s\n' "$a" >> "$D/argv.$n"; done
 env > "$D/env"
 if [ -f "$D/action" ]; then . "$D/action"; fi
 prev=""
@@ -218,6 +224,12 @@ exit "$(cat "$D/exit")"
         fs::write(self.mock_dir(seat).join("action"), script).unwrap();
     }
 
+    fn fresh_cwd(&self, label: &str) -> PathBuf {
+        let path = self.root.join(format!("cwd-{label}"));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
     fn mock_file(&self, seat: &str, name: &str) -> String {
         fs::read_to_string(self.mock_dir(seat).join(name)).unwrap_or_default()
     }
@@ -246,6 +258,14 @@ exit "$(cat "$D/exit")"
     fn recorded_argv(&self, seat: &str) -> Vec<String> {
         fs::read_to_string(self.mock_dir(seat).join("argv"))
             .expect("the mock ran and recorded its argv")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn recorded_argv_for(&self, seat: &str, spawn: usize) -> Vec<String> {
+        fs::read_to_string(self.mock_dir(seat).join(format!("argv.{spawn}")))
+            .expect("the requested mock invocation recorded its argv")
             .lines()
             .map(str::to_string)
             .collect()
@@ -291,6 +311,9 @@ exit "$(cat "$D/exit")"
         }
         for k in METERED {
             env.push((k.to_string(), fake_key("metered-")));
+        }
+        if let Ok(value) = std::env::var("TRIUMVIRATE_SESSION_BUSY_SECS") {
+            env.push(("TRIUMVIRATE_SESSION_BUSY_SECS".into(), value));
         }
         env
     }
@@ -486,6 +509,74 @@ fn client() -> reqwest::Client {
         .timeout(Duration::from_secs(120))
         .build()
         .expect("client")
+}
+
+async fn http_spawn(rig: &Rig, token: &str, agent: &str, name: &str, cwd: &Path) {
+    let response = client()
+        .post(format!("{}/session/spawn", rig.base()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"agent":agent,"name":name,"cwd":cwd}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+}
+
+async fn http_ask(
+    rig: &Rig,
+    token: &str,
+    name: &str,
+    message: &str,
+) -> (reqwest::StatusCode, Value) {
+    let response = client()
+        .post(format!("{}/session/ask", rig.base()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"name":name,"message":message}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.json().await.unwrap();
+    (status, body)
+}
+
+static IN_PROCESS_PRIOR_IDS: OnceLock<StdMutex<Vec<Option<String>>>> = OnceLock::new();
+static IN_PROCESS_SAW_HTTP_ACTIVE: OnceLock<StdMutex<Vec<bool>>> = OnceLock::new();
+
+fn recording_in_process_executor<'a>(
+    req: &'a AskAgentRequest,
+    _emitter: Option<mcp_tools::ProgressEmitter>,
+) -> Pin<Box<dyn Future<Output = Result<AskAgentResponse, String>> + Send + 'a>> {
+    IN_PROCESS_PRIOR_IDS
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(req.prior_cli_session_id.clone());
+    let saw_http = std::env::var_os("TRIUMVIRATE_HOME")
+        .map(PathBuf::from)
+        .is_some_and(|home| home.join("http-active").exists());
+    IN_PROCESS_SAW_HTTP_ACTIVE
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(saw_http);
+    Box::pin(async move {
+        if req.message == "hold" {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let mut response = AskAgentResponse::direct(
+            "integration-request".to_string(),
+            req.agent.clone(),
+            "in-process answer".to_string(),
+            Vec::new(),
+        );
+        response.cli_session_id = Some("in-process-id".to_string());
+        Ok(response)
+    })
 }
 
 /// Each seat answers through ask_agent with the fixture's answer and its tool record; the child's argv and env are
@@ -1166,4 +1257,532 @@ async fn over_the_walk_cap_is_audit_unavailable_and_spawns_nothing() {
         "{err}"
     );
     assert_eq!(rig.spawns("kimi"), 0, "nothing spawned");
+}
+
+/// A new-seat record is Pending before its first turn, then the next turn resumes the published vendor id.
+/// RED IF: HTTP spawn starts Ready, the first id is not persisted, or the second ask starts a fresh Kimi session.
+#[tokio::test]
+async fn http_new_seat_starts_pending_then_resumes_published_id() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    let spawn = client()
+        .post(format!("{}/session/spawn", rig.base()))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"agent":"kimi","name":"stateful","cwd":rig.cwd}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        spawn.status().is_success(),
+        "{}",
+        spawn.text().await.unwrap()
+    );
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap()).unwrap();
+    assert_eq!(persisted["stateful"]["phase"], "pending");
+
+    for _ in 0..2 {
+        let ask = client()
+            .post(format!("{}/session/ask", rig.base()))
+            .bearer_auth(token.trim())
+            .json(&serde_json::json!({"name":"stateful","message":"review"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(ask.status().is_success(), "{}", ask.text().await.unwrap());
+    }
+    let argv = rig.recorded_argv("kimi");
+    let resume = argv.iter().position(|arg| arg == "--session").unwrap();
+    assert_eq!(
+        argv.get(resume + 1).map(String::as_str),
+        Some("sess-kimi-fixture-0001")
+    );
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap()).unwrap();
+    assert_eq!(persisted["stateful"]["phase"], "ready");
+    assert_eq!(persisted["stateful"]["generation"], 2);
+}
+
+/// A successful first turn without a vendor id returns its answer marked non-resumable, then HTTP rejects the
+/// broken session with 409 and does not spawn the mock again.
+/// RED IF: missing_session_id is silent, is not persisted, has the wrong HTTP status, or allows another child.
+#[tokio::test]
+async fn http_missing_first_id_breaks_session_and_returns_conflict_next() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    let stdout = KIMI_STREAM
+        .lines()
+        .filter(|line| !line.contains("session.resume_hint"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    rig.set_fixture("kimi", &stdout, 0, "", None);
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    let spawn = client()
+        .post(format!("{}/session/spawn", rig.base()))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"agent":"kimi","name":"missing","cwd":rig.cwd}))
+        .send()
+        .await
+        .unwrap();
+    assert!(spawn.status().is_success());
+    let first = client()
+        .post(format!("{}/session/ask", rig.base()))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"name":"missing","message":"review"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success());
+    let first_body: Value = first.json().await.unwrap();
+    assert!(
+        first_body["response"]
+            .as_str()
+            .unwrap()
+            .contains("session not resumable: missing_session_id:kimi")
+    );
+    assert_eq!(rig.spawns("kimi"), 1);
+
+    let second = client()
+        .post(format!("{}/session/ask", rig.base()))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"name":"missing","message":"again"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+    let second_body: Value = second.json().await.unwrap();
+    assert_eq!(
+        second_body["error"],
+        "session_broken: missing_session_id:kimi; dismiss_session and spawn a new one"
+    );
+    assert_eq!(rig.spawns("kimi"), 1);
+}
+
+/// RED IF: two HTTP turns for one new-seat session overlap, or an HTTP turn overlaps an in-process turn.
+#[tokio::test]
+async fn t208_1_same_session_http_and_cross_surface_turns_never_overlap() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.set_action(
+        "kimi",
+        "if ! mkdir \"$TRIUMVIRATE_HOME/http-critical\"; then touch \"$TRIUMVIRATE_HOME/http-overlap\"; fi\ntouch \"$TRIUMVIRATE_HOME/http-active\"\nsleep 1\nrm -f \"$TRIUMVIRATE_HOME/http-active\"\nrmdir \"$TRIUMVIRATE_HOME/http-critical\" 2>/dev/null || true",
+    );
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "http-serial",
+        &rig.fresh_cwd("http-serial"),
+    )
+    .await;
+    let (first, second) = tokio::join!(
+        http_ask(&rig, token.trim(), "http-serial", "one"),
+        http_ask(&rig, token.trim(), "http-serial", "two")
+    );
+    assert!(
+        first.0.is_success() && second.0.is_success(),
+        "{first:?} {second:?}"
+    );
+    assert!(!rig.th.join("http-overlap").exists());
+
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "mixed-serial",
+        &rig.fresh_cwd("mixed-serial"),
+    )
+    .await;
+    IN_PROCESS_SAW_HTTP_ACTIVE
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .clear();
+    let sessions = Arc::new(tokio::sync::Mutex::new(
+        HashMap::<String, SessionState>::new(),
+    ));
+    let sessions_file = daemon_core::sessions_file_path(&rig.th);
+    let request = AskSessionRequest {
+        name: "mixed-serial".to_string(),
+        message: "mixed".to_string(),
+        ..Default::default()
+    };
+    let http = http_ask(&rig, token.trim(), "mixed-serial", "hold");
+    let in_process = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !rig.th.join("http-active").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "HTTP mock never entered its critical section"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        mcp_tools::inter_agent::ask_session(
+            &sessions,
+            Some(&sessions_file),
+            &request,
+            false,
+            recording_in_process_executor,
+        )
+        .await
+    };
+    let (http_result, in_process_result) = tokio::join!(http, in_process);
+    assert!(http_result.0.is_success(), "{http_result:?}");
+    assert!(in_process_result.is_ok(), "{in_process_result:?}");
+    assert_eq!(
+        *IN_PROCESS_SAW_HTTP_ACTIVE.get().unwrap().lock().unwrap(),
+        vec![false]
+    );
+}
+
+/// RED IF: persisted vendor ids do not cross from HTTP to in-process asks and back with exact resume values.
+#[tokio::test]
+async fn t208_1b_cross_surface_continuity_uses_exact_persisted_id() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    let sessions_file = daemon_core::sessions_file_path(&rig.th);
+
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "http-first",
+        &rig.fresh_cwd("http-first"),
+    )
+    .await;
+    assert!(
+        http_ask(&rig, token.trim(), "http-first", "publish")
+            .await
+            .0
+            .is_success()
+    );
+    IN_PROCESS_PRIOR_IDS
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .clear();
+    let sessions = Arc::new(tokio::sync::Mutex::new(
+        HashMap::<String, SessionState>::new(),
+    ));
+    mcp_tools::inter_agent::ask_session(
+        &sessions,
+        Some(&sessions_file),
+        &AskSessionRequest {
+            name: "http-first".to_string(),
+            message: "resume".to_string(),
+            ..Default::default()
+        },
+        false,
+        recording_in_process_executor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *IN_PROCESS_PRIOR_IDS.get().unwrap().lock().unwrap(),
+        vec![Some("sess-kimi-fixture-0001".to_string())]
+    );
+
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "process-first",
+        &rig.fresh_cwd("process-first"),
+    )
+    .await;
+    let sessions = Arc::new(tokio::sync::Mutex::new(
+        HashMap::<String, SessionState>::new(),
+    ));
+    mcp_tools::inter_agent::ask_session(
+        &sessions,
+        Some(&sessions_file),
+        &AskSessionRequest {
+            name: "process-first".to_string(),
+            message: "publish".to_string(),
+            ..Default::default()
+        },
+        false,
+        recording_in_process_executor,
+    )
+    .await
+    .unwrap();
+    assert!(
+        http_ask(&rig, token.trim(), "process-first", "resume")
+            .await
+            .0
+            .is_success()
+    );
+    let argv = rig.recorded_argv("kimi");
+    let flag = argv.iter().position(|arg| arg == "--session").unwrap();
+    assert_eq!(
+        argv.get(flag + 1).map(String::as_str),
+        Some("in-process-id")
+    );
+}
+
+/// RED IF: a held session lock does not return HTTP 409 session_busy, or the rejected turn spawns a child.
+#[tokio::test]
+async fn t208_2b_http_lock_timeout_is_conflict_and_spawns_nothing() {
+    let _g = ENV_LOCK.lock().await;
+    unsafe { std::env::set_var("TRIUMVIRATE_SESSION_BUSY_SECS", "1") };
+    let mut rig = Rig::new();
+    rig.set_action("kimi", "sleep 3");
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    http_spawn(&rig, token.trim(), "kimi", "busy", &rig.fresh_cwd("busy")).await;
+    let first = http_ask(&rig, token.trim(), "busy", "hold");
+    let second = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rig.spawns("kimi") == 0 {
+            assert!(Instant::now() < deadline, "first mock never spawned");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        http_ask(&rig, token.trim(), "busy", "blocked").await
+    };
+    let (first, second) = tokio::join!(first, second);
+    unsafe { std::env::remove_var("TRIUMVIRATE_SESSION_BUSY_SECS") };
+    assert!(first.0.is_success(), "{first:?}");
+    assert_eq!(second.0, reqwest::StatusCode::CONFLICT);
+    assert_eq!(second.1["error"], "session_busy: busy");
+    assert_eq!(rig.spawns("kimi"), 1);
+}
+
+/// RED IF: HTTP spawn does not persist a Pending record before any ask for every new seat.
+#[tokio::test]
+async fn t208_2c_http_spawn_persists_pending_before_first_ask() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    for seat in SEATS {
+        http_spawn(
+            &rig,
+            token.trim(),
+            seat,
+            seat,
+            &rig.fresh_cwd(&format!("pending-{seat}")),
+        )
+        .await;
+        let persisted: Value =
+            serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted[seat]["phase"], "pending", "{seat}");
+        assert_eq!(rig.spawns(seat), 0, "{seat}");
+    }
+}
+
+/// RED IF: locks for different session names and seats serialize independent child intervals.
+#[tokio::test]
+async fn t208_3_different_sessions_on_different_seats_overlap() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    let action = "if ! mkdir \"$TRIUMVIRATE_HOME/independent-active\"; then touch \"$TRIUMVIRATE_HOME/independent-overlap\"; fi\nsleep 1\nrmdir \"$TRIUMVIRATE_HOME/independent-active\" 2>/dev/null || true";
+    rig.set_action("kimi", action);
+    rig.set_action("qwen", action);
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "independent-k",
+        &rig.fresh_cwd("independent-k"),
+    )
+    .await;
+    http_spawn(
+        &rig,
+        token.trim(),
+        "qwen",
+        "independent-q",
+        &rig.fresh_cwd("independent-q"),
+    )
+    .await;
+    let (kimi, qwen) = tokio::join!(
+        http_ask(&rig, token.trim(), "independent-k", "one"),
+        http_ask(&rig, token.trim(), "independent-q", "two")
+    );
+    assert!(
+        kimi.0.is_success() && qwen.0.is_success(),
+        "{kimi:?} {qwen:?}"
+    );
+    assert!(rig.th.join("independent-overlap").exists());
+}
+
+/// RED IF: a failed first Kimi turn does not break, block, dismiss, respawn Pending, and then recover.
+#[tokio::test]
+async fn t208_4_broken_first_turn_requires_dismiss_before_recovery() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.set_fixture("kimi", "", 1, "first turn exploded\n", None);
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "recover",
+        &rig.fresh_cwd("recover-first"),
+    )
+    .await;
+    let first = http_ask(&rig, token.trim(), "recover", "fail").await;
+    assert_eq!(first.0, reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(rig.spawns("kimi"), 1);
+    let blocked = http_ask(&rig, token.trim(), "recover", "blocked").await;
+    assert_eq!(blocked.0, reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        blocked.1["error"],
+        "session_broken: first turn exploded; dismiss_session and spawn a new one"
+    );
+    assert_eq!(rig.spawns("kimi"), 1);
+
+    let dismissed = client()
+        .post(format!("{}/session/dismiss", rig.base()))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"name":"recover"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(dismissed.status().is_success());
+    let (_, stdout, export) = fixture("kimi");
+    rig.set_fixture("kimi", &stdout, 0, "", export.as_deref());
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "recover",
+        &rig.fresh_cwd("recover-second"),
+    )
+    .await;
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap()).unwrap();
+    assert_eq!(persisted["recover"]["phase"], "pending");
+    assert!(
+        http_ask(&rig, token.trim(), "recover", "works")
+            .await
+            .0
+            .is_success()
+    );
+    assert_eq!(rig.spawns("kimi"), 2);
+}
+
+/// RED IF: a Ready session whose vendor rejects its id does not become Broken and block the next child.
+#[tokio::test]
+async fn t208_5_vendor_rejected_ready_session_becomes_broken() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    http_spawn(
+        &rig,
+        token.trim(),
+        "kimi",
+        "rejected",
+        &rig.fresh_cwd("rejected"),
+    )
+    .await;
+    assert!(
+        http_ask(&rig, token.trim(), "rejected", "publish")
+            .await
+            .0
+            .is_success()
+    );
+    rig.set_fixture("kimi", "", 1, "Session not found\n", None);
+    assert_eq!(
+        http_ask(&rig, token.trim(), "rejected", "reject").await.0,
+        reqwest::StatusCode::BAD_GATEWAY
+    );
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap()).unwrap();
+    assert_eq!(persisted["rejected"]["phase"], "broken");
+    assert_eq!(persisted["rejected"]["broken_reason"], "Session not found");
+    let blocked = http_ask(&rig, token.trim(), "rejected", "blocked").await;
+    assert_eq!(blocked.0, reqwest::StatusCode::CONFLICT);
+    assert_eq!(rig.spawns("kimi"), 2);
+}
+
+/// RED IF: any new seat treats a successful first turn without an id as resumable or spawns a second child.
+#[tokio::test]
+async fn t208_6_each_new_seat_missing_first_id_breaks_and_blocks() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.set_fixture(
+        "kimi",
+        &KIMI_STREAM
+            .lines()
+            .filter(|line| !line.contains("session.resume_hint"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        0,
+        "",
+        None,
+    );
+    rig.set_fixture("mistral", MISTRAL_STREAM, 0, "", None);
+    rig.set_fixture(
+        "qwen",
+        &QWEN_STREAM
+            .lines()
+            .filter(|line| !line.contains("session_start"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        0,
+        "",
+        None,
+    );
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    for seat in SEATS {
+        let name = format!("missing-{seat}");
+        http_spawn(&rig, token.trim(), seat, &name, &rig.fresh_cwd(&name)).await;
+        let first = http_ask(&rig, token.trim(), &name, "first").await;
+        assert!(first.0.is_success(), "{seat}: {first:?}");
+        assert!(
+            first.1["response"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("session not resumable: missing_session_id:{seat}")),
+            "{seat}: {first:?}"
+        );
+        let blocked = http_ask(&rig, token.trim(), &name, "blocked").await;
+        assert_eq!(blocked.0, reqwest::StatusCode::CONFLICT, "{seat}");
+        assert_eq!(rig.spawns(seat), 1, "{seat}");
+    }
+}
+
+/// RED IF: any new seat fails to publish its exact id or uses the wrong resume flag and value on the next turn.
+#[tokio::test]
+async fn t208_7_each_new_seat_publishes_and_resumes_exact_id() {
+    let _g = ENV_LOCK.lock().await;
+    let mut rig = Rig::new();
+    rig.start_daemon().await;
+    let token = fs::read_to_string(rig.th.join("daemon.token")).unwrap();
+    for (seat, flag, id) in [
+        ("kimi", "--session", "sess-kimi-fixture-0001"),
+        ("mistral", "--resume", "vibe-sess-7f3a"),
+        ("qwen", "--resume", "7f3c9a2e-5b1d-4e8a-9c40-2d6f1e8b7a01"),
+    ] {
+        let name = format!("resume-{seat}");
+        http_spawn(&rig, token.trim(), seat, &name, &rig.fresh_cwd(&name)).await;
+        let first = http_ask(&rig, token.trim(), &name, "first").await;
+        assert!(first.0.is_success(), "{seat}: {first:?}");
+        let persisted: Value =
+            serde_json::from_str(&fs::read_to_string(rig.th.join("sessions.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted[&name]["cli_session_id"], id, "{seat}");
+        let second = http_ask(&rig, token.trim(), &name, "second").await;
+        assert!(second.0.is_success(), "{seat}: {second:?}");
+        let argv = rig.recorded_argv_for(seat, 2);
+        let position = argv.iter().position(|arg| arg == flag).unwrap();
+        assert_eq!(
+            argv.get(position + 1).map(String::as_str),
+            Some(id),
+            "{seat}"
+        );
+    }
 }

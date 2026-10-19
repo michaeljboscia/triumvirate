@@ -1,22 +1,22 @@
 //! Shared DTOs for MCP bridge <-> daemon communication.
 
+mod abe;
 mod api;
 mod git_ops;
 mod ledger;
-mod abe;
 mod streaming;
 
 pub use abe::*;
 pub use api::{
-    WorkersResponse, WorkerInfo, FleetResponse, FleetBuild, FleetTask,
-    StateResponse, ReplayRequest, ReplayResponse,
+    FleetBuild, FleetResponse, FleetTask, ReplayRequest, ReplayResponse, StateResponse, WorkerInfo,
+    WorkersResponse,
 };
 pub use git_ops::{GitOps, MergeResult};
-pub use streaming::{AgentStreamEvent, WorkerLifecycleType};
 pub use ledger::{
     DrainResult, GcResult, HealthStatus, Lesson, ManualRecord, NewLesson, RawEvent, SessionDetail,
     Summary,
 };
+pub use streaming::{AgentStreamEvent, WorkerLifecycleType};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1071,6 +1071,15 @@ pub struct StatusResponse {
     pub seats: std::collections::BTreeMap<String, SeatStatus>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPhase {
+    Pending,
+    #[default]
+    Ready,
+    Broken,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionState {
     pub agent: String,
@@ -1091,6 +1100,14 @@ pub struct SessionState {
     /// migration in `hydrate_session_ids_from_workers` fills it from the old registry once.
     #[serde(default)]
     pub cli_session_id: Option<String>,
+    /// Named `phase` rather than `state` to avoid colliding with the many runtime state locals.
+    /// Existing persisted records default to Ready and retain their previous behavior.
+    #[serde(default)]
+    pub phase: SessionPhase,
+    #[serde(default)]
+    pub broken_reason: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
     /// The immediate session that triggered this session's dispatch.
     /// For Pantheon-spawned Claude Code sessions, this is the panel_id.
     /// For Codex/Gemini workers dispatched via MCP, this is the caller's session_id.
@@ -1167,6 +1184,9 @@ mod tests {
             root_session_id: Some("sess-pantheon-panel-1".to_string()),
             pantheon_session_id: Some("pantheon-uuid-abc-123".to_string()),
             cli_session_id: None,
+            phase: super::SessionPhase::Ready,
+            broken_reason: None,
+            generation: 0,
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -1181,6 +1201,8 @@ mod tests {
         assert_eq!(parsed.pantheon_session_id, Some("pantheon-uuid-abc-123".to_string()));
     }
 
+    /// RED IF: a sessions.json record from before T-208 does not default to Ready, None, and generation zero.
+
     #[test]
     fn session_state_backwards_compatible_missing_lineage() {
         // Verify existing sessions.json files (without lineage fields) still
@@ -1193,6 +1215,9 @@ mod tests {
         assert_eq!(parsed.parent_session_id, None);
         assert_eq!(parsed.root_session_id, None);
         assert_eq!(parsed.pantheon_session_id, None);
+        assert_eq!(parsed.phase, super::SessionPhase::Ready);
+        assert_eq!(parsed.broken_reason, None);
+        assert_eq!(parsed.generation, 0);
     }
 
     #[test]
