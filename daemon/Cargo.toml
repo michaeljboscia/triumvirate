@@ -36,6 +36,6 @@ opentelemetry_sdk = "0.28"
 # so an async client panics with "there is no reactor running".
 opentelemetry-otlp = { version = "0.28", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs"] }
 opentelemetry-appender-tracing = "0.28"
-prometheus = "0.13"
+prometheus = "0.14"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
