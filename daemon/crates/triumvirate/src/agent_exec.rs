@@ -12999,7 +12999,13 @@ pub(crate) mod seven_primes_gate_tests {
                 .expect("new seat mock");
                 bin
             };
-            let kimi = new_seat("kimi", r#"{"role":"assistant","content":"kimi answered"}"#);
+            // A real Kimi turn ends with `session.resume_hint`; without it T-208 correctly breaks a session
+            // (`missing_session_id:kimi`), so the mock emits one like the live CLI does (LIVE_SMOKE-2026-10-19).
+            let kimi = new_seat(
+                "kimi",
+                "{\"role\":\"assistant\",\"content\":\"kimi answered\"}\n\
+                 {\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_t204\"}",
+            );
             let mistral = new_seat("mistral", "{}");
             let qwen = new_seat("qwen", "{}");
             // SAFETY: the caller holds the crate env lock and an EnvRestore over ENV.
