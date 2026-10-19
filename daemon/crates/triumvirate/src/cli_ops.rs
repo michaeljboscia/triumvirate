@@ -648,7 +648,7 @@ fn stray_key_files(seat_home: &std::path::Path, expected: &[&str]) -> Vec<String
             };
             for line in std::io::BufReader::new(file).split(b'\n') {
                 match line {
-                    Ok(line) if patterns.is_match(&String::from_utf8_lossy(&line)) => {
+                    Ok(line) if line_has_real_key(&patterns, &String::from_utf8_lossy(&line)) => {
                         found.push(name.clone());
                         break;
                     }
@@ -663,6 +663,30 @@ fn stray_key_files(seat_home: &std::path::Path, expected: &[&str]) -> Vec<String
     }
     found.sort();
     found
+}
+
+/// True when a match on `line` is a value that could be a real key. Documentation placeholders are not keys: Vibe
+/// downloads its own plugin docs into the seat home and they carry `MISTRAL_API_KEY=your_api_key_here` (live,
+/// 2026-10-19), which failed `stray_keys` for a clean seat. A value that is a placeholder (`your...`, `<...>`,
+/// `${...}`, `$VAR`, `xxx...`, `example...`, `changeme`, `...`, `***`) is skipped; anything else still fails.
+fn line_has_real_key(patterns: &regex_lite::Regex, line: &str) -> bool {
+    fn placeholder(value: &str) -> bool {
+        let v = value
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_ascii_lowercase();
+        ["your", "<", "${", "$", "xxx", "example", "changeme", "...", "***", "placeholder", "replace"]
+            .iter()
+            .any(|p| v.starts_with(p))
+    }
+    patterns.find_iter(line).any(|m| {
+        let text = m.as_str();
+        match (text.strip_prefix("sk-"), text.split_once('=')) {
+            (Some(rest), _) => !placeholder(rest),
+            (None, Some((_, value))) => !placeholder(value),
+            (None, None) => true,
+        }
+    })
 }
 
 /// The static checks for one new seat (REQ-054). None of them spawns the vendor CLI except `--version`.
@@ -1392,6 +1416,25 @@ mod seven_primes_doctor_tests {
         std::os::unix::fs::symlink(&kimi, kimi.join("loop")).unwrap();
         assert_eq!(stray_key_files(&kimi, &[]), Vec::<String>::new());
         assert!(failing("kimi", &ctx(&f, vec![], sandbox())).is_empty());
+    }
+
+    /// A vendor's documentation placeholder is not a key (Vibe's downloaded plugin docs, live 2026-10-19), but a
+    /// real-shaped value on the same kind of line still fails.
+    /// RED IF: placeholders fail a clean seat's stray_keys, or the placeholder rule lets a real key through.
+    #[test]
+    fn stray_scan_skips_doc_placeholders_but_not_real_keys() {
+        let f = good();
+        let kimi = f.home.join("homes/kimi");
+        let docs = kimi.join("logs/plugins/skills");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(
+            docs.join("SKILL.md"),
+            "export MISTRAL_API_KEY=your_api_key_here\nOPENAI_API_KEY=<your key>\nTOKEN=${TOKEN}\nsk-your-key-goes-here-xx\n",
+        )
+        .unwrap();
+        assert_eq!(stray_key_files(&kimi, &[]), Vec::<String>::new());
+        fs::write(docs.join("real.md"), format!("MISTRAL_API_KEY={}\n", fake_secret("m"))).unwrap();
+        assert_eq!(stray_key_files(&kimi, &[]), vec!["logs/plugins/skills/real.md".to_string()]);
     }
 
     /// An entry the scan cannot read is a finding, not a skip: a scanner that skips what it cannot read fails open.
