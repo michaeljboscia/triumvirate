@@ -134,7 +134,7 @@ verified_field() {
     local seat="$1" field="$2" file
     file="${TRIUMVIRATE_HOME:-${HOME}/.triumvirate}/seats/$seat/verified.json"
     [ -r "$file" ] || return 1
-    python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], ""))' "$file" "$field"
+    python3 -I -c 'import json, sys; v = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], ""); print("null" if v is None else v)' "$file" "$field"
 }
 
 run_new_seat_live_test() {
@@ -214,7 +214,7 @@ run_new_seat_guards() {
                 served_model="$(verified_field "$seat" served_model || true)"
                 timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
                 if [ -z "$cli_version" ] || [ -z "$served_model" ]; then echo "FAIL  $seat verified.json metadata unavailable"; FAILED=1; continue; fi
-                add_evidence_row "$seat" "$(python3 -I -c 'import json, sys; print(json.dumps({"status":"PASS","tests_run":int(sys.argv[1]),"cargo_summary":sys.argv[2],"cli_version":sys.argv[3],"served_model":sys.argv[4],"timestamp":sys.argv[5]}))' "$LIVE_COUNT" "$LIVE_SUMMARY" "$cli_version" "$served_model" "$timestamp")"
+                add_evidence_row "$seat" "$(python3 -I -c 'import json, sys; print(json.dumps({"status":"PASS","tests_run":int(sys.argv[1]),"cargo_summary":sys.argv[2],"cli_version":sys.argv[3],"served_model":None if sys.argv[4] == "null" else sys.argv[4],"timestamp":sys.argv[5]}))' "$LIVE_COUNT" "$LIVE_SUMMARY" "$cli_version" "$served_model" "$timestamp")"
             fi
         else
             FAILED=1
