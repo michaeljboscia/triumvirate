@@ -180,6 +180,17 @@ pub(crate) fn open(project_root: PathBuf) -> anyhow::Result<LedgerStore> {
     })
 }
 
+/// Opens the ledger only when `<project_root>/.triumvirate/ledger.db` already exists, so a
+/// caller that only maintains ledgers never creates one (or a `.triumvirate/` dir) in an
+/// arbitrary directory. Under launchd the daemon's cwd is `/`, which is read-only on macOS.
+pub(crate) fn open_existing(project_root: PathBuf) -> anyhow::Result<Option<LedgerStore>> {
+    let db_path = project_root.join(".triumvirate").join("ledger.db");
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    open(project_root).map(Some)
+}
+
 /// Additive migration for `reviews.dispatch_owned` (FIND-REVIEW-03).
 ///
 /// `CREATE TABLE IF NOT EXISTS` does not add a column to a database that already exists, and
