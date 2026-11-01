@@ -43,6 +43,20 @@ impl LedgerStore {
         store::open(project_root)
     }
 
+    /// Like [`LedgerStore::open`], but returns `None` instead of creating a ledger that does
+    /// not exist yet.
+    #[instrument(
+        skip_all,
+        fields(
+            event_type = "ledger_store_open",
+            spool_size = tracing::field::Empty,
+            operation = "open_existing"
+        )
+    )]
+    pub fn open_existing(project_root: PathBuf) -> anyhow::Result<Option<Self>> {
+        store::open_existing(project_root)
+    }
+
     #[instrument(
         skip_all,
         fields(
@@ -312,6 +326,34 @@ mod tests {
         let err = LedgerStore::open(PathBuf::from("relative/path"))
             .expect_err("relative paths must be rejected");
         assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn open_existing_never_creates_a_ledger() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project dir");
+        fs::set_permissions(&project_root, fs::Permissions::from_mode(0o555))
+            .expect("make project dir read-only");
+
+        let opened = LedgerStore::open_existing(project_root.clone());
+
+        fs::set_permissions(&project_root, fs::Permissions::from_mode(0o755))
+            .expect("restore project dir permissions");
+        assert!(opened.expect("a missing ledger is not an error").is_none());
+        assert!(!project_root.join(".triumvirate").exists());
+    }
+
+    #[test]
+    fn open_existing_opens_a_ledger_that_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().join("project");
+        drop(LedgerStore::open(project_root.clone()).expect("create ledger"));
+
+        let store = LedgerStore::open_existing(project_root.clone())
+            .expect("open existing ledger")
+            .expect("ledger exists");
+        assert_eq!(store.project_root(), project_root.as_path());
     }
 
     #[test]

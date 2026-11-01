@@ -3104,20 +3104,30 @@ async fn run_daemon() -> anyhow::Result<()> {
             return;
         };
 
+        enum StartupGc {
+            NoLedger,
+            Gated,
+            Completed(GcResult),
+        }
+
         let result = tokio::task::spawn_blocking({
             let project_root = project_root.clone();
-            move || -> anyhow::Result<Option<GcResult>> {
-                let store = LedgerStore::open(project_root)?;
+            move || -> anyhow::Result<StartupGc> {
+                // Never create a ledger here: the cwd is whatever the launcher left, and under
+                // launchd that is `/`, where creating `.triumvirate/` fails as read-only.
+                let Some(store) = LedgerStore::open_existing(project_root)? else {
+                    return Ok(StartupGc::NoLedger);
+                };
                 if !store.should_run_startup_gc()? {
-                    return Ok(None);
+                    return Ok(StartupGc::Gated);
                 }
-                Ok(Some(store.gc()?))
+                Ok(StartupGc::Completed(store.gc()?))
             }
         })
         .await;
 
         match result {
-            Ok(Ok(Some(gc_result))) => {
+            Ok(Ok(StartupGc::Completed(gc_result))) => {
                 tracing::info!(
                     events_scanned = gc_result.events_scanned,
                     events_deleted = gc_result.events_deleted,
@@ -3129,14 +3139,26 @@ async fn run_daemon() -> anyhow::Result<()> {
                     publish_ws_event(state, "ledger_gc", payload);
                 }
             }
-            Ok(Ok(None)) => {
+            Ok(Ok(StartupGc::NoLedger)) => {
+                tracing::info!(
+                    "startup ledger GC skipped: no ledger at {}",
+                    project_root.display()
+                );
+            }
+            Ok(Ok(StartupGc::Gated)) => {
                 tracing::debug!("startup ledger GC skipped");
             }
             Ok(Err(err)) => {
-                tracing::warn!("startup ledger GC failed: {err}");
+                tracing::warn!(
+                    "startup ledger GC failed for {}: {err}",
+                    project_root.display()
+                );
             }
             Err(err) => {
-                tracing::warn!("startup ledger GC join failure: {err}");
+                tracing::warn!(
+                    "startup ledger GC join failure for {}: {err}",
+                    project_root.display()
+                );
             }
         }
     }
