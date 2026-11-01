@@ -3113,8 +3113,6 @@ async fn run_daemon() -> anyhow::Result<()> {
         let result = tokio::task::spawn_blocking({
             let project_root = project_root.clone();
             move || -> anyhow::Result<StartupGc> {
-                // Never create a ledger here: the cwd is whatever the launcher left, and under
-                // launchd that is `/`, where creating `.triumvirate/` fails as read-only.
                 let Some(store) = LedgerStore::open_existing(project_root)? else {
                     return Ok(StartupGc::NoLedger);
                 };
