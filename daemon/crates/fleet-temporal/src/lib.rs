@@ -54,6 +54,13 @@ pub const DEFAULT_ADDRESSES: &str = "https://192.168.2.110:7233,https://100.73.4
 /// address does not answer at all, so without a bound the fallback would wait out a TCP timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often a running worker checks that its Temporal address still accepts TCP.
+const PROBE_EVERY: Duration = Duration::from_secs(30);
+/// Failed probes in a row before the worker is restarted.
+const PROBE_FAILURES: u32 = 3;
+/// How long a worker restarted by the probe may take to shut down before it is dropped.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
 impl WorkerConfig {
     /// `address` as an ordered list: comma-separated, tried first to last.
     pub fn addresses(&self) -> Vec<&str> {
@@ -79,6 +86,11 @@ impl WorkerConfig {
 /// Connect a client over mTLS. Fails loudly on a missing cert file rather than falling back to
 /// plain TLS: the server refuses a client without a cert, and the error should name the file.
 pub async fn connect(cfg: &WorkerConfig) -> anyhow::Result<Client> {
+    Ok(connect_any(cfg).await?.0)
+}
+
+/// `connect`, and the address that answered.
+async fn connect_any(cfg: &WorkerConfig) -> anyhow::Result<(Client, String)> {
     let read = |name: &str| {
         let p = cfg.cert_dir.join(name);
         std::fs::read(&p).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", p.display()))
@@ -103,7 +115,8 @@ pub async fn connect(cfg: &WorkerConfig) -> anyhow::Result<Client> {
         match tokio::time::timeout(CONNECT_TIMEOUT, Connection::connect(conn)).await {
             Ok(Ok(connection)) => {
                 tracing::info!(address, "temporal: connected");
-                return Ok(Client::new(connection, ClientOptions::new(cfg.namespace.clone()).build())?);
+                let client = Client::new(connection, ClientOptions::new(cfg.namespace.clone()).build())?;
+                return Ok((client, address.to_string()));
             }
             Ok(Err(e)) => {
                 let reason = format!("{address}: {e}");
@@ -322,24 +335,67 @@ fn worker_options(cfg: &WorkerConfig) -> anyhow::Result<WorkerOptions> {
         .build())
 }
 
-/// Run the worker until it fails. One attempt: the caller owns retry.
+/// Resolves with the last error once `address` has refused TCP `PROBE_FAILURES` times in a row.
+///
+/// The SDK retries a failed task poll forever (temporalio-client 1.0.0 `task_poll_retry_policy`),
+/// so `Worker::run` does not return while its server is unreachable. Without this probe the worker
+/// stays on a dead address, logs each poll retry at error, and never tries the next address.
+async fn unreachable(address: &str, every: Duration) -> String {
+    let target = url::Url::parse(address)
+        .ok()
+        .and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?)));
+    let Some(target) = target else {
+        return std::future::pending().await;
+    };
+    let mut failures = 0;
+    loop {
+        tokio::time::sleep(every).await;
+        let reason = match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&target)).await {
+            Ok(Ok(_)) => {
+                failures = 0;
+                continue;
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no answer in {} s", CONNECT_TIMEOUT.as_secs()),
+        };
+        failures += 1;
+        tracing::warn!(address, failures, error = %reason, "temporal: connected address does not accept TCP");
+        if failures >= PROBE_FAILURES {
+            return reason;
+        }
+    }
+}
+
+/// Run the worker until it fails or its address stops answering. One attempt: the caller owns
+/// retry, and its next `connect` tries every configured address again.
 async fn run_worker_once(cfg: &WorkerConfig) -> anyhow::Result<()> {
     let runtime = Runtime::from_current_tokio(Default::default())?;
-    let client = connect(cfg).await?;
+    let (client, address) = connect_any(cfg).await?;
     let mut worker = Worker::new(&runtime, client, worker_options(cfg)?)?;
+    let shutdown = worker.shutdown_handle();
     tracing::info!(
         namespace = %cfg.namespace,
         task_queue = %cfg.task_queue,
-        addresses = %cfg.address,
+        address,
         "temporal fleet worker polling"
     );
-    worker.run().await?;
-    Ok(())
+    let mut run = std::pin::pin!(worker.run());
+    tokio::select! {
+        ran = &mut run => Ok(ran?),
+        reason = unreachable(&address, PROBE_EVERY) => {
+            shutdown();
+            // Shutdown waits for polls that are still retrying. Bound it, then drop the worker:
+            // a run_worker activity in flight is adopted by its next attempt.
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, &mut run).await;
+            anyhow::bail!("{address} does not answer ({reason}); reconnecting")
+        }
+    }
 }
 
-/// Start the worker on its own thread and keep it running: a connect or poll failure is logged
-/// and retried with backoff (5 s doubling to 60 s), never silently abandoned. The no-pollers
-/// absence alert on this queue is what catches a worker that cannot get back up.
+/// Start the worker on its own thread and keep it running: a connect failure, or a connected
+/// address that stops answering, is logged and retried with backoff (5 s doubling to 60 s), never
+/// silently abandoned. The no-pollers absence alert on this queue is what catches a worker that
+/// cannot get back up.
 pub fn spawn_worker_thread(cfg: WorkerConfig) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("temporal-fleet-worker".to_string())
@@ -464,6 +520,24 @@ mod tests {
 #[cfg(test)]
 mod address_tests {
     use super::*;
+
+    /// RED IF a worker stays on an address that no longer accepts TCP (the SDK retries its polls
+    /// there forever), or restarts while the address still answers.
+    #[tokio::test]
+    async fn the_probe_fires_only_when_the_address_stops_answering() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = format!("https://{}", listener.local_addr().expect("addr"));
+        let every = Duration::from_millis(20);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), unreachable(&address, every)).await.is_err(),
+            "a live address must not fire the probe"
+        );
+        drop(listener);
+        let reason = tokio::time::timeout(Duration::from_secs(10), unreachable(&address, every))
+            .await
+            .expect("a dead address must fire the probe");
+        assert!(!reason.is_empty());
+    }
 
     /// RED IF the LAN stops being tried first, or the tailnet fallback drops out of the default.
     #[test]
