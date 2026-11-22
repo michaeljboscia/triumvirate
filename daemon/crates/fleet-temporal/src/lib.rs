@@ -394,8 +394,8 @@ async fn run_worker_once(cfg: &WorkerConfig) -> anyhow::Result<()> {
 
 /// Start the worker on its own thread and keep it running: a connect failure, or a connected
 /// address that stops answering, is logged and retried with backoff (5 s doubling to 60 s), never
-/// silently abandoned. The no-pollers
-/// absence alert on this queue is what catches a worker that cannot get back up.
+/// silently abandoned. The no-pollers absence alert on this queue is what catches a worker that
+/// cannot get back up.
 pub fn spawn_worker_thread(cfg: WorkerConfig) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("temporal-fleet-worker".to_string())
