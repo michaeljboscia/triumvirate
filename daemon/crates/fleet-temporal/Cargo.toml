@@ -17,7 +17,7 @@ temporalio-macros = "=1.0.0"
 temporalio-workflow = "=1.0.0"
 futures = "0.3"
 serde.workspace = true
-tokio = { version = "1", features = ["rt", "time", "macros", "process"] }
+tokio = { version = "1", features = ["rt", "time", "macros", "process", "net"] }
 anyhow.workspace = true
 tracing.workspace = true
 url = "2"
